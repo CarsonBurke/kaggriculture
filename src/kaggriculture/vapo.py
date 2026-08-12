@@ -334,12 +334,10 @@ def update_vapo(
             ).clamp_min(1.0)
 
             actor_optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=autocast_enabled,
-            ):
-                actor_output = actor(board, global_features, units, positions)
+            # Behavior likelihoods are collected in FP32. Replaying the actor
+            # under BF16 changes logits at unchanged weights, creating a false
+            # importance ratio and KL before the first optimizer step.
+            actor_output = actor(board, global_features, units, positions)
             (
                 new_unit,
                 new_kind,

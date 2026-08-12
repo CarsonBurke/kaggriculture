@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.policy import component_logprobs
 from kaggriculture.rollout import collect_self_play
 from kaggriculture.vapo import (
     VapoConfig,
@@ -118,6 +119,62 @@ def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
     assert actor_group["warmup_step"] == 1
     assert actor_group["base_lr"] == config.actor_learning_rate
     assert actor_group["lr"] == pytest.approx(config.actor_learning_rate / 4)
+
+
+def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
+    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        actor, critic, games=1, seed_start=92, episode_steps=3, sampling_seed=6
+    )
+    flat = rollout.valid.reshape(-1)
+    board = torch.from_numpy(rollout.board.reshape(-1, *rollout.board.shape[2:])[flat]).float()
+    global_features = torch.from_numpy(
+        rollout.global_features.reshape(-1, *rollout.global_features.shape[2:])[flat]
+    ).float()
+    units = torch.from_numpy(rollout.units.reshape(-1, *rollout.units.shape[2:])[flat]).float()
+    positions = torch.from_numpy(
+        rollout.unit_positions.reshape(-1, *rollout.unit_positions.shape[2:])[flat]
+    ).long()
+
+    output = actor(board, global_features, units, positions)
+    market_kinds = torch.from_numpy(
+        rollout.market_kinds.reshape(-1, *rollout.market_kinds.shape[2:])[flat]
+    ).long()
+    replayed = component_logprobs(
+        output,
+        actor.quantity_logits(output.market_quantity_context, market_kinds),
+        torch.from_numpy(
+            rollout.unit_actions.reshape(-1, *rollout.unit_actions.shape[2:])[flat]
+        ).long(),
+        market_kinds,
+        torch.from_numpy(
+            rollout.market_quantities.reshape(-1, *rollout.market_quantities.shape[2:])[flat]
+        ).long(),
+        torch.from_numpy(rollout.unit_masks.reshape(-1, *rollout.unit_masks.shape[2:])[flat]),
+        torch.from_numpy(
+            rollout.market_kind_masks.reshape(-1, *rollout.market_kind_masks.shape[2:])[flat]
+        ),
+        torch.from_numpy(
+            rollout.market_quantity_masks.reshape(-1, *rollout.market_quantity_masks.shape[2:])[
+                flat
+            ]
+        ),
+    )[:3]
+    behavior = (
+        rollout.old_unit_logprobs.reshape(-1, *rollout.old_unit_logprobs.shape[2:])[flat],
+        rollout.old_market_kind_logprobs.reshape(-1, *rollout.old_market_kind_logprobs.shape[2:])[
+            flat
+        ],
+        rollout.old_market_quantity_logprobs.reshape(
+            -1, *rollout.old_market_quantity_logprobs.shape[2:]
+        )[flat],
+    )
+
+    for new_logprobs, old_logprobs in zip(replayed, behavior, strict=True):
+        ratios = (new_logprobs - torch.from_numpy(old_logprobs)).exp()
+        torch.testing.assert_close(ratios, torch.ones_like(ratios), atol=1e-5, rtol=1e-5)
 
 
 def test_one_vapo_update_is_finite() -> None:
