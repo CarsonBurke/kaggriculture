@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kaggriculture-agent"
+version = "0.1.0"
+description = "Research and evaluation tooling for the Kaggriculture simulation competition"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "kaggle-environments==1.32.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4",
+  "ruff>=0.12",
+]
+train = [
+  "tensorboard>=2.18",
+  "torch>=2.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kaggriculture"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
