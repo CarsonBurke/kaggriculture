@@ -4,10 +4,12 @@ import numpy as np
 from kaggle_environments import make
 
 from kaggriculture.actions import (
+    N_QUANTITIES,
     MarketKind,
     UnitAction,
     compile_action,
     market_kind_mask,
+    market_order,
     quantity_mask,
     unit_action_mask,
 )
@@ -92,6 +94,55 @@ def test_compiler_supports_small_pickups_for_multiple_hands() -> None:
     assert action["hands"] == [["PICKUP", "WHEAT", 2]]
 
 
+def test_every_pickup_variant_compiles_to_its_exact_quantity() -> None:
+    observation = _observation()
+    observation["private"]["shed"].update(
+        {"WHEAT": 100, "FERTILIZER": 100, "GOOSE": 100, "COW": 100, "SHEEP": 100}
+    )
+    expected = {
+        **{f"PICKUP_WHEAT_{quantity}": ("WHEAT", quantity) for quantity in (1, 2, 4, 8, 16)},
+        **{f"PICKUP_FERTILIZER_{quantity}": ("FERTILIZER", quantity) for quantity in (1, 2, 4, 8)},
+        **{
+            f"PICKUP_{animal}_{quantity}": (animal, quantity)
+            for animal in ("GOOSE", "COW", "SHEEP")
+            for quantity in (1, 2, 3, 4)
+        },
+    }
+
+    mask = unit_action_mask(observation, 0)
+
+    assert len(expected) == 21
+    for name, (item, quantity) in expected.items():
+        action = UnitAction[name]
+        assert mask[action]
+        units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+        units[0] = action
+        kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+        quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+        compiled = compile_action(observation, units, kinds, quantities)
+        assert compiled["farmer"] == ["PICKUP", item, quantity]
+
+
+def test_pickup_masks_and_compilation_reserve_stock_sequentially() -> None:
+    observation = _observation()
+    observation["farms"][0]["hands"] = [[4, 4], [4, 4]]
+    observation["private"]["inventories"].extend(({}, {}))
+    observation["private"]["shed"]["FERTILIZER"] = 7
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[:3] = (
+        UnitAction.PICKUP_FERTILIZER_4,
+        UnitAction.PICKUP_FERTILIZER_2,
+        UnitAction.PICKUP_FERTILIZER_2,
+    )
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    compiled = compile_action(observation, units, kinds, quantities)
+
+    assert compiled["farmer"] == ["PICKUP", "FERTILIZER", 4]
+    assert compiled["hands"] == [["PICKUP", "FERTILIZER", 2], ["PASS"]]
+
+
 def test_compiler_allows_build_then_place_on_same_turn() -> None:
     observation = _observation()
     observation["farms"][0]["hands"] = [[4, 4]]
@@ -135,6 +186,21 @@ def test_compiler_emits_large_exact_quantity_in_one_market_slot() -> None:
     action = compile_action(observation, units, kinds, quantities)
 
     assert action["market"] == [["SELL", "WHEAT", 53]]
+
+
+def test_every_exact_market_quantity_compiles_in_one_slot() -> None:
+    assert N_QUANTITIES == 100
+    for quantity_index in range(N_QUANTITIES):
+        assert market_order(MarketKind.BUY_SEED_WHEAT, quantity_index) == [
+            "BUY_SEED",
+            "WHEAT",
+            quantity_index + 1,
+        ]
+        assert market_order(MarketKind.SELL_WOOL, quantity_index) == [
+            "SELL",
+            "WOOL",
+            quantity_index + 1,
+        ]
 
 
 def test_drop_is_dominated_and_masked_when_shed_is_full() -> None:
