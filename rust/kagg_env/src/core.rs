@@ -13,7 +13,7 @@ pub const MAX_MARKET_ORDERS: usize = 10;
 pub const UNIT_ACTIONS: usize = 44;
 pub const MARKET_KINDS: usize = 22;
 pub const MARKET_QUANTITIES: usize = 100;
-pub const FARM_CHANNELS: usize = 28;
+pub const FARM_CHANNELS: usize = 29;
 pub const BOARD_CHANNELS: usize = FARM_CHANNELS * 2;
 pub const GLOBAL_FEATURES: usize = 72;
 pub const CRITIC_FEATURES: usize = 101;
@@ -251,6 +251,26 @@ pub struct StepResult {
     pub money: [f32; PLAYERS],
 }
 
+pub struct FactorMasks {
+    pub unit: Vec<bool>,
+    pub market_kind: Vec<bool>,
+    pub market_quantity: Vec<bool>,
+    pub unit_active: [bool; MAX_UNITS],
+    pub market_active: [bool; MAX_MARKET_ORDERS],
+    pub market_quantity_active: [bool; MAX_MARKET_ORDERS],
+}
+
+#[derive(Clone)]
+struct PolicyMarketLedger {
+    money: i64,
+    shed: [u16; PRIVATE_ITEMS],
+    hires: u8,
+    original_hires: u8,
+    original_units: u8,
+    extra_land: usize,
+    inventory: [i32; PRODUCTS],
+}
+
 impl Game {
     pub fn new(seed: u64, config: GameConfig) -> Self {
         let spawn = default_spawn();
@@ -482,6 +502,94 @@ impl Game {
 
     pub fn pair_potential(&self) -> f32 {
         ((self.farm_equity(0) - self.farm_equity(1)) / 40_000.0).tanh() as f32
+    }
+
+    pub fn factor_masks(&self, player: usize, actions: &CompactAction) -> FactorMasks {
+        let mut unit = vec![false; MAX_UNITS * UNIT_ACTIONS];
+        let mut market_kind = vec![false; MAX_MARKET_ORDERS * MARKET_KINDS];
+        let mut market_quantity = vec![false; MAX_MARKET_ORDERS * MARKET_QUANTITIES];
+        let mut unit_active = [false; MAX_UNITS];
+        let mut market_active = [false; MAX_MARKET_ORDERS];
+        let mut market_quantity_active = [false; MAX_MARKET_ORDERS];
+        let day = self.step / self.config.turns_per_day;
+        let mut unit_ledger = self.clone();
+        let units = usize::from(self.farms[player].units);
+        for unit_index in 0..MAX_UNITS {
+            let row = &mut unit
+                [unit_index * UNIT_ACTIONS..(unit_index + 1) * UNIT_ACTIONS];
+            if unit_index >= units {
+                row[0] = true;
+                continue;
+            }
+            unit_active[unit_index] = true;
+            for (action, valid) in row.iter_mut().enumerate() {
+                *valid = unit_ledger.unit_action_valid(player, unit_index, action as u8, day);
+            }
+            let selected = usize::from(actions.units[unit_index]);
+            let applied = if selected < UNIT_ACTIONS && row[selected] {
+                selected as u8
+            } else {
+                0
+            };
+            unit_ledger.apply_unit_action(player, unit_index, applied, day);
+        }
+
+        let farm = &unit_ledger.farms[player];
+        let mut ledger = PolicyMarketLedger {
+            money: farm.money,
+            shed: unit_ledger.privates[player].shed,
+            hires: farm.hires_today,
+            original_hires: farm.hires_today,
+            original_units: farm.units,
+            extra_land: farm.unlocked.count_ones() as usize - 1,
+            inventory: unit_ledger.market_inventory,
+        };
+        let mut active = true;
+        for slot in 0..MAX_MARKET_ORDERS {
+            let kind_row =
+                &mut market_kind[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            let quantity_row = &mut market_quantity
+                [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
+            if !active {
+                kind_row[0] = true;
+                quantity_row[0] = true;
+                continue;
+            }
+            market_active[slot] = true;
+            fill_market_kind_mask(&unit_ledger.config, &ledger, kind_row);
+            let selected = usize::from(actions.market_kinds[slot]);
+            let kind = if selected < MARKET_KINDS && kind_row[selected] {
+                selected as u8
+            } else {
+                0
+            };
+            if kind == 0 {
+                quantity_row[0] = true;
+                active = false;
+                continue;
+            }
+            fill_market_quantity_mask(&unit_ledger.config, &ledger, kind, quantity_row);
+            if kind >= 3 {
+                market_quantity_active[slot] = true;
+            }
+            let selected_quantity = usize::from(actions.market_quantities[slot]);
+            let quantity = if selected_quantity < MARKET_QUANTITIES
+                && quantity_row[selected_quantity]
+            {
+                selected_quantity as u16 + 1
+            } else {
+                1
+            };
+            apply_policy_market_order(&unit_ledger.config, &mut ledger, kind, quantity);
+        }
+        FactorMasks {
+            unit,
+            market_kind,
+            market_quantity,
+            unit_active,
+            market_active,
+            market_quantity_active,
+        }
     }
 
     fn apply_unit_actions(&mut self, player: usize, actions: &CompactAction, day: u16) {
@@ -1092,6 +1200,138 @@ fn parse_order(kind: u8, quantity_index: u8) -> Option<MarketOrder> {
     })
 }
 
+fn fill_market_kind_mask(
+    config: &GameConfig,
+    ledger: &PolicyMarketLedger,
+    mask: &mut [bool],
+) {
+    debug_assert_eq!(mask.len(), MARKET_KINDS);
+    mask.fill(false);
+    mask[0] = true;
+    let added_hires = ledger.hires.saturating_sub(ledger.original_hires);
+    mask[1] = usize::from(ledger.original_units) + usize::from(added_hires) < MAX_UNITS
+        && ledger.money >= config.farm_hand_cost_mult * fib(ledger.hires);
+    mask[2] = ledger.extra_land < LAND_PRICES.len()
+        && ledger.money >= LAND_PRICES[ledger.extra_land];
+    for crop in 0..CROPS {
+        mask[3 + crop] = ledger.money >= SEED_COST[crop];
+    }
+    let room = config.shed_capacity.saturating_sub(ledger.shed.iter().sum());
+    for (kind, item) in [(8, 0), (9, 8)] {
+        let quote = market_price(item, ledger.inventory[item] - 1);
+        mask[kind] = room > 0 && ledger.money >= quote;
+    }
+    for animal in 0..ANIMALS {
+        mask[10 + animal] = room > 0 && ledger.money >= ANIMAL_COST[animal];
+    }
+    for product in 0..PRODUCTS {
+        mask[13 + product] = ledger.shed[product] > 0;
+    }
+}
+
+fn fill_market_quantity_mask(
+    config: &GameConfig,
+    ledger: &PolicyMarketLedger,
+    kind: u8,
+    mask: &mut [bool],
+) {
+    debug_assert_eq!(mask.len(), MARKET_QUANTITIES);
+    mask.fill(false);
+    if kind < 3 {
+        mask[0] = true;
+        return;
+    }
+    let room = config.shed_capacity.saturating_sub(ledger.shed.iter().sum());
+    let maximum = match kind {
+        3..=7 => (ledger.money / SEED_COST[usize::from(kind - 3)]).max(0) as usize,
+        8 | 9 => {
+            let item = if kind == 8 { 0 } else { 8 };
+            let mut inventory = ledger.inventory[item];
+            let mut money = ledger.money;
+            let mut count = 0usize;
+            while count < usize::from(room) {
+                let quote = market_price(item, inventory - 1);
+                if money < quote {
+                    break;
+                }
+                money -= quote;
+                inventory -= 1;
+                count += 1;
+            }
+            count
+        }
+        10..=12 => {
+            let animal = usize::from(kind - 10);
+            usize::from(room).min((ledger.money / ANIMAL_COST[animal]).max(0) as usize)
+        }
+        13..=21 => usize::from(ledger.shed[usize::from(kind - 13)]),
+        _ => 0,
+    };
+    mask.iter_mut()
+        .take(maximum.min(MARKET_QUANTITIES))
+        .for_each(|valid| *valid = true);
+}
+
+fn apply_policy_market_order(
+    config: &GameConfig,
+    ledger: &mut PolicyMarketLedger,
+    kind: u8,
+    quantity: u16,
+) {
+    match kind {
+        1 => {
+            ledger.money -= config.farm_hand_cost_mult * fib(ledger.hires);
+            ledger.hires += 1;
+        }
+        2 => {
+            ledger.money -= LAND_PRICES[ledger.extra_land];
+            ledger.extra_land += 1;
+        }
+        3..=7 => {
+            ledger.money -= SEED_COST[usize::from(kind - 3)] * i64::from(quantity);
+        }
+        8 | 9 => {
+            let item = if kind == 8 { 0 } else { 8 };
+            for _ in 0..quantity {
+                let quote = market_price(item, ledger.inventory[item] - 1);
+                if ledger.money < quote
+                    || ledger.shed.iter().sum::<u16>() >= config.shed_capacity
+                {
+                    break;
+                }
+                ledger.money -= quote;
+                ledger.shed[item] += 1;
+                ledger.inventory[item] -= 1;
+            }
+        }
+        10..=12 => {
+            let animal = usize::from(kind - 10);
+            let amount = quantity.min(
+                config
+                    .shed_capacity
+                    .saturating_sub(ledger.shed.iter().sum()),
+            );
+            ledger.money -= ANIMAL_COST[animal] * i64::from(amount);
+            ledger.shed[PRODUCTS + animal] += amount;
+        }
+        13..=21 => {
+            let item = usize::from(kind - 13);
+            for _ in 0..quantity {
+                if ledger.shed[item] == 0 {
+                    break;
+                }
+                let quote = market_price(item, ledger.inventory[item]);
+                ledger.shed[item] -= 1;
+                ledger.money += quote;
+                if quote > PRICE_FLOOR {
+                    ledger.inventory[item] += 1;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[inline]
 fn move_delta(action: u8) -> Option<(i16, i16)> {
     match action {
@@ -1243,7 +1483,7 @@ fn encode_farm(farm: &Farm, day: u16, step: u16, output: &mut [f32]) {
             set(0, 1.0);
             continue;
         }
-        set(27, 1.0);
+        set(28, 1.0);
         match tile.kind {
             TileKind::Empty => set(1, 1.0),
             TileKind::Weed => set(2, 1.0),
@@ -1267,6 +1507,13 @@ fn encode_farm(farm: &Farm, day: u16, step: u16, output: &mut [f32]) {
                     set(
                         26,
                         f32::from(u8::from(tile.max_lifespan_step <= step as i16)),
+                    );
+                    set(
+                        27,
+                        f32::from(u8::from(
+                            tile.max_lifespan_step <= step as i16
+                                && (step as i16 - tile.max_lifespan_step) % 2 == 0,
+                        )),
                     );
                 }
             }

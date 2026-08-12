@@ -87,8 +87,13 @@ def test_stored_behavior_likelihoods_replay_from_identical_features() -> None:
             flatten(rollout.units).float(),
             flatten(rollout.unit_positions).long(),
         )
+        quantity_logits = actor.quantity_logits(
+            output.market_quantity_context,
+            flatten(rollout.market_kinds).long(),
+        )
         unit, kind, quantity, *_ = component_logprobs(
             output,
+            quantity_logits,
             flatten(rollout.unit_actions).long(),
             flatten(rollout.market_kinds).long(),
             flatten(rollout.market_quantities).long(),

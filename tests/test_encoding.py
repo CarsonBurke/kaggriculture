@@ -79,5 +79,10 @@ def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:
     assert math.isclose(float(before_decay.global_features[-2]), 0.05, abs_tol=1e-3)
     assert float(before_decay.board[25, 4, 4]) > 0
     assert before_decay.board[26, 4, 4] == 0
+    assert before_decay.board[27, 4, 4] == 0
     assert at_decay.board[25, 4, 4] == 0
     assert at_decay.board[26, 4, 4] == 1
+    assert at_decay.board[27, 4, 4] == 1
+    zero["step"] = 73
+    after_decay_tick = encode_observation(zero, one["private"])
+    assert after_decay_tick.board[27, 4, 4] == 0

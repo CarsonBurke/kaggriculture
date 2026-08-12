@@ -24,7 +24,7 @@ from kaggriculture.constants import (
     TURNS_PER_DAY,
 )
 
-FARM_CHANNELS = 28
+FARM_CHANNELS = 29
 BOARD_CHANNELS = FARM_CHANNELS * 2
 GLOBAL_FEATURES = 72
 CRITIC_EXTRA_FEATURES = len(PRIVATE_ITEMS) * 2 + len(CROPS)
@@ -77,7 +77,7 @@ def _encode_farm(
             if tile == "LOCKED":
                 encoded[0, y, x] = 1.0
                 continue
-            encoded[27, y, x] = 1.0
+            encoded[28, y, x] = 1.0
             if tile is None:
                 encoded[1, y, x] = 1.0
                 continue
@@ -124,6 +124,9 @@ def _encode_farm(
                         min(1.0, (max_lifespan_step - step) / 96.0),
                     )
                     encoded[26, y, x] = float(max_lifespan_step <= step)
+                    encoded[27, y, x] = float(
+                        step >= max_lifespan_step and (step - max_lifespan_step) % 2 == 0
+                    )
 
     farmer = farm.get("farmer")
     if farmer is not None:

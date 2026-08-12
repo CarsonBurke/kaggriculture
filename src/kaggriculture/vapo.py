@@ -349,6 +349,10 @@ def update_vapo(
                 quantity_entropy,
             ) = component_logprobs(
                 actor_output,
+                actor.quantity_logits(
+                    actor_output.market_quantity_context,
+                    market_kinds,
+                ),
                 unit_actions,
                 market_kinds,
                 market_quantities,

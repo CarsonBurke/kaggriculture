@@ -45,10 +45,15 @@ def test_actor_and_critic_shapes() -> None:
         MAX_MARKET_ORDERS,
         N_MARKET_KINDS,
     )
-    assert output.market_quantity_logits.shape == (
+    assert output.market_quantity_context.shape == (
         batch,
         MAX_MARKET_ORDERS,
-        N_MARKET_KINDS,
+        config.quantity_rank,
+    )
+    selected_kinds = torch.zeros(batch, MAX_MARKET_ORDERS, dtype=torch.long)
+    assert actor.quantity_logits(output.market_quantity_context, selected_kinds).shape == (
+        batch,
+        MAX_MARKET_ORDERS,
         N_QUANTITIES,
     )
     assert critic_logits.shape == (batch, config.value_atoms)
@@ -146,10 +151,20 @@ def test_low_rank_quantity_head_has_state_by_kind_interaction() -> None:
     market_hidden[0, :, 0] = 1.0
     market_hidden[1, :, 0] = 2.0
 
-    logits = actor._quantity_logits(market_hidden)
-    buy_slope = (
-        logits[1, 0, MarketKind.BUY_SEED_WHEAT, 0] - logits[0, 0, MarketKind.BUY_SEED_WHEAT, 0]
-    )
-    sell_slope = logits[1, 0, MarketKind.SELL_WHEAT, 0] - logits[0, 0, MarketKind.SELL_WHEAT, 0]
+    context = actor.market_quantity_context(market_hidden)
+    buy_kinds = torch.full((2, MAX_MARKET_ORDERS), MarketKind.BUY_SEED_WHEAT, dtype=torch.long)
+    sell_kinds = torch.full((2, MAX_MARKET_ORDERS), MarketKind.SELL_WHEAT, dtype=torch.long)
+    buy_logits = actor.quantity_logits(context, buy_kinds)
+    sell_logits = actor.quantity_logits(context, sell_kinds)
+    buy_slope = buy_logits[1, 0, 0] - buy_logits[0, 0, 0]
+    sell_slope = sell_logits[1, 0, 0] - sell_logits[0, 0, 0]
 
     torch.testing.assert_close(sell_slope, 2.0 * buy_slope)
+
+
+def test_quantity_head_rejects_misaligned_selected_kinds() -> None:
+    actor = FarmActor(ModelConfig(width=8, residual_blocks=1, hidden=8, quantity_rank=4))
+    context = torch.zeros(2, MAX_MARKET_ORDERS, 4)
+
+    with pytest.raises(ValueError, match="must align"):
+        actor.quantity_logits(context, torch.zeros(2, MAX_MARKET_ORDERS - 1, dtype=torch.long))

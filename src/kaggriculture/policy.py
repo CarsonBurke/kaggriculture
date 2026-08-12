@@ -184,6 +184,7 @@ def _sample_numpy_categorical(
 
 def component_logprobs(
     output: ActorOutput,
+    market_quantity_logits: Tensor,
     unit_actions: Tensor,
     market_kinds: Tensor,
     market_quantities: Tensor,
@@ -197,14 +198,8 @@ def component_logprobs(
     kind_logprob, kind_entropy = categorical_statistics(
         output.market_kind_logits, market_kind_masks, market_kinds
     )
-    quantity_logits = output.market_quantity_logits.gather(
-        2,
-        market_kinds[..., None, None].expand(
-            *market_kinds.shape, 1, output.market_quantity_logits.size(-1)
-        ),
-    ).squeeze(2)
     quantity_logprob, quantity_entropy = categorical_statistics(
-        quantity_logits, market_quantity_masks, market_quantities
+        market_quantity_logits, market_quantity_masks, market_quantities
     )
     return (
         unit_logprob,
@@ -340,7 +335,10 @@ def act_batch(
     output = actor(tensors.board, tensors.global_features, tensors.units, tensors.unit_positions)
     unit_logits = output.unit_logits.float().cpu().numpy()
     market_kind_logits = output.market_kind_logits.float().cpu().numpy()
-    market_quantity_logits = output.market_quantity_logits.float().cpu().numpy()
+    market_quantity_context = output.market_quantity_context.float().cpu().numpy()
+    quantity_kind_gate = actor.market_quantity_kind_gate.weight.float().cpu().numpy()
+    quantity_values = actor.market_quantity_value.weight.float().cpu().numpy()
+    quantity_bias = actor.market_quantity_bias.float().cpu().numpy()
     batch_size = len(observations)
     generator = generator or np.random.default_rng()
 
@@ -446,7 +444,10 @@ def act_batch(
                 continue
             quantity_masks[row, slot] = _ledger_quantity_mask(observation, kind, ledgers[row])
             quantity_active[row, slot] = kind in QUANTIFIED_MARKET_KINDS
-        slot_quantity_logits = market_quantity_logits[np.arange(batch_size), slot, sampled_cpu]
+        quantity_features = market_quantity_context[:, slot] * (
+            1.0 + quantity_kind_gate[sampled_cpu]
+        )
+        slot_quantity_logits = quantity_features @ quantity_values.T + quantity_bias[sampled_cpu]
         sampled_quantity_cpu, logprob, entropy = _sample_numpy_categorical(
             slot_quantity_logits,
             quantity_masks[:, slot],

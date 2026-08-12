@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+import torch
 from kaggle_environments import make
 
 from kaggriculture.actions import MarketKind
@@ -10,6 +12,7 @@ from kaggriculture.policy import (
     _apply_ledger_order,
     _ledger_quantity_mask,
     act_batch,
+    component_logprobs,
 )
 
 
@@ -117,3 +120,61 @@ def test_sell_quantity_mask_is_an_exact_inventory_prefix() -> None:
 
     assert mask[:53].all()
     assert not mask[53:].any()
+
+
+def test_compact_cpu_quantity_logits_match_actor_exactly() -> None:
+    config = ModelConfig(
+        width=8,
+        residual_blocks=1,
+        hidden=16,
+        query_features=4,
+        quantity_rank=5,
+    )
+    actor = FarmActor(config)
+    context = torch.randn(3, 10, config.quantity_rank)
+    kinds = torch.randint(0, 22, (3, 10))
+
+    expected = actor.quantity_logits(context, kinds).detach().numpy()
+    context_numpy = context.numpy()
+    gate = actor.market_quantity_kind_gate.weight.detach().numpy()
+    values = actor.market_quantity_value.weight.detach().numpy()
+    bias = actor.market_quantity_bias.detach().numpy()
+    features = context_numpy * (1.0 + gate[kinds.numpy()])
+    actual = features @ values.T + bias[kinds.numpy()]
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 37})
+    observations = [row.observation for row in environment.reset(2)]
+    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    actor = FarmActor(config)
+    policy_step = act_batch(actor, None, observations, deterministic=True)
+    encoded = policy_step.encoded
+    with torch.inference_mode():
+        output = actor(
+            torch.from_numpy(np.stack([row.board for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.global_features for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.units for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.unit_positions for row in encoded])).long(),
+        )
+        kinds = torch.from_numpy(policy_step.factors.market_kinds)
+        quantity_logits = actor.quantity_logits(output.market_quantity_context, kinds)
+        _, _, quantity_logprobs, *_ = component_logprobs(
+            output,
+            quantity_logits,
+            torch.from_numpy(policy_step.factors.unit_actions),
+            kinds,
+            torch.from_numpy(policy_step.factors.market_quantities),
+            torch.from_numpy(policy_step.factors.unit_masks),
+            torch.from_numpy(policy_step.factors.market_kind_masks),
+            torch.from_numpy(policy_step.factors.market_quantity_masks),
+        )
+
+    active = policy_step.factors.market_quantity_active
+    np.testing.assert_allclose(
+        quantity_logprobs.numpy()[active],
+        policy_step.factors.market_quantity_logprobs[active],
+        atol=2e-6,
+    )

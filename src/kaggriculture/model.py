@@ -42,7 +42,7 @@ class ModelConfig:
 class ActorOutput(NamedTuple):
     unit_logits: Tensor
     market_kind_logits: Tensor
-    market_quantity_logits: Tensor
+    market_quantity_context: Tensor
 
 
 def _group_count(width: int) -> int:
@@ -210,18 +210,22 @@ class FarmActor(nn.Module):
                 0.5 * log_quantity
             )
 
-    def _quantity_logits(self, market_hidden: Tensor) -> Tensor:
-        quantity_context = self.market_quantity_context(market_hidden)
+    def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
+        """Score exact quantities only for the already-selected market kind."""
+        if quantity_context.shape[:-1] != market_kinds.shape:
+            raise ValueError("quantity context and selected market kinds must align")
+        if quantity_context.shape[-1] != self.config.quantity_rank:
+            raise ValueError("quantity context has the wrong feature width")
         # Multiplicative gating is the state x kind interaction. An additive
         # kind embedding would collapse after the dot product into a static
         # kind/quantity bias and could not size buys and sells differently as
         # inventory, cash, or price changes.
-        quantity_features = quantity_context[:, :, None, :] * (
-            1.0 + self.market_quantity_kind_gate.weight[None, None, :, :]
+        quantity_features = quantity_context * (
+            1.0 + self.market_quantity_kind_gate(market_kinds.long())
         )
         return (
-            torch.einsum("bskr,qr->bskq", quantity_features, self.market_quantity_value.weight)
-            + self.market_quantity_bias[None, None, :, :]
+            torch.einsum("bsr,qr->bsq", quantity_features, self.market_quantity_value.weight)
+            + self.market_quantity_bias[market_kinds.long()]
         )
 
     def forward(
@@ -247,7 +251,7 @@ class FarmActor(nn.Module):
         return ActorOutput(
             unit_logits=unit_logits,
             market_kind_logits=self.market_kind(market_hidden),
-            market_quantity_logits=self._quantity_logits(market_hidden),
+            market_quantity_context=self.market_quantity_context(market_hidden),
         )
 
 
