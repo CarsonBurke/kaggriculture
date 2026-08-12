@@ -128,6 +128,100 @@ impl BatchEnv {
         Ok(output)
     }
 
+    /// Exact sequential masks for every supplied factor row, before stepping.
+    fn factor_masks<'py>(
+        &self,
+        py: Python<'py>,
+        unit_actions: PyReadonlyArray3<'py, u8>,
+        market_kinds: PyReadonlyArray3<'py, u8>,
+        market_quantities: PyReadonlyArray3<'py, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let compact = extract_compact_actions(
+            self.games.len(),
+            unit_actions,
+            market_kinds,
+            market_quantities,
+        )?;
+        let masks = py.detach(|| {
+            self.games
+                .par_iter()
+                .zip(compact.par_iter())
+                .flat_map_iter(|(game, actions)| {
+                    (0..PLAYERS).map(|player| game.factor_masks(player, &actions[player]))
+                })
+                .collect::<Vec<_>>()
+        });
+        let rows = masks.len();
+        let output = PyDict::new(py);
+        output.set_item(
+            "unit_masks",
+            Array3::from_shape_vec(
+                (rows, MAX_UNITS, UNIT_ACTIONS),
+                masks
+                    .iter()
+                    .flat_map(|mask| mask.unit.iter().copied())
+                    .collect(),
+            )
+            .expect("unit mask shape is internal")
+            .into_pyarray(py),
+        )?;
+        output.set_item(
+            "market_kind_masks",
+            Array3::from_shape_vec(
+                (rows, MAX_MARKET_ORDERS, MARKET_KINDS),
+                masks
+                    .iter()
+                    .flat_map(|mask| mask.market_kind.iter().copied())
+                    .collect(),
+            )
+            .expect("market kind mask shape is internal")
+            .into_pyarray(py),
+        )?;
+        output.set_item(
+            "market_quantity_masks",
+            Array3::from_shape_vec(
+                (rows, MAX_MARKET_ORDERS, MARKET_QUANTITIES),
+                masks
+                    .iter()
+                    .flat_map(|mask| mask.market_quantity.iter().copied())
+                    .collect(),
+            )
+            .expect("market quantity mask shape is internal")
+            .into_pyarray(py),
+        )?;
+        output.set_item(
+            "unit_active",
+            Array2::from_shape_vec(
+                (rows, MAX_UNITS),
+                masks.iter().flat_map(|mask| mask.unit_active).collect(),
+            )
+            .expect("unit active shape is internal")
+            .into_pyarray(py),
+        )?;
+        output.set_item(
+            "market_active",
+            Array2::from_shape_vec(
+                (rows, MAX_MARKET_ORDERS),
+                masks.iter().flat_map(|mask| mask.market_active).collect(),
+            )
+            .expect("market active shape is internal")
+            .into_pyarray(py),
+        )?;
+        output.set_item(
+            "market_quantity_active",
+            Array2::from_shape_vec(
+                (rows, MAX_MARKET_ORDERS),
+                masks
+                    .iter()
+                    .flat_map(|mask| mask.market_quantity_active)
+                    .collect(),
+            )
+            .expect("quantity active shape is internal")
+            .into_pyarray(py),
+        )?;
+        Ok(output)
+    }
+
     fn step_factors<'py>(
         &mut self,
         py: Python<'py>,
@@ -135,33 +229,13 @@ impl BatchEnv {
         market_kinds: PyReadonlyArray3<'py, u8>,
         market_quantities: PyReadonlyArray3<'py, u8>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let expected_units = [self.games.len(), PLAYERS, MAX_UNITS];
-        let expected_market = [self.games.len(), PLAYERS, MAX_MARKET_ORDERS];
-        if unit_actions.shape() != expected_units {
-            return Err(PyValueError::new_err(format!(
-                "unit_actions shape {:?}, expected {expected_units:?}",
-                unit_actions.shape()
-            )));
-        }
-        if market_kinds.shape() != expected_market || market_quantities.shape() != expected_market {
-            return Err(PyValueError::new_err(format!(
-                "market factor shapes {:?}/{:?}, expected {expected_market:?}",
-                market_kinds.shape(),
-                market_quantities.shape()
-            )));
-        }
-        let units = unit_actions.as_array();
-        let kinds = market_kinds.as_array();
-        let quantities = market_quantities.as_array();
-        let compact: Vec<[CompactAction; PLAYERS]> = (0..self.games.len())
-            .map(|game| {
-                std::array::from_fn(|player| CompactAction {
-                    units: std::array::from_fn(|unit| units[[game, player, unit]]),
-                    market_kinds: std::array::from_fn(|slot| kinds[[game, player, slot]]),
-                    market_quantities: std::array::from_fn(|slot| quantities[[game, player, slot]]),
-                })
-            })
-            .collect();
+        let compact = extract_compact_actions(
+            self.games.len(),
+            unit_actions,
+            market_kinds,
+            market_quantities,
+        )?;
+        let previous_potentials: Vec<f32> = self.games.iter().map(Game::pair_potential).collect();
         let results = py.detach(|| {
             self.games
                 .par_iter_mut()
@@ -186,13 +260,78 @@ impl BatchEnv {
         )?;
         output.set_item(
             "final_money",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), money)
+            Array2::from_shape_vec((self.games.len(), PLAYERS), money.clone())
                 .expect("step money shape is internal")
                 .into_pyarray(py),
         )?;
-        output.set_item("dones", dones.into_pyarray(py))?;
+        output.set_item("dones", dones.clone().into_pyarray(py))?;
+        let post_potentials: Vec<f32> = self.games.iter().map(Game::pair_potential).collect();
+        let shaped: Vec<f32> = previous_potentials
+            .iter()
+            .zip(post_potentials.iter())
+            .zip(dones.iter())
+            .zip(money.chunks_exact(PLAYERS))
+            .flat_map(|(((&previous, &post), &done), cash)| {
+                let reward_zero = if done {
+                    let margin = cash[0] - cash[1];
+                    f32::from(margin > 0.0) - f32::from(margin < 0.0) - previous
+                } else {
+                    post - previous
+                };
+                [reward_zero, -reward_zero]
+            })
+            .collect();
+        output.set_item(
+            "previous_potentials",
+            Array1::from_vec(previous_potentials).into_pyarray(py),
+        )?;
+        output.set_item(
+            "potentials",
+            Array1::from_vec(post_potentials).into_pyarray(py),
+        )?;
+        output.set_item(
+            "shaped_rewards",
+            Array2::from_shape_vec((self.games.len(), PLAYERS), shaped)
+                .expect("shaped reward shape is internal")
+                .into_pyarray(py),
+        )?;
         Ok(output)
     }
+}
+
+fn extract_compact_actions(
+    games: usize,
+    unit_actions: PyReadonlyArray3<'_, u8>,
+    market_kinds: PyReadonlyArray3<'_, u8>,
+    market_quantities: PyReadonlyArray3<'_, u8>,
+) -> PyResult<Vec<[CompactAction; PLAYERS]>> {
+    let expected_units = [games, PLAYERS, MAX_UNITS];
+    let expected_market = [games, PLAYERS, MAX_MARKET_ORDERS];
+    if unit_actions.shape() != expected_units {
+        return Err(PyValueError::new_err(format!(
+            "unit_actions shape {:?}, expected {expected_units:?}",
+            unit_actions.shape()
+        )));
+    }
+    if market_kinds.shape() != expected_market || market_quantities.shape() != expected_market {
+        return Err(PyValueError::new_err(format!(
+            "market factor shapes {:?}/{:?}, expected {expected_market:?}",
+            market_kinds.shape(),
+            market_quantities.shape()
+        )));
+    }
+    let units = unit_actions.as_array();
+    let kinds = market_kinds.as_array();
+    let quantities = market_quantities.as_array();
+    Ok((0..games)
+        .map(|game| {
+            std::array::from_fn(|player| CompactAction {
+                units: std::array::from_fn(|unit| units[[game, player, unit]]),
+                market_kinds: std::array::from_fn(|slot| kinds[[game, player, slot]]),
+                market_quantities: std::array::from_fn(|slot| quantities[[game, player, slot]]),
+            })
+        })
+        .collect())
 }
 
 struct EncodedRow {

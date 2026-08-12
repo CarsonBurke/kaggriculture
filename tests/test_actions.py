@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from kaggle_environments import make
+from kaggle_environments.envs.kaggriculture import kaggriculture as official
 
 from kaggriculture.actions import (
     N_QUANTITIES,
@@ -121,6 +123,69 @@ def test_every_pickup_variant_compiles_to_its_exact_quantity() -> None:
         quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
         compiled = compile_action(observation, units, kinds, quantities)
         assert compiled["farmer"] == ["PICKUP", item, quantity]
+
+
+@pytest.mark.parametrize(
+    ("action", "item", "quantity"),
+    [
+        *[
+            (UnitAction[f"PICKUP_WHEAT_{quantity}"], "WHEAT", quantity)
+            for quantity in (1, 2, 4, 8, 16)
+        ],
+        *[
+            (UnitAction[f"PICKUP_FERTILIZER_{quantity}"], "FERTILIZER", quantity)
+            for quantity in (1, 2, 4, 8)
+        ],
+        *[
+            (UnitAction[f"PICKUP_{animal}_{quantity}"], animal, quantity)
+            for animal in ("GOOSE", "COW", "SHEEP")
+            for quantity in (1, 2, 3, 4)
+        ],
+    ],
+)
+def test_every_pickup_variant_matches_official_engine(
+    action: UnitAction, item: str, quantity: int
+) -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    state = environment.reset(2)
+    state[0].observation["private"]["shed"][item] = 100
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[0] = action
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    compiled = compile_action(state[0].observation, units, kinds, quantities)
+    following = environment.step([compiled, {}])[0].observation
+
+    assert following["private"]["shed"][item] == 100 - quantity
+    assert following["private"]["inventories"][0][item] == quantity
+
+
+@pytest.mark.parametrize("quantity", range(1, 101))
+def test_every_exact_sell_quantity_matches_official_engine(quantity: int) -> None:
+    observation = _observation()
+    observation["private"]["shed"]["WOOL"] = 100
+    farm = observation["farms"][0]
+    expected_money = float(farm["money"])
+    market_inventory = observation["market"]["inventory"]["WOOL"]
+    for offset in range(quantity):
+        expected_money += official.market_price("WOOL", market_inventory + offset)
+
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 7})
+    state = environment.reset(2)
+    state[0].observation["private"]["shed"]["WOOL"] = 100
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+    kinds[0] = MarketKind.SELL_WOOL
+    quantities[0] = quantity - 1
+    action = compile_action(state[0].observation, units, kinds, quantities)
+
+    following = environment.step([action, {}])[0].observation
+
+    assert action["market"] == [["SELL", "WOOL", quantity]]
+    assert following["private"]["shed"]["WOOL"] == 100 - quantity
+    assert following["farms"][0]["money"] == expected_money
 
 
 def test_pickup_masks_and_compilation_reserve_stock_sequentially() -> None:

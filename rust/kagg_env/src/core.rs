@@ -515,8 +515,7 @@ impl Game {
         let mut unit_ledger = self.clone();
         let units = usize::from(self.farms[player].units);
         for unit_index in 0..MAX_UNITS {
-            let row = &mut unit
-                [unit_index * UNIT_ACTIONS..(unit_index + 1) * UNIT_ACTIONS];
+            let row = &mut unit[unit_index * UNIT_ACTIONS..(unit_index + 1) * UNIT_ACTIONS];
             if unit_index >= units {
                 row[0] = true;
                 continue;
@@ -546,10 +545,9 @@ impl Game {
         };
         let mut active = true;
         for slot in 0..MAX_MARKET_ORDERS {
-            let kind_row =
-                &mut market_kind[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
-            let quantity_row = &mut market_quantity
-                [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
+            let kind_row = &mut market_kind[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            let quantity_row =
+                &mut market_quantity[slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
             if !active {
                 kind_row[0] = true;
                 quantity_row[0] = true;
@@ -573,13 +571,12 @@ impl Game {
                 market_quantity_active[slot] = true;
             }
             let selected_quantity = usize::from(actions.market_quantities[slot]);
-            let quantity = if selected_quantity < MARKET_QUANTITIES
-                && quantity_row[selected_quantity]
-            {
-                selected_quantity as u16 + 1
-            } else {
-                1
-            };
+            let quantity =
+                if selected_quantity < MARKET_QUANTITIES && quantity_row[selected_quantity] {
+                    selected_quantity as u16 + 1
+                } else {
+                    1
+                };
             apply_policy_market_order(&unit_ledger.config, &mut ledger, kind, quantity);
         }
         FactorMasks {
@@ -1200,23 +1197,21 @@ fn parse_order(kind: u8, quantity_index: u8) -> Option<MarketOrder> {
     })
 }
 
-fn fill_market_kind_mask(
-    config: &GameConfig,
-    ledger: &PolicyMarketLedger,
-    mask: &mut [bool],
-) {
+fn fill_market_kind_mask(config: &GameConfig, ledger: &PolicyMarketLedger, mask: &mut [bool]) {
     debug_assert_eq!(mask.len(), MARKET_KINDS);
     mask.fill(false);
     mask[0] = true;
     let added_hires = ledger.hires.saturating_sub(ledger.original_hires);
     mask[1] = usize::from(ledger.original_units) + usize::from(added_hires) < MAX_UNITS
         && ledger.money >= config.farm_hand_cost_mult * fib(ledger.hires);
-    mask[2] = ledger.extra_land < LAND_PRICES.len()
-        && ledger.money >= LAND_PRICES[ledger.extra_land];
+    mask[2] =
+        ledger.extra_land < LAND_PRICES.len() && ledger.money >= LAND_PRICES[ledger.extra_land];
     for crop in 0..CROPS {
         mask[3 + crop] = ledger.money >= SEED_COST[crop];
     }
-    let room = config.shed_capacity.saturating_sub(ledger.shed.iter().sum());
+    let room = config
+        .shed_capacity
+        .saturating_sub(ledger.shed.iter().sum());
     for (kind, item) in [(8, 0), (9, 8)] {
         let quote = market_price(item, ledger.inventory[item] - 1);
         mask[kind] = room > 0 && ledger.money >= quote;
@@ -1241,7 +1236,9 @@ fn fill_market_quantity_mask(
         mask[0] = true;
         return;
     }
-    let room = config.shed_capacity.saturating_sub(ledger.shed.iter().sum());
+    let room = config
+        .shed_capacity
+        .saturating_sub(ledger.shed.iter().sum());
     let maximum = match kind {
         3..=7 => (ledger.money / SEED_COST[usize::from(kind - 3)]).max(0) as usize,
         8 | 9 => {
@@ -1294,9 +1291,7 @@ fn apply_policy_market_order(
             let item = if kind == 8 { 0 } else { 8 };
             for _ in 0..quantity {
                 let quote = market_price(item, ledger.inventory[item] - 1);
-                if ledger.money < quote
-                    || ledger.shed.iter().sum::<u16>() >= config.shed_capacity
-                {
+                if ledger.money < quote || ledger.shed.iter().sum::<u16>() >= config.shed_capacity {
                     break;
                 }
                 ledger.money -= quote;
