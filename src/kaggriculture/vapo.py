@@ -257,6 +257,11 @@ def update_vapo(
     prepared = prepare_advantages(rollout, config)
     flat_valid = rollout.valid.reshape(-1)
     valid_indices = np.flatnonzero(flat_valid)
+    flat_component_counts = (
+        rollout.unit_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_quantity_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
+    )
 
     # The complete rollout is reused for several PPO epochs. Stage every array
     # on the accelerator once; repeated NumPy advanced indexing otherwise makes
@@ -295,9 +300,12 @@ def update_vapo(
         )
     }
     total_states = 0
+    actor_states = 0
     total_components = 0
     updates = 0
+    actor_updates = 0
     completed_epochs = 0
+    max_approx_kl = 0.0
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
     stop_for_kl = False
 
@@ -305,95 +313,119 @@ def update_vapo(
         shuffled = generator.permutation(valid_indices)
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
         for start in range(0, shuffled.size, config.minibatch_size):
-            indices = shuffled_device[start : start + config.minibatch_size]
+            stop = start + config.minibatch_size
+            host_indices = shuffled[start:stop]
+            indices = shuffled_device[start:stop]
             board = _batch_tensor(staged["board"], indices, torch.float32)
-            global_features = _batch_tensor(staged["global_features"], indices, torch.float32)
             critic_features = _batch_tensor(staged["critic_features"], indices, torch.float32)
-            units = _batch_tensor(staged["units"], indices, torch.float32)
-            positions = _batch_tensor(staged["unit_positions"], indices, torch.long)
-            unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
-            market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
-            market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
-            unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
-            kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
-            quantity_masks = _batch_tensor(staged["market_quantity_masks"], indices, torch.bool)
-            unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
-            kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
-            quantity_active = _batch_tensor(
-                staged["market_quantity_active"], indices, torch.float32
-            )
-            old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
-            old_kind = _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32)
-            old_quantity = _batch_tensor(
-                staged["old_market_quantity_logprobs"], indices, torch.float32
-            )
-            advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
-            component_count_tensor = (
-                unit_active.sum() + kind_active.sum() + quantity_active.sum()
-            ).clamp_min(1.0)
+            states = indices.numel()
 
-            actor_optimizer.zero_grad(set_to_none=True)
-            # Behavior likelihoods are collected in FP32. Replaying the actor
-            # under BF16 changes logits at unchanged weights, creating a false
-            # importance ratio and KL before the first optimizer step.
-            actor_output = actor(board, global_features, units, positions)
-            (
-                new_unit,
-                new_kind,
-                new_quantity,
-                unit_entropy,
-                kind_entropy,
-                quantity_entropy,
-            ) = component_logprobs(
-                actor_output,
-                actor.quantity_logits(
-                    actor_output.market_quantity_context,
-                    market_kinds,
-                ),
-                unit_actions,
-                market_kinds,
-                market_quantities,
-                unit_masks,
-                kind_masks,
-                quantity_masks,
-            )
-            policy_sum = torch.zeros((), device=device)
-            entropy_sum = torch.zeros((), device=device)
-            kl_sum = torch.zeros((), device=device)
-            clipped_sum = torch.zeros((), device=device)
-            for new, old, active, entropy in (
-                (new_unit, old_unit, unit_active, unit_entropy),
-                (new_kind, old_kind, kind_active, kind_entropy),
-                (new_quantity, old_quantity, quantity_active, quantity_entropy),
-            ):
-                component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
-                    new,
-                    old,
-                    advantages,
-                    active,
-                    config.clip_low,
-                    config.clip_high,
+            if not stop_for_kl:
+                # Component activity is immutable rollout metadata. Reducing it
+                # on the host avoids a CUDA synchronization in every minibatch
+                # merely to recover a denominator already known before staging.
+                component_count = max(1, int(flat_component_counts[host_indices].sum()))
+                global_features = _batch_tensor(staged["global_features"], indices, torch.float32)
+                units = _batch_tensor(staged["units"], indices, torch.float32)
+                positions = _batch_tensor(staged["unit_positions"], indices, torch.long)
+                unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
+                market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
+                market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
+                unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
+                kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
+                quantity_masks = _batch_tensor(staged["market_quantity_masks"], indices, torch.bool)
+                unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
+                kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
+                quantity_active = _batch_tensor(
+                    staged["market_quantity_active"], indices, torch.float32
                 )
-                policy_sum += component_objective
-                entropy_sum += (entropy * active).sum()
-                kl_sum += component_kl
-                clipped_sum += component_clipped
-            policy_loss = -policy_sum / component_count_tensor
-            entropy_mean = entropy_sum / component_count_tensor
-            actor_loss = policy_loss - config.entropy_coefficient * entropy_mean
-            if not torch.isfinite(actor_loss):
-                raise FloatingPointError("non-finite actor loss")
-            actor_loss.backward()
-            actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                actor.parameters(), config.max_gradient_norm
-            ).detach()
-            _optimizer_step(
-                actor_optimizer,
-                config.actor_learning_rate,
-                config.lr_warmup_steps,
-            )
+                old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
+                old_kind = _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32)
+                old_quantity = _batch_tensor(
+                    staged["old_market_quantity_logprobs"], indices, torch.float32
+                )
+                advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
+                actor_optimizer.zero_grad(set_to_none=True)
+                # Behavior likelihoods are collected in FP32. Replaying the
+                # actor under BF16 changes logits at unchanged weights, creating
+                # a false importance ratio before the first optimizer step.
+                actor_output = actor(board, global_features, units, positions)
+                (
+                    new_unit,
+                    new_kind,
+                    new_quantity,
+                    unit_entropy,
+                    kind_entropy,
+                    quantity_entropy,
+                ) = component_logprobs(
+                    actor_output,
+                    actor.quantity_logits(
+                        actor_output.market_quantity_context,
+                        market_kinds,
+                    ),
+                    unit_actions,
+                    market_kinds,
+                    market_quantities,
+                    unit_masks,
+                    kind_masks,
+                    quantity_masks,
+                )
+                policy_sum = torch.zeros((), device=device)
+                entropy_sum = torch.zeros((), device=device)
+                kl_sum = torch.zeros((), device=device)
+                clipped_sum = torch.zeros((), device=device)
+                for new, old, active, entropy in (
+                    (new_unit, old_unit, unit_active, unit_entropy),
+                    (new_kind, old_kind, kind_active, kind_entropy),
+                    (new_quantity, old_quantity, quantity_active, quantity_entropy),
+                ):
+                    component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
+                        new,
+                        old,
+                        advantages,
+                        active,
+                        config.clip_low,
+                        config.clip_high,
+                    )
+                    policy_sum += component_objective
+                    entropy_sum += (entropy * active).sum()
+                    kl_sum += component_kl
+                    clipped_sum += component_clipped
+                batch_kl = kl_sum.detach().double() / component_count
+                batch_kl_value = float(batch_kl)
+                max_approx_kl = max(max_approx_kl, batch_kl_value)
+                # The KL belongs to the policy that produced `actor_output`, so
+                # enforce the trust-region guard before mutating that policy.
+                if batch_kl_value > config.target_kl:
+                    stop_for_kl = True
+                else:
+                    policy_loss = -policy_sum / component_count
+                    entropy_mean = entropy_sum / component_count
+                    actor_loss = policy_loss - config.entropy_coefficient * entropy_mean
+                    if not torch.isfinite(actor_loss):
+                        raise FloatingPointError("non-finite actor loss")
+                    actor_loss.backward()
+                    actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        actor.parameters(), config.max_gradient_norm
+                    ).detach()
+                    _optimizer_step(
+                        actor_optimizer,
+                        config.actor_learning_rate,
+                        config.lr_warmup_steps,
+                    )
+                    totals["policy_loss"] += policy_loss.detach().double() * component_count
+                    totals["entropy"] += entropy_mean.detach().double() * component_count
+                    totals["approx_kl"] += batch_kl * component_count
+                    totals["clip_fraction"] += clipped_sum.detach().double()
+                    totals["actor_gradient_norm"] += actor_gradient_norm * states
+                    total_components += component_count
+                    actor_states += states
+                    actor_updates += 1
+
+            # Target KL constrains only the actor. Keep fitting the critic for
+            # every configured epoch even after policy replay is frozen.
             critic_optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
@@ -416,38 +448,25 @@ def update_vapo(
                 config.lr_warmup_steps,
             )
 
-            states = indices.numel()
-            component_count = int(component_count_tensor.detach().cpu())
-            batch_kl = kl_sum.detach().double() / component_count_tensor
-            totals["policy_loss"] += policy_loss.detach().double() * component_count
             totals["value_loss"] += value_loss.detach().double() * states
-            totals["entropy"] += entropy_mean.detach().double() * component_count
-            totals["approx_kl"] += batch_kl * component_count
-            totals["clip_fraction"] += clipped_sum.detach().double()
-            totals["actor_gradient_norm"] += actor_gradient_norm * states
             totals["critic_gradient_norm"] += critic_gradient_norm * states
-            total_components += component_count
             total_states += states
             updates += 1
-            # Check after each minibatch. Waiting until the end of an epoch can
-            # overshoot badly when the first from-scratch update is unstable.
-            if float(batch_kl) > config.target_kl:
-                stop_for_kl = True
-                break
         completed_epochs += 1
-        if stop_for_kl:
-            break
 
     metrics: dict[str, float | int] = {
         "updates": updates,
+        "actor_updates": actor_updates,
         "epochs": completed_epochs,
         "states": rollout.states,
         "policy_loss": float(totals["policy_loss"] / max(1, total_components)),
         "value_loss": float(totals["value_loss"] / max(1, total_states)),
         "entropy": float(totals["entropy"] / max(1, total_components)),
         "approx_kl": float(totals["approx_kl"] / max(1, total_components)),
+        "max_approx_kl": max_approx_kl,
+        "kl_early_stop": int(stop_for_kl),
         "clip_fraction": float(totals["clip_fraction"] / max(1, total_components)),
-        "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, total_states)),
+        "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, actor_states)),
         "critic_gradient_norm": float(totals["critic_gradient_norm"] / max(1, total_states)),
         "advantage_mean": float(prepared.advantages[rollout.valid].mean()),
         "advantage_std": float(prepared.advantages[rollout.valid].std()),

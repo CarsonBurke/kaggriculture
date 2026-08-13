@@ -37,42 +37,57 @@ class UnitAction(IntEnum):
     DROP = 5
     PICKUP_WHEAT_1 = 6
     PICKUP_WHEAT_2 = 7
-    PICKUP_WHEAT_4 = 8
-    PICKUP_WHEAT_8 = 9
-    PICKUP_WHEAT_16 = 10
-    PICKUP_FERTILIZER_1 = 11
-    PICKUP_FERTILIZER_2 = 12
-    PICKUP_FERTILIZER_4 = 13
-    PICKUP_FERTILIZER_8 = 14
-    PICKUP_GOOSE_1 = 15
-    PICKUP_GOOSE_2 = 16
-    PICKUP_GOOSE_3 = 17
-    PICKUP_GOOSE_4 = 18
-    PICKUP_COW_1 = 19
-    PICKUP_COW_2 = 20
-    PICKUP_COW_3 = 21
-    PICKUP_COW_4 = 22
-    PICKUP_SHEEP_1 = 23
-    PICKUP_SHEEP_2 = 24
-    PICKUP_SHEEP_3 = 25
-    PICKUP_SHEEP_4 = 26
-    PLACE_GOOSE = 27
-    PLACE_COW = 28
-    PLACE_SHEEP = 29
-    PLANT_WHEAT = 30
-    PLANT_CARROT = 31
-    PLANT_TOMATO = 32
-    PLANT_STRAWBERRY = 33
-    PLANT_MELON = 34
-    WATER = 35
-    HARVEST = 36
-    FERTILIZE = 37
-    DIG = 38
-    BUILD_COOP = 39
-    BUILD_PASTURE = 40
-    FEED = 41
-    COLLECT_FERTILIZER = 42
-    CARE = 43
+    PICKUP_WHEAT_3 = 8
+    PICKUP_WHEAT_4 = 9
+    PICKUP_WHEAT_5 = 10
+    PICKUP_WHEAT_6 = 11
+    PICKUP_WHEAT_7 = 12
+    PICKUP_WHEAT_8 = 13
+    PICKUP_WHEAT_9 = 14
+    PICKUP_WHEAT_10 = 15
+    PICKUP_WHEAT_11 = 16
+    PICKUP_WHEAT_12 = 17
+    PICKUP_WHEAT_13 = 18
+    PICKUP_WHEAT_14 = 19
+    PICKUP_WHEAT_15 = 20
+    PICKUP_WHEAT_16 = 21
+    PICKUP_FERTILIZER_1 = 22
+    PICKUP_FERTILIZER_2 = 23
+    PICKUP_FERTILIZER_3 = 24
+    PICKUP_FERTILIZER_4 = 25
+    PICKUP_FERTILIZER_5 = 26
+    PICKUP_FERTILIZER_6 = 27
+    PICKUP_FERTILIZER_7 = 28
+    PICKUP_FERTILIZER_8 = 29
+    PICKUP_GOOSE_1 = 30
+    PICKUP_GOOSE_2 = 31
+    PICKUP_GOOSE_3 = 32
+    PICKUP_GOOSE_4 = 33
+    PICKUP_COW_1 = 34
+    PICKUP_COW_2 = 35
+    PICKUP_COW_3 = 36
+    PICKUP_COW_4 = 37
+    PICKUP_SHEEP_1 = 38
+    PICKUP_SHEEP_2 = 39
+    PICKUP_SHEEP_3 = 40
+    PICKUP_SHEEP_4 = 41
+    PLACE_GOOSE = 42
+    PLACE_COW = 43
+    PLACE_SHEEP = 44
+    PLANT_WHEAT = 45
+    PLANT_CARROT = 46
+    PLANT_TOMATO = 47
+    PLANT_STRAWBERRY = 48
+    PLANT_MELON = 49
+    WATER = 50
+    HARVEST = 51
+    FERTILIZE = 52
+    DIG = 53
+    BUILD_COOP = 54
+    BUILD_PASTURE = 55
+    FEED = 56
+    COLLECT_FERTILIZER = 57
+    CARE = 58
 
     # The original unsuffixed names remain readable aliases for the largest
     # transfer, while masks expose every smaller coordination-friendly choice.
@@ -113,12 +128,10 @@ N_MARKET_KINDS = len(MarketKind)
 N_QUANTITIES = len(QUANTITY_BINS)
 
 _PICKUP_SPEC = {
-    **{
-        UnitAction[f"PICKUP_WHEAT_{quantity}"]: ("WHEAT", quantity) for quantity in (1, 2, 4, 8, 16)
-    },
+    **{UnitAction[f"PICKUP_WHEAT_{quantity}"]: ("WHEAT", quantity) for quantity in range(1, 17)},
     **{
         UnitAction[f"PICKUP_FERTILIZER_{quantity}"]: ("FERTILIZER", quantity)
-        for quantity in (1, 2, 4, 8)
+        for quantity in range(1, 9)
     },
     **{
         UnitAction[f"PICKUP_{animal}_{quantity}"]: (animal, quantity)

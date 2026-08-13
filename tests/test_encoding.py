@@ -59,6 +59,7 @@ def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:
     zero["hour"] = 22
     zero["private"]["shed"]["WHEAT"] = 60
     zero["private"]["inventories"][0]["MILK"] = 5
+    zero["remainingOverageTime"] = 7
     zero["farms"][0]["tiles"][4][4] = {
         "kind": "PLANT",
         "crop": "WHEAT",
@@ -77,6 +78,7 @@ def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:
 
     assert math.isclose(float(before_decay.global_features[-3]), 0.6, abs_tol=1e-3)
     assert math.isclose(float(before_decay.global_features[-2]), 0.05, abs_tol=1e-3)
+    assert before_decay.global_features[-1] == 1
     assert float(before_decay.board[25, 4, 4]) > 0
     assert before_decay.board[26, 4, 4] == 0
     assert before_decay.board[27, 4, 4] == 0
@@ -86,3 +88,30 @@ def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:
     zero["step"] = 73
     after_decay_tick = encode_observation(zero, one["private"])
     assert after_decay_tick.board[27, 4, 4] == 0
+
+
+def test_encoding_preserves_strategically_distinct_pending_care_bonuses() -> None:
+    zero, one = _observations()
+    animal = {
+        "kind": "PASTURE",
+        "animal": "COW",
+        "placed_day": 0,
+        "yield_units": 0,
+        "consecutive_unfed": 0,
+        "fed_today": True,
+        "cared_today": True,
+        "fertilizer_available": False,
+        "pending_care_bonus": 2,
+    }
+    zero["farms"][0]["tiles"][4][4] = animal
+    care_two = encode_observation(zero, one["private"])
+    animal["pending_care_bonus"] = 5
+    care_five = encode_observation(zero, one["private"])
+    animal["pending_care_bonus"] = 8
+    care_above_cap = encode_observation(zero, one["private"])
+
+    assert math.isclose(float(care_two.board[22, 4, 4]), 0.4, abs_tol=1e-3)
+    assert care_five.board[22, 4, 4] == 1
+    # Base production plus five banked units already fills the six-unit cap,
+    # so larger banks are behaviorally equivalent at the next production.
+    assert care_above_cap.board[22, 4, 4] == 1

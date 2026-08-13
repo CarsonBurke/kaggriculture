@@ -16,8 +16,30 @@ import torch
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.provenance import validate_run_provenance, validate_source_identity
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.vapo import VapoConfig
+
+CHECKPOINT_FORMAT_VERSION = 4
+
+
+def require_checkpoint_format(payload: dict[str, Any]) -> None:
+    """Reject checkpoints from incompatible model and action schemas."""
+    version = payload.get("format_version")
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported checkpoint format: {version}; expected {CHECKPOINT_FORMAT_VERSION}"
+        )
+    identity = validate_source_identity(payload.get("source_identity"))
+    run_provenance = validate_run_provenance(payload.get("run_provenance"))
+    if run_provenance is not None and run_provenance["source_identity"] != identity:
+        raise ValueError("checkpoint run provenance source does not match source identity")
+    if run_provenance is not None and (
+        not isinstance(payload.get("training_data_config"), dict)
+        or payload["training_data_config"].get("compile_models")
+        is not run_provenance["calibration"]["compile_models"]
+    ):
+        raise ValueError("checkpoint compile mode does not match run provenance")
 
 
 def rollout_diagnostics(rollout: RolloutBatch) -> dict[str, float | int]:
@@ -130,11 +152,28 @@ def save_checkpoint(
     iteration: int,
     next_seed: int,
     metrics: dict[str, Any],
+    source_identity: dict[str, Any],
+    run_provenance: dict[str, Any] | None = None,
     training_rng_state: dict[str, Any] | None = None,
+    training_data_config: dict[str, Any] | None = None,
+    league_snapshot_manifest: dict[int, str] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_source_identity = validate_source_identity(source_identity)
+    normalized_run_provenance = validate_run_provenance(run_provenance)
+    if (
+        normalized_run_provenance is not None
+        and normalized_run_provenance["source_identity"] != normalized_source_identity
+    ):
+        raise ValueError("checkpoint run provenance source does not match source identity")
+    if normalized_run_provenance is not None and (
+        not isinstance(training_data_config, dict)
+        or training_data_config.get("compile_models")
+        is not normalized_run_provenance["calibration"]["compile_models"]
+    ):
+        raise ValueError("checkpoint compile mode does not match run provenance")
     payload = {
-        "format_version": 2,
+        "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
         "next_seed": next_seed,
         "model_config": model_config.to_dict(),
@@ -149,6 +188,10 @@ def save_checkpoint(
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
         "training_rng": training_rng_state,
+        "training_data_config": training_data_config,
+        "league_snapshot_manifest": league_snapshot_manifest,
+        "source_identity": normalized_source_identity,
+        "run_provenance": normalized_run_provenance,
     }
     handle, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -172,8 +215,7 @@ def load_checkpoint(
     device: torch.device,
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location=device, weights_only=False)
-    if payload.get("format_version") not in {1, 2}:
-        raise ValueError(f"unsupported checkpoint format: {payload.get('format_version')}")
+    require_checkpoint_format(payload)
     actor.load_state_dict(payload["actor"])
     critic.load_state_dict(payload["critic"])
     if actor_optimizer is not None:
@@ -182,13 +224,82 @@ def load_checkpoint(
         critic_optimizer.load_state_dict(payload["critic_optimizer"])
     torch.set_rng_state(payload["torch_rng"].cpu())
     if torch.cuda.is_available() and payload.get("cuda_rng") is not None:
-        torch.cuda.set_rng_state_all(payload["cuda_rng"])
+        cuda_rng = payload["cuda_rng"]
+        if len(cuda_rng) != torch.cuda.device_count():
+            raise ValueError("checkpoint CUDA RNG state count does not match visible CUDA devices")
+        torch.cuda.set_rng_state_all(cuda_rng)
     np.random.set_state(payload["numpy_rng"])
     random.setstate(payload["python_rng"])
     return payload
 
 
-def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
+    """Append one canonical iteration record idempotently.
+
+    Checkpoints commit before telemetry. On recovery this fills a missing final
+    record without duplicating one that was already durably appended.
+    """
+    iteration = payload.get("iteration")
+    if type(iteration) is not int or iteration < 1:
+        raise ValueError("iteration metrics require a positive integer iteration")
+    rendered = json.dumps(payload, sort_keys=True, allow_nan=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
+    existing = ""
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        if existing and not existing.endswith("\n"):
+            # The journal is committed through an atomic replace below, so a
+            # partial suffix can only predate this crash-safe implementation.
+            # Recover the last complete line while retaining strict validation
+            # of every complete record.
+            existing = existing.rpartition("\n")[0]
+            if existing:
+                existing += "\n"
+        lines = [line for line in existing.splitlines() if line]
+        if lines:
+            previous = json.loads(lines[-1])
+            previous_iteration = previous.get("iteration")
+            if type(previous_iteration) is not int:
+                raise ValueError(f"metrics journal has an invalid final record: {path}")
+            if previous_iteration > iteration:
+                raise ValueError(
+                    f"metrics journal is ahead of checkpoint iteration {iteration}: {path}"
+                )
+            if previous_iteration == iteration:
+                if lines[-1] != rendered:
+                    raise ValueError(
+                        f"metrics journal conflicts with checkpoint iteration {iteration}: {path}"
+                    )
+                return False
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(existing)
+            stream.write(rendered + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def metrics_journal_iteration(path: Path) -> int:
+    """Return the last complete journal iteration, rejecting malformed history."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    text = path.read_text(encoding="utf-8")
+    if text and not text.endswith("\n"):
+        text = text.rpartition("\n")[0]
+    last_iteration = 0
+    for line in (line for line in text.splitlines() if line):
+        payload = json.loads(line)
+        iteration = payload.get("iteration")
+        if type(iteration) is not int or iteration != last_iteration + 1:
+            raise ValueError(f"metrics journal iterations are not contiguous: {path}")
+        last_iteration = iteration
+    return last_iteration

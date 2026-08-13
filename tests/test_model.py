@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -93,6 +95,15 @@ def test_initial_policy_prior_reaches_productive_actions_without_destroying_inve
     assert unit_bias[UnitAction.PICKUP_WHEAT_1] > unit_bias[UnitAction.PICKUP_WHEAT_16]
     assert unit_bias[UnitAction.PICKUP_FERTILIZER_1] > unit_bias[UnitAction.PICKUP_FERTILIZER_8]
     assert unit_bias[UnitAction.PICKUP_GOOSE_1] > unit_bias[UnitAction.PICKUP_GOOSE_4]
+    wheat_biases = torch.stack(
+        [unit_bias[UnitAction[f"PICKUP_WHEAT_{quantity}"]] for quantity in range(1, 17)]
+    )
+    fertilizer_biases = torch.stack(
+        [unit_bias[UnitAction[f"PICKUP_FERTILIZER_{quantity}"]] for quantity in range(1, 9)]
+    )
+    assert torch.all(wheat_biases[1:] < wheat_biases[:-1])
+    assert torch.all(fertilizer_biases[1:] < fertilizer_biases[:-1])
+    assert wheat_biases[-1].item() == pytest.approx(1.0 - math.log(16))
 
 
 def test_initial_market_prior_preserves_cash_and_liquidates_products() -> None:

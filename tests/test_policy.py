@@ -11,9 +11,50 @@ from kaggriculture.policy import (
     MarketLedger,
     _apply_ledger_order,
     _ledger_quantity_mask,
+    _sample_numpy_categorical,
     act_batch,
     component_logprobs,
 )
+
+
+class _FixedGenerator:
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def random(self, shape: tuple[int, ...]) -> np.ndarray:
+        return np.full(shape, self.value)
+
+
+def test_numpy_categorical_roundoff_fallback_stays_on_last_valid_action() -> None:
+    logits = np.asarray([[0.0, -1.0, -2.0, 20.0, 20.0]], dtype=np.float32)
+    mask = np.asarray([[True, True, True, False, False]])
+
+    actions, logprobs, entropies = _sample_numpy_categorical(
+        logits,
+        mask,
+        deterministic=False,
+        temperature=1.0,
+        generator=_FixedGenerator(np.nextafter(1.0, 0.0)),  # type: ignore[arg-type]
+    )
+
+    assert actions.tolist() == [2]
+    assert np.isfinite(logprobs).all()
+    assert np.isfinite(entropies).all()
+
+
+def test_numpy_categorical_zero_draw_selects_first_valid_sparse_action() -> None:
+    logits = np.zeros((1, 5), dtype=np.float32)
+    mask = np.asarray([[False, False, True, False, True]])
+
+    actions, _, _ = _sample_numpy_categorical(
+        logits,
+        mask,
+        deterministic=False,
+        temperature=1.0,
+        generator=_FixedGenerator(0.0),  # type: ignore[arg-type]
+    )
+
+    assert actions.tolist() == [2]
 
 
 def test_deterministic_policy_emits_masked_engine_actions() -> None:
@@ -44,6 +85,26 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
 
     next_state = environment.step(step.actions)
     assert all(row.status == "ACTIVE" for row in next_state)
+
+
+def test_policy_skips_quantity_head_for_nonquantified_market_rows() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 41})
+    observations = [row.observation for row in environment.reset(2)]
+    actor = FarmActor(ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4))
+    with torch.no_grad():
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-10)
+        actor.market_kind.bias[MarketKind.STOP] = 10
+        # Any accidental quantity-head evaluation would propagate NaNs into
+        # the stored behavior log-probabilities.
+        actor.market_quantity_context.weight.fill_(float("nan"))
+
+    policy_step = act_batch(actor, None, observations, deterministic=True)
+
+    assert not policy_step.factors.market_quantity_active.any()
+    assert not policy_step.factors.market_quantities.any()
+    assert not policy_step.factors.market_quantity_logprobs.any()
+    assert np.isfinite(policy_step.factors.market_quantity_logprobs).all()
 
 
 def test_market_ledger_matches_dynamic_engine_fill_and_round_trip() -> None:

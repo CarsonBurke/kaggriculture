@@ -157,6 +157,8 @@ def _sample_numpy_categorical(
     deterministic: bool,
     temperature: float,
     generator: np.random.Generator,
+    *,
+    draws: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if logits.shape != mask.shape:
         raise ValueError(f"logit/mask shape mismatch: {logits.shape} != {mask.shape}")
@@ -170,10 +172,15 @@ def _sample_numpy_categorical(
         actions = masked.argmax(axis=-1)
     else:
         cumulative = np.cumsum(probabilities, axis=-1)
-        draws = generator.random((probabilities.shape[0], 1))
-        actions = np.minimum((draws > cumulative).sum(axis=-1), probabilities.shape[1] - 1).astype(
-            np.int64
-        )
+        last_valid = mask.shape[-1] - 1 - mask[:, ::-1].argmax(axis=-1)
+        cumulative[np.arange(mask.shape[0]), last_valid] = 1.0
+        if draws is None:
+            draws = generator.random((probabilities.shape[0], 1))
+        elif draws.shape != (probabilities.shape[0], 1):
+            raise ValueError(
+                f"categorical draw shape mismatch: {draws.shape} != {(probabilities.shape[0], 1)}"
+            )
+        actions = (mask & (draws <= cumulative)).argmax(axis=-1).astype(np.int64)
     selected = probabilities[np.arange(probabilities.shape[0]), actions]
     logprobs = np.log(np.maximum(selected, np.finfo(np.float32).tiny))
     entropy = -(probabilities * np.log(np.maximum(probabilities, np.finfo(np.float32).tiny))).sum(
@@ -444,17 +451,34 @@ def act_batch(
                 continue
             quantity_masks[row, slot] = _ledger_quantity_mask(observation, kind, ledgers[row])
             quantity_active[row, slot] = kind in QUANTIFIED_MARKET_KINDS
-        quantity_features = market_quantity_context[:, slot] * (
-            1.0 + quantity_kind_gate[sampled_cpu]
-        )
-        slot_quantity_logits = quantity_features @ quantity_values.T + quantity_bias[sampled_cpu]
-        sampled_quantity_cpu, logprob, entropy = _sample_numpy_categorical(
-            slot_quantity_logits,
-            quantity_masks[:, slot],
-            deterministic,
-            temperature,
-            generator,
-        )
+        sampled_quantity_cpu = np.zeros(batch_size, dtype=np.int64)
+        logprob = np.zeros(batch_size, dtype=np.float32)
+        entropy = np.zeros(batch_size, dtype=np.float32)
+        active_rows = np.flatnonzero(quantity_active[:, slot])
+        # Preserve the RNG stream and each row's draw while avoiding the exact
+        # quantity GEMM for STOP, HIRE, BUY_LAND, and already-stopped rows. At
+        # the sparse initialization policy this skips nearly all B*10*R*100
+        # CPU work without changing sampled behavior.
+        quantity_draws = None if deterministic else generator.random((batch_size, 1))[active_rows]
+        if active_rows.size:
+            active_kinds = sampled_cpu[active_rows]
+            quantity_features = market_quantity_context[active_rows, slot] * (
+                1.0 + quantity_kind_gate[active_kinds]
+            )
+            slot_quantity_logits = (
+                quantity_features @ quantity_values.T + quantity_bias[active_kinds]
+            )
+            active_quantities, active_logprobs, active_entropies = _sample_numpy_categorical(
+                slot_quantity_logits,
+                quantity_masks[active_rows, slot],
+                deterministic,
+                temperature,
+                generator,
+                draws=quantity_draws,
+            )
+            sampled_quantity_cpu[active_rows] = active_quantities
+            logprob[active_rows] = active_logprobs
+            entropy[active_rows] = active_entropies
         market_quantities[:, slot] = sampled_quantity_cpu
         quantity_logprobs[:, slot] = logprob
         quantity_entropies[:, slot] = entropy

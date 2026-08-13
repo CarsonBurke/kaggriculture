@@ -11,6 +11,7 @@ replays/
 runs/
 checkpoints/
 artifacts/
+evaluations/
 *.tar.gz
 *.zip
 

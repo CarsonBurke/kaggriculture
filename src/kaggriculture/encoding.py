@@ -114,7 +114,7 @@ def _encode_farm(
                     encoded[20, y, x] = float(bool(tile.get("cared_today", False)))
                     encoded[21, y, x] = float(bool(tile.get("fertilizer_available", False)))
                     encoded[22, y, x] = min(
-                        1.0, float(tile.get("pending_care_bonus", 0) or 0) / 2.0
+                        1.0, float(tile.get("pending_care_bonus", 0) or 0) / 5.0
                     )
             if isinstance(tile, dict) and tile.get("kind") == "PLANT":
                 max_lifespan_step = int(tile.get("max_lifespan_step", -1) or -1)
@@ -199,7 +199,9 @@ def encode_observation(
                 for value in inventory.values()
             )
             / 100.0,
-            float(observation.get("remainingOverageTime", 60) or 0) / 60.0,
+            # Runtime overage is wrapper-dependent and always one in native
+            # training. Keep this reserved slot stationary to avoid live OOD.
+            1.0,
         )
     )
     global_features = np.asarray(features, dtype=np.float32)

@@ -120,6 +120,15 @@ def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
     assert actor_group["base_lr"] == config.actor_learning_rate
     assert actor_group["lr"] == pytest.approx(config.actor_learning_rate / 4)
 
+    restored_actor = FarmActor(model_config)
+    restored_critic = DistributionalCritic(model_config)
+    restored_actor_optimizer, _ = make_optimizers(restored_actor, restored_critic, config)
+    restored_actor_optimizer.load_state_dict(actor_optimizer.state_dict())
+    restored_group = restored_actor_optimizer.param_groups[0]
+    assert restored_group["warmup_step"] == actor_group["warmup_step"]
+    assert restored_group["base_lr"] == actor_group["base_lr"]
+    assert restored_group["lr"] == actor_group["lr"]
+
 
 def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
     model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
@@ -175,6 +184,52 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
     for new_logprobs, old_logprobs in zip(replayed, behavior, strict=True):
         ratios = (new_logprobs - torch.from_numpy(old_logprobs)).exp()
         torch.testing.assert_close(ratios, torch.ones_like(ratios), atol=1e-5, rtol=1e-5)
+
+
+def test_over_target_pre_step_kl_does_not_update_actor() -> None:
+    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        actor, critic, games=1, seed_start=93, episode_steps=3, sampling_seed=8
+    )
+    # Simulate behavior likelihoods from a stale policy. The unchanged actor is
+    # already far beyond the configured trust region before any optimizer step.
+    rollout.old_unit_logprobs[...] -= 1.0
+    rollout.old_market_kind_logprobs[...] -= 1.0
+    rollout.old_market_quantity_logprobs[...] -= 1.0
+    config = VapoConfig(
+        epochs=2,
+        minibatch_size=8,
+        target_kl=1e-4,
+        use_bfloat16=False,
+    )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+    critic_before = {
+        name: parameter.detach().clone() for name, parameter in critic.named_parameters()
+    }
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(9),
+    )
+
+    assert metrics["updates"] == config.epochs
+    assert metrics["actor_updates"] == 0
+    assert metrics["kl_early_stop"] == 1
+    assert metrics["max_approx_kl"] > config.target_kl
+    for name, parameter in actor.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+    assert any(
+        not torch.equal(parameter, critic_before[name])
+        for name, parameter in critic.named_parameters()
+    )
 
 
 def test_one_vapo_update_is_finite() -> None:

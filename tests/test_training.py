@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pytest
 import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
-from kaggriculture.training import load_checkpoint, save_checkpoint
+from kaggriculture.provenance import source_identity
+from kaggriculture.training import (
+    CHECKPOINT_FORMAT_VERSION,
+    append_iteration_jsonl,
+    load_checkpoint,
+    metrics_journal_iteration,
+    save_checkpoint,
+)
 from kaggriculture.vapo import VapoConfig, make_optimizers
 
 
@@ -29,7 +39,10 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
         iteration=3,
         next_seed=41,
         metrics={"score_rate": 0.75},
+        source_identity=source_identity(),
         training_rng_state=generator.bit_generator.state,
+        training_data_config={"games": 112},
+        league_snapshot_manifest={0: "a" * 64, 3: "b" * 64},
     )
     expected = generator.random(8)
 
@@ -45,5 +58,52 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     restored.bit_generator.state = payload["training_rng"]
 
     assert payload["iteration"] == 3
+    assert payload["format_version"] == CHECKPOINT_FORMAT_VERSION
     assert payload["next_seed"] == 41
+    assert payload["training_data_config"] == {"games": 112}
+    assert payload["league_snapshot_manifest"] == {0: "a" * 64, 3: "b" * 64}
+    assert payload["source_identity"] == source_identity()
     assert restored.random(8).tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 5])
+def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
+    path = tmp_path / "checkpoint.pt"
+    torch.save({"format_version": version}, path)
+    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+
+    with pytest.raises(ValueError, match="unsupported checkpoint format"):
+        load_checkpoint(
+            path,
+            FarmActor(model_config),
+            DistributionalCritic(model_config),
+            device=torch.device("cpu"),
+        )
+
+
+def test_iteration_metrics_journal_is_idempotent_and_conflict_detecting(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    first = {"iteration": 1, "loss": 0.5}
+    second = {"iteration": 2, "loss": 0.25}
+
+    assert append_iteration_jsonl(path, first)
+    assert not append_iteration_jsonl(path, first)
+    assert append_iteration_jsonl(path, second)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2
+
+    with pytest.raises(ValueError, match="conflicts"):
+        append_iteration_jsonl(path, {"iteration": 2, "loss": 9.0})
+    with pytest.raises(ValueError, match="ahead"):
+        append_iteration_jsonl(path, first)
+
+
+def test_iteration_metrics_journal_recovers_an_unterminated_crash_suffix(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    append_iteration_jsonl(path, {"iteration": 1, "loss": 0.5})
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write('{"iteration": 2, "loss"')
+
+    assert append_iteration_jsonl(path, {"iteration": 2, "loss": 0.25})
+
+    assert [json.loads(line)["iteration"] for line in path.read_text().splitlines()] == [1, 2]
+    assert metrics_journal_iteration(path) == 2

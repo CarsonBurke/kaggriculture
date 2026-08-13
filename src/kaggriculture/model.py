@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import NamedTuple
 
@@ -152,22 +153,19 @@ class FarmActor(nn.Module):
             unit_bias = self.unit_head[-1].bias
             unit_bias[UnitAction.PASS] = -1.25
             unit_bias[UnitAction.DROP] = 2.0
-            pickup_biases = {
-                UnitAction.PICKUP_WHEAT_1: 1.0,
-                UnitAction.PICKUP_WHEAT_2: 0.75,
-                UnitAction.PICKUP_WHEAT_4: 0.25,
-                UnitAction.PICKUP_WHEAT_8: -0.5,
-                UnitAction.PICKUP_WHEAT_16: -1.25,
-                UnitAction.PICKUP_FERTILIZER_1: 0.75,
-                UnitAction.PICKUP_FERTILIZER_2: 0.0,
-                UnitAction.PICKUP_FERTILIZER_4: -1.0,
-                UnitAction.PICKUP_FERTILIZER_8: -2.0,
-            }
-            for animal in ("GOOSE", "COW", "SHEEP"):
-                for quantity, bias in zip((1, 2, 3, 4), (0.75, -0.25, -1.0, -1.5), strict=True):
-                    pickup_biases[UnitAction[f"PICKUP_{animal}_{quantity}"]] = bias
-            for action, bias in pickup_biases.items():
-                unit_bias[action] = bias
+            # Exact pickup quantities are useful for coordinating several
+            # hands, but a flat prior over 36 pickup tokens would make shed
+            # actions dominate every other legal choice. A smooth 1/q prior
+            # keeps all exact transfers reachable while favoring q=1 per hand.
+            for item, maximum, offset in (
+                ("WHEAT", 16, 1.0),
+                ("FERTILIZER", 8, 0.75),
+                ("GOOSE", 4, 0.75),
+                ("COW", 4, 0.75),
+                ("SHEEP", 4, 0.75),
+            ):
+                for quantity in range(1, maximum + 1):
+                    unit_bias[UnitAction[f"PICKUP_{item}_{quantity}"]] = offset - math.log(quantity)
             unit_bias[UnitAction.PLACE_GOOSE : UnitAction.PLACE_SHEEP + 1] = 2.0
             unit_bias[UnitAction.PLANT_WHEAT : UnitAction.PLANT_MELON + 1] = 1.0
             unit_bias[UnitAction.WATER] = 2.0

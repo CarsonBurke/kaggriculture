@@ -10,9 +10,13 @@ pub const ANIMALS: usize = 3;
 pub const PRIVATE_ITEMS: usize = 12;
 pub const MAX_UNITS: usize = 16;
 pub const MAX_MARKET_ORDERS: usize = 10;
-pub const UNIT_ACTIONS: usize = 44;
+pub const UNIT_ACTIONS: usize = 59;
 pub const MARKET_KINDS: usize = 22;
 pub const MARKET_QUANTITIES: usize = 100;
+const UNIT_MASK_VALUES: usize = MAX_UNITS * UNIT_ACTIONS;
+const MARKET_KIND_MASK_VALUES: usize = MAX_MARKET_ORDERS * MARKET_KINDS;
+const MARKET_QUANTITY_MASK_VALUES: usize = MAX_MARKET_ORDERS * MARKET_QUANTITIES;
+pub const MAX_SAFE_SEED: u64 = u64::MAX / 1_000_003;
 pub const FARM_CHANNELS: usize = 29;
 pub const BOARD_CHANNELS: usize = FARM_CHANNELS * 2;
 pub const GLOBAL_FEATURES: usize = 72;
@@ -244,7 +248,7 @@ struct MarketOrder {
     remaining: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StepResult {
     pub done: bool,
     pub rewards: [f32; PLAYERS],
@@ -252,12 +256,264 @@ pub struct StepResult {
 }
 
 pub struct FactorMasks {
-    pub unit: Vec<bool>,
-    pub market_kind: Vec<bool>,
-    pub market_quantity: Vec<bool>,
+    pub unit: [bool; UNIT_MASK_VALUES],
+    pub market_kind: [bool; MARKET_KIND_MASK_VALUES],
+    pub market_quantity: [bool; MARKET_QUANTITY_MASK_VALUES],
     pub unit_active: [bool; MAX_UNITS],
     pub market_active: [bool; MAX_MARKET_ORDERS],
     pub market_quantity_active: [bool; MAX_MARKET_ORDERS],
+}
+
+impl Default for FactorMasks {
+    fn default() -> Self {
+        Self {
+            unit: [false; UNIT_MASK_VALUES],
+            market_kind: [false; MARKET_KIND_MASK_VALUES],
+            market_quantity: [false; MARKET_QUANTITY_MASK_VALUES],
+            unit_active: [false; MAX_UNITS],
+            market_active: [false; MAX_MARKET_ORDERS],
+            market_quantity_active: [false; MAX_MARKET_ORDERS],
+        }
+    }
+}
+
+pub struct SampledFactors {
+    pub action: CompactAction,
+    pub masks: FactorMasks,
+    pub unit_logprobs: [f32; MAX_UNITS],
+    pub market_kind_logprobs: [f32; MAX_MARKET_ORDERS],
+    pub market_quantity_logprobs: [f32; MAX_MARKET_ORDERS],
+    pub unit_entropies: [f32; MAX_UNITS],
+    pub market_kind_entropies: [f32; MAX_MARKET_ORDERS],
+    pub market_quantity_entropies: [f32; MAX_MARKET_ORDERS],
+    pub mean_entropy: f32,
+}
+
+impl Default for SampledFactors {
+    fn default() -> Self {
+        Self {
+            action: CompactAction::default(),
+            masks: FactorMasks::default(),
+            unit_logprobs: [0.0; MAX_UNITS],
+            market_kind_logprobs: [0.0; MAX_MARKET_ORDERS],
+            market_quantity_logprobs: [0.0; MAX_MARKET_ORDERS],
+            unit_entropies: [0.0; MAX_UNITS],
+            market_kind_entropies: [0.0; MAX_MARKET_ORDERS],
+            market_quantity_entropies: [0.0; MAX_MARKET_ORDERS],
+            mean_entropy: 0.0,
+        }
+    }
+}
+
+pub struct QuantityHead<'a> {
+    pub rank: usize,
+    pub kind_gate: &'a [f32],
+    pub values: &'a [f32],
+    pub bias: &'a [f32],
+}
+
+#[derive(Clone)]
+struct UnitLedger {
+    farm: Farm,
+    private: PrivateState,
+    config: GameConfig,
+}
+
+impl UnitLedger {
+    fn from_game(game: &Game, player: usize) -> Self {
+        Self {
+            farm: game.farms[player].clone(),
+            private: game.privates[player].clone(),
+            config: game.config.clone(),
+        }
+    }
+
+    fn action_valid(&self, unit: usize, action: u8, day: u16) -> bool {
+        if action >= UNIT_ACTIONS as u8 || unit >= usize::from(self.farm.units) {
+            return false;
+        }
+        if action == 0 {
+            return true;
+        }
+        let position = self.farm.positions[unit];
+        let x = usize::from(position.0);
+        let y = usize::from(position.1);
+        if let Some((dx, dy)) = move_delta(action) {
+            let nx = x as i16 + dx;
+            let ny = y as i16 + dy;
+            return (0..BOARD_SIZE as i16).contains(&nx) && (0..BOARD_SIZE as i16).contains(&ny);
+        }
+        let at_shed = is_shed_access(x, y);
+        if action == 5 {
+            return at_shed
+                && self.shed_total() < self.config.shed_capacity
+                && self.private.inventories[unit]
+                    .iter()
+                    .any(|&quantity| quantity > 0);
+        }
+        if let Some((item, quantity)) = pickup_spec(action) {
+            return at_shed && self.private.shed[item] >= quantity;
+        }
+        let tile = self.farm.tiles[y * BOARD_SIZE + x];
+        if tile.kind == TileKind::Locked {
+            return false;
+        }
+        if let Some(animal) = place_animal(action) {
+            return tile.kind == animal_structure(animal)
+                && !tile.has_animal
+                && self.private.inventories[unit][9 + animal] > 0;
+        }
+        if let Some(crop) = unit_plant_crop(action) {
+            return tile.kind == TileKind::Empty && self.private.seeds[crop] > 0;
+        }
+        match action {
+            50 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
+            51 if tile.kind == TileKind::Plant => {
+                tile.yield_units > 0
+                    && day.saturating_sub(tile.origin_day) >= FIRST_YIELD[usize::from(tile.species)]
+            }
+            51 => tile.has_animal && tile.yield_units > 0,
+            52 => {
+                tile.kind == TileKind::Plant
+                    && self.private.inventories[unit][8] > 0
+                    && tile.fertilized_until_day < day as i16 + 2
+            }
+            53 => tile.kind != TileKind::Empty && !tile.has_animal,
+            54 | 55 => tile.kind == TileKind::Empty,
+            56 => tile.has_animal && !tile.watered_or_fed && self.private.inventories[unit][0] > 0,
+            57 => tile.has_animal && tile.fertilizer_available,
+            58 => tile.has_animal && !tile.cared_today,
+            _ => false,
+        }
+    }
+
+    fn apply_action(&mut self, unit: usize, action: u8, day: u16) {
+        if action >= UNIT_ACTIONS as u8 || unit >= usize::from(self.farm.units) {
+            return;
+        }
+        let position = self.farm.positions[unit];
+        let x = usize::from(position.0);
+        let y = usize::from(position.1);
+        if let Some((dx, dy)) = move_delta(action) {
+            self.farm.positions[unit] = Position((x as i16 + dx) as u8, (y as i16 + dy) as u8);
+            return;
+        }
+        if action == 0 {
+            return;
+        }
+        if action == 5 {
+            self.drop_inventory(unit);
+            return;
+        }
+        if let Some((item, requested)) = pickup_spec(action) {
+            let quantity = self.private.shed[item].min(requested);
+            self.private.shed[item] -= quantity;
+            self.add_inventory(unit, item, quantity);
+            return;
+        }
+        let tile_index = y * BOARD_SIZE + x;
+        let tile = self.farm.tiles[tile_index];
+        if let Some(animal) = place_animal(action) {
+            let item = 9 + animal;
+            self.take_inventory(unit, item, 1);
+            self.farm.tiles[tile_index] = Tile::animal(animal, day);
+            return;
+        }
+        if let Some(crop) = unit_plant_crop(action) {
+            self.private.seeds[crop] -= 1;
+            self.farm.tiles[tile_index] = Tile::plant(crop, day, self.config.turns_per_day);
+            return;
+        }
+        match action {
+            50 => {
+                let crop = usize::from(tile.species);
+                let mutable = &mut self.farm.tiles[tile_index];
+                mutable.watered_or_fed = true;
+                if !CROP_ONGOING[crop] {
+                    let age = day - tile.origin_day;
+                    let start = MAX_YIELD_DAY[crop].div_ceil(2);
+                    if (start..=MAX_YIELD_DAY[crop]).contains(&age) {
+                        let bonus = if tile.fertilized_until_day >= day as i16 {
+                            2
+                        } else {
+                            1
+                        };
+                        mutable.yield_units =
+                            CROP_MAX_HELD[crop].min(mutable.yield_units.saturating_add(bonus));
+                    }
+                }
+            }
+            51 => {
+                if tile.kind == TileKind::Plant {
+                    let crop = usize::from(tile.species);
+                    self.add_inventory(unit, crop, u16::from(tile.yield_units));
+                    if CROP_ONGOING[crop] {
+                        self.farm.tiles[tile_index].yield_units = 0;
+                    } else {
+                        self.farm.tiles[tile_index] = Tile::default();
+                    }
+                } else {
+                    let product = ANIMAL_PRODUCT[usize::from(tile.species)];
+                    self.add_inventory(unit, product, u16::from(tile.yield_units));
+                    self.farm.tiles[tile_index].yield_units = 0;
+                }
+            }
+            52 => {
+                self.take_inventory(unit, 8, 1);
+                self.farm.tiles[tile_index].fertilized_until_day =
+                    tile.fertilized_until_day.max(day as i16 + 2);
+            }
+            53 => self.farm.tiles[tile_index] = Tile::default(),
+            54 => self.farm.tiles[tile_index] = Tile::structure(TileKind::Coop),
+            55 => self.farm.tiles[tile_index] = Tile::structure(TileKind::Pasture),
+            56 => {
+                self.take_inventory(unit, 0, 1);
+                self.farm.tiles[tile_index].watered_or_fed = true;
+            }
+            57 => {
+                self.farm.tiles[tile_index].fertilizer_available = false;
+                self.add_inventory(unit, 8, 1);
+            }
+            58 => self.farm.tiles[tile_index].cared_today = true,
+            _ => {}
+        }
+    }
+
+    fn shed_total(&self) -> u16 {
+        self.private.shed.iter().sum()
+    }
+
+    fn add_inventory(&mut self, unit: usize, item: usize, amount: u16) {
+        if amount > 0 && self.private.inventories[unit][item] == 0 {
+            let index = self.private.inventory_order[unit]
+                .iter()
+                .position(|&entry| entry == u8::MAX)
+                .unwrap();
+            self.private.inventory_order[unit][index] = item as u8;
+        }
+        self.private.inventories[unit][item] += amount;
+    }
+
+    fn take_inventory(&mut self, unit: usize, item: usize, amount: u16) {
+        self.private.inventories[unit][item] -= amount;
+        if self.private.inventories[unit][item] == 0 {
+            remove_inventory_order(&mut self.private.inventory_order[unit], item);
+        }
+    }
+
+    fn drop_inventory(&mut self, unit: usize) {
+        for raw_item in self.private.inventory_order[unit] {
+            if raw_item == u8::MAX {
+                break;
+            }
+            let item = usize::from(raw_item);
+            let room = self.config.shed_capacity.saturating_sub(self.shed_total());
+            let amount = self.private.inventories[unit][item].min(room);
+            self.private.shed[item] += amount;
+            self.private.inventories[unit][item] = 0;
+        }
+        self.private.inventory_order[unit] = [u8::MAX; PRIVATE_ITEMS];
+    }
 }
 
 #[derive(Clone)]
@@ -320,8 +576,8 @@ impl Game {
             return self.step_result();
         }
         let day = self.step / self.config.turns_per_day;
-        for player in 0..PLAYERS {
-            self.apply_unit_actions(player, &actions[player], day);
+        for (player, action) in actions.iter().enumerate() {
+            self.apply_unit_actions(player, action, day);
         }
         self.process_market(actions);
         self.town_consume(self.step);
@@ -350,6 +606,7 @@ impl Game {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_player(
         &self,
         player: usize,
@@ -479,6 +736,7 @@ impl Game {
             };
             value += f64::from(quantity) * item_value;
         }
+        #[allow(clippy::needless_range_loop)]
         for crop in 0..CROPS {
             value += 0.85 * f64::from(self.privates[player].seeds[crop]) * SEED_COST[crop] as f64;
         }
@@ -505,14 +763,14 @@ impl Game {
     }
 
     pub fn factor_masks(&self, player: usize, actions: &CompactAction) -> FactorMasks {
-        let mut unit = vec![false; MAX_UNITS * UNIT_ACTIONS];
-        let mut market_kind = vec![false; MAX_MARKET_ORDERS * MARKET_KINDS];
-        let mut market_quantity = vec![false; MAX_MARKET_ORDERS * MARKET_QUANTITIES];
+        let mut unit = [false; UNIT_MASK_VALUES];
+        let mut market_kind = [false; MARKET_KIND_MASK_VALUES];
+        let mut market_quantity = [false; MARKET_QUANTITY_MASK_VALUES];
         let mut unit_active = [false; MAX_UNITS];
         let mut market_active = [false; MAX_MARKET_ORDERS];
         let mut market_quantity_active = [false; MAX_MARKET_ORDERS];
         let day = self.step / self.config.turns_per_day;
-        let mut unit_ledger = self.clone();
+        let mut unit_ledger = UnitLedger::from_game(self, player);
         let units = usize::from(self.farms[player].units);
         for unit_index in 0..MAX_UNITS {
             let row = &mut unit[unit_index * UNIT_ACTIONS..(unit_index + 1) * UNIT_ACTIONS];
@@ -522,7 +780,7 @@ impl Game {
             }
             unit_active[unit_index] = true;
             for (action, valid) in row.iter_mut().enumerate() {
-                *valid = unit_ledger.unit_action_valid(player, unit_index, action as u8, day);
+                *valid = unit_ledger.action_valid(unit_index, action as u8, day);
             }
             let selected = usize::from(actions.units[unit_index]);
             let applied = if selected < UNIT_ACTIONS && row[selected] {
@@ -530,18 +788,18 @@ impl Game {
             } else {
                 0
             };
-            unit_ledger.apply_unit_action(player, unit_index, applied, day);
+            unit_ledger.apply_action(unit_index, applied, day);
         }
 
-        let farm = &unit_ledger.farms[player];
+        let farm = &unit_ledger.farm;
         let mut ledger = PolicyMarketLedger {
             money: farm.money,
-            shed: unit_ledger.privates[player].shed,
+            shed: unit_ledger.private.shed,
             hires: farm.hires_today,
             original_hires: farm.hires_today,
             original_units: farm.units,
             extra_land: farm.unlocked.count_ones() as usize - 1,
-            inventory: unit_ledger.market_inventory,
+            inventory: self.market_inventory,
         };
         let mut active = true;
         for slot in 0..MAX_MARKET_ORDERS {
@@ -586,6 +844,180 @@ impl Game {
             unit_active,
             market_active,
             market_quantity_active,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_factors(
+        &self,
+        player: usize,
+        unit_logits: &[f32],
+        market_kind_logits: &[f32],
+        market_quantity_context: &[f32],
+        quantity_head: &QuantityHead<'_>,
+        unit_draws: &[f32],
+        market_kind_draws: &[f32],
+        market_quantity_draws: &[f32],
+        deterministic: bool,
+        temperature: f32,
+    ) -> SampledFactors {
+        debug_assert_eq!(unit_logits.len(), MAX_UNITS * UNIT_ACTIONS);
+        debug_assert_eq!(market_kind_logits.len(), MAX_MARKET_ORDERS * MARKET_KINDS);
+        debug_assert_eq!(
+            market_quantity_context.len(),
+            MAX_MARKET_ORDERS * quantity_head.rank
+        );
+        debug_assert_eq!(
+            quantity_head.kind_gate.len(),
+            MARKET_KINDS * quantity_head.rank
+        );
+        debug_assert_eq!(
+            quantity_head.values.len(),
+            MARKET_QUANTITIES * quantity_head.rank
+        );
+        debug_assert_eq!(quantity_head.bias.len(), MARKET_KINDS * MARKET_QUANTITIES);
+        let mut action = CompactAction::default();
+        let mut unit_masks = [false; UNIT_MASK_VALUES];
+        let mut market_kind_masks = [false; MARKET_KIND_MASK_VALUES];
+        let mut market_quantity_masks = [false; MARKET_QUANTITY_MASK_VALUES];
+        let mut unit_active = [false; MAX_UNITS];
+        let mut market_active = [false; MAX_MARKET_ORDERS];
+        let mut market_quantity_active = [false; MAX_MARKET_ORDERS];
+        let mut unit_logprobs = [0.0; MAX_UNITS];
+        let mut market_kind_logprobs = [0.0; MAX_MARKET_ORDERS];
+        let mut market_quantity_logprobs = [0.0; MAX_MARKET_ORDERS];
+        let mut unit_entropies = [0.0; MAX_UNITS];
+        let mut market_kind_entropies = [0.0; MAX_MARKET_ORDERS];
+        let mut market_quantity_entropies = [0.0; MAX_MARKET_ORDERS];
+        let mut entropy_sum = 0.0f32;
+        let mut component_count = 0usize;
+        let day = self.step / self.config.turns_per_day;
+        let mut unit_ledger = UnitLedger::from_game(self, player);
+        let active_units = usize::from(self.farms[player].units);
+        for unit in 0..MAX_UNITS {
+            let mask = &mut unit_masks[unit * UNIT_ACTIONS..(unit + 1) * UNIT_ACTIONS];
+            if unit >= active_units {
+                mask[0] = true;
+            } else {
+                unit_active[unit] = true;
+                for (candidate, valid) in mask.iter_mut().enumerate() {
+                    *valid = unit_ledger.action_valid(unit, candidate as u8, day);
+                }
+            }
+            let (selected, logprob, entropy) = sample_categorical(
+                &unit_logits[unit * UNIT_ACTIONS..(unit + 1) * UNIT_ACTIONS],
+                mask,
+                deterministic,
+                temperature,
+                unit_draws[unit],
+            );
+            action.units[unit] = selected as u8;
+            unit_logprobs[unit] = logprob;
+            unit_entropies[unit] = entropy;
+            if unit_active[unit] {
+                entropy_sum += entropy;
+                component_count += 1;
+                unit_ledger.apply_action(unit, selected as u8, day);
+            }
+        }
+
+        let farm = &unit_ledger.farm;
+        let mut ledger = PolicyMarketLedger {
+            money: farm.money,
+            shed: unit_ledger.private.shed,
+            hires: farm.hires_today,
+            original_hires: farm.hires_today,
+            original_units: farm.units,
+            extra_land: farm.unlocked.count_ones() as usize - 1,
+            inventory: self.market_inventory,
+        };
+        let mut still_active = true;
+        let mut quantity_logits = [0.0f32; MARKET_QUANTITIES];
+        for slot in 0..MAX_MARKET_ORDERS {
+            let kind_mask = &mut market_kind_masks[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            let quantity_mask = &mut market_quantity_masks
+                [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
+            if still_active {
+                market_active[slot] = true;
+                fill_market_kind_mask(&unit_ledger.config, &ledger, kind_mask);
+            } else {
+                kind_mask[0] = true;
+            }
+            let (kind, kind_logprob, kind_entropy) = sample_categorical(
+                &market_kind_logits[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS],
+                kind_mask,
+                deterministic,
+                temperature,
+                market_kind_draws[slot],
+            );
+            action.market_kinds[slot] = kind as u8;
+            market_kind_logprobs[slot] = kind_logprob;
+            market_kind_entropies[slot] = kind_entropy;
+            if market_active[slot] {
+                entropy_sum += kind_entropy;
+                component_count += 1;
+            }
+            if !still_active || kind == 0 {
+                quantity_mask[0] = true;
+                still_active = false;
+                continue;
+            }
+            fill_market_quantity_mask(&unit_ledger.config, &ledger, kind as u8, quantity_mask);
+            if kind < 3 {
+                // HIRE and BUY_LAND have no quantity factor. Preserve the
+                // conventional zero category/log-probability outputs without
+                // touching the low-rank quantity head or consuming its draw.
+                action.market_quantities[slot] = 0;
+                apply_policy_market_order(&unit_ledger.config, &mut ledger, kind as u8, 1);
+                continue;
+            }
+            market_quantity_active[slot] = true;
+            score_quantities(
+                &market_quantity_context
+                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+                kind,
+                quantity_head,
+                &mut quantity_logits,
+            );
+            let (quantity, quantity_logprob, quantity_entropy) = sample_categorical(
+                &quantity_logits,
+                quantity_mask,
+                deterministic,
+                temperature,
+                market_quantity_draws[slot],
+            );
+            action.market_quantities[slot] = quantity as u8;
+            market_quantity_logprobs[slot] = quantity_logprob;
+            market_quantity_entropies[slot] = quantity_entropy;
+            if market_quantity_active[slot] {
+                entropy_sum += quantity_entropy;
+                component_count += 1;
+            }
+            apply_policy_market_order(
+                &unit_ledger.config,
+                &mut ledger,
+                kind as u8,
+                quantity as u16 + 1,
+            );
+        }
+
+        SampledFactors {
+            action,
+            masks: FactorMasks {
+                unit: unit_masks,
+                market_kind: market_kind_masks,
+                market_quantity: market_quantity_masks,
+                unit_active,
+                market_active,
+                market_quantity_active,
+            },
+            unit_logprobs,
+            market_kind_logprobs,
+            market_quantity_logprobs,
+            unit_entropies,
+            market_kind_entropies,
+            market_quantity_entropies,
+            mean_entropy: entropy_sum / component_count.max(1) as f32,
         }
     }
 
@@ -644,26 +1076,26 @@ impl Game {
             return tile.kind == TileKind::Empty && self.privates[player].seeds[crop] > 0;
         }
         match action {
-            35 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
-            36 if tile.kind == TileKind::Plant => {
+            50 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
+            51 if tile.kind == TileKind::Plant => {
                 tile.yield_units > 0
                     && day.saturating_sub(tile.origin_day) >= FIRST_YIELD[usize::from(tile.species)]
             }
-            36 => tile.has_animal && tile.yield_units > 0,
-            37 => {
+            51 => tile.has_animal && tile.yield_units > 0,
+            52 => {
                 tile.kind == TileKind::Plant
                     && self.privates[player].inventories[unit][8] > 0
                     && tile.fertilized_until_day < day as i16 + 2
             }
-            38 => tile.kind != TileKind::Empty && !tile.has_animal,
-            39 | 40 => tile.kind == TileKind::Empty,
-            41 => {
+            53 => tile.kind != TileKind::Empty && !tile.has_animal,
+            54 | 55 => tile.kind == TileKind::Empty,
+            56 => {
                 tile.has_animal
                     && !tile.watered_or_fed
                     && self.privates[player].inventories[unit][0] > 0
             }
-            42 => tile.has_animal && tile.fertilizer_available,
-            43 => tile.has_animal && !tile.cared_today,
+            57 => tile.has_animal && tile.fertilizer_available,
+            58 => tile.has_animal && !tile.cared_today,
             _ => false,
         }
     }
@@ -730,7 +1162,7 @@ impl Game {
             return;
         }
         match action {
-            35 => {
+            50 => {
                 if tile.kind != TileKind::Plant || tile.watered_or_fed {
                     return;
                 }
@@ -739,7 +1171,7 @@ impl Game {
                 mutable.watered_or_fed = true;
                 if !CROP_ONGOING[crop] {
                     let age = day - tile.origin_day;
-                    let start = (MAX_YIELD_DAY[crop] + 1) / 2;
+                    let start = MAX_YIELD_DAY[crop].div_ceil(2);
                     if (start..=MAX_YIELD_DAY[crop]).contains(&age) {
                         let bonus = if tile.fertilized_until_day >= day as i16 {
                             2
@@ -751,25 +1183,25 @@ impl Game {
                     }
                 }
             }
-            36 => self.harvest(player, unit, tile_index, day),
-            37 => {
+            51 => self.harvest(player, unit, tile_index, day),
+            52 => {
                 if tile.kind == TileKind::Plant && self.take_inventory(player, unit, 8, 1) {
                     self.farms[player].tiles[tile_index].fertilized_until_day =
                         tile.fertilized_until_day.max(day as i16 + 2);
                 }
             }
-            38 => {
+            53 => {
                 if tile.kind != TileKind::Empty && !tile.has_animal {
                     self.farms[player].tiles[tile_index] = Tile::default();
                 }
             }
-            39 if tile.kind == TileKind::Empty => {
+            54 if tile.kind == TileKind::Empty => {
                 self.farms[player].tiles[tile_index] = Tile::structure(TileKind::Coop);
             }
-            40 if tile.kind == TileKind::Empty => {
+            55 if tile.kind == TileKind::Empty => {
                 self.farms[player].tiles[tile_index] = Tile::structure(TileKind::Pasture);
             }
-            41 => {
+            56 => {
                 if tile.has_animal
                     && !tile.watered_or_fed
                     && self.take_inventory(player, unit, 0, 1)
@@ -777,11 +1209,11 @@ impl Game {
                     self.farms[player].tiles[tile_index].watered_or_fed = true;
                 }
             }
-            42 if tile.has_animal && tile.fertilizer_available => {
+            57 if tile.has_animal && tile.fertilizer_available => {
                 self.farms[player].tiles[tile_index].fertilizer_available = false;
                 self.add_inventory(player, unit, 8, 1);
             }
-            43 if tile.has_animal && !tile.cared_today => {
+            58 if tile.has_animal && !tile.cared_today => {
                 self.farms[player].tiles[tile_index].cared_today = true;
             }
             _ => {}
@@ -889,6 +1321,7 @@ impl Game {
                     )
                 }
             });
+            #[allow(clippy::needless_range_loop)]
             for player in 0..PLAYERS {
                 let Some(order) = orders[player] else {
                     continue;
@@ -1074,7 +1507,7 @@ impl Game {
     }
 
     fn end_of_day(&mut self, day: u16) {
-        let mixed_seed = self.seed.wrapping_mul(1_000_003) ^ u64::from(day);
+        let mixed_seed = (self.seed * 1_000_003) ^ u64::from(day);
         let mut rng = PyRandom::seed_u64(mixed_seed);
         for player in 0..PLAYERS {
             self.daily_refresh_plants(player, day);
@@ -1327,6 +1760,80 @@ fn apply_policy_market_order(
     }
 }
 
+fn score_quantities(
+    context: &[f32],
+    kind: usize,
+    head: &QuantityHead<'_>,
+    output: &mut [f32; MARKET_QUANTITIES],
+) {
+    #[allow(clippy::needless_range_loop)]
+    for quantity in 0..MARKET_QUANTITIES {
+        let mut score = head.bias[kind * MARKET_QUANTITIES + quantity];
+        #[allow(clippy::needless_range_loop)]
+        for rank in 0..head.rank {
+            let feature = context[rank] * (1.0 + head.kind_gate[kind * head.rank + rank]);
+            score += feature * head.values[quantity * head.rank + rank];
+        }
+        output[quantity] = score;
+    }
+}
+
+fn sample_categorical(
+    logits: &[f32],
+    mask: &[bool],
+    deterministic: bool,
+    temperature: f32,
+    draw: f32,
+) -> (usize, f32, f32) {
+    debug_assert_eq!(logits.len(), mask.len());
+    debug_assert!(logits.len() <= MARKET_QUANTITIES);
+    debug_assert!(mask.iter().any(|&valid| valid));
+    let temperature = temperature.max(1e-4);
+    let mut shifted = [0.0f32; MARKET_QUANTITIES];
+    let mut maximum = f32::NEG_INFINITY;
+    let mut argmax = 0usize;
+    for index in 0..logits.len() {
+        if mask[index] {
+            let value = logits[index] / temperature;
+            if value > maximum {
+                maximum = value;
+                argmax = index;
+            }
+        }
+    }
+    let mut total = 0.0f32;
+    for index in 0..logits.len() {
+        if mask[index] {
+            shifted[index] = (logits[index] / temperature - maximum).exp();
+            total += shifted[index];
+        }
+    }
+    let mut selected = argmax;
+    if !deterministic {
+        let mut cumulative = 0.0f32;
+        selected = mask.iter().rposition(|&valid| valid).unwrap();
+        for (index, probability) in shifted[..logits.len()].iter().enumerate() {
+            if !mask[index] {
+                continue;
+            }
+            cumulative += *probability / total;
+            if draw <= cumulative {
+                selected = index;
+                break;
+            }
+        }
+    }
+    let selected_probability = (shifted[selected] / total).max(f32::MIN_POSITIVE);
+    let mut entropy = 0.0f32;
+    for raw_probability in &shifted[..logits.len()] {
+        let probability = *raw_probability / total;
+        if probability > 0.0 {
+            entropy -= probability * probability.max(f32::MIN_POSITIVE).ln();
+        }
+    }
+    (selected, selected_probability.ln(), entropy)
+}
+
 #[inline]
 fn move_delta(action: u8) -> Option<(i16, i16)> {
     match action {
@@ -1341,27 +1848,27 @@ fn move_delta(action: u8) -> Option<(i16, i16)> {
 #[inline]
 fn pickup_spec(action: u8) -> Option<(usize, u16)> {
     match action {
-        6..=10 => Some((0, [1, 2, 4, 8, 16][usize::from(action - 6)])),
-        11..=14 => Some((8, [1, 2, 4, 8][usize::from(action - 11)])),
-        15..=18 => Some((9, u16::from(action - 14))),
-        19..=22 => Some((10, u16::from(action - 18))),
-        23..=26 => Some((11, u16::from(action - 22))),
+        6..=21 => Some((0, u16::from(action - 5))),
+        22..=29 => Some((8, u16::from(action - 21))),
+        30..=33 => Some((9, u16::from(action - 29))),
+        34..=37 => Some((10, u16::from(action - 33))),
+        38..=41 => Some((11, u16::from(action - 37))),
         _ => None,
     }
 }
 
 #[inline]
 fn place_animal(action: u8) -> Option<usize> {
-    (27..=29)
+    (42..=44)
         .contains(&action)
-        .then(|| usize::from(action - 27))
+        .then(|| usize::from(action - 42))
 }
 
 #[inline]
 fn unit_plant_crop(action: u8) -> Option<usize> {
-    (30..=34)
+    (45..=49)
         .contains(&action)
-        .then(|| usize::from(action - 30))
+        .then(|| usize::from(action - 45))
 }
 
 fn remove_inventory_order(order: &mut [u8; PRIVATE_ITEMS], item: usize) {
@@ -1453,6 +1960,7 @@ fn money_feature(amount: i64) -> f32 {
 }
 
 fn private_vector(private: &PrivateState, output: &mut [f32; 29]) {
+    #[allow(clippy::needless_range_loop)]
     for item in 0..PRIVATE_ITEMS {
         output[item] = f32::from(private.shed[item]) / 100.0;
     }
@@ -1522,7 +2030,7 @@ fn encode_farm(farm: &Farm, day: u16, step: u16, output: &mut [f32]) {
                     set(19, (f32::from(tile.consecutive_unmet) / 2.0).min(1.0));
                     set(20, f32::from(u8::from(tile.cared_today)));
                     set(21, f32::from(u8::from(tile.fertilizer_available)));
-                    set(22, (f32::from(tile.pending_care_bonus) / 2.0).min(1.0));
+                    set(22, (f32::from(tile.pending_care_bonus) / 5.0).min(1.0));
                 }
             }
             TileKind::Locked => unreachable!(),
@@ -1795,5 +2303,178 @@ mod tests {
         assert_eq!(market_price(0, 10_000), 25);
         assert_eq!(market_price(0, 9_600), 45);
         assert_eq!(market_price(4, 10_300), 1);
+    }
+
+    #[test]
+    fn exact_pickup_quantities_and_sequential_reservation() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[0] = 16;
+        game.privates[0].shed[8] = 8;
+        game.privates[0].shed[9] = 4;
+        let mut action = CompactAction::default();
+        action.market_kinds[0] = 1;
+        action.market_kinds[1] = 1;
+        action.units[0] = 21; // wheat 16
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.privates[0].inventories[0][0], 16);
+        assert_eq!(game.farms[0].units, 3);
+        let mut action = CompactAction::default();
+        action.units[0] = 29; // fertilizer 8
+        action.units[1] = 33; // goose 4
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.privates[0].inventories[0][8], 8);
+        assert_eq!(game.privates[0].inventories[1][9], 4);
+    }
+
+    #[test]
+    fn simultaneous_market_units_share_quote_then_commit_player_order() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[0] = 2;
+        game.privates[1].shed[0] = 2;
+        let mut sell = CompactAction::default();
+        sell.market_kinds[0] = 13;
+        sell.market_quantities[0] = 1; // exact quantity two
+        game.step(&[sell, sell]);
+        // Both first units see $25; both second units see the same post-pair quote.
+        let second_quote = market_price(0, MARKET_I0 + 2);
+        assert_eq!(game.farms[0].money, 3000 + 25 + second_quote);
+        assert_eq!(game.farms[1].money, 3000 + 25 + second_quote);
+        // Town-center demand at step zero consumes one after the four sales.
+        assert_eq!(game.market_inventory[0], MARKET_I0 + 3);
+    }
+
+    #[test]
+    fn plant_water_harvest_and_daily_weed_lifecycle() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].seeds[0] = 1;
+        let mut plant = CompactAction::default();
+        plant.units[0] = 45;
+        game.step(&[plant, CompactAction::default()]);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Plant);
+        // Unwatered planting day + one refresh makes two misses and a weed.
+        for _ in 1..24 {
+            game.step(&[CompactAction::default(); PLAYERS]);
+        }
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Weed);
+        let mut dig = CompactAction::default();
+        dig.units[0] = 53;
+        game.step(&[dig, CompactAction::default()]);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Empty);
+    }
+
+    #[test]
+    fn end_of_day_rng_shop_sequence_is_stable() {
+        let mut game = Game::new(123, GameConfig::default());
+        for _ in 0..72 {
+            game.step(&[CompactAction::default(); PLAYERS]);
+        }
+        assert_eq!(game.shop_count, 1);
+        // Differentially established against random.Random((123*1_000_003)^2)
+        // after the exact two-farm empty-tile weed draw sequence.
+        assert_eq!(SHOP_NAMES_SORTED[usize::from(game.shops[0])], "BAKERY");
+        let weeds_zero: Vec<usize> = game.farms[0]
+            .tiles
+            .iter()
+            .enumerate()
+            .filter(|(_, tile)| tile.kind == TileKind::Weed)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(weeds_zero, [4]);
+        assert!(
+            game.farms[1]
+                .tiles
+                .iter()
+                .all(|tile| tile.kind != TileKind::Weed)
+        );
+        assert_eq!(game.step, 72);
+    }
+
+    #[test]
+    fn quantity_mask_is_exact_prefix_not_sparse_bins() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[0] = 37;
+        let mut action = CompactAction::default();
+        action.market_kinds[0] = 13;
+        let masks = game.factor_masks(0, &action);
+        let row = &masks.market_quantity[..MARKET_QUANTITIES];
+        assert!(row[..37].iter().all(|&valid| valid));
+        assert!(row[37..].iter().all(|&valid| !valid));
+    }
+
+    #[test]
+    fn inventory_overflow_preserves_python_dict_insertion_order() {
+        let config = GameConfig {
+            shed_capacity: 1,
+            ..GameConfig::default()
+        };
+        let mut game = Game::new(0, config);
+        game.add_inventory(0, 0, 11, 1);
+        game.add_inventory(0, 0, 0, 1);
+        game.drop_inventory(0, 0);
+        assert_eq!(game.privates[0].shed[11], 1);
+        assert_eq!(game.privates[0].shed[0], 0);
+        assert_eq!(
+            game.privates[0].inventory_order[0],
+            [u8::MAX; PRIVATE_ITEMS]
+        );
+    }
+
+    #[test]
+    fn animal_care_feed_production_and_escape() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].tiles[44] = Tile::animal(0, 0);
+        game.farms[0].tiles[44].watered_or_fed = true;
+        game.farms[0].tiles[44].cared_today = true;
+        game.daily_refresh_animals(0, 3);
+        let goose = game.farms[0].tiles[44];
+        assert_eq!(goose.yield_units, 1);
+        assert_eq!(goose.pending_care_bonus, 1);
+        assert!(goose.fertilizer_available);
+        game.farms[0].tiles[44].watered_or_fed = true;
+        game.daily_refresh_animals(0, 4);
+        assert_eq!(game.farms[0].tiles[44].yield_units, 3);
+        game.daily_refresh_animals(0, 5);
+        assert!(game.farms[0].tiles[44].has_animal);
+        game.daily_refresh_animals(0, 6);
+        assert!(!game.farms[0].tiles[44].has_animal);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Coop);
+    }
+
+    #[test]
+    fn hire_then_land_orders_apply_in_slot_order() {
+        let mut game = Game::new(0, GameConfig::default());
+        let mut action = CompactAction::default();
+        action.market_kinds[0] = 1;
+        action.market_kinds[1] = 2;
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.farms[0].money, 1999);
+        assert_eq!(game.farms[0].units, 2);
+        assert_eq!(game.farms[0].unlocked, 0b0011);
+        assert_eq!(game.farms[0].tiles[5].kind, TileKind::Empty);
+    }
+
+    #[test]
+    fn bankers_rounding_matches_python_ties() {
+        assert_eq!(round_ties_even(2.5), 2);
+        assert_eq!(round_ties_even(3.5), 4);
+        assert_eq!(round_ties_even(4.499_999), 4);
+        assert_eq!(round_ties_even(4.500_001), 5);
+    }
+
+    #[test]
+    fn categorical_zero_draw_never_selects_a_masked_prefix() {
+        let logits = [100.0, 0.0, 1.0];
+        let mask = [false, true, true];
+        assert_eq!(sample_categorical(&logits, &mask, false, 1.0, 0.0).0, 1);
+    }
+
+    #[test]
+    fn categorical_roundoff_fallback_is_last_valid_category() {
+        let logits = [0.0, 0.0, 100.0];
+        let mask = [true, true, false];
+        assert_eq!(
+            sample_categorical(&logits, &mask, false, 1.0, 0.999_999_94).0,
+            1
+        );
     }
 }

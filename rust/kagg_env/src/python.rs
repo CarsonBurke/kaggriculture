@@ -1,12 +1,16 @@
 use crate::core::{
     BOARD_CHANNELS, BOARD_SIZE, CRITIC_FEATURES, CompactAction, GLOBAL_FEATURES, Game, GameConfig,
-    MARKET_KINDS, MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_UNITS, PLAYERS, UNIT_ACTIONS,
-    UNIT_FEATURES,
+    MARKET_KINDS, MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS,
+    SampledFactors, StepResult, UNIT_ACTIONS, UNIT_FEATURES,
 };
 use half::f16;
-use numpy::ndarray::{Array1, Array2, Array3, Array4};
-use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyIndexError, PyValueError};
+use numpy::ndarray::{Array1, Array2, Array3};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
+    PyUntypedArrayMethods,
+};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
@@ -14,6 +18,9 @@ use rayon::prelude::*;
 #[pyclass(name = "BatchEnv", unsendable)]
 pub(crate) struct BatchEnv {
     games: Vec<Game>,
+    sampled_scratch: Vec<SampledFactors>,
+    results_scratch: Vec<StepResult>,
+    previous_potentials_scratch: Vec<f32>,
 }
 
 #[pymethods]
@@ -25,11 +32,18 @@ impl BatchEnv {
         if seeds.is_empty() {
             return Err(PyValueError::new_err("seeds must be non-empty"));
         }
+        validate_seeds(seeds)?;
+        let games: Vec<Game> = seeds
+            .iter()
+            .map(|&seed| Game::new(seed, GameConfig::default()))
+            .collect();
         Ok(Self {
-            games: seeds
-                .iter()
-                .map(|&seed| Game::new(seed, GameConfig::default()))
+            sampled_scratch: (0..games.len() * PLAYERS)
+                .map(|_| SampledFactors::default())
                 .collect(),
+            results_scratch: vec![StepResult::default(); games.len()],
+            previous_potentials_scratch: vec![0.0; games.len()],
+            games,
         })
     }
 
@@ -46,6 +60,7 @@ impl BatchEnv {
                 self.games.len()
             )));
         }
+        validate_seeds(seeds)?;
         for (game, &seed) in self.games.iter_mut().zip(seeds) {
             *game = Game::new(seed, GameConfig::default());
         }
@@ -62,70 +77,19 @@ impl BatchEnv {
 
     /// Encode both seats in game-major/player-minor order without Python objects.
     fn encoded<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let rows = py.detach(|| {
-            self.games
-                .par_iter()
-                .flat_map_iter(|game| (0..PLAYERS).map(|player| encode_row(game, player)))
-                .collect::<Vec<_>>()
-        });
-        let batch_rows = rows.len();
-        let mut board = Vec::with_capacity(batch_rows * BOARD_CHANNELS * BOARD_SIZE * BOARD_SIZE);
-        let mut globals = Vec::with_capacity(batch_rows * GLOBAL_FEATURES);
-        let mut critic = Vec::with_capacity(batch_rows * CRITIC_FEATURES);
-        let mut units = Vec::with_capacity(batch_rows * MAX_UNITS * UNIT_FEATURES);
-        let mut positions = Vec::with_capacity(batch_rows * MAX_UNITS * 2);
-        let mut active = Vec::with_capacity(batch_rows * MAX_UNITS);
-        for row in rows {
-            board.extend(row.board.into_iter().map(f16::from_f32));
-            globals.extend(row.globals.into_iter().map(f16::from_f32));
-            critic.extend(row.critic.into_iter().map(f16::from_f32));
-            units.extend(row.units.into_iter().map(f16::from_f32));
-            positions.extend(row.positions);
-            active.extend(row.active);
-        }
-        let output = PyDict::new(py);
-        output.set_item(
-            "board",
-            Array4::from_shape_vec((batch_rows, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), board)
-                .expect("encoded board shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "global_features",
-            Array2::from_shape_vec((batch_rows, GLOBAL_FEATURES), globals)
-                .expect("encoded globals shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "critic_features",
-            Array2::from_shape_vec((batch_rows, CRITIC_FEATURES), critic)
-                .expect("encoded critic shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "units",
-            Array3::from_shape_vec((batch_rows, MAX_UNITS, UNIT_FEATURES), units)
-                .expect("encoded units shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "unit_positions",
-            Array3::from_shape_vec((batch_rows, MAX_UNITS, 2), positions)
-                .expect("encoded position shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "unit_active",
-            Array2::from_shape_vec((batch_rows, MAX_UNITS), active)
-                .expect("encoded active shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "potentials",
-            Array1::from_vec(self.games.iter().map(Game::pair_potential).collect())
-                .into_pyarray(py),
-        )?;
+        let output = allocate_encoded_buffers(py, self.games.len())?;
+        fill_encoded_output(py, &self.games, &output)?;
         Ok(output)
+    }
+
+    /// Allocate the exact output arrays expected by `encoded_into` once.
+    fn encoded_buffers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        allocate_encoded_buffers(py, self.games.len())
+    }
+
+    /// Fill caller-owned, writable C-contiguous arrays without allocating.
+    fn encoded_into(&self, py: Python<'_>, output: &Bound<'_, PyDict>) -> PyResult<()> {
+        fill_encoded_output(py, &self.games, output)
     }
 
     /// Exact sequential masks for every supplied factor row, before stepping.
@@ -222,6 +186,278 @@ impl BatchEnv {
         Ok(output)
     }
 
+    /// Allocate the exact output arrays expected by `sample_and_step_into` once.
+    fn sample_buffers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        allocate_sample_buffers(py, self.games.len())
+    }
+
+    /// Allocating convenience wrapper around `sample_and_step_into`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        unit_logits, market_kind_logits, market_quantity_context,
+        quantity_kind_gate, quantity_values, quantity_bias, head_ids,
+        unit_draws, market_kind_draws, market_quantity_draws,
+        deterministic_rows, temperatures
+    ))]
+    fn sample_and_step<'py>(
+        &mut self,
+        py: Python<'py>,
+        unit_logits: PyReadonlyArray3<'py, f32>,
+        market_kind_logits: PyReadonlyArray3<'py, f32>,
+        market_quantity_context: PyReadonlyArray3<'py, f32>,
+        quantity_kind_gate: PyReadonlyArray3<'py, f32>,
+        quantity_values: PyReadonlyArray3<'py, f32>,
+        quantity_bias: PyReadonlyArray3<'py, f32>,
+        head_ids: PyReadonlyArray1<'py, u16>,
+        unit_draws: PyReadonlyArray2<'py, f32>,
+        market_kind_draws: PyReadonlyArray2<'py, f32>,
+        market_quantity_draws: PyReadonlyArray2<'py, f32>,
+        deterministic_rows: PyReadonlyArray1<'py, bool>,
+        temperatures: PyReadonlyArray1<'py, f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let output = allocate_sample_buffers(py, self.games.len())?;
+        self.sample_and_step_into(
+            py,
+            unit_logits,
+            market_kind_logits,
+            market_quantity_context,
+            quantity_kind_gate,
+            quantity_values,
+            quantity_bias,
+            head_ids,
+            unit_draws,
+            market_kind_draws,
+            market_quantity_draws,
+            deterministic_rows,
+            temperatures,
+            &output,
+        )?;
+        Ok(output)
+    }
+
+    /// Fused sequential masking, sampling, exact joint step, and direct output fill.
+    ///
+    /// Factor rows use game-major/player-minor order. Explicit draws keep the
+    /// checkpointed NumPy RNG as the sole stochastic authority. Output arrays
+    /// must come from `sample_buffers` or match its exact writable C layout.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        unit_logits, market_kind_logits, market_quantity_context,
+        quantity_kind_gate, quantity_values, quantity_bias, head_ids,
+        unit_draws, market_kind_draws, market_quantity_draws,
+        deterministic_rows, temperatures, output
+    ))]
+    fn sample_and_step_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        unit_logits: PyReadonlyArray3<'py, f32>,
+        market_kind_logits: PyReadonlyArray3<'py, f32>,
+        market_quantity_context: PyReadonlyArray3<'py, f32>,
+        quantity_kind_gate: PyReadonlyArray3<'py, f32>,
+        quantity_values: PyReadonlyArray3<'py, f32>,
+        quantity_bias: PyReadonlyArray3<'py, f32>,
+        head_ids: PyReadonlyArray1<'py, u16>,
+        unit_draws: PyReadonlyArray2<'py, f32>,
+        market_kind_draws: PyReadonlyArray2<'py, f32>,
+        market_quantity_draws: PyReadonlyArray2<'py, f32>,
+        deterministic_rows: PyReadonlyArray1<'py, bool>,
+        temperatures: PyReadonlyArray1<'py, f32>,
+        output: &Bound<'py, PyDict>,
+    ) -> PyResult<()> {
+        let rows = self.games.len() * PLAYERS;
+        macro_rules! require_c_input {
+            ($array:ident, $name:literal) => {
+                if !$array.is_c_contiguous() {
+                    return Err(PyValueError::new_err(concat!(
+                        $name,
+                        " must be C-contiguous"
+                    )));
+                }
+            };
+        }
+        ensure_shape(
+            unit_logits.shape(),
+            &[rows, MAX_UNITS, UNIT_ACTIONS],
+            "unit_logits",
+        )?;
+        ensure_shape(
+            market_kind_logits.shape(),
+            &[rows, MAX_MARKET_ORDERS, MARKET_KINDS],
+            "market_kind_logits",
+        )?;
+        let context_shape = market_quantity_context.shape();
+        if context_shape.len() != 3
+            || context_shape[0] != rows
+            || context_shape[1] != MAX_MARKET_ORDERS
+        {
+            return Err(PyValueError::new_err(format!(
+                "market_quantity_context shape {context_shape:?}, expected [{rows}, {MAX_MARKET_ORDERS}, rank]"
+            )));
+        }
+        let rank = context_shape[2];
+        let head_shape = quantity_kind_gate.shape();
+        if head_shape.len() != 3
+            || head_shape[1] != MARKET_KINDS
+            || head_shape[2] != rank
+            || head_shape[0] == 0
+        {
+            return Err(PyValueError::new_err(format!(
+                "quantity_kind_gate shape {head_shape:?}, expected [heads, {MARKET_KINDS}, {rank}]"
+            )));
+        }
+        let heads = head_shape[0];
+        ensure_shape(
+            quantity_values.shape(),
+            &[heads, MARKET_QUANTITIES, rank],
+            "quantity_values",
+        )?;
+        ensure_shape(
+            quantity_bias.shape(),
+            &[heads, MARKET_KINDS, MARKET_QUANTITIES],
+            "quantity_bias",
+        )?;
+        ensure_shape(head_ids.shape(), &[rows], "head_ids")?;
+        ensure_shape(deterministic_rows.shape(), &[rows], "deterministic_rows")?;
+        ensure_shape(temperatures.shape(), &[rows], "temperatures")?;
+        ensure_shape(unit_draws.shape(), &[rows, MAX_UNITS], "unit_draws")?;
+        ensure_shape(
+            market_kind_draws.shape(),
+            &[rows, MAX_MARKET_ORDERS],
+            "market_kind_draws",
+        )?;
+        ensure_shape(
+            market_quantity_draws.shape(),
+            &[rows, MAX_MARKET_ORDERS],
+            "market_quantity_draws",
+        )?;
+
+        require_c_input!(unit_logits, "unit_logits");
+        require_c_input!(market_kind_logits, "market_kind_logits");
+        require_c_input!(market_quantity_context, "market_quantity_context");
+        require_c_input!(quantity_kind_gate, "quantity_kind_gate");
+        require_c_input!(quantity_values, "quantity_values");
+        require_c_input!(quantity_bias, "quantity_bias");
+        require_c_input!(head_ids, "head_ids");
+        require_c_input!(unit_draws, "unit_draws");
+        require_c_input!(market_kind_draws, "market_kind_draws");
+        require_c_input!(market_quantity_draws, "market_quantity_draws");
+        require_c_input!(deterministic_rows, "deterministic_rows");
+        require_c_input!(temperatures, "temperatures");
+
+        let unit_logits = unit_logits.as_slice()?;
+        let kind_logits = market_kind_logits.as_slice()?;
+        let quantity_context = market_quantity_context.as_slice()?;
+        let kind_gate = quantity_kind_gate.as_slice()?;
+        let quantity_values = quantity_values.as_slice()?;
+        let quantity_bias = quantity_bias.as_slice()?;
+        let head_ids = head_ids.as_slice()?;
+        let unit_draws = unit_draws.as_slice()?;
+        let kind_draws = market_kind_draws.as_slice()?;
+        let quantity_draws = market_quantity_draws.as_slice()?;
+        let deterministic_rows = deterministic_rows.as_slice()?;
+        let temperatures = temperatures.as_slice()?;
+        if head_ids.iter().any(|&head| usize::from(head) >= heads) {
+            return Err(PyValueError::new_err(
+                "head_ids contains an out-of-range head",
+            ));
+        }
+        if temperatures
+            .iter()
+            .any(|&temperature| !temperature.is_finite() || temperature <= 0.0)
+        {
+            return Err(PyValueError::new_err(
+                "temperatures must contain finite positive values",
+            ));
+        }
+        for (name, values) in [
+            ("unit_draws", unit_draws.iter()),
+            ("market_kind_draws", kind_draws.iter()),
+            ("market_quantity_draws", quantity_draws.iter()),
+        ] {
+            if values
+                .clone()
+                .any(|&value| !value.is_finite() || !(0.0..1.0).contains(&value))
+            {
+                return Err(PyValueError::new_err(format!(
+                    "{name} must contain finite values in [0, 1)"
+                )));
+            }
+        }
+
+        let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
+        let mut output_slices = output_arrays.slices()?;
+        self.previous_potentials_scratch
+            .par_iter_mut()
+            .zip(self.games.par_iter())
+            .for_each(|(output, game)| *output = game.pair_potential());
+        {
+            let games = &self.games;
+            let sampled = &mut self.sampled_scratch;
+            py.detach(|| {
+                sampled
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(row, output)| {
+                        let game = &games[row / PLAYERS];
+                        let player = row % PLAYERS;
+                        let head_id = usize::from(head_ids[row]);
+                        let gate_offset = head_id * MARKET_KINDS * rank;
+                        let values_offset = head_id * MARKET_QUANTITIES * rank;
+                        let bias_offset = head_id * MARKET_KINDS * MARKET_QUANTITIES;
+                        let head = crate::core::QuantityHead {
+                            rank,
+                            kind_gate: &kind_gate[gate_offset..gate_offset + MARKET_KINDS * rank],
+                            values: &quantity_values
+                                [values_offset..values_offset + MARKET_QUANTITIES * rank],
+                            bias: &quantity_bias
+                                [bias_offset..bias_offset + MARKET_KINDS * MARKET_QUANTITIES],
+                        };
+                        let unit_offset = row * MAX_UNITS * UNIT_ACTIONS;
+                        let kind_offset = row * MAX_MARKET_ORDERS * MARKET_KINDS;
+                        let context_offset = row * MAX_MARKET_ORDERS * rank;
+                        let unit_draw_offset = row * MAX_UNITS;
+                        let market_draw_offset = row * MAX_MARKET_ORDERS;
+                        *output = game.sample_factors(
+                            player,
+                            &unit_logits[unit_offset..unit_offset + MAX_UNITS * UNIT_ACTIONS],
+                            &kind_logits
+                                [kind_offset..kind_offset + MAX_MARKET_ORDERS * MARKET_KINDS],
+                            &quantity_context
+                                [context_offset..context_offset + MAX_MARKET_ORDERS * rank],
+                            &head,
+                            &unit_draws[unit_draw_offset..unit_draw_offset + MAX_UNITS],
+                            &kind_draws[market_draw_offset..market_draw_offset + MAX_MARKET_ORDERS],
+                            &quantity_draws
+                                [market_draw_offset..market_draw_offset + MAX_MARKET_ORDERS],
+                            deterministic_rows[row],
+                            temperatures[row],
+                        );
+                    });
+            });
+        }
+        {
+            let sampled = &self.sampled_scratch;
+            py.detach(|| {
+                self.games
+                    .par_iter_mut()
+                    .zip(self.results_scratch.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(game_index, (game, result))| {
+                        let row = game_index * PLAYERS;
+                        *result = game.step(&[sampled[row].action, sampled[row + 1].action]);
+                    });
+            });
+        }
+        fill_sample_step_output(
+            &self.games,
+            &self.sampled_scratch,
+            &self.results_scratch,
+            &self.previous_potentials_scratch,
+            &mut output_slices,
+        );
+        Ok(())
+    }
+
     fn step_factors<'py>(
         &mut self,
         py: Python<'py>,
@@ -299,6 +535,406 @@ impl BatchEnv {
     }
 }
 
+fn allocate_encoded_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
+    let rows = batch * PLAYERS;
+    let output = PyDict::new(py);
+    output.set_item(
+        "board",
+        PyArray4::<f16>::zeros(py, [rows, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE], false),
+    )?;
+    output.set_item(
+        "global_features",
+        PyArray2::<f16>::zeros(py, [rows, GLOBAL_FEATURES], false),
+    )?;
+    output.set_item(
+        "critic_features",
+        PyArray2::<f16>::zeros(py, [rows, CRITIC_FEATURES], false),
+    )?;
+    output.set_item(
+        "units",
+        PyArray3::<f16>::zeros(py, [rows, MAX_UNITS, UNIT_FEATURES], false),
+    )?;
+    output.set_item(
+        "unit_positions",
+        PyArray3::<i64>::zeros(py, [rows, MAX_UNITS, 2], false),
+    )?;
+    output.set_item(
+        "unit_active",
+        PyArray2::<bool>::zeros(py, [rows, MAX_UNITS], false),
+    )?;
+    output.set_item("potentials", PyArray1::<f32>::zeros(py, batch, false))?;
+    Ok(output)
+}
+
+fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
+    let rows = batch * PLAYERS;
+    let output = PyDict::new(py);
+    output.set_item(
+        "unit_actions",
+        PyArray2::<u8>::zeros(py, [rows, MAX_UNITS], false),
+    )?;
+    for name in ["market_kinds", "market_quantities"] {
+        output.set_item(
+            name,
+            PyArray2::<u8>::zeros(py, [rows, MAX_MARKET_ORDERS], false),
+        )?;
+    }
+    output.set_item(
+        "unit_masks",
+        PyArray3::<bool>::zeros(py, [rows, MAX_UNITS, UNIT_ACTIONS], false),
+    )?;
+    output.set_item(
+        "market_kind_masks",
+        PyArray3::<bool>::zeros(py, [rows, MAX_MARKET_ORDERS, MARKET_KINDS], false),
+    )?;
+    output.set_item(
+        "market_quantity_masks",
+        PyArray3::<bool>::zeros(py, [rows, MAX_MARKET_ORDERS, MARKET_QUANTITIES], false),
+    )?;
+    output.set_item(
+        "unit_active",
+        PyArray2::<bool>::zeros(py, [rows, MAX_UNITS], false),
+    )?;
+    for name in ["market_active", "market_quantity_active"] {
+        output.set_item(
+            name,
+            PyArray2::<bool>::zeros(py, [rows, MAX_MARKET_ORDERS], false),
+        )?;
+    }
+    output.set_item(
+        "unit_logprobs",
+        PyArray2::<f32>::zeros(py, [rows, MAX_UNITS], false),
+    )?;
+    for name in ["market_kind_logprobs", "market_quantity_logprobs"] {
+        output.set_item(
+            name,
+            PyArray2::<f32>::zeros(py, [rows, MAX_MARKET_ORDERS], false),
+        )?;
+    }
+    output.set_item("entropy", PyArray1::<f32>::zeros(py, rows, false))?;
+    for name in ["rewards", "final_money", "shaped_rewards"] {
+        output.set_item(name, PyArray2::<f32>::zeros(py, [batch, PLAYERS], false))?;
+    }
+    output.set_item("dones", PyArray1::<bool>::zeros(py, batch, false))?;
+    for name in ["previous_potentials", "potentials"] {
+        output.set_item(name, PyArray1::<f32>::zeros(py, batch, false))?;
+    }
+    Ok(output)
+}
+
+struct SampleOutputArrays<'py> {
+    unit_actions: PyReadwriteArray2<'py, u8>,
+    market_kinds: PyReadwriteArray2<'py, u8>,
+    market_quantities: PyReadwriteArray2<'py, u8>,
+    unit_masks: PyReadwriteArray3<'py, bool>,
+    market_kind_masks: PyReadwriteArray3<'py, bool>,
+    market_quantity_masks: PyReadwriteArray3<'py, bool>,
+    unit_active: PyReadwriteArray2<'py, bool>,
+    market_active: PyReadwriteArray2<'py, bool>,
+    market_quantity_active: PyReadwriteArray2<'py, bool>,
+    unit_logprobs: PyReadwriteArray2<'py, f32>,
+    market_kind_logprobs: PyReadwriteArray2<'py, f32>,
+    market_quantity_logprobs: PyReadwriteArray2<'py, f32>,
+    entropy: PyReadwriteArray1<'py, f32>,
+    rewards: PyReadwriteArray2<'py, f32>,
+    money: PyReadwriteArray2<'py, f32>,
+    dones: PyReadwriteArray1<'py, bool>,
+    previous: PyReadwriteArray1<'py, f32>,
+    potentials: PyReadwriteArray1<'py, f32>,
+    shaped: PyReadwriteArray2<'py, f32>,
+}
+
+impl<'py> SampleOutputArrays<'py> {
+    fn new(output: &Bound<'py, PyDict>, rows: usize, batch: usize) -> PyResult<Self> {
+        macro_rules! output_array {
+            ($name:literal, $type:ty, $shape:expr) => {{
+                let array = required_output(output, $name)?.cast_into::<$type>()?;
+                ensure_shape(array.shape(), &$shape, concat!("output ", $name))?;
+                if !array.is_c_contiguous() {
+                    return Err(non_contiguous($name));
+                }
+                array.try_readwrite()?
+            }};
+        }
+        Ok(Self {
+            unit_actions: output_array!("unit_actions", PyArray2<u8>, [rows, MAX_UNITS]),
+            market_kinds: output_array!("market_kinds", PyArray2<u8>, [rows, MAX_MARKET_ORDERS]),
+            market_quantities: output_array!(
+                "market_quantities",
+                PyArray2<u8>,
+                [rows, MAX_MARKET_ORDERS]
+            ),
+            unit_masks: output_array!(
+                "unit_masks",
+                PyArray3<bool>,
+                [rows, MAX_UNITS, UNIT_ACTIONS]
+            ),
+            market_kind_masks: output_array!(
+                "market_kind_masks",
+                PyArray3<bool>,
+                [rows, MAX_MARKET_ORDERS, MARKET_KINDS]
+            ),
+            market_quantity_masks: output_array!(
+                "market_quantity_masks",
+                PyArray3<bool>,
+                [rows, MAX_MARKET_ORDERS, MARKET_QUANTITIES]
+            ),
+            unit_active: output_array!("unit_active", PyArray2<bool>, [rows, MAX_UNITS]),
+            market_active: output_array!(
+                "market_active",
+                PyArray2<bool>,
+                [rows, MAX_MARKET_ORDERS]
+            ),
+            market_quantity_active: output_array!(
+                "market_quantity_active",
+                PyArray2<bool>,
+                [rows, MAX_MARKET_ORDERS]
+            ),
+            unit_logprobs: output_array!("unit_logprobs", PyArray2<f32>, [rows, MAX_UNITS]),
+            market_kind_logprobs: output_array!(
+                "market_kind_logprobs",
+                PyArray2<f32>,
+                [rows, MAX_MARKET_ORDERS]
+            ),
+            market_quantity_logprobs: output_array!(
+                "market_quantity_logprobs",
+                PyArray2<f32>,
+                [rows, MAX_MARKET_ORDERS]
+            ),
+            entropy: output_array!("entropy", PyArray1<f32>, [rows]),
+            rewards: output_array!("rewards", PyArray2<f32>, [batch, PLAYERS]),
+            money: output_array!("final_money", PyArray2<f32>, [batch, PLAYERS]),
+            dones: output_array!("dones", PyArray1<bool>, [batch]),
+            previous: output_array!("previous_potentials", PyArray1<f32>, [batch]),
+            potentials: output_array!("potentials", PyArray1<f32>, [batch]),
+            shaped: output_array!("shaped_rewards", PyArray2<f32>, [batch, PLAYERS]),
+        })
+    }
+
+    fn slices(&mut self) -> PyResult<SampleOutputSlices<'_>> {
+        let Self {
+            unit_actions,
+            market_kinds,
+            market_quantities,
+            unit_masks,
+            market_kind_masks,
+            market_quantity_masks,
+            unit_active,
+            market_active,
+            market_quantity_active,
+            unit_logprobs,
+            market_kind_logprobs,
+            market_quantity_logprobs,
+            entropy,
+            rewards,
+            money,
+            dones,
+            previous,
+            potentials,
+            shaped,
+        } = self;
+        Ok(SampleOutputSlices {
+            unit_actions: unit_actions
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("unit_actions"))?,
+            market_kinds: market_kinds
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_kinds"))?,
+            market_quantities: market_quantities
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_quantities"))?,
+            unit_masks: unit_masks
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("unit_masks"))?,
+            market_kind_masks: market_kind_masks
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_kind_masks"))?,
+            market_quantity_masks: market_quantity_masks
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_quantity_masks"))?,
+            unit_active: unit_active
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("unit_active"))?,
+            market_active: market_active
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_active"))?,
+            market_quantity_active: market_quantity_active
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_quantity_active"))?,
+            unit_logprobs: unit_logprobs
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("unit_logprobs"))?,
+            market_kind_logprobs: market_kind_logprobs
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_kind_logprobs"))?,
+            market_quantity_logprobs: market_quantity_logprobs
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_quantity_logprobs"))?,
+            entropy: entropy
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("entropy"))?,
+            rewards: rewards
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("rewards"))?,
+            money: money
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("final_money"))?,
+            dones: dones.as_slice_mut().map_err(|_| non_contiguous("dones"))?,
+            previous: previous
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("previous_potentials"))?,
+            potentials: potentials
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("potentials"))?,
+            shaped: shaped
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("shaped_rewards"))?,
+        })
+    }
+}
+
+struct SampleOutputSlices<'a> {
+    unit_actions: &'a mut [u8],
+    market_kinds: &'a mut [u8],
+    market_quantities: &'a mut [u8],
+    unit_masks: &'a mut [bool],
+    market_kind_masks: &'a mut [bool],
+    market_quantity_masks: &'a mut [bool],
+    unit_active: &'a mut [bool],
+    market_active: &'a mut [bool],
+    market_quantity_active: &'a mut [bool],
+    unit_logprobs: &'a mut [f32],
+    market_kind_logprobs: &'a mut [f32],
+    market_quantity_logprobs: &'a mut [f32],
+    entropy: &'a mut [f32],
+    rewards: &'a mut [f32],
+    money: &'a mut [f32],
+    dones: &'a mut [bool],
+    previous: &'a mut [f32],
+    potentials: &'a mut [f32],
+    shaped: &'a mut [f32],
+}
+
+fn required_output<'py>(output: &Bound<'py, PyDict>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    output
+        .get_item(name)?
+        .ok_or_else(|| PyKeyError::new_err(format!("missing output array {name:?}")))
+}
+
+fn non_contiguous(name: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "output array {name:?} must be writable and C-contiguous"
+    ))
+}
+
+fn fill_encoded_output(py: Python<'_>, games: &[Game], output: &Bound<'_, PyDict>) -> PyResult<()> {
+    let rows = games.len() * PLAYERS;
+    macro_rules! output_array {
+        ($name:literal, $type:ty, $shape:expr) => {{
+            let array = required_output(output, $name)?.cast_into::<$type>()?;
+            ensure_shape(array.shape(), &$shape, concat!("output ", $name))?;
+            if !array.is_c_contiguous() {
+                return Err(non_contiguous($name));
+            }
+            array.try_readwrite()?
+        }};
+    }
+    let mut board = output_array!(
+        "board",
+        PyArray4<f16>,
+        [rows, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE]
+    );
+    let mut globals = output_array!("global_features", PyArray2<f16>, [rows, GLOBAL_FEATURES]);
+    let mut critic = output_array!("critic_features", PyArray2<f16>, [rows, CRITIC_FEATURES]);
+    let mut units = output_array!("units", PyArray3<f16>, [rows, MAX_UNITS, UNIT_FEATURES]);
+    let mut positions = output_array!("unit_positions", PyArray3<i64>, [rows, MAX_UNITS, 2]);
+    let mut active = output_array!("unit_active", PyArray2<bool>, [rows, MAX_UNITS]);
+    let mut potentials = output_array!("potentials", PyArray1<f32>, [games.len()]);
+
+    let board = board.as_slice_mut().map_err(|_| non_contiguous("board"))?;
+    let globals = globals
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("global_features"))?;
+    let critic = critic
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("critic_features"))?;
+    let units = units.as_slice_mut().map_err(|_| non_contiguous("units"))?;
+    let positions = positions
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_positions"))?;
+    let active = active
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_active"))?;
+    let potentials = potentials
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("potentials"))?;
+
+    const BOARD_VALUES: usize = BOARD_CHANNELS * BOARD_SIZE * BOARD_SIZE;
+    const UNIT_VALUES: usize = MAX_UNITS * UNIT_FEATURES;
+    py.detach(|| {
+        board
+            .par_chunks_mut(BOARD_VALUES)
+            .zip(globals.par_chunks_mut(GLOBAL_FEATURES))
+            .zip(critic.par_chunks_mut(CRITIC_FEATURES))
+            .zip(units.par_chunks_mut(UNIT_VALUES))
+            .zip(positions.par_chunks_mut(MAX_UNITS * 2))
+            .zip(active.par_chunks_mut(MAX_UNITS))
+            .enumerate()
+            .for_each(
+                |(row, (((((board, globals), critic), units), positions), active))| {
+                    let mut board_f32 = [0.0; BOARD_VALUES];
+                    let mut globals_f32 = [0.0; GLOBAL_FEATURES];
+                    let mut critic_f32 = [0.0; CRITIC_FEATURES];
+                    let mut units_f32 = [0.0; UNIT_VALUES];
+                    games[row / PLAYERS].encode_player(
+                        row % PLAYERS,
+                        &mut board_f32,
+                        &mut globals_f32,
+                        &mut critic_f32,
+                        &mut units_f32,
+                        positions,
+                        active,
+                    );
+                    for (target, value) in board.iter_mut().zip(board_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in globals.iter_mut().zip(globals_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in critic.iter_mut().zip(critic_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in units.iter_mut().zip(units_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                },
+            );
+        potentials
+            .par_iter_mut()
+            .zip(games.par_iter())
+            .for_each(|(output, game)| *output = game.pair_potential());
+    });
+    Ok(())
+}
+
+fn ensure_shape(actual: &[usize], expected: &[usize], name: &str) -> PyResult<()> {
+    if actual != expected {
+        return Err(PyValueError::new_err(format!(
+            "{name} shape {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_seeds(seeds: &[u64]) -> PyResult<()> {
+    if seeds.iter().any(|&seed| seed > MAX_SAFE_SEED) {
+        return Err(PyValueError::new_err(format!(
+            "seed exceeds exact CPython-compatible maximum {MAX_SAFE_SEED}"
+        )));
+    }
+    Ok(())
+}
+
 fn extract_compact_actions(
     games: usize,
     unit_actions: PyReadonlyArray3<'_, u8>,
@@ -334,34 +970,87 @@ fn extract_compact_actions(
         .collect())
 }
 
-struct EncodedRow {
-    board: Vec<f32>,
-    globals: Vec<f32>,
-    critic: Vec<f32>,
-    units: Vec<f32>,
-    positions: Vec<i64>,
-    active: Vec<bool>,
-}
+fn fill_sample_step_output(
+    games: &[Game],
+    sampled: &[SampledFactors],
+    results: &[StepResult],
+    previous_potentials: &[f32],
+    output: &mut SampleOutputSlices<'_>,
+) {
+    let SampleOutputSlices {
+        unit_actions,
+        market_kinds,
+        market_quantities,
+        unit_masks,
+        market_kind_masks,
+        market_quantity_masks,
+        unit_active,
+        market_active,
+        market_quantity_active,
+        unit_logprobs,
+        market_kind_logprobs,
+        market_quantity_logprobs,
+        entropy,
+        rewards,
+        money,
+        dones,
+        previous,
+        potentials,
+        shaped,
+    } = output;
 
-fn encode_row(game: &Game, player: usize) -> EncodedRow {
-    let mut row = EncodedRow {
-        board: vec![0.0; BOARD_CHANNELS * BOARD_SIZE * BOARD_SIZE],
-        globals: vec![0.0; GLOBAL_FEATURES],
-        critic: vec![0.0; CRITIC_FEATURES],
-        units: vec![0.0; MAX_UNITS * UNIT_FEATURES],
-        positions: vec![0; MAX_UNITS * 2],
-        active: vec![false; MAX_UNITS],
-    };
-    game.encode_player(
-        player,
-        &mut row.board,
-        &mut row.globals,
-        &mut row.critic,
-        &mut row.units,
-        &mut row.positions,
-        &mut row.active,
-    );
-    row
+    for (row_index, row) in sampled.iter().enumerate() {
+        let unit_offset = row_index * MAX_UNITS;
+        let market_offset = row_index * MAX_MARKET_ORDERS;
+        let unit_mask_offset = row_index * MAX_UNITS * UNIT_ACTIONS;
+        let kind_mask_offset = row_index * MAX_MARKET_ORDERS * MARKET_KINDS;
+        let quantity_mask_offset = row_index * MAX_MARKET_ORDERS * MARKET_QUANTITIES;
+        unit_actions[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.action.units);
+        market_kinds[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.action.market_kinds);
+        market_quantities[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.action.market_quantities);
+        unit_masks[unit_mask_offset..unit_mask_offset + row.masks.unit.len()]
+            .copy_from_slice(&row.masks.unit);
+        market_kind_masks[kind_mask_offset..kind_mask_offset + row.masks.market_kind.len()]
+            .copy_from_slice(&row.masks.market_kind);
+        market_quantity_masks
+            [quantity_mask_offset..quantity_mask_offset + row.masks.market_quantity.len()]
+            .copy_from_slice(&row.masks.market_quantity);
+        unit_active[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.masks.unit_active);
+        market_active[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.masks.market_active);
+        market_quantity_active[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.masks.market_quantity_active);
+        unit_logprobs[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.unit_logprobs);
+        market_kind_logprobs[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.market_kind_logprobs);
+        market_quantity_logprobs[market_offset..market_offset + MAX_MARKET_ORDERS]
+            .copy_from_slice(&row.market_quantity_logprobs);
+        entropy[row_index] = row.mean_entropy;
+    }
+    for (game_index, ((game, result), &pre)) in games
+        .iter()
+        .zip(results)
+        .zip(previous_potentials)
+        .enumerate()
+    {
+        let offset = game_index * PLAYERS;
+        rewards[offset..offset + PLAYERS].copy_from_slice(&result.rewards);
+        money[offset..offset + PLAYERS].copy_from_slice(&result.money);
+        dones[game_index] = result.done;
+        previous[game_index] = pre;
+        let post = game.pair_potential();
+        potentials[game_index] = post;
+        let reward_zero = if result.done {
+            let margin = result.money[0] - result.money[1];
+            f32::from(margin > 0.0) - f32::from(margin < 0.0) - pre
+        } else {
+            post - pre
+        };
+        shaped[offset] = reward_zero;
+        shaped[offset + 1] = -reward_zero;
+    }
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
