@@ -40,7 +40,7 @@ from kaggriculture.constants import (
     market_price,
 )
 from kaggriculture.encoding import EncodedObservation, encode_observation
-from kaggriculture.model import ActorOutput, DistributionalCritic, FarmActor
+from kaggriculture.model import ActorOutput, FarmActor
 
 _MARKET_SEED_ITEMS = dict(
     zip(
@@ -86,8 +86,9 @@ class ActionFactors:
     unit_logprobs: np.ndarray
     market_kind_logprobs: np.ndarray
     market_quantity_logprobs: np.ndarray
-    values: np.ndarray
-    entropy: float
+    # Behavior entropy summed over each row's active components. Keeping the
+    # per-row sums lets any trajectory subset recover its exact mean entropy.
+    entropy_sums: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -335,7 +336,6 @@ def _apply_ledger_order(
 @torch.inference_mode()
 def act_batch(
     actor: FarmActor,
-    critic: DistributionalCritic | None,
     observations: list[dict[str, Any]],
     opponent_privates: list[dict[str, Any] | None] | None = None,
     *,
@@ -515,10 +515,6 @@ def act_batch(
                 ledgers[row],
             )
 
-    values = np.zeros(batch_size, dtype=np.float32)
-    if critic is not None:
-        critic_logits = critic(tensors.board, tensors.critic_features)
-        values = critic.value(critic_logits).cpu().numpy().astype(np.float32, copy=False)
     actions = [
         compile_action(observation, units, kinds, quantities)
         for observation, units, kinds, quantities in zip(
@@ -529,12 +525,11 @@ def act_batch(
             strict=True,
         )
     ]
-    component_count = unit_active.sum() + market_active.sum() + quantity_active.sum()
-    entropy_sum = (
-        (unit_entropies * unit_active).sum()
-        + (kind_entropies * market_active).sum()
-        + (quantity_entropies * quantity_active).sum()
-    )
+    entropy_sums = (
+        (unit_entropies * unit_active).sum(axis=1)
+        + (kind_entropies * market_active).sum(axis=1)
+        + (quantity_entropies * quantity_active).sum(axis=1)
+    ).astype(np.float64)
     factors = ActionFactors(
         unit_actions=unit_actions,
         market_kinds=market_kinds,
@@ -548,7 +543,6 @@ def act_batch(
         unit_logprobs=unit_logprobs,
         market_kind_logprobs=kind_logprobs,
         market_quantity_logprobs=quantity_logprobs,
-        values=values,
-        entropy=float(entropy_sum / max(1, component_count)),
+        entropy_sums=entropy_sums,
     )
     return PolicyStep(actions=actions, encoded=encoded, factors=factors)

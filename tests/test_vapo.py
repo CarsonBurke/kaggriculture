@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+import kaggriculture.vapo
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.rollout import collect_self_play
@@ -21,6 +22,8 @@ from kaggriculture.vapo import (
     _validate_staged_action_masks,
     generalized_advantage_and_targets,
     make_optimizers,
+    replay_behavior_values,
+    update_replay_parity,
     update_vapo,
 )
 
@@ -34,10 +37,7 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(model_config)
-    critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(
-        actor, critic, games=1, seed_start=89, episode_steps=3, sampling_seed=2
-    )
+    rollout = collect_self_play(actor, games=1, seed_start=89, episode_steps=3, sampling_seed=2)
     rollout.unit_masks[0, 0, 0].fill(False)
     device = torch.device("cpu")
     staged = {
@@ -168,7 +168,7 @@ def test_actor_gae_and_critic_monte_carlo_targets_are_decoupled() -> None:
     assert not torch.equal(targets, expected_advantages + values)
 
 
-def test_critic_targets_are_independent_of_actor_lambda_and_old_values() -> None:
+def test_critic_targets_are_independent_of_actor_lambda_and_behavior_values() -> None:
     rewards = torch.tensor([[0.25, -0.4, 0.6], [-0.1, 0.2, -0.3]])
     valid = torch.ones_like(rewards)
     first = generalized_advantage_and_targets(
@@ -250,9 +250,7 @@ def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
         use_bfloat16=False,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    rollout = collect_self_play(
-        actor, critic, games=1, seed_start=91, episode_steps=3, sampling_seed=4
-    )
+    rollout = collect_self_play(actor, games=1, seed_start=91, episode_steps=3, sampling_seed=4)
 
     update_vapo(
         actor,
@@ -284,10 +282,7 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(model_config)
-    critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(
-        actor, critic, games=1, seed_start=92, episode_steps=3, sampling_seed=6
-    )
+    rollout = collect_self_play(actor, games=1, seed_start=92, episode_steps=3, sampling_seed=6)
     flat = rollout.valid.reshape(-1)
     board = torch.from_numpy(rollout.board.reshape(-1, *rollout.board.shape[2:])[flat]).float()
     global_features = torch.from_numpy(
@@ -337,15 +332,47 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
         torch.testing.assert_close(ratios, torch.ones_like(ratios), atol=1e-5, rtol=1e-5)
 
 
+def test_update_replay_parity_gates_the_update_path_forward() -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    # A horizon long enough for hires and executed trades keeps every action
+    # component active, so the gate covers all three heads non-vacuously.
+    rollout = collect_self_play(actor, games=1, seed_start=94, episode_steps=32, sampling_seed=12)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    parity = update_replay_parity(actor, rollout, minibatch_size=3)
+
+    for component in ("unit", "kind", "quantity"):
+        assert parity[f"update_replay_{component}_active_count"] > 0
+        assert parity[f"update_replay_{component}_ratio_max_abs_error"] < 1e-4
+    assert parity["update_replay_max_ratio_error"] == max(
+        parity[f"update_replay_{component}_ratio_max_abs_error"]
+        for component in ("unit", "kind", "quantity")
+    )
+    for name, parameter in actor.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+    # A behavior/update mismatch must be visible as ratio drift: stale stored
+    # likelihoods shifted by log(2) produce ratios near two.
+    rollout.old_market_kind_logprobs[...] -= math.log(2.0)
+    rollout.old_market_quantity_logprobs[...] -= math.log(2.0)
+    drifted = update_replay_parity(actor, rollout, minibatch_size=3)
+    assert drifted["update_replay_kind_ratio_max_abs_error"] > 0.9
+    assert drifted["update_replay_quantity_ratio_max_abs_error"] > 0.9
+
+    with pytest.raises(ValueError, match="minibatch size"):
+        update_replay_parity(actor, rollout, minibatch_size=0)
+
+
 def test_over_target_pre_step_kl_does_not_update_actor() -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(
-        actor, critic, games=1, seed_start=93, episode_steps=3, sampling_seed=8
-    )
+    rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
     # Simulate behavior likelihoods from a stale policy. The unchanged actor is
     # already far beyond the configured trust region before any optimizer step.
     rollout.old_unit_logprobs[...] -= 1.0
@@ -391,9 +418,7 @@ def test_one_vapo_update_is_finite() -> None:
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(
-        actor, critic, games=2, seed_start=90, episode_steps=8, sampling_seed=3
-    )
+    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
     config = VapoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
 
@@ -414,9 +439,11 @@ def test_one_vapo_update_is_finite() -> None:
     assert metrics["actor_gae_lambda"] == config.actor_gae_lambda
     assert metrics["critic_gae_lambda"] == 1.0
     assert metrics["gamma"] == config.gamma
+    # Critic targets are exact Monte Carlo suffix returns, independent of the
+    # replayed behavior values, so a zero reference reproduces them exactly.
     value_targets = generalized_advantage_and_targets(
         torch.from_numpy(rollout.rewards),
-        torch.from_numpy(rollout.old_values),
+        torch.zeros_like(torch.from_numpy(rollout.rewards)),
         torch.from_numpy(rollout.valid),
         actor_gae_lambda=config.actor_gae_lambda,
         gamma=config.gamma,
@@ -426,17 +453,21 @@ def test_one_vapo_update_is_finite() -> None:
     assert metrics["value_target_max"] == pytest.approx(float(valid_targets.max()))
 
 
-def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero() -> None:
+def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero(monkeypatch) -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(
-        actor, critic, games=1, seed_start=94, episode_steps=3, sampling_seed=10
-    )
+    rollout = collect_self_play(actor, games=1, seed_start=94, episode_steps=3, sampling_seed=10)
     rollout.rewards.fill(0.0)
-    rollout.old_values.fill(0.0)
+    # Zero rewards alone leave value-driven GAE deltas; zero replayed values
+    # too so every advantage is exactly zero and entropy carries no gradient.
+    monkeypatch.setattr(
+        kaggriculture.vapo,
+        "replay_behavior_values",
+        lambda critic, board, critic_features, **kwargs: torch.zeros(board.shape[0]),
+    )
     config = VapoConfig(
         epochs=1,
         minibatch_size=rollout.states,
@@ -462,3 +493,74 @@ def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero() -> None:
     assert metrics["entropy"] > 0.0
     for name, parameter in actor.named_parameters():
         torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+
+def test_behavior_values_are_replayed_before_the_update_mutates_the_critic(monkeypatch) -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(actor, games=1, seed_start=96, episode_steps=3, sampling_seed=14)
+    critic_before = {
+        name: parameter.detach().clone() for name, parameter in critic.named_parameters()
+    }
+    observed: dict[str, float | int] = {"calls": 0, "critic_drift": float("inf")}
+    real_replay = kaggriculture.vapo.replay_behavior_values
+
+    def recording_replay(critic_module, board, critic_features, **kwargs):
+        observed["calls"] = int(observed["calls"]) + 1
+        observed["critic_drift"] = max(
+            (parameter - critic_before[name]).abs().max().item()
+            for name, parameter in critic_module.named_parameters()
+        )
+        return real_replay(critic_module, board, critic_features, **kwargs)
+
+    monkeypatch.setattr(kaggriculture.vapo, "replay_behavior_values", recording_replay)
+    config = VapoConfig(epochs=2, minibatch_size=8, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+
+    update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(15),
+    )
+
+    # Replaying collection-time values is only faithful while the critic still
+    # holds its behavior-time weights: exactly one replay, at zero drift, even
+    # though the following epochs then mutate the critic.
+    assert observed["calls"] == 1
+    assert observed["critic_drift"] == 0.0
+    assert any(
+        not torch.equal(parameter, critic_before[name])
+        for name, parameter in critic.named_parameters()
+    )
+
+
+def test_behavior_value_replay_is_chunk_invariant_and_restores_mode() -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        FarmActor(model_config), games=1, seed_start=95, episode_steps=4, sampling_seed=12
+    )
+    board = _stage_tensor(rollout.board, torch.device("cpu"))
+    critic_features = _stage_tensor(rollout.critic_features, torch.device("cpu"))
+    critic.train()
+
+    replayed = replay_behavior_values(critic, board, critic_features, chunk_size=2)
+
+    assert critic.training
+    with torch.inference_mode():
+        critic.eval()
+        expected = critic.value(critic(board.float(), critic_features.float()))
+        critic.train()
+    assert replayed.shape == (board.shape[0],)
+    torch.testing.assert_close(replayed, expected)
+    with pytest.raises(ValueError, match="rows must align"):
+        replay_behavior_values(critic, board, critic_features[:1])

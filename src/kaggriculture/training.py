@@ -20,7 +20,7 @@ from kaggriculture.provenance import validate_run_provenance, validate_source_id
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.vapo import VapoConfig
 
-CHECKPOINT_FORMAT_VERSION = 7
+CHECKPOINT_FORMAT_VERSION = 8
 
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:

@@ -45,9 +45,8 @@ from kaggriculture.provenance import (
 from kaggriculture.rollout import (
     RolloutBatch,
     allocate_rollout_storage,
-    collect_frozen_opponents_play_rust,
-    collect_self_play_rust,
-    merge_contiguous_rollouts,
+    collect_mixed_play_rust,
+    slice_trajectories,
 )
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import (
@@ -448,6 +447,7 @@ def main() -> None:
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
+        compile_update=args.compile_models,
     )
     training_data_config = _training_data_config(args, device)
     actor = FarmActor(model_config).to(device)
@@ -605,9 +605,11 @@ def main() -> None:
         writer_factory=lambda path: SummaryWriter(path),
     )
     opponent_pool = FrozenActorPool(model_config, device)
-    # One reusable trajectory-major arena holds both rollout parts, so each
-    # iteration avoids a multi-gigabyte host concatenation and can stage the
-    # replay to the accelerator from pinned memory.
+    # One reusable trajectory-major pinned arena receives the whole mixed
+    # wave (self-play rows first, league rows after) directly from the
+    # collector, so the replay stages to the accelerator without any host
+    # concatenation. The self-play prefix serves iterations without league
+    # play, which produce fewer trajectories.
     self_play_rows = args.games * 2
     rollout_arena = allocate_rollout_storage(
         self_play_rows + args.league_games,
@@ -615,11 +617,6 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
     self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
-    league_storage = (
-        {name: array[self_play_rows:] for name, array in rollout_arena.items()}
-        if args.league_games
-        else None
-    )
 
     commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
     pending_commit: Future[None] | None = None
@@ -676,35 +673,20 @@ def main() -> None:
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
             break
         iteration_started = time.monotonic()
-        self_play_sampling_seed = int(generator.integers(0, np.iinfo(np.int64).max))
-        self_play = collect_self_play_rust(
-            actor,
-            critic,
-            games=args.games,
-            seed_start=next_seed,
-            episode_steps=args.episode_steps,
-            temperature=args.temperature,
-            sampling_seed=self_play_sampling_seed,
-            compile_models=args.compile_models,
-            storage=self_play_storage,
-        )
-        next_seed += args.games
-        self_play_diagnostics = {
-            f"self_play_{name}": value for name, value in rollout_diagnostics(self_play).items()
-        }
+        sampling_seed = int(generator.integers(0, np.iinfo(np.int64).max))
         opponent_checkpoint = ""
         league_diagnostics = {}
-        league = None
         selections = _select_league_opponents(
             args,
             list_actor_snapshots(league_directory),
             iteration,
             generator,
         )
-        if args.league_games and selections:
+        league_games = args.league_games if selections else 0
+        if league_games:
             opponents = opponent_pool.acquire([selection.ref.path for selection in selections])
             assignments = _balanced_assignments(
-                args.league_games,
+                league_games,
                 len(opponents),
                 generator,
             )
@@ -719,35 +701,47 @@ def main() -> None:
                 [row.category != "active" for row in selections],
                 dtype=np.bool_,
             )
-            league_sampling_seed = int(generator.integers(0, np.iinfo(np.int64).max))
-            league = collect_frozen_opponents_play_rust(
-                actor,
-                critic,
-                opponents,
-                games=args.league_games,
-                opponent_indices=assignments,
-                seed_start=next_seed,
-                episode_steps=args.episode_steps,
-                temperature=args.temperature,
-                opponent_temperature=args.opponent_temperature,
-                opponent_temperatures=opponent_temperatures,
-                deterministic_opponents=deterministic_opponents,
-                sampling_seed=league_sampling_seed,
-                compile_models=args.compile_models,
-                storage=league_storage,
-            )
-            next_seed += args.league_games
-            league_diagnostics = {
-                f"league_{name}": value for name, value in rollout_diagnostics(league).items()
-            }
-            league_diagnostics.update(_league_opponent_diagnostics(league, assignments, selections))
             opponent_checkpoint = ",".join(row.ref.path.name for row in selections)
-        if league is not None:
-            rollout = merge_contiguous_rollouts(rollout_arena, [self_play, league])
-            del league
-        else:
-            rollout = self_play
-        del self_play
+        # Self-play and league games advance in one native wave, so the
+        # learner forward covers every current-policy row at once and the
+        # collector writes straight into the shared arena.
+        rollout = collect_mixed_play_rust(
+            actor,
+            opponents if league_games else (),
+            self_play_games=args.games,
+            league_games=league_games,
+            opponent_indices=assignments if league_games else None,
+            seed_start=next_seed,
+            episode_steps=args.episode_steps,
+            temperature=args.temperature,
+            opponent_temperature=args.opponent_temperature,
+            opponent_temperatures=opponent_temperatures if league_games else None,
+            deterministic_opponents=deterministic_opponents if league_games else None,
+            sampling_seed=sampling_seed,
+            compile_models=args.compile_models,
+            storage=rollout_arena if league_games else self_play_storage,
+        )
+        next_seed += args.games + league_games
+        # The wave's wall-clock is indivisible; per-part timing keys would
+        # merely repeat it, so slice diagnostics keep only outcome metrics.
+        indivisible_timings = ("rollout_seconds", "rollout_states_per_second")
+        self_play_diagnostics = {
+            f"self_play_{name}": value
+            for name, value in rollout_diagnostics(
+                slice_trajectories(rollout, 0, self_play_rows)
+            ).items()
+            if name not in indivisible_timings
+        }
+        if league_games:
+            league_part = slice_trajectories(rollout, self_play_rows, rollout.trajectories)
+            league_diagnostics = {
+                f"league_{name}": value
+                for name, value in rollout_diagnostics(league_part).items()
+                if name not in indivisible_timings
+            }
+            league_diagnostics.update(
+                _league_opponent_diagnostics(league_part, assignments, selections)
+            )
         update_started = time.monotonic()
         update_metrics = update_vapo(
             actor,

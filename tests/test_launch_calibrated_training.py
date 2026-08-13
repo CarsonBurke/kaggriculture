@@ -83,7 +83,8 @@ def _records(
             "cudnn_benchmark": True,
         },
         "model": module._production_model_config(),
-        "vapo": module._production_vapo_config(),
+        "vapo": module._production_vapo_config(compiled=compiled),
+        "max_update_replay_error": 1e-3,
         "torch": str(module.torch.__version__),
     }
     identity = module.source_identity()
@@ -103,9 +104,8 @@ def _records(
                 "self_play_games": games,
                 "league_games": 96,
                 "physical_games": games + 96,
-                "self_play_rollout_seconds": rollout_seconds * 0.6,
-                "league_rollout_seconds": rollout_seconds * 0.4,
                 "rollout_seconds": rollout_seconds,
+                "update_replay_parity_seconds": total_seconds * 0.05,
                 "update_seconds": total_seconds - rollout_seconds,
                 "total_seconds": total_seconds,
                 "iterations_per_hour": 3600.0 / total_seconds,
@@ -301,7 +301,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert decision["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
     assert "--compile-models" in decision["training_command"]
     assert "--entropy-coefficient" not in decision["training_command"]
-    assert "entropy_coefficient" not in module._production_vapo_config()
+    assert "entropy_coefficient" not in module._production_vapo_config(compiled=False)
     assert decision["source_identity"] == module.source_identity()
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]
@@ -315,7 +315,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--gamma", "1.0"),
         (
             "--actor-gae-lambda",
-            str(module._production_vapo_config()["actor_gae_lambda"]),
+            str(module._production_vapo_config(compiled=False)["actor_gae_lambda"]),
         ),
         ("--target-kl", "0.03"),
     ):

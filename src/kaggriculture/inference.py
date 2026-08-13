@@ -13,8 +13,8 @@ from kaggriculture.policy import act_batch
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
-LEGACY_CHECKPOINT_FORMAT_VERSION = 6
-CHECKPOINT_FORMAT_VERSION = 7
+LEGACY_CHECKPOINT_FORMAT_VERSION = 7
+CHECKPOINT_FORMAT_VERSION = 8
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset(
     (ACTOR_ARTIFACT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION)
 )
@@ -88,7 +88,6 @@ class CheckpointAgent:
     def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
         return act_batch(
             self.actor,
-            None,
             [observation],
             deterministic=True,
         ).actions[0]

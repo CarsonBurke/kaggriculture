@@ -135,8 +135,10 @@ def _production_model_config() -> dict[str, int | float]:
     return ModelConfig().to_dict()
 
 
-def _production_vapo_config() -> dict[str, int | float | bool]:
-    return asdict(VapoConfig(epochs=1, minibatch_size=2048, target_kl=0.03))
+def _production_vapo_config(*, compiled: bool) -> dict[str, int | float | bool]:
+    return asdict(
+        VapoConfig(epochs=1, minibatch_size=2048, target_kl=0.03, compile_update=compiled)
+    )
 
 
 def _require_positive_number(record: dict[str, Any], key: str, context: str) -> float:
@@ -211,7 +213,8 @@ def _validate_configuration(
             "cudnn_benchmark": True,
         },
         "model": _production_model_config(),
-        "vapo": _production_vapo_config(),
+        "vapo": _production_vapo_config(compiled=compiled),
+        "max_update_replay_error": 1e-3,
         "torch": str(torch.__version__),
     }
     for key, expected_value in expected.items():
@@ -315,9 +318,8 @@ def _validate_report(
                         f"{context} benchmark iteration {games}/{repeat} has invalid {key}"
                     )
             for key in (
-                "self_play_rollout_seconds",
-                "league_rollout_seconds",
                 "rollout_seconds",
+                "update_replay_parity_seconds",
                 "update_seconds",
                 "total_seconds",
                 "iterations_per_hour",
@@ -398,6 +400,14 @@ def choose_compilation(
     compiled_comparable = dict(compiled_validated.configuration)
     del eager_comparable["compile_models"]
     del compiled_comparable["compile_models"]
+    # vapo.compile_update tracks each run's compilation mode by construction;
+    # every other vapo field must still match exactly across the two reports.
+    eager_comparable["vapo"] = {
+        key: value for key, value in eager_comparable["vapo"].items() if key != "compile_update"
+    }
+    compiled_comparable["vapo"] = {
+        key: value for key, value in compiled_comparable["vapo"].items() if key != "compile_update"
+    }
     if eager_comparable != compiled_comparable:
         differing = sorted(
             key
@@ -496,7 +506,7 @@ def _training_command(
     resume_checkpoint: Path | None = None,
 ) -> list[str]:
     model = _production_model_config()
-    vapo = _production_vapo_config()
+    vapo = _production_vapo_config(compiled=compile_models)
     command = [
         sys.executable,
         str(Path(__file__).with_name("train_vapo.py")),

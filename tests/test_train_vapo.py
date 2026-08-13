@@ -252,8 +252,8 @@ def test_main_writes_complete_manifests_and_portably_resumes(
 
     rollout = SimpleNamespace(states=1)
     monkeypatch.setattr(module, "SummaryWriter", Writer)
-    monkeypatch.setattr(module, "collect_self_play_rust", lambda *args, **kwargs: rollout)
-    monkeypatch.setattr(module, "merge_contiguous_rollouts", lambda storage, parts: parts[0])
+    monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *args, **kwargs: rollout)
+    monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(
         module,

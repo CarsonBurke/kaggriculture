@@ -21,7 +21,7 @@ from kaggriculture.encoding import (
     pair_potential,
     shaped_pair_reward,
 )
-from kaggriculture.model import ActorOutput, DistributionalCritic, FarmActor
+from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.policy import PolicyStep, act_batch
 from kaggriculture.rust_env import load_native
 
@@ -47,14 +47,13 @@ class RolloutBatch:
     old_unit_logprobs: np.ndarray
     old_market_kind_logprobs: np.ndarray
     old_market_quantity_logprobs: np.ndarray
-    old_values: np.ndarray
     rewards: np.ndarray
     valid: np.ndarray
     episode_seeds: np.ndarray
     final_money: np.ndarray
     opponent_money: np.ndarray
     seats: np.ndarray
-    mean_entropy: float
+    entropy_sums: np.ndarray
     elapsed_seconds: float
 
     @property
@@ -68,6 +67,14 @@ class RolloutBatch:
     @property
     def states(self) -> int:
         return int(self.valid.sum())
+
+    @property
+    def mean_entropy(self) -> float:
+        """Mean behavior entropy per active policy component."""
+        components = int(
+            self.unit_active.sum() + self.market_active.sum() + self.market_quantity_active.sum()
+        )
+        return float(self.entropy_sums.sum() / max(1, components))
 
 
 def _trajectory_first(values: list[np.ndarray], dtype: np.dtype[Any] | None = None) -> np.ndarray:
@@ -109,7 +116,6 @@ def _new_fields() -> dict[str, list[np.ndarray]]:
             "old_unit_logprobs",
             "old_market_kind_logprobs",
             "old_market_quantity_logprobs",
-            "old_values",
             "rewards",
             "valid",
         )
@@ -141,7 +147,6 @@ def _record_policy_step(fields: dict[str, list[np.ndarray]], policy_step: Policy
     fields["old_unit_logprobs"].append(factors.unit_logprobs)
     fields["old_market_kind_logprobs"].append(factors.market_kind_logprobs)
     fields["old_market_quantity_logprobs"].append(factors.market_quantity_logprobs)
-    fields["old_values"].append(factors.values)
 
 
 def _finish_rollout(
@@ -151,7 +156,7 @@ def _finish_rollout(
     final_money: np.ndarray,
     opponent_money: np.ndarray,
     seats: np.ndarray,
-    entropies: list[float],
+    entropy_sums: np.ndarray,
     started: float,
 ) -> RolloutBatch:
     return RolloutBatch(
@@ -172,14 +177,13 @@ def _finish_rollout(
         old_unit_logprobs=_trajectory_first(fields["old_unit_logprobs"]),
         old_market_kind_logprobs=_trajectory_first(fields["old_market_kind_logprobs"]),
         old_market_quantity_logprobs=_trajectory_first(fields["old_market_quantity_logprobs"]),
-        old_values=_trajectory_first(fields["old_values"]),
         rewards=_trajectory_first(fields["rewards"]),
         valid=_trajectory_first(fields["valid"]),
         episode_seeds=episode_seeds,
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
-        mean_entropy=float(np.mean(entropies)),
+        entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
 
@@ -205,7 +209,6 @@ def _native_field_specs(trajectories: int, horizon: int) -> dict[str, tuple[tupl
         "old_unit_logprobs": ((*prefix, MAX_UNITS), np.float32),
         "old_market_kind_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
         "old_market_quantity_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
-        "old_values": (prefix, np.float32),
         "rewards": (prefix, np.float32),
         "valid": (prefix, np.bool_),
     }
@@ -346,10 +349,9 @@ class _HostActorOutput:
 
 def _packed_outputs_to_host(
     outputs: tuple[ActorOutput, ...],
-    values: torch.Tensor | None,
     pinned_buffer: torch.Tensor | None,
-) -> tuple[list[_HostActorOutput], np.ndarray | None, torch.Tensor | None]:
-    """Transfer all policy heads and optional values with one device sync."""
+) -> tuple[list[_HostActorOutput], torch.Tensor | None]:
+    """Transfer all policy heads with one device sync."""
     if outputs[0].unit_logits.device.type == "cpu":
         return (
             [
@@ -360,7 +362,6 @@ def _packed_outputs_to_host(
                 )
                 for output in outputs
             ],
-            None if values is None else values.float().numpy(),
             pinned_buffer,
         )
 
@@ -375,10 +376,6 @@ def _packed_outputs_to_host(
             tensor = tensor.float()
             tensors.append(tensor.reshape(-1))
             shapes.append(tuple(tensor.shape))
-    if values is not None:
-        values = values.float()
-        tensors.append(values.reshape(-1))
-        shapes.append(tuple(values.shape))
     packed = torch.cat(tensors)
     if pinned_buffer is None or pinned_buffer.numel() != packed.numel():
         pinned_buffer = torch.empty(
@@ -399,11 +396,10 @@ def _packed_outputs_to_host(
     host_outputs = [
         _HostActorOutput(*arrays[index : index + 3]) for index in range(0, 3 * len(outputs), 3)
     ]
-    host_values = arrays[-1] if values is not None else None
-    return host_outputs, host_values, pinned_buffer
+    return host_outputs, pinned_buffer
 
 
-def _cached_compiled_forward(model: FarmActor | DistributionalCritic) -> Any:
+def _cached_compiled_forward(model: FarmActor) -> Any:
     """Capture the native ATen rollout forward in a CUDA graph.
 
     PPO replays stored behavior likelihoods through the eager FP32 actor. The
@@ -428,7 +424,7 @@ def _cached_compiled_forward(model: FarmActor | DistributionalCritic) -> Any:
 
 
 def _rollout_model_forward(
-    model: FarmActor | DistributionalCritic,
+    model: FarmActor,
     *inputs: torch.Tensor,
     compile_model: bool,
 ) -> ActorOutput | torch.Tensor:
@@ -436,6 +432,108 @@ def _rollout_model_forward(
     if not compile_model or inputs[0].device.type != "cuda":
         return model(*inputs)
     return _cached_compiled_forward(model)(*inputs)
+
+
+class _StackedFrozenEnsemble:
+    """One batched forward over every frozen league seat via stacked weights.
+
+    League opponents share an architecture but not weights. Stacking their
+    parameters lane-wise and running a single vmapped functional call replaces
+    the per-opponent forward loop, so the whole frozen side of a mixed wave is
+    one large kernel sequence instead of several small ones. Instances persist
+    for the process and are refilled in place each collection call: a captured
+    CUDA graph keeps reading current weights at stable addresses without any
+    per-step parameter copies.
+    """
+
+    def __init__(self, models: Sequence[FarmActor]) -> None:
+        self.template = FarmActor(models[0].config).to("meta")
+        self.template.eval()
+        import torch._dynamo
+
+        # The stacked tensors outlive any inference-mode region the collector
+        # runs under; inference tensors would reject the in-place `load`
+        # refills on later calls made outside that region.
+        with torch.inference_mode(False):
+            self.params = self._stacked("named_parameters", models)
+            self.buffers = self._stacked("named_buffers", models)
+        for tensor in (*self.params.values(), *self.buffers.values()):
+            torch._dynamo.mark_static_address(tensor)
+        self._compiled: dict[int, Any] = {}
+
+    @staticmethod
+    def _stacked(source: str, models: Sequence[FarmActor]) -> dict[str, torch.Tensor]:
+        states = [dict(getattr(model, source)()) for model in models]
+        return {name: torch.stack([state[name].detach() for state in states]) for name in states[0]}
+
+    def load(self, models: Sequence[FarmActor]) -> None:
+        for source, stacked_group in (
+            ("named_parameters", self.params),
+            ("named_buffers", self.buffers),
+        ):
+            for lane, model in enumerate(models):
+                state = dict(getattr(model, source)())
+                for name, stacked in stacked_group.items():
+                    stacked[lane].copy_(state[name])
+
+    def _forward(
+        self,
+        board: torch.Tensor,
+        global_features: torch.Tensor,
+        units: torch.Tensor,
+        unit_positions: torch.Tensor,
+    ) -> ActorOutput:
+        def run(
+            params: dict[str, torch.Tensor],
+            buffers: dict[str, torch.Tensor],
+            *inputs: torch.Tensor,
+        ) -> ActorOutput:
+            return torch.func.functional_call(self.template, (params, buffers), inputs)
+
+        return torch.vmap(run)(
+            self.params, self.buffers, board, global_features, units, unit_positions
+        )
+
+    def __call__(
+        self,
+        board: torch.Tensor,
+        global_features: torch.Tensor,
+        units: torch.Tensor,
+        unit_positions: torch.Tensor,
+        *,
+        compile_model: bool,
+    ) -> ActorOutput:
+        if not compile_model or board.device.type != "cuda":
+            return self._forward(board, global_features, units, unit_positions)
+        # One compiled callable per lane width: league assignments may change
+        # the padded width between waves, and sharing one callable would burn
+        # through Dynamo's per-code recompile budget before falling back to
+        # eager silently.
+        compiled = self._compiled.get(board.shape[1])
+        if compiled is None:
+            compiled = torch.compile(
+                self._forward,
+                backend="cudagraphs",
+                fullgraph=True,
+                dynamic=False,
+            )
+            self._compiled[board.shape[1]] = compiled
+        return compiled(board, global_features, units, unit_positions)
+
+
+_FROZEN_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedFrozenEnsemble] = {}
+
+
+def _stacked_frozen_ensemble(models: Sequence[FarmActor]) -> _StackedFrozenEnsemble:
+    """Fetch or build the persistent stacked ensemble for these league lanes."""
+    key = (models[0].config, len(models), next(models[0].parameters()).device)
+    ensemble = _FROZEN_ENSEMBLE_CACHE.get(key)
+    if ensemble is None:
+        ensemble = _StackedFrozenEnsemble(models)
+        _FROZEN_ENSEMBLE_CACHE[key] = ensemble
+    else:
+        ensemble.load(models)
+    return ensemble
 
 
 def _mark_cuda_graph_step(device: torch.device, enabled: bool) -> None:
@@ -478,7 +576,6 @@ def _store_native_wave(
     step: int,
     encoded: dict[str, np.ndarray],
     sampled: dict[str, np.ndarray],
-    values: np.ndarray,
     rewards: np.ndarray,
     rows: np.ndarray | slice = slice(None),
 ) -> None:
@@ -500,7 +597,6 @@ def _store_native_wave(
     }
     for destination, source in mapping.items():
         fields[destination][:, step] = np.asarray(sampled[source])[rows]
-    fields["old_values"][:, step] = values
     fields["rewards"][:, step] = rewards
 
 
@@ -511,8 +607,7 @@ def _native_batch(
     final_money: np.ndarray,
     opponent_money: np.ndarray,
     seats: np.ndarray,
-    entropy_sum: float,
-    component_count: int,
+    entropy_sums: np.ndarray,
     started: float,
 ) -> RolloutBatch:
     return RolloutBatch(
@@ -521,15 +616,296 @@ def _native_batch(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
-        mean_entropy=entropy_sum / max(1, component_count),
+        entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
 
 
 @torch.inference_mode()
+def collect_mixed_play_rust(
+    actor: FarmActor,
+    opponents: Sequence[FarmActor] = (),
+    *,
+    self_play_games: int = 0,
+    league_games: int = 0,
+    opponent_indices: Sequence[int] | np.ndarray | None = None,
+    seed_start: int,
+    episode_steps: int = 720,
+    deterministic: bool = False,
+    temperature: float = 1.0,
+    opponent_temperature: float = 0.8,
+    opponent_temperatures: Sequence[float] | np.ndarray | None = None,
+    deterministic_opponent: bool = False,
+    deterministic_opponents: Sequence[bool] | np.ndarray | None = None,
+    sampling_seed: int = 0,
+    compile_models: bool = False,
+    storage: dict[str, np.ndarray] | None = None,
+) -> RolloutBatch:
+    """Collect self-play and frozen-league games in one native wave.
+
+    Every game advances inside the same BatchEnv step, so the learner runs a
+    single large forward per step covering both seats of every self-play game
+    plus the current seat of every league game, instead of separate smaller
+    self-play and league waves. All frozen league seats run as one additional
+    stacked-weight forward regardless of how many distinct opponents are
+    assigned. Stored trajectories are ordered self-play first, then league,
+    matching a caller-provided storage arena.
+
+    Rollouts capture only behavior policy state. Value predictions for GAE
+    are replayed from the stored features in one large batched critic pass
+    at update time, where the critic weights are still exactly the behavior
+    weights, instead of paying a small synchronous forward every step.
+    """
+    if self_play_games < 0 or league_games < 0:
+        raise ValueError("game counts cannot be negative")
+    if self_play_games + league_games < 1:
+        raise ValueError("at least one game is required")
+    if episode_steps != 720:
+        raise ValueError("the native simulator currently supports the competition horizon 720")
+    opponents = tuple(opponents)
+    if league_games and not opponents:
+        raise ValueError("league games require at least one frozen opponent")
+    if opponents and not league_games:
+        raise ValueError("frozen opponents require league games")
+    if len(opponents) > np.iinfo(np.uint16).max:
+        raise ValueError("too many frozen opponents for native head identifiers")
+    _validate_learner_temperature(temperature)
+    if opponent_temperatures is None:
+        frozen_temperatures = np.full(len(opponents), opponent_temperature, dtype=np.float32)
+    else:
+        frozen_temperatures = np.asarray(opponent_temperatures, dtype=np.float32)
+        if frozen_temperatures.shape != (len(opponents),):
+            raise ValueError(f"opponent temperatures must have shape {(len(opponents),)}")
+    if opponents and (
+        not np.isfinite(frozen_temperatures).all() or (frozen_temperatures <= 0.0).any()
+    ):
+        raise ValueError("opponent temperatures must be finite and positive")
+    if deterministic_opponents is None:
+        frozen_deterministic = np.full(len(opponents), deterministic_opponent, dtype=np.bool_)
+    else:
+        raw_deterministic = np.asarray(deterministic_opponents)
+        if raw_deterministic.shape != (len(opponents),):
+            raise ValueError(f"deterministic opponent flags must have shape {(len(opponents),)}")
+        if not np.issubdtype(raw_deterministic.dtype, np.bool_):
+            raise ValueError("deterministic opponent flags must be booleans")
+        frozen_deterministic = raw_deterministic.astype(np.bool_, copy=False)
+    if opponent_indices is None:
+        assignments = np.zeros(league_games, dtype=np.int64)
+    else:
+        raw_assignments = np.asarray(opponent_indices)
+        if raw_assignments.shape != (league_games,):
+            raise ValueError(f"opponent indices must have shape {(league_games,)}")
+        if not np.issubdtype(raw_assignments.dtype, np.integer):
+            raise ValueError("opponent indices must be integers")
+        assignments = raw_assignments.astype(np.int64, copy=False)
+    if (assignments < 0).any() or (assignments >= max(1, len(opponents))).any():
+        raise ValueError("opponent index is outside the frozen opponent list")
+    started = time.perf_counter()
+    actor.eval()
+    for opponent in opponents:
+        opponent.eval()
+    device = next(actor.parameters()).device
+    if any(next(opponent.parameters()).device != device for opponent in opponents):
+        raise ValueError("current and all frozen models must use the same device")
+    if any(opponent.config != actor.config for opponent in opponents):
+        raise ValueError("current and frozen actors must use the same model configuration")
+
+    games = self_play_games + league_games
+    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
+    environment = load_native().BatchEnv(seeds)
+    rows = games * 2
+    horizon = episode_steps - 1
+    self_play_rows = self_play_games * 2
+    trajectories = self_play_rows + league_games
+    fields = _native_rollout_storage(storage, trajectories, horizon)
+    encoded_wave = _native_encoded_wave(environment, device)
+    encoded = encoded_wave.arrays
+    sampled = environment.sample_buffers()
+
+    league_seats = (seeds[self_play_games:] % 2).astype(np.int64)
+    league_game_rows = self_play_rows + 2 * np.arange(league_games, dtype=np.int64)
+    league_current_rows = league_game_rows + league_seats
+    frozen_rows = league_game_rows + (1 - league_seats)
+    stored_rows = np.concatenate([np.arange(self_play_rows, dtype=np.int64), league_current_rows])
+    generator = np.random.default_rng(sampling_seed)
+    frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
+    kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
+    head_ids = np.zeros(rows, dtype=np.uint16)
+    head_ids[frozen_rows] = (assignments + 1).astype(np.uint16)
+    deterministic_rows = np.full(rows, deterministic, dtype=np.bool_)
+    deterministic_rows[frozen_rows] = frozen_deterministic[assignments]
+    temperatures = np.full(rows, temperature, dtype=np.float32)
+    temperatures[frozen_rows] = frozen_temperatures[assignments]
+    entropy_sums = np.zeros(trajectories, dtype=np.float64)
+    final = None
+    packed_host = None
+
+    # A pure self-play wave keeps the learner forward over the contiguous full
+    # batch and stores every row, avoiding gather/scatter work entirely.
+    store_rows: np.ndarray | slice = slice(None) if not league_games else stored_rows
+    current_tensor = None if not league_games else torch.as_tensor(stored_rows, device=device)
+    if league_games:
+        frozen_groups = tuple(
+            frozen_rows[np.flatnonzero(assignments == opponent_index)]
+            for opponent_index in range(len(opponents))
+        )
+        active_indices = [index for index, group in enumerate(frozen_groups) if group.size]
+        active_groups = [frozen_groups[index] for index in active_indices]
+        # Pad every lane to the widest group so the stacked forward keeps one
+        # static shape. Padding replicates a real row of the same lane; those
+        # outputs are exact duplicates and are discarded on scatter.
+        lanes = len(active_indices)
+        lane_width = max(group.size for group in active_groups)
+        lane_rows = np.empty((lanes, lane_width), dtype=np.int64)
+        lane_valid = np.zeros((lanes, lane_width), dtype=np.bool_)
+        for lane, group in enumerate(active_groups):
+            lane_rows[lane, : group.size] = group
+            lane_rows[lane, group.size :] = group[0]
+            lane_valid[lane, : group.size] = True
+        lane_valid_flat = lane_valid.reshape(-1)
+        frozen_store_rows = np.concatenate(active_groups)
+        frozen_tensor = torch.as_tensor(lane_rows.reshape(-1), device=device)
+        ensemble = _stacked_frozen_ensemble([opponents[index] for index in active_indices])
+        unit_logits = np.empty((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
+        kind_logits = np.empty((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
+        quantity_context = np.empty(
+            (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
+        )
+    for step in range(horizon):
+        environment.encoded_into(encoded)
+        encoded_wave.copy_to_device()
+        _mark_cuda_graph_step(device, compile_models)
+        if not league_games:
+            output = _rollout_model_forward(
+                actor,
+                encoded_wave.board,
+                encoded_wave.global_features,
+                encoded_wave.units,
+                encoded_wave.unit_positions,
+                compile_model=compile_models,
+            )
+            assert isinstance(output, ActorOutput)
+            host_outputs, packed_host = _packed_outputs_to_host((output,), packed_host)
+            host = host_outputs[0]
+            step_unit_logits = host.unit_logits
+            step_kind_logits = host.market_kind_logits
+            step_quantity_context = host.market_quantity_context
+            unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+        else:
+            current_output = _rollout_model_forward(
+                actor,
+                encoded_wave.board.index_select(0, current_tensor),
+                encoded_wave.global_features.index_select(0, current_tensor),
+                encoded_wave.units.index_select(0, current_tensor),
+                encoded_wave.unit_positions.index_select(0, current_tensor),
+                compile_model=compile_models,
+            )
+            assert isinstance(current_output, ActorOutput)
+            lane_output = ensemble(
+                *(
+                    tensor.index_select(0, frozen_tensor).view(lanes, lane_width, *tensor.shape[1:])
+                    for tensor in (
+                        encoded_wave.board,
+                        encoded_wave.global_features,
+                        encoded_wave.units,
+                        encoded_wave.unit_positions,
+                    )
+                ),
+                compile_model=compile_models,
+            )
+            frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+            host_outputs, packed_host = _packed_outputs_to_host(
+                (current_output, frozen_output), packed_host
+            )
+            current_host, frozen_host = host_outputs
+            for destination, current_values, frozen_values in (
+                (unit_logits, current_host.unit_logits, frozen_host.unit_logits),
+                (kind_logits, current_host.market_kind_logits, frozen_host.market_kind_logits),
+                (
+                    quantity_context,
+                    current_host.market_quantity_context,
+                    frozen_host.market_quantity_context,
+                ),
+            ):
+                destination[stored_rows] = current_values
+                destination[frozen_store_rows] = frozen_values[lane_valid_flat]
+            step_unit_logits = unit_logits
+            step_kind_logits = kind_logits
+            step_quantity_context = quantity_context
+            unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
+            kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+            quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+            current_draws = _categorical_draws(generator, stored_rows.size)
+            frozen_draws = _categorical_draws(frozen_generator, league_games)
+            for destination, current_values, frozen_values in zip(
+                (unit_draws, kind_draws, quantity_draws),
+                current_draws,
+                frozen_draws,
+                strict=True,
+            ):
+                destination[stored_rows] = current_values
+                destination[frozen_rows] = frozen_values
+        environment.sample_and_step_into(
+            step_unit_logits,
+            step_kind_logits,
+            step_quantity_context,
+            kind_gate,
+            quantity_values,
+            quantity_bias,
+            head_ids,
+            unit_draws,
+            kind_draws,
+            quantity_draws,
+            deterministic_rows,
+            temperatures,
+            sampled,
+        )
+        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        _store_native_wave(fields, step, encoded, sampled, rewards[store_rows], store_rows)
+        counts = (
+            np.asarray(sampled["unit_active"])[store_rows].sum(axis=1)
+            + np.asarray(sampled["market_active"])[store_rows].sum(axis=1)
+            + np.asarray(sampled["market_quantity_active"])[store_rows].sum(axis=1)
+        )
+        entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
+        dones = np.asarray(sampled["dones"], dtype=np.bool_)
+        if step + 1 < horizon and dones.any():
+            raise RuntimeError("native rollout terminated before the competition horizon")
+        if step + 1 == horizon and not dones.all():
+            raise RuntimeError("native rollout did not terminate at the competition horizon")
+        final = np.asarray(sampled["final_money"], dtype=np.float32)
+
+    assert final is not None
+    self_final = final[:self_play_games]
+    league_final = final[self_play_games:]
+    league_index = np.arange(league_games)
+    final_money = np.concatenate([self_final.reshape(-1), league_final[league_index, league_seats]])
+    opponent_money = np.concatenate(
+        [self_final[:, ::-1].reshape(-1), league_final[league_index, 1 - league_seats]]
+    )
+    return _native_batch(
+        fields,
+        episode_seeds=np.concatenate(
+            [
+                np.repeat(seeds[:self_play_games].astype(np.int64), 2),
+                seeds[self_play_games:].astype(np.int64),
+            ]
+        ),
+        final_money=final_money,
+        opponent_money=opponent_money,
+        seats=np.concatenate(
+            [
+                np.tile(np.asarray([0, 1], dtype=np.int8), self_play_games),
+                league_seats.astype(np.int8),
+            ]
+        ),
+        entropy_sums=entropy_sums,
+        started=started,
+    )
+
+
 def collect_self_play_rust(
     actor: FarmActor,
-    critic: DistributionalCritic,
     *,
     games: int,
     seed_start: int,
@@ -543,109 +919,21 @@ def collect_self_play_rust(
     """Collect both on-policy seats through the exact batched Rust simulator."""
     if games < 1:
         raise ValueError("games must be positive")
-    if episode_steps != 720:
-        raise ValueError("the native simulator currently supports the competition horizon 720")
-    _validate_learner_temperature(temperature)
-    started = time.perf_counter()
-    actor.eval()
-    critic.eval()
-    device = next(actor.parameters()).device
-    if next(critic.parameters()).device != device:
-        raise ValueError("actor and critic must use the same device")
-    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
-    environment = load_native().BatchEnv(seeds)
-    trajectories = games * 2
-    horizon = episode_steps - 1
-    fields = _native_rollout_storage(storage, trajectories, horizon)
-    encoded_wave = _native_encoded_wave(environment, device)
-    encoded = encoded_wave.arrays
-    sampled = environment.sample_buffers()
-    generator = np.random.default_rng(sampling_seed)
-    kind_gate, quantity_values, quantity_bias = _quantity_heads((actor,))
-    head_ids = np.zeros(trajectories, dtype=np.uint16)
-    deterministic_rows = np.full(trajectories, deterministic, dtype=np.bool_)
-    temperatures = np.full(trajectories, temperature, dtype=np.float32)
-    entropy_sum = 0.0
-    component_count = 0
-    final = None
-    packed_host = None
-    for step in range(horizon):
-        environment.encoded_into(encoded)
-        encoded_wave.copy_to_device()
-        _mark_cuda_graph_step(device, compile_models)
-        output = _rollout_model_forward(
-            actor,
-            encoded_wave.board,
-            encoded_wave.global_features,
-            encoded_wave.units,
-            encoded_wave.unit_positions,
-            compile_model=compile_models,
-        )
-        assert isinstance(output, ActorOutput)
-        value_tensor = critic.value(
-            _rollout_model_forward(
-                critic,
-                encoded_wave.board,
-                encoded_wave.critic_features,
-                compile_model=compile_models,
-            )
-        )
-        host_outputs, values, packed_host = _packed_outputs_to_host(
-            (output,), value_tensor, packed_host
-        )
-        host_output = host_outputs[0]
-        assert values is not None
-        unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, trajectories)
-        environment.sample_and_step_into(
-            host_output.unit_logits,
-            host_output.market_kind_logits,
-            host_output.market_quantity_context,
-            kind_gate,
-            quantity_values,
-            quantity_bias,
-            head_ids,
-            unit_draws,
-            kind_draws,
-            quantity_draws,
-            deterministic_rows,
-            temperatures,
-            sampled,
-        )
-        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
-        _store_native_wave(fields, step, encoded, sampled, values, rewards)
-        counts = (
-            np.asarray(sampled["unit_active"]).sum(axis=1)
-            + np.asarray(sampled["market_active"]).sum(axis=1)
-            + np.asarray(sampled["market_quantity_active"]).sum(axis=1)
-        )
-        entropy_sum += float(np.dot(np.asarray(sampled["entropy"]), counts))
-        component_count += int(counts.sum())
-        dones = np.asarray(sampled["dones"], dtype=np.bool_)
-        if step + 1 < horizon and dones.any():
-            raise RuntimeError("native self-play terminated before the competition horizon")
-        if step + 1 == horizon and not dones.all():
-            raise RuntimeError("native self-play did not terminate at the competition horizon")
-        final = np.asarray(sampled["final_money"], dtype=np.float32)
-
-    assert final is not None
-    final_money = final.reshape(-1)
-    opponent_money = final[:, ::-1].reshape(-1)
-    return _native_batch(
-        fields,
-        episode_seeds=np.repeat(seeds.astype(np.int64), 2),
-        final_money=final_money,
-        opponent_money=opponent_money,
-        seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
-        entropy_sum=entropy_sum,
-        component_count=component_count,
-        started=started,
+    return collect_mixed_play_rust(
+        actor,
+        self_play_games=games,
+        seed_start=seed_start,
+        episode_steps=episode_steps,
+        deterministic=deterministic,
+        temperature=temperature,
+        sampling_seed=sampling_seed,
+        compile_models=compile_models,
+        storage=storage,
     )
 
 
-@torch.inference_mode()
 def collect_frozen_opponents_play_rust(
     actor: FarmActor,
-    critic: DistributionalCritic,
     opponents: Sequence[FarmActor],
     *,
     games: int,
@@ -662,214 +950,30 @@ def collect_frozen_opponents_play_rust(
     compile_models: bool = False,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
-    """Collect one current-policy seat per game against assigned frozen actors."""
+    """Collect one current-policy seat per native game against assigned frozen actors."""
     if games < 1:
         raise ValueError("games must be positive")
-    if episode_steps != 720:
-        raise ValueError("the native simulator currently supports the competition horizon 720")
-    opponents = tuple(opponents)
-    if not opponents:
-        raise ValueError("at least one frozen opponent is required")
-    if len(opponents) > np.iinfo(np.uint16).max:
-        raise ValueError("too many frozen opponents for native head identifiers")
-    _validate_learner_temperature(temperature)
-    if opponent_temperatures is None:
-        frozen_temperatures = np.full(len(opponents), opponent_temperature, dtype=np.float32)
-    else:
-        frozen_temperatures = np.asarray(opponent_temperatures, dtype=np.float32)
-        if frozen_temperatures.shape != (len(opponents),):
-            raise ValueError(f"opponent temperatures must have shape {(len(opponents),)}")
-    if not np.isfinite(frozen_temperatures).all() or (frozen_temperatures <= 0.0).any():
-        raise ValueError("opponent temperatures must be finite and positive")
-    if deterministic_opponents is None:
-        frozen_deterministic = np.full(len(opponents), deterministic_opponent, dtype=np.bool_)
-    else:
-        raw_deterministic = np.asarray(deterministic_opponents)
-        if raw_deterministic.shape != (len(opponents),):
-            raise ValueError(f"deterministic opponent flags must have shape {(len(opponents),)}")
-        if not np.issubdtype(raw_deterministic.dtype, np.bool_):
-            raise ValueError("deterministic opponent flags must be booleans")
-        frozen_deterministic = raw_deterministic.astype(np.bool_, copy=False)
-    if opponent_indices is None:
-        assignments = np.zeros(games, dtype=np.int64)
-    else:
-        raw_assignments = np.asarray(opponent_indices)
-        if raw_assignments.shape != (games,):
-            raise ValueError(f"opponent indices must have shape {(games,)}")
-        if not np.issubdtype(raw_assignments.dtype, np.integer):
-            raise ValueError("opponent indices must be integers")
-        assignments = raw_assignments.astype(np.int64, copy=False)
-    if (assignments < 0).any() or (assignments >= len(opponents)).any():
-        raise ValueError("opponent index is outside the frozen opponent list")
-    started = time.perf_counter()
-    actor.eval()
-    critic.eval()
-    for opponent in opponents:
-        opponent.eval()
-    device = next(actor.parameters()).device
-    if next(critic.parameters()).device != device or any(
-        next(opponent.parameters()).device != device for opponent in opponents
-    ):
-        raise ValueError("current, critic, and all frozen models must use the same device")
-    if any(opponent.config != actor.config for opponent in opponents):
-        raise ValueError("current and frozen actors must use the same model configuration")
-    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
-    environment = load_native().BatchEnv(seeds)
-    rows = games * 2
-    horizon = episode_steps - 1
-    fields = _native_rollout_storage(storage, games, horizon)
-    encoded_wave = _native_encoded_wave(environment, device)
-    encoded = encoded_wave.arrays
-    sampled = environment.sample_buffers()
-    seats = (seeds % 2).astype(np.int8)
-    current_rows = np.arange(games, dtype=np.int64) * 2 + seats
-    frozen_rows = np.arange(games, dtype=np.int64) * 2 + (1 - seats)
-    generator = np.random.default_rng(sampling_seed)
-    frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
-    kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
-    head_ids = np.zeros(rows, dtype=np.uint16)
-    head_ids[frozen_rows] = (assignments + 1).astype(np.uint16)
-    head_ids[current_rows] = 0
-    deterministic_rows = np.zeros(rows, dtype=np.bool_)
-    deterministic_rows[frozen_rows] = frozen_deterministic[assignments]
-    deterministic_rows[current_rows] = deterministic
-    temperatures = np.ones(rows, dtype=np.float32)
-    temperatures[frozen_rows] = frozen_temperatures[assignments]
-    temperatures[current_rows] = temperature
-    entropy_sum = 0.0
-    component_count = 0
-    final = None
-    current_tensor = torch.as_tensor(current_rows, device=device)
-    frozen_groups = tuple(
-        frozen_rows[np.flatnonzero(assignments == opponent_index)]
-        for opponent_index in range(len(opponents))
-    )
-    active_frozen = tuple(
-        (opponent, selected_rows, torch.as_tensor(selected_rows, device=device))
-        for opponent, selected_rows in zip(opponents, frozen_groups, strict=True)
-        if selected_rows.size
-    )
-    unit_logits = np.empty((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
-    kind_logits = np.empty((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
-    quantity_context = np.empty(
-        (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
-    )
-    packed_host = None
-    for step in range(horizon):
-        environment.encoded_into(encoded)
-        encoded_wave.copy_to_device()
-        _mark_cuda_graph_step(device, compile_models)
-        current_output = _rollout_model_forward(
-            actor,
-            encoded_wave.board.index_select(0, current_tensor),
-            encoded_wave.global_features.index_select(0, current_tensor),
-            encoded_wave.units.index_select(0, current_tensor),
-            encoded_wave.unit_positions.index_select(0, current_tensor),
-            compile_model=compile_models,
-        )
-        assert isinstance(current_output, ActorOutput)
-        frozen_outputs: list[ActorOutput] = []
-        selected_groups: list[np.ndarray] = []
-        for opponent, selected_rows, selected_tensor in active_frozen:
-            frozen_output = _rollout_model_forward(
-                opponent,
-                encoded_wave.board.index_select(0, selected_tensor),
-                encoded_wave.global_features.index_select(0, selected_tensor),
-                encoded_wave.units.index_select(0, selected_tensor),
-                encoded_wave.unit_positions.index_select(0, selected_tensor),
-                compile_model=compile_models,
-            )
-            assert isinstance(frozen_output, ActorOutput)
-            frozen_outputs.append(frozen_output)
-            selected_groups.append(selected_rows)
-        value_tensor = critic.value(
-            _rollout_model_forward(
-                critic,
-                encoded_wave.board.index_select(0, current_tensor),
-                encoded_wave.critic_features.index_select(0, current_tensor),
-                compile_model=compile_models,
-            )
-        )
-        host_outputs, values, packed_host = _packed_outputs_to_host(
-            (current_output, *frozen_outputs), value_tensor, packed_host
-        )
-        assert values is not None
-        for output, selected in zip(
-            host_outputs,
-            (current_rows, *selected_groups),
-            strict=True,
-        ):
-            unit_logits[selected] = output.unit_logits
-            kind_logits[selected] = output.market_kind_logits
-            quantity_context[selected] = output.market_quantity_context
-        unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
-        kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-        quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-        current_draws = _categorical_draws(generator, games)
-        frozen_draws = _categorical_draws(frozen_generator, games)
-        for destination, current_values, frozen_values in zip(
-            (unit_draws, kind_draws, quantity_draws), current_draws, frozen_draws, strict=True
-        ):
-            destination[current_rows] = current_values
-            destination[frozen_rows] = frozen_values
-        environment.sample_and_step_into(
-            unit_logits,
-            kind_logits,
-            quantity_context,
-            kind_gate,
-            quantity_values,
-            quantity_bias,
-            head_ids,
-            unit_draws,
-            kind_draws,
-            quantity_draws,
-            deterministic_rows,
-            temperatures,
-            sampled,
-        )
-        all_rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
-        _store_native_wave(
-            fields,
-            step,
-            encoded,
-            sampled,
-            values,
-            all_rewards[current_rows],
-            current_rows,
-        )
-        counts = (
-            np.asarray(sampled["unit_active"])[current_rows].sum(axis=1)
-            + np.asarray(sampled["market_active"])[current_rows].sum(axis=1)
-            + np.asarray(sampled["market_quantity_active"])[current_rows].sum(axis=1)
-        )
-        entropy_sum += float(np.dot(np.asarray(sampled["entropy"])[current_rows], counts))
-        component_count += int(counts.sum())
-        dones = np.asarray(sampled["dones"], dtype=np.bool_)
-        if step + 1 < horizon and dones.any():
-            raise RuntimeError("native league play terminated before the competition horizon")
-        if step + 1 == horizon and not dones.all():
-            raise RuntimeError("native league play did not terminate at the competition horizon")
-        final = np.asarray(sampled["final_money"], dtype=np.float32)
-
-    assert final is not None
-    game_indices = np.arange(games)
-    final_money = final[game_indices, seats]
-    opponent_money = final[game_indices, 1 - seats]
-    return _native_batch(
-        fields,
-        episode_seeds=seeds.astype(np.int64),
-        final_money=final_money,
-        opponent_money=opponent_money,
-        seats=seats,
-        entropy_sum=entropy_sum,
-        component_count=component_count,
-        started=started,
+    return collect_mixed_play_rust(
+        actor,
+        opponents,
+        league_games=games,
+        opponent_indices=opponent_indices,
+        seed_start=seed_start,
+        episode_steps=episode_steps,
+        deterministic=deterministic,
+        temperature=temperature,
+        opponent_temperature=opponent_temperature,
+        opponent_temperatures=opponent_temperatures,
+        deterministic_opponent=deterministic_opponent,
+        deterministic_opponents=deterministic_opponents,
+        sampling_seed=sampling_seed,
+        compile_models=compile_models,
+        storage=storage,
     )
 
 
 def collect_frozen_opponent_play_rust(
     actor: FarmActor,
-    critic: DistributionalCritic,
     opponent: FarmActor,
     *,
     games: int,
@@ -885,7 +989,6 @@ def collect_frozen_opponent_play_rust(
     """Collect one current-policy seat per native game against one frozen actor."""
     return collect_frozen_opponents_play_rust(
         actor,
-        critic,
         (opponent,),
         games=games,
         seed_start=seed_start,
@@ -901,7 +1004,6 @@ def collect_frozen_opponent_play_rust(
 
 def collect_self_play(
     actor: FarmActor,
-    critic: DistributionalCritic,
     *,
     games: int,
     seed_start: int,
@@ -918,7 +1020,6 @@ def collect_self_play(
     _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
-    critic.eval()
     generator = np.random.default_rng(sampling_seed)
     environments = [
         make(
@@ -934,7 +1035,7 @@ def collect_self_play(
     trajectories = games * 2
     final_money = np.zeros(trajectories, dtype=np.float32)
     opponent_money = np.zeros(trajectories, dtype=np.float32)
-    entropies = []
+    entropy_sums = np.zeros(trajectories, dtype=np.float64)
     for _ in range(episode_steps):
         if all(environment.done for environment in environments):
             break
@@ -942,7 +1043,6 @@ def collect_self_play(
             raise RuntimeError("synchronous environments terminated at different horizons")
         policy_step = act_batch(
             actor,
-            critic,
             _observations(states),
             _opponent_privates(states),
             deterministic=deterministic,
@@ -950,7 +1050,7 @@ def collect_self_play(
             generator=generator,
         )
         _record_policy_step(fields, policy_step)
-        entropies.append(policy_step.factors.entropy)
+        entropy_sums += policy_step.factors.entropy_sums
 
         next_states = []
         step_rewards = np.zeros(trajectories, dtype=np.float32)
@@ -987,14 +1087,13 @@ def collect_self_play(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
-        entropies=entropies,
+        entropy_sums=entropy_sums,
         started=started,
     )
 
 
 def collect_frozen_opponent_play(
     actor: FarmActor,
-    critic: DistributionalCritic,
     opponent: FarmActor,
     *,
     games: int,
@@ -1014,7 +1113,6 @@ def collect_frozen_opponent_play(
     _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
-    critic.eval()
     opponent.eval()
     device = next(actor.parameters()).device
     if next(opponent.parameters()).device != device:
@@ -1035,7 +1133,7 @@ def collect_frozen_opponent_play(
     fields = _new_fields()
     final_money = np.zeros(games, dtype=np.float32)
     opponent_money = np.zeros(games, dtype=np.float32)
-    entropies = []
+    entropy_sums = np.zeros(games, dtype=np.float64)
     for _ in range(episode_steps):
         if all(environment.done for environment in environments):
             break
@@ -1049,7 +1147,6 @@ def collect_frozen_opponent_play(
         ]
         current_step = act_batch(
             actor,
-            critic,
             current_observations,
             [observation["private"] for observation in frozen_observations],
             deterministic=deterministic,
@@ -1058,14 +1155,13 @@ def collect_frozen_opponent_play(
         )
         frozen_step = act_batch(
             opponent,
-            None,
             frozen_observations,
             deterministic=deterministic_opponent,
             temperature=opponent_temperature,
             generator=opponent_generator,
         )
         _record_policy_step(fields, current_step)
-        entropies.append(current_step.factors.entropy)
+        entropy_sums += current_step.factors.entropy_sums
 
         next_states = []
         step_rewards = np.zeros(games, dtype=np.float32)
@@ -1100,32 +1196,45 @@ def collect_frozen_opponent_play(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
-        entropies=entropies,
+        entropy_sums=entropy_sums,
         started=started,
     )
 
 
-_TRAJECTORY_METADATA_FIELDS = ("episode_seeds", "final_money", "opponent_money", "seats")
+_TRAJECTORY_METADATA_FIELDS = (
+    "episode_seeds",
+    "final_money",
+    "opponent_money",
+    "seats",
+    "entropy_sums",
+)
 
 
 def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:
-    """Combine per-trajectory metadata and component-weighted entropy."""
-    component_counts = [
-        int(
-            batch.unit_active.sum() + batch.market_active.sum() + batch.market_quantity_active.sum()
-        )
-        for batch in batches
-    ]
-    mean_entropy = sum(
-        batch.mean_entropy * count for batch, count in zip(batches, component_counts, strict=True)
-    ) / max(1, sum(component_counts))
+    """Concatenate per-trajectory metadata across compatible batches."""
     combined: dict[str, Any] = {
         field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
         for field in _TRAJECTORY_METADATA_FIELDS
     }
-    combined["mean_entropy"] = mean_entropy
     combined["elapsed_seconds"] = sum(batch.elapsed_seconds for batch in batches)
     return combined
+
+
+def slice_trajectories(batch: RolloutBatch, start: int, stop: int) -> RolloutBatch:
+    """View a contiguous trajectory range of a batch without copying states.
+
+    The slice shares the underlying arrays, so per-part diagnostics of a
+    merged wave cost no memory. The wave's elapsed time is indivisible and
+    carried over unchanged.
+    """
+    if not 0 <= start < stop <= batch.trajectories:
+        raise ValueError("trajectory slice is out of range")
+    state_fields = tuple(_native_field_specs(1, 1))
+    return RolloutBatch(
+        **{field: getattr(batch, field)[start:stop] for field in state_fields},
+        **{field: getattr(batch, field)[start:stop] for field in _TRAJECTORY_METADATA_FIELDS},
+        elapsed_seconds=batch.elapsed_seconds,
+    )
 
 
 def concatenate_rollouts(batches: list[RolloutBatch]) -> RolloutBatch:

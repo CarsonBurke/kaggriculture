@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig, parameter_count
+from kaggriculture.model import FarmActor, ModelConfig, parameter_count
 from kaggriculture.policy import component_logprobs
 from kaggriculture.provenance import source_identity
 from kaggriculture.rollout import collect_self_play_rust
@@ -105,7 +105,6 @@ def parse_args() -> argparse.Namespace:
 @torch.inference_mode()
 def replay_diagnostics(
     actor: FarmActor,
-    critic: DistributionalCritic,
     rollout,
     minibatch_size: int,
 ) -> dict[str, float | int]:
@@ -131,7 +130,6 @@ def replay_diagnostics(
     maximum_logprob_error = {"unit": 0.0, "kind": 0.0, "quantity": 0.0}
     maximum_ratio_error = {"unit": 0.0, "kind": 0.0, "quantity": 0.0}
     active_counts = {"unit": 0, "kind": 0, "quantity": 0}
-    maximum_value_error = 0.0
     for start in range(0, indices.size, minibatch_size):
         selected = indices[start : start + minibatch_size]
         board = tensor("board", torch.float32, selected)
@@ -175,15 +173,6 @@ def replay_diagnostics(
             maximum_ratio_error[name] = max(
                 maximum_ratio_error[name], float((difference.exp() - 1.0).abs().max())
             )
-        values = critic.value(critic(board, tensor("critic_features", torch.float32, selected)))
-        value_difference = values - torch.as_tensor(
-            rollout.old_values.reshape(-1)[selected],
-            device=device,
-            dtype=torch.float32,
-        )
-        if not bool(torch.isfinite(value_difference).all()):
-            raise FloatingPointError("non-finite critic replay difference")
-        maximum_value_error = max(maximum_value_error, float(value_difference.abs().max()))
 
     return {
         **{
@@ -195,7 +184,6 @@ def replay_diagnostics(
             for name, value in maximum_ratio_error.items()
         },
         **{f"replay_{name}_active_count": value for name, value in active_counts.items()},
-        "replay_value_max_abs_error": maximum_value_error,
     }
 
 
@@ -235,7 +223,6 @@ def main() -> None:
         quantity_rank=args.quantity_rank,
     )
     actor = FarmActor(config).to(device).eval()
-    critic = DistributionalCritic(config).to(device).eval()
     emit(
         {
             "event": "configuration",
@@ -243,7 +230,6 @@ def main() -> None:
             "compile_models": args.compile_models,
             "max_replay_error": args.max_replay_error,
             "actor_parameters": parameter_count(actor),
-            "critic_parameters": parameter_count(critic),
             "model": config.to_dict(),
             "torch": torch.__version__,
             "source_identity": source_identity(),
@@ -260,7 +246,6 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats(device)
             rollout = collect_self_play_rust(
                 actor,
-                critic,
                 games=games,
                 seed_start=seed_cursor,
                 sampling_seed=args.seed ^ (games << 16) ^ repeat,
@@ -293,7 +278,6 @@ def main() -> None:
             if repeat == 0:
                 replay = replay_diagnostics(
                     actor,
-                    critic,
                     rollout,
                     args.replay_minibatch_size,
                 )
@@ -307,11 +291,6 @@ def main() -> None:
                                 f"{name} {metric} replay error {error:.9g} exceeds "
                                 f"{args.max_replay_error:.9g}"
                             )
-                if replay["replay_value_max_abs_error"] > args.max_replay_error:
-                    raise AssertionError(
-                        f"critic replay error {replay['replay_value_max_abs_error']:.9g} "
-                        f"exceeds {args.max_replay_error:.9g}"
-                    )
                 payload.update(replay)
             emit(payload)
             del rollout

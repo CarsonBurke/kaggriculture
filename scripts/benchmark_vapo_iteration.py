@@ -21,14 +21,11 @@ import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig, parameter_count
 from kaggriculture.provenance import source_identity
-from kaggriculture.rollout import (
-    collect_frozen_opponents_play_rust,
-    collect_self_play_rust,
-    concatenate_rollouts,
-)
+from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
+from kaggriculture.rust_env import load_native
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
-from kaggriculture.vapo import VapoConfig, make_optimizers, update_vapo
+from kaggriculture.vapo import VapoConfig, make_optimizers, update_replay_parity, update_vapo
 
 _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
@@ -135,6 +132,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--opponent-temperature", type=float, default=0.8)
     parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument(
+        "--max-update-replay-error",
+        type=float,
+        default=1e-3,
+        help=(
+            "maximum unchanged-policy importance-ratio drift through the exact "
+            "update-path forward; CUDA kernels are batch-shape stable only to "
+            "roughly 1e-4, so this gates compiled/graphed update variants"
+        ),
+    )
     parser.add_argument("--compile-models", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -145,6 +152,25 @@ def parse_args() -> argparse.Namespace:
 def _synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _verify_first_step_critic_features(rollout, self_play_games: int, seed_start: int) -> None:
+    """Cross-validate stored critic features against a fresh native encode.
+
+    Behavior values are replayed solely from stored `critic_features`, which
+    nothing else consumes during collection. Recomputing the opening step from
+    a fresh BatchEnv and demanding bitwise fp16 equality catches arena-layout
+    or staging corruption across the whole merged wave at production scale.
+    """
+    league_games = rollout.trajectories - self_play_games * 2
+    seeds = np.arange(seed_start, seed_start + self_play_games + league_games, dtype=np.uint64)
+    fresh = np.asarray(load_native().BatchEnv(seeds).encoded()["critic_features"])
+    self_rows = np.arange(self_play_games * 2, dtype=np.int64)
+    league_seats = rollout.seats[self_play_games * 2 :].astype(np.int64)
+    league_rows = 2 * (self_play_games + np.arange(league_games, dtype=np.int64)) + league_seats
+    stored_rows = np.concatenate([self_rows, league_rows])
+    if not np.array_equal(rollout.critic_features[:, 0], fresh[stored_rows].astype(np.float16)):
+        raise RuntimeError("stored first-step critic features do not match a fresh native encode")
 
 
 def _hardware_identity(device: torch.device) -> dict[str, object]:
@@ -219,6 +245,12 @@ def main() -> None:
         raise ValueError("temperatures must be finite and positive")
     if args.temperature != 1.0:
         raise ValueError("on-policy VAPO benchmarking requires --temperature 1.0")
+    if (
+        not math.isfinite(args.max_update_replay_error)
+        or args.max_update_replay_error <= 0.0
+        or args.max_update_replay_error > 1e-3
+    ):
+        raise ValueError("--max-update-replay-error must be finite, positive, and at most 1e-3")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -240,6 +272,7 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
+        compile_update=args.compile_models,
     )
     identity = source_identity()
     emit(
@@ -267,6 +300,7 @@ def main() -> None:
             "source_identity": identity,
             "temperature": args.temperature,
             "opponent_temperature": args.opponent_temperature,
+            "max_update_replay_error": args.max_update_replay_error,
             "precision": {
                 "use_bfloat16": vapo_config.use_bfloat16,
                 "float32_matmul_precision": torch.get_float32_matmul_precision(),
@@ -295,6 +329,13 @@ def main() -> None:
         generator = np.random.default_rng(args.seed)
         seed_cursor = args.seed
         physical_games = self_play_games + args.league_games
+        # Production collects the whole mixed wave into one reusable pinned
+        # arena; mirror that here so staging behavior matches training.
+        arena = allocate_rollout_storage(
+            self_play_games * 2 + args.league_games,
+            PRODUCTION_EPISODE_STEPS - 1,
+            pin_memory=device.type == "cuda",
+        )
         repeat_payloads = []
 
         for repeat in range(args.repeats):
@@ -303,23 +344,10 @@ def main() -> None:
             _synchronize(device)
             iteration_started = time.perf_counter()
 
-            self_play_started = time.perf_counter()
-            self_play = collect_self_play_rust(
-                actor,
-                critic,
-                games=self_play_games,
-                seed_start=seed_cursor,
-                episode_steps=PRODUCTION_EPISODE_STEPS,
-                temperature=args.temperature,
-                sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-                compile_models=args.compile_models,
-            )
-            seed_cursor += self_play_games
-            _synchronize(device)
-            self_play_seconds = time.perf_counter() - self_play_started
-            rollout_parts = [self_play]
-
-            league_seconds = 0.0
+            opponents = []
+            assignments = None
+            opponent_temperatures = None
+            deterministic_opponents = None
             if args.league_games:
                 # Production reconstructs selected frozen actors from archive
                 # snapshots on every iteration. Keep that object lifecycle in
@@ -331,38 +359,56 @@ def main() -> None:
                 for opponent in opponents:
                     opponent.load_state_dict(frozen_opponent_state)
                     opponent.requires_grad_(False)
-                league_started = time.perf_counter()
                 assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
                 generator.shuffle(assignments)
                 deterministic_opponents = np.ones(len(opponents), dtype=np.bool_)
                 deterministic_opponents[1:3] = False
                 opponent_temperatures = np.ones(len(opponents), dtype=np.float32)
                 opponent_temperatures[1:3] = args.opponent_temperature
-                league = collect_frozen_opponents_play_rust(
-                    actor,
-                    critic,
-                    opponents,
-                    games=args.league_games,
-                    opponent_indices=assignments,
-                    seed_start=seed_cursor,
-                    episode_steps=PRODUCTION_EPISODE_STEPS,
-                    temperature=args.temperature,
-                    opponent_temperature=args.opponent_temperature,
-                    opponent_temperatures=opponent_temperatures,
-                    deterministic_opponents=deterministic_opponents,
-                    sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-                    compile_models=args.compile_models,
-                )
-                seed_cursor += args.league_games
-                _synchronize(device)
-                league_seconds = time.perf_counter() - league_started
-                rollout_parts.append(league)
-
-            rollout = concatenate_rollouts(rollout_parts)
+            wave_seed_start = seed_cursor
+            rollout = collect_mixed_play_rust(
+                actor,
+                opponents,
+                self_play_games=self_play_games,
+                league_games=args.league_games,
+                opponent_indices=assignments,
+                seed_start=wave_seed_start,
+                episode_steps=PRODUCTION_EPISODE_STEPS,
+                temperature=args.temperature,
+                opponent_temperature=args.opponent_temperature,
+                opponent_temperatures=opponent_temperatures,
+                deterministic_opponents=deterministic_opponents,
+                sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
+                compile_models=args.compile_models,
+                storage=arena,
+            )
+            seed_cursor += physical_games
+            _synchronize(device)
             rollout_seconds = time.perf_counter() - iteration_started
-            del rollout_parts, self_play
-            if args.league_games:
-                del league, opponents
+            del opponents
+
+            # Gate the update-path importance ratios at unchanged weights
+            # before the update mutates the actor. This bounds the numeric
+            # drift any update-path change (compilation, CUDA graphs, larger
+            # minibatches) injects into clipping and the KL trust region.
+            parity_started = time.perf_counter()
+            parity = update_replay_parity(
+                actor,
+                rollout,
+                minibatch_size=vapo_config.minibatch_size,
+                compile_model=vapo_config.compile_update,
+            )
+            _synchronize(device)
+            parity_seconds = time.perf_counter() - parity_started
+            for component in ("unit", "kind", "quantity"):
+                if parity[f"update_replay_{component}_active_count"] < 1:
+                    raise RuntimeError(f"update replay parity saw no active {component} components")
+            if parity["update_replay_max_ratio_error"] > args.max_update_replay_error:
+                raise RuntimeError(
+                    "update-path importance ratios drifted beyond "
+                    f"{args.max_update_replay_error}: {parity['update_replay_max_ratio_error']}"
+                )
+            _verify_first_step_critic_features(rollout, self_play_games, wave_seed_start)
 
             update_started = time.perf_counter()
             update_metrics = update_vapo(
@@ -378,7 +424,10 @@ def main() -> None:
             update_seconds = time.perf_counter() - update_started
             if int(update_metrics["actor_updates"]) < 1:
                 raise RuntimeError("benchmark iteration completed without an actor update")
-            total_seconds = time.perf_counter() - iteration_started
+            # The parity gate is benchmark-only instrumentation; production
+            # iterations are rollout plus update, so the calibration decision
+            # must be based on exactly that.
+            total_seconds = rollout_seconds + update_seconds
             diagnostics = rollout_diagnostics(rollout)
             payload = {
                 "event": "iteration",
@@ -389,9 +438,8 @@ def main() -> None:
                 "physical_games": physical_games,
                 "learner_trajectories": rollout.trajectories,
                 "learner_states": rollout.states,
-                "self_play_rollout_seconds": self_play_seconds,
-                "league_rollout_seconds": league_seconds,
                 "rollout_seconds": rollout_seconds,
+                "update_replay_parity_seconds": parity_seconds,
                 "update_seconds": update_seconds,
                 "total_seconds": total_seconds,
                 "physical_games_per_rollout_second": physical_games / rollout_seconds,
@@ -408,6 +456,7 @@ def main() -> None:
                 "critic_parameters": parameter_count(critic),
                 "money_mean": diagnostics["money_mean"],
                 "tie_fraction": diagnostics["tie_fraction"],
+                **parity,
                 **update_metrics,
             }
             emit(payload)
@@ -441,7 +490,7 @@ def main() -> None:
                 ),
             }
         )
-        del actor, critic, actor_optimizer, critic_optimizer, frozen_opponent_state
+        del actor, critic, actor_optimizer, critic_optimizer, frozen_opponent_state, arena
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()

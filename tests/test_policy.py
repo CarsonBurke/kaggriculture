@@ -6,7 +6,7 @@ from kaggle_environments import make
 
 from kaggriculture.actions import MarketKind
 from kaggriculture.constants import PRODUCTS
-from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import (
     MarketLedger,
     _apply_ledger_order,
@@ -65,11 +65,9 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
     actor = FarmActor(config)
-    critic = DistributionalCritic(config)
 
     step = act_batch(
         actor,
-        critic,
         observations,
         [observations[1]["private"], observations[0]["private"]],
         deterministic=True,
@@ -109,7 +107,7 @@ def test_policy_skips_quantity_head_for_nonquantified_market_rows() -> None:
         # the stored behavior log-probabilities.
         actor.market_quantity_context.weight.fill_(float("nan"))
 
-    policy_step = act_batch(actor, None, observations, deterministic=True)
+    policy_step = act_batch(actor, observations, deterministic=True)
 
     assert not policy_step.factors.market_quantity_active.any()
     assert not policy_step.factors.market_quantities.any()
@@ -224,7 +222,7 @@ def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(config)
-    policy_step = act_batch(actor, None, observations, deterministic=True)
+    policy_step = act_batch(actor, observations, deterministic=True)
     encoded = policy_step.encoded
     with torch.inference_mode():
         output = actor(
