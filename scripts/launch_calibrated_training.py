@@ -20,7 +20,7 @@ import torch
 
 from kaggriculture.model import ModelConfig
 from kaggriculture.provenance import source_identity, validate_source_identity
-from kaggriculture.vapo import VapoConfig
+from kaggriculture.vapo import MAX_FIRST_MINIBATCH_KL, MAX_UPDATE_REPLAY_RATIO_ERROR, VapoConfig
 
 PRODUCTION_SELF_PLAY_GAMES = 112
 PRODUCTION_LEAGUE_GAMES = 96
@@ -214,7 +214,8 @@ def _validate_configuration(
         },
         "model": _production_model_config(),
         "vapo": _production_vapo_config(compiled=compiled),
-        "max_update_replay_error": 1e-3,
+        "max_update_replay_error": MAX_UPDATE_REPLAY_RATIO_ERROR,
+        "max_first_minibatch_kl": MAX_FIRST_MINIBATCH_KL,
         "torch": str(torch.__version__),
     }
     for key, expected_value in expected.items():

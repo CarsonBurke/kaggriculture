@@ -84,7 +84,8 @@ def _records(
         },
         "model": module._production_model_config(),
         "vapo": module._production_vapo_config(compiled=compiled),
-        "max_update_replay_error": 1e-3,
+        "max_update_replay_error": module.MAX_UPDATE_REPLAY_RATIO_ERROR,
+        "max_first_minibatch_kl": module.MAX_FIRST_MINIBATCH_KL,
         "torch": str(module.torch.__version__),
     }
     identity = module.source_identity()

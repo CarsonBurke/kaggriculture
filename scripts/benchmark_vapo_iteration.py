@@ -25,7 +25,14 @@ from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_r
 from kaggriculture.rust_env import load_native
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
-from kaggriculture.vapo import VapoConfig, make_optimizers, update_replay_parity, update_vapo
+from kaggriculture.vapo import (
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_RATIO_ERROR,
+    VapoConfig,
+    make_optimizers,
+    update_replay_parity,
+    update_vapo,
+)
 
 _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
@@ -135,11 +142,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-update-replay-error",
         type=float,
-        default=1e-3,
+        default=MAX_UPDATE_REPLAY_RATIO_ERROR,
         help=(
-            "maximum unchanged-policy importance-ratio drift through the exact "
-            "update-path forward; CUDA kernels are batch-shape stable only to "
-            "roughly 1e-4, so this gates compiled/graphed update variants"
+            "maximum likelihood-ratio divergence between the rollout sampling "
+            "path and the update-path behavior replay; this bounds off-policy "
+            "sampling bias (the importance ratio itself starts at one via "
+            "replay_behavior_logprobs), so its budget is a fraction of the "
+            "clip band sitting above the measured ~2.4e-2 bf16 noise floor"
+        ),
+    )
+    parser.add_argument(
+        "--max-first-minibatch-kl",
+        type=float,
+        default=MAX_FIRST_MINIBATCH_KL,
+        help=(
+            "maximum approximate KL of the first actor minibatch at unchanged "
+            "weights; nonzero values are pure numerics between the behavior "
+            "replay and the grad-mode minibatch computation of the same "
+            "forward, so this gates the exactness of the ratio-at-one "
+            "construction"
         ),
     )
     parser.add_argument("--compile-models", action="store_true")
@@ -248,9 +269,15 @@ def main() -> None:
     if (
         not math.isfinite(args.max_update_replay_error)
         or args.max_update_replay_error <= 0.0
-        or args.max_update_replay_error > 1e-3
+        or args.max_update_replay_error > 1e-1
     ):
-        raise ValueError("--max-update-replay-error must be finite, positive, and at most 1e-3")
+        raise ValueError("--max-update-replay-error must be finite, positive, and at most 1e-1")
+    if (
+        not math.isfinite(args.max_first_minibatch_kl)
+        or args.max_first_minibatch_kl <= 0.0
+        or args.max_first_minibatch_kl > 1e-3
+    ):
+        raise ValueError("--max-first-minibatch-kl must be finite, positive, and at most 1e-3")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -301,6 +328,7 @@ def main() -> None:
             "temperature": args.temperature,
             "opponent_temperature": args.opponent_temperature,
             "max_update_replay_error": args.max_update_replay_error,
+            "max_first_minibatch_kl": args.max_first_minibatch_kl,
             "precision": {
                 "use_bfloat16": vapo_config.use_bfloat16,
                 "float32_matmul_precision": torch.get_float32_matmul_precision(),
@@ -387,16 +415,18 @@ def main() -> None:
             rollout_seconds = time.perf_counter() - iteration_started
             del opponents
 
-            # Gate the update-path importance ratios at unchanged weights
-            # before the update mutates the actor. This bounds the numeric
-            # drift any update-path change (compilation, CUDA graphs, larger
-            # minibatches) injects into clipping and the KL trust region.
+            # Audit the divergence between the sampling-path likelihoods and
+            # the update-path behavior replay before the update mutates the
+            # actor. The importance ratio no longer sees this difference (the
+            # update replays behavior likelihoods through its own forward);
+            # what it bounds is the off-policy sampling bias.
             parity_started = time.perf_counter()
             parity = update_replay_parity(
                 actor,
                 rollout,
                 minibatch_size=vapo_config.minibatch_size,
                 compile_model=vapo_config.compile_update,
+                autocast_enabled=vapo_config.use_bfloat16 and device.type == "cuda",
             )
             _synchronize(device)
             parity_seconds = time.perf_counter() - parity_started
@@ -405,7 +435,7 @@ def main() -> None:
                     raise RuntimeError(f"update replay parity saw no active {component} components")
             if parity["update_replay_max_ratio_error"] > args.max_update_replay_error:
                 raise RuntimeError(
-                    "update-path importance ratios drifted beyond "
+                    "sampling-vs-update likelihood divergence exceeded "
                     f"{args.max_update_replay_error}: {parity['update_replay_max_ratio_error']}"
                 )
             _verify_first_step_critic_features(rollout, self_play_games, wave_seed_start)
@@ -422,6 +452,16 @@ def main() -> None:
             )
             _synchronize(device)
             update_seconds = time.perf_counter() - update_started
+            # Gate the first-minibatch KL before the actor-update count: an
+            # inflated KL at unchanged weights trips the trust region on
+            # minibatch zero, so checking update counts first would report the
+            # symptom instead of the cause.
+            first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
+            if first_minibatch_kl > args.max_first_minibatch_kl:
+                raise RuntimeError(
+                    "first-minibatch KL at unchanged weights exceeded "
+                    f"{args.max_first_minibatch_kl}: {first_minibatch_kl}"
+                )
             if int(update_metrics["actor_updates"]) < 1:
                 raise RuntimeError("benchmark iteration completed without an actor update")
             # The parity gate is benchmark-only instrumentation; production
