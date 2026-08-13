@@ -257,8 +257,17 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(
         module,
+        "update_replay_parity",
+        lambda *args, **kwargs: {"update_replay_max_ratio_error": 0.0},
+    )
+    monkeypatch.setattr(
+        module,
         "update_vapo",
-        lambda *args, **kwargs: {"actor_updates": 1, "critic_updates": 1},
+        lambda *args, **kwargs: {
+            "actor_updates": 1,
+            "critic_updates": 1,
+            "first_minibatch_approx_kl": 0.0,
+        },
     )
 
     def arguments(run_dir: Path, iterations: int, resume: Path | None = None) -> list[str]:

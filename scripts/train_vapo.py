@@ -62,8 +62,11 @@ from kaggriculture.training import (
 )
 from kaggriculture.vapo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_RATIO_ERROR,
     VapoConfig,
     make_optimizers,
+    update_replay_parity,
     update_vapo,
 )
 
@@ -669,6 +672,7 @@ def main() -> None:
             run_provenance=run_provenance,
         )
 
+    replay_parity_audited = False
     while iteration < args.iterations:
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
             break
@@ -742,6 +746,28 @@ def main() -> None:
             league_diagnostics.update(
                 _league_opponent_diagnostics(league_part, assignments, selections)
             )
+        # The update pins its importance ratio to one by replaying behavior
+        # likelihoods through its own forward, so a staging bug applied
+        # identically to both update-path sides would never move the KL guard.
+        # Comparing that replay against the rollout's stored sampling
+        # likelihoods once per process catches exactly that class of bug; the
+        # bound is the measured bf16 noise floor with ~2x headroom.
+        replay_parity_metrics: dict[str, float | int] = {}
+        if not replay_parity_audited:
+            replay_parity_metrics = update_replay_parity(
+                actor,
+                rollout,
+                minibatch_size=vapo_config.minibatch_size,
+                compile_model=vapo_config.compile_update,
+                autocast_enabled=vapo_config.use_bfloat16 and device.type == "cuda",
+            )
+            parity_error = float(replay_parity_metrics["update_replay_max_ratio_error"])
+            if parity_error > MAX_UPDATE_REPLAY_RATIO_ERROR:
+                raise RuntimeError(
+                    "sampling-vs-update likelihood divergence exceeded "
+                    f"{MAX_UPDATE_REPLAY_RATIO_ERROR}: {parity_error}"
+                )
+            replay_parity_audited = True
         update_started = time.monotonic()
         update_metrics = update_vapo(
             actor,
@@ -752,6 +778,16 @@ def main() -> None:
             vapo_config,
             generator=generator,
         )
+        # An inflated first-minibatch KL at unchanged weights means the
+        # behavior replay and the minibatch forward disagree beyond numerics;
+        # gate it before the update count so the cause is reported, not the
+        # tripped trust region it produces.
+        first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
+        if first_minibatch_kl > MAX_FIRST_MINIBATCH_KL:
+            raise RuntimeError(
+                "first-minibatch KL at unchanged weights exceeded "
+                f"{MAX_FIRST_MINIBATCH_KL}: {first_minibatch_kl}"
+            )
         if int(update_metrics["actor_updates"]) < 1:
             raise RuntimeError("VAPO iteration completed without an actor update")
         update_seconds = time.monotonic() - update_started
@@ -769,6 +805,7 @@ def main() -> None:
             **rollout_diagnostics(rollout),
             **self_play_diagnostics,
             **league_diagnostics,
+            **replay_parity_metrics,
             **update_metrics,
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
