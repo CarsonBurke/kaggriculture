@@ -28,7 +28,6 @@ class VapoConfig:
     minibatch_size: int = 2048
     clip_low: float = 0.80
     clip_high: float = 1.28
-    entropy_coefficient: float = 0.01
     # Zero selects exact Monte Carlo credit. With gamma=1 this preserves the
     # telescoping potential-shaped objective exactly. Positive values expose
     # length-adaptive VAPO lambda only as an explicit ablation.
@@ -114,8 +113,6 @@ def _validate_config(config: VapoConfig) -> None:
         raise ValueError("LR warmup steps cannot be negative")
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
         raise ValueError("clip interval must straddle one")
-    if not math.isfinite(config.entropy_coefficient) or config.entropy_coefficient < 0.0:
-        raise ValueError("entropy coefficient must be finite and non-negative")
     if config.gamma != 1.0:
         raise ValueError("Kaggriculture potential shaping requires undiscounted gamma=1")
     if not math.isfinite(config.gae_lambda_alpha) or config.gae_lambda_alpha < 0.0:
@@ -237,6 +234,36 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.
     return 1.0 - float(np.var(selected_targets - selected_predictions)) / variance
 
 
+def _validate_rollout_action_masks(rollout: RolloutBatch) -> None:
+    """Validate stored categorical support once, before accelerator staging."""
+    valid = rollout.valid.reshape(-1)
+    for name, masks, actions in (
+        ("unit", rollout.unit_masks, rollout.unit_actions),
+        ("market kind", rollout.market_kind_masks, rollout.market_kinds),
+        ("market quantity", rollout.market_quantity_masks, rollout.market_quantities),
+    ):
+        flat_masks = masks.reshape((-1, *masks.shape[2:]))
+        flat_actions = actions.reshape((-1, *actions.shape[2:]))
+        if flat_masks.shape[:-1] != flat_actions.shape:
+            raise ValueError(f"{name} action and mask shapes do not align")
+        valid_actions = flat_actions[valid]
+        if valid_actions.size == 0:
+            continue
+        categories = flat_masks.shape[-1]
+        if valid_actions.min() < 0 or valid_actions.max() >= categories:
+            raise ValueError(f"{name} action is outside its categorical support")
+        nonempty = flat_masks.any(axis=-1)
+        if not nonempty[valid].all():
+            raise ValueError(f"{name} mask has no valid category")
+        selected_valid = np.take_along_axis(
+            flat_masks,
+            flat_actions.clip(0, categories - 1)[..., None],
+            axis=-1,
+        ).squeeze(-1)
+        if not selected_valid[valid].all():
+            raise ValueError(f"{name} action is masked out")
+
+
 def update_vapo(
     actor: FarmActor,
     critic: DistributionalCritic,
@@ -254,7 +281,24 @@ def update_vapo(
         raise ValueError("actor and critic must use the same device")
     actor.train()
     critic.train()
+    _validate_rollout_action_masks(rollout)
     prepared = prepare_advantages(rollout, config)
+    valid_value_targets = prepared.value_targets[rollout.valid]
+    value_support = critic.support.detach().float().cpu().numpy()
+    support_widths = np.diff(value_support)
+    if (
+        not np.isfinite(value_support).all()
+        or not (support_widths > 0).all()
+        or not np.allclose(support_widths, support_widths[:1])
+    ):
+        raise ValueError("critic value support must be finite, increasing, and evenly spaced")
+    if not np.isfinite(valid_value_targets).all():
+        raise ValueError("value targets must be finite")
+    if (
+        valid_value_targets.min() < value_support[0]
+        or valid_value_targets.max() > value_support[-1]
+    ):
+        raise ValueError("value targets fall outside the critic support")
     flat_valid = rollout.valid.reshape(-1)
     valid_indices = np.flatnonzero(flat_valid)
     flat_component_counts = (
@@ -371,6 +415,7 @@ def update_vapo(
                     unit_masks,
                     kind_masks,
                     quantity_masks,
+                    validate_masks=False,
                 )
                 policy_sum = torch.zeros((), device=device)
                 entropy_sum = torch.zeros((), device=device)
@@ -390,7 +435,7 @@ def update_vapo(
                         config.clip_high,
                     )
                     policy_sum += component_objective
-                    entropy_sum += (entropy * active).sum()
+                    entropy_sum += (entropy.detach() * active).sum()
                     kl_sum += component_kl
                     clipped_sum += component_clipped
                 batch_kl = kl_sum.detach().double() / component_count
@@ -403,10 +448,9 @@ def update_vapo(
                 else:
                     policy_loss = -policy_sum / component_count
                     entropy_mean = entropy_sum / component_count
-                    actor_loss = policy_loss - config.entropy_coefficient * entropy_mean
-                    if not torch.isfinite(actor_loss):
-                        raise FloatingPointError("non-finite actor loss")
-                    actor_loss.backward()
+                    if not torch.isfinite(policy_loss):
+                        raise FloatingPointError("non-finite policy loss")
+                    policy_loss.backward()
                     actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                         actor.parameters(), config.max_gradient_norm
                     ).detach()
@@ -434,7 +478,11 @@ def update_vapo(
             ):
                 critic_logits = critic(board, critic_features)
             value_loss = distributional_value_loss(
-                critic_logits, value_targets, critic.support
+                critic_logits,
+                value_targets,
+                critic.support,
+                sigma_ratio=critic.config.value_sigma_ratio,
+                validate=False,
             ).mean()
             if not torch.isfinite(value_loss):
                 raise FloatingPointError("non-finite critic loss")
@@ -472,6 +520,8 @@ def update_vapo(
         "advantage_std": float(prepared.advantages[rollout.valid].std()),
         "value_target_mean": float(prepared.value_targets[rollout.valid].mean()),
         "value_target_std": float(prepared.value_targets[rollout.valid].std()),
+        "value_target_min": float(prepared.value_targets[rollout.valid].min()),
+        "value_target_max": float(prepared.value_targets[rollout.valid].max()),
         "lambda_mean": float(prepared.lambdas.mean()),
         "actor_learning_rate": float(actor_optimizer.param_groups[0]["lr"]),
         "critic_learning_rate": float(critic_optimizer.param_groups[0]["lr"]),

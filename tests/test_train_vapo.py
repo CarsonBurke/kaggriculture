@@ -39,6 +39,16 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.league_active_pool_size == 16
     assert args.epochs == 1
     assert args.minibatch_size == 2048
+    assert (
+        args.cnn_width,
+        args.cnn_blocks,
+        args.model_dim,
+        args.transformer_layers,
+        args.attention_heads,
+        args.ffn_multiplier,
+        args.quantity_rank,
+    ) == (48, 2, 96, 7, 4, 4, 32)
+    assert not hasattr(args, "entropy_coefficient")
     assert args.gae_lambda_alpha == 0.0
     assert args.target_kl == 0.03
     assert args.checkpoint_every == 5
@@ -161,7 +171,9 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
     tmp_path,
 ) -> None:
     module = _training_script()
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(model_config)
     source_run = tmp_path / "source"
     source_run.mkdir()
@@ -256,14 +268,16 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "0",
             "--device",
             "cpu",
-            "--width",
+            "--cnn-width",
             "8",
-            "--residual-blocks",
+            "--cnn-blocks",
             "1",
-            "--hidden",
+            "--model-dim",
             "16",
-            "--query-features",
-            "4",
+            "--transformer-layers",
+            "3",
+            "--attention-heads",
+            "2",
             "--checkpoint-every",
             "1",
             "--no-bfloat16",

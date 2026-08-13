@@ -18,7 +18,7 @@ import torch
 
 from kaggriculture.model import FarmActor, ModelConfig
 
-LEAGUE_SNAPSHOT_FORMAT_VERSION = 1
+LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
 _SNAPSHOT_NAME = re.compile(r"league-actor-(\d{8})\.pt")
 _MAX_CANONICAL_ITERATION = 99_999_999
 

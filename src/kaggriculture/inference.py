@@ -12,8 +12,8 @@ from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import act_batch
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
 
-ACTOR_ARTIFACT_FORMAT_VERSION = 4
-CHECKPOINT_FORMAT_VERSION = 4
+ACTOR_ARTIFACT_FORMAT_VERSION = 5
+CHECKPOINT_FORMAT_VERSION = 5
 
 
 def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:

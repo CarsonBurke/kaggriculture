@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import asdict
 
 import numpy as np
 import pytest
@@ -12,11 +13,31 @@ from kaggriculture.rollout import collect_self_play
 from kaggriculture.vapo import (
     VapoConfig,
     _clipped_surrogate_sums,
+    _validate_rollout_action_masks,
     generalized_advantage_and_targets,
     length_adaptive_lambda,
     make_optimizers,
     update_vapo,
 )
+
+
+def test_vapo_config_has_no_entropy_bonus() -> None:
+    assert "entropy_coefficient" not in asdict(VapoConfig())
+
+
+def test_rollout_action_masks_are_validated_once_before_replay() -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        actor, critic, games=1, seed_start=89, episode_steps=3, sampling_seed=2
+    )
+    rollout.unit_masks[0, 0, 0].fill(False)
+
+    with pytest.raises(ValueError, match="unit mask has no valid category"):
+        _validate_rollout_action_masks(rollout)
 
 
 def test_default_lambda_is_exact_monte_carlo() -> None:
@@ -91,7 +112,9 @@ def test_asymmetric_clipping_leaves_harmful_direction_unclipped() -> None:
 
 
 def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     config = VapoConfig(
@@ -131,7 +154,9 @@ def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
 
 
 def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(
@@ -187,7 +212,9 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
 
 
 def test_over_target_pre_step_kl_does_not_update_actor() -> None:
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(
@@ -233,7 +260,9 @@ def test_over_target_pre_step_kl_does_not_update_actor() -> None:
 
 
 def test_one_vapo_update_is_finite() -> None:
-    model_config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    model_config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(
@@ -257,3 +286,50 @@ def test_one_vapo_update_is_finite() -> None:
     assert math.isfinite(metrics["policy_loss"])
     assert 0.0 <= metrics["clip_fraction"] <= 1.0
     assert metrics["lambda_mean"] == 1.0
+    value_targets = generalized_advantage_and_targets(
+        torch.from_numpy(rollout.rewards),
+        torch.from_numpy(rollout.old_values),
+        torch.from_numpy(rollout.valid),
+        torch.ones(rollout.trajectories),
+    )[1]
+    valid_targets = value_targets[torch.from_numpy(rollout.valid)]
+    assert metrics["value_target_min"] == pytest.approx(float(valid_targets.min()))
+    assert metrics["value_target_max"] == pytest.approx(float(valid_targets.max()))
+
+
+def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero() -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        actor, critic, games=1, seed_start=94, episode_steps=3, sampling_seed=10
+    )
+    rollout.rewards.fill(0.0)
+    rollout.old_values.fill(0.0)
+    config = VapoConfig(
+        epochs=1,
+        minibatch_size=rollout.states,
+        lr_warmup_steps=0,
+        weight_decay=0.0,
+        use_bfloat16=False,
+    )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(11),
+    )
+
+    assert metrics["actor_updates"] == 1
+    assert metrics["policy_loss"] == pytest.approx(0.0, abs=1e-12)
+    assert metrics["entropy"] > 0.0
+    for name, parameter in actor.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)

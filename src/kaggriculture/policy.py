@@ -134,16 +134,22 @@ def stack_encoded(
     )
 
 
-def mask_logits(logits: Tensor, mask: Tensor) -> Tensor:
+def mask_logits(logits: Tensor, mask: Tensor, *, validate: bool = True) -> Tensor:
     if logits.shape != mask.shape:
         raise ValueError(f"logit/mask shape mismatch: {logits.shape} != {mask.shape}")
-    if not bool(mask.any(dim=-1).all()):
+    if validate and not bool(mask.any(dim=-1).all()):
         raise ValueError("every categorical decision needs at least one valid action")
     return logits.float().masked_fill(~mask, torch.finfo(torch.float32).min)
 
 
-def categorical_statistics(logits: Tensor, mask: Tensor, actions: Tensor) -> tuple[Tensor, Tensor]:
-    masked = mask_logits(logits, mask)
+def categorical_statistics(
+    logits: Tensor,
+    mask: Tensor,
+    actions: Tensor,
+    *,
+    validate_mask: bool = True,
+) -> tuple[Tensor, Tensor]:
+    masked = mask_logits(logits, mask, validate=validate_mask)
     log_probabilities = masked.log_softmax(dim=-1)
     probabilities = log_probabilities.exp()
     selected = log_probabilities.gather(-1, actions.long().unsqueeze(-1)).squeeze(-1)
@@ -198,15 +204,26 @@ def component_logprobs(
     unit_masks: Tensor,
     market_kind_masks: Tensor,
     market_quantity_masks: Tensor,
+    *,
+    validate_masks: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     unit_logprob, unit_entropy = categorical_statistics(
-        output.unit_logits, unit_masks, unit_actions
+        output.unit_logits,
+        unit_masks,
+        unit_actions,
+        validate_mask=validate_masks,
     )
     kind_logprob, kind_entropy = categorical_statistics(
-        output.market_kind_logits, market_kind_masks, market_kinds
+        output.market_kind_logits,
+        market_kind_masks,
+        market_kinds,
+        validate_mask=validate_masks,
     )
     quantity_logprob, quantity_entropy = categorical_statistics(
-        market_quantity_logits, market_quantity_masks, market_quantities
+        market_quantity_logits,
+        market_quantity_masks,
+        market_quantities,
+        validate_mask=validate_masks,
     )
     return (
         unit_logprob,
@@ -394,7 +411,11 @@ def act_batch(
                 crop = CROPS[int(raw_action) - int(UnitAction.PLANT_WHEAT)]
                 remaining_seeds[row][crop] = remaining_seeds[row].get(crop, 0) - 1
             apply_unit_shed_effect(
-                observations[row], unit_index, int(raw_action), remaining_unit_sheds[row]
+                observations[row],
+                unit_index,
+                int(raw_action),
+                remaining_unit_sheds[row],
+                unit_tiles[row],
             )
             apply_unit_tile_effect(observations[row], unit_index, int(raw_action), unit_tiles[row])
 

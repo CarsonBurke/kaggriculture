@@ -26,23 +26,39 @@ from kaggriculture.rollout import (
     collect_self_play_rust,
     concatenate_rollouts,
 )
+from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 from kaggriculture.vapo import VapoConfig, make_optimizers, update_vapo
 
 _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
+_REPORT_MIRROR: TensorboardMirror | None = None
+_REPORT_TENSORBOARD_DIR: Path | None = None
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_ACTIVE_OPPONENTS = 2
 
 
-def _configure_report(path: Path | None) -> None:
-    global _REPORT_PATH
+def _configure_report(path: Path | None, tensorboard_dir: Path | None = None) -> None:
+    global _REPORT_MIRROR, _REPORT_PATH, _REPORT_TENSORBOARD_DIR
+    if _REPORT_MIRROR is not None:
+        _REPORT_MIRROR.close()
+        _REPORT_MIRROR = None
     _REPORT_PATH = None if path is None else path.expanduser().resolve()
+    if tensorboard_dir is not None and _REPORT_PATH is None:
+        raise ValueError("TensorBoard output requires a JSONL report path")
+    if _REPORT_PATH is not None:
+        default = _REPORT_PATH.parent / "tensorboard" / _REPORT_PATH.stem
+        selected = default if tensorboard_dir is None else tensorboard_dir
+        _REPORT_TENSORBOARD_DIR = selected.expanduser().resolve()
+    else:
+        _REPORT_TENSORBOARD_DIR = None
     _REPORT_LINES.clear()
 
 
 def emit(payload: dict) -> None:
     """Write one finite, standards-compliant JSONL record."""
+
+    global _REPORT_MIRROR
 
     def normalize(value, path: str):
         if isinstance(value, np.generic):
@@ -73,6 +89,11 @@ def emit(payload: dict) -> None:
         os.replace(temporary, _REPORT_PATH)
     finally:
         temporary.unlink(missing_ok=True)
+    if _REPORT_MIRROR is None:
+        assert _REPORT_TENSORBOARD_DIR is not None
+        _REPORT_MIRROR = TensorboardMirror(_REPORT_PATH, _REPORT_TENSORBOARD_DIR)
+    else:
+        _REPORT_MIRROR.record(payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,10 +123,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--width", type=int, default=64)
-    parser.add_argument("--residual-blocks", type=int, default=3)
-    parser.add_argument("--hidden", type=int, default=192)
-    parser.add_argument("--query-features", type=int, default=24)
+    parser.add_argument("--cnn-width", type=int, default=48)
+    parser.add_argument("--cnn-blocks", type=int, default=2)
+    parser.add_argument("--model-dim", type=int, default=96)
+    parser.add_argument("--transformer-layers", type=int, default=7)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--ffn-multiplier", type=int, default=4)
+    parser.add_argument("--quantity-rank", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -114,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-models", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--tensorboard-dir", type=Path)
     return parser.parse_args()
 
 
@@ -171,7 +196,7 @@ def _completion_record(game_counts: list[int], repeats: int) -> dict[str, object
 
 def main() -> None:
     args = parse_args()
-    _configure_report(args.output)
+    _configure_report(args.output, args.tensorboard_dir)
     game_counts = [int(value) for value in args.games.split(",")]
     if not game_counts or any(value < 1 for value in game_counts):
         raise ValueError("--games must be a comma-separated list of positive integers")
@@ -202,10 +227,13 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
 
     model_config = ModelConfig(
-        width=args.width,
-        residual_blocks=args.residual_blocks,
-        hidden=args.hidden,
-        query_features=args.query_features,
+        cnn_width=args.cnn_width,
+        cnn_blocks=args.cnn_blocks,
+        model_dim=args.model_dim,
+        transformer_layers=args.transformer_layers,
+        attention_heads=args.attention_heads,
+        ffn_multiplier=args.ffn_multiplier,
+        quantity_rank=args.quantity_rank,
     )
     vapo_config = VapoConfig(
         epochs=args.epochs,
@@ -418,6 +446,7 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
     emit(_completion_record(game_counts, args.repeats))
+    _configure_report(None)
 
 
 if __name__ == "__main__":

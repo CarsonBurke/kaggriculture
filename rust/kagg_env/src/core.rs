@@ -355,13 +355,14 @@ impl UnitLedger {
             return at_shed && self.private.shed[item] >= quantity;
         }
         let tile = self.farm.tiles[y * BOARD_SIZE + x];
+        if let Some(animal) = place_animal(action) {
+            let has_animal = self.private.inventories[unit][9 + animal] > 0;
+            let installs_animal = tile.kind == animal_structure(animal) && !tile.has_animal;
+            let deposits_animal = at_shed && self.shed_total() < self.config.shed_capacity;
+            return has_animal && (installs_animal || deposits_animal);
+        }
         if tile.kind == TileKind::Locked {
             return false;
-        }
-        if let Some(animal) = place_animal(action) {
-            return tile.kind == animal_structure(animal)
-                && !tile.has_animal
-                && self.private.inventories[unit][9 + animal] > 0;
         }
         if let Some(crop) = unit_plant_crop(action) {
             return tile.kind == TileKind::Empty && self.private.seeds[crop] > 0;
@@ -415,8 +416,12 @@ impl UnitLedger {
         let tile = self.farm.tiles[tile_index];
         if let Some(animal) = place_animal(action) {
             let item = 9 + animal;
-            self.take_inventory(unit, item, 1);
-            self.farm.tiles[tile_index] = Tile::animal(animal, day);
+            if tile.kind == animal_structure(animal) && !tile.has_animal {
+                self.take_inventory(unit, item, 1);
+                self.farm.tiles[tile_index] = Tile::animal(animal, day);
+            } else if is_shed_access(x, y) {
+                self.place_to_shed(unit, item, 1);
+            }
             return;
         }
         if let Some(crop) = unit_plant_crop(action) {
@@ -513,6 +518,17 @@ impl UnitLedger {
             self.private.inventories[unit][item] = 0;
         }
         self.private.inventory_order[unit] = [u8::MAX; PRIVATE_ITEMS];
+    }
+
+    fn place_to_shed(&mut self, unit: usize, item: usize, requested: u16) {
+        let available = self.private.inventories[unit][item];
+        let room = self.config.shed_capacity.saturating_sub(self.shed_total());
+        let quantity = requested.min(available).min(room);
+        if quantity == 0 {
+            return;
+        }
+        self.take_inventory(unit, item, quantity);
+        self.private.shed[item] += quantity;
     }
 }
 
@@ -1064,13 +1080,14 @@ impl Game {
             return at_shed && self.privates[player].shed[item] >= quantity;
         }
         let tile = self.farms[player].tiles[y * BOARD_SIZE + x];
+        if let Some(animal) = place_animal(action) {
+            let has_animal = self.privates[player].inventories[unit][9 + animal] > 0;
+            let installs_animal = tile.kind == animal_structure(animal) && !tile.has_animal;
+            let deposits_animal = at_shed && self.shed_total(player) < self.config.shed_capacity;
+            return has_animal && (installs_animal || deposits_animal);
+        }
         if tile.kind == TileKind::Locked {
             return false;
-        }
-        if let Some(animal) = place_animal(action) {
-            return tile.kind == animal_structure(animal)
-                && !tile.has_animal
-                && self.privates[player].inventories[unit][9 + animal] > 0;
         }
         if let Some(crop) = unit_plant_crop(action) {
             return tile.kind == TileKind::Empty && self.privates[player].seeds[crop] > 0;
@@ -2399,6 +2416,71 @@ mod tests {
         let row = &masks.market_quantity[..MARKET_QUANTITIES];
         assert!(row[..37].iter().all(|&valid| valid));
         assert!(row[37..].iter().all(|&valid| !valid));
+    }
+
+    #[test]
+    fn place_animal_at_shed_reserves_capacity_before_later_units() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].units = 2;
+        game.farms[0].positions[0] = Position(5, 4);
+        game.farms[0].positions[1] = Position(4, 4);
+        game.privates[0].shed[0] = 99;
+        game.add_inventory(0, 0, 10, 1);
+        game.add_inventory(0, 1, 10, 1);
+        let mut action = CompactAction::default();
+        action.units[0] = 43;
+        action.units[1] = 43;
+
+        let masks = game.factor_masks(0, &action);
+
+        assert!(masks.unit[43]);
+        assert!(!masks.unit[UNIT_ACTIONS + 43]);
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(
+            game.farms[0].tiles[4 * BOARD_SIZE + 5].kind,
+            TileKind::Locked
+        );
+        assert_eq!(game.privates[0].shed[10], 1);
+        assert_eq!(game.privates[0].inventories[0][10], 0);
+        assert_eq!(game.privates[0].inventories[1][10], 1);
+    }
+
+    #[test]
+    fn place_animal_prefers_matching_structure_when_shed_is_full() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].tiles[44] = Tile::structure(TileKind::Pasture);
+        game.privates[0].shed[0] = 100;
+        game.add_inventory(0, 0, 10, 1);
+        let mut action = CompactAction::default();
+        action.units[0] = 43;
+
+        let masks = game.factor_masks(0, &action);
+
+        assert!(masks.unit[43]);
+        game.step(&[action, CompactAction::default()]);
+        assert!(game.farms[0].tiles[44].has_animal);
+        assert_eq!(game.farms[0].tiles[44].species, 1);
+        assert_eq!(game.privates[0].shed.iter().sum::<u16>(), 100);
+        assert_eq!(game.privates[0].inventories[0][10], 0);
+    }
+
+    #[test]
+    fn build_then_place_does_not_consume_shed_capacity_in_unit_ledger() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].units = 2;
+        game.privates[0].shed[0] = 99;
+        game.add_inventory(0, 1, 10, 1);
+        let mut action = CompactAction::default();
+        action.units[0] = 55;
+        action.units[1] = 43;
+
+        let masks = game.factor_masks(0, &action);
+
+        assert!(masks.unit[UNIT_ACTIONS + 43]);
+        assert!(masks.market_kind[8]);
+        game.step(&[action, CompactAction::default()]);
+        assert!(game.farms[0].tiles[44].has_animal);
+        assert_eq!(game.privates[0].shed.iter().sum::<u16>(), 99);
     }
 
     #[test]

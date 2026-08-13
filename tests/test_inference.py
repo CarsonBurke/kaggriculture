@@ -22,7 +22,9 @@ from kaggriculture.provenance import run_provenance_from_decision, source_identi
 
 
 def test_actor_artifact_round_trip(tmp_path: Path) -> None:
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     artifact = actor_artifact_from_checkpoint(
         {
@@ -44,8 +46,10 @@ def test_actor_artifact_round_trip(tmp_path: Path) -> None:
         assert torch.equal(expected, actual)
 
 
+@pytest.mark.parametrize("calibrated", [False, True])
 def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
     tmp_path: Path,
+    calibrated: bool,
 ) -> None:
     config = ModelConfig()
     actor = FarmActor(config)
@@ -58,18 +62,20 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         actor.market_quantity_bias[:, -1] = 50.0
     checkpoint = tmp_path / "checkpoint.pt"
     archive = tmp_path / "submission.tar.gz"
-    run_provenance = run_provenance_from_decision(
-        {
-            "source_identity": source_identity(),
-            "compile_models": False,
-            "eager_report_sha256": "a" * 64,
-            "eager_report_size_bytes": 100,
-            "compiled_report_sha256": "b" * 64,
-            "compiled_report_size_bytes": 120,
-            "minimum_compile_speedup": 1.05,
-            "measured_compile_speedup": 1.0,
-        },
-    )
+    run_provenance = None
+    if calibrated:
+        run_provenance = run_provenance_from_decision(
+            {
+                "source_identity": source_identity(),
+                "compile_models": False,
+                "eager_report_sha256": "a" * 64,
+                "eager_report_size_bytes": 100,
+                "compiled_report_sha256": "b" * 64,
+                "compiled_report_size_bytes": 120,
+                "minimum_compile_speedup": 1.05,
+                "measured_compile_speedup": 1.0,
+            },
+        )
     torch.save(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -156,7 +162,9 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
     with tarfile.open(archive, "r:gz") as bundle:
         assert set(bundle.getnames()) == required
         bundle.extractall(tmp_path / "extracted", filter="data")
-    assert archive.stat().st_size < 5_000_000
+    # Keep the actor-only artifact compact without constraining worthwhile
+    # policy capacity to the former CNN's incidental five-megabyte footprint.
+    assert archive.stat().st_size < 8_000_000
 
     probe = r"""
 import json
@@ -167,10 +175,12 @@ from pathlib import Path
 root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
 import kaggriculture
-import main
 from kaggle_environments import make
+from kaggle_environments.agent import get_last_callable
 
 assert Path(kaggriculture.__file__).resolve().is_relative_to(root)
+main_path = root / "main.py"
+raw_agent = get_last_callable(main_path.read_text(encoding="utf-8"), path=str(main_path))
 environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 991})
 observation = environment.reset(2)[0].observation
 farm = observation["farms"][0]
@@ -182,7 +192,7 @@ observation["private"]["inventories"] = [{} for _ in range(16)]
 elapsed = []
 for _ in range(5):
     started = time.perf_counter()
-    action = main.agent(observation)
+    action = raw_agent(observation)
     elapsed.append(time.perf_counter() - started)
 assert len(action["hands"]) == 15
 assert len(action["market"]) == 10
@@ -204,7 +214,7 @@ print(json.dumps({"max_action_seconds": max(elapsed), "action": action}))
     assert result["max_action_seconds"] < 1.0
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 5])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4])
 def test_actor_artifact_rejects_incompatible_format(tmp_path: Path, version) -> None:
     path = tmp_path / "model.pt"
     torch.save({"format_version": version}, path)

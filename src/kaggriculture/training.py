@@ -20,7 +20,7 @@ from kaggriculture.provenance import validate_run_provenance, validate_source_id
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.vapo import VapoConfig
 
-CHECKPOINT_FORMAT_VERSION = 4
+CHECKPOINT_FORMAT_VERSION = 5
 
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
@@ -271,6 +271,10 @@ def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
                         f"metrics journal conflicts with checkpoint iteration {iteration}: {path}"
                     )
                 return False
+            if previous_iteration + 1 != iteration:
+                raise ValueError(
+                    f"metrics journal is missing iterations before {iteration}: {path}"
+                )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -288,18 +292,22 @@ def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
 
 
 def metrics_journal_iteration(path: Path) -> int:
-    """Return the last complete journal iteration, rejecting malformed history."""
+    """Return the last iteration of a contiguous, possibly portable journal suffix."""
     path = Path(path)
     if not path.exists():
         return 0
     text = path.read_text(encoding="utf-8")
     if text and not text.endswith("\n"):
         text = text.rpartition("\n")[0]
-    last_iteration = 0
+    last_iteration: int | None = None
     for line in (line for line in text.splitlines() if line):
         payload = json.loads(line)
         iteration = payload.get("iteration")
-        if type(iteration) is not int or iteration != last_iteration + 1:
+        if (
+            type(iteration) is not int
+            or iteration < 1
+            or (last_iteration is not None and iteration != last_iteration + 1)
+        ):
             raise ValueError(f"metrics journal iterations are not contiguous: {path}")
         last_iteration = iteration
-    return last_iteration
+    return 0 if last_iteration is None else last_iteration

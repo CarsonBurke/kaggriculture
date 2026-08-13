@@ -19,7 +19,9 @@ from kaggriculture.vapo import VapoConfig, make_optimizers
 
 
 def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     vapo_config = VapoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
@@ -66,11 +68,13 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert restored.random(8).tolist() == expected.tolist()
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 5])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)
-    model_config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
 
     with pytest.raises(ValueError, match="unsupported checkpoint format"):
         load_checkpoint(
@@ -107,3 +111,14 @@ def test_iteration_metrics_journal_recovers_an_unterminated_crash_suffix(tmp_pat
 
     assert [json.loads(line)["iteration"] for line in path.read_text().splitlines()] == [1, 2]
     assert metrics_journal_iteration(path) == 2
+
+
+def test_iteration_metrics_journal_supports_a_portable_contiguous_suffix(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+
+    assert append_iteration_jsonl(path, {"iteration": 100, "loss": 1.0})
+    assert append_iteration_jsonl(path, {"iteration": 101, "loss": 0.5})
+    assert metrics_journal_iteration(path) == 101
+
+    with pytest.raises(ValueError, match="missing iterations"):
+        append_iteration_jsonl(path, {"iteration": 103, "loss": 0.25})

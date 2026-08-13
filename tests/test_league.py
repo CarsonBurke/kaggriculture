@@ -17,7 +17,15 @@ from kaggriculture.model import FarmActor, ModelConfig
 
 
 def _actor() -> FarmActor:
-    return FarmActor(ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4))
+    return FarmActor(
+        ModelConfig(
+            cnn_width=8,
+            cnn_blocks=1,
+            model_dim=16,
+            transformer_layers=3,
+            attention_heads=2,
+        )
+    )
 
 
 def test_actor_snapshot_is_small_strict_cpu_only_and_idempotent(tmp_path) -> None:
@@ -106,7 +114,9 @@ def test_snapshot_loading_rejects_schema_filename_and_model_mismatches(tmp_path)
     with pytest.raises(ValueError, match="filename/iteration"):
         load_actor_snapshot(mismatched_name)
 
-    other = ModelConfig(width=16, residual_blocks=1, hidden=16, query_features=4)
+    other = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     with pytest.raises(ValueError, match="configuration mismatch"):
         load_actor_snapshot(ref.path, expected_model_config=other)
 

@@ -184,7 +184,9 @@ def test_screening_defaults_to_32_paired_v27_seed_clusters(monkeypatch) -> None:
 
 def test_artifact_validation_accepts_saved_training_checkpoint(tmp_path: Path) -> None:
     evaluator = _load_evaluator()
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     checkpoint = tmp_path / "checkpoint-000017.pt"
     torch.save(

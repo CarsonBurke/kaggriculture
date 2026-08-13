@@ -36,8 +36,27 @@ def test_native_categorical_draw_transport_stays_strictly_below_one() -> None:
         assert (component == np.nextafter(np.float32(1.0), np.float32(0.0))).all()
 
 
+@pytest.mark.parametrize("collector", (collect_self_play, collect_self_play_rust))
+@pytest.mark.parametrize("temperature", (0.8, 1.2, float("nan")))
+def test_on_policy_collectors_reject_nonunit_temperature(collector, temperature: float) -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    with pytest.raises(ValueError, match=r"learner temperature 1\.0"):
+        collector(
+            FarmActor(config),
+            DistributionalCritic(config),
+            games=1,
+            seed_start=1,
+            temperature=temperature,
+        )
+
+
 def test_short_self_play_rollout_shapes_and_telescoping() -> None:
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
 
@@ -66,7 +85,9 @@ def test_short_self_play_rollout_shapes_and_telescoping() -> None:
 
 
 def test_frozen_opponent_rollout_and_concatenation() -> None:
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     opponent = FarmActor(config)
@@ -93,7 +114,9 @@ def test_frozen_opponent_rollout_and_concatenation() -> None:
 
 
 def test_concatenation_weights_entropy_by_active_policy_components() -> None:
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     first = collect_self_play(
@@ -130,7 +153,9 @@ def test_concatenation_weights_entropy_by_active_policy_components() -> None:
 
 
 def test_stored_behavior_likelihoods_replay_from_identical_features() -> None:
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     rollout = collect_self_play(
@@ -179,7 +204,9 @@ def test_stored_behavior_likelihoods_replay_from_identical_features() -> None:
 
 @pytest.mark.parametrize("collector", [collect_self_play_rust])
 def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     with torch.no_grad():
@@ -261,7 +288,15 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
 
 
 def test_compiled_rollout_cache_does_not_pollute_actor_state_dict(monkeypatch) -> None:
-    actor = FarmActor(ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4))
+    actor = FarmActor(
+        ModelConfig(
+            cnn_width=8,
+            cnn_blocks=1,
+            model_dim=16,
+            transformer_layers=3,
+            attention_heads=2,
+        )
+    )
 
     class CompiledWrapper(torch.nn.Module):
         def __init__(self, wrapped: FarmActor) -> None:
@@ -296,7 +331,9 @@ def test_compiled_rollout_cache_does_not_pollute_actor_state_dict(monkeypatch) -
 
 
 def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     opponent = FarmActor(config)
@@ -331,7 +368,9 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
 
 
 def test_native_frozen_opponent_pool_routes_each_game_to_its_assigned_actor() -> None:
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     opponents = [FarmActor(config), FarmActor(config)]
@@ -392,7 +431,9 @@ def test_native_frozen_opponent_pool_routes_each_game_to_its_assigned_actor() ->
 
 @pytest.mark.parametrize("indices", [[0], [0.0, 0.0], [0, 2], [0, -1]])
 def test_native_frozen_opponent_pool_rejects_invalid_assignments(indices) -> None:
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     opponent = FarmActor(config)

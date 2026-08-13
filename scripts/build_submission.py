@@ -32,9 +32,11 @@ PACKAGE_FILES = (
 MAIN = '''"""Kaggriculture VAPO submission entrypoint."""
 from pathlib import Path
 
+import kaggriculture
 from kaggriculture.inference import CheckpointAgent
 
-_AGENT = CheckpointAgent(Path(__file__).with_name("model.pt"))
+_BUNDLE_ROOT = Path(kaggriculture.__file__).resolve().parent.parent
+_AGENT = CheckpointAgent(_BUNDLE_ROOT / "model.pt")
 
 
 def agent(obs):
@@ -68,7 +70,7 @@ def _load_evaluation(
         raise ValueError("finalist evaluation does not bind the selected checkpoint bytes")
     if provenance.get("source_identity") != source:
         raise ValueError("finalist evaluation source identity does not match the checkpoint")
-    run_provenance = validate_run_provenance(provenance.get("run_provenance"), required=True)
+    run_provenance = validate_run_provenance(provenance.get("run_provenance"))
     if run_provenance != payload.get("artifact_provenance", {}).get("run_provenance"):
         raise ValueError("finalist evaluation run provenance is inconsistent")
     if payload.get("opponent_label") != "public-v27":
@@ -123,7 +125,7 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
     artifact = actor_artifact_from_checkpoint(checkpoint)
     source = require_source_identity(artifact["source_identity"])
-    run_provenance = validate_run_provenance(artifact.get("run_provenance"), required=True)
+    run_provenance = validate_run_provenance(artifact.get("run_provenance"))
     evaluation_contents = evaluation_report.read_bytes()
     evaluation = _load_evaluation(
         evaluation_contents,
@@ -136,7 +138,8 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
         raise ValueError("checkpoint-selection run provenance does not match the checkpoint")
     evaluation_digest = hashlib.sha256(evaluation_contents).hexdigest()
     artifact["training_checkpoint_sha256"] = checkpoint_digest
-    artifact["run_provenance_sha256"] = run_provenance["sha256"]
+    run_provenance_sha256 = None if run_provenance is None else run_provenance["sha256"]
+    artifact["run_provenance_sha256"] = run_provenance_sha256
     artifact["selection_report_sha256"] = evaluation["selection_provenance"]["sha256"]
     artifact["evaluation_report_sha256"] = evaluation_digest
     source_package = Path(__file__).parents[1] / "src" / "kaggriculture"
@@ -168,7 +171,7 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
             "checkpoint": {
                 "sha256": checkpoint_digest,
                 "iteration": int(artifact["iteration"]),
-                "run_provenance_sha256": run_provenance["sha256"],
+                "run_provenance_sha256": run_provenance_sha256,
             },
             "evaluation": {
                 "sha256": evaluation_digest,

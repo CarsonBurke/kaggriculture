@@ -56,8 +56,11 @@ seed_start = int(sys.argv[4])
 action_timeout = float(sys.argv[5])
 sys.path.insert(0, str(root))
 
-import main
 from kaggle_environments import make
+from kaggle_environments.agent import get_last_callable
+
+main_path = root / "main.py"
+raw_agent = get_last_callable(main_path.read_text(encoding="utf-8"), path=str(main_path))
 
 games = []
 all_action_seconds = []
@@ -68,7 +71,7 @@ for seed in range(seed_start, seed_start + seeds):
         def timed_agent(observation):
             started = time.perf_counter()
             try:
-                return main.agent(observation)
+                return raw_agent(observation)
             finally:
                 action_seconds.append(time.perf_counter() - started)
 
@@ -173,7 +176,7 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         raise ValueError(f"unsupported submission manifest: {manifest['format_version']}")
     source = validate_source_identity(manifest["source_identity"])
     require_source_identity(source)
-    run_provenance = validate_run_provenance(manifest["run_provenance"], required=True)
+    run_provenance = validate_run_provenance(manifest["run_provenance"])
     files = manifest["files"]
     expected_files = REQUIRED_MEMBERS - {"manifest.json"}
     if not isinstance(files, dict) or set(files) != expected_files:
@@ -251,7 +254,8 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         raise ValueError("submission model has a different source identity")
     if artifact.get("run_provenance") != run_provenance:
         raise ValueError("submission model has different run provenance")
-    if run_provenance["sha256"] != checkpoint["run_provenance_sha256"]:
+    run_provenance_sha256 = None if run_provenance is None else run_provenance["sha256"]
+    if run_provenance_sha256 != checkpoint["run_provenance_sha256"]:
         raise ValueError("submission manifest run provenance digest is inconsistent")
     if artifact.get("run_provenance_sha256") != checkpoint["run_provenance_sha256"]:
         raise ValueError("submission model has a different run provenance digest")

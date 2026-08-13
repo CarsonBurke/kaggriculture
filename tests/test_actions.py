@@ -229,6 +229,7 @@ def test_compiler_allows_build_then_place_on_same_turn() -> None:
     observation = _observation()
     observation["farms"][0]["hands"] = [[4, 4]]
     observation["private"]["inventories"].append({"COW": 1})
+    observation["private"]["shed"]["WHEAT"] = 100
     units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
     units[:2] = (UnitAction.BUILD_PASTURE, UnitAction.PLACE_COW)
     kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
@@ -238,6 +239,93 @@ def test_compiler_allows_build_then_place_on_same_turn() -> None:
 
     assert action["farmer"] == ["BUILD_PASTURE"]
     assert action["hands"] == [["PLACE", "COW"]]
+
+
+@pytest.mark.parametrize("position", ([4, 4], [5, 4]))
+def test_place_animal_falls_back_to_shed_and_matches_official_engine(
+    position: list[int],
+) -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 7})
+    state = environment.reset(2)
+    observation = state[0].observation
+    observation["farms"][0]["farmer"] = position
+    observation["private"]["inventories"][0].update({"WHEAT": 1, "COW": 1})
+    observation["private"]["shed"]["WHEAT"] = 99
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[0] = UnitAction.PLACE_COW
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    mask = unit_action_mask(observation, 0)
+    compiled = compile_action(observation, units, kinds, quantities)
+    following = environment.step([compiled, {}])[0].observation
+
+    assert mask[UnitAction.PLACE_COW]
+    assert compiled["farmer"] == ["PLACE", "COW"]
+    assert following["private"]["shed"]["WHEAT"] == 99
+    assert following["private"]["shed"]["COW"] == 1
+    assert following["private"]["inventories"][0] == {"WHEAT": 1}
+
+
+def test_place_animal_prefers_matching_structure_when_shed_is_full() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 7})
+    state = environment.reset(2)
+    observation = state[0].observation
+    observation["farms"][0]["tiles"][4][4] = {"kind": "PASTURE"}
+    observation["private"]["inventories"][0]["COW"] = 1
+    observation["private"]["shed"]["WHEAT"] = 100
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[0] = UnitAction.PLACE_COW
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    mask = unit_action_mask(observation, 0)
+    compiled = compile_action(observation, units, kinds, quantities)
+    following = environment.step([compiled, {}])[0].observation
+
+    assert mask[UnitAction.PLACE_COW]
+    assert following["farms"][0]["tiles"][4][4]["animal"] == "COW"
+    assert following["private"]["shed"]["COW"] == 0
+    assert following["private"]["inventories"][0] == {}
+
+
+def test_place_animal_reserves_last_shed_slot_across_units() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 7})
+    state = environment.reset(2)
+    observation = state[0].observation
+    observation["farms"][0]["hands"] = [[4, 4]]
+    observation["private"]["inventories"][0]["COW"] = 1
+    observation["private"]["inventories"].append({"COW": 1})
+    observation["private"]["shed"]["WHEAT"] = 99
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[:2] = UnitAction.PLACE_COW
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    compiled = compile_action(observation, units, kinds, quantities)
+    following = environment.step([compiled, {}])[0].observation
+
+    assert compiled["farmer"] == ["PLACE", "COW"]
+    assert compiled["hands"] == [["PASS"]]
+    assert following["private"]["shed"]["COW"] == 1
+    assert following["private"]["inventories"] == [{}, {"COW": 1}]
+
+
+def test_build_then_place_does_not_reserve_a_shed_slot() -> None:
+    observation = _observation()
+    observation["farms"][0]["hands"] = [[4, 4]]
+    observation["private"]["inventories"].append({"COW": 1})
+    observation["private"]["shed"]["WHEAT"] = 99
+    remaining_shed = dict(observation["private"]["shed"])
+    tiles = copy_tile_grid(observation["farms"][0]["tiles"])
+
+    apply_unit_tile_effect(observation, 0, UnitAction.BUILD_PASTURE, tiles)
+    apply_unit_shed_effect(observation, 1, UnitAction.PLACE_COW, remaining_shed, tiles)
+    apply_unit_tile_effect(observation, 1, UnitAction.PLACE_COW, tiles)
+
+    assert sum(remaining_shed.values()) == 99
+    assert remaining_shed["COW"] == 0
+    assert tiles[4][4]["animal"] == "COW"
 
 
 def test_compiler_allows_plant_then_water_on_same_turn() -> None:
@@ -327,7 +415,7 @@ def _python_sequential_factor_masks(
         if UnitAction.PLANT_WHEAT <= selected <= UnitAction.PLANT_MELON:
             crop = CROPS[selected - int(UnitAction.PLANT_WHEAT)]
             remaining_seeds[crop] = remaining_seeds.get(crop, 0) - 1
-        apply_unit_shed_effect(observation, unit, selected, remaining_shed)
+        apply_unit_shed_effect(observation, unit, selected, remaining_shed, tiles)
         apply_unit_tile_effect(observation, unit, selected, tiles)
 
     market_inventory = (observation.get("market") or {}).get("inventory") or {}

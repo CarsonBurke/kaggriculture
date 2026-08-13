@@ -241,6 +241,8 @@ def unit_action_mask(
         )
         for action, (item, quantity) in _PICKUP_SPEC.items():
             mask[action] = int(shed.get(item, 0) or 0) >= quantity
+        for action, animal in _PLACE_ANIMAL.items():
+            mask[action] = shed_room > 0 and int(inventory.get(animal, 0) or 0) > 0
 
     tile = tiles[y][x]
     if tile == "LOCKED":
@@ -275,11 +277,10 @@ def unit_action_mask(
         )
         mask[UnitAction.DIG] = True
     elif kind in {"COOP", "PASTURE"}:
-        animal = tile.get("animal")
-        if animal is None:
+        if "animal" not in tile:
             mask[UnitAction.DIG] = True
             for action, candidate in _PLACE_ANIMAL.items():
-                mask[action] = (
+                mask[action] |= (
                     ANIMAL_STRUCTURE[candidate] == kind
                     and int(inventory.get(candidate, 0) or 0) > 0
                 )
@@ -405,6 +406,7 @@ def apply_unit_shed_effect(
     unit_index: int,
     action_value: int,
     shed: dict[str, int],
+    tiles_override: list[list[Any]] | None = None,
 ) -> None:
     """Update a shed ledger using the engine's sequential unit-action semantics."""
     action = UnitAction(action_value)
@@ -412,6 +414,28 @@ def apply_unit_shed_effect(
         item, quantity = _PICKUP_SPEC[action]
         available = int(shed.get(item, 0) or 0)
         shed[item] = available - min(quantity, available)
+        return
+    if action in _PLACE_ANIMAL:
+        player = int(observation.get("player", 0) or 0)
+        farm = (observation.get("farms") or [])[player]
+        position = _unit_position(farm, unit_index)
+        if position is None:
+            return
+        x, y = position
+        tiles = tiles_override if tiles_override is not None else farm.get("tiles") or []
+        animal = _PLACE_ANIMAL[action]
+        tile = tiles[y][x]
+        installs_animal = (
+            isinstance(tile, dict)
+            and tile.get("kind") == ANIMAL_STRUCTURE[animal]
+            and "animal" not in tile
+        )
+        if installs_animal or position not in shed_access_tiles(len(tiles) or BOARD_SIZE):
+            return
+        inventory = _unit_inventory(observation.get("private") or {}, unit_index)
+        room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed.values()))
+        if room > 0 and int(inventory.get(animal, 0) or 0) > 0:
+            shed[animal] = int(shed.get(animal, 0) or 0) + 1
         return
     if action != UnitAction.DROP:
         return
@@ -547,7 +571,7 @@ def compile_action(
         if crop is not None:
             remaining_seeds[crop] = int(remaining_seeds.get(crop, 0) or 0) - 1
         commands.append(unit_action_command(observation, index, selected, remaining_shed))
-        apply_unit_shed_effect(observation, index, selected, remaining_shed)
+        apply_unit_shed_effect(observation, index, selected, remaining_shed, tiles)
         apply_unit_tile_effect(observation, index, selected, tiles)
 
     orders = []

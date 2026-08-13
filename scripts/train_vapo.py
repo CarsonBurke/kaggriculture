@@ -45,6 +45,7 @@ from kaggriculture.rollout import (
     collect_self_play_rust,
     concatenate_rollouts,
 )
+from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import (
     append_iteration_jsonl,
     load_checkpoint,
@@ -72,10 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--max-hours", type=float, default=0.0)
-    parser.add_argument("--width", type=int, default=64)
-    parser.add_argument("--residual-blocks", type=int, default=3)
-    parser.add_argument("--hidden", type=int, default=192)
-    parser.add_argument("--query-features", type=int, default=24)
+    parser.add_argument("--cnn-width", type=int, default=48)
+    parser.add_argument("--cnn-blocks", type=int, default=2)
+    parser.add_argument("--model-dim", type=int, default=96)
+    parser.add_argument("--transformer-layers", type=int, default=7)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--ffn-multiplier", type=int, default=4)
+    parser.add_argument("--quantity-rank", type=int, default=32)
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
@@ -84,7 +88,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-low", type=float, default=0.80)
     parser.add_argument("--clip-high", type=float, default=1.28)
-    parser.add_argument("--entropy-coefficient", type=float, default=0.01)
     parser.add_argument(
         "--gae-lambda-alpha",
         type=float,
@@ -114,10 +117,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         "league_active_pool_size": args.league_active_pool_size,
         "episode_steps": args.episode_steps,
         "checkpoint_every": args.checkpoint_every,
-        "width": args.width,
-        "residual_blocks": args.residual_blocks,
-        "hidden": args.hidden,
-        "query_features": args.query_features,
+        "cnn_width": args.cnn_width,
+        "cnn_blocks": args.cnn_blocks,
+        "model_dim": args.model_dim,
+        "transformer_layers": args.transformer_layers,
+        "attention_heads": args.attention_heads,
+        "ffn_multiplier": args.ffn_multiplier,
+        "quantity_rank": args.quantity_rank,
         "epochs": args.epochs,
         "minibatch_size": args.minibatch_size,
     }
@@ -396,10 +402,13 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
 
     model_config = ModelConfig(
-        width=args.width,
-        residual_blocks=args.residual_blocks,
-        hidden=args.hidden,
-        query_features=args.query_features,
+        cnn_width=args.cnn_width,
+        cnn_blocks=args.cnn_blocks,
+        model_dim=args.model_dim,
+        transformer_layers=args.transformer_layers,
+        attention_heads=args.attention_heads,
+        ffn_multiplier=args.ffn_multiplier,
+        quantity_rank=args.quantity_rank,
     )
     vapo_config = VapoConfig(
         actor_learning_rate=args.actor_lr,
@@ -410,7 +419,6 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
-        entropy_coefficient=args.entropy_coefficient,
         gae_lambda_alpha=args.gae_lambda_alpha,
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
@@ -504,7 +512,6 @@ def main() -> None:
     (args.run_dir / "config.json").write_text(
         json.dumps(configuration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    writer = SummaryWriter(args.run_dir / "tensorboard")
     if resume_payload is not None:
         destination_latest = args.run_dir / "latest.pt"
         if destination_latest.exists():
@@ -567,10 +574,11 @@ def main() -> None:
                     run_provenance=run_provenance,
                 )
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", resume_payload["metrics"])
-        for name, value in resume_payload["metrics"].items():
-            if isinstance(value, int | float):
-                writer.add_scalar(name, value, iteration)
-        writer.flush()
+    writer = TensorboardMirror(
+        args.run_dir / "metrics.jsonl",
+        args.run_dir / "tensorboard",
+        writer_factory=lambda path: SummaryWriter(path),
+    )
     started = time.monotonic()
 
     # The snapshot for the checkpoint's current actor is installed before the
@@ -753,10 +761,7 @@ def main() -> None:
                 run_provenance=run_provenance,
             )
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", metrics)
-        for name, value in metrics.items():
-            if isinstance(value, int | float):
-                writer.add_scalar(name, value, iteration)
-        writer.flush()
+        writer.record(metrics)
         print(json.dumps(metrics, sort_keys=True), flush=True)
         del rollout
     writer.close()

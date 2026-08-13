@@ -5,8 +5,24 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+
+def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -> None:
+    module = _script()
+    latest = tmp_path / "run" / "latest.pt"
+    command = module._training_command(
+        SimpleNamespace(iterations=500, max_hours=0.0, seed=7),
+        latest.parent,
+        compile_models=False,
+        expected_source_digest="a" * 64,
+        calibration_decision=tmp_path / "decision.json",
+        resume_checkpoint=latest,
+    )
+
+    assert command[-2:] == ["--resume", str(latest)]
 
 
 def _script():
@@ -151,7 +167,7 @@ def test_compile_requires_a_material_matched_speedup() -> None:
 def test_compile_decision_rejects_nonproduction_or_mismatched_configuration() -> None:
     module = _script()
     compiled = _records(module, compiled=True, seconds=9.0)
-    compiled[0]["model"] = dict(compiled[0]["model"], width=128)
+    compiled[0]["model"] = dict(compiled[0]["model"], cnn_width=128)
 
     with pytest.raises(ValueError, match="model"):
         module.choose_compilation(_records(module, compiled=False, seconds=10.0), compiled)
@@ -236,6 +252,9 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     eager_contents = _write_report(eager_path, eager_records)
     compiled_contents = _write_report(compiled_path, compiled_records)
     run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    latest_checkpoint = run_directory / "latest.pt"
+    latest_checkpoint.write_bytes(b"atomic checkpoint")
     invocation: dict[str, object] = {}
 
     class Executed(Exception):
@@ -278,7 +297,11 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert Path(decision["compiled_report"]).read_bytes() == compiled_contents
     assert invocation["executable"] == sys.executable
     assert invocation["command"] == decision["training_command"]
+    assert decision["resume_checkpoint"] == str(latest_checkpoint)
+    assert decision["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
     assert "--compile-models" in decision["training_command"]
+    assert "--entropy-coefficient" not in decision["training_command"]
+    assert "entropy_coefficient" not in module._production_vapo_config()
     assert decision["source_identity"] == module.source_identity()
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]

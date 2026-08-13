@@ -19,20 +19,35 @@ from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig, pa
 from kaggriculture.policy import component_logprobs
 from kaggriculture.provenance import source_identity
 from kaggriculture.rollout import collect_self_play_rust
+from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 
 _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
+_REPORT_MIRROR: TensorboardMirror | None = None
+_REPORT_TENSORBOARD_DIR: Path | None = None
 
 
-def _configure_report(path: Path | None) -> None:
-    global _REPORT_PATH
+def _configure_report(path: Path | None, tensorboard_dir: Path | None = None) -> None:
+    global _REPORT_MIRROR, _REPORT_PATH, _REPORT_TENSORBOARD_DIR
+    if _REPORT_MIRROR is not None:
+        _REPORT_MIRROR.close()
+        _REPORT_MIRROR = None
     _REPORT_PATH = None if path is None else path.expanduser().resolve()
+    if tensorboard_dir is not None and _REPORT_PATH is None:
+        raise ValueError("TensorBoard output requires a JSONL report path")
+    if _REPORT_PATH is not None:
+        default = _REPORT_PATH.parent / "tensorboard" / _REPORT_PATH.stem
+        selected = default if tensorboard_dir is None else tensorboard_dir
+        _REPORT_TENSORBOARD_DIR = selected.expanduser().resolve()
+    else:
+        _REPORT_TENSORBOARD_DIR = None
     _REPORT_LINES.clear()
 
 
 def emit(payload: dict) -> None:
     """Write one strict, machine-readable JSONL record."""
+    global _REPORT_MIRROR
     rendered = json.dumps(payload, sort_keys=True, allow_nan=False)
     print(rendered, flush=True)
     if _REPORT_PATH is None:
@@ -51,6 +66,11 @@ def emit(payload: dict) -> None:
         os.replace(temporary, _REPORT_PATH)
     finally:
         temporary.unlink(missing_ok=True)
+    if _REPORT_MIRROR is None:
+        assert _REPORT_TENSORBOARD_DIR is not None
+        _REPORT_MIRROR = TensorboardMirror(_REPORT_PATH, _REPORT_TENSORBOARD_DIR)
+    else:
+        _REPORT_MIRROR.record(payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,14 +79,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--width", type=int, default=64)
-    parser.add_argument("--residual-blocks", type=int, default=3)
-    parser.add_argument("--hidden", type=int, default=192)
-    parser.add_argument("--query-features", type=int, default=24)
+    parser.add_argument("--cnn-width", type=int, default=48)
+    parser.add_argument("--cnn-blocks", type=int, default=2)
+    parser.add_argument("--model-dim", type=int, default=96)
+    parser.add_argument("--transformer-layers", type=int, default=7)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--ffn-multiplier", type=int, default=4)
+    parser.add_argument("--quantity-rank", type=int, default=32)
     parser.add_argument("--compile-models", action="store_true")
     parser.add_argument("--replay-minibatch-size", type=int, default=2048)
-    parser.add_argument("--max-replay-error", type=float, default=5e-6)
+    parser.add_argument(
+        "--max-replay-error",
+        type=float,
+        default=1e-3,
+        help=(
+            "maximum unchanged-policy log-ratio drift across collection and PPO replay; "
+            "CUDA kernels are batch-shape stable only to roughly 1e-4"
+        ),
+    )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--tensorboard-dir", type=Path)
     return parser.parse_args()
 
 
@@ -77,7 +109,14 @@ def replay_diagnostics(
     rollout,
     minibatch_size: int,
 ) -> dict[str, float | int]:
-    """Measure behavior/eager-replay drift over every stored policy factor."""
+    """Measure unchanged-policy behavior/replay drift over every stored factor.
+
+    Collection and PPO replay intentionally use different batch shapes. CUDA
+    convolution and GEMM kernels are not bitwise batch-shape invariant, even in
+    eager mode, so this is a semantic importance-ratio guard rather than a
+    same-kernel floating-point identity check. Native categorical correctness
+    is covered separately against the exact host logits supplied to Rust.
+    """
     device = next(actor.parameters()).device
     flat_valid = rollout.valid.reshape(-1)
     indices = np.flatnonzero(flat_valid)
@@ -162,7 +201,7 @@ def replay_diagnostics(
 
 def main() -> None:
     args = parse_args()
-    _configure_report(args.output)
+    _configure_report(args.output, args.tensorboard_dir)
     game_counts = [int(value) for value in args.games.split(",")]
     if not game_counts or any(value < 1 for value in game_counts):
         raise ValueError("--games must be a comma-separated list of positive integers")
@@ -172,8 +211,12 @@ def main() -> None:
         raise ValueError("compiled benchmarks require at least two repeats (cold and steady)")
     if args.replay_minibatch_size < 1:
         raise ValueError("--replay-minibatch-size must be positive")
-    if not np.isfinite(args.max_replay_error) or args.max_replay_error <= 0.0:
-        raise ValueError("--max-replay-error must be finite and positive")
+    if (
+        not np.isfinite(args.max_replay_error)
+        or args.max_replay_error <= 0.0
+        or args.max_replay_error > 1e-3
+    ):
+        raise ValueError("--max-replay-error must be finite, positive, and at most 1e-3")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -183,10 +226,13 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
     config = ModelConfig(
-        width=args.width,
-        residual_blocks=args.residual_blocks,
-        hidden=args.hidden,
-        query_features=args.query_features,
+        cnn_width=args.cnn_width,
+        cnn_blocks=args.cnn_blocks,
+        model_dim=args.model_dim,
+        transformer_layers=args.transformer_layers,
+        attention_heads=args.attention_heads,
+        ffn_multiplier=args.ffn_multiplier,
+        quantity_rank=args.quantity_rank,
     )
     actor = FarmActor(config).to(device).eval()
     critic = DistributionalCritic(config).to(device).eval()
@@ -286,6 +332,7 @@ def main() -> None:
         summaries.append(summary)
         emit({"event": "batch_summary", **summary})
     emit({"event": "summary", "batches": summaries})
+    _configure_report(None)
 
 
 if __name__ == "__main__":

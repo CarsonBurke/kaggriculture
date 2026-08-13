@@ -493,6 +493,7 @@ def _training_command(
     compile_models: bool,
     expected_source_digest: str,
     calibration_decision: Path,
+    resume_checkpoint: Path | None = None,
 ) -> list[str]:
     model = _production_model_config()
     vapo = _production_vapo_config()
@@ -531,14 +532,20 @@ def _training_command(
         str(PRODUCTION_TEMPERATURE),
         "--checkpoint-every",
         str(PRODUCTION_CHECKPOINT_EVERY),
-        "--width",
-        str(model["width"]),
-        "--residual-blocks",
-        str(model["residual_blocks"]),
-        "--hidden",
-        str(model["hidden"]),
-        "--query-features",
-        str(model["query_features"]),
+        "--cnn-width",
+        str(model["cnn_width"]),
+        "--cnn-blocks",
+        str(model["cnn_blocks"]),
+        "--model-dim",
+        str(model["model_dim"]),
+        "--transformer-layers",
+        str(model["transformer_layers"]),
+        "--attention-heads",
+        str(model["attention_heads"]),
+        "--ffn-multiplier",
+        str(model["ffn_multiplier"]),
+        "--quantity-rank",
+        str(model["quantity_rank"]),
         "--actor-lr",
         str(vapo["actor_learning_rate"]),
         "--critic-lr",
@@ -555,8 +562,6 @@ def _training_command(
         str(vapo["clip_low"]),
         "--clip-high",
         str(vapo["clip_high"]),
-        "--entropy-coefficient",
-        str(vapo["entropy_coefficient"]),
         "--gae-lambda-alpha",
         str(vapo["gae_lambda_alpha"]),
         "--target-kl",
@@ -566,6 +571,8 @@ def _training_command(
     ]
     if compile_models:
         command.append("--compile-models")
+    if resume_checkpoint is not None:
+        command.extend(("--resume", str(resume_checkpoint)))
     return command
 
 
@@ -592,6 +599,12 @@ def main() -> None:
             f"{benchmark_identity['sha256']} != {identity['sha256']}"
         )
     run_directory = args.run_dir.expanduser().resolve()
+    latest_checkpoint = run_directory / "latest.pt"
+    if latest_checkpoint.is_symlink() or (
+        latest_checkpoint.exists() and not latest_checkpoint.is_file()
+    ):
+        raise ValueError(f"training resume checkpoint is not a regular file: {latest_checkpoint}")
+    resume_checkpoint = latest_checkpoint if latest_checkpoint.is_file() else None
     evidence_directory = run_directory / "provenance"
     eager_retained = evidence_directory / "eager-vapo.jsonl"
     compiled_retained = evidence_directory / "compiled-vapo.jsonl"
@@ -604,6 +617,7 @@ def main() -> None:
         compile_models=bool(decision["compile_models"]),
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
+        resume_checkpoint=resume_checkpoint,
     )
     decision.update(
         {
@@ -617,6 +631,7 @@ def main() -> None:
             "max_hours": args.max_hours,
             "seed": args.seed,
             "training_command": command,
+            "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
             "source_identity": identity,
         }
     )

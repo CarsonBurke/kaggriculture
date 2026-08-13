@@ -357,13 +357,14 @@ def _packed_outputs_to_host(
 
 
 def _cached_compiled_forward(model: FarmActor | DistributionalCritic) -> Any:
-    """Capture a numerically eager-equivalent rollout forward in a CUDA graph.
+    """Capture the native ATen rollout forward in a CUDA graph.
 
     PPO replays stored behavior likelihoods through the eager FP32 actor. The
     CUDA-graphs-only backend retains native ATen operations while removing their
-    repeated launch overhead. Keep this contract strict: Inductor fusion changes
-    convolution layouts and the normalization/reduction stack enough to make an
-    unchanged policy's stored behavior likelihoods fail exact PPO replay.
+    repeated launch overhead. CUDA convolution and GEMM kernels are not bitwise
+    invariant across eager/graph execution or batch shapes; the rollout benchmark
+    therefore enforces a tight semantic importance-ratio bound. Keep Inductor out
+    of this path: its additional fusion creates materially larger policy drift.
     """
     compiled = getattr(model, "_kaggriculture_rollout_forward", None)
     if compiled is None:
@@ -417,6 +418,12 @@ def _categorical_draws(
     for draws in (units, kinds, quantities):
         np.minimum(draws, _MAX_FLOAT32_CATEGORICAL_DRAW, out=draws)
     return units, kinds, quantities
+
+
+def _validate_learner_temperature(temperature: float) -> None:
+    """Require behavior logits to match the unit-temperature PPO replay policy."""
+    if not np.isfinite(temperature) or temperature != 1.0:
+        raise ValueError("on-policy rollout collection requires learner temperature 1.0")
 
 
 def _store_native_wave(
@@ -490,8 +497,7 @@ def collect_self_play_rust(
         raise ValueError("games must be positive")
     if episode_steps != 720:
         raise ValueError("the native simulator currently supports the competition horizon 720")
-    if not np.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("temperature must be finite and positive")
+    _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
     critic.eval()
@@ -617,8 +623,7 @@ def collect_frozen_opponents_play_rust(
         raise ValueError("at least one frozen opponent is required")
     if len(opponents) > np.iinfo(np.uint16).max:
         raise ValueError("too many frozen opponents for native head identifiers")
-    if not np.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("current-policy temperature must be finite and positive")
+    _validate_learner_temperature(temperature)
     if opponent_temperatures is None:
         frozen_temperatures = np.full(len(opponents), opponent_temperature, dtype=np.float32)
     else:
@@ -861,6 +866,7 @@ def collect_self_play(
         raise ValueError("games must be positive")
     if episode_steps < 2:
         raise ValueError("episode_steps must be at least two")
+    _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
     critic.eval()
@@ -960,6 +966,7 @@ def collect_frozen_opponent_play(
         raise ValueError("games must be positive")
     if episode_steps < 2:
         raise ValueError("episode_steps must be at least two")
+    _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
     critic.eval()

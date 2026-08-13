@@ -61,7 +61,9 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 23})
     state = environment.reset(2)
     observations = [row.observation for row in state]
-    config = ModelConfig(width=16, residual_blocks=1, hidden=32, query_features=8)
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
 
@@ -90,7 +92,15 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
 def test_policy_skips_quantity_head_for_nonquantified_market_rows() -> None:
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 41})
     observations = [row.observation for row in environment.reset(2)]
-    actor = FarmActor(ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4))
+    actor = FarmActor(
+        ModelConfig(
+            cnn_width=8,
+            cnn_blocks=1,
+            model_dim=16,
+            transformer_layers=3,
+            attention_heads=2,
+        )
+    )
     with torch.no_grad():
         actor.market_kind.weight.zero_()
         actor.market_kind.bias.fill_(-10)
@@ -185,10 +195,11 @@ def test_sell_quantity_mask_is_an_exact_inventory_prefix() -> None:
 
 def test_compact_cpu_quantity_logits_match_actor_exactly() -> None:
     config = ModelConfig(
-        width=8,
-        residual_blocks=1,
-        hidden=16,
-        query_features=4,
+        cnn_width=8,
+        cnn_blocks=1,
+        model_dim=16,
+        transformer_layers=3,
+        attention_heads=2,
         quantity_rank=5,
     )
     actor = FarmActor(config)
@@ -209,7 +220,9 @@ def test_compact_cpu_quantity_logits_match_actor_exactly() -> None:
 def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 37})
     observations = [row.observation for row in environment.reset(2)]
-    config = ModelConfig(width=8, residual_blocks=1, hidden=16, query_features=4)
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
     actor = FarmActor(config)
     policy_step = act_batch(actor, None, observations, deterministic=True)
     encoded = policy_step.encoded

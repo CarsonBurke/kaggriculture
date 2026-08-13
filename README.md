@@ -70,13 +70,27 @@ every checkpoint.
 Training is direct from-scratch self-play. It uses exact undiscounted Monte
 Carlo credit by default so the potential-shaped rewards telescope to the real
 terminal win/loss objective; no demonstrations, distillation, behavior cloning,
-or value pretraining are involved. The production defaults collect 112 live
+value pretraining, or entropy bonus are involved. The production defaults collect 112 live
 self-play games plus 96 frozen-league games and replay them once. Frozen
 actor-only snapshots are written every update, with opponents drawn from a
 16-policy recent window and log-age historical strata. Recent opponents are
 sampled at temperature 0.8; the initial anchor and historical policies use the
 same deterministic decoding as a submission. Full resumable checkpoints are
 kept every five updates.
+
+The actor and critic have separate spatial U-Nets and fixed-token entity
+transformers. The actor attends over one state token, 100 board cells, 16 unit
+slots, and 10 autoregressive market slots using pre-normalization, ReLU-squared
+feed-forwards, normalized queries/keys, axial RoPE, long U-shaped residual skips,
+and PyTorch scaled-dot-product attention (Flash Attention on eligible CUDA
+inputs). Inactive unit slots are zeroed after every block; legality is enforced
+by the exact sequential action ledger, not leaked into attention. All game
+actions are discrete. Market quantities use a state- and order-conditioned
+masked categorical over every integer from 1 through 100, which preserves exact
+PPO likelihoods and multimodal quantity choices; a continuous Beta density would
+not be a valid likelihood for these integer actions. The centralized critic uses
+HL-Gauss labels on a bounded categorical support with headroom around the proven
+`[-2, 2]` return range.
 
 Each full checkpoint binds the immutable `league/` sidecar archive with a
 SHA-256 manifest, the complete source identity, and canonical calibration/run
@@ -90,6 +104,22 @@ league settings instead of silently forking the data distribution:
   --run-dir runs/vapo-resumed \
   --resume runs/vapo-main/checkpoint-000100.pt
 ```
+
+Training and benchmark metrics are mirrored to TensorBoard only after their
+canonical JSONL record is durably committed. On restart, a missing, stale, torn,
+or corrupted TensorBoard mirror is rebuilt from JSONL. Existing journals can be
+migrated idempotently with:
+
+```bash
+.venv/bin/python scripts/jsonl_to_tensorboard.py runs/*/metrics.jsonl artifacts/benchmarks/*.jsonl
+.venv/bin/tensorboard --logdir_spec runs:runs,benchmarks:artifacts/benchmarks/tensorboard
+```
+
+JSONL remains the compact, hashable calibration/provenance evidence;
+TensorBoard is the primary human-facing view. `scripts/ml_pipeline_status.py
+--heal --watch` prints compact pipeline state and retries bounded infrastructure
+launch failures. Rerunning the calibrated launcher automatically resumes a
+valid atomic `latest.pt` instead of starting over.
 
 Screen a checkpoint on fixed, training-disjoint seeds and both seat
 orientations. The default opponent is the fixed public v27 reference; any
