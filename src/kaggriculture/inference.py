@@ -13,15 +13,22 @@ from kaggriculture.policy import act_batch
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
-CHECKPOINT_FORMAT_VERSION = 5
+LEGACY_CHECKPOINT_FORMAT_VERSION = 6
+CHECKPOINT_FORMAT_VERSION = 7
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset(
+    (ACTOR_ARTIFACT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION)
+)
+SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS = frozenset(
+    (ACTOR_ARTIFACT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION)
+)
 
 
 def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
     checkpoint_version = checkpoint.get("format_version")
-    if checkpoint_version != CHECKPOINT_FORMAT_VERSION:
+    if checkpoint_version not in SUPPORTED_CHECKPOINT_FORMAT_VERSIONS:
+        expected = ", ".join(map(str, sorted(SUPPORTED_CHECKPOINT_FORMAT_VERSIONS)))
         raise ValueError(
-            f"unsupported checkpoint format: {checkpoint_version}; "
-            f"expected {CHECKPOINT_FORMAT_VERSION}"
+            f"unsupported checkpoint format: {checkpoint_version}; expected one of {expected}"
         )
     if "actor" not in checkpoint or "model_config" not in checkpoint:
         raise ValueError("checkpoint is missing actor weights or model configuration")
@@ -45,10 +52,10 @@ def load_actor_artifact(
 ) -> tuple[FarmActor, dict[str, Any]]:
     payload = torch.load(path, map_location=device, weights_only=False)
     version = payload.get("format_version")
-    if version != ACTOR_ARTIFACT_FORMAT_VERSION:
+    if version not in SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS:
+        expected = ", ".join(map(str, sorted(SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS)))
         raise ValueError(
-            f"unsupported actor artifact format: {version}; "
-            f"expected {ACTOR_ARTIFACT_FORMAT_VERSION}"
+            f"unsupported actor artifact format: {version}; expected one of {expected}"
         )
     identity = validate_source_identity(payload.get("source_identity"))
     run_provenance = validate_run_provenance(payload.get("run_provenance"))

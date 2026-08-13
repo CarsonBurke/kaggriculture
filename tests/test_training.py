@@ -68,7 +68,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert restored.random(8).tolist() == expected.tolist()
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)
@@ -122,3 +122,13 @@ def test_iteration_metrics_journal_supports_a_portable_contiguous_suffix(tmp_pat
 
     with pytest.raises(ValueError, match="missing iterations"):
         append_iteration_jsonl(path, {"iteration": 103, "loss": 0.25})
+
+
+def test_iteration_metrics_journal_rejects_a_blank_final_line(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    append_iteration_jsonl(path, {"iteration": 1, "loss": 0.5})
+    with path.open("ab") as stream:
+        stream.write(b"\n")
+
+    with pytest.raises(ValueError, match="invalid final record"):
+        append_iteration_jsonl(path, {"iteration": 2, "loss": 0.25})

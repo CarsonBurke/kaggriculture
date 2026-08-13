@@ -14,6 +14,7 @@ from kaggriculture.actions import MarketKind
 from kaggriculture.inference import (
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
+    LEGACY_CHECKPOINT_FORMAT_VERSION,
     actor_artifact_from_checkpoint,
     load_actor_artifact,
 )
@@ -21,14 +22,22 @@ from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.provenance import run_provenance_from_decision, source_identity
 
 
-def test_actor_artifact_round_trip(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "checkpoint_version",
+    [
+        ACTOR_ARTIFACT_FORMAT_VERSION,
+        LEGACY_CHECKPOINT_FORMAT_VERSION,
+        CHECKPOINT_FORMAT_VERSION,
+    ],
+)
+def test_actor_artifact_round_trip(tmp_path: Path, checkpoint_version: int) -> None:
     config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
     actor = FarmActor(config)
     artifact = actor_artifact_from_checkpoint(
         {
-            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "format_version": checkpoint_version,
             "model_config": config.to_dict(),
             "actor": actor.state_dict(),
             "iteration": 3,
@@ -42,6 +51,37 @@ def test_actor_artifact_round_trip(tmp_path: Path) -> None:
 
     assert metadata["iteration"] == 3
     assert metadata["format_version"] == ACTOR_ARTIFACT_FORMAT_VERSION
+    for expected, actual in zip(actor.parameters(), restored.parameters(), strict=True):
+        assert torch.equal(expected, actual)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_version",
+    [LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION],
+)
+def test_full_checkpoint_loads_directly_as_actor(tmp_path: Path, checkpoint_version: int) -> None:
+    config = ModelConfig(
+        cnn_width=8,
+        cnn_blocks=1,
+        model_dim=16,
+        transformer_layers=3,
+        attention_heads=2,
+    )
+    actor = FarmActor(config)
+    path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": checkpoint_version,
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "source_identity": source_identity(),
+        },
+        path,
+    )
+
+    restored, metadata = load_actor_artifact(path)
+
+    assert metadata["format_version"] == checkpoint_version
     for expected, actual in zip(actor.parameters(), restored.parameters(), strict=True):
         assert torch.equal(expected, actual)
 

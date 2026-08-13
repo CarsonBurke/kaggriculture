@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from kaggriculture.league import (
+    FrozenActorPool,
     SnapshotRef,
     copy_actor_snapshot,
     list_actor_snapshots,
@@ -281,3 +282,30 @@ def test_snapshot_mix_rejects_invalid_configuration(tmp_path, kwargs) -> None:
 
     with pytest.raises(ValueError):
         select_snapshot_mix([SnapshotRef(0, tmp_path / "unused")], **arguments)
+
+
+def test_frozen_actor_pool_reuses_slots_and_reloads_in_place(tmp_path) -> None:
+    actor = _actor()
+    first = save_actor_snapshot(tmp_path, actor, 1)
+    with torch.no_grad():
+        next(actor.parameters()).add_(0.5)
+    second = save_actor_snapshot(tmp_path, actor, 2)
+    pool = FrozenActorPool(actor.config, torch.device("cpu"))
+
+    [loaded] = pool.acquire([first.path])
+    pointer = next(loaded.parameters()).data_ptr()
+    assert not loaded.training
+    assert not any(parameter.requires_grad for parameter in loaded.parameters())
+
+    [reacquired] = pool.acquire([first.path])
+    assert reacquired is loaded
+    assert next(reacquired.parameters()).data_ptr() == pointer
+
+    # Selecting a different snapshot reuses the slot and its parameter
+    # storage, which is what keeps captured compiled forwards valid.
+    [reloaded] = pool.acquire([second.path])
+    assert reloaded is loaded
+    assert next(reloaded.parameters()).data_ptr() == pointer
+    reference = load_actor_snapshot(second.path, expected_model_config=actor.config)
+    for actual, expected in zip(reloaded.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected)

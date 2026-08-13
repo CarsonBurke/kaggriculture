@@ -150,6 +150,29 @@ def test_live_mirror_recovers_a_committed_record(tmp_path: Path) -> None:
     assert not migrate_jsonl_to_tensorboard(journal, log_dir).rebuilt
 
 
+def test_live_mirror_survives_an_equal_length_torn_tail_replacement(tmp_path: Path) -> None:
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    first = {"iteration": 1, "loss": 0.5}
+    second = {"iteration": 2, "loss": 0.25}
+    _write_jsonl(journal, [first])
+    with journal.open("ab") as stream:
+        stream.write(json.dumps(second, sort_keys=True).encode("utf-8") + b"X")
+    mirror = TensorboardMirror(journal, log_dir)
+    torn_size = journal.stat().st_size
+
+    # The journal appender truncates the torn suffix and commits a complete
+    # record of exactly the same byte length, so file size alone cannot reveal
+    # the change to the incremental mirror state.
+    _write_jsonl(journal, [first, second])
+    assert journal.stat().st_size == torn_size
+
+    mirror.record(second)
+    mirror.close()
+
+    assert _scalars(log_dir, "loss") == [(1, 0.5), (2, 0.25)]
+
+
 def test_live_mirror_repairs_corruption_before_recording(tmp_path: Path) -> None:
     journal = tmp_path / "metrics.jsonl"
     log_dir = tmp_path / "tensorboard"

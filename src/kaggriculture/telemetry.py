@@ -60,11 +60,10 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, An
     return result
 
 
-def read_jsonl_snapshot(path: Path) -> JournalSnapshot:
-    """Read one atomic journal snapshot, recovering only a torn final suffix."""
-    path = Path(path).expanduser().resolve()
-    contents = path.read_bytes() if path.exists() else b""
-    digest = hashlib.sha256(contents).hexdigest()
+def _parse_journal_lines(
+    contents: bytes, path: Path, first_line_number: int = 1
+) -> tuple[dict[str, Any], ...]:
+    """Strictly parse complete journal lines, ignoring only a torn final suffix."""
     try:
         text = contents.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -72,7 +71,7 @@ def read_jsonl_snapshot(path: Path) -> JournalSnapshot:
     if text and not text.endswith("\n"):
         text = text.rpartition("\n")[0]
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line_number, line in enumerate(text.splitlines(), start=first_line_number):
         if not line:
             raise ValueError(f"metrics journal contains a blank record: {path}:{line_number}")
         try:
@@ -86,7 +85,16 @@ def read_jsonl_snapshot(path: Path) -> JournalSnapshot:
         if not isinstance(record, dict):
             raise ValueError(f"metrics record is not an object: {path}:{line_number}")
         records.append(record)
-    return JournalSnapshot(path, digest, len(contents), tuple(records))
+    return tuple(records)
+
+
+def read_jsonl_snapshot(path: Path) -> JournalSnapshot:
+    """Read one atomic journal snapshot, recovering only a torn final suffix."""
+    path = Path(path).expanduser().resolve()
+    contents = path.read_bytes() if path.exists() else b""
+    digest = hashlib.sha256(contents).hexdigest()
+    records = _parse_journal_lines(contents, path)
+    return JournalSnapshot(path, digest, len(contents), records)
 
 
 def _file_sha256(path: Path) -> str:
@@ -120,7 +128,10 @@ def _manifest_payload(snapshot: JournalSnapshot, log_dir: Path) -> dict[str, Any
 
 
 def _write_manifest(snapshot: JournalSnapshot, log_dir: Path) -> None:
-    payload = _manifest_payload(snapshot, log_dir)
+    _write_manifest_payload(_manifest_payload(snapshot, log_dir), log_dir)
+
+
+def _write_manifest_payload(payload: dict[str, Any], log_dir: Path) -> None:
     destination = log_dir / _MANIFEST_NAME
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".tmp", dir=log_dir
@@ -192,14 +203,18 @@ def _number(value: object) -> float | None:
     return converted
 
 
+def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
+    mode = "compiled" if configuration.get("compile_models") is True else "eager"
+    kind = "vapo" if "self_play_game_counts" in configuration else "rollout"
+    return kind, mode
+
+
 def _benchmark_context(records: tuple[dict[str, Any], ...]) -> tuple[str, str]:
     configuration = next(
         (record for record in records if record.get("event") == "configuration"),
         {},
     )
-    mode = "compiled" if configuration.get("compile_models") is True else "eager"
-    kind = "vapo" if "self_play_game_counts" in configuration else "rollout"
-    return kind, mode
+    return _configuration_context(configuration)
 
 
 def _write_record(
@@ -315,7 +330,13 @@ def migrate_jsonl_to_tensorboard(
 
 
 class TensorboardMirror:
-    """Live TensorBoard writer that repairs itself from its JSONL source journal."""
+    """Live TensorBoard writer that repairs itself from its JSONL source journal.
+
+    The journal and TensorBoard event files are both append-only, so per-record
+    integrity tracking reads and hashes only the appended bytes. Any anomaly
+    (shrinkage, torn suffix, parse failure, manifest mismatch) falls back to
+    the full-read verification and rebuild paths.
+    """
 
     def __init__(
         self,
@@ -336,6 +357,97 @@ class TensorboardMirror:
         self.log_dir = selected_log_dir.resolve()
         self._open_writer()
 
+    def _reset_journal_state(self) -> None:
+        self._journal_sha = hashlib.sha256()
+        self._journal_size = 0
+        self._journal_records = 0
+        self._last_record: dict[str, Any] | None = None
+        self._configuration: dict[str, Any] = {}
+        self._event_hashes: dict[str, tuple[Any, int]] = {}
+
+    def _absorb_journal_records(self, records: tuple[dict[str, Any], ...]) -> None:
+        self._journal_records += len(records)
+        if records:
+            self._last_record = records[-1]
+        if not self._configuration:
+            self._configuration = next(
+                (record for record in records if record.get("event") == "configuration"),
+                {},
+            )
+
+    def _reload_journal_state(self) -> None:
+        self._reset_journal_state()
+        contents = self.journal_path.read_bytes() if self.journal_path.exists() else b""
+        if not contents.endswith(b"\n"):
+            # Track only the newline-terminated prefix. A torn suffix may later
+            # be truncated and replaced by an append of identical length, which
+            # byte size alone cannot distinguish from an unchanged file.
+            cut = contents.rfind(b"\n")
+            contents = contents[: cut + 1] if cut >= 0 else b""
+        records = _parse_journal_lines(contents, self.journal_path)
+        self._journal_sha.update(contents)
+        self._journal_size = len(contents)
+        self._absorb_journal_records(records)
+
+    def _extend_journal_state(self) -> bool:
+        """Absorb appended journal bytes; False demands a full state reload."""
+        size = self.journal_path.stat().st_size if self.journal_path.exists() else 0
+        if size < self._journal_size:
+            return False
+        if size == self._journal_size:
+            return True
+        with self.journal_path.open("rb") as stream:
+            stream.seek(self._journal_size)
+            appended = stream.read(size - self._journal_size)
+        if len(appended) != size - self._journal_size or not appended.endswith(b"\n"):
+            return False
+        try:
+            records = _parse_journal_lines(
+                appended, self.journal_path, first_line_number=self._journal_records + 1
+            )
+        except ValueError:
+            return False
+        self._journal_sha.update(appended)
+        self._journal_size = size
+        self._absorb_journal_records(records)
+        return True
+
+    def _current_event_files(self) -> dict[str, dict[str, int | str]]:
+        """Hash event files incrementally, rehashing only on shrinkage."""
+        result: dict[str, dict[str, int | str]] = {}
+        for path in sorted(self.log_dir.rglob("events.out.tfevents.*")):
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"TensorBoard event path is not a regular file: {path}")
+            relative = path.relative_to(self.log_dir).as_posix()
+            cached = self._event_hashes.get(relative)
+            size = path.stat().st_size
+            if cached is None or size < cached[1]:
+                hasher, offset = hashlib.sha256(), 0
+            else:
+                hasher, offset = cached
+            if size > offset:
+                with path.open("rb") as stream:
+                    stream.seek(offset)
+                    while chunk := stream.read(1 << 20):
+                        hasher.update(chunk)
+                        offset += len(chunk)
+            self._event_hashes[relative] = (hasher, offset)
+            result[relative] = {"sha256": hasher.hexdigest(), "size_bytes": offset}
+        return result
+
+    def _manifest_matches(self) -> bool:
+        manifest_path = self.log_dir / _MANIFEST_NAME
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return (
+                manifest.get("format_version") == TENSORBOARD_MIRROR_FORMAT_VERSION
+                and manifest.get("event_files") == self._current_event_files()
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
     def _open_writer(self) -> None:
         writer = self.writer_factory(self.log_dir)
         try:
@@ -346,6 +458,7 @@ class TensorboardMirror:
                 writer.close()
             raise
         self.writer = writer
+        self._reload_journal_state()
 
     def _repair(self) -> None:
         with suppress(Exception):
@@ -361,21 +474,30 @@ class TensorboardMirror:
 
     def record(self, payload: dict[str, Any]) -> None:
         """Mirror the journal's newly committed final record, repairing on failure."""
-        snapshot = read_jsonl_snapshot(self.journal_path)
-        if not snapshot.records or snapshot.records[-1] != payload:
+        if not self._extend_journal_state():
+            self._reload_journal_state()
+        if not self._journal_records or self._last_record != payload:
             raise ValueError("TensorBoard payload is not the committed final JSONL record")
-        if not _manifest_event_files_match(self.log_dir):
+        if not self._manifest_matches():
             self._repair()
             return
         try:
-            _write_record(
-                self.writer,
-                payload,
-                len(snapshot.records) - 1,
-                _benchmark_context(snapshot.records),
-            )
+            context = _configuration_context(self._configuration)
+            _write_record(self.writer, payload, self._journal_records - 1, context)
             self.writer.flush()
-            _write_manifest(snapshot, self.log_dir)
+            _write_manifest_payload(
+                {
+                    "format_version": TENSORBOARD_MIRROR_FORMAT_VERSION,
+                    "source": {
+                        "name": self.journal_path.name,
+                        "sha256": self._journal_sha.hexdigest(),
+                        "size_bytes": self._journal_size,
+                        "records": self._journal_records,
+                    },
+                    "event_files": self._current_event_files(),
+                },
+                self.log_dir,
+            )
         except Exception:
             self._repair()
 

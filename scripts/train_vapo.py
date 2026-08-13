@@ -10,6 +10,7 @@ import random
 import sys
 import time
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -18,12 +19,14 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.league import (
+    FrozenActorPool,
     SnapshotRef,
     SnapshotSelection,
     copy_actor_snapshot,
     list_actor_snapshots,
     load_actor_snapshot,
     save_actor_snapshot,
+    save_actor_state_snapshot,
     select_snapshot_mix,
     snapshot_sha256,
 )
@@ -41,19 +44,29 @@ from kaggriculture.provenance import (
 )
 from kaggriculture.rollout import (
     RolloutBatch,
+    allocate_rollout_storage,
     collect_frozen_opponents_play_rust,
     collect_self_play_rust,
-    concatenate_rollouts,
+    merge_contiguous_rollouts,
 )
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import (
     append_iteration_jsonl,
+    checkpoint_payload,
+    cpu_state_copy,
     load_checkpoint,
     metrics_journal_iteration,
     rollout_diagnostics,
     save_checkpoint,
+    training_rng_states,
+    write_checkpoint,
 )
-from kaggriculture.vapo import VapoConfig, make_optimizers, update_vapo
+from kaggriculture.vapo import (
+    DEFAULT_ACTOR_GAE_LAMBDA,
+    VapoConfig,
+    make_optimizers,
+    update_vapo,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,10 +102,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-low", type=float, default=0.80)
     parser.add_argument("--clip-high", type=float, default=1.28)
     parser.add_argument(
-        "--gae-lambda-alpha",
+        "--gamma",
         type=float,
-        default=0.0,
-        help="0 uses exact Monte Carlo credit; positive values enable adaptive-lambda ablations",
+        default=1.0,
+        help="reward discount; 1.0 preserves the exact final relative-bank objective",
+    )
+    parser.add_argument(
+        "--actor-gae-lambda",
+        type=float,
+        default=DEFAULT_ACTOR_GAE_LAMBDA,
+        help=(
+            "actor GAE lambda; defaults to VAPO's alpha=0.05 value for the "
+            "fixed 719-action competition horizon; critic targets always use lambda=1"
+        ),
     )
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
@@ -150,8 +172,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("clip interval must straddle one")
     if args.lr_warmup_steps < 0:
         raise ValueError("LR warmup steps cannot be negative")
-    if args.gae_lambda_alpha < 0:
-        raise ValueError("GAE lambda alpha cannot be negative")
+    if args.gamma != 1.0:
+        raise ValueError("Kaggriculture bank-delta rewards require --gamma 1.0")
+    if not math.isfinite(args.actor_gae_lambda) or not 0.0 <= args.actor_gae_lambda <= 1.0:
+        raise ValueError("actor GAE lambda must be finite and in [0, 1]")
     if not math.isfinite(args.max_hours) or args.max_hours < 0.0:
         raise ValueError("max hours must be finite and non-negative")
     if args.seed < 0:
@@ -419,7 +443,8 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
-        gae_lambda_alpha=args.gae_lambda_alpha,
+        gamma=args.gamma,
+        actor_gae_lambda=args.actor_gae_lambda,
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
@@ -579,6 +604,43 @@ def main() -> None:
         args.run_dir / "tensorboard",
         writer_factory=lambda path: SummaryWriter(path),
     )
+    opponent_pool = FrozenActorPool(model_config, device)
+    # One reusable trajectory-major arena holds both rollout parts, so each
+    # iteration avoids a multi-gigabyte host concatenation and can stage the
+    # replay to the accelerator from pinned memory.
+    self_play_rows = args.games * 2
+    rollout_arena = allocate_rollout_storage(
+        self_play_rows + args.league_games,
+        args.episode_steps - 1,
+        pin_memory=device.type == "cuda",
+    )
+    self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
+    league_storage = (
+        {name: array[self_play_rows:] for name, array in rollout_arena.items()}
+        if args.league_games
+        else None
+    )
+
+    commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
+    pending_commit: Future[None] | None = None
+
+    def commit_iteration(payload: dict, actor_state: dict) -> None:
+        """Durably commit one iteration's artifacts in canonical order.
+
+        Runs on the single commit worker, so commits execute in submission
+        order: league snapshot before the checkpoint that references it, and
+        the checkpoint before its journal record, exactly as the recovery
+        logic expects.
+        """
+        committed = int(payload["iteration"])
+        snapshot = save_actor_state_snapshot(league_directory, model_config, actor_state, committed)
+        league_snapshot_manifest[committed] = snapshot_sha256(snapshot.path)
+        write_checkpoint(args.run_dir / "latest.pt", payload)
+        if committed % args.checkpoint_every == 0:
+            write_checkpoint(args.run_dir / f"checkpoint-{committed:06d}.pt", payload)
+        append_iteration_jsonl(args.run_dir / "metrics.jsonl", payload["metrics"])
+        writer.record(payload["metrics"])
+
     started = time.monotonic()
 
     # The snapshot for the checkpoint's current actor is installed before the
@@ -624,12 +686,12 @@ def main() -> None:
             temperature=args.temperature,
             sampling_seed=self_play_sampling_seed,
             compile_models=args.compile_models,
+            storage=self_play_storage,
         )
         next_seed += args.games
         self_play_diagnostics = {
             f"self_play_{name}": value for name, value in rollout_diagnostics(self_play).items()
         }
-        rollout_parts = [self_play]
         opponent_checkpoint = ""
         league_diagnostics = {}
         league = None
@@ -640,14 +702,7 @@ def main() -> None:
             generator,
         )
         if args.league_games and selections:
-            opponents = [
-                load_actor_snapshot(
-                    selection.ref.path,
-                    expected_model_config=model_config,
-                    device=device,
-                )
-                for selection in selections
-            ]
+            opponents = opponent_pool.acquire([selection.ref.path for selection in selections])
             assignments = _balanced_assignments(
                 args.league_games,
                 len(opponents),
@@ -679,19 +734,20 @@ def main() -> None:
                 deterministic_opponents=deterministic_opponents,
                 sampling_seed=league_sampling_seed,
                 compile_models=args.compile_models,
+                storage=league_storage,
             )
             next_seed += args.league_games
             league_diagnostics = {
                 f"league_{name}": value for name, value in rollout_diagnostics(league).items()
             }
             league_diagnostics.update(_league_opponent_diagnostics(league, assignments, selections))
-            rollout_parts.append(league)
             opponent_checkpoint = ",".join(row.ref.path.name for row in selections)
-            del opponents
-        rollout = concatenate_rollouts(rollout_parts)
-        del rollout_parts, self_play
         if league is not None:
+            rollout = merge_contiguous_rollouts(rollout_arena, [self_play, league])
             del league
+        else:
+            rollout = self_play
+        del self_play
         update_started = time.monotonic()
         update_metrics = update_vapo(
             actor,
@@ -723,47 +779,37 @@ def main() -> None:
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
-        current_snapshot = save_actor_snapshot(league_directory, actor, iteration)
-        league_snapshot_manifest[iteration] = snapshot_sha256(current_snapshot.path)
-        save_checkpoint(
-            args.run_dir / "latest.pt",
-            actor=actor,
-            critic=critic,
-            actor_optimizer=actor_optimizer,
-            critic_optimizer=critic_optimizer,
+        # Capture every mutable input on this thread, then commit the durable
+        # artifacts (league snapshot, checkpoints, journal, mirror) in the
+        # background so serialization and fsync overlap the next rollout. The
+        # snapshot digest lands in the shared manifest inside the worker,
+        # before the payload referencing that manifest is serialized.
+        actor_state = cpu_state_copy(actor.state_dict())
+        payload = checkpoint_payload(
+            actor_state=actor_state,
+            critic_state=cpu_state_copy(critic.state_dict()),
+            actor_optimizer_state=cpu_state_copy(actor_optimizer.state_dict()),
+            critic_optimizer_state=cpu_state_copy(critic_optimizer.state_dict()),
             model_config=model_config,
             vapo_config=vapo_config,
             iteration=iteration,
             next_seed=next_seed,
             metrics=metrics,
+            source_identity=current_source_identity,
+            rng_states=training_rng_states(),
+            run_provenance=run_provenance,
             training_rng_state=generator.bit_generator.state,
             training_data_config=training_data_config,
             league_snapshot_manifest=league_snapshot_manifest,
-            source_identity=current_source_identity,
-            run_provenance=run_provenance,
         )
-        if iteration % args.checkpoint_every == 0:
-            save_checkpoint(
-                args.run_dir / f"checkpoint-{iteration:06d}.pt",
-                actor=actor,
-                critic=critic,
-                actor_optimizer=actor_optimizer,
-                critic_optimizer=critic_optimizer,
-                model_config=model_config,
-                vapo_config=vapo_config,
-                iteration=iteration,
-                next_seed=next_seed,
-                metrics=metrics,
-                training_rng_state=generator.bit_generator.state,
-                training_data_config=training_data_config,
-                league_snapshot_manifest=league_snapshot_manifest,
-                source_identity=current_source_identity,
-                run_provenance=run_provenance,
-            )
-        append_iteration_jsonl(args.run_dir / "metrics.jsonl", metrics)
-        writer.record(metrics)
+        if pending_commit is not None:
+            pending_commit.result()
+        pending_commit = commit_executor.submit(commit_iteration, payload, actor_state)
         print(json.dumps(metrics, sort_keys=True), flush=True)
         del rollout
+    if pending_commit is not None:
+        pending_commit.result()
+    commit_executor.shutdown(wait=True)
     writer.close()
 
 

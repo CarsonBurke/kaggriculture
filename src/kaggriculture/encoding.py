@@ -9,17 +9,14 @@ from typing import Any
 import numpy as np
 
 from kaggriculture.constants import (
-    ANIMAL_COST,
     ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
     CROPS,
     EPISODE_STEPS,
-    LAND_PRICES,
     MAX_UNITS,
     PRIVATE_ITEMS,
     PRODUCTS,
-    SEED_COST,
     SHOP_NAMES,
     TURNS_PER_DAY,
 )
@@ -33,7 +30,6 @@ UNIT_FEATURES = 5 + len(PRIVATE_ITEMS)
 
 _CROP_INDEX = {crop: index for index, crop in enumerate(CROPS)}
 _ANIMAL_INDEX = {animal: index for index, animal in enumerate(ANIMALS)}
-_PRODUCT_OF_ANIMAL = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
 
 
 @dataclass(frozen=True)
@@ -249,71 +245,39 @@ def encode_observation(
     )
 
 
-def farm_equity(observation: dict[str, Any]) -> float:
-    """Mark-to-market potential used only for objective-preserving reward shaping."""
-    player = int(observation.get("player", 0) or 0)
-    farm = (observation.get("farms") or [])[player]
-    private = observation.get("private") or {}
-    prices = (observation.get("market") or {}).get("prices") or {}
-    value = float(farm.get("money", 0) or 0)
-
-    def item_value(item: str) -> float:
-        if item in BASE_PRICE:
-            return 0.72 * float(prices.get(item, BASE_PRICE[item]) or 0)
-        return 0.82 * ANIMAL_COST[item]
-
-    shed = private.get("shed") or {}
-    inventories = private.get("inventories") or []
-    for item in PRIVATE_ITEMS:
-        quantity = int(shed.get(item, 0) or 0) + sum(
-            int(inventory.get(item, 0) or 0) for inventory in inventories
-        )
-        value += quantity * item_value(item)
-    for crop in CROPS:
-        value += 0.85 * int((private.get("seeds") or {}).get(crop, 0) or 0) * SEED_COST[crop]
-
-    for row in farm.get("tiles") or []:
-        for tile in row:
-            if not isinstance(tile, dict):
-                continue
-            animal = tile.get("animal")
-            if animal in ANIMAL_COST:
-                product = _PRODUCT_OF_ANIMAL[animal]
-                value += 0.72 * ANIMAL_COST[animal]
-                value += (
-                    0.72
-                    * int(tile.get("yield_units", 0) or 0)
-                    * float(prices.get(product, BASE_PRICE[product]) or 0)
-                )
-            elif tile.get("kind") == "PLANT":
-                crop = tile.get("crop")
-                if crop in SEED_COST:
-                    value += 0.6 * SEED_COST[crop]
-                    value += (
-                        0.72
-                        * int(tile.get("yield_units", 0) or 0)
-                        * float(prices.get(crop, BASE_PRICE[crop]) or 0)
-                    )
-    extra_land = max(0, len(farm.get("unlocked_quadrants") or []) - 1)
-    value += 0.45 * sum(LAND_PRICES[:extra_land])
-    return value
-
-
 def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
-    """Bounded zero-sum potential from player zero's perspective."""
-    margin = farm_equity(observation_zero) - farm_equity(observation_one)
-    return math.tanh(margin / 40_000.0)
+    """Exact bounded relative score from player zero's perspective.
+
+    Kaggriculture scores only bank money.  The normalized margin is the bank
+    advantage as a fraction of the money held by both players, is exactly
+    antisymmetric, and has exactly the same winner/tie relation as the final
+    score. It deliberately assigns no speculative value to inventory or future
+    output.
+    """
+    observations = (observation_zero, observation_one)
+    money: list[float] = []
+    for expected_player, observation in enumerate(observations):
+        raw_player = observation.get("player", expected_player)
+        player = expected_player if raw_player is None else int(raw_player)
+        if player != expected_player:
+            raise ValueError(f"expected player {expected_player} observation, got player {player}")
+        farms = observation.get("farms") or []
+        if len(farms) != 2:
+            raise ValueError(f"expected exactly two farms, got {len(farms)}")
+        amount = float(farms[player].get("money", 0) or 0)
+        if not math.isfinite(amount) or amount < 0.0:
+            raise ValueError("farm money must be finite and non-negative")
+        money.append(amount)
+    total = money[0] + money[1]
+    return 0.0 if total == 0.0 else (money[0] - money[1]) / total
 
 
 def shaped_pair_reward(
     previous_potential: float,
     next_potential: float,
-    terminal_money_margin: float | None = None,
 ) -> tuple[float, float]:
-    """Potential shaping whose episode sum is exactly terminal win/loss."""
-    if terminal_money_margin is None:
-        reward_zero = next_potential - previous_potential
-    else:
-        outcome = float(terminal_money_margin > 0) - float(terminal_money_margin < 0)
-        reward_zero = outcome - previous_potential
+    """Dense zero-sum change in exact relative scored-bank value."""
+    if not math.isfinite(previous_potential) or not math.isfinite(next_potential):
+        raise ValueError("pair potentials must be finite")
+    reward_zero = next_potential - previous_potential
     return reward_zero, -reward_zero

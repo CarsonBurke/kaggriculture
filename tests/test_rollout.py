@@ -12,12 +12,14 @@ from kaggriculture.policy import component_logprobs
 from kaggriculture.rollout import (
     _cached_compiled_forward,
     _categorical_draws,
+    allocate_rollout_storage,
     collect_frozen_opponent_play,
     collect_frozen_opponent_play_rust,
     collect_frozen_opponents_play_rust,
     collect_self_play,
     collect_self_play_rust,
     concatenate_rollouts,
+    merge_contiguous_rollouts,
 )
 from kaggriculture.rust_env import load_native
 
@@ -25,6 +27,11 @@ from kaggriculture.rust_env import load_native
 class _NearOneGenerator:
     def random(self, size):
         return np.full(size, np.nextafter(1.0, 0.0), dtype=np.float64)
+
+
+def _relative_bank_score(own: np.ndarray, opponent: np.ndarray) -> np.ndarray:
+    total = own + opponent
+    return np.divide(own - opponent, total, out=np.zeros_like(own), where=total != 0)
 
 
 def test_native_categorical_draw_transport_stays_strictly_below_one() -> None:
@@ -75,9 +82,8 @@ def test_short_self_play_rollout_shapes_and_telescoping() -> None:
     assert rollout.states == 28
     assert rollout.board.shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
-    outcomes = (rollout.final_money > rollout.opponent_money).astype(float)
-    outcomes -= (rollout.final_money < rollout.opponent_money).astype(float)
-    assert rollout.rewards.sum(axis=1).tolist() == pytest.approx(outcomes.tolist(), abs=1e-6)
+    final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
+    assert rollout.rewards.sum(axis=1).tolist() == pytest.approx(final_scores.tolist(), abs=1e-6)
     assert rollout.seats.tolist() == [0, 1, 0, 1]
     assert rollout.episode_seeds.tolist() == [50, 50, 51, 51]
     np.testing.assert_allclose(rollout.rewards[0], -rollout.rewards[1], atol=1e-7)
@@ -227,9 +233,8 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
     assert rollout.trajectories == 2
     assert rollout.horizon == 719
     assert rollout.states == 1438
-    outcomes = (rollout.final_money > rollout.opponent_money).astype(float)
-    outcomes -= (rollout.final_money < rollout.opponent_money).astype(float)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), outcomes, atol=2e-6)
+    final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
+    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
     assert rollout.seats.tolist() == [0, 1]
     assert np.isfinite(rollout.old_unit_logprobs).all()
     assert np.isfinite(rollout.old_market_kind_logprobs).all()
@@ -353,9 +358,8 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
     assert rollout.states == 1438
     assert rollout.seats.tolist() == [0, 1]
     assert rollout.episode_seeds.tolist() == [130, 131]
-    outcomes = (rollout.final_money > rollout.opponent_money).astype(float)
-    outcomes -= (rollout.final_money < rollout.opponent_money).astype(float)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), outcomes, atol=2e-6)
+    final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
+    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
 
     # A fresh native batch exposes the same game-major/player-minor opening
     # rows. Verify that league storage selects the current seat's centralized
@@ -447,3 +451,43 @@ def test_native_frozen_opponent_pool_rejects_invalid_assignments(indices) -> Non
             opponent_indices=indices,
             seed_start=150,
         )
+
+
+def test_arena_collection_merges_adjacent_batches_without_copying() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(config)
+    critic = DistributionalCritic(config)
+    arena = allocate_rollout_storage(4, 719)
+    first = collect_self_play_rust(
+        actor,
+        critic,
+        games=1,
+        seed_start=11,
+        sampling_seed=1,
+        storage={name: array[:2] for name, array in arena.items()},
+    )
+    second = collect_self_play_rust(
+        actor,
+        critic,
+        games=1,
+        seed_start=12,
+        sampling_seed=2,
+        storage={name: array[2:] for name, array in arena.items()},
+    )
+
+    merged = merge_contiguous_rollouts(arena, [first, second])
+
+    assert (merged.trajectories, merged.horizon, merged.states) == (4, 719, 2876)
+    assert (
+        merged.board.__array_interface__["data"][0] == arena["board"].__array_interface__["data"][0]
+    )
+    np.testing.assert_array_equal(merged.rewards[:2], first.rewards)
+    np.testing.assert_array_equal(merged.rewards[2:], second.rewards)
+    np.testing.assert_array_equal(
+        merged.final_money, np.concatenate([first.final_money, second.final_money])
+    )
+    np.testing.assert_array_equal(merged.seats, np.concatenate([first.seats, second.seats]))
+    with pytest.raises(ValueError, match="not adjacent views"):
+        merge_contiguous_rollouts(arena, [second, first])

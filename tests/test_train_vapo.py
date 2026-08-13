@@ -49,10 +49,16 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
         args.quantity_rank,
     ) == (48, 2, 96, 7, 4, 4, 32)
     assert not hasattr(args, "entropy_coefficient")
-    assert args.gae_lambda_alpha == 0.0
+    assert args.gamma == 1.0
+    assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
+    assert not hasattr(args, "gae_lambda")
     assert args.target_kl == 0.03
     assert args.checkpoint_every == 5
     module._validate_args(args)
+
+    args.gamma = 0.99
+    with pytest.raises(ValueError, match=r"require --gamma 1\.0"):
+        module._validate_args(args)
 
 
 def test_training_rejects_a_league_budget_that_drops_opponent_categories(
@@ -247,7 +253,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     rollout = SimpleNamespace(states=1)
     monkeypatch.setattr(module, "SummaryWriter", Writer)
     monkeypatch.setattr(module, "collect_self_play_rust", lambda *args, **kwargs: rollout)
-    monkeypatch.setattr(module, "concatenate_rollouts", lambda parts: parts[0])
+    monkeypatch.setattr(module, "merge_contiguous_rollouts", lambda storage, parts: parts[0])
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(
         module,

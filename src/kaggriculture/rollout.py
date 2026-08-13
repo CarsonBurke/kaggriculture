@@ -184,33 +184,80 @@ def _finish_rollout(
     )
 
 
-def _allocate_native_fields(trajectories: int, horizon: int) -> dict[str, np.ndarray]:
-    """Allocate trajectory-major storage once for a native full-horizon rollout."""
+def _native_field_specs(trajectories: int, horizon: int) -> dict[str, tuple[tuple[int, ...], type]]:
+    """Return the trajectory-major shape and dtype of every native rollout field."""
     prefix = (trajectories, horizon)
     return {
-        "board": np.empty((*prefix, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=np.float16),
-        "global_features": np.empty((*prefix, GLOBAL_FEATURES), dtype=np.float16),
-        "critic_features": np.empty((*prefix, CRITIC_FEATURES), dtype=np.float16),
-        "units": np.empty((*prefix, MAX_UNITS, UNIT_FEATURES), dtype=np.float16),
-        "unit_positions": np.empty((*prefix, MAX_UNITS, 2), dtype=np.int8),
-        "unit_actions": np.empty((*prefix, MAX_UNITS), dtype=np.int8),
-        "market_kinds": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.int8),
-        "market_quantities": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.int8),
-        "unit_masks": np.empty((*prefix, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.bool_),
-        "market_kind_masks": np.empty((*prefix, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.bool_),
-        "market_quantity_masks": np.empty(
-            (*prefix, MAX_MARKET_ORDERS, N_QUANTITIES), dtype=np.bool_
-        ),
-        "unit_active": np.empty((*prefix, MAX_UNITS), dtype=np.bool_),
-        "market_active": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.bool_),
-        "market_quantity_active": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.bool_),
-        "old_unit_logprobs": np.empty((*prefix, MAX_UNITS), dtype=np.float32),
-        "old_market_kind_logprobs": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.float32),
-        "old_market_quantity_logprobs": np.empty((*prefix, MAX_MARKET_ORDERS), dtype=np.float32),
-        "old_values": np.empty(prefix, dtype=np.float32),
-        "rewards": np.empty(prefix, dtype=np.float32),
-        "valid": np.ones(prefix, dtype=np.bool_),
+        "board": ((*prefix, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), np.float16),
+        "global_features": ((*prefix, GLOBAL_FEATURES), np.float16),
+        "critic_features": ((*prefix, CRITIC_FEATURES), np.float16),
+        "units": ((*prefix, MAX_UNITS, UNIT_FEATURES), np.float16),
+        "unit_positions": ((*prefix, MAX_UNITS, 2), np.int8),
+        "unit_actions": ((*prefix, MAX_UNITS), np.int8),
+        "market_kinds": ((*prefix, MAX_MARKET_ORDERS), np.int8),
+        "market_quantities": ((*prefix, MAX_MARKET_ORDERS), np.int8),
+        "unit_masks": ((*prefix, MAX_UNITS, N_UNIT_ACTIONS), np.bool_),
+        "market_kind_masks": ((*prefix, MAX_MARKET_ORDERS, N_MARKET_KINDS), np.bool_),
+        "market_quantity_masks": ((*prefix, MAX_MARKET_ORDERS, N_QUANTITIES), np.bool_),
+        "unit_active": ((*prefix, MAX_UNITS), np.bool_),
+        "market_active": ((*prefix, MAX_MARKET_ORDERS), np.bool_),
+        "market_quantity_active": ((*prefix, MAX_MARKET_ORDERS), np.bool_),
+        "old_unit_logprobs": ((*prefix, MAX_UNITS), np.float32),
+        "old_market_kind_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
+        "old_market_quantity_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
+        "old_values": (prefix, np.float32),
+        "rewards": (prefix, np.float32),
+        "valid": (prefix, np.bool_),
     }
+
+
+_TORCH_STORAGE_DTYPES = {
+    np.dtype(np.float16): torch.float16,
+    np.dtype(np.float32): torch.float32,
+    np.dtype(np.int8): torch.int8,
+    np.dtype(np.bool_): torch.bool,
+}
+
+
+def allocate_rollout_storage(
+    trajectories: int, horizon: int, *, pin_memory: bool = False
+) -> dict[str, np.ndarray]:
+    """Allocate reusable trajectory-major rollout storage.
+
+    Pinned storage is allocated through page-locked torch tensors and exposed
+    as NumPy views, so replay staging can upload the complete rollout to the
+    accelerator asynchronously instead of through pageable-memory copies.
+    """
+    if trajectories < 1 or horizon < 1:
+        raise ValueError("rollout storage requires positive trajectories and horizon")
+    storage: dict[str, np.ndarray] = {}
+    for name, (shape, dtype) in _native_field_specs(trajectories, horizon).items():
+        if pin_memory:
+            tensor = torch.empty(
+                shape, dtype=_TORCH_STORAGE_DTYPES[np.dtype(dtype)], pin_memory=True
+            )
+            storage[name] = tensor.numpy()
+        else:
+            storage[name] = np.empty(shape, dtype=dtype)
+    storage["valid"][:] = True
+    return storage
+
+
+def _native_rollout_storage(
+    storage: dict[str, np.ndarray] | None, trajectories: int, horizon: int
+) -> dict[str, np.ndarray]:
+    """Validate caller-provided storage or allocate a fresh full-horizon block."""
+    if storage is None:
+        return allocate_rollout_storage(trajectories, horizon)
+    specs = _native_field_specs(trajectories, horizon)
+    if set(storage) != set(specs):
+        raise ValueError("rollout storage fields do not match the native layout")
+    for name, (shape, dtype) in specs.items():
+        array = storage[name]
+        if array.shape != shape or array.dtype != np.dtype(dtype):
+            raise ValueError(f"rollout storage field {name} has the wrong shape or dtype")
+    storage["valid"][:] = True
+    return storage
 
 
 def _quantity_heads(actors: tuple[FarmActor, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -491,6 +538,7 @@ def collect_self_play_rust(
     temperature: float = 1.0,
     sampling_seed: int = 0,
     compile_models: bool = False,
+    storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect both on-policy seats through the exact batched Rust simulator."""
     if games < 1:
@@ -508,7 +556,7 @@ def collect_self_play_rust(
     environment = load_native().BatchEnv(seeds)
     trajectories = games * 2
     horizon = episode_steps - 1
-    fields = _allocate_native_fields(trajectories, horizon)
+    fields = _native_rollout_storage(storage, trajectories, horizon)
     encoded_wave = _native_encoded_wave(environment, device)
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
@@ -612,6 +660,7 @@ def collect_frozen_opponents_play_rust(
     deterministic: bool = False,
     sampling_seed: int = 0,
     compile_models: bool = False,
+    storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect one current-policy seat per game against assigned frozen actors."""
     if games < 1:
@@ -668,7 +717,7 @@ def collect_frozen_opponents_play_rust(
     environment = load_native().BatchEnv(seeds)
     rows = games * 2
     horizon = episode_steps - 1
-    fields = _allocate_native_fields(games, horizon)
+    fields = _native_rollout_storage(storage, games, horizon)
     encoded_wave = _native_encoded_wave(environment, device)
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
@@ -918,13 +967,9 @@ def collect_self_play(
                 )
                 final_money[offset : offset + 2] = money
                 opponent_money[offset : offset + 2] = money[::-1]
-                pair_rewards = shaped_pair_reward(potentials[game], 0.0, float(money[0] - money[1]))
-            else:
-                next_potential = pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-                pair_rewards = shaped_pair_reward(potentials[game], next_potential)
-                potentials[game] = next_potential
+            next_potential = pair_potential(next_state[0].observation, next_state[1].observation)
+            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
+            potentials[game] = next_potential
             step_rewards[offset : offset + 2] = pair_rewards
         fields["rewards"].append(step_rewards)
         fields["valid"].append(np.ones(trajectories, dtype=np.bool_))
@@ -1037,15 +1082,9 @@ def collect_frozen_opponent_play(
                 player_money = (float(farms[0]["money"]), float(farms[1]["money"]))
                 final_money[game] = player_money[int(seat)]
                 opponent_money[game] = player_money[1 - int(seat)]
-                pair_rewards = shaped_pair_reward(
-                    potentials[game], 0.0, player_money[0] - player_money[1]
-                )
-            else:
-                next_potential = pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-                pair_rewards = shaped_pair_reward(potentials[game], next_potential)
-                potentials[game] = next_potential
+            next_potential = pair_potential(next_state[0].observation, next_state[1].observation)
+            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
+            potentials[game] = next_potential
             step_rewards[game] = pair_rewards[int(seat)]
         fields["rewards"].append(step_rewards)
         fields["valid"].append(np.ones(games, dtype=np.bool_))
@@ -1066,44 +1105,11 @@ def collect_frozen_opponent_play(
     )
 
 
-def concatenate_rollouts(batches: list[RolloutBatch]) -> RolloutBatch:
-    """Concatenate compatible current-policy trajectories from several match sources."""
-    if not batches:
-        raise ValueError("at least one rollout batch is required")
-    if len(batches) == 1:
-        return batches[0]
-    if len({batch.horizon for batch in batches}) != 1:
-        raise ValueError("rollout horizons must match")
-    array_fields = (
-        "board",
-        "global_features",
-        "critic_features",
-        "units",
-        "unit_positions",
-        "unit_actions",
-        "market_kinds",
-        "market_quantities",
-        "unit_masks",
-        "market_kind_masks",
-        "market_quantity_masks",
-        "unit_active",
-        "market_active",
-        "market_quantity_active",
-        "old_unit_logprobs",
-        "old_market_kind_logprobs",
-        "old_market_quantity_logprobs",
-        "old_values",
-        "rewards",
-        "valid",
-        "episode_seeds",
-        "final_money",
-        "opponent_money",
-        "seats",
-    )
-    combined = {
-        field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
-        for field in array_fields
-    }
+_TRAJECTORY_METADATA_FIELDS = ("episode_seeds", "final_money", "opponent_money", "seats")
+
+
+def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:
+    """Combine per-trajectory metadata and component-weighted entropy."""
     component_counts = [
         int(
             batch.unit_active.sum() + batch.market_active.sum() + batch.market_quantity_active.sum()
@@ -1113,8 +1119,60 @@ def concatenate_rollouts(batches: list[RolloutBatch]) -> RolloutBatch:
     mean_entropy = sum(
         batch.mean_entropy * count for batch, count in zip(batches, component_counts, strict=True)
     ) / max(1, sum(component_counts))
+    combined: dict[str, Any] = {
+        field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
+        for field in _TRAJECTORY_METADATA_FIELDS
+    }
+    combined["mean_entropy"] = mean_entropy
+    combined["elapsed_seconds"] = sum(batch.elapsed_seconds for batch in batches)
+    return combined
+
+
+def concatenate_rollouts(batches: list[RolloutBatch]) -> RolloutBatch:
+    """Concatenate compatible current-policy trajectories from several match sources."""
+    if not batches:
+        raise ValueError("at least one rollout batch is required")
+    if len(batches) == 1:
+        return batches[0]
+    if len({batch.horizon for batch in batches}) != 1:
+        raise ValueError("rollout horizons must match")
+    state_fields = tuple(_native_field_specs(1, 1))
+    combined = {
+        field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
+        for field in state_fields
+    }
+    return RolloutBatch(**combined, **_combined_rollout_metadata(batches))
+
+
+def merge_contiguous_rollouts(
+    storage: dict[str, np.ndarray], batches: list[RolloutBatch]
+) -> RolloutBatch:
+    """Combine batches collected into adjacent views of one storage arena.
+
+    The per-state arrays are taken from the arena without copying; only the
+    small per-trajectory metadata arrays are concatenated. Every batch must
+    occupy exactly its expected row range of the arena, in order.
+    """
+    if not batches:
+        raise ValueError("at least one rollout batch is required")
+    if len({batch.horizon for batch in batches}) != 1:
+        raise ValueError("rollout horizons must match")
+    rows = sum(batch.trajectories for batch in batches)
+    state_fields = tuple(_native_field_specs(1, 1))
+    offset = 0
+    for batch in batches:
+        for field in state_fields:
+            expected = storage[field][offset : offset + batch.trajectories]
+            actual = getattr(batch, field)
+            if (
+                actual.shape != expected.shape
+                or actual.__array_interface__["data"][0] != expected.__array_interface__["data"][0]
+            ):
+                raise ValueError("rollout batches are not adjacent views of the storage arena")
+        offset += batch.trajectories
+    if any(storage[field].shape[0] != rows for field in state_fields):
+        raise ValueError("storage arena rows do not match the combined batches")
     return RolloutBatch(
-        **combined,
-        mean_entropy=mean_entropy,
-        elapsed_seconds=sum(batch.elapsed_seconds for batch in batches),
+        **{field: storage[field] for field in state_fields},
+        **_combined_rollout_metadata(batches),
     )

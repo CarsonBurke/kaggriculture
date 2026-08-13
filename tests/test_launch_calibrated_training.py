@@ -312,6 +312,11 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--league-historical-opponents", "2"),
         ("--epochs", "1"),
         ("--minibatch-size", "2048"),
+        ("--gamma", "1.0"),
+        (
+            "--actor-gae-lambda",
+            str(module._production_vapo_config()["actor_gae_lambda"]),
+        ),
         ("--target-kl", "0.03"),
     ):
         index = decision["training_command"].index(flag)

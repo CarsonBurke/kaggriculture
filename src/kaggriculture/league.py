@@ -109,10 +109,21 @@ def save_actor_snapshot(directory: Path, actor: FarmActor, iteration: int) -> Sn
     Repeating the exact same save is idempotent. Reusing an iteration for
     different weights fails instead of silently changing the frozen league.
     """
+    state = {name: value.detach().cpu().clone() for name, value in actor.state_dict().items()}
+    return save_actor_state_snapshot(directory, actor.config, state, iteration)
+
+
+def save_actor_state_snapshot(
+    directory: Path,
+    model_config: ModelConfig,
+    state: dict[str, torch.Tensor],
+    iteration: int,
+) -> SnapshotRef:
+    """Atomically save one immutable snapshot from an already-captured CPU state."""
     directory = Path(directory)
     path = _snapshot_path(directory, iteration)
-    state = {name: value.detach().cpu().clone() for name, value in actor.state_dict().items()}
-    config = actor.config.to_dict()
+    state = {name: value.detach().cpu() for name, value in state.items()}
+    config = _model_config_dict(model_config)
     if path.exists():
         existing = _load_payload(path)
         _validate_canonical_filename(path, existing["iteration"])
@@ -151,13 +162,11 @@ def save_actor_snapshot(directory: Path, actor: FarmActor, iteration: int) -> Sn
     return SnapshotRef(iteration, path)
 
 
-def load_actor_snapshot(
+def _validated_snapshot_state(
     path: Path,
-    *,
-    expected_model_config: ModelConfig | dict[str, Any] | None = None,
-    device: torch.device | str = "cpu",
-) -> FarmActor:
-    """Validate and strictly load a frozen actor snapshot."""
+    expected_model_config: ModelConfig | dict[str, Any] | None,
+) -> tuple[ModelConfig, dict[str, torch.Tensor]]:
+    """Validate one snapshot file and return its configuration and actor state."""
     path = Path(path)
     payload = _load_payload(path)
     _validate_canonical_filename(path, payload["iteration"])
@@ -169,16 +178,66 @@ def load_actor_snapshot(
         config = ModelConfig(**payload["model_config"])
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid league snapshot model configuration: {path}") from error
+    return config, payload["actor"]
+
+
+def load_actor_snapshot(
+    path: Path,
+    *,
+    expected_model_config: ModelConfig | dict[str, Any] | None = None,
+    device: torch.device | str = "cpu",
+) -> FarmActor:
+    """Validate and strictly load a frozen actor snapshot."""
+    path = Path(path)
+    config, state = _validated_snapshot_state(path, expected_model_config)
     # Parameter initialization is discarded immediately by strict loading, so
     # frozen-policy I/O must not perturb training's checkpointed RNG stream.
     with torch.random.fork_rng(devices=[]):
         actor = FarmActor(config).to(device)
     try:
-        actor.load_state_dict(payload["actor"], strict=True)
+        actor.load_state_dict(state, strict=True)
     except RuntimeError as error:
         raise ValueError(f"invalid league snapshot actor state: {path}") from error
     actor.eval().requires_grad_(False)
     return actor
+
+
+class FrozenActorPool:
+    """Persistent frozen-actor slots that load snapshot weights in place.
+
+    Rollout compilation caches its wrapper per module instance, so constructing
+    a fresh ``FarmActor`` for every selected opponent forces a Dynamo retrace
+    and CUDA graph recapture every iteration. Slot ``i`` always serves the
+    ``i``-th selection of an iteration; reloading weights into the same module
+    keeps every captured graph valid because parameter storages are reused.
+    """
+
+    def __init__(self, model_config: ModelConfig, device: torch.device | str) -> None:
+        self._model_config = model_config
+        self._device = device
+        self._slots: list[FarmActor] = []
+        self._loaded: list[Path | None] = []
+
+    def acquire(self, snapshot_paths: Sequence[Path]) -> list[FarmActor]:
+        """Return one validated frozen actor per snapshot path, reusing slots."""
+        while len(self._slots) < len(snapshot_paths):
+            with torch.random.fork_rng(devices=[]):
+                slot = FarmActor(self._model_config).to(self._device)
+            slot.eval().requires_grad_(False)
+            self._slots.append(slot)
+            self._loaded.append(None)
+        for index, path in enumerate(snapshot_paths):
+            resolved = Path(path).resolve()
+            if self._loaded[index] == resolved:
+                continue
+            _, state = _validated_snapshot_state(resolved, self._model_config)
+            self._loaded[index] = None
+            try:
+                self._slots[index].load_state_dict(state, strict=True)
+            except RuntimeError as error:
+                raise ValueError(f"invalid league snapshot actor state: {resolved}") from error
+            self._loaded[index] = resolved
+        return self._slots[: len(snapshot_paths)]
 
 
 def snapshot_sha256(path: Path) -> str:

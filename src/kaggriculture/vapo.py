@@ -1,4 +1,4 @@
-"""VAPO-style masked token update for complete Kaggriculture trajectories."""
+"""VAPO masked-token update with decoupled actor GAE and critic returns."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from kaggriculture.constants import EPISODE_STEPS
 from kaggriculture.model import (
     DistributionalCritic,
     FarmActor,
@@ -16,6 +17,11 @@ from kaggriculture.model import (
 )
 from kaggriculture.policy import component_logprobs
 from kaggriculture.rollout import RolloutBatch
+
+VAPO_GAE_ALPHA = 0.05
+COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (VAPO_GAE_ALPHA * COMPETITION_ACTION_STEPS)
+CRITIC_GAE_LAMBDA = 1.0
 
 
 @dataclass(frozen=True)
@@ -28,10 +34,10 @@ class VapoConfig:
     minibatch_size: int = 2048
     clip_low: float = 0.80
     clip_high: float = 1.28
-    # Zero selects exact Monte Carlo credit. With gamma=1 this preserves the
-    # telescoping potential-shaped objective exactly. Positive values expose
-    # length-adaptive VAPO lambda only as an explicit ablation.
-    gae_lambda_alpha: float = 0.0
+    # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
+    # competition's fixed 719-action horizon. The critic is deliberately
+    # decoupled below and always learns from lambda-one Monte Carlo returns.
+    actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     gamma: float = 1.0
     max_gradient_norm: float = 1.0
     target_kl: float = 0.08
@@ -42,39 +48,38 @@ class VapoConfig:
 class AdvantageBatch:
     advantages: np.ndarray
     value_targets: np.ndarray
-    lambdas: np.ndarray
-
-
-def length_adaptive_lambda(lengths: Tensor, alpha: float = 0.0) -> Tensor:
-    """Return exact-MC lambda by default, or length-adaptive VAPO lambda."""
-    if not math.isfinite(alpha) or alpha < 0.0:
-        raise ValueError("GAE lambda alpha must be finite and non-negative")
-    lengths = lengths.float().clamp_min(1)
-    if alpha == 0.0:
-        return torch.ones_like(lengths)
-    horizon = torch.maximum(
-        alpha * lengths,
-        torch.minimum(lengths, torch.full_like(lengths, 1.0 / alpha)),
-    )
-    return (1.0 - 1.0 / horizon).clamp(0.0, 1.0)
 
 
 def generalized_advantage_and_targets(
     rewards: Tensor,
     values: Tensor,
     valid: Tensor,
-    lambdas: Tensor,
+    actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
     gamma: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
-    """Masked GAE and lambda-one return targets in one reverse pass."""
+    """Compute actor lambda-GAE and decoupled lambda-one critic targets."""
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")
-    if values.ndim != 2 or lambdas.shape != values.shape[:1]:
-        raise ValueError("values must be [trajectories, time] and lambdas one per trajectory")
-    if not math.isfinite(gamma) or gamma < 0.0 or gamma > 1.0:
-        raise ValueError("gamma must be finite and in [0, 1]")
+    if values.ndim != 2:
+        raise ValueError("values must be [trajectories, time]")
+    if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be finite and in (0, 1]")
+    if not math.isfinite(actor_gae_lambda) or not 0.0 <= actor_gae_lambda <= 1.0:
+        raise ValueError("actor GAE lambda must be finite and in [0, 1]")
+    if values.size(1) == 0:
+        return torch.zeros_like(values), torch.zeros_like(values)
 
-    valid = valid.to(values.dtype)
+    valid_mask = valid.bool()
+    if bool((~torch.isfinite(rewards) & valid_mask).any()):
+        raise ValueError("valid rewards must be finite")
+    if bool((~torch.isfinite(values) & valid_mask).any()):
+        raise ValueError("valid values must be finite")
+    # Invalid padding is semantically absent. Select it away before arithmetic
+    # because IEEE NaN multiplied by a zero mask remains NaN and could otherwise
+    # contaminate the preceding valid suffix.
+    rewards = torch.where(valid_mask, rewards, torch.zeros_like(rewards))
+    values = torch.where(valid_mask, values, torch.zeros_like(values))
+    valid = valid_mask.to(values.dtype)
     zero_column = torch.zeros_like(values[:, :1])
     next_values = torch.cat((values[:, 1:], zero_column), dim=1)
     next_valids = torch.cat((valid[:, 1:], torch.zeros_like(valid[:, :1])), dim=1)
@@ -82,18 +87,21 @@ def generalized_advantage_and_targets(
     running_advantage = torch.zeros(values.size(0), dtype=values.dtype, device=values.device)
     running_return = torch.zeros_like(running_advantage)
     advantage_columns: list[Tensor] = []
-    return_columns: list[Tensor] = []
+    target_columns: list[Tensor] = []
     for step in range(values.size(1) - 1, -1, -1):
         next_valid = next_valids[:, step]
         running_advantage = (
-            deltas[:, step] + gamma * lambdas * running_advantage * next_valid
+            deltas[:, step] + gamma * actor_gae_lambda * running_advantage * next_valid
         ) * valid[:, step]
-        running_return = (deltas[:, step] + gamma * running_return * next_valid) * valid[:, step]
+        # This is the undiscounted Monte Carlo suffix return when gamma=1.
+        # Computing it directly from rewards makes the critic target exactly
+        # independent of its own predictions, including in floating point.
+        running_return = (rewards[:, step] + gamma * running_return * next_valid) * valid[:, step]
         advantage_columns.append(running_advantage)
-        return_columns.append(running_return)
+        target_columns.append(running_return)
     advantages = torch.stack(advantage_columns[::-1], dim=1).to(values.dtype)
-    return_advantages = torch.stack(return_columns[::-1], dim=1).to(values.dtype)
-    return advantages, return_advantages + values * valid
+    value_targets = torch.stack(target_columns[::-1], dim=1).to(values.dtype)
+    return advantages, value_targets
 
 
 def _validate_config(config: VapoConfig) -> None:
@@ -114,9 +122,9 @@ def _validate_config(config: VapoConfig) -> None:
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
         raise ValueError("clip interval must straddle one")
     if config.gamma != 1.0:
-        raise ValueError("Kaggriculture potential shaping requires undiscounted gamma=1")
-    if not math.isfinite(config.gae_lambda_alpha) or config.gae_lambda_alpha < 0.0:
-        raise ValueError("GAE lambda alpha must be finite and non-negative")
+        raise ValueError("Kaggriculture bank-delta rewards require undiscounted gamma=1")
+    if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
+        raise ValueError("actor GAE lambda must be finite and in [0, 1]")
 
 
 def prepare_advantages(rollout: RolloutBatch, config: VapoConfig) -> AdvantageBatch:
@@ -124,10 +132,12 @@ def prepare_advantages(rollout: RolloutBatch, config: VapoConfig) -> AdvantageBa
     rewards = torch.from_numpy(rollout.rewards).float()
     values = torch.from_numpy(rollout.old_values).float()
     valid = torch.from_numpy(rollout.valid).float()
-    lengths = valid.sum(dim=1)
-    lambdas = length_adaptive_lambda(lengths, config.gae_lambda_alpha)
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, lambdas, config.gamma
+        rewards,
+        values,
+        valid,
+        actor_gae_lambda=config.actor_gae_lambda,
+        gamma=config.gamma,
     )
     selected = advantages[valid.bool()]
     if selected.numel() == 0:
@@ -137,7 +147,6 @@ def prepare_advantages(rollout: RolloutBatch, config: VapoConfig) -> AdvantageBa
     return AdvantageBatch(
         advantages=normalized.numpy(),
         value_targets=targets.numpy(),
-        lambdas=lambdas.numpy(),
     )
 
 
@@ -177,13 +186,35 @@ def make_optimizers(
 
 
 def _stage_tensor(array: np.ndarray, device: torch.device) -> Tensor:
-    flat = array.reshape((-1, *array.shape[2:]))
-    return torch.from_numpy(flat).to(device=device)
+    flat = torch.from_numpy(array.reshape((-1, *array.shape[2:])))
+    # Pinned rollout arenas upload asynchronously; stream ordering keeps the
+    # copies safe because every consumer runs on the same stream.
+    return flat.to(device=device, non_blocking=flat.is_pinned())
 
 
 def _batch_tensor(staged: Tensor, indices: Tensor, dtype: torch.dtype | None = None) -> Tensor:
     selected = staged.index_select(0, indices)
     return selected if dtype is None or selected.dtype == dtype else selected.to(dtype=dtype)
+
+
+def _balanced_minibatch_slices(sample_count: int, maximum_size: int) -> tuple[slice, ...]:
+    """Partition an epoch into near-equal, nonempty minibatches.
+
+    A short final tail would otherwise receive a full optimizer step despite
+    its mean loss containing fewer samples. Balancing keeps every sample's
+    per-epoch influence approximately equal without dropping any states.
+    """
+    if sample_count < 1 or maximum_size < 1:
+        raise ValueError("sample count and maximum minibatch size must be positive")
+    batch_count = math.ceil(sample_count / maximum_size)
+    base_size, larger_batches = divmod(sample_count, batch_count)
+    slices: list[slice] = []
+    start = 0
+    for batch in range(batch_count):
+        size = base_size + int(batch < larger_batches)
+        slices.append(slice(start, start + size))
+        start += size
+    return tuple(slices)
 
 
 def _optimizer_step(
@@ -234,34 +265,43 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.
     return 1.0 - float(np.var(selected_targets - selected_predictions)) / variance
 
 
-def _validate_rollout_action_masks(rollout: RolloutBatch) -> None:
-    """Validate stored categorical support once, before accelerator staging."""
-    valid = rollout.valid.reshape(-1)
-    for name, masks, actions in (
-        ("unit", rollout.unit_masks, rollout.unit_actions),
-        ("market kind", rollout.market_kind_masks, rollout.market_kinds),
-        ("market quantity", rollout.market_quantity_masks, rollout.market_quantities),
+def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> None:
+    """Validate stored categorical support in one staged accelerator pass."""
+    flags: list[Tensor] = []
+    messages: list[str] = []
+    for name, masks_key, actions_key in (
+        ("unit", "unit_masks", "unit_actions"),
+        ("market kind", "market_kind_masks", "market_kinds"),
+        ("market quantity", "market_quantity_masks", "market_quantities"),
     ):
-        flat_masks = masks.reshape((-1, *masks.shape[2:]))
-        flat_actions = actions.reshape((-1, *actions.shape[2:]))
-        if flat_masks.shape[:-1] != flat_actions.shape:
+        masks = staged[masks_key]
+        actions = staged[actions_key].long()
+        if masks.shape[:-1] != actions.shape:
             raise ValueError(f"{name} action and mask shapes do not align")
-        valid_actions = flat_actions[valid]
-        if valid_actions.size == 0:
-            continue
-        categories = flat_masks.shape[-1]
-        if valid_actions.min() < 0 or valid_actions.max() >= categories:
-            raise ValueError(f"{name} action is outside its categorical support")
-        nonempty = flat_masks.any(axis=-1)
-        if not nonempty[valid].all():
-            raise ValueError(f"{name} mask has no valid category")
-        selected_valid = np.take_along_axis(
-            flat_masks,
-            flat_actions.clip(0, categories - 1)[..., None],
-            axis=-1,
-        ).squeeze(-1)
-        if not selected_valid[valid].all():
-            raise ValueError(f"{name} action is masked out")
+        categories = masks.shape[-1]
+        valid_rows = valid.view(valid.shape[0], *([1] * (actions.ndim - 1)))
+        selected = torch.gather(masks, -1, actions.clamp(0, categories - 1).unsqueeze(-1)).squeeze(
+            -1
+        )
+        flags.extend(
+            (
+                (((actions < 0) | (actions >= categories)) & valid_rows).any(),
+                (~masks.any(dim=-1) & valid_rows).any(),
+                (~selected & valid_rows).any(),
+            )
+        )
+        messages.extend(
+            (
+                f"{name} action is outside its categorical support",
+                f"{name} mask has no valid category",
+                f"{name} action is masked out",
+            )
+        )
+    # One aggregated host readback replaces per-field synchronizing checks.
+    failures = torch.stack(flags).cpu()
+    for failed, message in zip(failures.tolist(), messages, strict=True):
+        if failed:
+            raise ValueError(message)
 
 
 def update_vapo(
@@ -281,7 +321,6 @@ def update_vapo(
         raise ValueError("actor and critic must use the same device")
     actor.train()
     critic.train()
-    _validate_rollout_action_masks(rollout)
     prepared = prepare_advantages(rollout, config)
     valid_value_targets = prepared.value_targets[rollout.valid]
     value_support = critic.support.detach().float().cpu().numpy()
@@ -331,6 +370,9 @@ def update_vapo(
         "advantages": torch.from_numpy(prepared.advantages.reshape(-1)).to(device),
         "value_targets": torch.from_numpy(prepared.value_targets.reshape(-1)).to(device),
     }
+    # Stored categorical support is validated in one staged pass; repeated
+    # NumPy sweeps over the multi-gigabyte host rollout would stall the update.
+    _validate_staged_action_masks(staged, torch.from_numpy(flat_valid).to(device))
     totals = {
         key: torch.zeros((), device=device, dtype=torch.float64)
         for key in (
@@ -356,10 +398,9 @@ def update_vapo(
     for _epoch in range(config.epochs):
         shuffled = generator.permutation(valid_indices)
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
-        for start in range(0, shuffled.size, config.minibatch_size):
-            stop = start + config.minibatch_size
-            host_indices = shuffled[start:stop]
-            indices = shuffled_device[start:stop]
+        for batch_slice in _balanced_minibatch_slices(shuffled.size, config.minibatch_size):
+            host_indices = shuffled[batch_slice]
+            indices = shuffled_device[batch_slice]
             board = _batch_tensor(staged["board"], indices, torch.float32)
             critic_features = _batch_tensor(staged["critic_features"], indices, torch.float32)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
@@ -522,7 +563,9 @@ def update_vapo(
         "value_target_std": float(prepared.value_targets[rollout.valid].std()),
         "value_target_min": float(prepared.value_targets[rollout.valid].min()),
         "value_target_max": float(prepared.value_targets[rollout.valid].max()),
-        "lambda_mean": float(prepared.lambdas.mean()),
+        "actor_gae_lambda": config.actor_gae_lambda,
+        "critic_gae_lambda": CRITIC_GAE_LAMBDA,
+        "gamma": config.gamma,
         "actor_learning_rate": float(actor_optimizer.param_groups[0]["lr"]),
         "critic_learning_rate": float(critic_optimizer.param_groups[0]["lr"]),
         "explained_variance": _explained_variance(

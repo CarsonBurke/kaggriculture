@@ -20,7 +20,7 @@ from kaggriculture.provenance import validate_run_provenance, validate_source_id
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.vapo import VapoConfig
 
-CHECKPOINT_FORMAT_VERSION = 5
+CHECKPOINT_FORMAT_VERSION = 7
 
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
@@ -140,6 +140,100 @@ def rollout_diagnostics(rollout: RolloutBatch) -> dict[str, float | int]:
     }
 
 
+def cpu_state_copy(state: Any) -> Any:
+    """Deep-copy a (possibly nested) state container with tensors moved to CPU.
+
+    Snapshots the live training state so serialization can proceed off the
+    critical path while the optimizer keeps mutating the originals.
+    """
+    if isinstance(state, torch.Tensor):
+        return state.detach().to("cpu", copy=True)
+    if isinstance(state, dict):
+        return {name: cpu_state_copy(value) for name, value in state.items()}
+    if isinstance(state, list | tuple):
+        return type(state)(cpu_state_copy(value) for value in state)
+    return state
+
+
+def training_rng_states() -> dict[str, Any]:
+    """Capture every process-global RNG stream a checkpoint must restore."""
+    return {
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }
+
+
+def checkpoint_payload(
+    *,
+    actor_state: dict[str, Any],
+    critic_state: dict[str, Any],
+    actor_optimizer_state: dict[str, Any],
+    critic_optimizer_state: dict[str, Any],
+    model_config: ModelConfig,
+    vapo_config: VapoConfig,
+    iteration: int,
+    next_seed: int,
+    metrics: dict[str, Any],
+    source_identity: dict[str, Any],
+    rng_states: dict[str, Any],
+    run_provenance: dict[str, Any] | None = None,
+    training_rng_state: dict[str, Any] | None = None,
+    training_data_config: dict[str, Any] | None = None,
+    league_snapshot_manifest: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """Assemble a validated checkpoint payload from already-captured state."""
+    normalized_source_identity = validate_source_identity(source_identity)
+    normalized_run_provenance = validate_run_provenance(run_provenance)
+    if (
+        normalized_run_provenance is not None
+        and normalized_run_provenance["source_identity"] != normalized_source_identity
+    ):
+        raise ValueError("checkpoint run provenance source does not match source identity")
+    if normalized_run_provenance is not None and (
+        not isinstance(training_data_config, dict)
+        or training_data_config.get("compile_models")
+        is not normalized_run_provenance["calibration"]["compile_models"]
+    ):
+        raise ValueError("checkpoint compile mode does not match run provenance")
+    if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
+        raise ValueError("checkpoint RNG capture is incomplete")
+    return {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "iteration": iteration,
+        "next_seed": next_seed,
+        "model_config": model_config.to_dict(),
+        "vapo_config": asdict(vapo_config),
+        "actor": actor_state,
+        "critic": critic_state,
+        "actor_optimizer": actor_optimizer_state,
+        "critic_optimizer": critic_optimizer_state,
+        "metrics": metrics,
+        **rng_states,
+        "training_rng": training_rng_state,
+        "training_data_config": training_data_config,
+        "league_snapshot_manifest": league_snapshot_manifest,
+        "source_identity": normalized_source_identity,
+        "run_provenance": normalized_run_provenance,
+    }
+
+
+def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically serialize one checkpoint payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_checkpoint(
     path: Path,
     *,
@@ -158,51 +252,24 @@ def save_checkpoint(
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    normalized_source_identity = validate_source_identity(source_identity)
-    normalized_run_provenance = validate_run_provenance(run_provenance)
-    if (
-        normalized_run_provenance is not None
-        and normalized_run_provenance["source_identity"] != normalized_source_identity
-    ):
-        raise ValueError("checkpoint run provenance source does not match source identity")
-    if normalized_run_provenance is not None and (
-        not isinstance(training_data_config, dict)
-        or training_data_config.get("compile_models")
-        is not normalized_run_provenance["calibration"]["compile_models"]
-    ):
-        raise ValueError("checkpoint compile mode does not match run provenance")
-    payload = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "iteration": iteration,
-        "next_seed": next_seed,
-        "model_config": model_config.to_dict(),
-        "vapo_config": asdict(vapo_config),
-        "actor": actor.state_dict(),
-        "critic": critic.state_dict(),
-        "actor_optimizer": actor_optimizer.state_dict(),
-        "critic_optimizer": critic_optimizer.state_dict(),
-        "metrics": metrics,
-        "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        "numpy_rng": np.random.get_state(),
-        "python_rng": random.getstate(),
-        "training_rng": training_rng_state,
-        "training_data_config": training_data_config,
-        "league_snapshot_manifest": league_snapshot_manifest,
-        "source_identity": normalized_source_identity,
-        "run_provenance": normalized_run_provenance,
-    }
-    handle, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    payload = checkpoint_payload(
+        actor_state=actor.state_dict(),
+        critic_state=critic.state_dict(),
+        actor_optimizer_state=actor_optimizer.state_dict(),
+        critic_optimizer_state=critic_optimizer.state_dict(),
+        model_config=model_config,
+        vapo_config=vapo_config,
+        iteration=iteration,
+        next_seed=next_seed,
+        metrics=metrics,
+        source_identity=source_identity,
+        rng_states=training_rng_states(),
+        run_provenance=run_provenance,
+        training_rng_state=training_rng_state,
+        training_data_config=training_data_config,
+        league_snapshot_manifest=league_snapshot_manifest,
     )
-    os.close(handle)
-    temporary = Path(temporary_name)
-    try:
-        torch.save(payload, temporary)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_checkpoint(path, payload)
 
 
 def load_checkpoint(
@@ -233,32 +300,60 @@ def load_checkpoint(
     return payload
 
 
+_JOURNAL_TAIL_WINDOW = 1 << 20
+
+
+def _journal_last_line(stream: Any, path: Path) -> str | None:
+    """Truncate a torn final suffix and return the last complete record."""
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    if not size:
+        return None
+    window = min(size, _JOURNAL_TAIL_WINDOW)
+    stream.seek(size - window)
+    tail = stream.read(window)
+    if not tail.endswith(b"\n"):
+        # A torn suffix can only follow a crash mid-append. Recover the last
+        # complete line while retaining strict validation of that record.
+        cut = tail.rfind(b"\n")
+        if cut < 0 and window < size:
+            raise ValueError(f"metrics journal has an oversized torn record: {path}")
+        size = size - (len(tail) - cut - 1) if cut >= 0 else 0
+        stream.truncate(size)
+        if not size:
+            return None
+        window = min(size, _JOURNAL_TAIL_WINDOW)
+        stream.seek(size - window)
+        tail = stream.read(window)
+    body = tail[:-1]
+    cut = body.rfind(b"\n")
+    if cut < 0 and window < size:
+        raise ValueError(f"metrics journal has an oversized record: {path}")
+    return body[cut + 1 :].decode("utf-8")
+
+
 def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
-    """Append one canonical iteration record idempotently.
+    """Append one canonical iteration record idempotently in constant time.
 
     Checkpoints commit before telemetry. On recovery this fills a missing final
-    record without duplicating one that was already durably appended.
+    record without duplicating one that was already durably appended. Readers
+    recover a torn final suffix, so a plain fsynced append preserves the
+    journal's crash-safety contract without rewriting the complete file.
     """
     iteration = payload.get("iteration")
     if type(iteration) is not int or iteration < 1:
         raise ValueError("iteration metrics require a positive integer iteration")
     rendered = json.dumps(payload, sort_keys=True, allow_nan=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = ""
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if existing and not existing.endswith("\n"):
-            # The journal is committed through an atomic replace below, so a
-            # partial suffix can only predate this crash-safe implementation.
-            # Recover the last complete line while retaining strict validation
-            # of every complete record.
-            existing = existing.rpartition("\n")[0]
-            if existing:
-                existing += "\n"
-        lines = [line for line in existing.splitlines() if line]
-        if lines:
-            previous = json.loads(lines[-1])
-            previous_iteration = previous.get("iteration")
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    with os.fdopen(descriptor, "r+b") as stream:
+        last_line = _journal_last_line(stream, path)
+        if last_line is not None:
+            try:
+                previous = json.loads(last_line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"metrics journal has an invalid final record: {path}") from error
+            previous_iteration = previous.get("iteration") if isinstance(previous, dict) else None
             if type(previous_iteration) is not int:
                 raise ValueError(f"metrics journal has an invalid final record: {path}")
             if previous_iteration > iteration:
@@ -266,7 +361,7 @@ def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
                     f"metrics journal is ahead of checkpoint iteration {iteration}: {path}"
                 )
             if previous_iteration == iteration:
-                if lines[-1] != rendered:
+                if last_line != rendered:
                     raise ValueError(
                         f"metrics journal conflicts with checkpoint iteration {iteration}: {path}"
                     )
@@ -275,19 +370,10 @@ def append_iteration_jsonl(path: Path, payload: dict[str, Any]) -> bool:
                 raise ValueError(
                     f"metrics journal is missing iterations before {iteration}: {path}"
                 )
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(existing)
-            stream.write(rendered + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        stream.seek(0, os.SEEK_END)
+        stream.write(rendered.encode("utf-8") + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
     return True
 
 

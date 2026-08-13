@@ -2,9 +2,10 @@
 
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
-The learner is direct, from-scratch VAPO self-play. Training does not depend on
-expert demonstrations, distillation, behavior cloning, or value pretraining. An
-exact batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
+The learner is direct, from-scratch self-play with VAPO-style factor clipping
+and decoupled GAE. Training does not currently depend on expert
+demonstrations, distillation, behavior cloning, or value pretraining. An exact
+batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
 environment remains the parity oracle and final evaluator.
 
 Install both development and training dependencies before running the complete
@@ -67,11 +68,23 @@ VAPO, or data-generation settings. It enables compilation only for a measured
 steady-state speedup of at least 1.05x and binds the complete decision into
 every checkpoint.
 
-Training is direct from-scratch self-play. It uses exact undiscounted Monte
-Carlo credit by default so the potential-shaped rewards telescope to the real
-terminal win/loss objective; no demonstrations, distillation, behavior cloning,
-value pretraining, or entropy bonus are involved. The production defaults collect 112 live
-self-play games plus 96 frozen-league games and replay them once. Frozen
+Training is direct from-scratch self-play. At every transition, player zero's
+potential is the exact relative scored-bank value
+`(money_0 - money_1) / (money_0 + money_1)` (zero when both banks are empty),
+and rewards are its change; player one receives the negative. There is no
+terminal reward override and no guessed mark-to-market value for inventory,
+land, animals, or future production. Since both players start with equal money,
+the undiscounted episode return is exactly the final normalized bank margin,
+whose sign exactly matches the game's winner/tie relation. Gamma is fixed at
+1.0: discounting potential differences would introduce a separate preference
+for holding cash early. Following VAPO's decoupled GAE, actor advantages use
+`lambda_policy = 1 - 1 / (0.05 * 719) = 0.9721835883`, while critic targets use
+lambda one and are therefore exact Monte Carlo suffix returns. Valid games
+always contain 719 actions, so the paper's length-adaptive formula is constant
+for this environment. Epoch permutations are split into balanced minibatches
+so a short tail cannot receive a disproportionate optimizer step. No entropy
+bonus is involved. The production defaults collect 112 live self-play games
+plus 96 frozen-league games and replay them once. Frozen
 actor-only snapshots are written every update, with opponents drawn from a
 16-policy recent window and log-age historical strata. Recent opponents are
 sampled at temperature 0.8; the initial anchor and historical policies use the
@@ -91,6 +104,14 @@ PPO likelihoods and multimodal quantity choices; a continuous Beta density would
 not be a valid likelihood for these integer actions. The centralized critic uses
 HL-Gauss labels on a bounded categorical support with headroom around the proven
 `[-2, 2]` return range.
+
+Future ablation, intentionally not implemented yet: actor-only pretraining on
+the public v27 route. Demonstrations must first be projected through the exact
+sequential legality ledger (invalid unit actions become PASS, invalid market
+orders are removed and compacted rather than converted to STOP, and excessive
+quantities are clamped to the largest legal integer). Any pretrained actor must
+then enter RL with a fresh critic and optimizer, with no persistent BC or KL
+term, and must beat the from-scratch initialization on held-out paired seeds.
 
 Each full checkpoint binds the immutable `league/` sidecar archive with a
 SHA-256 manifest, the complete source identity, and canonical calibration/run

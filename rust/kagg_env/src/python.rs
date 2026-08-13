@@ -496,24 +496,17 @@ impl BatchEnv {
         )?;
         output.set_item(
             "final_money",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), money.clone())
+            Array2::from_shape_vec((self.games.len(), PLAYERS), money)
                 .expect("step money shape is internal")
                 .into_pyarray(py),
         )?;
-        output.set_item("dones", dones.clone().into_pyarray(py))?;
+        output.set_item("dones", dones.into_pyarray(py))?;
         let post_potentials: Vec<f32> = self.games.iter().map(Game::pair_potential).collect();
         let shaped: Vec<f32> = previous_potentials
             .iter()
             .zip(post_potentials.iter())
-            .zip(dones.iter())
-            .zip(money.chunks_exact(PLAYERS))
-            .flat_map(|(((&previous, &post), &done), cash)| {
-                let reward_zero = if done {
-                    let margin = cash[0] - cash[1];
-                    f32::from(margin > 0.0) - f32::from(margin < 0.0) - previous
-                } else {
-                    post - previous
-                };
+            .flat_map(|(&previous, &post)| {
+                let reward_zero = post - previous;
                 [reward_zero, -reward_zero]
             })
             .collect();
@@ -1042,12 +1035,7 @@ fn fill_sample_step_output(
         previous[game_index] = pre;
         let post = game.pair_potential();
         potentials[game_index] = post;
-        let reward_zero = if result.done {
-            let margin = result.money[0] - result.money[1];
-            f32::from(margin > 0.0) - f32::from(margin < 0.0) - pre
-        } else {
-            post - pre
-        };
+        let reward_zero = post - pre;
         shaped[offset] = reward_zero;
         shaped[offset + 1] = -reward_zero;
     }

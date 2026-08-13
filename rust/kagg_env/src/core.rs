@@ -736,46 +736,15 @@ impl Game {
         }
     }
 
-    pub fn farm_equity(&self, player: usize) -> f64 {
-        let mut value = self.farms[player].money as f64;
-        for item in 0..PRIVATE_ITEMS {
-            let carried: u16 = self.privates[player]
-                .inventories
-                .iter()
-                .map(|inventory| inventory[item])
-                .sum();
-            let quantity = self.privates[player].shed[item] + carried;
-            let item_value = if item < PRODUCTS {
-                0.72 * self.market_prices[item] as f64
-            } else {
-                0.82 * ANIMAL_COST[item - PRODUCTS] as f64
-            };
-            value += f64::from(quantity) * item_value;
-        }
-        #[allow(clippy::needless_range_loop)]
-        for crop in 0..CROPS {
-            value += 0.85 * f64::from(self.privates[player].seeds[crop]) * SEED_COST[crop] as f64;
-        }
-        for tile in self.farms[player].tiles {
-            if tile.has_animal {
-                let animal = usize::from(tile.species);
-                value += 0.72 * ANIMAL_COST[animal] as f64;
-                value += 0.72
-                    * f64::from(tile.yield_units)
-                    * self.market_prices[ANIMAL_PRODUCT[animal]] as f64;
-            } else if tile.kind == TileKind::Plant {
-                let crop = usize::from(tile.species);
-                value += 0.6 * SEED_COST[crop] as f64;
-                value += 0.72 * f64::from(tile.yield_units) * self.market_prices[crop] as f64;
-            }
-        }
-        let extra = self.farms[player].unlocked.count_ones().saturating_sub(1) as usize;
-        value += 0.45 * LAND_PRICES[..extra].iter().sum::<i64>() as f64;
-        value
-    }
-
     pub fn pair_potential(&self) -> f32 {
-        ((self.farm_equity(0) - self.farm_equity(1)) / 40_000.0).tanh() as f32
+        let money_zero = self.farms[0].money as f64;
+        let money_one = self.farms[1].money as f64;
+        let total = money_zero + money_one;
+        if total == 0.0 {
+            0.0
+        } else {
+            ((money_zero - money_one) / total) as f32
+        }
     }
 
     pub fn factor_masks(&self, player: usize, actions: &CompactAction) -> FactorMasks {
@@ -2320,6 +2289,23 @@ mod tests {
         assert_eq!(market_price(0, 10_000), 25);
         assert_eq!(market_price(0, 9_600), 45);
         assert_eq!(market_price(4, 10_300), 1);
+    }
+
+    #[test]
+    fn pair_potential_is_exact_relative_bank_score() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 3000;
+        game.farms[1].money = 1000;
+        game.privates[1].shed.fill(100);
+        assert_eq!(game.pair_potential(), 0.5);
+
+        game.farms[0].money = 1000;
+        game.farms[1].money = 3000;
+        assert_eq!(game.pair_potential(), -0.5);
+
+        game.farms[0].money = 0;
+        game.farms[1].money = 0;
+        assert_eq!(game.pair_potential(), 0.0);
     }
 
     #[test]

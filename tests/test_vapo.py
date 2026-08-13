@@ -11,11 +11,15 @@ from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.rollout import collect_self_play
 from kaggriculture.vapo import (
+    CRITIC_GAE_LAMBDA,
+    DEFAULT_ACTOR_GAE_LAMBDA,
     VapoConfig,
+    _balanced_minibatch_slices,
     _clipped_surrogate_sums,
-    _validate_rollout_action_masks,
+    _stage_tensor,
+    _validate_config,
+    _validate_staged_action_masks,
     generalized_advantage_and_targets,
-    length_adaptive_lambda,
     make_optimizers,
     update_vapo,
 )
@@ -35,51 +39,156 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         actor, critic, games=1, seed_start=89, episode_steps=3, sampling_seed=2
     )
     rollout.unit_masks[0, 0, 0].fill(False)
+    device = torch.device("cpu")
+    staged = {
+        name: _stage_tensor(getattr(rollout, name), device)
+        for name in (
+            "unit_actions",
+            "market_kinds",
+            "market_quantities",
+            "unit_masks",
+            "market_kind_masks",
+            "market_quantity_masks",
+        )
+    }
+    valid = torch.from_numpy(rollout.valid.reshape(-1)).to(device)
 
     with pytest.raises(ValueError, match="unit mask has no valid category"):
-        _validate_rollout_action_masks(rollout)
+        _validate_staged_action_masks(staged, valid)
 
 
-def test_default_lambda_is_exact_monte_carlo() -> None:
-    values = length_adaptive_lambda(torch.tensor([1, 2, 5, 100, 720]))
+def test_default_gae_matches_fixed_horizon_vapo() -> None:
+    config = VapoConfig()
 
-    assert values.tolist() == [1.0] * 5
+    assert config.gamma == 1.0
+    assert config.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
+    assert config.actor_gae_lambda == pytest.approx(699.0 / 719.0)
+    assert config.actor_gae_lambda == DEFAULT_ACTOR_GAE_LAMBDA
+    assert 1.0 / (1.0 - config.actor_gae_lambda) == pytest.approx(0.05 * 719.0)
+    assert CRITIC_GAE_LAMBDA == 1.0
 
 
-def test_length_adaptive_lambda_remains_an_explicit_ablation() -> None:
-    values = length_adaptive_lambda(torch.tensor([1, 2, 5, 100, 720]), alpha=0.5)
+def test_discounted_bank_delta_objective_is_rejected() -> None:
+    with pytest.raises(ValueError, match="undiscounted gamma=1"):
+        _validate_config(VapoConfig(gamma=0.99))
 
-    assert values.tolist() == pytest.approx([0.0, 0.5, 0.6, 0.98, 1.0 - 1.0 / 360.0])
+
+def test_minibatches_are_balanced_without_dropping_the_tail() -> None:
+    slices = _balanced_minibatch_slices(230_080, 2048)
+    sizes = [row.stop - row.start for row in slices]
+
+    assert len(slices) == 113
+    assert sum(sizes) == 230_080
+    assert max(sizes) <= 2048
+    assert max(sizes) - min(sizes) <= 1
+    assert slices[0].start == 0
+    assert slices[-1].stop == 230_080
 
 
-def test_gae_terminal_reward_reaches_opening() -> None:
+def test_actor_lambda_decays_terminal_residual_but_critic_target_does_not() -> None:
     rewards = torch.tensor([[0.0, 0.0, 1.0]])
     values = torch.zeros_like(rewards)
     valid = torch.ones_like(rewards)
 
-    advantages, targets = generalized_advantage_and_targets(rewards, values, valid, torch.ones(1))
+    advantages, targets = generalized_advantage_and_targets(
+        rewards, values, valid, actor_gae_lambda=0.5
+    )
 
-    assert advantages.tolist() == [[1.0, 1.0, 1.0]]
+    assert advantages.tolist() == [[0.25, 0.5, 1.0]]
     assert targets.tolist() == [[1.0, 1.0, 1.0]]
 
 
-def test_exact_mc_preserves_telescoping_shaping_for_every_state() -> None:
-    # Potential-shaped rewards telescope to outcome minus the current
-    # potential. At the symmetric opening the potential is zero, so the actor
-    # receives the raw terminal outcome across the complete 719-step horizon.
-    potentials = torch.tensor([[0.2, -0.1, 0.4, 0.3]])
-    outcome = torch.tensor([[-1.0]])
-    rewards = torch.cat(
-        (potentials[:, 1:] - potentials[:, :-1], outcome - potentials[:, -1:]), dim=1
-    )
+def test_exact_mc_preserves_dense_bank_delta_for_every_state() -> None:
+    potentials = torch.tensor([[0.2, -0.1, 0.4, 0.3, 0.6]])
+    rewards = potentials[:, 1:] - potentials[:, :-1]
     valid = torch.ones_like(rewards)
 
     values = torch.zeros_like(rewards)
-    advantages, targets = generalized_advantage_and_targets(rewards, values, valid, torch.ones(1))
-    expected = outcome - potentials
+    advantages, targets = generalized_advantage_and_targets(
+        rewards, values, valid, actor_gae_lambda=0.5
+    )
+    expected = potentials[:, -1:] - potentials[:, :-1]
 
     torch.testing.assert_close(targets, expected)
+    assert not torch.equal(advantages, expected)
+
+
+def test_dense_gae_matches_reference_recurrence_at_scale() -> None:
+    generator = torch.Generator().manual_seed(17)
+    rewards = torch.randn(4, 719, generator=generator)
+    values = torch.randn(4, 719, generator=generator)
+    valid = torch.ones_like(rewards)
+    gamma, actor_gae_lambda = 1.0, DEFAULT_ACTOR_GAE_LAMBDA
+
+    advantages, targets = generalized_advantage_and_targets(
+        rewards,
+        values,
+        valid,
+        actor_gae_lambda=actor_gae_lambda,
+        gamma=gamma,
+    )
+
+    deltas = rewards.clone()
+    deltas[:, :-1] += gamma * values[:, 1:]
+    deltas -= values
+    expected = torch.empty_like(deltas)
+    running = torch.zeros(deltas.size(0))
+    for step in range(deltas.size(1) - 1, -1, -1):
+        running = deltas[:, step] + gamma * actor_gae_lambda * running
+        expected[:, step] = running
+
     torch.testing.assert_close(advantages, expected)
+    expected_targets = torch.empty_like(rewards)
+    running_return = torch.zeros(rewards.size(0))
+    for step in range(rewards.size(1) - 1, -1, -1):
+        running_return = rewards[:, step] + gamma * running_return
+        expected_targets[:, step] = running_return
+    torch.testing.assert_close(targets, expected_targets)
+
+
+def test_actor_gae_and_critic_monte_carlo_targets_are_decoupled() -> None:
+    rewards = torch.tensor([[0.2, -0.1, 0.3]])
+    values = torch.tensor([[0.4, 0.1, -0.2]])
+    valid = torch.ones_like(rewards)
+
+    advantages, targets = generalized_advantage_and_targets(
+        rewards, values, valid, actor_gae_lambda=0.5, gamma=0.9
+    )
+
+    delta_2 = 0.3 - (-0.2)
+    delta_1 = -0.1 + 0.9 * (-0.2) - 0.1
+    delta_0 = 0.2 + 0.9 * 0.1 - 0.4
+    expected_2 = delta_2
+    expected_1 = delta_1 + 0.9 * 0.5 * expected_2
+    expected_0 = delta_0 + 0.9 * 0.5 * expected_1
+    expected_advantages = torch.tensor([[expected_0, expected_1, expected_2]])
+    expected_targets = torch.tensor([[0.2 + 0.9 * (-0.1 + 0.9 * 0.3), -0.1 + 0.9 * 0.3, 0.3]])
+    torch.testing.assert_close(advantages, expected_advantages)
+    torch.testing.assert_close(targets, expected_targets)
+    assert not torch.equal(targets, expected_advantages + values)
+
+
+def test_critic_targets_are_independent_of_actor_lambda_and_old_values() -> None:
+    rewards = torch.tensor([[0.25, -0.4, 0.6], [-0.1, 0.2, -0.3]])
+    valid = torch.ones_like(rewards)
+    first = generalized_advantage_and_targets(
+        rewards,
+        torch.tensor([[10.0, -7.0, 3.0], [4.0, 1.0, -8.0]]),
+        valid,
+        actor_gae_lambda=0.1,
+    )[1]
+    second = generalized_advantage_and_targets(
+        rewards,
+        torch.tensor([[-2.0, 6.0, 9.0], [-5.0, 11.0, 0.5]]),
+        valid,
+        actor_gae_lambda=0.99,
+    )[1]
+
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(
+        first,
+        torch.tensor([[0.45, 0.2, 0.6], [-0.2, -0.1, -0.3]]),
+    )
 
 
 def test_masked_gae_does_not_bootstrap_through_padding() -> None:
@@ -87,11 +196,28 @@ def test_masked_gae_does_not_bootstrap_through_padding() -> None:
     values = torch.tensor([[0.25, 0.5, 99.0], [0.1, 0.2, 0.3]])
     valid = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
 
-    advantages, targets = generalized_advantage_and_targets(rewards, values, valid, torch.ones(2))
+    advantages, targets = generalized_advantage_and_targets(
+        rewards, values, valid, actor_gae_lambda=1.0
+    )
 
     torch.testing.assert_close(targets[0], torch.tensor([1.0, 1.0, 0.0]))
     torch.testing.assert_close(advantages[0], torch.tensor([0.75, 0.5, 0.0]))
     torch.testing.assert_close(targets[1], torch.tensor([-1.0, -1.0, -1.0]))
+
+
+def test_masked_gae_ignores_nonfinite_padding_but_rejects_nonfinite_valid_data() -> None:
+    rewards = torch.tensor([[0.0, 1.0, float("nan")]])
+    values = torch.tensor([[0.25, 0.5, float("inf")]])
+    valid = torch.tensor([[True, True, False]])
+
+    advantages, targets = generalized_advantage_and_targets(
+        rewards, values, valid, actor_gae_lambda=1.0
+    )
+
+    torch.testing.assert_close(advantages, torch.tensor([[0.75, 0.5, 0.0]]))
+    torch.testing.assert_close(targets, torch.tensor([[1.0, 1.0, 0.0]]))
+    with pytest.raises(ValueError, match="valid rewards must be finite"):
+        generalized_advantage_and_targets(rewards, values, torch.ones_like(valid))
 
 
 def test_asymmetric_clipping_leaves_harmful_direction_unclipped() -> None:
@@ -285,12 +411,15 @@ def test_one_vapo_update_is_finite() -> None:
     assert metrics["epochs"] == 1
     assert math.isfinite(metrics["policy_loss"])
     assert 0.0 <= metrics["clip_fraction"] <= 1.0
-    assert metrics["lambda_mean"] == 1.0
+    assert metrics["actor_gae_lambda"] == config.actor_gae_lambda
+    assert metrics["critic_gae_lambda"] == 1.0
+    assert metrics["gamma"] == config.gamma
     value_targets = generalized_advantage_and_targets(
         torch.from_numpy(rollout.rewards),
         torch.from_numpy(rollout.old_values),
         torch.from_numpy(rollout.valid),
-        torch.ones(rollout.trajectories),
+        actor_gae_lambda=config.actor_gae_lambda,
+        gamma=config.gamma,
     )[1]
     valid_targets = value_targets[torch.from_numpy(rollout.valid)]
     assert metrics["value_target_min"] == pytest.approx(float(valid_targets.min()))

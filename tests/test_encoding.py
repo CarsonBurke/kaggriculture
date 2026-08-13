@@ -42,14 +42,31 @@ def test_encoding_shapes_and_viewpoint_symmetry() -> None:
     assert pair_potential(zero, one) == 0.0
 
 
-def test_shaping_telescopes_to_terminal_outcome() -> None:
-    potentials = [0.0, 0.15, -0.2, 0.4]
-    rewards = []
-    for previous, following in pairwise(potentials):
-        rewards.append(shaped_pair_reward(previous, following)[0])
-    rewards.append(shaped_pair_reward(potentials[-1], 0.0, terminal_money_margin=3.0)[0])
+def test_pair_potential_is_exact_relative_bank_percentage() -> None:
+    zero, one = _observations()
+    zero["farms"][0]["money"] = 9000
+    one["farms"][1]["money"] = 3000
+    zero["private"]["shed"]["WHEAT"] = 100
+    one["private"]["shed"]["MILK"] = 100
 
-    assert math.isclose(sum(rewards), 1.0)
+    assert pair_potential(zero, one) == 0.5
+    zero["farms"][0]["money"] = 3000
+    one["farms"][1]["money"] = 9000
+    assert pair_potential(zero, one) == -0.5
+
+    zero["farms"][0]["money"] = 0
+    one["farms"][1]["money"] = 0
+    assert pair_potential(zero, one) == 0.0
+
+
+def test_dense_bank_rewards_telescope_without_a_terminal_override() -> None:
+    potentials = [0.0, 0.15, -0.2, 0.4]
+    rewards = [
+        shaped_pair_reward(previous, following)[0] for previous, following in pairwise(potentials)
+    ]
+
+    assert math.isclose(sum(rewards), potentials[-1] - potentials[0])
+    assert shaped_pair_reward(-0.25, 0.5) == (0.75, -0.75)
 
 
 def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:
