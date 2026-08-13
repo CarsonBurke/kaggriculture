@@ -158,6 +158,18 @@ def categorical_statistics(
     return selected, entropy
 
 
+def categorical_logprob(
+    logits: Tensor,
+    mask: Tensor,
+    actions: Tensor,
+    *,
+    validate_mask: bool = True,
+) -> Tensor:
+    masked = mask_logits(logits, mask, validate=validate_mask)
+    log_probabilities = masked.log_softmax(dim=-1)
+    return log_probabilities.gather(-1, actions.long().unsqueeze(-1)).squeeze(-1)
+
+
 def _sample_numpy_categorical(
     logits: np.ndarray,
     mask: np.ndarray,
@@ -233,6 +245,41 @@ def component_logprobs(
         unit_entropy,
         kind_entropy,
         quantity_entropy,
+    )
+
+
+def component_selected_logprobs(
+    output: ActorOutput,
+    market_quantity_logits: Tensor,
+    unit_actions: Tensor,
+    market_kinds: Tensor,
+    market_quantities: Tensor,
+    unit_masks: Tensor,
+    market_kind_masks: Tensor,
+    market_quantity_masks: Tensor,
+    *,
+    validate_masks: bool = True,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Selected-action log-likelihoods only, skipping the entropy reductions.
+
+    The behavior replay and the parity audit gather one likelihood per
+    component for every valid state and discard entropy, so the entropy
+    branch of `component_logprobs` would spend a softmax-sized reduction per
+    head on the full batch for nothing.
+    """
+    return (
+        categorical_logprob(
+            output.unit_logits, unit_masks, unit_actions, validate_mask=validate_masks
+        ),
+        categorical_logprob(
+            output.market_kind_logits, market_kind_masks, market_kinds, validate_mask=validate_masks
+        ),
+        categorical_logprob(
+            market_quantity_logits,
+            market_quantity_masks,
+            market_quantities,
+            validate_mask=validate_masks,
+        ),
     )
 
 

@@ -14,6 +14,7 @@ from kaggriculture.policy import (
     _sample_numpy_categorical,
     act_batch,
     component_logprobs,
+    component_selected_logprobs,
 )
 
 
@@ -250,3 +251,39 @@ def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
         policy_step.factors.market_quantity_logprobs[active],
         atol=2e-6,
     )
+
+
+def test_component_selected_logprobs_matches_component_logprobs() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 41})
+    observations = [row.observation for row in environment.reset(2)]
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(config)
+    policy_step = act_batch(actor, observations, deterministic=True)
+    encoded = policy_step.encoded
+    with torch.inference_mode():
+        output = actor(
+            torch.from_numpy(np.stack([row.board for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.global_features for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.units for row in encoded])).float(),
+            torch.from_numpy(np.stack([row.unit_positions for row in encoded])).long(),
+        )
+        kinds = torch.from_numpy(policy_step.factors.market_kinds)
+        arguments = (
+            output,
+            actor.quantity_logits(output.market_quantity_context, kinds),
+            torch.from_numpy(policy_step.factors.unit_actions),
+            kinds,
+            torch.from_numpy(policy_step.factors.market_quantities),
+            torch.from_numpy(policy_step.factors.unit_masks),
+            torch.from_numpy(policy_step.factors.market_kind_masks),
+            torch.from_numpy(policy_step.factors.market_quantity_masks),
+        )
+        full = component_logprobs(*arguments)
+        selected = component_selected_logprobs(*arguments)
+
+    # The entropy-free path must be the same masking/log_softmax/gather ops,
+    # so it agrees bit-for-bit with the full statistics on every head.
+    for lean, reference in zip(selected, full[:3], strict=True):
+        torch.testing.assert_close(lean, reference, rtol=0.0, atol=0.0)
