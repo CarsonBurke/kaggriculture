@@ -366,18 +366,62 @@ def test_update_replay_parity_gates_the_update_path_forward() -> None:
         update_replay_parity(actor, rollout, minibatch_size=0)
 
 
-def test_over_target_pre_step_kl_does_not_update_actor() -> None:
+def test_update_ratio_is_pinned_to_one_regardless_of_stored_likelihoods() -> None:
+    """The behavior replay makes the update immune to sampling-path numerics.
+
+    Corrupting the rollout's stored likelihoods must not disturb the update:
+    behavior likelihoods are recomputed through the update-path forward, so
+    the first minibatch's importance ratio is exactly one at unchanged
+    weights (identical eager function on CPU) and the actor still trains.
+    """
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(actor, games=1, seed_start=95, episode_steps=3, sampling_seed=10)
+    rollout.old_unit_logprobs[...] -= 3.0
+    rollout.old_market_kind_logprobs[...] -= 3.0
+    rollout.old_market_quantity_logprobs[...] -= 3.0
+    config = VapoConfig(epochs=1, minibatch_size=1 << 12, target_kl=1e-6, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(11),
+    )
+
+    # One minibatch covers the whole rollout, so the sole actor update ran at
+    # unchanged weights: any nonzero KL would be numerics, and the corrupted
+    # stored likelihoods would have produced KL near e^3.
+    assert metrics["first_minibatch_approx_kl"] == 0.0
+    assert metrics["actor_updates"] == 1
+    assert metrics["kl_early_stop"] == 0
+
+
+def test_over_target_pre_step_kl_does_not_update_actor(monkeypatch) -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
-    # Simulate behavior likelihoods from a stale policy. The unchanged actor is
-    # already far beyond the configured trust region before any optimizer step.
-    rollout.old_unit_logprobs[...] -= 1.0
-    rollout.old_market_kind_logprobs[...] -= 1.0
-    rollout.old_market_quantity_logprobs[...] -= 1.0
+    # Simulate a behavior policy far from the current actor at the interface
+    # where behavior likelihoods now enter the update: the in-update replay.
+    # The unchanged actor is then already beyond the trust region before any
+    # optimizer step.
+    genuine_replay = kaggriculture.vapo.replay_behavior_logprobs
+
+    def stale_replay(*args, **kwargs):
+        replayed = genuine_replay(*args, **kwargs)
+        return {name: values - 1.0 for name, values in replayed.items()}
+
+    monkeypatch.setattr(kaggriculture.vapo, "replay_behavior_logprobs", stale_replay)
     config = VapoConfig(
         epochs=2,
         minibatch_size=8,

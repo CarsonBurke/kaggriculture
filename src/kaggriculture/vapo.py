@@ -15,13 +15,25 @@ from kaggriculture.model import (
     FarmActor,
     distributional_value_loss,
 )
-from kaggriculture.policy import component_logprobs
+from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.rollout import RolloutBatch
 
 VAPO_GAE_ALPHA = 0.05
 COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
 DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (VAPO_GAE_ALPHA * COMPETITION_ACTION_STEPS)
 CRITIC_GAE_LAMBDA = 1.0
+
+# Numerics gates shared by the calibration benchmark, the training launcher's
+# expected configuration, and the production training loop. The sampling-path
+# versus update-replay ratio divergence is irreducible bf16 noise: measured
+# worst cases are 2.35e-2 over 230k production states at initialization and
+# 1.9e-2 across seed, rollout-size, and sharpened-head sweeps, while real
+# staging or precision bugs present orders of magnitude larger, so 5e-2 keeps
+# roughly 2x headroom while spending only a fraction of the [0.8, 1.28] clip
+# band. The first-minibatch KL at unchanged weights measures ~7e-8 under
+# compile with bf16; 1e-4 bounds the ratio-at-one construction with margin.
+MAX_UPDATE_REPLAY_RATIO_ERROR = 5e-2
+MAX_FIRST_MINIBATCH_KL = 1e-4
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,10 @@ class VapoConfig:
     gamma: float = 1.0
     max_gradient_norm: float = 1.0
     target_kl: float = 0.08
+    # BF16 autocast for both update-path forwards. The actor's importance
+    # ratio starts at one because `replay_behavior_logprobs` recomputes the
+    # behavior side through the update path's forward at the same precision;
+    # log_softmax stays fp32 under autocast either way.
     use_bfloat16: bool = True
     # Compile the update-path forward/backward with Inductor. Fusion collapses
     # the launch-bound logprob/surrogate math into a few large kernels while
@@ -135,10 +151,25 @@ def _validate_config(config: VapoConfig) -> None:
 
 
 def _replayed_value_chunk(
-    critic: DistributionalCritic, board: Tensor, critic_features: Tensor
+    critic: DistributionalCritic,
+    board: Tensor,
+    critic_features: Tensor,
+    autocast_enabled: bool,
 ) -> Tensor:
-    """One fp32 critic value forward over a chunk of stored state features."""
-    return critic.value(critic(board.float(), critic_features.float()))
+    """One critic value forward over a chunk of stored state features.
+
+    Runs under the same autocast state as the critic's training minibatches.
+    The values feed only GAE advantages, whose tolerance is far looser than
+    the ~1e-3 value shift BF16 introduces, and `critic.value` reduces the
+    distributional head in fp32 either way.
+    """
+    with torch.autocast(
+        device_type=board.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        critic_logits = critic(board.float(), critic_features.float())
+    return critic.value(critic_logits)
 
 
 @torch.inference_mode()
@@ -153,17 +184,17 @@ def replay_behavior_values(
     # bandwidth-bound without that spike.
     chunk_size: int = 4096,
     compile_model: bool = False,
+    autocast_enabled: bool = False,
 ) -> Tensor:
     """Replay behavior-time value predictions from stored state features.
 
     The critic is untouched between rollout collection and its first
     optimizer step of the update, so replaying the stored features through
-    the FP32 critic reproduces the collection-time predictions without
-    paying one small synchronous critic forward per environment step. Must
-    run before the update mutates the critic. This full-batch pass is half
-    the update's wall clock when run eagerly, so on CUDA it routes through
-    the same Inductor compilation as the rest of the update path; the math
-    stays fp32 and only kernel fusion changes.
+    the critic reproduces the collection-time predictions without paying one
+    small synchronous critic forward per environment step. Must run before
+    the update mutates the critic. This full-batch pass is half the update's
+    wall clock when run eagerly, so on CUDA it routes through the same
+    Inductor compilation and autocast state as the rest of the update path.
     """
     if board.ndim < 1 or board.shape[0] != critic_features.shape[0]:
         raise ValueError("board and critic feature rows must align")
@@ -182,6 +213,7 @@ def replay_behavior_values(
                 critic,
                 board[start : start + chunk_size],
                 critic_features[start : start + chunk_size],
+                autocast_enabled,
             )
             for start in range(0, board.shape[0], chunk_size)
         ]
@@ -310,26 +342,155 @@ def _replayed_component_logprobs(
     unit_masks: Tensor,
     kind_masks: Tensor,
     quantity_masks: Tensor,
+    autocast_enabled: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Replay stored actions through the update-path policy forward.
 
-    This is the exact forward whose likelihoods enter the PPO importance
-    ratios. `update_replay_parity` gates this same code path, so any numeric
-    change here (kernel selection, compilation, precision) is observable as
-    ratio drift at unchanged weights.
+    This defines the current-likelihood side of the PPO importance ratio in
+    every actor minibatch. The behavior side is produced at unchanged weights
+    by `_replayed_selected_logprobs`, which runs the identical forward,
+    masking, fp32 log_softmax, and gather math minus the entropy branch, so
+    the ratio starts at one up to numerics. The residual — separate Inductor
+    graphs when compiled, and minibatch composition that differs by the
+    update loop's shuffle (row counts differ by at most one) — is observed
+    directly by the `first_minibatch_approx_kl` metric and gated at
+    `MAX_FIRST_MINIBATCH_KL`. Autocast keeps log_softmax in fp32 by policy,
+    so the returned log-likelihoods are full precision either way.
     """
-    actor_output = actor(board, global_features, units, positions)
-    return component_logprobs(
-        actor_output,
-        actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
-        unit_actions,
-        market_kinds,
-        market_quantities,
-        unit_masks,
-        kind_masks,
-        quantity_masks,
-        validate_masks=False,
+    with torch.autocast(
+        device_type=board.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        actor_output = actor(board, global_features, units, positions)
+        return component_logprobs(
+            actor_output,
+            actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
+            unit_actions,
+            market_kinds,
+            market_quantities,
+            unit_masks,
+            kind_masks,
+            quantity_masks,
+            validate_masks=False,
+        )
+
+
+def _replayed_selected_logprobs(
+    actor: FarmActor,
+    board: Tensor,
+    global_features: Tensor,
+    units: Tensor,
+    positions: Tensor,
+    unit_actions: Tensor,
+    market_kinds: Tensor,
+    market_quantities: Tensor,
+    unit_masks: Tensor,
+    kind_masks: Tensor,
+    quantity_masks: Tensor,
+    autocast_enabled: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Entropy-free `_replayed_component_logprobs` for full-batch replays.
+
+    The behavior replay and the parity audit sweep every valid state but use
+    only the gathered log-likelihoods, so this variant skips the per-head
+    entropy reductions the minibatch objective needs for its metrics.
+    """
+    with torch.autocast(
+        device_type=board.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        actor_output = actor(board, global_features, units, positions)
+        return component_selected_logprobs(
+            actor_output,
+            actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
+            unit_actions,
+            market_kinds,
+            market_quantities,
+            unit_masks,
+            kind_masks,
+            quantity_masks,
+            validate_masks=False,
+        )
+
+
+@torch.no_grad()
+def replay_behavior_logprobs(
+    actor: FarmActor,
+    staged: dict[str, Tensor],
+    valid_indices: np.ndarray,
+    *,
+    minibatch_size: int,
+    autocast_enabled: bool,
+    compile_model: bool = False,
+) -> dict[str, Tensor]:
+    """Recompute behavior log-likelihoods through the update-path forward.
+
+    The rollout path samples actions from logits produced by a differently
+    compiled (and differently batched) forward, so its recorded likelihoods
+    differ from the update path's by kernel-selection noise. Recomputing them
+    here at unchanged weights, with the update path's forward and logprob
+    math at the update's precision, starts the importance ratio at one up to
+    numerics — which is what makes a reduced-precision update forward legal.
+    (The match is not bit-exact: the update loop shuffles its balanced
+    minibatches so a row's batch size can differ by one, and the compiled
+    replay and minibatch graphs are separate Inductor artifacts. That
+    residual is measured by `first_minibatch_approx_kl` and gated at
+    `MAX_FIRST_MINIBATCH_KL`.) The rollout-vs-update divergence becomes an
+    off-policy sampling bias instead of a ratio error; `update_replay_parity`
+    measures exactly that divergence.
+
+    Must run before the first actor optimizer step. `torch.no_grad` rather
+    than inference mode: the outputs are later gathered inside the autograd
+    minibatch graph, which inference tensors do not permit.
+    """
+    if minibatch_size < 1:
+        raise ValueError("minibatch size must be positive")
+    if valid_indices.size == 0:
+        raise ValueError("rollout contains no valid states")
+    device = staged["board"].device
+    replay = (
+        _cached_update_callable(actor, "_kaggriculture_logprob_replay", _replayed_selected_logprobs)
+        if compile_model and device.type == "cuda"
+        else _replayed_selected_logprobs
     )
+    rows = staged["board"].shape[0]
+    replayed = {
+        "old_unit_logprobs": torch.zeros(
+            (rows, staged["unit_actions"].shape[1]), dtype=torch.float32, device=device
+        ),
+        "old_market_kind_logprobs": torch.zeros(
+            (rows, staged["market_kinds"].shape[1]), dtype=torch.float32, device=device
+        ),
+        "old_market_quantity_logprobs": torch.zeros(
+            (rows, staged["market_quantities"].shape[1]), dtype=torch.float32, device=device
+        ),
+    }
+    ordered = torch.from_numpy(valid_indices).to(device=device)
+    for batch_slice in _balanced_minibatch_slices(valid_indices.size, minibatch_size):
+        indices = ordered[batch_slice]
+        unit_logprobs, kind_logprobs, quantity_logprobs = replay(
+            actor,
+            _batch_tensor(staged["board"], indices, torch.float32),
+            _batch_tensor(staged["global_features"], indices, torch.float32),
+            _batch_tensor(staged["units"], indices, torch.float32),
+            _batch_tensor(staged["unit_positions"], indices, torch.long),
+            _batch_tensor(staged["unit_actions"], indices, torch.long),
+            _batch_tensor(staged["market_kinds"], indices, torch.long),
+            _batch_tensor(staged["market_quantities"], indices, torch.long),
+            _batch_tensor(staged["unit_masks"], indices, torch.bool),
+            _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+            _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+            autocast_enabled,
+        )
+        for name, values in (
+            ("old_unit_logprobs", unit_logprobs),
+            ("old_market_kind_logprobs", kind_logprobs),
+            ("old_market_quantity_logprobs", quantity_logprobs),
+        ):
+            replayed[name].index_copy_(0, indices, values.float())
+    return replayed
 
 
 def _cached_update_callable(module: torch.nn.Module, attribute: str, function):
@@ -371,6 +532,7 @@ def _actor_minibatch_terms(
     advantages: Tensor,
     clip_low: float,
     clip_high: float,
+    autocast_enabled: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """One actor minibatch: policy replay plus clipped surrogate reductions.
 
@@ -397,6 +559,7 @@ def _actor_minibatch_terms(
         unit_masks,
         kind_masks,
         quantity_masks,
+        autocast_enabled,
     )
     policy_sum = torch.zeros((), device=board.device)
     entropy_sum = torch.zeros((), device=board.device)
@@ -451,14 +614,19 @@ def update_replay_parity(
     *,
     minibatch_size: int,
     compile_model: bool = False,
+    autocast_enabled: bool = False,
 ) -> dict[str, float | int]:
-    """Measure importance-ratio drift of the update path at unchanged weights.
+    """Measure rollout-sampling versus update-replay likelihood divergence.
 
     Runs the same staging, minibatch slicing, and policy forward as
-    `update_vapo` and compares the replayed component log-likelihoods with the
-    stored behavior likelihoods. Called before the first optimizer step, every
-    deviation from ratio one is pure numerics: it bounds the false clipping
-    and KL pressure that the update path itself injects into the objective.
+    `update_vapo`'s behavior replay and compares its log-likelihoods with the
+    likelihoods the rollout sampler actually drew actions from. Since
+    `replay_behavior_logprobs` pins the update's importance ratio to one at
+    unchanged weights by construction, this difference no longer enters the
+    objective as ratio error; it instead bounds the off-policy sampling bias
+    between the distribution actions were drawn from and the distribution the
+    gradient assumes. Pass the production `use_bfloat16` flag so the audited
+    path is the deployed one.
     """
     if minibatch_size < 1:
         raise ValueError("minibatch size must be positive")
@@ -491,11 +659,9 @@ def update_replay_parity(
     ordered = torch.from_numpy(valid_indices).to(device=device)
     compile_enabled = compile_model and device.type == "cuda"
     replay = (
-        _cached_update_callable(
-            actor, "_kaggriculture_parity_forward", _replayed_component_logprobs
-        )
+        _cached_update_callable(actor, "_kaggriculture_logprob_replay", _replayed_selected_logprobs)
         if compile_enabled
-        else _replayed_component_logprobs
+        else _replayed_selected_logprobs
     )
     maximum_logprob_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
     maximum_ratio_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
@@ -515,6 +681,7 @@ def update_replay_parity(
             _batch_tensor(staged["unit_masks"], indices, torch.bool),
             _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
             _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+            autocast_enabled,
         )
         for name, new_logprobs, old_key, active_key in (
             ("unit", replayed[0], "old_unit_logprobs", "unit_active"),
@@ -665,9 +832,6 @@ def update_vapo(
         "unit_active": _stage_tensor(rollout.unit_active, device),
         "market_active": _stage_tensor(rollout.market_active, device),
         "market_quantity_active": _stage_tensor(rollout.market_quantity_active, device),
-        "old_unit_logprobs": _stage_tensor(rollout.old_unit_logprobs, device),
-        "old_market_kind_logprobs": _stage_tensor(rollout.old_market_kind_logprobs, device),
-        "old_market_quantity_logprobs": _stage_tensor(rollout.old_market_quantity_logprobs, device),
     }
     # Stored categorical support is validated in one staged pass; repeated
     # NumPy sweeps over the multi-gigabyte host rollout would stall the update.
@@ -675,16 +839,34 @@ def update_vapo(
     # Behavior values for GAE are replayed here from the staged features at
     # full batch instead of one small synchronous critic forward per rollout
     # step. The critic still holds exactly the behavior weights at this point.
+    autocast_enabled = config.use_bfloat16 and device.type == "cuda"
+    compile_enabled = config.compile_update and device.type == "cuda"
     behavior_values = (
         replay_behavior_values(
             critic,
             staged["board"],
             staged["critic_features"],
             compile_model=config.compile_update,
+            autocast_enabled=autocast_enabled,
         )
         .cpu()
         .numpy()
         .reshape(rollout.rewards.shape)
+    )
+    # Behavior likelihoods are recomputed through the update path itself (same
+    # callable, precision, and minibatch partitioning as the loop below), not
+    # taken from the rollout's sampling-path logits. The stored rollout
+    # likelihoods remain the sampling ground truth that `update_replay_parity`
+    # audits this replay against.
+    staged.update(
+        replay_behavior_logprobs(
+            actor,
+            staged,
+            valid_indices,
+            minibatch_size=config.minibatch_size,
+            autocast_enabled=autocast_enabled,
+            compile_model=config.compile_update,
+        )
     )
     actor.train()
     critic.train()
@@ -726,8 +908,7 @@ def update_vapo(
     actor_updates = 0
     completed_epochs = 0
     max_approx_kl = 0.0
-    autocast_enabled = config.use_bfloat16 and device.type == "cuda"
-    compile_enabled = config.compile_update and device.type == "cuda"
+    first_minibatch_kl = 0.0
     actor_terms = (
         _cached_update_callable(actor, "_kaggriculture_update_terms", _actor_minibatch_terms)
         if compile_enabled
@@ -786,9 +967,11 @@ def update_vapo(
                 advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
                 actor_optimizer.zero_grad(set_to_none=True)
-                # Behavior likelihoods are collected in FP32. Replaying the
-                # actor under BF16 changes logits at unchanged weights, creating
-                # a false importance ratio before the first optimizer step.
+                # Behavior likelihoods were replayed above at unchanged
+                # weights through the update path's logprob math, so the ratio
+                # starts at one up to numerics (separate compiled graphs and
+                # shuffle-dependent batch composition); the first-minibatch KL
+                # metric observes that residual.
                 policy_sum, entropy_sum, kl_sum, clipped_sum = actor_terms(
                     actor,
                     board,
@@ -810,6 +993,7 @@ def update_vapo(
                     advantages,
                     config.clip_low,
                     config.clip_high,
+                    autocast_enabled,
                 )
                 batch_kl = kl_sum.detach().double() / component_count
                 policy_loss = -policy_sum / component_count
@@ -849,6 +1033,11 @@ def update_vapo(
                 guard_event.synchronize()
             batch_kl_value, policy_loss_value, value_loss_value = guard_host.tolist()
             if run_actor:
+                if updates == 0:
+                    # At unchanged weights this KL is pure numerics: the drift
+                    # between the behavior replay above and this minibatch
+                    # forward.
+                    first_minibatch_kl = batch_kl_value
                 max_approx_kl = max(max_approx_kl, batch_kl_value)
                 # Non-finite losses abort training; the already-queued backward
                 # of a poisoned minibatch is never observed past this raise.
@@ -896,6 +1085,7 @@ def update_vapo(
         "entropy": float(totals["entropy"] / max(1, total_components)),
         "approx_kl": float(totals["approx_kl"] / max(1, total_components)),
         "max_approx_kl": max_approx_kl,
+        "first_minibatch_approx_kl": first_minibatch_kl,
         "kl_early_stop": int(stop_for_kl),
         "clip_fraction": float(totals["clip_fraction"] / max(1, total_components)),
         "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, actor_states)),
