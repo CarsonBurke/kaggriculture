@@ -116,6 +116,17 @@ class ResidualBlock(nn.Module):
         return inputs + self.layers(inputs)
 
 
+def _linear_upsample_weights(input_size: int, output_size: int) -> Tensor:
+    """Interpolation matrix equal to align_corners=False linear resampling.
+
+    Derived by resampling the identity through F.interpolate itself, so the
+    weights match ATen's boundary handling exactly rather than re-deriving it.
+    """
+    identity = torch.eye(input_size).unsqueeze(1)
+    resampled = F.interpolate(identity, size=output_size, mode="linear", align_corners=False)
+    return resampled.squeeze(1).T.contiguous()
+
+
 class SpatialUNet(nn.Module):
     """A compact two-resolution U-Net that retains one token per board tile."""
 
@@ -144,16 +155,22 @@ class SpatialUNet(nn.Module):
             ReluSquared(),
             nn.Conv2d(width, config.model_dim, 1),
         )
+        low_size = (BOARD_SIZE + 1) // 2
+        self.register_buffer(
+            "upsample_weights", _linear_upsample_weights(low_size, BOARD_SIZE), persistent=False
+        )
 
     def forward(self, board: Tensor) -> Tensor:
         high_resolution = self.encoder(self.input(board))
         low_resolution = self.bottleneck(self.down(high_resolution))
-        upsampled = F.interpolate(
-            low_resolution,
-            size=high_resolution.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+        # Bilinear upsampling as two separable matmuls. ATen's NCHW
+        # upsample_bilinear2d kernel parallelizes only over output pixels and is
+        # two orders of magnitude slower than these GEMMs at this shape. The
+        # matmul form matches F.interpolate to fp32 rounding (~5e-7) at
+        # "highest" matmul precision; under the deployed TF32 setting the GEMM
+        # rounds to ~2e-3 on unit-scale activations, the same order as the
+        # TF32 noise the network's other matmuls already carry.
+        upsampled = self.upsample_weights @ low_resolution @ self.upsample_weights.T
         decoded = (self.up_projection(upsampled) + high_resolution) * math.sqrt(0.5)
         return self.output(self.decoder(decoded))
 
@@ -202,22 +219,37 @@ class AxialRotaryEmbedding(nn.Module):
         real, imaginary = pairs.unbind(dim=-1)
         return torch.stack((-imaginary, real), dim=-1).flatten(-2)
 
-    def forward(self, query: Tensor, key: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
-        if query.shape != key.shape:
-            raise ValueError("query and key shapes must match for self-attention RoPE")
-        if positions.shape != (query.shape[0], query.shape[-2], 2):
+    def rotation(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+        """Gather per-token cos/sin tables once for reuse by every layer.
+
+        The gather output depends only on token positions, which are identical
+        across all transformer layers, so hoisting it out of the attention
+        modules removes the layer-count multiple of both the gather kernels and
+        their saved activations.
+        """
+        if positions.ndim != 3 or positions.shape[-1] != 2:
             raise ValueError("RoPE positions must have shape [batch, tokens, 2]")
         coordinates = positions.long().clamp(0, self.board_size - 1)
         indices = coordinates[..., 1] * self.board_size + coordinates[..., 0]
-        cosine = self.cosine.index_select(0, indices.reshape(-1)).view(
-            query.shape[0], 1, query.shape[-2], query.shape[-1]
-        )
+        batch, tokens = indices.shape
+        cosine = self.cosine.index_select(0, indices.reshape(-1)).view(batch, 1, tokens, -1)
         sine = self.sine.index_select(0, indices.reshape(-1)).view_as(cosine)
+        return cosine, sine
+
+    @classmethod
+    def apply_rotation(
+        cls, query: Tensor, key: Tensor, rotation: tuple[Tensor, Tensor]
+    ) -> tuple[Tensor, Tensor]:
+        if query.shape != key.shape:
+            raise ValueError("query and key shapes must match for self-attention RoPE")
+        cosine, sine = rotation
+        if cosine.shape[0] != query.shape[0] or cosine.shape[-2:] != query.shape[-2:]:
+            raise ValueError("RoPE rotation does not match the query batch or token layout")
         cosine = cosine.to(dtype=query.dtype)
         sine = sine.to(dtype=query.dtype)
         return (
-            query * cosine + self._rotate_pairs(query) * sine,
-            key * cosine + self._rotate_pairs(key) * sine,
+            query * cosine + cls._rotate_pairs(query) * sine,
+            key * cosine + cls._rotate_pairs(key) * sine,
         )
 
 
@@ -238,16 +270,15 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(config.model_dim, 3 * config.model_dim, bias=False)
         self.query_norm = nn.RMSNorm(self.head_dim)
         self.key_norm = nn.RMSNorm(self.head_dim)
-        self.rope = AxialRotaryEmbedding(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
 
-    def forward(self, inputs: Tensor, positions: Tensor) -> Tensor:
+    def forward(self, inputs: Tensor, rotation: tuple[Tensor, Tensor]) -> Tensor:
         batch, tokens, width = inputs.shape
         qkv = self.qkv(inputs).view(batch, tokens, 3, self.heads, self.head_dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
         query = self.query_norm(query)
         key = self.key_norm(key)
-        query, key = self.rope(query, key, positions)
+        query, key = AxialRotaryEmbedding.apply_rotation(query, key, rotation)
         query, key, value = _sdpa_inputs(query, key, value)
         # Inactive unit tokens are explicitly zeroed at every block boundary.
         # Omitting an attention mask keeps this static-shape call Flash-eligible.
@@ -279,11 +310,11 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.model_dim)
         self.ffn = ReluSquaredFeedForward(config)
 
-    def forward(self, inputs: Tensor, positions: Tensor, valid: Tensor) -> Tensor:
+    def forward(self, inputs: Tensor, rotation: tuple[Tensor, Tensor], valid: Tensor) -> Tensor:
         hidden = torch.where(valid, inputs, 0.0)
         hidden = torch.where(
             valid,
-            hidden + self.attention(self.attention_norm(hidden), positions),
+            hidden + self.attention(self.attention_norm(hidden), rotation),
             0.0,
         )
         return torch.where(valid, hidden + self.ffn(self.ffn_norm(hidden)), 0.0)
@@ -295,21 +326,23 @@ class EntityTransformer(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         side_depth = config.transformer_layers // 2
+        self.rope = AxialRotaryEmbedding(config.model_dim // config.attention_heads)
         self.encoder = nn.ModuleList(TransformerBlock(config) for _ in range(side_depth))
         self.bottleneck = TransformerBlock(config)
         self.decoder = nn.ModuleList(TransformerBlock(config) for _ in range(side_depth))
         self.output_norm = nn.RMSNorm(config.model_dim)
 
     def forward(self, inputs: Tensor, positions: Tensor, valid: Tensor) -> Tensor:
+        rotation = self.rope.rotation(positions)
         hidden = torch.where(valid, inputs, 0.0)
         skips: list[Tensor] = []
         for block in self.encoder:
-            hidden = block(hidden, positions, valid)
+            hidden = block(hidden, rotation, valid)
             skips.append(hidden)
-        hidden = self.bottleneck(hidden, positions, valid)
+        hidden = self.bottleneck(hidden, rotation, valid)
         for block, skip in zip(self.decoder, reversed(skips), strict=True):
             hidden = torch.where(valid, (hidden + skip) * math.sqrt(0.5), 0.0)
-            hidden = block(hidden, positions, valid)
+            hidden = block(hidden, rotation, valid)
         return torch.where(valid, self.output_norm(hidden), 0.0)
 
 

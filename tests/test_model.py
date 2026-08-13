@@ -13,7 +13,7 @@ from kaggriculture.actions import (
     MarketKind,
     UnitAction,
 )
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import BOARD_SIZE, MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
@@ -26,6 +26,7 @@ from kaggriculture.model import (
     FarmActor,
     ModelConfig,
     SelfAttention,
+    SpatialUNet,
     distributional_value_loss,
     hl_gauss_value_targets,
 )
@@ -136,7 +137,8 @@ def test_axial_rope_rotates_each_coordinate_axis_independently() -> None:
     query = torch.ones(1, 1, 3, 8)
     positions = torch.tensor([[[0, 0], [1, 0], [0, 1]]])
 
-    rotated_query, rotated_key = rope(query, query.clone(), positions)
+    rotation = rope.rotation(positions)
+    rotated_query, rotated_key = AxialRotaryEmbedding.apply_rotation(query, query.clone(), rotation)
 
     torch.testing.assert_close(rotated_query, rotated_key)
     torch.testing.assert_close(rotated_query[..., 0, :], query[..., 0, :])
@@ -161,8 +163,9 @@ def test_attention_uses_unmasked_deterministic_sdpa(
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
     inputs = torch.randn(2, 5, 16)
     positions = torch.zeros(2, 5, 2, dtype=torch.long)
+    rotation = AxialRotaryEmbedding(head_dim=8).rotation(positions)
 
-    output = attention(inputs, positions)
+    output = attention(inputs, rotation)
 
     assert output.shape == inputs.shape
     assert captured == {
@@ -255,6 +258,27 @@ def test_non_multiple_of_eight_cnn_width_is_supported() -> None:
 
     assert actor.spatial.output[0].num_groups == 5
     assert critic.spatial.output[0].num_groups == 5
+
+
+def test_separable_upsample_matches_bilinear_interpolation() -> None:
+    unet = SpatialUNet(_small_config())
+    low_size = (BOARD_SIZE + 1) // 2
+    low_resolution = torch.randn(4, 6, low_size, low_size)
+
+    reference = torch.nn.functional.interpolate(
+        low_resolution,
+        size=(BOARD_SIZE, BOARD_SIZE),
+        mode="bilinear",
+        align_corners=False,
+    )
+    upsampled = unet.upsample_weights @ low_resolution @ unet.upsample_weights.T
+
+    assert torch.allclose(upsampled, reference, atol=2e-6, rtol=0.0)
+    # Interpolation weights form a partition of unity, so constants are exact.
+    assert torch.allclose(unet.upsample_weights.sum(dim=1), torch.ones(BOARD_SIZE))
+    # The buffer must stay out of checkpoints to keep the format unchanged.
+    assert "upsample_weights" not in unet.state_dict()
+    assert "spatial.upsample_weights" not in FarmActor(_small_config()).state_dict()
 
 
 def test_initial_policy_prior_reaches_productive_actions_without_destroying_investments() -> None:
