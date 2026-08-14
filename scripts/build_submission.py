@@ -28,6 +28,9 @@ PACKAGE_FILES = (
     "model.py",
     "policy.py",
     "provenance.py",
+    "registry.py",
+    "structured.py",
+    "tokens.py",
 )
 MAIN = '''"""Kaggriculture VAPO submission entrypoint."""
 from pathlib import Path

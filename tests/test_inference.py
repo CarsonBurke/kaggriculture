@@ -14,7 +14,7 @@ from kaggriculture.actions import MarketKind
 from kaggriculture.inference import (
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
-    LEGACY_CHECKPOINT_FORMAT_VERSION,
+    LEGACY_CHECKPOINT_FORMAT_VERSIONS,
     actor_artifact_from_checkpoint,
     load_actor_artifact,
 )
@@ -26,7 +26,7 @@ from kaggriculture.provenance import run_provenance_from_decision, source_identi
     "checkpoint_version",
     [
         ACTOR_ARTIFACT_FORMAT_VERSION,
-        LEGACY_CHECKPOINT_FORMAT_VERSION,
+        *sorted(LEGACY_CHECKPOINT_FORMAT_VERSIONS),
         CHECKPOINT_FORMAT_VERSION,
     ],
 )
@@ -57,7 +57,7 @@ def test_actor_artifact_round_trip(tmp_path: Path, checkpoint_version: int) -> N
 
 @pytest.mark.parametrize(
     "checkpoint_version",
-    [LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION],
+    [*sorted(LEGACY_CHECKPOINT_FORMAT_VERSIONS), CHECKPOINT_FORMAT_VERSION],
 )
 def test_full_checkpoint_loads_directly_as_actor(tmp_path: Path, checkpoint_version: int) -> None:
     config = ModelConfig(
@@ -198,6 +198,9 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/model.py",
         "kaggriculture/policy.py",
         "kaggriculture/provenance.py",
+        "kaggriculture/registry.py",
+        "kaggriculture/structured.py",
+        "kaggriculture/tokens.py",
     }
     with tarfile.open(archive, "r:gz") as bundle:
         assert set(bundle.getnames()) == required

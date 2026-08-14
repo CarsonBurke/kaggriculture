@@ -15,16 +15,26 @@ import torch
 
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
+from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
+from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
+from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.vapo import VapoConfig
 
-CHECKPOINT_FORMAT_VERSION = 8
+AnyActor = FarmActor | StructuredActor
+AnyCritic = DistributionalCritic | StructuredCritic
+AnyModelConfig = ModelConfig | StructuredConfig
 
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
-    """Reject checkpoints from incompatible model and action schemas."""
+    """Reject checkpoints from incompatible model and action schemas.
+
+    Resume demands the current format exactly — a stale checkpoint must fail
+    with a format error, not a downstream schema error. Actor-only export in
+    inference.py separately accepts the legacy read-compatible versions.
+    """
     version = payload.get("format_version")
     if version != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(
@@ -53,10 +63,10 @@ def rollout_diagnostics(rollout: RolloutBatch) -> dict[str, float | int]:
     market_quantities = rollout.market_quantities[active_quantities]
     return {
         "rollout_trajectories": rollout.trajectories,
-        "rollout_states": rollout.states,
+        "rollout_states": rollout.state_count,
         "rollout_horizon": rollout.horizon,
         "rollout_seconds": rollout.elapsed_seconds,
-        "rollout_states_per_second": rollout.states / max(rollout.elapsed_seconds, 1e-9),
+        "rollout_states_per_second": rollout.state_count / max(rollout.elapsed_seconds, 1e-9),
         "rollout_entropy": rollout.mean_entropy,
         "money_mean": float(rollout.final_money.mean()),
         "money_median": float(np.median(rollout.final_money)),
@@ -171,7 +181,7 @@ def checkpoint_payload(
     critic_state: dict[str, Any],
     actor_optimizer_state: dict[str, Any],
     critic_optimizer_state: dict[str, Any],
-    model_config: ModelConfig,
+    model_config: AnyModelConfig,
     vapo_config: VapoConfig,
     iteration: int,
     next_seed: int,
@@ -182,6 +192,8 @@ def checkpoint_payload(
     training_rng_state: dict[str, Any] | None = None,
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
+    league_score_rates: dict[int, float] | None = None,
+    initial_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
     normalized_source_identity = validate_source_identity(source_identity)
@@ -203,6 +215,7 @@ def checkpoint_payload(
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
         "next_seed": next_seed,
+        "architecture": architecture_of_config(model_config).name,
         "model_config": model_config.to_dict(),
         "vapo_config": asdict(vapo_config),
         "actor": actor_state,
@@ -214,6 +227,14 @@ def checkpoint_payload(
         "training_rng": training_rng_state,
         "training_data_config": training_data_config,
         "league_snapshot_manifest": league_snapshot_manifest,
+        # PFSP opponent estimates are part of the training state: without
+        # them a resume replays retired opponents and perturbs the RNG
+        # stream that opponent selection consumes.
+        "league_score_rates": league_score_rates,
+        # Warm-start provenance travels with the run: opponent selection
+        # keeps the iteration-0 league snapshot eligible only when it is a
+        # pretrained baseline, and a resume must preserve that decision.
+        "initial_actor": initial_actor,
         "source_identity": normalized_source_identity,
         "run_provenance": normalized_run_provenance,
     }
@@ -237,11 +258,11 @@ def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
 def save_checkpoint(
     path: Path,
     *,
-    actor: FarmActor,
-    critic: DistributionalCritic,
+    actor: AnyActor,
+    critic: AnyCritic,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
-    model_config: ModelConfig,
+    model_config: AnyModelConfig,
     vapo_config: VapoConfig,
     iteration: int,
     next_seed: int,
@@ -251,6 +272,8 @@ def save_checkpoint(
     training_rng_state: dict[str, Any] | None = None,
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
+    league_score_rates: dict[int, float] | None = None,
+    initial_actor: dict[str, Any] | None = None,
 ) -> None:
     payload = checkpoint_payload(
         actor_state=actor.state_dict(),
@@ -268,14 +291,16 @@ def save_checkpoint(
         training_rng_state=training_rng_state,
         training_data_config=training_data_config,
         league_snapshot_manifest=league_snapshot_manifest,
+        league_score_rates=league_score_rates,
+        initial_actor=initial_actor,
     )
     write_checkpoint(path, payload)
 
 
 def load_checkpoint(
     path: Path,
-    actor: FarmActor,
-    critic: DistributionalCritic,
+    actor: AnyActor,
+    critic: AnyCritic,
     actor_optimizer: torch.optim.Optimizer | None = None,
     critic_optimizer: torch.optim.Optimizer | None = None,
     *,
@@ -283,6 +308,13 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location=device, weights_only=False)
     require_checkpoint_format(payload)
+    # Validate the model identity before mutating anything: a mismatched
+    # checkpoint must fail with these messages, not with a strict-loading
+    # key dump halfway through restoring the actor.
+    if resolve_architecture(payload).name != architecture_of(actor).name:
+        raise ValueError("checkpoint architecture does not match the constructed models")
+    if payload["model_config"] != actor.config.to_dict():
+        raise ValueError("checkpoint model configuration does not match the constructed models")
     actor.load_state_dict(payload["actor"])
     critic.load_state_dict(payload["critic"])
     if actor_optimizer is not None:

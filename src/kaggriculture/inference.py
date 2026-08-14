@@ -7,20 +7,24 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 
-from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import act_batch
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
+from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
-LEGACY_CHECKPOINT_FORMAT_VERSION = 7
-CHECKPOINT_FORMAT_VERSION = 8
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset(
-    (ACTOR_ARTIFACT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION)
-)
-SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS = frozenset(
-    (ACTOR_ARTIFACT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION, CHECKPOINT_FORMAT_VERSION)
-)
+# Version 9 added required PFSP league score-rate resume state, the
+# critic_epochs knob, and the architecture tag. Resume (training.py) demands
+# the current version exactly; actor export stays readable across the legacy
+# versions because their actor/model_config/provenance schema is unchanged.
+CHECKPOINT_FORMAT_VERSION = 9
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8))
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
+    ACTOR_ARTIFACT_FORMAT_VERSION,
+    CHECKPOINT_FORMAT_VERSION,
+}
+SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS = SUPPORTED_CHECKPOINT_FORMAT_VERSIONS
 
 
 def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +42,7 @@ def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]
         raise ValueError("checkpoint run provenance source does not match source identity")
     return {
         "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+        "architecture": resolve_architecture(checkpoint).name,
         "model_config": checkpoint["model_config"],
         "actor": checkpoint["actor"],
         "iteration": int(checkpoint.get("iteration", 0)),
@@ -49,7 +54,7 @@ def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]
 
 def load_actor_artifact(
     path: Path, device: torch.device | str = "cpu"
-) -> tuple[FarmActor, dict[str, Any]]:
+) -> tuple[nn.Module, dict[str, Any]]:
     payload = torch.load(path, map_location=device, weights_only=False)
     version = payload.get("format_version")
     if version not in SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS:
@@ -61,8 +66,7 @@ def load_actor_artifact(
     run_provenance = validate_run_provenance(payload.get("run_provenance"))
     if run_provenance is not None and run_provenance["source_identity"] != identity:
         raise ValueError("actor artifact run provenance source does not match source identity")
-    config = ModelConfig(**payload["model_config"])
-    actor = FarmActor(config).to(device)
+    actor = resolve_architecture(payload).build_actor(payload["model_config"]).to(device)
     actor.load_state_dict(payload["actor"])
     actor.eval()
     return actor, payload

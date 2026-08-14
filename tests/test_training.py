@@ -45,6 +45,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
         training_rng_state=generator.bit_generator.state,
         training_data_config={"games": 112},
         league_snapshot_manifest={0: "a" * 64, 3: "b" * 64},
+        league_score_rates={1: 0.5, 3: 0.75},
     )
     expected = generator.random(8)
 
@@ -64,11 +65,12 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert payload["next_seed"] == 41
     assert payload["training_data_config"] == {"games": 112}
     assert payload["league_snapshot_manifest"] == {0: "a" * 64, 3: "b" * 64}
+    assert payload["league_score_rates"] == {1: 0.5, 3: 0.75}
     assert payload["source_identity"] == source_identity()
     assert restored.random(8).tolist() == expected.tolist()
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)

@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import file_digest
@@ -16,7 +16,17 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.registry import (
+    Architecture,
+    architecture_of_config,
+    resolve_architecture,
+)
+from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+
+AnyActor = FarmActor | StructuredActor
+AnyCritic = DistributionalCritic | StructuredCritic
+AnyModelConfig = ModelConfig | StructuredConfig
 
 LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
 _SNAPSHOT_NAME = re.compile(r"league-actor-(\d{8})\.pt")
@@ -32,7 +42,7 @@ class SnapshotRef:
 @dataclass(frozen=True)
 class SnapshotSelection:
     ref: SnapshotRef
-    category: Literal["initial", "active", "historical"]
+    category: Literal["active", "historical"]
 
 
 def _snapshot_path(directory: Path, iteration: int) -> Path:
@@ -43,8 +53,8 @@ def _snapshot_path(directory: Path, iteration: int) -> Path:
     return directory / f"league-actor-{iteration:08d}.pt"
 
 
-def _model_config_dict(config: ModelConfig | dict[str, Any]) -> dict[str, Any]:
-    return config.to_dict() if isinstance(config, ModelConfig) else dict(config)
+def _model_config_dict(config: AnyModelConfig | dict[str, Any]) -> dict[str, Any]:
+    return dict(config) if isinstance(config, dict) else config.to_dict()
 
 
 def _load_payload(path: Path) -> dict[str, Any]:
@@ -53,13 +63,17 @@ def _load_payload(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError(f"league snapshot is not a dictionary: {path}")
-    expected_keys = {"format_version", "iteration", "model_config", "actor"}
-    if set(payload) != expected_keys:
-        missing = sorted(expected_keys - set(payload))
-        unexpected = sorted(set(payload) - expected_keys)
+    # Snapshots written before the architecture registry carry no tag and are
+    # all convolutional entity transformers, matching the registry's default.
+    required_keys = {"format_version", "iteration", "model_config", "actor"}
+    if not required_keys <= set(payload) or set(payload) - required_keys - {"architecture"}:
+        missing = sorted(required_keys - set(payload))
+        unexpected = sorted(set(payload) - required_keys - {"architecture"})
         raise ValueError(
             f"invalid league snapshot schema at {path}: missing={missing}, unexpected={unexpected}"
         )
+    if "architecture" in payload and type(payload["architecture"]) is not str:
+        raise ValueError(f"league snapshot has an invalid architecture tag: {path}")
     if (
         type(payload["format_version"]) is not int
         or payload["format_version"] != LEAGUE_SNAPSHOT_FORMAT_VERSION
@@ -73,7 +87,11 @@ def _load_payload(path: Path) -> dict[str, Any]:
         raise ValueError(f"league snapshot has invalid iteration: {path}")
     if not isinstance(payload["model_config"], dict) or not isinstance(payload["actor"], dict):
         raise ValueError(f"league snapshot has invalid model metadata or actor state: {path}")
-    expected_config = ModelConfig().to_dict()
+    try:
+        architecture = resolve_architecture(payload)
+    except ValueError as error:
+        raise ValueError(f"league snapshot has an unknown architecture: {path}") from error
+    expected_config = architecture.config_class().to_dict()
     if set(payload["model_config"]) != set(expected_config) or any(
         type(payload["model_config"][name]) is not type(default)
         for name, default in expected_config.items()
@@ -94,16 +112,20 @@ def _validate_canonical_filename(path: Path, iteration: int) -> None:
 
 
 def _matches_actor_state(
-    payload: dict[str, Any], config: dict[str, Any], state: dict[str, torch.Tensor]
+    payload: dict[str, Any],
+    architecture: Architecture,
+    config: dict[str, Any],
+    state: dict[str, torch.Tensor],
 ) -> bool:
     return (
-        payload["model_config"] == config
+        resolve_architecture(payload).name == architecture.name
+        and payload["model_config"] == config
         and payload["actor"].keys() == state.keys()
         and all(torch.equal(payload["actor"][name], value) for name, value in state.items())
     )
 
 
-def save_actor_snapshot(directory: Path, actor: FarmActor, iteration: int) -> SnapshotRef:
+def save_actor_snapshot(directory: Path, actor: AnyActor, iteration: int) -> SnapshotRef:
     """Atomically save one immutable CPU actor snapshot.
 
     Repeating the exact same save is idempotent. Reusing an iteration for
@@ -115,7 +137,7 @@ def save_actor_snapshot(directory: Path, actor: FarmActor, iteration: int) -> Sn
 
 def save_actor_state_snapshot(
     directory: Path,
-    model_config: ModelConfig,
+    model_config: AnyModelConfig,
     state: dict[str, torch.Tensor],
     iteration: int,
 ) -> SnapshotRef:
@@ -123,11 +145,12 @@ def save_actor_state_snapshot(
     directory = Path(directory)
     path = _snapshot_path(directory, iteration)
     state = {name: value.detach().cpu() for name, value in state.items()}
+    architecture = architecture_of_config(model_config)
     config = _model_config_dict(model_config)
     if path.exists():
         existing = _load_payload(path)
         _validate_canonical_filename(path, existing["iteration"])
-        if not _matches_actor_state(existing, config, state):
+        if not _matches_actor_state(existing, architecture, config, state):
             raise FileExistsError(f"refusing to replace immutable league snapshot: {path}")
         return SnapshotRef(iteration, path)
 
@@ -135,6 +158,7 @@ def save_actor_state_snapshot(
     payload = {
         "format_version": LEAGUE_SNAPSHOT_FORMAT_VERSION,
         "iteration": iteration,
+        "architecture": architecture.name,
         "model_config": config,
         "actor": state,
     }
@@ -153,7 +177,7 @@ def save_actor_state_snapshot(
         except FileExistsError:
             existing = _load_payload(path)
             _validate_canonical_filename(path, existing["iteration"])
-            if not _matches_actor_state(existing, config, state):
+            if not _matches_actor_state(existing, architecture, config, state):
                 raise FileExistsError(
                     f"refusing to replace immutable league snapshot: {path}"
                 ) from None
@@ -164,36 +188,41 @@ def save_actor_state_snapshot(
 
 def _validated_snapshot_state(
     path: Path,
-    expected_model_config: ModelConfig | dict[str, Any] | None,
-) -> tuple[ModelConfig, dict[str, torch.Tensor]]:
-    """Validate one snapshot file and return its configuration and actor state."""
+    expected_model_config: AnyModelConfig | dict[str, Any] | None,
+) -> tuple[Architecture, AnyModelConfig, dict[str, torch.Tensor]]:
+    """Validate one snapshot file and return its family, configuration, and state."""
     path = Path(path)
     payload = _load_payload(path)
     _validate_canonical_filename(path, payload["iteration"])
+    architecture = resolve_architecture(payload)
     if expected_model_config is not None:
+        if not isinstance(expected_model_config, dict) and (
+            architecture_of_config(expected_model_config).name != architecture.name
+        ):
+            raise ValueError(f"league snapshot architecture mismatch: {path}")
         expected = _model_config_dict(expected_model_config)
         if payload["model_config"] != expected:
             raise ValueError(f"league snapshot model configuration mismatch: {path}")
     try:
-        config = ModelConfig(**payload["model_config"])
+        config = architecture.config_class(**payload["model_config"])
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid league snapshot model configuration: {path}") from error
-    return config, payload["actor"]
+    return architecture, config, payload["actor"]
 
 
 def load_actor_snapshot(
     path: Path,
     *,
-    expected_model_config: ModelConfig | dict[str, Any] | None = None,
+    expected_model_config: AnyModelConfig | dict[str, Any] | None = None,
     device: torch.device | str = "cpu",
-) -> FarmActor:
+) -> AnyActor:
     """Validate and strictly load a frozen actor snapshot."""
     path = Path(path)
-    config, state = _validated_snapshot_state(path, expected_model_config)
+    architecture, config, state = _validated_snapshot_state(path, expected_model_config)
     # Parameter initialization is discarded immediately by strict loading, so
     # frozen-policy I/O must not perturb training's checkpointed RNG stream.
     with torch.random.fork_rng(devices=[]):
-        actor = FarmActor(config).to(device)
+        actor = architecture.actor_class(config).to(device)
     try:
         actor.load_state_dict(state, strict=True)
     except RuntimeError as error:
@@ -212,17 +241,18 @@ class FrozenActorPool:
     keeps every captured graph valid because parameter storages are reused.
     """
 
-    def __init__(self, model_config: ModelConfig, device: torch.device | str) -> None:
+    def __init__(self, model_config: AnyModelConfig, device: torch.device | str) -> None:
+        self._architecture = architecture_of_config(model_config)
         self._model_config = model_config
         self._device = device
-        self._slots: list[FarmActor] = []
+        self._slots: list[AnyActor] = []
         self._loaded: list[Path | None] = []
 
-    def acquire(self, snapshot_paths: Sequence[Path]) -> list[FarmActor]:
+    def acquire(self, snapshot_paths: Sequence[Path]) -> list[AnyActor]:
         """Return one validated frozen actor per snapshot path, reusing slots."""
         while len(self._slots) < len(snapshot_paths):
             with torch.random.fork_rng(devices=[]):
-                slot = FarmActor(self._model_config).to(self._device)
+                slot = self._architecture.actor_class(self._model_config).to(self._device)
             slot.eval().requires_grad_(False)
             self._slots.append(slot)
             self._loaded.append(None)
@@ -230,7 +260,7 @@ class FrozenActorPool:
             resolved = Path(path).resolve()
             if self._loaded[index] == resolved:
                 continue
-            _, state = _validated_snapshot_state(resolved, self._model_config)
+            _, _, state = _validated_snapshot_state(resolved, self._model_config)
             self._loaded[index] = None
             try:
                 self._slots[index].load_state_dict(state, strict=True)
@@ -250,7 +280,7 @@ def copy_actor_snapshot(
     source: Path,
     directory: Path,
     *,
-    expected_model_config: ModelConfig | dict[str, Any],
+    expected_model_config: AnyModelConfig | dict[str, Any],
 ) -> SnapshotRef:
     """Validate and atomically copy an immutable snapshot into another archive."""
     source = Path(source)
@@ -315,13 +345,49 @@ def list_actor_snapshots(directory: Path) -> list[SnapshotRef]:
     return sorted(refs)
 
 
-def _sample_without_replacement(
-    values: Sequence[SnapshotRef], count: int, generator: np.random.Generator
+# Prioritized fictitious self-play weighting: an opponent's sampling weight is
+# (1 - score_rate)^2, so competitive opponents dominate and a fully beaten one
+# (score rate 1.0) retires from sampling entirely. Unmeasured opponents count
+# as even (0.5) so new snapshots enter the rotation at moderate priority.
+PFSP_UNMEASURED_SCORE_RATE = 0.5
+
+
+def _pfsp_weights(
+    values: Sequence[SnapshotRef],
+    score_rates: Mapping[int, float] | None,
+) -> np.ndarray:
+    rates = np.asarray(
+        [
+            (
+                PFSP_UNMEASURED_SCORE_RATE
+                if score_rates is None
+                else float(score_rates.get(ref.iteration, PFSP_UNMEASURED_SCORE_RATE))
+            )
+            for ref in values
+        ],
+        dtype=np.float64,
+    )
+    if np.any(~np.isfinite(rates)) or np.any(rates < 0.0) or np.any(rates > 1.0):
+        raise ValueError("opponent score rates must be finite and within [0, 1]")
+    return np.square(1.0 - rates)
+
+
+def _weighted_sample_without_replacement(
+    values: Sequence[SnapshotRef],
+    count: int,
+    generator: np.random.Generator,
+    weights: np.ndarray,
 ) -> list[SnapshotRef]:
     if count <= 0 or not values:
         return []
-    size = min(count, len(values))
-    indices = np.atleast_1d(generator.choice(len(values), size=size, replace=False))
+    total = float(weights.sum())
+    if total <= 0.0:
+        # Every candidate is fully beaten; nothing here is worth games.
+        return []
+    size = min(count, int(np.count_nonzero(weights)))
+    indices = np.atleast_1d(
+        generator.choice(len(values), size=size, replace=False, p=weights / total)
+    )
     return [values[int(index)] for index in indices]
 
 
@@ -330,24 +396,38 @@ def _sample_log_age_strata(
     count: int,
     current_iteration: int,
     generator: np.random.Generator,
+    weights: np.ndarray,
 ) -> list[SnapshotRef]:
-    """Round-robin across log2 age buckets, sampling within each bucket."""
-    buckets: dict[int, list[SnapshotRef]] = {}
-    for ref in values:
+    """Sample across log2 age buckets, PFSP-weighted at both levels.
+
+    Buckets are drawn without replacement in proportion to their total PFSP
+    weight, then one member is drawn within the chosen bucket by weight.
+    Weighting the bucket draw keeps age diversity while denying a full
+    historical slot to an age stratum whose only members are nearly beaten.
+    """
+    buckets: dict[int, list[tuple[SnapshotRef, float]]] = {}
+    for ref, weight in zip(values, weights, strict=True):
+        if weight <= 0.0:
+            continue
         age = max(1, current_iteration - ref.iteration)
-        buckets.setdefault(age.bit_length() - 1, []).append(ref)
+        buckets.setdefault(age.bit_length() - 1, []).append((ref, float(weight)))
     selected: list[SnapshotRef] = []
-    while buckets and len(selected) < count:
-        bucket_ids = list(buckets)
-        generator.shuffle(bucket_ids)
-        for bucket in bucket_ids:
-            candidates = buckets[bucket]
-            index = int(generator.integers(0, len(candidates)))
-            selected.append(candidates.pop(index))
-            if not candidates:
-                del buckets[bucket]
-            if len(selected) == count:
-                break
+    remaining = list(buckets)
+    while remaining and len(selected) < count:
+        totals = np.asarray(
+            [sum(weight for _, weight in buckets[bucket]) for bucket in remaining],
+            dtype=np.float64,
+        )
+        drawn = remaining[int(generator.choice(len(remaining), p=totals / totals.sum()))]
+        remaining.remove(drawn)
+        candidates = buckets[drawn]
+        bucket_weights = np.asarray([weight for _, weight in candidates], dtype=np.float64)
+        index = int(generator.choice(len(candidates), p=bucket_weights / bucket_weights.sum()))
+        selected.append(candidates.pop(index)[0])
+        if not candidates:
+            del buckets[drawn]
+        if not remaining and len(selected) < count:
+            remaining = [bucket for bucket in buckets if buckets[bucket]]
     return selected
 
 
@@ -359,15 +439,29 @@ def select_snapshot_mix(
     historical_count: int,
     active_pool_size: int,
     generator: np.random.Generator,
-    include_initial: bool = True,
+    score_rates: Mapping[int, float] | None = None,
+    pretrained_start: bool = False,
 ) -> list[SnapshotSelection]:
-    """Select distinct initial, recent-active, and log-age historical opponents.
+    """Select distinct recent-active and log-age historical opponents.
 
-    The optional initial anchor is additional to ``active_count`` and
-    ``historical_count``. Active candidates are the newest
-    ``active_pool_size`` frozen iterations. Historical candidates must be
-    strictly older than that complete active window. Undersized pools return
-    fewer selections without duplicating a policy.
+    Active candidates are the newest ``active_pool_size`` frozen iterations.
+    Historical candidates must be strictly older than that complete active
+    window. The iteration-0 snapshot is excluded by default: games against a
+    randomly initialized policy teach nothing a trained snapshot cannot. A
+    ``pretrained_start`` run keeps it eligible — there iteration 0 is the
+    warm-start baseline, and playing it holds anti-regression pressure
+    against the learner's own starting point.
+    Undersized pools return fewer selections without duplicating a policy.
+
+    ``score_rates`` maps snapshot iteration to the learner's recent score rate
+    against that snapshot; sampling is prioritized fictitious self-play with
+    weight (1 - score_rate)^2, so fully beaten opponents retire and their
+    games return to competitive opponents instead of 100%-win blowouts.
+
+    Selections list every active snapshot (sorted by iteration) before every
+    historical one (also sorted). Positional consumers — the iteration
+    benchmark reconstructs production's temperature/deterministic decode from
+    this ordering — depend on it, so it is part of the contract.
     """
     if current_iteration < 0:
         raise ValueError("current iteration cannot be negative")
@@ -397,22 +491,25 @@ def select_snapshot_mix(
     if not eligible:
         return []
 
-    initial = eligible_by_iteration.get(0)
-    non_initial = [ref for ref in eligible if ref.iteration != 0]
-    active_window = non_initial[-active_pool_size:]
-    active = _sample_without_replacement(active_window, active_count, generator)
+    trained = eligible if pretrained_start else [ref for ref in eligible if ref.iteration != 0]
+    active_window = trained[-active_pool_size:]
+    active = _weighted_sample_without_replacement(
+        active_window,
+        active_count,
+        generator,
+        _pfsp_weights(active_window, score_rates),
+    )
     active_iterations = {ref.iteration for ref in active_window}
-    historical_candidates = [ref for ref in non_initial if ref.iteration not in active_iterations]
+    historical_candidates = [ref for ref in trained if ref.iteration not in active_iterations]
     historical = _sample_log_age_strata(
         historical_candidates,
         min(historical_count, len(historical_candidates)),
         current_iteration,
         generator,
+        _pfsp_weights(historical_candidates, score_rates),
     )
 
     selections = []
-    if include_initial and initial is not None:
-        selections.append(SnapshotSelection(initial, "initial"))
     selections.extend(SnapshotSelection(ref, "active") for ref in sorted(active))
     selections.extend(SnapshotSelection(ref, "historical") for ref in sorted(historical))
     return selections
