@@ -50,6 +50,14 @@ def _families_by_field() -> dict[str, list[str]]:
     return families
 
 
+def _default_summary(name: str, families: list[str]) -> str:
+    """Render the per-family default, which is the whole point of the flag."""
+    defaults = {family: getattr(ARCHITECTURES[family].config_class(), name) for family in families}
+    if len(set(defaults.values())) == 1:
+        return f"default {next(iter(defaults.values()))}"
+    return "default " + ", ".join(f"{value} for {family}" for family, value in defaults.items())
+
+
 def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
     """Add every family's structural flags, each defaulting to its dataclass value."""
     for name, families in _families_by_field().items():
@@ -58,7 +66,7 @@ def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
             _flag(name),
             type=int,
             default=None,
-            help=f"{name.replace('_', ' ')} ({applies}); defaults to the architecture default",
+            help=f"{name.replace('_', ' ')} ({applies}); {_default_summary(name, families)}",
         )
 
 

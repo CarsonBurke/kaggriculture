@@ -36,6 +36,23 @@ def test_completion_record_covers_the_exact_cartesian_product() -> None:
     }
 
 
+def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> None:
+    """A calibration report is only launch evidence when its model matches
+    production exactly, and launch_calibrated_training rejects it otherwise."""
+    import sys
+
+    from kaggriculture.modelargs import model_config_from_args
+    from kaggriculture.production import production_model_config
+    from kaggriculture.registry import CONV_ENTITY, resolve_architecture
+
+    module = _script()
+    monkeypatch.setattr(sys, "argv", ["benchmark_vapo_iteration.py"])
+
+    config = model_config_from_args(resolve_architecture(CONV_ENTITY), module.parse_args())
+
+    assert config.to_dict() == production_model_config()
+
+
 def test_hardware_identity_records_common_cpu_metadata() -> None:
     module = _script()
 

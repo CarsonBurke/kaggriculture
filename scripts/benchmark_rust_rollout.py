@@ -79,13 +79,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--cnn-width", type=int, default=48)
-    parser.add_argument("--cnn-blocks", type=int, default=2)
-    parser.add_argument("--model-dim", type=int, default=96)
-    parser.add_argument("--transformer-layers", type=int, default=7)
-    parser.add_argument("--attention-heads", type=int, default=4)
-    parser.add_argument("--ffn-multiplier", type=int, default=4)
-    parser.add_argument("--quantity-rank", type=int, default=32)
     parser.add_argument("--compile-models", action="store_true")
     parser.add_argument("--replay-minibatch-size", type=int, default=2048)
     parser.add_argument(
@@ -213,15 +206,10 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
-    config = ModelConfig(
-        cnn_width=args.cnn_width,
-        cnn_blocks=args.cnn_blocks,
-        model_dim=args.model_dim,
-        transformer_layers=args.transformer_layers,
-        attention_heads=args.attention_heads,
-        ffn_multiplier=args.ffn_multiplier,
-        quantity_rank=args.quantity_rank,
-    )
+    # This benchmark replays the convolutional actor's own inputs, so it is
+    # deliberately single-family; the configuration is the family default
+    # rather than a second copy of it that can drift.
+    config = ModelConfig()
     actor = FarmActor(config).to(device).eval()
     emit(
         {

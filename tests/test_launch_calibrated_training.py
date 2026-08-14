@@ -49,6 +49,30 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
     assert command[command.index("--external-eval-opponents") + 1] == "starter,public-v27"
 
 
+def test_training_command_round_trips_through_the_training_parser(monkeypatch, tmp_path) -> None:
+    """The command is bound verbatim into run provenance, so its flag list is
+    load-bearing: it must parse, validate, and build the production model."""
+    from kaggriculture.model import ModelConfig
+    from kaggriculture.modelargs import model_config_from_args
+    from kaggriculture.registry import CONV_ENTITY, resolve_architecture
+
+    training = _script("train_vapo.py")
+    command = build_training_command(
+        tmp_path / "run",
+        iterations=500,
+        max_hours=0.0,
+        seed=7,
+        compile_models=False,
+    )
+    monkeypatch.setattr(sys, "argv", ["train_vapo.py", *command[2:]])
+
+    args = training.parse_args()
+    training._validate_args(args)
+
+    assert args.architecture == CONV_ENTITY
+    assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
+
+
 def test_training_command_requires_digest_and_decision_together(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="together"):
         build_training_command(
