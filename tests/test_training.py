@@ -87,6 +87,71 @@ def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
         )
 
 
+def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_path) -> None:
+    """A resume whose checkpoint was written by another architecture, or by
+    the same architecture at another capacity, must fail on model identity --
+    and must fail before strict loading has already replaced any weights."""
+    from kaggriculture.registry import architecture_of_config
+    from kaggriculture.structured import StructuredConfig
+
+    vapo_config = VapoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
+    conv = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    def store(path, model_config) -> None:
+        architecture = architecture_of_config(model_config)
+        actor = architecture.actor_class(model_config)
+        critic = architecture.critic_class(model_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+        save_checkpoint(
+            path,
+            actor=actor,
+            critic=critic,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            model_config=model_config,
+            vapo_config=vapo_config,
+            iteration=1,
+            next_seed=2,
+            metrics={},
+            source_identity=source_identity(),
+        )
+
+    foreign_family = tmp_path / "structured.pt"
+    store(
+        foreign_family,
+        StructuredConfig(
+            model_dim=16,
+            attention_heads=2,
+            ffn_multiplier=1,
+            farm_blocks=1,
+            opponent_latents=2,
+            latents=4,
+            core_layers=1,
+            quantity_rank=4,
+        ),
+    )
+    foreign_capacity = tmp_path / "wider-conv.pt"
+    store(
+        foreign_capacity,
+        ModelConfig(
+            cnn_width=16, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+        ),
+    )
+
+    actor = FarmActor(conv)
+    critic = DistributionalCritic(conv)
+    before = {name: value.clone() for name, value in actor.state_dict().items()}
+
+    with pytest.raises(ValueError, match="checkpoint architecture does not match"):
+        load_checkpoint(foreign_family, actor, critic, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="checkpoint model configuration does not match"):
+        load_checkpoint(foreign_capacity, actor, critic, device=torch.device("cpu"))
+
+    assert all(torch.equal(value, before[name]) for name, value in actor.state_dict().items())
+
+
 def test_iteration_metrics_journal_is_idempotent_and_conflict_detecting(tmp_path) -> None:
     path = tmp_path / "metrics.jsonl"
     first = {"iteration": 1, "loss": 0.5}
