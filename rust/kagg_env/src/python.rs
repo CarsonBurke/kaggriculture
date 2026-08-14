@@ -1,7 +1,9 @@
 use crate::core::{
-    BOARD_CHANNELS, BOARD_SIZE, CRITIC_FEATURES, CompactAction, GLOBAL_FEATURES, Game, GameConfig,
-    MARKET_KINDS, MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS,
-    SampledFactors, StepResult, UNIT_ACTIONS, UNIT_FEATURES,
+    BOARD_CHANNELS, BOARD_SIZE, CRITIC_FEATURES, CROP_TOKEN_FIELDS, CROPS, CompactAction,
+    FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig, MARKET_KINDS, MARKET_QUANTITIES,
+    MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS, PRODUCT_TOKEN_FIELDS, PRODUCTS,
+    SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS,
+    UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS,
 };
 use half::f16;
 use numpy::ndarray::{Array1, Array2, Array3};
@@ -96,6 +98,23 @@ impl BatchEnv {
     /// Fill caller-owned, writable C-contiguous arrays without allocating.
     fn encoded_into(&self, py: Python<'_>, output: &Bound<'_, PyDict>) -> PyResult<()> {
         fill_encoded_output(py, &self.games, output)
+    }
+
+    /// Encode both seats' structured token bundles without Python objects.
+    fn structured<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let output = allocate_structured_buffers(py, self.games.len())?;
+        fill_structured_output(py, &self.games, &output)?;
+        Ok(output)
+    }
+
+    /// Allocate the exact output arrays expected by `structured_into` once.
+    fn structured_buffers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        allocate_structured_buffers(py, self.games.len())
+    }
+
+    /// Fill caller-owned, writable C-contiguous structured arrays without allocating.
+    fn structured_into(&self, py: Python<'_>, output: &Bound<'_, PyDict>) -> PyResult<()> {
+        fill_structured_output(py, &self.games, output)
     }
 
     /// Exact sequential masks for every supplied factor row, before stepping.
@@ -562,6 +581,247 @@ fn allocate_encoded_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Boun
     Ok(output)
 }
 
+fn allocate_structured_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
+    let rows = batch * PLAYERS;
+    let output = PyDict::new(py);
+    output.set_item(
+        "tile_categorical",
+        PyArray3::<i8>::zeros(py, [rows, TILE_TOKENS, TILE_CATEGORICAL], false),
+    )?;
+    output.set_item(
+        "tile_continuous",
+        PyArray3::<f16>::zeros(py, [rows, TILE_TOKENS, TILE_CONTINUOUS], false),
+    )?;
+    output.set_item(
+        "unit_categorical",
+        PyArray3::<i8>::zeros(py, [rows, MAX_UNITS, UNIT_CATEGORICAL], false),
+    )?;
+    output.set_item(
+        "unit_continuous",
+        PyArray3::<f16>::zeros(py, [rows, MAX_UNITS, UNIT_CONTINUOUS], false),
+    )?;
+    output.set_item(
+        "unit_active",
+        PyArray2::<bool>::zeros(py, [rows, MAX_UNITS], false),
+    )?;
+    output.set_item(
+        "unit_tile_gather",
+        PyArray3::<i8>::zeros(py, [rows, MAX_UNITS, UNIT_GATHERS], false),
+    )?;
+    output.set_item(
+        "unit_tile_gather_valid",
+        PyArray3::<bool>::zeros(py, [rows, MAX_UNITS, UNIT_GATHERS], false),
+    )?;
+    output.set_item(
+        "products",
+        PyArray3::<f16>::zeros(py, [rows, PRODUCTS, PRODUCT_TOKEN_FIELDS], false),
+    )?;
+    output.set_item(
+        "crops",
+        PyArray3::<f16>::zeros(py, [rows, CROPS, CROP_TOKEN_FIELDS], false),
+    )?;
+    output.set_item(
+        "farms",
+        PyArray3::<f16>::zeros(py, [rows, PLAYERS, FARM_TOKEN_FIELDS], false),
+    )?;
+    output.set_item(
+        "town",
+        PyArray2::<f16>::zeros(py, [rows, TOWN_TOKEN_FIELDS], false),
+    )?;
+    output.set_item("potentials", PyArray1::<f32>::zeros(py, batch, false))?;
+    Ok(output)
+}
+
+fn fill_structured_output(
+    py: Python<'_>,
+    games: &[Game],
+    output: &Bound<'_, PyDict>,
+) -> PyResult<()> {
+    let rows = games.len() * PLAYERS;
+    macro_rules! output_array {
+        ($name:literal, $type:ty, $shape:expr) => {{
+            let array = required_output(output, $name)?.cast_into::<$type>()?;
+            ensure_shape(array.shape(), &$shape, concat!("output ", $name))?;
+            if !array.is_c_contiguous() {
+                return Err(non_contiguous($name));
+            }
+            array.try_readwrite()?
+        }};
+    }
+    let mut tile_categorical = output_array!(
+        "tile_categorical",
+        PyArray3<i8>,
+        [rows, TILE_TOKENS, TILE_CATEGORICAL]
+    );
+    let mut tile_continuous = output_array!(
+        "tile_continuous",
+        PyArray3<f16>,
+        [rows, TILE_TOKENS, TILE_CONTINUOUS]
+    );
+    let mut unit_categorical = output_array!(
+        "unit_categorical",
+        PyArray3<i8>,
+        [rows, MAX_UNITS, UNIT_CATEGORICAL]
+    );
+    let mut unit_continuous = output_array!(
+        "unit_continuous",
+        PyArray3<f16>,
+        [rows, MAX_UNITS, UNIT_CONTINUOUS]
+    );
+    let mut unit_active = output_array!("unit_active", PyArray2<bool>, [rows, MAX_UNITS]);
+    let mut unit_tile_gather = output_array!(
+        "unit_tile_gather",
+        PyArray3<i8>,
+        [rows, MAX_UNITS, UNIT_GATHERS]
+    );
+    let mut unit_tile_gather_valid = output_array!(
+        "unit_tile_gather_valid",
+        PyArray3<bool>,
+        [rows, MAX_UNITS, UNIT_GATHERS]
+    );
+    let mut products = output_array!(
+        "products",
+        PyArray3<f16>,
+        [rows, PRODUCTS, PRODUCT_TOKEN_FIELDS]
+    );
+    let mut crops = output_array!("crops", PyArray3<f16>, [rows, CROPS, CROP_TOKEN_FIELDS]);
+    let mut farms = output_array!("farms", PyArray3<f16>, [rows, PLAYERS, FARM_TOKEN_FIELDS]);
+    let mut town = output_array!("town", PyArray2<f16>, [rows, TOWN_TOKEN_FIELDS]);
+    let mut potentials = output_array!("potentials", PyArray1<f32>, [games.len()]);
+
+    let tile_categorical = tile_categorical
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("tile_categorical"))?;
+    let tile_continuous = tile_continuous
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("tile_continuous"))?;
+    let unit_categorical = unit_categorical
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_categorical"))?;
+    let unit_continuous = unit_continuous
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_continuous"))?;
+    let unit_active = unit_active
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_active"))?;
+    let unit_tile_gather = unit_tile_gather
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_tile_gather"))?;
+    let unit_tile_gather_valid = unit_tile_gather_valid
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("unit_tile_gather_valid"))?;
+    let products = products
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("products"))?;
+    let crops = crops.as_slice_mut().map_err(|_| non_contiguous("crops"))?;
+    let farms = farms.as_slice_mut().map_err(|_| non_contiguous("farms"))?;
+    let town = town.as_slice_mut().map_err(|_| non_contiguous("town"))?;
+    let potentials = potentials
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("potentials"))?;
+
+    const TILE_CATEGORICAL_VALUES: usize = TILE_TOKENS * TILE_CATEGORICAL;
+    const TILE_CONTINUOUS_VALUES: usize = TILE_TOKENS * TILE_CONTINUOUS;
+    const UNIT_CATEGORICAL_VALUES: usize = MAX_UNITS * UNIT_CATEGORICAL;
+    const UNIT_CONTINUOUS_VALUES: usize = MAX_UNITS * UNIT_CONTINUOUS;
+    const UNIT_GATHER_VALUES: usize = MAX_UNITS * UNIT_GATHERS;
+    const PRODUCT_VALUES: usize = PRODUCTS * PRODUCT_TOKEN_FIELDS;
+    const CROP_VALUES: usize = CROPS * CROP_TOKEN_FIELDS;
+    const FARM_VALUES: usize = PLAYERS * FARM_TOKEN_FIELDS;
+    py.detach(|| {
+        tile_categorical
+            .par_chunks_mut(TILE_CATEGORICAL_VALUES)
+            .zip(tile_continuous.par_chunks_mut(TILE_CONTINUOUS_VALUES))
+            .zip(unit_categorical.par_chunks_mut(UNIT_CATEGORICAL_VALUES))
+            .zip(unit_continuous.par_chunks_mut(UNIT_CONTINUOUS_VALUES))
+            .zip(unit_active.par_chunks_mut(MAX_UNITS))
+            .zip(unit_tile_gather.par_chunks_mut(UNIT_GATHER_VALUES))
+            .zip(unit_tile_gather_valid.par_chunks_mut(UNIT_GATHER_VALUES))
+            .zip(products.par_chunks_mut(PRODUCT_VALUES))
+            .zip(crops.par_chunks_mut(CROP_VALUES))
+            .zip(farms.par_chunks_mut(FARM_VALUES))
+            .zip(town.par_chunks_mut(TOWN_TOKEN_FIELDS))
+            .enumerate()
+            .for_each(
+                |(
+                    row,
+                    (
+                        (
+                            (
+                                (
+                                    (
+                                        (
+                                            (
+                                                (
+                                                    (
+                                                        (tile_categorical, tile_continuous),
+                                                        unit_categorical,
+                                                    ),
+                                                    unit_continuous,
+                                                ),
+                                                unit_active,
+                                            ),
+                                            unit_tile_gather,
+                                        ),
+                                        unit_tile_gather_valid,
+                                    ),
+                                    products,
+                                ),
+                                crops,
+                            ),
+                            farms,
+                        ),
+                        town,
+                    ),
+                )| {
+                    let mut tile_continuous_f32 = [0.0f32; TILE_CONTINUOUS_VALUES];
+                    let mut unit_continuous_f32 = [0.0f32; UNIT_CONTINUOUS_VALUES];
+                    let mut products_f32 = [0.0f32; PRODUCT_VALUES];
+                    let mut crops_f32 = [0.0f32; CROP_VALUES];
+                    let mut farms_f32 = [0.0f32; FARM_VALUES];
+                    let mut town_f32 = [0.0f32; TOWN_TOKEN_FIELDS];
+                    games[row / PLAYERS].encode_player_structured(
+                        row % PLAYERS,
+                        tile_categorical,
+                        &mut tile_continuous_f32,
+                        unit_categorical,
+                        &mut unit_continuous_f32,
+                        unit_active,
+                        unit_tile_gather,
+                        unit_tile_gather_valid,
+                        &mut products_f32,
+                        &mut crops_f32,
+                        &mut farms_f32,
+                        &mut town_f32,
+                    );
+                    for (target, value) in tile_continuous.iter_mut().zip(tile_continuous_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in unit_continuous.iter_mut().zip(unit_continuous_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in products.iter_mut().zip(products_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in crops.iter_mut().zip(crops_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in farms.iter_mut().zip(farms_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in town.iter_mut().zip(town_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                },
+            );
+        potentials
+            .par_iter_mut()
+            .zip(games.par_iter())
+            .for_each(|(output, game)| *output = game.pair_potential());
+    });
+    Ok(())
+}
+
 fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
     let rows = batch * PLAYERS;
     let output = PyDict::new(py);
@@ -1025,11 +1285,8 @@ fn fill_sample_step_output(
             .copy_from_slice(&row.market_quantity_logprobs);
         entropy[row_index] = row.mean_entropy;
     }
-    for (game_index, ((game, result), cached)) in games
-        .iter()
-        .zip(results)
-        .zip(potential_cache)
-        .enumerate()
+    for (game_index, ((game, result), cached)) in
+        games.iter().zip(results).zip(potential_cache).enumerate()
     {
         let offset = game_index * PLAYERS;
         rewards[offset..offset + PLAYERS].copy_from_slice(&result.rewards);

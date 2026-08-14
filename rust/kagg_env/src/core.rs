@@ -22,6 +22,17 @@ pub const BOARD_CHANNELS: usize = FARM_CHANNELS * 2;
 pub const GLOBAL_FEATURES: usize = 72;
 pub const CRITIC_FEATURES: usize = 101;
 pub const UNIT_FEATURES: usize = 17;
+// Structured token widths. Must stay identical to src/kaggriculture/tokens.py.
+pub const TILE_TOKENS: usize = TILE_COUNT * PLAYERS;
+pub const TILE_CATEGORICAL: usize = 6;
+pub const TILE_CONTINUOUS: usize = 18;
+pub const UNIT_CATEGORICAL: usize = 4;
+pub const UNIT_CONTINUOUS: usize = PRIVATE_ITEMS + 2;
+pub const UNIT_GATHERS: usize = 5;
+pub const PRODUCT_TOKEN_FIELDS: usize = 5;
+pub const CROP_TOKEN_FIELDS: usize = 6;
+pub const FARM_TOKEN_FIELDS: usize = 4;
+pub const TOWN_TOKEN_FIELDS: usize = 14;
 
 const PRODUCT_NAMES: [&str; PRODUCTS] = [
     "WHEAT",
@@ -84,6 +95,18 @@ const ANIMAL_PRODUCT: [usize; ANIMALS] = [5, 6, 7];
 const LAND_PRICES: [i64; 3] = [1000, 2000, 4000];
 const PRICE_FLOOR: i64 = 1;
 const MARKET_I0: i32 = 10_000;
+
+// Illiquid cost-basis credit fractions for the shaping potential.  Kept near
+// engine cost so buying an asset is only a small potential dip: a deep dip
+// (land once sat at 0.45) makes every purchase an immediate shaped-reward
+// cliff the policy never crosses, starving the critic of post-purchase data.
+// Must stay identical to ILLIQUID_* in src/kaggriculture/encoding.py.
+const ILLIQUID_SHED_ANIMAL_CREDIT: f64 = 0.82;
+const ILLIQUID_SHED_SEED_CREDIT: f64 = 0.85;
+const ILLIQUID_PLACED_ANIMAL_CREDIT: f64 = 0.85;
+const ILLIQUID_PLANTED_SEED_CREDIT: f64 = 0.8;
+const ILLIQUID_PENDING_YIELD_CREDIT: f64 = 0.72;
+const ILLIQUID_LAND_CREDIT: f64 = 0.9;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -736,6 +759,169 @@ impl Game {
         }
     }
 
+    /// Encode one seat's structured token bundle, mirroring tokens.py exactly.
+    ///
+    /// Every continuous value is computed in f64 and truncated to f32 on
+    /// store, reproducing the Python tokenizer's float64 -> float32 chain
+    /// before the binding layer's final f16 staging cast. Categorical columns
+    /// are small vocabulary indices staged as i8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_player_structured(
+        &self,
+        player: usize,
+        tile_categorical: &mut [i8],
+        tile_continuous: &mut [f32],
+        unit_categorical: &mut [i8],
+        unit_continuous: &mut [f32],
+        unit_active: &mut [bool],
+        unit_tile_gather: &mut [i8],
+        unit_tile_gather_valid: &mut [bool],
+        products: &mut [f32],
+        crops: &mut [f32],
+        farms: &mut [f32],
+        town: &mut [f32],
+    ) {
+        assert_eq!(tile_categorical.len(), TILE_TOKENS * TILE_CATEGORICAL);
+        assert_eq!(tile_continuous.len(), TILE_TOKENS * TILE_CONTINUOUS);
+        assert_eq!(unit_categorical.len(), MAX_UNITS * UNIT_CATEGORICAL);
+        assert_eq!(unit_continuous.len(), MAX_UNITS * UNIT_CONTINUOUS);
+        assert_eq!(unit_active.len(), MAX_UNITS);
+        assert_eq!(unit_tile_gather.len(), MAX_UNITS * UNIT_GATHERS);
+        assert_eq!(unit_tile_gather_valid.len(), MAX_UNITS * UNIT_GATHERS);
+        assert_eq!(products.len(), PRODUCTS * PRODUCT_TOKEN_FIELDS);
+        assert_eq!(crops.len(), CROPS * CROP_TOKEN_FIELDS);
+        assert_eq!(farms.len(), PLAYERS * FARM_TOKEN_FIELDS);
+        assert_eq!(town.len(), TOWN_TOKEN_FIELDS);
+        tile_categorical.fill(0);
+        tile_continuous.fill(0.0);
+        unit_categorical.fill(0);
+        unit_continuous.fill(0.0);
+        unit_active.fill(false);
+        unit_tile_gather.fill(0);
+        unit_tile_gather_valid.fill(false);
+        products.fill(0.0);
+        crops.fill(0.0);
+        farms.fill(0.0);
+        town.fill(0.0);
+
+        let opponent = 1 - player;
+        let day = self.step / self.config.turns_per_day;
+        encode_farm_structured(
+            &self.farms[player],
+            day,
+            self.step,
+            false,
+            &mut tile_categorical[..TILE_COUNT * TILE_CATEGORICAL],
+            &mut tile_continuous[..TILE_COUNT * TILE_CONTINUOUS],
+        );
+        encode_farm_structured(
+            &self.farms[opponent],
+            day,
+            self.step,
+            true,
+            &mut tile_categorical[TILE_COUNT * TILE_CATEGORICAL..],
+            &mut tile_continuous[TILE_COUNT * TILE_CONTINUOUS..],
+        );
+
+        let farm = &self.farms[player];
+        let private = &self.privates[player];
+        for unit in 0..usize::from(farm.units) {
+            unit_active[unit] = true;
+            let position = farm.positions[unit];
+            let x = usize::from(position.0);
+            let y = usize::from(position.1);
+            let categorical =
+                &mut unit_categorical[unit * UNIT_CATEGORICAL..(unit + 1) * UNIT_CATEGORICAL];
+            categorical[0] = i8::from(unit != 0);
+            categorical[1] = unit as i8;
+            categorical[2] = y as i8;
+            categorical[3] = x as i8;
+            let continuous =
+                &mut unit_continuous[unit * UNIT_CONTINUOUS..(unit + 1) * UNIT_CONTINUOUS];
+            let mut total = 0.0f64;
+            for (target, &count) in continuous[..PRIVATE_ITEMS]
+                .iter_mut()
+                .zip(&private.inventories[unit])
+            {
+                let held = f64::from(count);
+                total += held;
+                *target = (held / 32.0) as f32;
+            }
+            continuous[PRIVATE_ITEMS] = (total / 32.0) as f32;
+            continuous[PRIVATE_ITEMS + 1] = f32::from(u8::from(is_shed_access(x, y)));
+            const GATHER_DELTAS: [(i16, i16); UNIT_GATHERS] =
+                [(0, 0), (0, -1), (0, 1), (1, 0), (-1, 0)];
+            for (gather, (dx, dy)) in GATHER_DELTAS.iter().enumerate() {
+                let nx = x as i16 + dx;
+                let ny = y as i16 + dy;
+                if (0..BOARD_SIZE as i16).contains(&nx) && (0..BOARD_SIZE as i16).contains(&ny) {
+                    unit_tile_gather[unit * UNIT_GATHERS + gather] =
+                        (ny * BOARD_SIZE as i16 + nx) as i8;
+                    unit_tile_gather_valid[unit * UNIT_GATHERS + gather] = true;
+                }
+            }
+        }
+
+        let max_base_price = MARKET_PARAMS
+            .iter()
+            .map(|params| params.0)
+            .fold(0.0, f64::max);
+        for item in 0..PRODUCTS {
+            let base = MARKET_PARAMS[item].0;
+            let mut carried = 0.0f64;
+            for inventory in &private.inventories[..usize::from(farm.units)] {
+                carried += f64::from(inventory[item]);
+            }
+            let row = &mut products[item * PRODUCT_TOKEN_FIELDS..(item + 1) * PRODUCT_TOKEN_FIELDS];
+            row[0] =
+                ((f64::from(self.market_inventory[item]) - f64::from(MARKET_I0)) / 500.0) as f32;
+            row[1] = (self.market_prices[item] as f64 / (2.0 * base)) as f32;
+            row[2] = (base / max_base_price) as f32;
+            row[3] = (f64::from(private.shed[item]) / f64::from(self.config.shed_capacity)) as f32;
+            row[4] = (carried / f64::from(self.config.shed_capacity)) as f32;
+        }
+        let max_seed_cost = SEED_COST.iter().copied().max().unwrap() as f64;
+        let max_yield_day = f64::from(*MAX_YIELD_DAY.iter().max().unwrap());
+        let max_yield = f64::from(*CROP_MAX_HELD.iter().max().unwrap());
+        for crop in 0..CROPS {
+            let row = &mut crops[crop * CROP_TOKEN_FIELDS..(crop + 1) * CROP_TOKEN_FIELDS];
+            row[0] = (SEED_COST[crop] as f64 / max_seed_cost) as f32;
+            row[1] = (f64::from(private.seeds[crop]) / f64::from(self.config.shed_capacity)) as f32;
+            row[2] = (f64::from(FIRST_YIELD[crop]) / max_yield_day) as f32;
+            row[3] = (f64::from(MAX_YIELD_DAY[crop]) / max_yield_day) as f32;
+            row[4] = (f64::from(CROP_MAX_HELD[crop]) / max_yield) as f32;
+            row[5] = f32::from(u8::from(CROP_ONGOING[crop]));
+        }
+        for (slot, index) in [player, opponent].into_iter().enumerate() {
+            let summary = &self.farms[index];
+            let row = &mut farms[slot * FARM_TOKEN_FIELDS..(slot + 1) * FARM_TOKEN_FIELDS];
+            row[0] = money_feature(summary.money);
+            row[1] = (f64::from(summary.unlocked.count_ones()) / 4.0) as f32;
+            row[2] = (f64::from(summary.units - 1) / f64::from(MAX_UNITS as u8 - 1)) as f32;
+            row[3] = (f64::from(summary.hires_today) / f64::from(MAX_UNITS as u8 - 1)) as f32;
+        }
+
+        let hour = self.step % self.config.turns_per_day;
+        let cycle =
+            2.0 * std::f64::consts::PI * f64::from(hour) / f64::from(self.config.turns_per_day);
+        let episode_days =
+            f64::from(self.config.episode_steps) / f64::from(self.config.turns_per_day);
+        let horizon = f64::from(self.config.episode_steps - 1);
+        town[0] = (f64::from(day) / episode_days) as f32;
+        town[1] = (f64::from(hour) / f64::from(self.config.turns_per_day)) as f32;
+        town[2] = (f64::from(self.step) / horizon) as f32;
+        town[3] = (f64::from(self.config.episode_steps - 1 - self.step) / horizon) as f32;
+        town[4] = cycle.sin() as f32;
+        town[5] = cycle.cos() as f32;
+        for shop in 0..8 {
+            let count = self.shops[..usize::from(self.shop_count)]
+                .iter()
+                .filter(|&&candidate| usize::from(candidate) == shop)
+                .count();
+            town[6 + shop] = (count as f64 / 8.0) as f32;
+        }
+    }
+
     /// Bank money plus the exact proceeds of liquidating every held product.
     ///
     /// Mirrors the engine's sell arithmetic unit by unit: each unit quotes at
@@ -785,27 +971,31 @@ impl Game {
             for inventory in &self.privates[player].inventories[..units] {
                 held += i64::from(inventory[PRODUCTS + animal]);
             }
-            value += 0.82 * held as f64 * ANIMAL_COST[animal] as f64;
+            value += ILLIQUID_SHED_ANIMAL_CREDIT * held as f64 * ANIMAL_COST[animal] as f64;
         }
         #[allow(clippy::needless_range_loop)]
         for crop in 0..CROPS {
-            value += 0.85 * f64::from(self.privates[player].seeds[crop]) * SEED_COST[crop] as f64;
+            value += ILLIQUID_SHED_SEED_CREDIT
+                * f64::from(self.privates[player].seeds[crop])
+                * SEED_COST[crop] as f64;
         }
         for tile in self.farms[player].tiles {
             if tile.has_animal {
                 let animal = usize::from(tile.species);
-                value += 0.72 * ANIMAL_COST[animal] as f64;
-                value += 0.72
+                value += ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[animal] as f64;
+                value += ILLIQUID_PENDING_YIELD_CREDIT
                     * f64::from(tile.yield_units)
                     * self.market_prices[ANIMAL_PRODUCT[animal]] as f64;
             } else if tile.kind == TileKind::Plant {
                 let crop = usize::from(tile.species);
-                value += 0.6 * SEED_COST[crop] as f64;
-                value += 0.72 * f64::from(tile.yield_units) * self.market_prices[crop] as f64;
+                value += ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[crop] as f64;
+                value += ILLIQUID_PENDING_YIELD_CREDIT
+                    * f64::from(tile.yield_units)
+                    * self.market_prices[crop] as f64;
             }
         }
         let extra = self.farms[player].unlocked.count_ones().saturating_sub(1) as usize;
-        value += 0.45 * LAND_PRICES[..extra].iter().sum::<i64>() as f64;
+        value += ILLIQUID_LAND_CREDIT * LAND_PRICES[..extra].iter().sum::<i64>() as f64;
         value
     }
 
@@ -2121,6 +2311,140 @@ fn encode_farm(farm: &Farm, day: u16, step: u16, output: &mut [f32]) {
     }
 }
 
+// Structured tile continuous field indices, matching tokens.py
+// TILE_CONTINUOUS_FIELDS order exactly.
+const TF_YIELD_FRACTION: usize = 0;
+const TF_AGE_FRACTION: usize = 1;
+const TF_MATURITY_FRACTION: usize = 2;
+const TF_WATERED_TODAY: usize = 3;
+const TF_FED_TODAY: usize = 4;
+const TF_CARED_TODAY: usize = 5;
+const TF_FERTILIZER_REMAINING: usize = 6;
+const TF_FERTILIZER_AVAILABLE: usize = 7;
+const TF_PENDING_CARE_BONUS: usize = 8;
+const TF_DECAY_PRESSURE: usize = 9;
+const TF_LIFESPAN_REMAINING: usize = 10;
+const TF_LIFESPAN_EXPIRED: usize = 11;
+const TF_LIFESPAN_DECAY_TICK: usize = 12;
+const TF_HARVEST_READY: usize = 13;
+const TF_EDGE: usize = 14;
+const TF_CORNER: usize = 15;
+const TF_SHED_DISTANCE: usize = 16;
+const TF_SHED_ACCESS: usize = 17;
+
+/// Structured tile kind vocabulary index (tokens.py TILE_KINDS order).
+#[inline]
+fn structured_tile_kind(kind: TileKind) -> i8 {
+    match kind {
+        TileKind::Locked => 0,
+        TileKind::Empty => 1,
+        TileKind::Weed => 2,
+        TileKind::Plant => 3,
+        TileKind::Coop => 4,
+        TileKind::Pasture => 5,
+    }
+}
+
+fn encode_farm_structured(
+    farm: &Farm,
+    day: u16,
+    step: u16,
+    opponent: bool,
+    categorical: &mut [i8],
+    continuous: &mut [f32],
+) {
+    debug_assert_eq!(categorical.len(), TILE_COUNT * TILE_CATEGORICAL);
+    debug_assert_eq!(continuous.len(), TILE_COUNT * TILE_CONTINUOUS);
+    const ACCESS: [(i16, i16); 4] = [(4, 4), (5, 4), (4, 5), (5, 5)];
+    // The 10x10 board's largest Manhattan distance to shed access is 8.
+    const MAX_SHED_DISTANCE: f64 = 8.0;
+    for y in 0..BOARD_SIZE {
+        for x in 0..BOARD_SIZE {
+            let token = y * BOARD_SIZE + x;
+            let tile = farm.tiles[token];
+            let row = &mut categorical[token * TILE_CATEGORICAL..(token + 1) * TILE_CATEGORICAL];
+            row[0] = structured_tile_kind(tile.kind);
+            row[2] = i8::from(opponent);
+            row[3] = y as i8;
+            row[4] = x as i8;
+            row[5] = quadrant_of(x, y) as i8;
+            let features = &mut continuous[token * TILE_CONTINUOUS..(token + 1) * TILE_CONTINUOUS];
+            let edge = x == 0 || x == BOARD_SIZE - 1 || y == 0 || y == BOARD_SIZE - 1;
+            let corner = (x == 0 || x == BOARD_SIZE - 1) && (y == 0 || y == BOARD_SIZE - 1);
+            features[TF_EDGE] = f32::from(u8::from(edge));
+            features[TF_CORNER] = f32::from(u8::from(corner));
+            let distance = ACCESS
+                .iter()
+                .map(|&(ax, ay)| (x as i16 - ax).abs() + (y as i16 - ay).abs())
+                .min()
+                .unwrap();
+            features[TF_SHED_DISTANCE] = (f64::from(distance) / MAX_SHED_DISTANCE) as f32;
+            features[TF_SHED_ACCESS] = f32::from(u8::from(is_shed_access(x, y)));
+
+            let age = f64::from(day.saturating_sub(tile.origin_day));
+            let episode_days = 30.0;
+            match tile.kind {
+                TileKind::Locked | TileKind::Empty | TileKind::Weed => {}
+                TileKind::Plant => {
+                    let crop = usize::from(tile.species);
+                    row[1] = (1 + crop) as i8;
+                    let stock = f64::from(tile.yield_units);
+                    features[TF_YIELD_FRACTION] =
+                        (stock / f64::from(CROP_MAX_HELD[crop])).min(1.0) as f32;
+                    features[TF_AGE_FRACTION] = (age / episode_days).min(1.0) as f32;
+                    features[TF_MATURITY_FRACTION] =
+                        (age / f64::from(FIRST_YIELD[crop])).min(1.0) as f32;
+                    features[TF_WATERED_TODAY] = f32::from(u8::from(tile.watered_or_fed));
+                    features[TF_FERTILIZER_REMAINING] = (f64::from(
+                        (i32::from(tile.fertilized_until_day) - i32::from(day) + 1).max(0),
+                    ) / 3.0)
+                        .min(1.0) as f32;
+                    features[TF_DECAY_PRESSURE] =
+                        (f64::from(tile.consecutive_unmet) / 2.0).min(1.0) as f32;
+                    if tile.max_lifespan_step >= 0 {
+                        features[TF_LIFESPAN_REMAINING] = (f64::from(
+                            (i32::from(tile.max_lifespan_step) - i32::from(step)).max(0),
+                        ) / 96.0)
+                            .min(1.0)
+                            as f32;
+                        let expired = i32::from(step) >= i32::from(tile.max_lifespan_step);
+                        features[TF_LIFESPAN_EXPIRED] = f32::from(u8::from(expired));
+                        features[TF_LIFESPAN_DECAY_TICK] = f32::from(u8::from(
+                            expired
+                                && (i32::from(step) - i32::from(tile.max_lifespan_step)) % 2 == 0,
+                        ));
+                    }
+                    features[TF_HARVEST_READY] = f32::from(u8::from(
+                        age >= f64::from(FIRST_YIELD[crop]) && tile.yield_units > 0,
+                    ));
+                }
+                TileKind::Coop | TileKind::Pasture => {
+                    if !tile.has_animal {
+                        continue;
+                    }
+                    let animal = usize::from(tile.species);
+                    row[1] = (1 + CROPS + animal) as i8;
+                    let stock = f64::from(tile.yield_units);
+                    features[TF_YIELD_FRACTION] =
+                        (stock / f64::from(ANIMAL_MAX_HELD[animal])).min(1.0) as f32;
+                    features[TF_AGE_FRACTION] = (age / episode_days).min(1.0) as f32;
+                    features[TF_MATURITY_FRACTION] =
+                        (age / f64::from(ANIMAL_FIRST_YIELD[animal])).min(1.0) as f32;
+                    features[TF_FED_TODAY] = f32::from(u8::from(tile.watered_or_fed));
+                    features[TF_CARED_TODAY] = f32::from(u8::from(tile.cared_today));
+                    features[TF_FERTILIZER_AVAILABLE] =
+                        f32::from(u8::from(tile.fertilizer_available));
+                    features[TF_PENDING_CARE_BONUS] =
+                        (f64::from(tile.pending_care_bonus) / 5.0).min(1.0) as f32;
+                    features[TF_DECAY_PRESSURE] =
+                        (f64::from(tile.consecutive_unmet) / 2.0).min(1.0) as f32;
+                    features[TF_HARVEST_READY] = f32::from(u8::from(tile.yield_units > 0));
+                }
+            }
+        }
+    }
+}
+
 #[inline]
 fn shape(kind: Shape, x: f64) -> f64 {
     match kind {
@@ -2476,17 +2800,17 @@ mod tests {
         game.farms[0].tiles[11].yield_units = 2;
         game.farms[0].unlocked = 0b111;
 
-        let expected = 0.82 * 2.0 * ANIMAL_COST[0] as f64
-            + 0.85 * 4.0 * SEED_COST[2] as f64
-            + 0.6 * SEED_COST[0] as f64
-            + 0.72 * 2.0 * game.market_prices[0] as f64
-            + 0.72 * ANIMAL_COST[1] as f64
-            + 0.72 * 3.0 * game.market_prices[6] as f64 // cow -> MILK
-            + 0.72 * ANIMAL_COST[0] as f64
-            + 0.72 * 1.0 * game.market_prices[5] as f64 // goose -> EGG
-            + 0.72 * ANIMAL_COST[2] as f64
-            + 0.72 * 2.0 * game.market_prices[7] as f64 // sheep -> WOOL
-            + 0.45 * (LAND_PRICES[0] + LAND_PRICES[1]) as f64;
+        let expected = ILLIQUID_SHED_ANIMAL_CREDIT * 2.0 * ANIMAL_COST[0] as f64
+            + ILLIQUID_SHED_SEED_CREDIT * 4.0 * SEED_COST[2] as f64
+            + ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[0] as f64
+            + ILLIQUID_PENDING_YIELD_CREDIT * 2.0 * game.market_prices[0] as f64
+            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[1] as f64
+            + ILLIQUID_PENDING_YIELD_CREDIT * 3.0 * game.market_prices[6] as f64 // cow -> MILK
+            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[0] as f64
+            + ILLIQUID_PENDING_YIELD_CREDIT * 1.0 * game.market_prices[5] as f64 // goose -> EGG
+            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[2] as f64
+            + ILLIQUID_PENDING_YIELD_CREDIT * 2.0 * game.market_prices[7] as f64 // sheep -> WOOL
+            + ILLIQUID_LAND_CREDIT * (LAND_PRICES[0] + LAND_PRICES[1]) as f64;
         assert!((game.illiquid_value(0) - expected).abs() < 1e-9);
         // Investment now moves the shaping potential instead of reading as
         // pure loss, so self-play cannot settle into the never-spend tie.
