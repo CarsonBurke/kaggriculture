@@ -19,3 +19,6 @@ evaluations/
 .vscode/
 .idea/
 .DS_Store
+
+# Local git worktrees for parallel experiment branches
+worktrees/
