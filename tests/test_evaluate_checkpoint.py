@@ -161,12 +161,14 @@ def test_run_game_records_non_done_status_as_an_explicit_error(monkeypatch) -> N
 
 
 def test_public_v27_alias_resolves_to_fixed_file(monkeypatch, tmp_path: Path) -> None:
+    import kaggriculture.opponents as opponents
+
     evaluator = _load_evaluator()
     opponent = tmp_path / "v27.py"
     opponent.write_text("def agent(obs): return {}\n", encoding="utf-8")
-    monkeypatch.setattr(evaluator, "PUBLIC_V27_OPPONENT", opponent)
+    monkeypatch.setattr(opponents, "PUBLIC_V27_OPPONENT", opponent)
 
-    label, resolved = evaluator._normalize_opponent("v27")
+    label, resolved = evaluator.normalize_opponent("v27")
 
     assert label == "public-v27"
     assert resolved == str(opponent.resolve())

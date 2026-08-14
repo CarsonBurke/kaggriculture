@@ -23,13 +23,11 @@ import numpy as np
 import torch
 
 from kaggriculture.inference import CheckpointAgent, load_actor_artifact
+from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.provenance import file_sha256, require_source_identity
 
 EPISODE_STEPS = 720
 DEFAULT_SEED_CLUSTERS = 32
-BUILTIN_OPPONENTS = frozenset(("pass", "random", "starter"))
-PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
-PUBLIC_V27_ALIASES = frozenset(("v27", "public-v27"))
 _CAPTURE_LIMIT = 4_000
 
 
@@ -93,20 +91,6 @@ _WORKER_AGENT: CheckpointAgent | None = None
 _WORKER_OPPONENT: str | None = None
 
 
-def _normalize_opponent(opponent: str) -> tuple[str, str]:
-    if opponent in BUILTIN_OPPONENTS:
-        return opponent, opponent
-    if opponent in PUBLIC_V27_ALIASES:
-        path = PUBLIC_V27_OPPONENT.resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"public v27 opponent is unavailable: {path}")
-        return "public-v27", str(path)
-    path = Path(opponent).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"opponent does not exist: {path}")
-    return path.name, str(path)
-
-
 def _resolve_device(name: str) -> torch.device:
     if name == "auto":
         name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -141,7 +125,9 @@ def _opponent_provenance(
     *,
     logical_path: str | None = None,
 ) -> dict[str, Any]:
-    if label in BUILTIN_OPPONENTS:
+    # The runnable, not the label, decides identity: a file opponent named
+    # like a built-in must still record file provenance.
+    if opponent in BUILTIN_OPPONENTS:
         return {"kind": "builtin", "name": label}
     path = Path(opponent).resolve()
     return {
@@ -561,7 +547,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     device = _resolve_device(args.device)
     if args.workers > 1 and device.type != "cpu":
         raise ValueError("parallel evaluation supports CPU only; use --workers 1 on accelerators")
-    opponent_label, opponent = _normalize_opponent(args.opponent)
+    opponent_label, opponent = normalize_opponent(args.opponent)
     seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="kaggriculture-evaluation-snapshot-") as name:

@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from kaggriculture.opponents import normalize_opponent
+
 
 @dataclass(frozen=True)
 class GameSpec:
@@ -52,12 +54,9 @@ class GameResult:
 
 
 def _normalize_agent(agent: str) -> str:
-    if agent in {"pass", "random", "starter"}:
-        return agent
-    path = Path(agent).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"agent does not exist: {path}")
-    return str(path)
+    runnable: str
+    _, runnable = normalize_opponent(agent)
+    return runnable
 
 
 def _run_game(spec: GameSpec) -> GameResult:
