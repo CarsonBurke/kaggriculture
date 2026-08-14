@@ -616,3 +616,61 @@ def test_slice_trajectories_views_the_arena_and_validates_the_range() -> None:
     for start, stop in ((-1, 2), (0, 0), (2, 1), (0, rollout.trajectories + 1)):
         with pytest.raises(ValueError, match="out of range"):
             slice_trajectories(rollout, start, stop)
+
+
+def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None:
+    """The done-step potential must switch from liquidation value to bank.
+
+    Forces player zero to end the episode holding a large unsold shed, so the
+    terminal branch is observable: with products still held, relative bank and
+    relative liquidation value differ, and the telescoped shaped return must
+    equal the exact relative final bank rather than the liquidation score.
+    Random-policy episodes cannot guard this — they end bankrupt and empty,
+    making the terminal reward zero either way.
+    """
+    import json
+
+    from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+    from kaggriculture.encoding import pair_potential, terminal_pair_potential
+
+    native = load_native()
+    environment = native.BatchEnv(np.asarray([911], dtype=np.uint64))
+    telescoped = 0.0
+    step = 0
+    while True:
+        unit = np.zeros((1, 2, MAX_UNITS), dtype=np.uint8)
+        kinds = np.zeros((1, 2, MAX_MARKET_ORDERS), dtype=np.uint8)
+        quantities = np.zeros((1, 2, MAX_MARKET_ORDERS), dtype=np.uint8)
+        if step == 0:
+            kinds[0, 0, 0] = MarketKind.BUY_PRODUCT_WHEAT
+            quantities[0, 0, 0] = 79  # quantity bin 79 orders 80 units
+        out = environment.step_factors(unit, kinds, quantities)
+        telescoped += float(np.asarray(out["shaped_rewards"])[0, 0])
+        step += 1
+        if np.asarray(out["dones"]).all():
+            break
+
+    frozen = json.loads(environment.snapshot_json(0))
+    observations = [
+        {
+            "player": player,
+            "farms": frozen["farms"],
+            "private": frozen["privates"][player],
+            "market": frozen["market"],
+        }
+        for player in range(2)
+    ]
+    assert observations[0]["private"]["shed"]["WHEAT"] == 80
+    terminal = terminal_pair_potential(observations[0], observations[1])
+    mid_episode = pair_potential(observations[0], observations[1])
+    assert abs(terminal - mid_episode) > 0.01
+
+    money = np.asarray(out["final_money"], dtype=np.float64)[0]
+    assert money[0] > 0.0 and money[1] > 0.0
+    relative_bank = (money[0] - money[1]) / (money[0] + money[1])
+    assert terminal == pytest.approx(relative_bank, abs=1e-9)
+    # Native terminal potential matches the python mirror bank-only score.
+    assert float(np.asarray(out["potentials"])[0]) == pytest.approx(terminal, abs=1e-7)
+    # The shaped return telescopes to the exact relative final bank, not to
+    # the liquidation score of the unsold shed.
+    assert telescoped == pytest.approx(relative_bank, abs=1e-5)

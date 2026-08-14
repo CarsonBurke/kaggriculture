@@ -20,7 +20,10 @@ pub(crate) struct BatchEnv {
     games: Vec<Game>,
     sampled_scratch: Vec<SampledFactors>,
     results_scratch: Vec<StepResult>,
-    previous_potentials_scratch: Vec<f32>,
+    /// Shaping potential of each game's current state, written by every step
+    /// path so the next step's previous potential is a carry-forward instead
+    /// of a recomputed liquidation walk.
+    potential_cache: Vec<f32>,
 }
 
 #[pymethods]
@@ -42,7 +45,7 @@ impl BatchEnv {
                 .map(|_| SampledFactors::default())
                 .collect(),
             results_scratch: vec![StepResult::default(); games.len()],
-            previous_potentials_scratch: vec![0.0; games.len()],
+            potential_cache: games.iter().map(Game::pair_potential).collect(),
             games,
         })
     }
@@ -63,6 +66,9 @@ impl BatchEnv {
         validate_seeds(seeds)?;
         for (game, &seed) in self.games.iter_mut().zip(seeds) {
             *game = Game::new(seed, GameConfig::default());
+        }
+        for (cached, game) in self.potential_cache.iter_mut().zip(&self.games) {
+            *cached = game.pair_potential();
         }
         Ok(())
     }
@@ -386,10 +392,6 @@ impl BatchEnv {
 
         let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
         let mut output_slices = output_arrays.slices()?;
-        self.previous_potentials_scratch
-            .par_iter_mut()
-            .zip(self.games.par_iter())
-            .for_each(|(output, game)| *output = game.pair_potential());
         {
             let games = &self.games;
             let sampled = &mut self.sampled_scratch;
@@ -452,7 +454,7 @@ impl BatchEnv {
             &self.games,
             &self.sampled_scratch,
             &self.results_scratch,
-            &self.previous_potentials_scratch,
+            &mut self.potential_cache,
             &mut output_slices,
         );
         Ok(())
@@ -471,7 +473,7 @@ impl BatchEnv {
             market_kinds,
             market_quantities,
         )?;
-        let previous_potentials: Vec<f32> = self.games.iter().map(Game::pair_potential).collect();
+        let previous_potentials = self.potential_cache.clone();
         let results = py.detach(|| {
             self.games
                 .par_iter_mut()
@@ -501,7 +503,8 @@ impl BatchEnv {
                 .into_pyarray(py),
         )?;
         output.set_item("dones", dones.into_pyarray(py))?;
-        let post_potentials: Vec<f32> = self.games.iter().map(Game::pair_potential).collect();
+        let post_potentials: Vec<f32> = self.games.iter().map(Game::post_step_potential).collect();
+        self.potential_cache.copy_from_slice(&post_potentials);
         let shaped: Vec<f32> = previous_potentials
             .iter()
             .zip(post_potentials.iter())
@@ -967,7 +970,7 @@ fn fill_sample_step_output(
     games: &[Game],
     sampled: &[SampledFactors],
     results: &[StepResult],
-    previous_potentials: &[f32],
+    potential_cache: &mut [f32],
     output: &mut SampleOutputSlices<'_>,
 ) {
     let SampleOutputSlices {
@@ -1022,19 +1025,21 @@ fn fill_sample_step_output(
             .copy_from_slice(&row.market_quantity_logprobs);
         entropy[row_index] = row.mean_entropy;
     }
-    for (game_index, ((game, result), &pre)) in games
+    for (game_index, ((game, result), cached)) in games
         .iter()
         .zip(results)
-        .zip(previous_potentials)
+        .zip(potential_cache)
         .enumerate()
     {
         let offset = game_index * PLAYERS;
         rewards[offset..offset + PLAYERS].copy_from_slice(&result.rewards);
         money[offset..offset + PLAYERS].copy_from_slice(&result.money);
         dones[game_index] = result.done;
+        let pre = *cached;
         previous[game_index] = pre;
-        let post = game.pair_potential();
+        let post = game.post_step_potential();
         potentials[game_index] = post;
+        *cached = post;
         let reward_zero = post - pre;
         shaped[offset] = reward_zero;
         shaped[offset + 1] = -reward_zero;

@@ -736,14 +736,105 @@ impl Game {
         }
     }
 
+    /// Bank money plus the exact proceeds of liquidating every held product.
+    ///
+    /// Mirrors the engine's sell arithmetic unit by unit: each unit quotes at
+    /// the current market inventory and a sale restocks the market only while
+    /// the quote sits above the price floor.  Products in unit hands count at
+    /// shed value, an optimistic bound: depositing needs shed room and one
+    /// more turn.  Quotes and counts are integers, so the sum is exact in f64.
+    pub fn liquidation_value(&self, player: usize) -> f64 {
+        let mut held = [0_i64; PRODUCTS];
+        for (count, &stored) in held.iter_mut().zip(&self.privates[player].shed) {
+            *count = i64::from(stored);
+        }
+        let units = usize::from(self.farms[player].units);
+        for inventory in &self.privates[player].inventories[..units] {
+            for (count, &carried) in held.iter_mut().zip(&inventory[..PRODUCTS]) {
+                *count += i64::from(carried);
+            }
+        }
+        let mut value = self.farms[player].money as f64;
+        for (item, &count) in held.iter().enumerate() {
+            let mut market = self.market_inventory[item];
+            for _ in 0..count {
+                let price = market_price(item, market);
+                value += price as f64;
+                if price > PRICE_FLOOR {
+                    market += 1;
+                }
+            }
+        }
+        value
+    }
+
+    /// Heuristic cost-basis credit for assets the market cannot buy back.
+    ///
+    /// Animals, seeds, planted crops, pending yields, and land have no exact
+    /// cash value, so this credits fractions of engine cost (posted prices
+    /// for pending yields) purely to smooth credit assignment across the
+    /// invest-produce-sell loop: without it, self-play collapses into a
+    /// never-spend tie equilibrium before harvests can pay back.  The
+    /// terminal bank override keeps the objective exact regardless of these
+    /// weights.
+    pub fn illiquid_value(&self, player: usize) -> f64 {
+        let mut value = 0.0;
+        let units = usize::from(self.farms[player].units);
+        for animal in 0..ANIMALS {
+            let mut held = i64::from(self.privates[player].shed[PRODUCTS + animal]);
+            for inventory in &self.privates[player].inventories[..units] {
+                held += i64::from(inventory[PRODUCTS + animal]);
+            }
+            value += 0.82 * held as f64 * ANIMAL_COST[animal] as f64;
+        }
+        #[allow(clippy::needless_range_loop)]
+        for crop in 0..CROPS {
+            value += 0.85 * f64::from(self.privates[player].seeds[crop]) * SEED_COST[crop] as f64;
+        }
+        for tile in self.farms[player].tiles {
+            if tile.has_animal {
+                let animal = usize::from(tile.species);
+                value += 0.72 * ANIMAL_COST[animal] as f64;
+                value += 0.72
+                    * f64::from(tile.yield_units)
+                    * self.market_prices[ANIMAL_PRODUCT[animal]] as f64;
+            } else if tile.kind == TileKind::Plant {
+                let crop = usize::from(tile.species);
+                value += 0.6 * SEED_COST[crop] as f64;
+                value += 0.72 * f64::from(tile.yield_units) * self.market_prices[crop] as f64;
+            }
+        }
+        let extra = self.farms[player].unlocked.count_ones().saturating_sub(1) as usize;
+        value += 0.45 * LAND_PRICES[..extra].iter().sum::<i64>() as f64;
+        value
+    }
+
+    /// Bounded relative farm value from player zero's perspective.
+    ///
+    /// The dense shaping potential: an exact liquidation core (market product
+    /// trades stay exactly potential-neutral and harvested-but-unsold output
+    /// is credited at true sale proceeds) plus the heuristic cost-basis
+    /// credit for illiquid assets.
     pub fn pair_potential(&self) -> f32 {
-        let money_zero = self.farms[0].money as f64;
-        let money_one = self.farms[1].money as f64;
-        let total = money_zero + money_one;
-        if total == 0.0 {
-            0.0
+        relative_score(
+            self.liquidation_value(0) + self.illiquid_value(0),
+            self.liquidation_value(1) + self.illiquid_value(1),
+        )
+    }
+
+    /// Bounded relative bank score, the quantity the engine actually scores.
+    pub fn terminal_potential(&self) -> f32 {
+        relative_score(self.farms[0].money as f64, self.farms[1].money as f64)
+    }
+
+    /// Post-step shaping potential: relative liquidation value mid-episode and
+    /// relative bank at termination, so the telescoped shaped return equals
+    /// the exact relative final bank score.
+    pub fn post_step_potential(&self) -> f32 {
+        if self.done {
+            self.terminal_potential()
         } else {
-            ((money_zero - money_one) / total) as f32
+            self.pair_potential()
         }
     }
 
@@ -2040,6 +2131,15 @@ fn shape(kind: Shape, x: f64) -> f64 {
     }
 }
 
+fn relative_score(zero: f64, one: f64) -> f32 {
+    let total = zero + one;
+    if total == 0.0 {
+        0.0
+    } else {
+        ((zero - one) / total) as f32
+    }
+}
+
 pub fn market_price(item: usize, inventory: i32) -> i64 {
     let (base, scale, below_shape, below_target, above_shape, above_target) = MARKET_PARAMS[item];
     let (kind, target, distance, sign) = if inventory < MARKET_I0 {
@@ -2292,11 +2392,10 @@ mod tests {
     }
 
     #[test]
-    fn pair_potential_is_exact_relative_bank_score() {
+    fn pair_potential_is_relative_farm_value_with_exact_liquid_core() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
-        game.privates[1].shed.fill(100);
         assert_eq!(game.pair_potential(), 0.5);
 
         game.farms[0].money = 1000;
@@ -2306,6 +2405,106 @@ mod tests {
         game.farms[0].money = 0;
         game.farms[1].money = 0;
         assert_eq!(game.pair_potential(), 0.0);
+
+        // Held products count at their exact sale proceeds, whether they sit
+        // in the shed or in a hired unit's hands.
+        game.farms[0].money = 1000;
+        game.farms[1].money = 1000;
+        game.farms[0].units = 2;
+        game.privates[0].shed[0] = 30;
+        game.privates[0].inventories[1][0] = 10;
+        game.privates[1].shed[4] = 5;
+        let zero = game.liquidation_value(0);
+        let one = game.liquidation_value(1);
+        assert!(zero > 1000.0);
+        assert!(one > 1000.0);
+        assert_eq!(game.pair_potential(), ((zero - one) / (zero + one)) as f32);
+
+        // Unhired unit slots are outside the observation and must not count.
+        game.privates[0].inventories[5][0] = 99;
+        assert_eq!(game.liquidation_value(0), zero);
+    }
+
+    #[test]
+    fn liquidation_value_matches_engine_sell_proceeds_exactly() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 250;
+        game.privates[0].shed[0] = 60;
+        game.privates[0].shed[4] = 25;
+        game.privates[0].shed[8] = 40;
+        // Deep above-target inventory drives MELON quotes onto the price
+        // floor, exercising the floor-conditional market restock.
+        game.market_inventory[4] = 10_320;
+        let predicted = game.liquidation_value(0);
+
+        for item in [0, 4, 8] {
+            while game.privates[0].shed[item] > 0 {
+                let price = market_price(item, game.market_inventory[item]);
+                let order = MarketOrder {
+                    kind: 13 + item as u8,
+                    item,
+                    remaining: 1,
+                };
+                assert!(game.commit_market_unit(0, order, price));
+            }
+        }
+
+        assert_eq!(predicted, game.farms[0].money as f64);
+    }
+
+    #[test]
+    fn illiquid_value_credits_cost_basis_fractions() {
+        let mut game = Game::new(0, GameConfig::default());
+        assert_eq!(game.illiquid_value(0), 0.0);
+        assert_eq!(game.illiquid_value(1), 0.0);
+
+        game.privates[0].shed[9] = 2; // geese in the shed
+        game.privates[0].seeds[2] = 4; // tomato seeds
+        game.farms[0].tiles[3].kind = TileKind::Plant;
+        game.farms[0].tiles[3].species = 0; // wheat
+        game.farms[0].tiles[3].yield_units = 2;
+        // All three species, pinning the species -> product price mapping
+        // (goose -> egg, cow -> milk, sheep -> wool).
+        game.farms[0].tiles[7].has_animal = true;
+        game.farms[0].tiles[7].species = 1; // cow
+        game.farms[0].tiles[7].yield_units = 3;
+        game.farms[0].tiles[9].has_animal = true;
+        game.farms[0].tiles[9].species = 0; // goose
+        game.farms[0].tiles[9].yield_units = 1;
+        game.farms[0].tiles[11].has_animal = true;
+        game.farms[0].tiles[11].species = 2; // sheep
+        game.farms[0].tiles[11].yield_units = 2;
+        game.farms[0].unlocked = 0b111;
+
+        let expected = 0.82 * 2.0 * ANIMAL_COST[0] as f64
+            + 0.85 * 4.0 * SEED_COST[2] as f64
+            + 0.6 * SEED_COST[0] as f64
+            + 0.72 * 2.0 * game.market_prices[0] as f64
+            + 0.72 * ANIMAL_COST[1] as f64
+            + 0.72 * 3.0 * game.market_prices[6] as f64 // cow -> MILK
+            + 0.72 * ANIMAL_COST[0] as f64
+            + 0.72 * 1.0 * game.market_prices[5] as f64 // goose -> EGG
+            + 0.72 * ANIMAL_COST[2] as f64
+            + 0.72 * 2.0 * game.market_prices[7] as f64 // sheep -> WOOL
+            + 0.45 * (LAND_PRICES[0] + LAND_PRICES[1]) as f64;
+        assert!((game.illiquid_value(0) - expected).abs() < 1e-9);
+        // Investment now moves the shaping potential instead of reading as
+        // pure loss, so self-play cannot settle into the never-spend tie.
+        assert!(game.pair_potential() > 0.0);
+    }
+
+    #[test]
+    fn terminal_potential_scores_bank_only() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 3000;
+        game.farms[1].money = 1000;
+        game.privates[1].shed.fill(100);
+        assert_eq!(game.terminal_potential(), 0.5);
+        assert!(game.pair_potential() < 0.5);
+
+        assert_eq!(game.post_step_potential(), game.pair_potential());
+        game.done = true;
+        assert_eq!(game.post_step_potential(), 0.5);
     }
 
     #[test]

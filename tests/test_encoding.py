@@ -6,15 +6,18 @@ from itertools import pairwise
 import numpy as np
 from kaggle_environments import make
 
-from kaggriculture.constants import MAX_UNITS
+from kaggriculture.constants import MAX_UNITS, PRICE_FLOOR, market_price
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
     GLOBAL_FEATURES,
     UNIT_FEATURES,
     encode_observation,
+    illiquid_value,
+    liquidation_value,
     pair_potential,
     shaped_pair_reward,
+    terminal_pair_potential,
 )
 
 
@@ -42,12 +45,10 @@ def test_encoding_shapes_and_viewpoint_symmetry() -> None:
     assert pair_potential(zero, one) == 0.0
 
 
-def test_pair_potential_is_exact_relative_bank_percentage() -> None:
+def test_pair_potential_is_relative_farm_value_with_exact_liquid_core() -> None:
     zero, one = _observations()
     zero["farms"][0]["money"] = 9000
     one["farms"][1]["money"] = 3000
-    zero["private"]["shed"]["WHEAT"] = 100
-    one["private"]["shed"]["MILK"] = 100
 
     assert pair_potential(zero, one) == 0.5
     zero["farms"][0]["money"] = 3000
@@ -57,6 +58,69 @@ def test_pair_potential_is_exact_relative_bank_percentage() -> None:
     zero["farms"][0]["money"] = 0
     one["farms"][1]["money"] = 0
     assert pair_potential(zero, one) == 0.0
+
+    # Held products shift the potential by their exact sale proceeds.
+    zero["farms"][0]["money"] = 1000
+    one["farms"][1]["money"] = 1000
+    zero["private"]["shed"]["WHEAT"] = 40
+    one["private"]["shed"]["MILK"] = 5
+    value_zero = liquidation_value(zero, 0)
+    value_one = liquidation_value(one, 1)
+    assert value_zero > 1000.0
+    assert value_one > 1000.0
+    assert pair_potential(zero, one) == (value_zero - value_one) / (value_zero + value_one)
+
+
+def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
+    zero, _ = _observations()
+    zero["private"]["shed"]["WHEAT"] = 3
+    zero["private"]["inventories"][0]["WHEAT"] = 2
+
+    expected = float(zero["farms"][0]["money"])
+    inventory_level = int(zero["market"]["inventory"]["WHEAT"])
+    for _ in range(5):
+        price = market_price("WHEAT", inventory_level)
+        expected += float(price)
+        if price > PRICE_FLOOR:
+            inventory_level += 1
+
+    assert liquidation_value(zero, 0) == expected
+
+
+def test_illiquid_value_credits_cost_basis_fractions() -> None:
+    zero, one = _observations()
+    assert illiquid_value(zero, 0) == 0.0
+    assert illiquid_value(one, 1) == 0.0
+
+    zero["private"]["shed"]["GOOSE"] = 2
+    zero["private"]["seeds"]["TOMATO"] = 4
+    zero["farms"][0]["tiles"][0][3] = {"kind": "PLANT", "crop": "WHEAT", "yield_units": 2}
+    zero["farms"][0]["tiles"][0][7] = {"animal": "COW", "yield_units": 3}
+    zero["farms"][0]["unlocked_quadrants"] = ["NW", "NE", "SW"]
+    prices = zero["market"]["prices"]
+
+    expected = (
+        0.82 * 2 * 300
+        + 0.85 * 4 * 50
+        + 0.6 * 10
+        + 0.72 * 2 * prices["WHEAT"]
+        + 0.72 * 400
+        + 0.72 * 3 * prices["MILK"]
+        + 0.45 * (1000 + 2000)
+    )
+    assert abs(illiquid_value(zero, 0) - expected) < 1e-9
+    # Investment moves the shaping potential instead of reading as pure loss.
+    assert pair_potential(zero, one) > 0.0
+
+
+def test_terminal_pair_potential_scores_bank_only() -> None:
+    zero, one = _observations()
+    zero["farms"][0]["money"] = 3000
+    one["farms"][1]["money"] = 1000
+    zero["private"]["shed"]["WHEAT"] = 100
+
+    assert terminal_pair_potential(zero, one) == 0.5
+    assert pair_potential(zero, one) > 0.5
 
 
 def test_dense_bank_rewards_telescope_without_a_terminal_override() -> None:

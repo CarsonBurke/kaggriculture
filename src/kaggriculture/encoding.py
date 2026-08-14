@@ -9,16 +9,22 @@ from typing import Any
 import numpy as np
 
 from kaggriculture.constants import (
+    ANIMAL_COST,
     ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
     CROPS,
     EPISODE_STEPS,
+    LAND_PRICES,
+    MARKET_I0,
     MAX_UNITS,
+    PRICE_FLOOR,
     PRIVATE_ITEMS,
     PRODUCTS,
+    SEED_COST,
     SHOP_NAMES,
     TURNS_PER_DAY,
+    market_price,
 )
 
 FARM_CHANNELS = 29
@@ -245,31 +251,144 @@ def encode_observation(
     )
 
 
-def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
-    """Exact bounded relative score from player zero's perspective.
+def _validated_player(observation: dict[str, Any], expected_player: int) -> int:
+    raw_player = observation.get("player", expected_player)
+    player = expected_player if raw_player is None else int(raw_player)
+    if player != expected_player:
+        raise ValueError(f"expected player {expected_player} observation, got player {player}")
+    farms = observation.get("farms") or []
+    if len(farms) != 2:
+        raise ValueError(f"expected exactly two farms, got {len(farms)}")
+    return player
 
-    Kaggriculture scores only bank money.  The normalized margin is the bank
-    advantage as a fraction of the money held by both players, is exactly
-    antisymmetric, and has exactly the same winner/tie relation as the final
-    score. It deliberately assigns no speculative value to inventory or future
-    output.
+
+def _scored_money(observation: dict[str, Any], expected_player: int) -> float:
+    player = _validated_player(observation, expected_player)
+    farms = observation.get("farms") or []
+    amount = float(farms[player].get("money", 0) or 0)
+    if not math.isfinite(amount) or amount < 0.0:
+        raise ValueError("farm money must be finite and non-negative")
+    return amount
+
+
+def liquidation_value(observation: dict[str, Any], expected_player: int) -> float:
+    """Bank money plus the exact proceeds of liquidating every held product.
+
+    Mirrors the engine's sell arithmetic unit by unit: each unit quotes at the
+    current market inventory and a sale restocks the market only while the
+    quote sits above the price floor.  Products in unit hands count at shed
+    value, an optimistic bound: depositing needs shed room and one more turn.
+    Quotes and counts are integers, so the sum is exact.
     """
-    observations = (observation_zero, observation_one)
-    money: list[float] = []
-    for expected_player, observation in enumerate(observations):
-        raw_player = observation.get("player", expected_player)
-        player = expected_player if raw_player is None else int(raw_player)
-        if player != expected_player:
-            raise ValueError(f"expected player {expected_player} observation, got player {player}")
-        farms = observation.get("farms") or []
-        if len(farms) != 2:
-            raise ValueError(f"expected exactly two farms, got {len(farms)}")
-        amount = float(farms[player].get("money", 0) or 0)
-        if not math.isfinite(amount) or amount < 0.0:
-            raise ValueError("farm money must be finite and non-negative")
-        money.append(amount)
-    total = money[0] + money[1]
-    return 0.0 if total == 0.0 else (money[0] - money[1]) / total
+    value = _scored_money(observation, expected_player)
+    private = observation.get("private") or {}
+    shed = private.get("shed") or {}
+    inventories = private.get("inventories") or []
+    market = observation.get("market") or {}
+    market_inventory = market.get("inventory") or {}
+    market_params = market.get("params")
+    for item in PRODUCTS:
+        held = int(shed.get(item, 0) or 0) + sum(
+            int(inventory.get(item, 0) or 0) for inventory in inventories
+        )
+        inventory_level = int(market_inventory.get(item, MARKET_I0))
+        for _ in range(held):
+            price = market_price(item, inventory_level, market_params)
+            value += float(price)
+            if price > PRICE_FLOOR:
+                inventory_level += 1
+    return value
+
+
+_ANIMAL_PRODUCT = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
+
+
+def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
+    """Heuristic cost-basis credit for assets the market cannot buy back.
+
+    Animals, seeds, planted crops, pending yields, and land have no exact cash
+    value, so this credits fractions of engine cost (posted prices for pending
+    yields) purely to smooth credit assignment across the invest-produce-sell
+    loop: without it, self-play collapses into a never-spend tie equilibrium
+    before harvests can pay back.  The terminal bank override keeps the
+    objective exact regardless of these weights.
+    """
+    player = _validated_player(observation, expected_player)
+    farm = (observation.get("farms") or [])[player]
+    private = observation.get("private") or {}
+    prices = (observation.get("market") or {}).get("prices") or {}
+    shed = private.get("shed") or {}
+    inventories = private.get("inventories") or []
+    seeds = private.get("seeds") or {}
+    value = 0.0
+    for animal, cost in ANIMAL_COST.items():
+        held = int(shed.get(animal, 0) or 0) + sum(
+            int(inventory.get(animal, 0) or 0) for inventory in inventories
+        )
+        value += 0.82 * held * cost
+    for crop in CROPS:
+        value += 0.85 * int(seeds.get(crop, 0) or 0) * SEED_COST[crop]
+    for row in farm.get("tiles") or []:
+        for tile in row:
+            if not isinstance(tile, dict):
+                continue
+            animal = tile.get("animal")
+            if animal is not None:
+                # Raise on schema drift: a silently skipped tile would diverge
+                # from the rust potential without tripping the parity oracle.
+                product = _ANIMAL_PRODUCT[animal]
+                value += 0.72 * ANIMAL_COST[animal]
+                value += (
+                    0.72
+                    * int(tile.get("yield_units", 0) or 0)
+                    * float(prices.get(product, BASE_PRICE[product]) or 0)
+                )
+            elif tile.get("kind") == "PLANT":
+                crop = tile.get("crop")
+                if crop not in SEED_COST:
+                    raise ValueError(f"unknown crop {crop!r} on planted tile")
+                value += 0.6 * SEED_COST[crop]
+                value += (
+                    0.72
+                    * int(tile.get("yield_units", 0) or 0)
+                    * float(prices.get(crop, BASE_PRICE[crop]) or 0)
+                )
+    extra_land = max(0, len(farm.get("unlocked_quadrants") or []) - 1)
+    value += 0.45 * sum(LAND_PRICES[:extra_land])
+    return value
+
+
+def _relative_score(zero: float, one: float) -> float:
+    total = zero + one
+    return 0.0 if total == 0.0 else (zero - one) / total
+
+
+def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
+    """Bounded relative farm value from player zero's perspective.
+
+    The dense shaping potential: an exact liquidation core (market product
+    trades stay exactly potential-neutral and harvested-but-unsold output is
+    credited at true sale proceeds) plus the heuristic cost-basis credit for
+    illiquid assets.
+    """
+    return _relative_score(
+        liquidation_value(observation_zero, 0) + illiquid_value(observation_zero, 0),
+        liquidation_value(observation_one, 1) + illiquid_value(observation_one, 1),
+    )
+
+
+def terminal_pair_potential(
+    observation_zero: dict[str, Any], observation_one: dict[str, Any]
+) -> float:
+    """Bounded relative bank score, the quantity the engine actually scores.
+
+    Used as the potential of terminal states so the telescoped shaped return
+    equals the exact relative final bank score.
+    """
+    return _relative_score(
+        _scored_money(observation_zero, 0),
+        _scored_money(observation_one, 1),
+    )
 
 
 def shaped_pair_reward(

@@ -20,6 +20,7 @@ from kaggriculture.encoding import (
     UNIT_FEATURES,
     pair_potential,
     shaped_pair_reward,
+    terminal_pair_potential,
 )
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.policy import PolicyStep, act_batch
@@ -1067,7 +1068,13 @@ def collect_self_play(
                 )
                 final_money[offset : offset + 2] = money
                 opponent_money[offset : offset + 2] = money[::-1]
-            next_potential = pair_potential(next_state[0].observation, next_state[1].observation)
+                next_potential = terminal_pair_potential(
+                    next_state[0].observation, next_state[1].observation
+                )
+            else:
+                next_potential = pair_potential(
+                    next_state[0].observation, next_state[1].observation
+                )
             pair_rewards = shaped_pair_reward(potentials[game], next_potential)
             potentials[game] = next_potential
             step_rewards[offset : offset + 2] = pair_rewards
@@ -1178,7 +1185,13 @@ def collect_frozen_opponent_play(
                 player_money = (float(farms[0]["money"]), float(farms[1]["money"]))
                 final_money[game] = player_money[int(seat)]
                 opponent_money[game] = player_money[1 - int(seat)]
-            next_potential = pair_potential(next_state[0].observation, next_state[1].observation)
+                next_potential = terminal_pair_potential(
+                    next_state[0].observation, next_state[1].observation
+                )
+            else:
+                next_potential = pair_potential(
+                    next_state[0].observation, next_state[1].observation
+                )
             pair_rewards = shaped_pair_reward(potentials[game], next_potential)
             potentials[game] = next_potential
             step_rewards[game] = pair_rewards[int(seat)]
