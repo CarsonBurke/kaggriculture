@@ -11,6 +11,12 @@ from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
     GLOBAL_FEATURES,
+    ILLIQUID_LAND_CREDIT,
+    ILLIQUID_PENDING_YIELD_CREDIT,
+    ILLIQUID_PLACED_ANIMAL_CREDIT,
+    ILLIQUID_PLANTED_SEED_CREDIT,
+    ILLIQUID_SHED_ANIMAL_CREDIT,
+    ILLIQUID_SHED_SEED_CREDIT,
     UNIT_FEATURES,
     encode_observation,
     illiquid_value,
@@ -100,13 +106,13 @@ def test_illiquid_value_credits_cost_basis_fractions() -> None:
     prices = zero["market"]["prices"]
 
     expected = (
-        0.82 * 2 * 300
-        + 0.85 * 4 * 50
-        + 0.6 * 10
-        + 0.72 * 2 * prices["WHEAT"]
-        + 0.72 * 400
-        + 0.72 * 3 * prices["MILK"]
-        + 0.45 * (1000 + 2000)
+        ILLIQUID_SHED_ANIMAL_CREDIT * 2 * 300
+        + ILLIQUID_SHED_SEED_CREDIT * 4 * 50
+        + ILLIQUID_PLANTED_SEED_CREDIT * 10
+        + ILLIQUID_PENDING_YIELD_CREDIT * 2 * prices["WHEAT"]
+        + ILLIQUID_PLACED_ANIMAL_CREDIT * 400
+        + ILLIQUID_PENDING_YIELD_CREDIT * 3 * prices["MILK"]
+        + ILLIQUID_LAND_CREDIT * (1000 + 2000)
     )
     assert abs(illiquid_value(zero, 0) - expected) < 1e-9
     # Investment moves the shaping potential instead of reading as pure loss.

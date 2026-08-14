@@ -302,6 +302,18 @@ def liquidation_value(observation: dict[str, Any], expected_player: int) -> floa
 
 _ANIMAL_PRODUCT = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
 
+# Illiquid cost-basis credit fractions for the shaping potential.  Kept near
+# engine cost so buying an asset is only a small potential dip: a deep dip
+# (land once sat at 0.45) makes every purchase an immediate shaped-reward
+# cliff the policy never crosses, starving the critic of post-purchase data.
+# Must stay identical to ILLIQUID_* in rust/kagg_env/src/core.rs.
+ILLIQUID_SHED_ANIMAL_CREDIT = 0.82
+ILLIQUID_SHED_SEED_CREDIT = 0.85
+ILLIQUID_PLACED_ANIMAL_CREDIT = 0.85
+ILLIQUID_PLANTED_SEED_CREDIT = 0.8
+ILLIQUID_PENDING_YIELD_CREDIT = 0.72
+ILLIQUID_LAND_CREDIT = 0.9
+
 
 def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
     """Heuristic cost-basis credit for assets the market cannot buy back.
@@ -325,9 +337,9 @@ def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
         held = int(shed.get(animal, 0) or 0) + sum(
             int(inventory.get(animal, 0) or 0) for inventory in inventories
         )
-        value += 0.82 * held * cost
+        value += ILLIQUID_SHED_ANIMAL_CREDIT * held * cost
     for crop in CROPS:
-        value += 0.85 * int(seeds.get(crop, 0) or 0) * SEED_COST[crop]
+        value += ILLIQUID_SHED_SEED_CREDIT * int(seeds.get(crop, 0) or 0) * SEED_COST[crop]
     for row in farm.get("tiles") or []:
         for tile in row:
             if not isinstance(tile, dict):
@@ -337,9 +349,9 @@ def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
                 # Raise on schema drift: a silently skipped tile would diverge
                 # from the rust potential without tripping the parity oracle.
                 product = _ANIMAL_PRODUCT[animal]
-                value += 0.72 * ANIMAL_COST[animal]
+                value += ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[animal]
                 value += (
-                    0.72
+                    ILLIQUID_PENDING_YIELD_CREDIT
                     * int(tile.get("yield_units", 0) or 0)
                     * float(prices.get(product, BASE_PRICE[product]) or 0)
                 )
@@ -347,14 +359,14 @@ def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
                 crop = tile.get("crop")
                 if crop not in SEED_COST:
                     raise ValueError(f"unknown crop {crop!r} on planted tile")
-                value += 0.6 * SEED_COST[crop]
+                value += ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[crop]
                 value += (
-                    0.72
+                    ILLIQUID_PENDING_YIELD_CREDIT
                     * int(tile.get("yield_units", 0) or 0)
                     * float(prices.get(crop, BASE_PRICE[crop]) or 0)
                 )
     extra_land = max(0, len(farm.get("unlocked_quadrants") or []) - 1)
-    value += 0.45 * sum(LAND_PRICES[:extra_land])
+    value += ILLIQUID_LAND_CREDIT * sum(LAND_PRICES[:extra_land])
     return value
 
 
