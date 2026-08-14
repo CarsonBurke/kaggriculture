@@ -48,6 +48,7 @@ from kaggriculture.registry import (
 )
 from kaggriculture.structured import StructuredActor
 from kaggriculture.tokens import encode_structured_observation
+from kaggriculture.training import write_checkpoint
 from kaggriculture.vapo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
 
 SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1,))
@@ -119,6 +120,11 @@ class DemonstrationTensors:
     """
 
     staged: dict[str, torch.Tensor]
+    # Active components per row, kept on the host. The clone loss is a mean
+    # over active components, so an epoch average must weight by that count;
+    # reducing the device masks per minibatch would sync the accelerator once
+    # per optimizer step for a value that never changes.
+    row_components: np.ndarray
 
     @property
     def rows(self) -> int:
@@ -212,8 +218,13 @@ def load_dataset(
         stacked = {
             name: np.concatenate([arrays[name] for arrays in members]) for name in members[0]
         }
+        components = sum(
+            stacked[name].astype(np.float64).sum(axis=1)
+            for name in ("unit_active", "market_active", "market_quantity_active")
+        )
         return DemonstrationTensors(
-            staged={name: torch.from_numpy(value).to(device) for name, value in stacked.items()}
+            staged={name: torch.from_numpy(value).to(device) for name, value in stacked.items()},
+            row_components=components,
         )
 
     return stage(splits[False]), stage(splits[True]), manifest
@@ -356,6 +367,7 @@ def _artifact_payload(
     config: Any,
     metrics: dict[str, float],
     bc_provenance: dict[str, Any],
+    identity: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
@@ -364,7 +376,10 @@ def _artifact_payload(
         "actor": {name: value.cpu() for name, value in actor.state_dict().items()},
         "iteration": 0,
         "metrics": metrics,
-        "source_identity": source_identity(),
+        # Bound once at launch, like every other entry point: re-hashing the
+        # tree per improving epoch would tag the weights with a source that
+        # may have changed since they were trained.
+        "source_identity": identity,
         "run_provenance": None,
         "bc_provenance": bc_provenance,
     }
@@ -396,8 +411,8 @@ def train(
     artifact_path = output_dir / "bc-actor.pt"
     metrics_path = output_dir / "metrics.jsonl"
     # A second clone into a populated directory would overwrite an artifact
-    # that may be better than anything this run produces, and would append a
-    # second epoch block to a journal that reads as one monotone run.
+    # that may be better than anything this run produces, and truncate the
+    # journal that is the only record of how it was produced.
     existing = [path for path in (artifact_path, metrics_path) if path.exists()]
     if existing:
         raise FileExistsError(
@@ -436,6 +451,7 @@ def train(
         "holdout_seeds": holdout_seeds,
         "command": sys.argv,
     }
+    identity = source_identity()
 
     best = math.inf
     best_metrics: dict[str, float] = {}
@@ -444,7 +460,14 @@ def train(
         for epoch in range(epochs):
             actor.train()
             started = time.perf_counter()
-            order = torch.randperm(train_split.rows, generator=generator).to(device)
+            # The permutation stays on the host as well: the epoch weights come
+            # from precomputed host-side counts, which needs the same order.
+            shuffle = torch.randperm(train_split.rows, generator=generator)
+            order = shuffle.to(device)
+            shuffled_components = train_split.row_components[shuffle.numpy()]
+            # The applied learning rate, captured before the first step of this
+            # epoch advances the cosine schedule past it.
+            applied_learning_rate = optimizer.param_groups[0]["lr"]
             epoch_loss = 0.0
             epoch_components = 0.0
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
@@ -459,11 +482,7 @@ def train(
                 # The loss is a mean over active components, so the epoch
                 # average must weight by that same count, exactly as the VAPO
                 # update aggregates its per-minibatch losses.
-                components = float(
-                    factors["unit_active"].sum()
-                    + factors["market_active"].sum()
-                    + factors["market_quantity_active"].sum()
-                )
+                components = float(shuffled_components[indices].sum())
                 epoch_loss += float(loss.detach()) * components
                 epoch_components += components
             holdout = evaluate(
@@ -472,7 +491,7 @@ def train(
             record = {
                 "epoch": epoch,
                 "train_loss": epoch_loss / max(epoch_components, 1.0),
-                "learning_rate": schedule.get_last_lr()[0],
+                "learning_rate": applied_learning_rate,
                 "seconds": time.perf_counter() - started,
                 **{f"holdout_{name}": value for name, value in holdout.items()},
             }
@@ -488,9 +507,13 @@ def train(
             )
             if holdout["nll"] < best:
                 best, best_metrics, stale = holdout["nll"], holdout, 0
-                torch.save(
-                    _artifact_payload(architecture, actor, config, holdout, bc_provenance),
+                # Atomic: a kill mid-save must not destroy the best artifact so
+                # far, which the rerun guard would then refuse to replace.
+                write_checkpoint(
                     artifact_path,
+                    _artifact_payload(
+                        architecture, actor, config, holdout, bc_provenance, identity
+                    ),
                 )
             else:
                 stale += 1
