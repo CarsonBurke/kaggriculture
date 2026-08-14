@@ -93,7 +93,6 @@ def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
         dataset_dir,
         architecture=CONV_ENTITY,
         holdout_seeds=1,
-        device=torch.device("cpu"),
         encode_workers=1,
     )
 
@@ -105,6 +104,38 @@ def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
     assert train_split.staged["unit_actions"].dtype == torch.int8
 
 
+@pytest.mark.parametrize("architecture", [CONV_ENTITY, STRUCTURED])
+def test_only_the_minibatch_crosses_to_the_accelerator(
+    dataset_dir: Path, architecture: str
+) -> None:
+    """The corpus stays on the host and the transfer happens per minibatch.
+
+    Staged on the device, dataset size and batch size compete for the same
+    memory and a large corpus fails to clone at a batch size that fits by
+    itself. The meta device stands in for an accelerator here: it records
+    placement without allocating, so the assertion runs on any machine.
+    """
+    trainer = _load_trainer()
+    train_split, _, _ = trainer.load_dataset(
+        dataset_dir,
+        architecture=architecture,
+        holdout_seeds=1,
+        encode_workers=1,
+    )
+    accelerator = torch.device("meta")
+
+    actor_args, factors = trainer._batch(architecture, train_split, torch.arange(8), accelerator)
+
+    assert all(value.device.type == "cpu" for value in train_split.staged.values())
+    assert all(value.device == accelerator for value in factors.values())
+    # The conv family splats four tensors; the structured family splats one
+    # named tuple of them.
+    moved = actor_args if architecture == CONV_ENTITY else tuple(actor_args[0])
+    assert moved and all(value.device == accelerator for value in moved)
+    assert factors["unit_actions"].dtype == torch.long
+    assert moved[0].dtype == (torch.float32 if architecture == CONV_ENTITY else torch.long)
+
+
 def test_structured_retokenization_yields_matched_rows(dataset_dir: Path) -> None:
     """Both families clone the same episodes: identical row counts and factors."""
     trainer = _load_trainer()
@@ -113,14 +144,12 @@ def test_structured_retokenization_yields_matched_rows(dataset_dir: Path) -> Non
         dataset_dir,
         architecture=CONV_ENTITY,
         holdout_seeds=1,
-        device=torch.device("cpu"),
         encode_workers=1,
     )
     train_split, holdout_split, _ = trainer.load_dataset(
         dataset_dir,
         architecture=STRUCTURED,
         holdout_seeds=1,
-        device=torch.device("cpu"),
         encode_workers=1,
     )
 
@@ -153,7 +182,6 @@ def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path
             corrupt,
             architecture=CONV_ENTITY,
             holdout_seeds=1,
-            device=torch.device("cpu"),
             encode_workers=1,
         )
 
@@ -325,14 +353,15 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
         dataset_dir,
         architecture=CONV_ENTITY,
         holdout_seeds=1,
-        device=torch.device("cpu"),
         encode_workers=1,
     )
     torch.manual_seed(0)
     from kaggriculture.model import FarmActor
 
     actor = FarmActor(_tiny_config())
-    actor_args, factors = trainer._batch(CONV_ENTITY, train_split, torch.arange(train_split.rows))
+    actor_args, factors = trainer._batch(
+        CONV_ENTITY, train_split, torch.arange(train_split.rows), torch.device("cpu")
+    )
     loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
 
     assert record["train_loss"] == pytest.approx(float(loss.detach()), rel=1e-5)
@@ -345,7 +374,6 @@ def test_clone_loss_is_the_masked_mean_component_nll(dataset_dir: Path, architec
         dataset_dir,
         architecture=architecture,
         holdout_seeds=1,
-        device=torch.device("cpu"),
         encode_workers=1,
     )
     torch.manual_seed(0)
@@ -356,10 +384,12 @@ def test_clone_loss_is_the_masked_mean_component_nll(dataset_dir: Path, architec
     else:
         actor = StructuredActor(_tiny_structured_config())
     indices = torch.arange(train_split.rows)
-    actor_args, factors = trainer._batch(architecture, train_split, indices)
+    actor_args, factors = trainer._batch(architecture, train_split, indices, torch.device("cpu"))
 
     loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
-    metrics = trainer.evaluate(architecture, actor, train_split, batch_size=64, autocast=False)
+    metrics = trainer.evaluate(
+        architecture, actor, train_split, batch_size=64, device=torch.device("cpu"), autocast=False
+    )
 
     active_counts = {
         "unit": float(factors["unit_active"].sum()),

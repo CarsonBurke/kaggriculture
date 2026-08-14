@@ -112,11 +112,20 @@ def parse_args() -> argparse.Namespace:
 
 @dataclass
 class DemonstrationTensors:
-    """Whole-dataset tensors staged on the training device.
+    """Whole-dataset tensors staged in host memory.
 
     Storage dtypes mirror the rollout staging path (fp16 features, int8/bool
     factors); minibatches cast to compute dtypes through the same batching
     helpers as the VAPO update.
+
+    The corpus stays on the host and only the minibatch crosses to the
+    accelerator. Staged on the device instead, dataset size and batch size
+    compete for the same memory: the conv-entity encoding is ~10 MiB per
+    episode-seat, so a thousand-seat corpus reserves ~10 GiB before a single
+    activation is allocated, and the clone's memory ceiling becomes a limit on
+    how much data it may learn from rather than on how wide a batch it may
+    take. The gather and transfer cost a few percent of a step whose forward
+    and backward dominate.
     """
 
     staged: dict[str, torch.Tensor]
@@ -180,7 +189,6 @@ def load_dataset(
     *,
     architecture: str,
     holdout_seeds: int,
-    device: torch.device,
     encode_workers: int,
 ) -> tuple[DemonstrationTensors, DemonstrationTensors, dict[str, Any]]:
     """Load, encode, and stage the dataset; returns (train, holdout, manifest)."""
@@ -223,7 +231,7 @@ def load_dataset(
             for name in ("unit_active", "market_active", "market_quantity_active")
         )
         return DemonstrationTensors(
-            staged={name: torch.from_numpy(value).to(device) for name, value in stacked.items()},
+            staged={name: torch.from_numpy(value) for name, value in stacked.items()},
             row_components=components,
         )
 
@@ -231,21 +239,34 @@ def load_dataset(
 
 
 def _batch(
-    architecture: str, tensors: DemonstrationTensors, indices: torch.Tensor
+    architecture: str,
+    tensors: DemonstrationTensors,
+    indices: torch.Tensor | slice,
+    device: torch.device,
 ) -> tuple[tuple[Any, ...], dict[str, torch.Tensor]]:
-    """One minibatch of actor forward arguments plus teacher-forced factors."""
-    staged = tensors.staged
-    actor_args = _actor_batch_args(architecture, staged, indices)
+    """One minibatch of actor forward arguments plus teacher-forced factors.
+
+    The gather runs on the host, where the corpus lives, and moves the narrow
+    storage dtypes; the widening casts to the compute dtypes then run on the
+    accelerator through the same helpers the VAPO update uses, so the bus
+    carries fp16 and int8 rather than the fp32 and int64 they become.
+    """
+    rows = {
+        name: _batch_tensor(value, indices).to(device, non_blocking=True)
+        for name, value in tensors.staged.items()
+    }
+    whole = slice(None)
+    actor_args = _actor_batch_args(architecture, rows, whole)
     factors = {
-        "unit_actions": _batch_tensor(staged["unit_actions"], indices, torch.long),
-        "market_kinds": _batch_tensor(staged["market_kinds"], indices, torch.long),
-        "market_quantities": _batch_tensor(staged["market_quantities"], indices, torch.long),
-        "unit_masks": _batch_tensor(staged["unit_masks"], indices),
-        "market_kind_masks": _batch_tensor(staged["market_kind_masks"], indices),
-        "market_quantity_masks": _batch_tensor(staged["market_quantity_masks"], indices),
-        "unit_active": _batch_tensor(staged["unit_active"], indices),
-        "market_active": _batch_tensor(staged["market_active"], indices),
-        "market_quantity_active": _batch_tensor(staged["market_quantity_active"], indices),
+        "unit_actions": _batch_tensor(rows["unit_actions"], whole, torch.long),
+        "market_kinds": _batch_tensor(rows["market_kinds"], whole, torch.long),
+        "market_quantities": _batch_tensor(rows["market_quantities"], whole, torch.long),
+        "unit_masks": rows["unit_masks"],
+        "market_kind_masks": rows["market_kind_masks"],
+        "market_quantity_masks": rows["market_quantity_masks"],
+        "unit_active": rows["unit_active"],
+        "market_active": rows["market_active"],
+        "market_quantity_active": rows["market_quantity_active"],
     }
     return actor_args, factors
 
@@ -291,6 +312,7 @@ def evaluate(
     tensors: DemonstrationTensors,
     *,
     batch_size: int,
+    device: torch.device,
     autocast: bool,
 ) -> dict[str, float]:
     """Per-head masked NLL, top-1 accuracy, and entropy on one split."""
@@ -299,10 +321,9 @@ def evaluate(
     hits = dict(sums)
     entropies = dict(sums)
     counts = dict(sums)
-    device = tensors.staged["unit_actions"].device
     for start in range(0, tensors.rows, batch_size):
-        indices = torch.arange(start, min(start + batch_size, tensors.rows), device=device)
-        actor_args, factors = _batch(architecture, tensors, indices)
+        indices = slice(start, min(start + batch_size, tensors.rows))
+        actor_args, factors = _batch(architecture, tensors, indices, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
             output = actor(*actor_args)
             quantity_logits = actor.quantity_logits(
@@ -427,7 +448,6 @@ def train(
         dataset_dir,
         architecture=architecture,
         holdout_seeds=holdout_seeds,
-        device=device,
         encode_workers=encode_workers,
     )
     manifest_digest = hashlib.sha256((dataset_dir / "manifest.json").read_bytes()).hexdigest()
@@ -460,18 +480,18 @@ def train(
         for epoch in range(epochs):
             actor.train()
             started = time.perf_counter()
-            # The permutation stays on the host as well: the epoch weights come
-            # from precomputed host-side counts, which needs the same order.
-            shuffle = torch.randperm(train_split.rows, generator=generator)
-            order = shuffle.to(device)
-            shuffled_components = train_split.row_components[shuffle.numpy()]
+            # The permutation indexes host storage and also selects the epoch
+            # weights from precomputed host-side counts, which needs the same
+            # order.
+            order = torch.randperm(train_split.rows, generator=generator)
+            shuffled_components = train_split.row_components[order.numpy()]
             # The applied learning rate, captured before the first step of this
             # epoch advances the cosine schedule past it.
             applied_learning_rate = optimizer.param_groups[0]["lr"]
             epoch_loss = 0.0
             epoch_components = 0.0
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
-                actor_args, factors = _batch(architecture, train_split, order[indices])
+                actor_args, factors = _batch(architecture, train_split, order[indices], device)
                 loss = _clone_loss(actor, actor_args, factors, autocast)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite clone loss in epoch {epoch}")
@@ -486,7 +506,12 @@ def train(
                 epoch_loss += float(loss.detach()) * components
                 epoch_components += components
             holdout = evaluate(
-                architecture, actor, holdout_split, batch_size=batch_size, autocast=autocast
+                architecture,
+                actor,
+                holdout_split,
+                batch_size=batch_size,
+                device=device,
+                autocast=autocast,
             )
             record = {
                 "epoch": epoch,
