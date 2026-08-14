@@ -19,6 +19,7 @@ import json
 import sys
 import time
 import zlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         help="other seat; when it equals the teacher, both seats are recorded",
     )
     parser.add_argument("--episode-steps", type=int, default=720)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help=(
+            "parallel episode extractors; seeds are independent games, so this "
+            "divides wall time almost exactly and changes nothing in the output"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -138,39 +148,75 @@ def _agent_digest(runnable: str) -> str | None:
     return None if runnable in BUILTIN_OPPONENTS else file_sha256(Path(runnable))
 
 
+def _extract_seed(
+    teacher: str,
+    opponent: str,
+    seed: int,
+    episode_steps: int,
+    seats: tuple[int, ...],
+    output_dir: Path,
+) -> list[dict[str, Any]]:
+    """Play one seed and archive every recorded seat of it.
+
+    Seeds are wholly independent games, so this is the unit of parallelism.
+    Each seat writes a uniquely named archive, so workers never contend.
+    """
+    steps = _play_episode(teacher, opponent, seed, episode_steps)
+    final = steps[-1]
+    records = []
+    for seat in seats:
+        arrays = extract_episode(steps, seat, episode_steps=episode_steps)
+        name = f"episode-{seed:08d}-seat{seat}"
+        np.savez_compressed(output_dir / f"{name}.npz", **arrays)
+        records.append(
+            {
+                "file": f"{name}.npz",
+                "seed": seed,
+                "seat": seat,
+                "steps": episode_steps - 1,
+                "teacher_money": float(final[seat].reward),
+                "opponent_money": float(final[1 - seat].reward),
+            }
+        )
+    return records
+
+
 def main() -> None:
     args = parse_args()
     if args.episodes < 1 or args.episode_steps != 720:
         raise ValueError("extraction needs at least one episode at the competition horizon")
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
     teacher_label, teacher = normalize_opponent(args.teacher)
     opponent_label, opponent = normalize_opponent(args.opponent)
     mirrored = teacher == opponent
+    seats = (0, 1) if mirrored else (0,)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    episodes = []
+    seeds = range(args.seed_start, args.seed_start + args.episodes)
+    episodes: list[dict[str, Any]] = []
     started = time.perf_counter()
-    for seed in range(args.seed_start, args.seed_start + args.episodes):
-        steps = _play_episode(teacher, opponent, seed, args.episode_steps)
-        final = steps[-1]
-        for seat in (0, 1) if mirrored else (0,):
-            arrays = extract_episode(steps, seat, episode_steps=args.episode_steps)
-            name = f"episode-{seed:08d}-seat{seat}"
-            np.savez_compressed(args.output_dir / f"{name}.npz", **arrays)
-            episodes.append(
-                {
-                    "file": f"{name}.npz",
-                    "seed": seed,
-                    "seat": seat,
-                    "steps": args.episode_steps - 1,
-                    "teacher_money": float(final[seat].reward),
-                    "opponent_money": float(final[1 - seat].reward),
-                }
+    with ProcessPoolExecutor(max_workers=min(args.workers, args.episodes)) as pool:
+        pending = {
+            pool.submit(
+                _extract_seed, teacher, opponent, seed, args.episode_steps, seats, args.output_dir
+            ): seed
+            for seed in seeds
+        }
+        # A failed projection must abort the whole extraction: a dataset that
+        # silently omits the seeds the ledger could not represent is a biased
+        # dataset. Raising here shuts the pool down with the offending step.
+        for future in as_completed(pending):
+            episodes.extend(future.result())
+            elapsed = time.perf_counter() - started
+            print(
+                f"seed {pending[future]}: extracted "
+                f"({elapsed:.1f}s elapsed, {len(episodes)} episode-seats)",
+                flush=True,
             )
-        elapsed = time.perf_counter() - started
-        print(
-            f"seed {seed}: extracted ({elapsed:.1f}s elapsed, {len(episodes)} episode-seats)",
-            flush=True,
-        )
+    # Completion order is nondeterministic under parallelism; the manifest is
+    # provenance and is hashed, so it is written in seed order regardless.
+    episodes.sort(key=lambda record: (record["seed"], record["seat"]))
 
     manifest = {
         "format_version": DATASET_FORMAT_VERSION,
