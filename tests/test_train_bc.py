@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+from kaggle_environments import make
+
+from kaggriculture.inference import load_actor_artifact
+from kaggriculture.model import ModelConfig
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED
+from kaggriculture.structured import StructuredActor, StructuredConfig
+
+EPISODE_STEPS = 8
+
+
+def _load_trainer():
+    path = Path(__file__).parents[1] / "scripts" / "train_bc.py"
+    spec = importlib.util.spec_from_file_location("train_bc", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_extractor():
+    path = Path(__file__).parents[1] / "scripts" / "extract_bc_dataset.py"
+    spec = importlib.util.spec_from_file_location("extract_bc_dataset", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def dataset_dir(tmp_path_factory) -> Path:
+    """A tiny real-engine mirrored dataset: 2 seeds x 2 seats of starter play."""
+    extractor = _load_extractor()
+    directory = tmp_path_factory.mktemp("bc-dataset")
+    episodes = []
+    for seed in (3, 4):
+        environment = make(
+            "kaggriculture",
+            configuration={"episodeSteps": EPISODE_STEPS, "seed": seed},
+            debug=False,
+        )
+        environment.run(["starter", "starter"])
+        for seat in (0, 1):
+            arrays = extractor.extract_episode(environment.steps, seat, episode_steps=EPISODE_STEPS)
+            name = f"episode-{seed:08d}-seat{seat}"
+            np.savez_compressed(directory / f"{name}.npz", **arrays)
+            episodes.append({"file": f"{name}.npz", "seed": seed, "seat": seat})
+    manifest = {
+        "format_version": 1,
+        "teacher": {"label": "starter", "sha256": None},
+        "opponent": {"label": "starter", "sha256": None},
+        "episode_steps": EPISODE_STEPS,
+        "episodes": episodes,
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return directory
+
+
+def _tiny_config() -> ModelConfig:
+    return ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
+
+
+def _tiny_structured_config() -> StructuredConfig:
+    return StructuredConfig(
+        model_dim=16,
+        attention_heads=2,
+        ffn_multiplier=1,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+        quantity_rank=4,
+    )
+
+
+def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
+    trainer = _load_trainer()
+
+    train_split, holdout_split, manifest = trainer.load_dataset(
+        dataset_dir,
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    rows_per_seed = 2 * (EPISODE_STEPS - 1)
+    assert train_split.rows == rows_per_seed
+    assert holdout_split.rows == rows_per_seed
+    assert manifest["teacher"]["label"] == "starter"
+    assert train_split.staged["board"].dtype == torch.float16
+    assert train_split.staged["unit_actions"].dtype == torch.int8
+
+
+def test_structured_retokenization_yields_matched_rows(dataset_dir: Path) -> None:
+    """Both families clone the same episodes: identical row counts and factors."""
+    trainer = _load_trainer()
+
+    conv_train, conv_holdout, _ = trainer.load_dataset(
+        dataset_dir,
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+    train_split, holdout_split, _ = trainer.load_dataset(
+        dataset_dir,
+        architecture=STRUCTURED,
+        holdout_seeds=1,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    assert (train_split.rows, holdout_split.rows) == (conv_train.rows, conv_holdout.rows)
+    for split, conv_split in ((train_split, conv_train), (holdout_split, conv_holdout)):
+        for name in trainer._FACTOR_FIELDS:
+            torch.testing.assert_close(split.staged[name], conv_split.staged[name])
+    assert set(trainer._STRUCTURED_STATE_FIELDS) <= set(train_split.staged)
+    assert "board" not in train_split.staged
+    assert train_split.staged["tile_categorical"].dtype == torch.int8
+    assert train_split.staged["tile_continuous"].dtype == torch.float16
+
+
+def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+    corrupt = tmp_path / "corrupt"
+    corrupt.mkdir()
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    for entry in manifest["episodes"]:
+        with np.load(dataset_dir / entry["file"]) as archive:
+            arrays = dict(archive)
+        arrays["unit_actions"] = arrays["unit_actions"].copy()
+        arrays["unit_masks"] = arrays["unit_masks"].copy()
+        arrays["unit_masks"][0, 0, arrays["unit_actions"][0, 0]] = False
+        np.savez_compressed(corrupt / entry["file"], **arrays)
+    (corrupt / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="violate their own masks"):
+        trainer.load_dataset(
+            corrupt,
+            architecture=CONV_ENTITY,
+            holdout_seeds=1,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )
+
+
+def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+
+    best = trainer.train(
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=2,
+        patience=2,
+        batch_size=8,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    assert set(best) >= {"nll", "unit_nll", "unit_accuracy", "kind_accuracy"}
+    records = [
+        json.loads(line)
+        for line in (output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["epoch"] for record in records] == [0, 1]
+    assert all(np.isfinite(record["train_loss"]) for record in records)
+
+    actor, payload = load_actor_artifact(output / "bc-actor.pt")
+    assert payload["architecture"] == CONV_ENTITY
+    assert payload["bc_provenance"]["teacher"]["label"] == "starter"
+    assert len(payload["bc_provenance"]["manifest_sha256"]) == 64
+    assert actor.training is False
+
+
+def test_structured_training_saves_a_loadable_structured_artifact(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    trainer = _load_trainer()
+    output = tmp_path / "run-structured"
+
+    best = trainer.train(
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        architecture=STRUCTURED,
+        config=_tiny_structured_config(),
+        holdout_seeds=1,
+        epochs=2,
+        patience=2,
+        batch_size=8,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    assert np.isfinite(best["nll"])
+    actor, payload = load_actor_artifact(output / "bc-actor.pt")
+    assert isinstance(actor, StructuredActor)
+    assert payload["architecture"] == STRUCTURED
+    assert payload["model_config"] == _tiny_structured_config().to_dict()
+    assert payload["bc_provenance"]["architecture"] == STRUCTURED
+    assert actor.training is False
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected"), [(CONV_ENTITY, ModelConfig()), (STRUCTURED, StructuredConfig())]
+)
+def test_unflagged_clone_builds_the_family_default_configuration(
+    monkeypatch, tmp_path: Path, architecture: str, expected: object
+) -> None:
+    """A warm start compares model configurations for equality, so an
+    unflagged clone and an unflagged training run must agree by construction."""
+    trainer = _load_trainer()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_bc.py",
+            "--dataset",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "run"),
+            "--architecture",
+            architecture,
+        ],
+    )
+    args = trainer.parse_args()
+
+    config = trainer.model_config_from_args(trainer.resolve_architecture(architecture), args)
+
+    assert config == expected
+
+
+def test_clone_rejects_a_config_from_another_family(dataset_dir: Path, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+
+    with pytest.raises(ValueError, match="does not configure the structured architecture"):
+        trainer.train(
+            dataset_dir=dataset_dir,
+            output_dir=tmp_path / "mismatch",
+            architecture=STRUCTURED,
+            config=_tiny_config(),
+            holdout_seeds=1,
+            epochs=1,
+            patience=1,
+            batch_size=8,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            seed=0,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )
+
+
+def test_clone_refuses_to_overwrite_an_existing_run(dataset_dir: Path, tmp_path: Path) -> None:
+    """A rerun would clobber an artifact that may beat anything it produces."""
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+    arguments = dict(
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=1,
+        patience=1,
+        batch_size=8,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    trainer.train(**arguments)
+    with pytest.raises(FileExistsError, match=r"bc-actor\.pt, metrics\.jsonl"):
+        trainer.train(**arguments)
+
+
+def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_path: Path) -> None:
+    """The loss is a mean over active components, so the epoch average must
+    weight by that count — not by rows, which vary in how many units act."""
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+    trainer.train(
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=1,
+        patience=1,
+        batch_size=1_000_000,  # one minibatch: the epoch mean is that loss exactly
+        learning_rate=0.0,  # frozen weights, so the recorded loss is reproducible
+        weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+    record = json.loads((output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+    train_split, _, _ = trainer.load_dataset(
+        dataset_dir,
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+    torch.manual_seed(0)
+    from kaggriculture.model import FarmActor
+
+    actor = FarmActor(_tiny_config())
+    actor_args, factors = trainer._batch(CONV_ENTITY, train_split, torch.arange(train_split.rows))
+    loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
+
+    assert record["train_loss"] == pytest.approx(float(loss.detach()), rel=1e-5)
+
+
+@pytest.mark.parametrize("architecture", [CONV_ENTITY, STRUCTURED])
+def test_clone_loss_is_the_masked_mean_component_nll(dataset_dir: Path, architecture: str) -> None:
+    trainer = _load_trainer()
+    train_split, _, _ = trainer.load_dataset(
+        dataset_dir,
+        architecture=architecture,
+        holdout_seeds=1,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+    torch.manual_seed(0)
+    if architecture == CONV_ENTITY:
+        from kaggriculture.model import FarmActor
+
+        actor = FarmActor(_tiny_config())
+    else:
+        actor = StructuredActor(_tiny_structured_config())
+    indices = torch.arange(train_split.rows)
+    actor_args, factors = trainer._batch(architecture, train_split, indices)
+
+    loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
+    metrics = trainer.evaluate(architecture, actor, train_split, batch_size=64, autocast=False)
+
+    active_counts = {
+        "unit": float(factors["unit_active"].sum()),
+        "kind": float(factors["market_active"].sum()),
+        "quantity": float(factors["market_quantity_active"].sum()),
+    }
+    expected = sum(metrics[f"{name}_nll"] * count for name, count in active_counts.items()) / sum(
+        active_counts.values()
+    )
+    assert float(loss.detach()) == pytest.approx(expected, rel=1e-5)
