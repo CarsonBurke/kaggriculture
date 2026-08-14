@@ -41,6 +41,8 @@ from kaggriculture.constants import (
 )
 from kaggriculture.encoding import EncodedObservation, encode_observation
 from kaggriculture.model import ActorOutput, FarmActor
+from kaggriculture.structured import StructuredActor, stack_structured
+from kaggriculture.tokens import StructuredObservation, encode_structured_observation
 
 _MARKET_SEED_ITEMS = dict(
     zip(
@@ -94,7 +96,9 @@ class ActionFactors:
 @dataclass(frozen=True)
 class PolicyStep:
     actions: list[dict[str, Any]]
-    encoded: list[EncodedObservation]
+    # Per-architecture encodings: EncodedObservation for the convolutional
+    # family, StructuredObservation for the structured transformer.
+    encoded: list[EncodedObservation] | list[StructuredObservation]
     factors: ActionFactors
 
 
@@ -382,7 +386,7 @@ def _apply_ledger_order(
 
 @torch.inference_mode()
 def act_batch(
-    actor: FarmActor,
+    actor: FarmActor | StructuredActor,
     observations: list[dict[str, Any]],
     opponent_privates: list[dict[str, Any] | None] | None = None,
     *,
@@ -398,12 +402,22 @@ def act_batch(
     if len(opponent_privates) != len(observations):
         raise ValueError("opponent private-state count must match observations")
     device = next(actor.parameters()).device
-    encoded = [
-        encode_observation(observation, opponent_private)
-        for observation, opponent_private in zip(observations, opponent_privates, strict=True)
-    ]
-    tensors = stack_encoded(encoded, device)
-    output = actor(tensors.board, tensors.global_features, tensors.units, tensors.unit_positions)
+    if isinstance(actor, StructuredActor):
+        encoded = [
+            encode_structured_observation(observation, opponent_private)
+            for observation, opponent_private in zip(observations, opponent_privates, strict=True)
+        ]
+        inputs, _ = stack_structured(encoded, device=device)
+        output = actor(inputs)
+    else:
+        encoded = [
+            encode_observation(observation, opponent_private)
+            for observation, opponent_private in zip(observations, opponent_privates, strict=True)
+        ]
+        tensors = stack_encoded(encoded, device)
+        output = actor(
+            tensors.board, tensors.global_features, tensors.units, tensors.unit_positions
+        )
     unit_logits = output.unit_logits.float().cpu().numpy()
     market_kind_logits = output.market_kind_logits.float().cpu().numpy()
     market_quantity_context = output.market_quantity_context.float().cpu().numpy()

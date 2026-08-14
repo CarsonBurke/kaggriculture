@@ -355,6 +355,98 @@ def _board_positions() -> Tensor:
     return torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
 
 
+def initialize_policy_heads(
+    unit_head: nn.Linear,
+    market_kind: nn.Linear,
+    market_quantity_context: nn.Linear,
+    market_quantity_kind_gate: nn.Embedding,
+    market_quantity_value: nn.Embedding,
+    market_quantity_bias: nn.Parameter,
+) -> None:
+    """Initialize the shared policy heads every actor architecture uses."""
+    for head in (unit_head, market_kind, market_quantity_context):
+        nn.init.normal_(head.weight, std=0.01)
+        if head.bias is not None:
+            nn.init.zeros_(head.bias)
+    nn.init.zeros_(market_quantity_kind_gate.weight)
+    nn.init.normal_(market_quantity_value.weight, std=0.01)
+    nn.init.zeros_(market_quantity_bias)
+
+    # Legal masks already remove actions that cannot have an effect. Among
+    # the remaining actions, favor completing an economic cycle over random
+    # movement or destroying an investment. Every action remains learnable.
+    with torch.no_grad():
+        unit_bias = unit_head.bias
+        unit_bias[UnitAction.PASS] = -1.25
+        unit_bias[UnitAction.DROP] = 2.0
+        for item, maximum, offset in (
+            ("WHEAT", 16, 1.0),
+            ("FERTILIZER", 8, 0.75),
+            ("GOOSE", 4, 0.75),
+            ("COW", 4, 0.75),
+            ("SHEEP", 4, 0.75),
+        ):
+            for quantity in range(1, maximum + 1):
+                unit_bias[UnitAction[f"PICKUP_{item}_{quantity}"]] = offset - math.log(quantity)
+        unit_bias[UnitAction.PLACE_GOOSE : UnitAction.PLACE_SHEEP + 1] = 2.0
+        unit_bias[UnitAction.PLANT_WHEAT : UnitAction.PLANT_MELON + 1] = 1.0
+        unit_bias[UnitAction.WATER] = 2.0
+        unit_bias[UnitAction.HARVEST] = 2.5
+        unit_bias[UnitAction.FERTILIZE] = 1.0
+        unit_bias[UnitAction.DIG] = -0.5
+        unit_bias[UnitAction.BUILD_COOP : UnitAction.BUILD_PASTURE + 1] = -2.5
+        unit_bias[UnitAction.FEED] = 2.0
+        unit_bias[UnitAction.COLLECT_FERTILIZER] = 2.0
+        unit_bias[UnitAction.CARE] = 1.0
+
+        # Keep roughly 95% opening STOP probability and bias initial
+        # exploration toward cheap hires/seeds and inventory liquidation.
+        kind_bias = market_kind.bias
+        kind_bias[MarketKind.STOP] = 4.5
+        kind_bias[MarketKind.HIRE] = 1.0
+        kind_bias[MarketKind.BUY_LAND] = -7.0
+        kind_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1] = -1.0
+        kind_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_PRODUCT_FERTILIZER + 1] = -3.0
+        kind_bias[MarketKind.BUY_ANIMAL_GOOSE : MarketKind.BUY_ANIMAL_SHEEP + 1] = -4.0
+        kind_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1] = 4.0
+
+        quantities = torch.as_tensor(
+            QUANTITY_BINS,
+            device=market_quantity_bias.device,
+            dtype=market_quantity_bias.dtype,
+        )
+        log_quantity = quantities.log()
+        market_quantity_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1].copy_(
+            -2.0 * log_quantity
+        )
+        market_quantity_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1].copy_(
+            -2.5 * log_quantity
+        )
+        market_quantity_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1].copy_(
+            0.5 * log_quantity
+        )
+
+
+def factored_quantity_logits(
+    quantity_context: Tensor,
+    market_kinds: Tensor,
+    kind_gate: nn.Embedding,
+    quantity_value: nn.Embedding,
+    quantity_bias: Tensor,
+    quantity_rank: int,
+) -> Tensor:
+    """Score exact quantities only for the already-selected market kind."""
+    if quantity_context.shape[:-1] != market_kinds.shape:
+        raise ValueError("quantity context and selected market kinds must align")
+    if quantity_context.shape[-1] != quantity_rank:
+        raise ValueError("quantity context has the wrong feature width")
+    quantity_features = quantity_context * (1.0 + kind_gate(market_kinds.long()))
+    return (
+        torch.einsum("bsr,qr->bsq", quantity_features, quantity_value.weight)
+        + quantity_bias[market_kinds.long()]
+    )
+
+
 class FarmActor(nn.Module):
     """Decentralized entity policy using only the acting player's private state."""
 
@@ -386,82 +478,24 @@ class FarmActor(nn.Module):
         self._initialize_policy_heads()
 
     def _initialize_policy_heads(self) -> None:
-        heads = (self.unit_head[-1], self.market_kind, self.market_quantity_context)
-        for head in heads:
-            nn.init.normal_(head.weight, std=0.01)
-            if head.bias is not None:
-                nn.init.zeros_(head.bias)
-        nn.init.zeros_(self.market_quantity_kind_gate.weight)
-        nn.init.normal_(self.market_quantity_value.weight, std=0.01)
-        nn.init.zeros_(self.market_quantity_bias)
-
-        # Legal masks already remove actions that cannot have an effect. Among
-        # the remaining actions, favor completing an economic cycle over random
-        # movement or destroying an investment. Every action remains learnable.
-        with torch.no_grad():
-            unit_bias = self.unit_head[-1].bias
-            unit_bias[UnitAction.PASS] = -1.25
-            unit_bias[UnitAction.DROP] = 2.0
-            for item, maximum, offset in (
-                ("WHEAT", 16, 1.0),
-                ("FERTILIZER", 8, 0.75),
-                ("GOOSE", 4, 0.75),
-                ("COW", 4, 0.75),
-                ("SHEEP", 4, 0.75),
-            ):
-                for quantity in range(1, maximum + 1):
-                    unit_bias[UnitAction[f"PICKUP_{item}_{quantity}"]] = offset - math.log(quantity)
-            unit_bias[UnitAction.PLACE_GOOSE : UnitAction.PLACE_SHEEP + 1] = 2.0
-            unit_bias[UnitAction.PLANT_WHEAT : UnitAction.PLANT_MELON + 1] = 1.0
-            unit_bias[UnitAction.WATER] = 2.0
-            unit_bias[UnitAction.HARVEST] = 2.5
-            unit_bias[UnitAction.FERTILIZE] = 1.0
-            unit_bias[UnitAction.DIG] = -0.5
-            unit_bias[UnitAction.BUILD_COOP : UnitAction.BUILD_PASTURE + 1] = -2.5
-            unit_bias[UnitAction.FEED] = 2.0
-            unit_bias[UnitAction.COLLECT_FERTILIZER] = 2.0
-            unit_bias[UnitAction.CARE] = 1.0
-
-            # Keep roughly 95% opening STOP probability and bias initial
-            # exploration toward cheap hires/seeds and inventory liquidation.
-            kind_bias = self.market_kind.bias
-            kind_bias[MarketKind.STOP] = 4.5
-            kind_bias[MarketKind.HIRE] = 1.0
-            kind_bias[MarketKind.BUY_LAND] = -7.0
-            kind_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1] = -1.0
-            kind_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_PRODUCT_FERTILIZER + 1] = -3.0
-            kind_bias[MarketKind.BUY_ANIMAL_GOOSE : MarketKind.BUY_ANIMAL_SHEEP + 1] = -4.0
-            kind_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1] = 4.0
-
-            quantities = torch.as_tensor(
-                QUANTITY_BINS,
-                device=self.market_quantity_bias.device,
-                dtype=self.market_quantity_bias.dtype,
-            )
-            log_quantity = quantities.log()
-            quantity_bias = self.market_quantity_bias
-            quantity_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1].copy_(
-                -2.0 * log_quantity
-            )
-            quantity_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1].copy_(
-                -2.5 * log_quantity
-            )
-            quantity_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1].copy_(
-                0.5 * log_quantity
-            )
+        initialize_policy_heads(
+            self.unit_head[-1],
+            self.market_kind,
+            self.market_quantity_context,
+            self.market_quantity_kind_gate,
+            self.market_quantity_value,
+            self.market_quantity_bias,
+        )
 
     def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
         """Score exact quantities only for the already-selected market kind."""
-        if quantity_context.shape[:-1] != market_kinds.shape:
-            raise ValueError("quantity context and selected market kinds must align")
-        if quantity_context.shape[-1] != self.config.quantity_rank:
-            raise ValueError("quantity context has the wrong feature width")
-        quantity_features = quantity_context * (
-            1.0 + self.market_quantity_kind_gate(market_kinds.long())
-        )
-        return (
-            torch.einsum("bsr,qr->bsq", quantity_features, self.market_quantity_value.weight)
-            + self.market_quantity_bias[market_kinds.long()]
+        return factored_quantity_logits(
+            quantity_context,
+            market_kinds,
+            self.market_quantity_kind_gate,
+            self.market_quantity_value,
+            self.market_quantity_bias,
+            self.config.quantity_rank,
         )
 
     def forward(
