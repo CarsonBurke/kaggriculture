@@ -19,7 +19,7 @@ import json
 import sys
 import time
 import zlib
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +181,35 @@ def _extract_seed(
     return records
 
 
+def collect_extractions(pending: dict[Future, int], started: float) -> list[dict[str, Any]]:
+    """Gather every seed's records, aborting the run on the first failure.
+
+    A dataset that silently omits the seeds the ledger could not represent is
+    a biased dataset, so a projection error has to propagate. Cancelling the
+    queued futures here, in this thread, is what makes that abort prompt:
+    `Executor.shutdown(cancel_futures=True)` only asks the pool's manager
+    thread to cancel them later, and the shutdown that runs while the
+    exception unwinds resets the request before the manager ever acts, so
+    every remaining seed would still play out in full before the offending
+    step became visible.
+    """
+    episodes: list[dict[str, Any]] = []
+    try:
+        for future in as_completed(pending):
+            episodes.extend(future.result())
+            elapsed = time.perf_counter() - started
+            print(
+                f"seed {pending[future]}: extracted "
+                f"({elapsed:.1f}s elapsed, {len(episodes)} episode-seats)",
+                flush=True,
+            )
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        raise
+    return episodes
+
+
 def main() -> None:
     args = parse_args()
     if args.episodes < 1 or args.episode_steps != 720:
@@ -194,26 +223,21 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = range(args.seed_start, args.seed_start + args.episodes)
-    episodes: list[dict[str, Any]] = []
     started = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=min(args.workers, args.episodes)) as pool:
+    pool = ProcessPoolExecutor(max_workers=min(args.workers, args.episodes))
+    try:
         pending = {
             pool.submit(
                 _extract_seed, teacher, opponent, seed, args.episode_steps, seats, args.output_dir
             ): seed
             for seed in seeds
         }
-        # A failed projection must abort the whole extraction: a dataset that
-        # silently omits the seeds the ledger could not represent is a biased
-        # dataset. Raising here shuts the pool down with the offending step.
-        for future in as_completed(pending):
-            episodes.extend(future.result())
-            elapsed = time.perf_counter() - started
-            print(
-                f"seed {pending[future]}: extracted "
-                f"({elapsed:.1f}s elapsed, {len(episodes)} episode-seats)",
-                flush=True,
-            )
+        episodes = collect_extractions(pending, started)
+    finally:
+        # After a cancellation this waits only for the seeds already in
+        # flight, which is the shortest correct abort: their worker processes
+        # own open archive handles.
+        pool.shutdown(wait=True)
     # Completion order is nondeterministic under parallelism; the manifest is
     # provenance and is hashed, so it is written in seed order regardless.
     episodes.sort(key=lambda record: (record["seed"], record["seat"]))
