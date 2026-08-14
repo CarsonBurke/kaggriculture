@@ -5,17 +5,19 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from kaggriculture.production import build_training_command
+
 
 def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -> None:
-    module = _script()
     latest = tmp_path / "run" / "latest.pt"
-    command = module._training_command(
-        SimpleNamespace(iterations=500, max_hours=0.0, seed=7),
+    command = build_training_command(
         latest.parent,
+        iterations=500,
+        max_hours=0.0,
+        seed=7,
         compile_models=False,
         expected_source_digest="a" * 64,
         calibration_decision=tmp_path / "decision.json",
@@ -25,9 +27,21 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
     assert command[-2:] == ["--resume", str(latest)]
 
 
-def _script():
-    path = Path(__file__).parents[1] / "scripts" / "launch_calibrated_training.py"
-    spec = importlib.util.spec_from_file_location("kaggriculture_launch_calibrated", path)
+def test_training_command_requires_digest_and_decision_together(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="together"):
+        build_training_command(
+            tmp_path,
+            iterations=1,
+            max_hours=0.0,
+            seed=7,
+            compile_models=True,
+            expected_source_digest="a" * 64,
+        )
+
+
+def _script(name: str = "launch_calibrated_training.py"):
+    path = Path(__file__).parents[1] / "scripts" / name
+    spec = importlib.util.spec_from_file_location(f"kaggriculture_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -82,8 +96,8 @@ def _records(
             "float32_matmul_precision": "high",
             "cudnn_benchmark": True,
         },
-        "model": module._production_model_config(),
-        "vapo": module._production_vapo_config(compiled=compiled),
+        "model": module.production_model_config(),
+        "vapo": module.production_vapo_config(compiled=compiled),
         "max_update_replay_error": module.MAX_UPDATE_REPLAY_RATIO_ERROR,
         "max_first_minibatch_kl": module.MAX_FIRST_MINIBATCH_KL,
         "torch": str(module.torch.__version__),
@@ -302,7 +316,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert decision["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
     assert "--compile-models" in decision["training_command"]
     assert "--entropy-coefficient" not in decision["training_command"]
-    assert "entropy_coefficient" not in module._production_vapo_config(compiled=False)
+    assert "entropy_coefficient" not in module.production_vapo_config(compiled=False)
     assert decision["source_identity"] == module.source_identity()
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]
@@ -316,9 +330,56 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--gamma", "1.0"),
         (
             "--actor-gae-lambda",
-            str(module._production_vapo_config(compiled=False)["actor_gae_lambda"]),
+            str(module.production_vapo_config(compiled=False)["actor_gae_lambda"]),
         ),
         ("--target-kl", "0.03"),
     ):
         index = decision["training_command"].index(flag)
         assert decision["training_command"][index + 1] == expected
+
+
+def test_direct_launch_compiles_without_calibration_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script("launch_production.py")
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    latest_checkpoint = run_directory / "latest.pt"
+    latest_checkpoint.write_bytes(b"atomic checkpoint")
+    invocation: dict[str, object] = {}
+
+    class Executed(Exception):
+        pass
+
+    def fake_execv(executable: str, command: list[str]) -> None:
+        invocation.update(executable=executable, command=command)
+        raise Executed
+
+    monkeypatch.setattr(module.os, "execv", fake_execv)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_production.py",
+            "--run-dir",
+            str(run_directory),
+            "--iterations",
+            "17",
+        ],
+    )
+
+    with pytest.raises(Executed):
+        module.main()
+
+    launch = json.loads((run_directory / "launch.json").read_text())
+    assert launch["event"] == "direct_launch"
+    assert launch["compile_models"] is True
+    assert launch["iterations"] == 17
+    assert launch["resume_checkpoint"] == str(latest_checkpoint)
+    assert launch["source_identity"] == module.source_identity()
+    assert invocation["executable"] == sys.executable
+    assert invocation["command"] == launch["training_command"]
+    assert "--compile-models" in launch["training_command"]
+    assert "--expected-source-digest" not in launch["training_command"]
+    assert "--calibration-decision" not in launch["training_command"]
+    assert launch["training_command"][-2:] == ["--resume", str(latest_checkpoint)]

@@ -38,10 +38,16 @@ MAX_FIRST_MINIBATCH_KL = 1e-4
 
 @dataclass(frozen=True)
 class VapoConfig:
-    actor_learning_rate: float = 3e-4
-    critic_learning_rate: float = 1e-3
+    # Learning rates follow CleanRL's PPO reference (2.5e-4, Adam eps 1e-5)
+    # for both networks; CleanRL additionally anneals linearly to zero, which
+    # this pipeline deliberately does not adopt (warmup then constant).
+    actor_learning_rate: float = 2.5e-4
+    critic_learning_rate: float = 2.5e-4
     lr_warmup_steps: int = 32
-    weight_decay: float = 1e-4
+    # No weight decay: with decay the AdamW update is not scale-invariant and
+    # steadily shrinks norm gains and biases, and the CleanRL reference runs
+    # plain Adam. Zero makes AdamW identical to Adam.
+    weight_decay: float = 0.0
     epochs: int = 4
     minibatch_size: int = 2048
     clip_low: float = 0.80
