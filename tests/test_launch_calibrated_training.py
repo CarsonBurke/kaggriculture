@@ -73,6 +73,59 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
 
 
+def test_warm_started_command_round_trips_through_the_training_parser(monkeypatch, tmp_path):
+    """A BC-warm-started baseline has to reach train_vapo through the same
+    launcher every family uses, or the families are not being compared on one
+    pipeline. The flags must survive the round trip and bind the artifact."""
+    training = _script("train_vapo.py")
+    artifact = tmp_path / "bc-actor.pt"
+    artifact.write_bytes(b"")
+    command = build_training_command(
+        tmp_path / "run",
+        iterations=500,
+        max_hours=0.0,
+        seed=7,
+        compile_models=False,
+        initial_actor=artifact,
+        critic_warmup_iterations=15,
+    )
+    monkeypatch.setattr(sys, "argv", ["train_vapo.py", *command[2:]])
+
+    args = training.parse_args()
+    training._validate_args(args)
+
+    assert args.init_actor_from == artifact
+    assert args.critic_warmup_iterations == 15
+    assert args.resume is None
+
+
+def test_warm_start_and_resume_are_rejected_together(tmp_path: Path) -> None:
+    """train_vapo rejects the pair; catching it in the builder keeps the
+    launcher from rewriting a run's evidence before the run refuses to start."""
+    with pytest.raises(ValueError, match="already has an actor"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=500,
+            max_hours=0.0,
+            seed=7,
+            compile_models=False,
+            initial_actor=tmp_path / "bc-actor.pt",
+            resume_checkpoint=tmp_path / "checkpoint-000010.pt",
+        )
+
+
+def test_critic_warmup_without_a_warm_start_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="only to a warm-started run"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=500,
+            max_hours=0.0,
+            seed=7,
+            compile_models=False,
+            critic_warmup_iterations=15,
+        )
+
+
 def test_training_command_requires_digest_and_decision_together(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="together"):
         build_training_command(
@@ -428,3 +481,105 @@ def test_direct_launch_compiles_without_calibration_evidence(
     assert "--expected-source-digest" not in launch["training_command"]
     assert "--calibration-decision" not in launch["training_command"]
     assert launch["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
+
+
+def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resubmitting the identical launch command is how a killed run continues.
+
+    The warm start belongs to the run, not to the relaunch: once a checkpoint
+    exists the actor and the remaining critic warmup both come from it, which
+    is why train_vapo refuses to have them restated. The launcher therefore
+    has to drop the flags itself rather than fail, and it has to carry the
+    recorded warm start forward -- it rewrites the decision file in place, so
+    restating the now-empty flags would leave the run's own launch record
+    claiming it started from scratch.
+    """
+    module = _script()
+    eager_path = tmp_path / "eager.jsonl"
+    compiled_path = tmp_path / "compiled.jsonl"
+    _write_report(eager_path, _records(module, compiled=False, seconds=10.0))
+    _write_report(compiled_path, _records(module, compiled=True, seconds=9.0))
+    run_directory = tmp_path / "run"
+    artifact = tmp_path / "bc-actor.pt"
+    artifact.write_bytes(b"cloned actor")
+    invocation: dict[str, object] = {}
+
+    class Executed(Exception):
+        pass
+
+    def fake_execv(executable: str, command: list[str]) -> None:
+        invocation.update(executable=executable, command=command)
+        raise Executed
+
+    monkeypatch.setattr(module.os, "execv", fake_execv)
+    argv = [
+        "launch_calibrated_training.py",
+        "--eager-report",
+        str(eager_path),
+        "--compiled-report",
+        str(compiled_path),
+        "--run-dir",
+        str(run_directory),
+        "--iterations",
+        "500",
+        "--init-actor-from",
+        str(artifact),
+        "--critic-warmup-iterations",
+        "15",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(Executed):
+        module.main()
+
+    decision_path = run_directory / "calibration-decision.json"
+    first = json.loads(decision_path.read_text())
+    assert first["initial_actor"] == str(artifact)
+    assert first["critic_warmup_iterations"] == 15
+    assert first["resume_checkpoint"] is None
+    command = first["training_command"]
+    assert command[command.index("--init-actor-from") + 1] == str(artifact)
+    assert command[command.index("--critic-warmup-iterations") + 1] == "15"
+
+    # The run crashed inside the warmup window and left a checkpoint behind.
+    latest_checkpoint = run_directory / "latest.pt"
+    latest_checkpoint.write_bytes(b"atomic checkpoint")
+
+    with pytest.raises(Executed):
+        module.main()
+
+    second = json.loads(decision_path.read_text())
+    assert second["resume_checkpoint"] == str(latest_checkpoint)
+    assert second["initial_actor"] == str(artifact)
+    assert second["critic_warmup_iterations"] == 15
+    resumed = second["training_command"]
+    assert invocation["command"] == resumed
+    assert "--init-actor-from" not in resumed
+    assert "--critic-warmup-iterations" not in resumed
+    assert resumed[-2:] == ["--resume", str(latest_checkpoint)]
+
+    training = _script("train_vapo.py")
+    monkeypatch.setattr(sys, "argv", ["train_vapo.py", *resumed[2:]])
+    arguments = training.parse_args()
+    training._validate_args(arguments)
+    assert arguments.resume == latest_checkpoint
+    assert arguments.init_actor_from is None
+    assert arguments.critic_warmup_iterations is None
+
+
+def test_a_warmup_that_outlasts_the_run_is_rejected(tmp_path: Path) -> None:
+    """The actor would never take a step, and the stalled-actor guard is
+    suppressed for exactly those iterations, so the run would finish silently
+    identical to the clone it started from."""
+    with pytest.raises(ValueError, match="leave iterations for the actor"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=15,
+            max_hours=0.0,
+            seed=7,
+            compile_models=False,
+            initial_actor=tmp_path / "bc-actor.pt",
+            critic_warmup_iterations=15,
+        )

@@ -425,6 +425,33 @@ def choose_compilation(
     }
 
 
+def _warm_start_record(
+    initial_actor: Path | None, critic_warmup_iterations: int | None
+) -> dict[str, Any]:
+    return {
+        "initial_actor": None if initial_actor is None else str(initial_actor),
+        "critic_warmup_iterations": critic_warmup_iterations,
+    }
+
+
+def _recorded_warm_start(decision_path: Path) -> dict[str, Any] | None:
+    """The warm start the run being resumed was launched with, if any.
+
+    The decision file is rewritten on every relaunch, so a resume that simply
+    restated the current (empty) flags would erase the only launch-side record
+    of which clone the weights came from. A decision written before warm
+    starting existed carries neither key and is treated as no warm start.
+    """
+    if not decision_path.is_file():
+        return None
+    recorded = json.loads(decision_path.read_text(encoding="utf-8"))
+    if not isinstance(recorded, dict) or recorded.get("initial_actor") is None:
+        return None
+    return _warm_start_record(
+        Path(str(recorded["initial_actor"])), recorded.get("critic_warmup_iterations")
+    )
+
+
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -483,6 +510,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--max-hours", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260812)
+    parser.add_argument(
+        "--init-actor-from",
+        type=Path,
+        help=(
+            "behavior-cloned actor artifact to initialize iteration zero from; "
+            "the critic and both optimizers still start fresh"
+        ),
+    )
+    parser.add_argument(
+        "--critic-warmup-iterations",
+        type=int,
+        help="iterations spent fitting the critic to the warm-started policy before it is trusted",
+    )
     return parser.parse_args()
 
 
@@ -495,6 +535,23 @@ def main() -> None:
         raise ValueError("max hours must be finite and non-negative")
     if args.seed < 0:
         raise ValueError("seed cannot be negative")
+    requested_actor = (
+        None if args.init_actor_from is None else args.init_actor_from.expanduser().resolve()
+    )
+    if requested_actor is not None and not requested_actor.is_file():
+        raise FileNotFoundError(requested_actor)
+    if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 1:
+        raise ValueError("critic warmup iterations must be positive")
+    if args.critic_warmup_iterations is not None and args.init_actor_from is None:
+        raise ValueError("critic warmup applies only to a warm-started run")
+    # A warmup that outlives the run never lets the actor take a step, and the
+    # stalled-actor guard inside training is suppressed for exactly those
+    # iterations, so the run would finish silently identical to its clone.
+    if (
+        args.critic_warmup_iterations is not None
+        and args.critic_warmup_iterations >= args.iterations
+    ):
+        raise ValueError("critic warmup must leave iterations for the actor to train in")
     eager_report = _read_report(args.eager_report)
     compiled_report = _read_report(args.compiled_report)
     decision = choose_compilation(
@@ -511,12 +568,25 @@ def main() -> None:
         )
     run_directory = args.run_dir.expanduser().resolve()
     resume_checkpoint = resolve_resume_checkpoint(run_directory)
+    decision_path = run_directory / "calibration-decision.json"
+    # Relaunching the identical command is how a killed run continues, so the
+    # warm-start flags must not turn that into an error. Once the run exists
+    # its actor and its remaining critic warmup both come from the checkpoint,
+    # which is why train_vapo rejects restating them; the launch record still
+    # has to name the clone the weights came from, so it is carried forward
+    # from the decision this run was started with rather than dropped.
+    warm_start = _warm_start_record(requested_actor, args.critic_warmup_iterations)
+    initial_actor = None if resume_checkpoint is not None else requested_actor
+    critic_warmup_iterations = (
+        None if resume_checkpoint is not None else args.critic_warmup_iterations
+    )
+    if resume_checkpoint is not None:
+        warm_start = _recorded_warm_start(decision_path) or warm_start
     evidence_directory = run_directory / "provenance"
     eager_retained = evidence_directory / "eager-vapo.jsonl"
     compiled_retained = evidence_directory / "compiled-vapo.jsonl"
     _retain_report(eager_report, eager_retained)
     _retain_report(compiled_report, compiled_retained)
-    decision_path = run_directory / "calibration-decision.json"
     command = build_training_command(
         run_directory,
         iterations=args.iterations,
@@ -526,6 +596,8 @@ def main() -> None:
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
         resume_checkpoint=resume_checkpoint,
+        initial_actor=initial_actor,
+        critic_warmup_iterations=critic_warmup_iterations,
     )
     decision.update(
         {
@@ -539,6 +611,7 @@ def main() -> None:
             "max_hours": args.max_hours,
             "seed": args.seed,
             "training_command": command,
+            **warm_start,
             "resume_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
             "source_identity": identity,
         }

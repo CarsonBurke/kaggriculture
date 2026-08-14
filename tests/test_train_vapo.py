@@ -587,10 +587,100 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     with pytest.raises(ValueError, match="warmup iterations"):
         module._validate_args(args)
 
+    # A warmup that spans the run freezes the actor for its whole life, and
+    # the stalled-actor guard is suppressed for exactly those iterations, so
+    # nothing downstream would notice the policy never moved.
+    args.critic_warmup_iterations = args.iterations
+    with pytest.raises(ValueError, match="leave iterations for the actor"):
+        module._validate_args(args)
+
     args.critic_warmup_iterations = 0
     args.resume = tmp_path / "latest.pt"
     with pytest.raises(ValueError, match="fresh run"):
         module._validate_args(args)
+
+
+def test_critic_warmup_cannot_be_restated_on_a_resume(monkeypatch, tmp_path) -> None:
+    """The count is persisted with the warm start, so a relaunch must not be
+    able to supply a different one -- and must not be able to supply none.
+    A crash inside the warmup window otherwise resumes with no warmup, and the
+    actor starts stepping against a critic that never finished fitting."""
+    module = _training_script()
+
+    def parsed(*flags: str):
+        monkeypatch.setattr(sys, "argv", ["train_vapo.py", "--run-dir", str(tmp_path), *flags])
+        return module.parse_args()
+
+    unflagged = parsed()
+    module._validate_args(unflagged)
+    assert unflagged.critic_warmup_iterations is None
+
+    restated = parsed("--resume", str(tmp_path / "latest.pt"), "--critic-warmup-iterations", "15")
+    with pytest.raises(ValueError, match="restored from its checkpoint"):
+        module._validate_args(restated)
+
+    orphaned = parsed("--critic-warmup-iterations", "15")
+    with pytest.raises(ValueError, match="only to a warm-started run"):
+        module._validate_args(orphaned)
+
+
+def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -> None:
+    """The warm-start record is the channel that survives a resume, so it has
+    to carry both the count the run must keep honoring and the tree that
+    tokenized the demonstrations."""
+    from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
+    from kaggriculture.provenance import source_identity
+    from kaggriculture.training import CHECKPOINT_FORMAT_VERSION, checkpoint_payload
+    from kaggriculture.vapo import VapoConfig
+
+    module = _training_script()
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    identity = source_identity()
+    artifact = tmp_path / "bc-actor.pt"
+    torch.save(
+        {
+            "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+            "architecture": CONV_ENTITY,
+            "model_config": config.to_dict(),
+            "actor": FarmActor(config).state_dict(),
+            "iteration": 0,
+            "metrics": {},
+            "source_identity": identity,
+            "run_provenance": None,
+            "bc_provenance": {"teacher": {"label": "public-v27"}},
+        },
+        artifact,
+    )
+
+    record = module._load_initial_actor(
+        artifact, FarmActor(config), CONV_ENTITY, config, torch.device("cpu")
+    )
+    record["critic_warmup_iterations"] = 15
+
+    payload = checkpoint_payload(
+        actor_state={},
+        critic_state={},
+        actor_optimizer_state={},
+        critic_optimizer_state={},
+        model_config=config,
+        vapo_config=VapoConfig(epochs=1, minibatch_size=4, use_bfloat16=False),
+        iteration=3,
+        next_seed=11,
+        metrics={},
+        source_identity=identity,
+        rng_states={"torch_rng": None, "cuda_rng": None, "numpy_rng": None, "python_rng": None},
+        initial_actor=record,
+    )
+
+    assert payload["format_version"] == CHECKPOINT_FORMAT_VERSION
+    assert payload["initial_actor"]["critic_warmup_iterations"] == 15
+    assert payload["initial_actor"]["source_identity"] == identity
+    # This is what the resume branch reads; iteration 3 of a 15-iteration
+    # warmup must still be inside it.
+    restored = int(payload["initial_actor"].get("critic_warmup_iterations", 0))
+    assert payload["iteration"] < restored
 
 
 def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -> None:

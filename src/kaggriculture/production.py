@@ -79,10 +79,21 @@ def build_training_command(
     expected_source_digest: str | None = None,
     calibration_decision: Path | None = None,
     resume_checkpoint: Path | None = None,
+    initial_actor: Path | None = None,
+    critic_warmup_iterations: int | None = None,
 ) -> list[str]:
     """Build the exact production train_vapo.py invocation."""
     if (expected_source_digest is None) != (calibration_decision is None):
         raise ValueError("source digest and calibration decision must be provided together")
+    # A warm start initializes iteration zero; a resume continues a run that
+    # already has an actor. train_vapo rejects the pair, and it must fail here
+    # rather than after the launcher has already rewritten the run's evidence.
+    if initial_actor is not None and resume_checkpoint is not None:
+        raise ValueError("a resumed run already has an actor; --init-actor-from initializes one")
+    if critic_warmup_iterations is not None and initial_actor is None:
+        raise ValueError("critic warmup applies only to a warm-started run")
+    if critic_warmup_iterations is not None and not 0 < critic_warmup_iterations < iterations:
+        raise ValueError("critic warmup must be positive and leave iterations for the actor")
     model = production_model_config()
     vapo = production_vapo_config(compiled=compile_models)
     command = [
@@ -176,6 +187,10 @@ def build_training_command(
     )
     if compile_models:
         command.append("--compile-models")
+    if initial_actor is not None:
+        command.extend(("--init-actor-from", str(initial_actor)))
+        if critic_warmup_iterations is not None:
+            command.extend(("--critic-warmup-iterations", str(critic_warmup_iterations)))
     if resume_checkpoint is not None:
         command.extend(("--resume", str(resume_checkpoint)))
     return command

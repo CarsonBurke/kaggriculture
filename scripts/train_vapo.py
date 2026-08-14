@@ -162,8 +162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--critic-warmup-iterations",
         type=int,
-        default=0,
-        help="iterations of critic-only updates before the actor participates",
+        help=(
+            "iterations of critic-only updates before the actor participates; "
+            "belongs to the warm start, and a resumed run restores it from its checkpoint"
+        ),
     )
     return parser.parse_args()
 
@@ -203,13 +205,34 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not math.isfinite(args.opponent_temperature) or args.opponent_temperature <= 0.0:
         raise ValueError("opponent temperature must be finite and positive")
-    if args.critic_warmup_iterations < 0:
+    if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 0:
         raise ValueError("critic warmup iterations cannot be negative")
     if args.init_actor_from is not None and args.resume is not None:
         raise ValueError(
             "--init-actor-from initializes a fresh run; a resumed run's actor "
             "comes from its checkpoint"
         )
+    # The warmup count is part of the warm start and is persisted with it, so a
+    # resume restores it rather than restating it. Without that, a crash inside
+    # the warmup window would silently relaunch with no warmup at all -- the
+    # actor would start taking steps against a critic that never finished
+    # fitting, which is the single failure this protocol exists to prevent.
+    if args.critic_warmup_iterations is not None and args.resume is not None:
+        raise ValueError(
+            "--critic-warmup-iterations belongs to the run being resumed and is "
+            "restored from its checkpoint"
+        )
+    if args.critic_warmup_iterations is not None and args.init_actor_from is None:
+        raise ValueError("critic warmup applies only to a warm-started run")
+    # A warmup at least as long as the run freezes the actor for its whole
+    # life, and the stalled-actor guard that would otherwise catch zero actor
+    # updates is deliberately suppressed while the warmup is active, so the
+    # run would end silently identical to the clone it started from.
+    if (
+        args.critic_warmup_iterations is not None
+        and args.critic_warmup_iterations >= args.iterations
+    ):
+        raise ValueError("critic warmup must leave iterations for the actor to train in")
     if not 0 < args.clip_low < 1 < args.clip_high:
         raise ValueError("clip interval must straddle one")
     if args.lr_warmup_steps < 0:
@@ -262,6 +285,11 @@ def _load_initial_actor(
         "format_version": payload["format_version"],
         "iteration": int(payload.get("iteration", 0)),
         "bc_provenance": payload.get("bc_provenance"),
+        # Equality with the current tree would be unusable here -- any edit
+        # changes it, and the clone is deliberately produced before the run.
+        # Recording which tree tokenized the demonstrations is free, and
+        # without it the checkpoint cannot say where its weights came from.
+        "source_identity": payload.get("source_identity"),
     }
 
 
@@ -662,10 +690,15 @@ def main() -> None:
     critic = architecture.critic_class(model_config).to(device)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
     initial_actor_provenance = None
+    critic_warmup_iterations = 0
     if args.init_actor_from is not None:
         initial_actor_provenance = _load_initial_actor(
             args.init_actor_from, actor, architecture.name, model_config, device
         )
+        critic_warmup_iterations = args.critic_warmup_iterations or 0
+        # The count travels inside the warm-start record so it survives a
+        # resume; validation already guarantees the two arrive together.
+        initial_actor_provenance["critic_warmup_iterations"] = critic_warmup_iterations
     generator = np.random.default_rng(args.seed + 1)
     iteration = 0
     next_seed = args.seed
@@ -702,8 +735,12 @@ def main() -> None:
         if resume_payload.get("training_rng") is not None:
             generator.bit_generator.state = resume_payload["training_rng"]
         # Restore warm-start provenance: the resumed run must keep treating
-        # the iteration-0 league snapshot as a pretrained baseline.
+        # the iteration-0 league snapshot as a pretrained baseline, and must
+        # keep freezing the actor for whatever remains of the critic warmup.
         initial_actor_provenance = resume_payload.get("initial_actor")
+        critic_warmup_iterations = int(
+            (initial_actor_provenance or {}).get("critic_warmup_iterations", 0)
+        )
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
     journal_iteration = metrics_journal_iteration(args.run_dir / "metrics.jsonl")
@@ -1004,7 +1041,7 @@ def main() -> None:
         update_started = time.monotonic()
         # Critic-first warm start: a freshly initialized critic must fit
         # before its advantages may push a pretrained actor.
-        warmup_active = iteration < args.critic_warmup_iterations
+        warmup_active = iteration < critic_warmup_iterations
         update_metrics = update_vapo(
             actor,
             critic,
