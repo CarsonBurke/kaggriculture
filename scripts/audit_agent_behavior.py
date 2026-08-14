@@ -52,7 +52,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _final_farm_summary(farm: dict[str, Any]) -> dict[str, Any]:
-    """What the agent is holding when the episode ends."""
+    """What the agent is holding when the episode ends.
+
+    There is no ``ANIMAL`` tile kind: an animal occupies a COOP or PASTURE
+    tile and is named by that tile's ``animal`` field, exactly as the board
+    encoder reads it. Counting a kind that the engine never emits reports a
+    constant zero, which reads as "keeps no livestock" for any agent at all.
+    """
     animals: Counter[str] = Counter()
     crops: Counter[str] = Counter()
     structures: Counter[str] = Counter()
@@ -63,10 +69,11 @@ def _final_farm_summary(farm: dict[str, Any]) -> dict[str, Any]:
             kind = tile.get("kind")
             if kind == "PLANT":
                 crops[str(tile.get("crop"))] += 1
-            elif kind == "ANIMAL":
-                animals[str(tile.get("animal"))] += 1
             elif kind in ("COOP", "PASTURE"):
                 structures[str(kind)] += 1
+                animal = tile.get("animal")
+                if animal is not None:
+                    animals[str(animal)] += 1
     return {
         "money": float(farm.get("money", 0) or 0),
         "unlocked_quadrants": len(farm.get("unlocked_quadrants") or []),

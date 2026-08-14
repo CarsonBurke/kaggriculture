@@ -17,15 +17,20 @@ def _script():
 
 
 def test_final_farm_summary_counts_the_route_the_agent_ended_holding() -> None:
+    """Livestock is read off COOP and PASTURE tiles, which is where the engine
+    actually puts it -- see the board encoder, which reads the same field. An
+    occupied structure counts as both a structure and an animal; an empty one
+    counts only as a structure."""
     module = _script()
     tiles = [
         [
             {"kind": "PLANT", "crop": "WHEAT"},
             {"kind": "PLANT", "crop": "MELON"},
-            {"kind": "ANIMAL", "animal": "COW"},
+            {"kind": "PASTURE", "animal": "COW"},
         ],
         [
-            {"kind": "ANIMAL", "animal": "COW"},
+            {"kind": "PASTURE", "animal": "COW"},
+            {"kind": "COOP", "animal": "GOOSE"},
             {"kind": "PASTURE"},
             {"kind": "SOIL"},
             None,
@@ -44,10 +49,23 @@ def test_final_farm_summary_counts_the_route_the_agent_ended_holding() -> None:
     assert summary["money"] == 145_000.0
     assert summary["unlocked_quadrants"] == 3
     assert summary["units"] == 4
-    assert summary["animal_tiles"] == {"GOOSE": 0, "COW": 2, "SHEEP": 0}
+    assert summary["animal_tiles"] == {"GOOSE": 1, "COW": 2, "SHEEP": 0}
     assert summary["planted_tiles"]["WHEAT"] == 1
     assert summary["planted_tiles"]["MELON"] == 1
     assert summary["planted_tiles"]["CARROT"] == 0
+    assert summary["structure_tiles"] == {"COOP": 1, "PASTURE": 3}
+
+
+def test_final_farm_summary_reads_livestock_from_the_engine_tile_schema() -> None:
+    """Regression: the engine emits no ``ANIMAL`` tile kind, so a summary that
+    looked for one reported zero livestock for every agent ever audited."""
+    module = _script()
+
+    summary = module._final_farm_summary(
+        {"tiles": [[{"kind": "ANIMAL", "animal": "COW"}, {"kind": "PASTURE", "animal": "SHEEP"}]]}
+    )
+
+    assert summary["animal_tiles"] == {"GOOSE": 0, "COW": 0, "SHEEP": 1}
     assert summary["structure_tiles"] == {"PASTURE": 1}
 
 
