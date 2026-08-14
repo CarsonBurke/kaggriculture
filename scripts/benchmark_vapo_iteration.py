@@ -19,10 +19,27 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig, parameter_count
+from kaggriculture.model import ModelConfig, parameter_count
+from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.production import (
+    PRODUCTION_EPISODE_STEPS,
+    PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
+    PRODUCTION_LEAGUE_GAMES,
+    PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
+    PRODUCTION_OPPONENT_TEMPERATURE,
+    PRODUCTION_TEMPERATURE,
+    production_vapo_config,
+)
 from kaggriculture.provenance import source_identity
-from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.rollout import (
+    _CROP_SEED_COLUMNS,
+    _PRODUCT_STOCK_COLUMNS,
+    allocate_rollout_storage,
+    collect_mixed_play_rust,
+)
 from kaggriculture.rust_env import load_native
+from kaggriculture.structured import StructuredConfig
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 from kaggriculture.vapo import (
@@ -38,8 +55,15 @@ _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
 _REPORT_MIRROR: TensorboardMirror | None = None
 _REPORT_TENSORBOARD_DIR: Path | None = None
-PRODUCTION_EPISODE_STEPS = 720
-PRODUCTION_ACTIVE_OPPONENTS = 2
+
+# Calibration reports are only valid launch evidence when their configuration
+# matches production exactly, so every default derives from the shared source.
+# The model is the exception only in form: production_model_config() *is* the
+# conv dataclass defaults, which is what an unflagged entity-cnn run builds.
+_PRODUCTION_VAPO = production_vapo_config(compiled=False)
+_PRODUCTION_LEAGUE_OPPONENTS = (
+    PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS
+)
 
 
 def _configure_report(path: Path | None, tensorboard_dir: Path | None = None) -> None:
@@ -110,14 +134,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--league-games",
         type=int,
-        default=96,
+        default=PRODUCTION_LEAGUE_GAMES,
         help="frozen-opponent games per iteration (each yields one learner trajectory)",
     )
     parser.add_argument(
         "--league-opponents",
         type=int,
-        default=5,
-        help="separate frozen actor forwards, matching initial + active + historical production",
+        default=_PRODUCTION_LEAGUE_OPPONENTS,
+        help="separate frozen actor forwards, matching active + historical production",
     )
     parser.add_argument(
         "--repeats",
@@ -127,18 +151,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--cnn-width", type=int, default=48)
-    parser.add_argument("--cnn-blocks", type=int, default=2)
-    parser.add_argument("--model-dim", type=int, default=96)
-    parser.add_argument("--transformer-layers", type=int, default=7)
-    parser.add_argument("--attention-heads", type=int, default=4)
-    parser.add_argument("--ffn-multiplier", type=int, default=4)
-    parser.add_argument("--quantity-rank", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--minibatch-size", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--opponent-temperature", type=float, default=0.8)
-    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        default=CONV_ENTITY,
+        help="actor/critic family; each family's structural flags default to that "
+        "family's model configuration and a flag from another family is rejected. "
+        "The conv defaults are exactly the production model, so an unflagged "
+        "entity-cnn run is valid calibration evidence",
+    )
+    add_model_config_arguments(parser)
+    parser.add_argument("--epochs", type=int, default=_PRODUCTION_VAPO["epochs"])
+    parser.add_argument(
+        "--critic-epochs",
+        type=int,
+        default=_PRODUCTION_VAPO["critic_epochs"],
+        help="total critic epochs (>= --epochs); the actor trains only in the first --epochs",
+    )
+    parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_VAPO["minibatch_size"])
+    parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
+    parser.add_argument(
+        "--opponent-temperature", type=float, default=PRODUCTION_OPPONENT_TEMPERATURE
+    )
+    parser.add_argument("--target-kl", type=float, default=_PRODUCTION_VAPO["target_kl"])
     parser.add_argument(
         "--max-update-replay-error",
         type=float,
@@ -175,23 +210,43 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _verify_first_step_critic_features(rollout, self_play_games: int, seed_start: int) -> None:
-    """Cross-validate stored critic features against a fresh native encode.
+def _verify_first_step_critic_state(rollout, self_play_games: int, seed_start: int) -> None:
+    """Cross-validate stored critic-only state against a fresh native encode.
 
-    Behavior values are replayed solely from stored `critic_features`, which
-    nothing else consumes during collection. Recomputing the opening step from
-    a fresh BatchEnv and demanding bitwise fp16 equality catches arena-layout
-    or staging corruption across the whole merged wave at production scale.
+    Behavior values are replayed solely from stored critic inputs that nothing
+    else consumes during collection: `critic_features` for the conv family, and
+    the paired seat's critic extras for the structured family. Recomputing the
+    opening step from a fresh BatchEnv and demanding bitwise staged-dtype
+    equality catches arena-layout or staging corruption across the whole merged
+    wave at production scale.
     """
     league_games = rollout.trajectories - self_play_games * 2
     seeds = np.arange(seed_start, seed_start + self_play_games + league_games, dtype=np.uint64)
-    fresh = np.asarray(load_native().BatchEnv(seeds).encoded()["critic_features"])
     self_rows = np.arange(self_play_games * 2, dtype=np.int64)
     league_seats = rollout.seats[self_play_games * 2 :].astype(np.int64)
     league_rows = 2 * (self_play_games + np.arange(league_games, dtype=np.int64)) + league_seats
     stored_rows = np.concatenate([self_rows, league_rows])
-    if not np.array_equal(rollout.critic_features[:, 0], fresh[stored_rows].astype(np.float16)):
-        raise RuntimeError("stored first-step critic features do not match a fresh native encode")
+    if rollout.architecture == CONV_ENTITY:
+        fresh = np.asarray(load_native().BatchEnv(seeds).encoded()["critic_features"])
+        if not np.array_equal(
+            rollout.states["critic_features"][:, 0], fresh[stored_rows].astype(np.float16)
+        ):
+            raise RuntimeError(
+                "stored first-step critic features do not match a fresh native encode"
+            )
+        return
+    fresh = load_native().BatchEnv(seeds).structured()
+    pair_rows = stored_rows ^ 1
+    expected = {
+        "critic_products": np.asarray(fresh["products"])[pair_rows][:, :, _PRODUCT_STOCK_COLUMNS],
+        "critic_crops": np.asarray(fresh["crops"])[pair_rows][:, :, _CROP_SEED_COLUMNS],
+        "opponent_unit_categorical": np.asarray(fresh["unit_categorical"])[pair_rows],
+        "opponent_unit_continuous": np.asarray(fresh["unit_continuous"])[pair_rows],
+        "opponent_unit_active": np.asarray(fresh["unit_active"])[pair_rows],
+    }
+    for name, value in expected.items():
+        if not np.array_equal(rollout.states[name][:, 0], value):
+            raise RuntimeError(f"stored first-step {name} does not match a fresh native encode")
 
 
 def _hardware_identity(device: torch.device) -> dict[str, object]:
@@ -259,6 +314,8 @@ def main() -> None:
         raise ValueError("--repeats must be at least two to separate cold and steady iterations")
     if args.epochs < 1 or args.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
+    if args.critic_epochs < args.epochs:
+        raise ValueError("--critic-epochs cannot be fewer than --epochs")
     if any(
         not math.isfinite(value) or value <= 0.0
         for value in (args.temperature, args.opponent_temperature)
@@ -285,17 +342,11 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
-    model_config = ModelConfig(
-        cnn_width=args.cnn_width,
-        cnn_blocks=args.cnn_blocks,
-        model_dim=args.model_dim,
-        transformer_layers=args.transformer_layers,
-        attention_heads=args.attention_heads,
-        ffn_multiplier=args.ffn_multiplier,
-        quantity_rank=args.quantity_rank,
-    )
+    architecture = resolve_architecture(args.architecture)
+    model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
     vapo_config = VapoConfig(
         epochs=args.epochs,
+        critic_epochs=args.critic_epochs,
         minibatch_size=args.minibatch_size,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
@@ -305,19 +356,17 @@ def main() -> None:
     emit(
         {
             "event": "configuration",
+            "architecture": architecture.name,
             "device": str(device),
             "hardware": _hardware_identity(device),
             "self_play_game_counts": game_counts,
             "league_games_per_iteration": args.league_games,
             "league_opponents": args.league_opponents,
-            "league_initial_opponents": min(args.league_opponents, 1),
             "league_active_opponents": min(
-                PRODUCTION_ACTIVE_OPPONENTS,
-                max(args.league_opponents - 1, 0),
+                PRODUCTION_LEAGUE_ACTIVE_OPPONENTS, args.league_opponents
             ),
             "league_historical_opponents": max(
-                args.league_opponents - 1 - PRODUCTION_ACTIVE_OPPONENTS,
-                0,
+                args.league_opponents - PRODUCTION_LEAGUE_ACTIVE_OPPONENTS, 0
             ),
             "episode_steps": PRODUCTION_EPISODE_STEPS,
             "physical_games_per_iteration": [games + args.league_games for games in game_counts],
@@ -348,8 +397,8 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
             torch.cuda.empty_cache()
-        actor = FarmActor(model_config).to(device)
-        critic = DistributionalCritic(model_config).to(device)
+        actor = architecture.actor_class(model_config).to(device)
+        critic = architecture.critic_class(model_config).to(device)
         frozen_opponent_state = {
             name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
         }
@@ -360,6 +409,7 @@ def main() -> None:
         # Production collects the whole mixed wave into one reusable pinned
         # arena; mirror that here so staging behavior matches training.
         arena = allocate_rollout_storage(
+            architecture.name,
             self_play_games * 2 + args.league_games,
             PRODUCTION_EPISODE_STEPS - 1,
             pin_memory=device.type == "cuda",
@@ -382,17 +432,23 @@ def main() -> None:
                 # the benchmark: compiled current actor/critic graphs persist,
                 # while frozen-policy wrappers are fresh each repeat.
                 opponents = [
-                    FarmActor(model_config).to(device) for _ in range(args.league_opponents)
+                    architecture.actor_class(model_config).to(device)
+                    for _ in range(args.league_opponents)
                 ]
                 for opponent in opponents:
                     opponent.load_state_dict(frozen_opponent_state)
                     opponent.requires_grad_(False)
                 assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
                 generator.shuffle(assignments)
+                # Match production decode: active opponents lead the mix and
+                # sample at the opponent temperature; historical ones are
+                # deterministic at temperature one.
                 deterministic_opponents = np.ones(len(opponents), dtype=np.bool_)
-                deterministic_opponents[1:3] = False
+                deterministic_opponents[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = False
                 opponent_temperatures = np.ones(len(opponents), dtype=np.float32)
-                opponent_temperatures[1:3] = args.opponent_temperature
+                opponent_temperatures[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = (
+                    args.opponent_temperature
+                )
             wave_seed_start = seed_cursor
             rollout = collect_mixed_play_rust(
                 actor,
@@ -438,7 +494,7 @@ def main() -> None:
                     "sampling-vs-update likelihood divergence exceeded "
                     f"{args.max_update_replay_error}: {parity['update_replay_max_ratio_error']}"
                 )
-            _verify_first_step_critic_features(rollout, self_play_games, wave_seed_start)
+            _verify_first_step_critic_state(rollout, self_play_games, wave_seed_start)
 
             update_started = time.perf_counter()
             update_metrics = update_vapo(
@@ -477,15 +533,21 @@ def main() -> None:
                 "league_games": args.league_games,
                 "physical_games": physical_games,
                 "learner_trajectories": rollout.trajectories,
-                "learner_states": rollout.states,
+                "learner_states": rollout.state_count,
                 "rollout_seconds": rollout_seconds,
                 "update_replay_parity_seconds": parity_seconds,
                 "update_seconds": update_seconds,
                 "total_seconds": total_seconds,
                 "physical_games_per_rollout_second": physical_games / rollout_seconds,
-                "learner_states_per_rollout_second": rollout.states / rollout_seconds,
+                "learner_states_per_rollout_second": rollout.state_count / rollout_seconds,
                 "critic_replayed_states_per_second": (
-                    rollout.states * vapo_config.epochs / update_seconds
+                    rollout.state_count
+                    * (
+                        vapo_config.epochs
+                        if vapo_config.critic_epochs is None
+                        else vapo_config.critic_epochs
+                    )
+                    / update_seconds
                 ),
                 "iterations_per_hour": 3600.0 / total_seconds,
                 "peak_cuda_bytes": (

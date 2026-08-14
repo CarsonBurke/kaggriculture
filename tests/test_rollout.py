@@ -9,9 +9,13 @@ import torch
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
+    _CROP_SEED_COLUMNS,
+    _PRODUCT_STOCK_COLUMNS,
     _cached_compiled_forward,
     _categorical_draws,
+    _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
     collect_frozen_opponent_play_rust,
@@ -24,6 +28,7 @@ from kaggriculture.rollout import (
     slice_trajectories,
 )
 from kaggriculture.rust_env import load_native
+from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredInputs
 
 
 class _NearOneGenerator:
@@ -78,8 +83,8 @@ def test_short_self_play_rollout_shapes_and_telescoping() -> None:
 
     assert rollout.trajectories == 4
     assert rollout.horizon == 7
-    assert rollout.states == 28
-    assert rollout.board.shape[:2] == (4, 7)
+    assert rollout.state_count == 28
+    assert rollout.states["board"].shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
     final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
     assert rollout.rewards.sum(axis=1).tolist() == pytest.approx(final_scores.tolist(), abs=1e-6)
@@ -167,10 +172,10 @@ def _assert_stored_rows_replay_from_current_actor(actor: FarmActor, rollout) -> 
     """
     with torch.inference_mode():
         output = actor(
-            _flatten_states(rollout.board).float(),
-            _flatten_states(rollout.global_features).float(),
-            _flatten_states(rollout.units).float(),
-            _flatten_states(rollout.unit_positions).long(),
+            _flatten_states(rollout.states["board"]).float(),
+            _flatten_states(rollout.states["global_features"]).float(),
+            _flatten_states(rollout.states["units"]).float(),
+            _flatten_states(rollout.states["unit_positions"]).long(),
         )
         quantity_logits = actor.quantity_logits(
             output.market_quantity_context,
@@ -242,7 +247,7 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
 
     assert rollout.trajectories == 2
     assert rollout.horizon == 719
-    assert rollout.states == 1438
+    assert rollout.state_count == 1438
     final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
     assert rollout.seats.tolist() == [0, 1]
@@ -258,10 +263,10 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
 
     with torch.inference_mode():
         output = actor(
-            flatten(rollout.board).float(),
-            flatten(rollout.global_features).float(),
-            flatten(rollout.units).float(),
-            flatten(rollout.unit_positions).long(),
+            flatten(rollout.states["board"]).float(),
+            flatten(rollout.states["global_features"]).float(),
+            flatten(rollout.states["units"]).float(),
+            flatten(rollout.states["unit_positions"]).long(),
         )
         unit, kind, quantity, *_ = component_logprobs(
             output,
@@ -359,7 +364,7 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
 
     assert rollout.trajectories == 2
     assert rollout.horizon == 719
-    assert rollout.states == 1438
+    assert rollout.state_count == 1438
     assert rollout.seats.tolist() == [0, 1]
     assert rollout.episode_seeds.tolist() == [130, 131]
     final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
@@ -371,7 +376,8 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
     initial = load_native().BatchEnv(np.asarray([130, 131], dtype=np.uint64)).encoded()
     current_rows = np.asarray([0, 3])
     np.testing.assert_array_equal(
-        rollout.critic_features[:, 0], np.asarray(initial["critic_features"])[current_rows]
+        rollout.states["critic_features"][:, 0],
+        np.asarray(initial["critic_features"])[current_rows],
     )
 
 
@@ -507,7 +513,7 @@ def test_arena_collection_merges_adjacent_batches_without_copying() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(config)
-    arena = allocate_rollout_storage(4, 719)
+    arena = allocate_rollout_storage(CONV_ENTITY, 4, 719)
     first = collect_self_play_rust(
         actor,
         games=1,
@@ -525,9 +531,10 @@ def test_arena_collection_merges_adjacent_batches_without_copying() -> None:
 
     merged = merge_contiguous_rollouts(arena, [first, second])
 
-    assert (merged.trajectories, merged.horizon, merged.states) == (4, 719, 2876)
+    assert (merged.trajectories, merged.horizon, merged.state_count) == (4, 719, 2876)
     assert (
-        merged.board.__array_interface__["data"][0] == arena["board"].__array_interface__["data"][0]
+        merged.states["board"].__array_interface__["data"][0]
+        == arena["board"].__array_interface__["data"][0]
     )
     np.testing.assert_array_equal(merged.rewards[:2], first.rewards)
     np.testing.assert_array_equal(merged.rewards[2:], second.rewards)
@@ -550,7 +557,7 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
     opponents = [FarmActor(config), FarmActor(config)]
 
     self_play_games, league_games = 1, 2
-    arena = allocate_rollout_storage(self_play_games * 2 + league_games, 719)
+    arena = allocate_rollout_storage(CONV_ENTITY, self_play_games * 2 + league_games, 719)
     rollout = collect_mixed_play_rust(
         actor,
         opponents,
@@ -562,9 +569,9 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
         storage=arena,
     )
 
-    assert (rollout.trajectories, rollout.horizon, rollout.states) == (4, 719, 2876)
+    assert (rollout.trajectories, rollout.horizon, rollout.state_count) == (4, 719, 2876)
     assert (
-        rollout.board.__array_interface__["data"][0]
+        rollout.states["board"].__array_interface__["data"][0]
         == arena["board"].__array_interface__["data"][0]
     )
     # Self-play rows come first (both seats of the same seed), league rows
@@ -582,7 +589,8 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
     initial = load_native().BatchEnv(np.asarray([130, 131, 132], dtype=np.uint64)).encoded()
     stored_rows = np.asarray([0, 1, 2 + (131 % 2), 4 + (132 % 2)])
     np.testing.assert_array_equal(
-        rollout.critic_features[:, 0], np.asarray(initial["critic_features"])[stored_rows]
+        rollout.states["critic_features"][:, 0],
+        np.asarray(initial["critic_features"])[stored_rows],
     )
 
     # Every stored row — both self-play seats and the league current seats —
@@ -605,7 +613,7 @@ def test_slice_trajectories_views_the_arena_and_validates_the_range() -> None:
     assert part.trajectories == 2
     assert part.horizon == rollout.horizon
     assert part.elapsed_seconds == rollout.elapsed_seconds
-    assert np.shares_memory(part.board, rollout.board)
+    assert np.shares_memory(part.states["board"], rollout.states["board"])
     assert np.shares_memory(part.entropy_sums, rollout.entropy_sums)
     np.testing.assert_array_equal(part.episode_seeds, rollout.episode_seeds[1:3])
     np.testing.assert_array_equal(part.rewards, rollout.rewards[1:3])
@@ -616,6 +624,215 @@ def test_slice_trajectories_views_the_arena_and_validates_the_range() -> None:
     for start, stop in ((-1, 2), (0, 0), (2, 1), (0, rollout.trajectories + 1)):
         with pytest.raises(ValueError, match="out of range"):
             slice_trajectories(rollout, start, stop)
+
+
+def _small_structured_config() -> StructuredConfig:
+    return StructuredConfig(
+        model_dim=16,
+        attention_heads=2,
+        ffn_multiplier=1,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+        quantity_rank=4,
+    )
+
+
+def _force_quantity_orders(actor: FarmActor | StructuredActor) -> None:
+    """Pin the market heads to a quantified buy so the quantity path is live.
+
+    The conservative production prior otherwise legitimately produces whole
+    episodes with no quantified market order at initialization, which would
+    leave the quantity component's replay assertions vacuous.
+    """
+    with torch.no_grad():
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-12.0)
+        actor.market_kind.bias[MarketKind.STOP] = -6.0
+        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
+        actor.market_quantity_context.weight.zero_()
+        actor.market_quantity_value.weight.zero_()
+        actor.market_quantity_bias.fill_(-50.0)
+        actor.market_quantity_bias[MarketKind.BUY_SEED_WHEAT, -1] = 50.0
+
+
+def _structured_replay_inputs(rollout) -> StructuredInputs:
+    states = rollout.states
+    return StructuredInputs(
+        tile_categorical=_flatten_states(states["tile_categorical"]).long(),
+        tile_continuous=_flatten_states(states["tile_continuous"]).float(),
+        unit_categorical=_flatten_states(states["unit_categorical"]).long(),
+        unit_continuous=_flatten_states(states["unit_continuous"]).float(),
+        unit_active=_flatten_states(rollout.unit_active).bool(),
+        unit_tile_gather=_flatten_states(states["unit_tile_gather"]).long(),
+        unit_tile_gather_valid=_flatten_states(states["unit_tile_gather_valid"]).bool(),
+        products=_flatten_states(states["products"]).float(),
+        crops=_flatten_states(states["crops"]).float(),
+        farms=_flatten_states(states["farms"]).float(),
+        town=_flatten_states(states["town"]).float(),
+    )
+
+
+def _assert_structured_rows_replay_from_current_actor(
+    actor: StructuredActor, rollout, atol: float
+) -> None:
+    """Structured mirror of the convolutional replay-and-entropy audit."""
+    with torch.inference_mode():
+        output = actor(_structured_replay_inputs(rollout))
+        market_kinds = _flatten_states(rollout.market_kinds).long()
+        unit, kind, quantity, unit_entropy, kind_entropy, quantity_entropy = component_logprobs(
+            output,
+            actor.quantity_logits(output.market_quantity_context, market_kinds),
+            _flatten_states(rollout.unit_actions).long(),
+            market_kinds,
+            _flatten_states(rollout.market_quantities).long(),
+            _flatten_states(rollout.unit_masks).bool(),
+            _flatten_states(rollout.market_kind_masks).bool(),
+            _flatten_states(rollout.market_quantity_masks).bool(),
+        )
+
+    unit_active = _flatten_states(rollout.unit_active).bool()
+    kind_active = _flatten_states(rollout.market_active).bool()
+    quantity_active = _flatten_states(rollout.market_quantity_active).bool()
+    for replayed, behavior, active in (
+        (unit, _flatten_states(rollout.old_unit_logprobs), unit_active),
+        (kind, _flatten_states(rollout.old_market_kind_logprobs), kind_active),
+        (quantity, _flatten_states(rollout.old_market_quantity_logprobs), quantity_active),
+    ):
+        assert active.any()
+        np.testing.assert_allclose(replayed[active], behavior[active], rtol=0.0, atol=atol)
+
+    def per_trajectory(entropy: torch.Tensor, active: torch.Tensor) -> np.ndarray:
+        contributions = torch.where(active, entropy.double(), torch.zeros((), dtype=torch.float64))
+        return contributions.reshape(rollout.trajectories, -1).sum(dim=1).numpy()
+
+    replayed_sums = (
+        per_trajectory(unit_entropy, unit_active)
+        + per_trajectory(kind_entropy, kind_active)
+        + per_trajectory(quantity_entropy, quantity_active)
+    )
+    np.testing.assert_allclose(rollout.entropy_sums, replayed_sums, rtol=1e-5, atol=5e-3)
+
+
+def test_structured_self_play_rollout_replays_from_stored_states() -> None:
+    actor = StructuredActor(_small_structured_config())
+    _force_quantity_orders(actor)
+
+    rollout = collect_self_play(actor, games=1, seed_start=210, episode_steps=8, sampling_seed=13)
+
+    assert rollout.architecture == STRUCTURED
+    assert (rollout.trajectories, rollout.horizon, rollout.state_count) == (2, 7, 14)
+    assert set(rollout.states) == set(_state_field_specs(STRUCTURED))
+    for name, (shape, dtype) in _state_field_specs(STRUCTURED).items():
+        assert rollout.states[name].shape == (2, 7, *shape)
+        assert rollout.states[name].dtype == dtype
+    final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
+    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    np.testing.assert_allclose(rollout.rewards[0], -rollout.rewards[1], atol=1e-7)
+    _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=2e-6)
+
+
+def test_native_structured_sampler_and_encoder_agree_on_unit_activity() -> None:
+    """The sampled factor mask and the attention mask must be one predicate.
+
+    The Rust sampler and the Rust structured encoder each compute "unit slot
+    is an existing unit" independently; the rollout stores the sampler's
+    answer and reuses it as StructuredInputs.unit_active in the update path.
+    Replaying the stored actions through a fresh environment compares the
+    encoder's per-step answer against the stored sampler mask, so any future
+    asymmetric edit to either predicate fails here instead of silently
+    biasing the update's attention masking off-policy.
+    """
+    actor = StructuredActor(_small_structured_config())
+    with torch.no_grad():
+        # Force hires so unit activity actually grows past the opening farmer;
+        # otherwise the identity below is only tested on constant masks.
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-20.0)
+        actor.market_kind.bias[MarketKind.HIRE] = 20.0
+
+    rollout = collect_self_play_rust(actor, games=1, seed_start=217, sampling_seed=19)
+
+    environment = load_native().BatchEnv(np.asarray([217], dtype=np.uint64))
+    for step in range(rollout.horizon):
+        encoded = environment.structured()
+        np.testing.assert_array_equal(
+            rollout.unit_active[:, step], np.asarray(encoded["unit_active"])
+        )
+        environment.step_factors(
+            rollout.unit_actions[:, step].astype(np.uint8)[None],
+            rollout.market_kinds[:, step].astype(np.uint8)[None],
+            rollout.market_quantities[:, step].astype(np.uint8)[None],
+        )
+    assert rollout.unit_active.sum() > rollout.trajectories * rollout.horizon
+
+
+def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
+    config = _small_structured_config()
+    actor = StructuredActor(config)
+    _force_quantity_orders(actor)
+    # Deliberately distinct opponent weights: the replay below only passes if
+    # the merged wave routed the learner's outputs into every stored row.
+    opponents = [StructuredActor(config), StructuredActor(config)]
+
+    self_play_games, league_games = 1, 2
+    arena = allocate_rollout_storage(STRUCTURED, self_play_games * 2 + league_games, 719)
+    rollout = collect_mixed_play_rust(
+        actor,
+        opponents,
+        self_play_games=self_play_games,
+        league_games=league_games,
+        opponent_indices=np.asarray([0, 1]),
+        seed_start=230,
+        sampling_seed=21,
+        storage=arena,
+    )
+
+    assert rollout.architecture == STRUCTURED
+    assert (rollout.trajectories, rollout.horizon, rollout.state_count) == (4, 719, 2876)
+    assert (
+        rollout.states["tile_continuous"].__array_interface__["data"][0]
+        == arena["tile_continuous"].__array_interface__["data"][0]
+    )
+    assert rollout.episode_seeds.tolist() == [230, 230, 231, 232]
+    assert rollout.seats.tolist() == [0, 1, 231 % 2, 232 % 2]
+    final_scores = _relative_bank_score(rollout.final_money, rollout.opponent_money)
+    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    assert np.isfinite(rollout.old_unit_logprobs).all()
+    assert np.isfinite(rollout.old_market_kind_logprobs).all()
+    assert np.isfinite(rollout.old_market_quantity_logprobs).all()
+    assert rollout.market_quantity_active[:, 0, 0].all()
+
+    # The centralized-critic extras must be the paired seat's own view of the
+    # shared game-major/player-minor native batch, with the private economy
+    # columns sliced from the paired seat's token buffers.
+    initial = load_native().BatchEnv(np.asarray([230, 231, 232], dtype=np.uint64)).structured()
+    stored_rows = np.asarray([0, 1, 2 + (231 % 2), 4 + (232 % 2)])
+    pair_rows = stored_rows ^ 1
+    np.testing.assert_array_equal(
+        rollout.states["unit_categorical"][:, 0],
+        np.asarray(initial["unit_categorical"])[stored_rows],
+    )
+    np.testing.assert_array_equal(
+        rollout.states["opponent_unit_categorical"][:, 0],
+        np.asarray(initial["unit_categorical"])[pair_rows],
+    )
+    np.testing.assert_array_equal(
+        rollout.states["opponent_unit_active"][:, 0],
+        np.asarray(initial["unit_active"])[pair_rows],
+    )
+    np.testing.assert_array_equal(
+        rollout.states["critic_products"][:, 0],
+        np.asarray(initial["products"])[pair_rows][:, :, _PRODUCT_STOCK_COLUMNS],
+    )
+    np.testing.assert_array_equal(
+        rollout.states["critic_crops"][:, 0],
+        np.asarray(initial["crops"])[pair_rows][:, :, _CROP_SEED_COLUMNS],
+    )
+
+    assert np.isfinite(rollout.entropy_sums).all() and rollout.mean_entropy > 0.0
+    _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
 
 
 def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None:

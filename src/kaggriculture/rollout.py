@@ -12,7 +12,7 @@ import torch
 from kaggle_environments import make
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
-from kaggriculture.constants import BOARD_SIZE, MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import BOARD_SIZE, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
@@ -24,18 +24,33 @@ from kaggriculture.encoding import (
 )
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.policy import PolicyStep, act_batch
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
+from kaggriculture.structured import StructuredActor, StructuredInputs
+from kaggriculture.tokens import (
+    CROP_PRIVATE_FIELDS,
+    CROP_TOKEN_FIELDS,
+    FARM_TOKEN_FIELDS,
+    N_TILE_CATEGORICAL,
+    N_TILE_CONTINUOUS,
+    N_UNIT_CATEGORICAL,
+    N_UNIT_CONTINUOUS,
+    PRODUCT_PRIVATE_FIELDS,
+    PRODUCT_TOKEN_FIELDS,
+    TILE_COUNT,
+    TOWN_TOKEN_FIELDS,
+    UNIT_TILE_GATHERS,
+)
 
 _MAX_FLOAT32_CATEGORICAL_DRAW = np.nextafter(np.float32(1.0), np.float32(0.0))
 
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    board: np.ndarray
-    global_features: np.ndarray
-    critic_features: np.ndarray
-    units: np.ndarray
-    unit_positions: np.ndarray
+    """Behavior rollout: architecture-specific state arrays plus shared factors."""
+
+    architecture: str
+    states: dict[str, np.ndarray]
     unit_actions: np.ndarray
     market_kinds: np.ndarray
     market_quantities: np.ndarray
@@ -66,7 +81,7 @@ class RolloutBatch:
         return int(self.rewards.shape[1])
 
     @property
-    def states(self) -> int:
+    def state_count(self) -> int:
         return int(self.valid.sum())
 
     @property
@@ -96,46 +111,90 @@ def _opponent_privates(states: list[list[Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _new_fields() -> dict[str, list[np.ndarray]]:
-    return {
-        name: []
-        for name in (
-            "board",
-            "global_features",
-            "critic_features",
-            "units",
-            "unit_positions",
-            "unit_actions",
-            "market_kinds",
-            "market_quantities",
-            "unit_masks",
-            "market_kind_masks",
-            "market_quantity_masks",
-            "unit_active",
-            "market_active",
-            "market_quantity_active",
-            "old_unit_logprobs",
-            "old_market_kind_logprobs",
-            "old_market_quantity_logprobs",
-            "rewards",
-            "valid",
-        )
-    }
+def _state_field_specs(architecture: str) -> dict[str, tuple[tuple[int, ...], type]]:
+    """Per-state shape and staging dtype of every architecture state field.
+
+    Structured rollouts persist the exact staging layout of
+    ``StructuredObservation`` plus the centralized-critic extras. The extras
+    come from the opponent seat's viewpoint, so native collection derives
+    them from the paired row's buffers instead of encoding them twice.
+    """
+    if architecture == CONV_ENTITY:
+        return {
+            "board": ((BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), np.float16),
+            "global_features": ((GLOBAL_FEATURES,), np.float16),
+            "critic_features": ((CRITIC_FEATURES,), np.float16),
+            "units": ((MAX_UNITS, UNIT_FEATURES), np.float16),
+            "unit_positions": ((MAX_UNITS, 2), np.int8),
+        }
+    if architecture == STRUCTURED:
+        gathers = len(UNIT_TILE_GATHERS)
+        return {
+            "tile_categorical": ((2 * TILE_COUNT, N_TILE_CATEGORICAL), np.int8),
+            "tile_continuous": ((2 * TILE_COUNT, N_TILE_CONTINUOUS), np.float16),
+            "unit_categorical": ((MAX_UNITS, N_UNIT_CATEGORICAL), np.int8),
+            "unit_continuous": ((MAX_UNITS, N_UNIT_CONTINUOUS), np.float16),
+            "unit_tile_gather": ((MAX_UNITS, gathers), np.int8),
+            "unit_tile_gather_valid": ((MAX_UNITS, gathers), np.bool_),
+            "products": ((len(PRODUCTS), len(PRODUCT_TOKEN_FIELDS)), np.float16),
+            "crops": ((len(CROPS), len(CROP_TOKEN_FIELDS)), np.float16),
+            "farms": ((2, len(FARM_TOKEN_FIELDS)), np.float16),
+            "town": ((len(TOWN_TOKEN_FIELDS),), np.float16),
+            "opponent_unit_categorical": ((MAX_UNITS, N_UNIT_CATEGORICAL), np.int8),
+            "opponent_unit_continuous": ((MAX_UNITS, N_UNIT_CONTINUOUS), np.float16),
+            "opponent_unit_active": ((MAX_UNITS,), np.bool_),
+            "critic_products": ((len(PRODUCTS), len(PRODUCT_PRIVATE_FIELDS)), np.float16),
+            "critic_crops": ((len(CROPS), len(CROP_PRIVATE_FIELDS)), np.float16),
+        }
+    raise ValueError(f"unknown rollout architecture {architecture!r}")
 
 
-def _record_policy_step(fields: dict[str, list[np.ndarray]], policy_step: PolicyStep) -> None:
+_SHARED_FIELD_SPECS: dict[str, tuple[tuple[int, ...], type]] = {
+    "unit_actions": ((MAX_UNITS,), np.int8),
+    "market_kinds": ((MAX_MARKET_ORDERS,), np.int8),
+    "market_quantities": ((MAX_MARKET_ORDERS,), np.int8),
+    "unit_masks": ((MAX_UNITS, N_UNIT_ACTIONS), np.bool_),
+    "market_kind_masks": ((MAX_MARKET_ORDERS, N_MARKET_KINDS), np.bool_),
+    "market_quantity_masks": ((MAX_MARKET_ORDERS, N_QUANTITIES), np.bool_),
+    "unit_active": ((MAX_UNITS,), np.bool_),
+    "market_active": ((MAX_MARKET_ORDERS,), np.bool_),
+    "market_quantity_active": ((MAX_MARKET_ORDERS,), np.bool_),
+    "old_unit_logprobs": ((MAX_UNITS,), np.float32),
+    "old_market_kind_logprobs": ((MAX_MARKET_ORDERS,), np.float32),
+    "old_market_quantity_logprobs": ((MAX_MARKET_ORDERS,), np.float32),
+    "rewards": ((), np.float32),
+    "valid": ((), np.bool_),
+}
+
+_SHARED_ROLLOUT_FIELDS = tuple(_SHARED_FIELD_SPECS)
+
+# Opponent-viewpoint columns the centralized critic reads from the paired
+# row's economy tokens: their own shed/carried product stock and seed counts.
+_PRODUCT_STOCK_COLUMNS = slice(
+    PRODUCT_TOKEN_FIELDS.index("shed_stock"), PRODUCT_TOKEN_FIELDS.index("carried_stock") + 1
+)
+_CROP_SEED_COLUMNS = slice(
+    CROP_TOKEN_FIELDS.index("seeds_held"), CROP_TOKEN_FIELDS.index("seeds_held") + 1
+)
+
+
+def _rollout_array(batch: RolloutBatch, field: str) -> np.ndarray:
+    return batch.states[field] if field in batch.states else getattr(batch, field)
+
+
+def _new_fields(architecture: str) -> dict[str, list[np.ndarray]]:
+    return {name: [] for name in (*_state_field_specs(architecture), *_SHARED_ROLLOUT_FIELDS)}
+
+
+def _record_policy_step(
+    architecture: str, fields: dict[str, list[np.ndarray]], policy_step: PolicyStep
+) -> None:
     factors = policy_step.factors
-    fields["board"].append(np.stack([row.board for row in policy_step.encoded]).astype(np.float16))
-    fields["global_features"].append(
-        np.stack([row.global_features for row in policy_step.encoded]).astype(np.float16)
-    )
-    fields["critic_features"].append(
-        np.stack([row.critic_features for row in policy_step.encoded]).astype(np.float16)
-    )
-    fields["units"].append(np.stack([row.units for row in policy_step.encoded]).astype(np.float16))
-    fields["unit_positions"].append(
-        np.stack([row.unit_positions for row in policy_step.encoded]).astype(np.int8)
-    )
+    for name, (_, dtype) in _state_field_specs(architecture).items():
+        rows = [getattr(row, name) for row in policy_step.encoded]
+        if any(row is None for row in rows):
+            raise ValueError("rollout collection requires opponent private state on every row")
+        fields[name].append(np.stack(rows).astype(dtype, copy=False))
     fields["unit_actions"].append(factors.unit_actions.astype(np.int8))
     fields["market_kinds"].append(factors.market_kinds.astype(np.int8))
     fields["market_quantities"].append(factors.market_quantities.astype(np.int8))
@@ -151,6 +210,7 @@ def _record_policy_step(fields: dict[str, list[np.ndarray]], policy_step: Policy
 
 
 def _finish_rollout(
+    architecture: str,
     fields: dict[str, list[np.ndarray]],
     *,
     episode_seeds: np.ndarray,
@@ -161,25 +221,12 @@ def _finish_rollout(
     started: float,
 ) -> RolloutBatch:
     return RolloutBatch(
-        board=_trajectory_first(fields["board"]),
-        global_features=_trajectory_first(fields["global_features"]),
-        critic_features=_trajectory_first(fields["critic_features"]),
-        units=_trajectory_first(fields["units"]),
-        unit_positions=_trajectory_first(fields["unit_positions"]),
-        unit_actions=_trajectory_first(fields["unit_actions"]),
-        market_kinds=_trajectory_first(fields["market_kinds"]),
-        market_quantities=_trajectory_first(fields["market_quantities"]),
-        unit_masks=_trajectory_first(fields["unit_masks"]),
-        market_kind_masks=_trajectory_first(fields["market_kind_masks"]),
-        market_quantity_masks=_trajectory_first(fields["market_quantity_masks"]),
-        unit_active=_trajectory_first(fields["unit_active"]),
-        market_active=_trajectory_first(fields["market_active"]),
-        market_quantity_active=_trajectory_first(fields["market_quantity_active"]),
-        old_unit_logprobs=_trajectory_first(fields["old_unit_logprobs"]),
-        old_market_kind_logprobs=_trajectory_first(fields["old_market_kind_logprobs"]),
-        old_market_quantity_logprobs=_trajectory_first(fields["old_market_quantity_logprobs"]),
-        rewards=_trajectory_first(fields["rewards"]),
-        valid=_trajectory_first(fields["valid"]),
+        architecture=architecture,
+        states={name: _trajectory_first(fields[name]) for name in _state_field_specs(architecture)},
+        **{
+            name: _trajectory_first(fields[name], dtype)
+            for name, (_, dtype) in _SHARED_FIELD_SPECS.items()
+        },
         episode_seeds=episode_seeds,
         final_money=final_money,
         opponent_money=opponent_money,
@@ -189,29 +236,17 @@ def _finish_rollout(
     )
 
 
-def _native_field_specs(trajectories: int, horizon: int) -> dict[str, tuple[tuple[int, ...], type]]:
+def _native_field_specs(
+    architecture: str, trajectories: int, horizon: int
+) -> dict[str, tuple[tuple[int, ...], type]]:
     """Return the trajectory-major shape and dtype of every native rollout field."""
     prefix = (trajectories, horizon)
     return {
-        "board": ((*prefix, BOARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), np.float16),
-        "global_features": ((*prefix, GLOBAL_FEATURES), np.float16),
-        "critic_features": ((*prefix, CRITIC_FEATURES), np.float16),
-        "units": ((*prefix, MAX_UNITS, UNIT_FEATURES), np.float16),
-        "unit_positions": ((*prefix, MAX_UNITS, 2), np.int8),
-        "unit_actions": ((*prefix, MAX_UNITS), np.int8),
-        "market_kinds": ((*prefix, MAX_MARKET_ORDERS), np.int8),
-        "market_quantities": ((*prefix, MAX_MARKET_ORDERS), np.int8),
-        "unit_masks": ((*prefix, MAX_UNITS, N_UNIT_ACTIONS), np.bool_),
-        "market_kind_masks": ((*prefix, MAX_MARKET_ORDERS, N_MARKET_KINDS), np.bool_),
-        "market_quantity_masks": ((*prefix, MAX_MARKET_ORDERS, N_QUANTITIES), np.bool_),
-        "unit_active": ((*prefix, MAX_UNITS), np.bool_),
-        "market_active": ((*prefix, MAX_MARKET_ORDERS), np.bool_),
-        "market_quantity_active": ((*prefix, MAX_MARKET_ORDERS), np.bool_),
-        "old_unit_logprobs": ((*prefix, MAX_UNITS), np.float32),
-        "old_market_kind_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
-        "old_market_quantity_logprobs": ((*prefix, MAX_MARKET_ORDERS), np.float32),
-        "rewards": (prefix, np.float32),
-        "valid": (prefix, np.bool_),
+        name: ((*prefix, *shape), dtype)
+        for name, (shape, dtype) in {
+            **_state_field_specs(architecture),
+            **_SHARED_FIELD_SPECS,
+        }.items()
     }
 
 
@@ -224,7 +259,7 @@ _TORCH_STORAGE_DTYPES = {
 
 
 def allocate_rollout_storage(
-    trajectories: int, horizon: int, *, pin_memory: bool = False
+    architecture: str, trajectories: int, horizon: int, *, pin_memory: bool = False
 ) -> dict[str, np.ndarray]:
     """Allocate reusable trajectory-major rollout storage.
 
@@ -235,7 +270,7 @@ def allocate_rollout_storage(
     if trajectories < 1 or horizon < 1:
         raise ValueError("rollout storage requires positive trajectories and horizon")
     storage: dict[str, np.ndarray] = {}
-    for name, (shape, dtype) in _native_field_specs(trajectories, horizon).items():
+    for name, (shape, dtype) in _native_field_specs(architecture, trajectories, horizon).items():
         if pin_memory:
             tensor = torch.empty(
                 shape, dtype=_TORCH_STORAGE_DTYPES[np.dtype(dtype)], pin_memory=True
@@ -248,12 +283,12 @@ def allocate_rollout_storage(
 
 
 def _native_rollout_storage(
-    storage: dict[str, np.ndarray] | None, trajectories: int, horizon: int
+    storage: dict[str, np.ndarray] | None, architecture: str, trajectories: int, horizon: int
 ) -> dict[str, np.ndarray]:
     """Validate caller-provided storage or allocate a fresh full-horizon block."""
     if storage is None:
-        return allocate_rollout_storage(trajectories, horizon)
-    specs = _native_field_specs(trajectories, horizon)
+        return allocate_rollout_storage(architecture, trajectories, horizon)
+    specs = _native_field_specs(architecture, trajectories, horizon)
     if set(storage) != set(specs):
         raise ValueError("rollout storage fields do not match the native layout")
     for name, (shape, dtype) in specs.items():
@@ -264,10 +299,12 @@ def _native_rollout_storage(
     return storage
 
 
-def _quantity_heads(actors: tuple[FarmActor, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _quantity_heads(
+    actors: tuple[FarmActor | StructuredActor, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Materialize the small selected-kind quantity heads once per rollout."""
 
-    def parameter(actor: FarmActor, name: str) -> np.ndarray:
+    def parameter(actor: FarmActor | StructuredActor, name: str) -> np.ndarray:
         value = getattr(actor, name)
         if hasattr(value, "weight"):
             value = value.weight
@@ -286,6 +323,39 @@ def _quantity_heads(actors: tuple[FarmActor, ...]) -> tuple[np.ndarray, np.ndarr
     )
 
 
+def _select_inputs(inputs: tuple[Any, ...], rows: torch.Tensor) -> tuple[Any, ...]:
+    """Gather rows of a model-argument tuple, recursing into token bundles."""
+    return tuple(
+        type(entry)(*(tensor.index_select(0, rows) for tensor in entry))
+        if isinstance(entry, tuple)
+        else entry.index_select(0, rows)
+        for entry in inputs
+    )
+
+
+def _lane_view_inputs(
+    inputs: tuple[Any, ...], rows: torch.Tensor, lanes: int, width: int
+) -> tuple[Any, ...]:
+    """Gather ensemble rows and fold them into [lanes, width, ...] shapes."""
+
+    def folded(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.index_select(0, rows).view(lanes, width, *tensor.shape[1:])
+
+    return tuple(
+        type(entry)(*(folded(tensor) for tensor in entry))
+        if isinstance(entry, tuple)
+        else folded(entry)
+        for entry in inputs
+    )
+
+
+def _leading_tensor(inputs: tuple[Any, ...]) -> torch.Tensor:
+    head = inputs[0]
+    while isinstance(head, tuple):
+        head = head[0]
+    return head
+
+
 @dataclass(frozen=True)
 class _NativeEncodedWave:
     arrays: dict[str, np.ndarray]
@@ -302,6 +372,12 @@ class _NativeEncodedWave:
         non_blocking = self.device_features.device.type == "cuda"
         self.device_features.copy_(self.host_features, non_blocking=non_blocking)
         self.unit_positions.copy_(self.host_positions, non_blocking=non_blocking)
+
+    def refresh(self, environment: Any) -> None:
+        environment.encoded_into(self.arrays)
+
+    def inputs(self) -> tuple[torch.Tensor, ...]:
+        return (self.board, self.global_features, self.units, self.unit_positions)
 
 
 def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncodedWave:
@@ -339,6 +415,97 @@ def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncod
         units=device_views["units"],
         unit_positions=unit_positions,
     )
+
+
+# Host-to-device transport groups for the structured wave: every group packs
+# into one pinned block so a wave costs three asynchronous uploads.
+_STRUCTURED_CONTINUOUS_BUFFERS = (
+    "tile_continuous",
+    "unit_continuous",
+    "products",
+    "crops",
+    "farms",
+    "town",
+)
+_STRUCTURED_CATEGORICAL_BUFFERS = ("tile_categorical", "unit_categorical", "unit_tile_gather")
+_STRUCTURED_FLAG_BUFFERS = ("unit_active", "unit_tile_gather_valid")
+
+
+@dataclass(frozen=True)
+class _NativeStructuredWave:
+    arrays: dict[str, np.ndarray]
+    host_continuous: torch.Tensor
+    host_categorical: torch.Tensor
+    host_flags: torch.Tensor
+    device_continuous: torch.Tensor
+    device_categorical: torch.Tensor
+    device_flags: torch.Tensor
+    device_inputs: StructuredInputs
+
+    def copy_to_device(self) -> None:
+        non_blocking = self.device_continuous.device.type == "cuda"
+        self.device_continuous.copy_(self.host_continuous, non_blocking=non_blocking)
+        self.device_categorical.copy_(self.host_categorical, non_blocking=non_blocking)
+        self.device_flags.copy_(self.host_flags, non_blocking=non_blocking)
+
+    def refresh(self, environment: Any) -> None:
+        environment.structured_into(self.arrays)
+
+    def inputs(self) -> tuple[StructuredInputs]:
+        return (self.device_inputs,)
+
+
+def _native_structured_wave(environment: Any, device: torch.device) -> _NativeStructuredWave:
+    """Build reusable structured Rust output plus packed device token tensors.
+
+    Categorical indices upload straight from their int8 staging bytes into
+    int64 embedding-index tensors; continuous features upload from float16
+    staging into the float32 the model consumes.
+    """
+    arrays = {name: np.asarray(value) for name, value in environment.structured_buffers().items()}
+    pin_memory = device.type == "cuda"
+
+    def packed(
+        names: tuple[str, ...], host_dtype: torch.dtype, device_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        sizes = [arrays[name].size for name in names]
+        host = torch.empty(sum(sizes), dtype=host_dtype, pin_memory=pin_memory)
+        block = torch.empty(sum(sizes), dtype=device_dtype, device=device)
+        views: dict[str, torch.Tensor] = {}
+        cursor = 0
+        for name, size in zip(names, sizes, strict=True):
+            shape = arrays[name].shape
+            views[name] = block[cursor : cursor + size].reshape(shape)
+            arrays[name] = host[cursor : cursor + size].reshape(shape).numpy()
+            cursor += size
+        return host, block, views
+
+    host_continuous, device_continuous, views = packed(
+        _STRUCTURED_CONTINUOUS_BUFFERS, torch.float16, torch.float32
+    )
+    host_categorical, device_categorical, categorical_views = packed(
+        _STRUCTURED_CATEGORICAL_BUFFERS, torch.int8, torch.int64
+    )
+    host_flags, device_flags, flag_views = packed(_STRUCTURED_FLAG_BUFFERS, torch.bool, torch.bool)
+    views |= categorical_views | flag_views
+    return _NativeStructuredWave(
+        arrays=arrays,
+        host_continuous=host_continuous,
+        host_categorical=host_categorical,
+        host_flags=host_flags,
+        device_continuous=device_continuous,
+        device_categorical=device_categorical,
+        device_flags=device_flags,
+        device_inputs=StructuredInputs(**{name: views[name] for name in StructuredInputs._fields}),
+    )
+
+
+def _native_wave(
+    architecture: str, environment: Any, device: torch.device
+) -> _NativeEncodedWave | _NativeStructuredWave:
+    if architecture == CONV_ENTITY:
+        return _native_encoded_wave(environment, device)
+    return _native_structured_wave(environment, device)
 
 
 @dataclass(frozen=True)
@@ -400,7 +567,7 @@ def _packed_outputs_to_host(
     return host_outputs, pinned_buffer
 
 
-def _cached_compiled_forward(model: FarmActor) -> Any:
+def _cached_compiled_forward(model: FarmActor | StructuredActor) -> Any:
     """Capture the native ATen rollout forward in a CUDA graph.
 
     PPO replays stored behavior likelihoods through the eager FP32 actor. The
@@ -425,12 +592,12 @@ def _cached_compiled_forward(model: FarmActor) -> Any:
 
 
 def _rollout_model_forward(
-    model: FarmActor,
-    *inputs: torch.Tensor,
+    model: FarmActor | StructuredActor,
+    *inputs: Any,
     compile_model: bool,
 ) -> ActorOutput | torch.Tensor:
     """Run one static rollout wave, optionally through a cached compiled graph."""
-    if not compile_model or inputs[0].device.type != "cuda":
+    if not compile_model or _leading_tensor(inputs).device.type != "cuda":
         return model(*inputs)
     return _cached_compiled_forward(model)(*inputs)
 
@@ -447,8 +614,8 @@ class _StackedFrozenEnsemble:
     per-step parameter copies.
     """
 
-    def __init__(self, models: Sequence[FarmActor]) -> None:
-        self.template = FarmActor(models[0].config).to("meta")
+    def __init__(self, models: Sequence[FarmActor | StructuredActor]) -> None:
+        self.template = type(models[0])(models[0].config).to("meta")
         self.template.eval()
         import torch._dynamo
 
@@ -463,11 +630,13 @@ class _StackedFrozenEnsemble:
         self._compiled: dict[int, Any] = {}
 
     @staticmethod
-    def _stacked(source: str, models: Sequence[FarmActor]) -> dict[str, torch.Tensor]:
+    def _stacked(
+        source: str, models: Sequence[FarmActor | StructuredActor]
+    ) -> dict[str, torch.Tensor]:
         states = [dict(getattr(model, source)()) for model in models]
         return {name: torch.stack([state[name].detach() for state in states]) for name in states[0]}
 
-    def load(self, models: Sequence[FarmActor]) -> None:
+    def load(self, models: Sequence[FarmActor | StructuredActor]) -> None:
         for source, stacked_group in (
             ("named_parameters", self.params),
             ("named_buffers", self.buffers),
@@ -477,40 +646,25 @@ class _StackedFrozenEnsemble:
                 for name, stacked in stacked_group.items():
                     stacked[lane].copy_(state[name])
 
-    def _forward(
-        self,
-        board: torch.Tensor,
-        global_features: torch.Tensor,
-        units: torch.Tensor,
-        unit_positions: torch.Tensor,
-    ) -> ActorOutput:
+    def _forward(self, *inputs: Any) -> ActorOutput:
         def run(
             params: dict[str, torch.Tensor],
             buffers: dict[str, torch.Tensor],
-            *inputs: torch.Tensor,
+            *inner: Any,
         ) -> ActorOutput:
-            return torch.func.functional_call(self.template, (params, buffers), inputs)
+            return torch.func.functional_call(self.template, (params, buffers), inner)
 
-        return torch.vmap(run)(
-            self.params, self.buffers, board, global_features, units, unit_positions
-        )
+        return torch.vmap(run)(self.params, self.buffers, *inputs)
 
-    def __call__(
-        self,
-        board: torch.Tensor,
-        global_features: torch.Tensor,
-        units: torch.Tensor,
-        unit_positions: torch.Tensor,
-        *,
-        compile_model: bool,
-    ) -> ActorOutput:
-        if not compile_model or board.device.type != "cuda":
-            return self._forward(board, global_features, units, unit_positions)
+    def __call__(self, *inputs: Any, compile_model: bool) -> ActorOutput:
+        leading = _leading_tensor(inputs)
+        if not compile_model or leading.device.type != "cuda":
+            return self._forward(*inputs)
         # One compiled callable per lane width: league assignments may change
         # the padded width between waves, and sharing one callable would burn
         # through Dynamo's per-code recompile budget before falling back to
         # eager silently.
-        compiled = self._compiled.get(board.shape[1])
+        compiled = self._compiled.get(leading.shape[1])
         if compiled is None:
             compiled = torch.compile(
                 self._forward,
@@ -518,16 +672,18 @@ class _StackedFrozenEnsemble:
                 fullgraph=True,
                 dynamic=False,
             )
-            self._compiled[board.shape[1]] = compiled
-        return compiled(board, global_features, units, unit_positions)
+            self._compiled[leading.shape[1]] = compiled
+        return compiled(*inputs)
 
 
 _FROZEN_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedFrozenEnsemble] = {}
 
 
-def _stacked_frozen_ensemble(models: Sequence[FarmActor]) -> _StackedFrozenEnsemble:
+def _stacked_frozen_ensemble(
+    models: Sequence[FarmActor | StructuredActor],
+) -> _StackedFrozenEnsemble:
     """Fetch or build the persistent stacked ensemble for these league lanes."""
-    key = (models[0].config, len(models), next(models[0].parameters()).device)
+    key = (type(models[0]), models[0].config, len(models), next(models[0].parameters()).device)
     ensemble = _FROZEN_ENSEMBLE_CACHE.get(key)
     if ensemble is None:
         ensemble = _StackedFrozenEnsemble(models)
@@ -572,36 +728,74 @@ def _validate_learner_temperature(temperature: float) -> None:
         raise ValueError("on-policy rollout collection requires learner temperature 1.0")
 
 
+_SAMPLED_FIELD_SOURCES = {
+    "unit_actions": "unit_actions",
+    "market_kinds": "market_kinds",
+    "market_quantities": "market_quantities",
+    "unit_masks": "unit_masks",
+    "market_kind_masks": "market_kind_masks",
+    "market_quantity_masks": "market_quantity_masks",
+    "unit_active": "unit_active",
+    "market_active": "market_active",
+    "market_quantity_active": "market_quantity_active",
+    "old_unit_logprobs": "unit_logprobs",
+    "old_market_kind_logprobs": "market_kind_logprobs",
+    "old_market_quantity_logprobs": "market_quantity_logprobs",
+}
+
+_CONV_ENCODED_FIELDS = ("board", "global_features", "critic_features", "units", "unit_positions")
+_STRUCTURED_ENCODED_FIELDS = (
+    "tile_categorical",
+    "tile_continuous",
+    "unit_categorical",
+    "unit_continuous",
+    "unit_tile_gather",
+    "unit_tile_gather_valid",
+    "products",
+    "crops",
+    "farms",
+    "town",
+)
+
+
 def _store_native_wave(
+    architecture: str,
     fields: dict[str, np.ndarray],
     step: int,
     encoded: dict[str, np.ndarray],
     sampled: dict[str, np.ndarray],
     rewards: np.ndarray,
-    rows: np.ndarray | slice = slice(None),
+    rows: np.ndarray | slice,
+    pair_rows: np.ndarray,
 ) -> None:
-    for name in ("board", "global_features", "critic_features", "units", "unit_positions"):
-        fields[name][:, step] = np.asarray(encoded[name])[rows]
-    mapping = {
-        "unit_actions": "unit_actions",
-        "market_kinds": "market_kinds",
-        "market_quantities": "market_quantities",
-        "unit_masks": "unit_masks",
-        "market_kind_masks": "market_kind_masks",
-        "market_quantity_masks": "market_quantity_masks",
-        "unit_active": "unit_active",
-        "market_active": "market_active",
-        "market_quantity_active": "market_quantity_active",
-        "old_unit_logprobs": "unit_logprobs",
-        "old_market_kind_logprobs": "market_kind_logprobs",
-        "old_market_quantity_logprobs": "market_quantity_logprobs",
-    }
-    for destination, source in mapping.items():
+    if architecture == CONV_ENTITY:
+        for name in _CONV_ENCODED_FIELDS:
+            fields[name][:, step] = np.asarray(encoded[name])[rows]
+    else:
+        for name in _STRUCTURED_ENCODED_FIELDS:
+            fields[name][:, step] = np.asarray(encoded[name])[rows]
+        # Centralized-critic extras are the paired seat's own view of the same
+        # buffers, so no second encoding pass exists anywhere.
+        fields["opponent_unit_categorical"][:, step] = np.asarray(encoded["unit_categorical"])[
+            pair_rows
+        ]
+        fields["opponent_unit_continuous"][:, step] = np.asarray(encoded["unit_continuous"])[
+            pair_rows
+        ]
+        fields["opponent_unit_active"][:, step] = np.asarray(encoded["unit_active"])[pair_rows]
+        fields["critic_products"][:, step] = np.asarray(encoded["products"])[pair_rows][
+            :, :, _PRODUCT_STOCK_COLUMNS
+        ]
+        fields["critic_crops"][:, step] = np.asarray(encoded["crops"])[pair_rows][
+            :, :, _CROP_SEED_COLUMNS
+        ]
+    for destination, source in _SAMPLED_FIELD_SOURCES.items():
         fields[destination][:, step] = np.asarray(sampled[source])[rows]
     fields["rewards"][:, step] = rewards
 
 
 def _native_batch(
+    architecture: str,
     fields: dict[str, np.ndarray],
     *,
     episode_seeds: np.ndarray,
@@ -611,8 +805,11 @@ def _native_batch(
     entropy_sums: np.ndarray,
     started: float,
 ) -> RolloutBatch:
+    state_names = set(_state_field_specs(architecture))
     return RolloutBatch(
-        **fields,
+        architecture=architecture,
+        states={name: array for name, array in fields.items() if name in state_names},
+        **{name: array for name, array in fields.items() if name not in state_names},
         episode_seeds=episode_seeds,
         final_money=final_money,
         opponent_money=opponent_money,
@@ -624,8 +821,8 @@ def _native_batch(
 
 @torch.inference_mode()
 def collect_mixed_play_rust(
-    actor: FarmActor,
-    opponents: Sequence[FarmActor] = (),
+    actor: FarmActor | StructuredActor,
+    opponents: Sequence[FarmActor | StructuredActor] = (),
     *,
     self_play_games: int = 0,
     league_games: int = 0,
@@ -708,8 +905,12 @@ def collect_mixed_play_rust(
     device = next(actor.parameters()).device
     if any(next(opponent.parameters()).device != device for opponent in opponents):
         raise ValueError("current and all frozen models must use the same device")
-    if any(opponent.config != actor.config for opponent in opponents):
+    if any(
+        type(opponent) is not type(actor) or opponent.config != actor.config
+        for opponent in opponents
+    ):
         raise ValueError("current and frozen actors must use the same model configuration")
+    architecture = architecture_of(actor).name
 
     games = self_play_games + league_games
     seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
@@ -718,8 +919,8 @@ def collect_mixed_play_rust(
     horizon = episode_steps - 1
     self_play_rows = self_play_games * 2
     trajectories = self_play_rows + league_games
-    fields = _native_rollout_storage(storage, trajectories, horizon)
-    encoded_wave = _native_encoded_wave(environment, device)
+    fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
+    encoded_wave = _native_wave(architecture, environment, device)
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
 
@@ -744,6 +945,7 @@ def collect_mixed_play_rust(
     # A pure self-play wave keeps the learner forward over the contiguous full
     # batch and stores every row, avoiding gather/scatter work entirely.
     store_rows: np.ndarray | slice = slice(None) if not league_games else stored_rows
+    stored_pair_rows = stored_rows ^ 1
     current_tensor = None if not league_games else torch.as_tensor(stored_rows, device=device)
     if league_games:
         frozen_groups = tuple(
@@ -773,16 +975,13 @@ def collect_mixed_play_rust(
             (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
         )
     for step in range(horizon):
-        environment.encoded_into(encoded)
+        encoded_wave.refresh(environment)
         encoded_wave.copy_to_device()
         _mark_cuda_graph_step(device, compile_models)
         if not league_games:
             output = _rollout_model_forward(
                 actor,
-                encoded_wave.board,
-                encoded_wave.global_features,
-                encoded_wave.units,
-                encoded_wave.unit_positions,
+                *encoded_wave.inputs(),
                 compile_model=compile_models,
             )
             assert isinstance(output, ActorOutput)
@@ -795,23 +994,12 @@ def collect_mixed_play_rust(
         else:
             current_output = _rollout_model_forward(
                 actor,
-                encoded_wave.board.index_select(0, current_tensor),
-                encoded_wave.global_features.index_select(0, current_tensor),
-                encoded_wave.units.index_select(0, current_tensor),
-                encoded_wave.unit_positions.index_select(0, current_tensor),
+                *_select_inputs(encoded_wave.inputs(), current_tensor),
                 compile_model=compile_models,
             )
             assert isinstance(current_output, ActorOutput)
             lane_output = ensemble(
-                *(
-                    tensor.index_select(0, frozen_tensor).view(lanes, lane_width, *tensor.shape[1:])
-                    for tensor in (
-                        encoded_wave.board,
-                        encoded_wave.global_features,
-                        encoded_wave.units,
-                        encoded_wave.unit_positions,
-                    )
-                ),
+                *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
                 compile_model=compile_models,
             )
             frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
@@ -862,7 +1050,16 @@ def collect_mixed_play_rust(
             sampled,
         )
         rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
-        _store_native_wave(fields, step, encoded, sampled, rewards[store_rows], store_rows)
+        _store_native_wave(
+            architecture,
+            fields,
+            step,
+            encoded,
+            sampled,
+            rewards[store_rows],
+            store_rows,
+            stored_pair_rows,
+        )
         counts = (
             np.asarray(sampled["unit_active"])[store_rows].sum(axis=1)
             + np.asarray(sampled["market_active"])[store_rows].sum(axis=1)
@@ -885,6 +1082,7 @@ def collect_mixed_play_rust(
         [self_final[:, ::-1].reshape(-1), league_final[league_index, 1 - league_seats]]
     )
     return _native_batch(
+        architecture,
         fields,
         episode_seeds=np.concatenate(
             [
@@ -906,7 +1104,7 @@ def collect_mixed_play_rust(
 
 
 def collect_self_play_rust(
-    actor: FarmActor,
+    actor: FarmActor | StructuredActor,
     *,
     games: int,
     seed_start: int,
@@ -934,8 +1132,8 @@ def collect_self_play_rust(
 
 
 def collect_frozen_opponents_play_rust(
-    actor: FarmActor,
-    opponents: Sequence[FarmActor],
+    actor: FarmActor | StructuredActor,
+    opponents: Sequence[FarmActor | StructuredActor],
     *,
     games: int,
     opponent_indices: Sequence[int] | np.ndarray | None = None,
@@ -974,8 +1172,8 @@ def collect_frozen_opponents_play_rust(
 
 
 def collect_frozen_opponent_play_rust(
-    actor: FarmActor,
-    opponent: FarmActor,
+    actor: FarmActor | StructuredActor,
+    opponent: FarmActor | StructuredActor,
     *,
     games: int,
     seed_start: int,
@@ -1004,7 +1202,7 @@ def collect_frozen_opponent_play_rust(
 
 
 def collect_self_play(
-    actor: FarmActor,
+    actor: FarmActor | StructuredActor,
     *,
     games: int,
     seed_start: int,
@@ -1021,6 +1219,7 @@ def collect_self_play(
     _validate_learner_temperature(temperature)
     started = time.perf_counter()
     actor.eval()
+    architecture = architecture_of(actor).name
     generator = np.random.default_rng(sampling_seed)
     environments = [
         make(
@@ -1032,7 +1231,7 @@ def collect_self_play(
     ]
     states = [environment.reset(2) for environment in environments]
     potentials = [pair_potential(state[0].observation, state[1].observation) for state in states]
-    fields = _new_fields()
+    fields = _new_fields(architecture)
     trajectories = games * 2
     final_money = np.zeros(trajectories, dtype=np.float32)
     opponent_money = np.zeros(trajectories, dtype=np.float32)
@@ -1050,7 +1249,7 @@ def collect_self_play(
             temperature=temperature,
             generator=generator,
         )
-        _record_policy_step(fields, policy_step)
+        _record_policy_step(architecture, fields, policy_step)
         entropy_sums += policy_step.factors.entropy_sums
 
         next_states = []
@@ -1087,6 +1286,7 @@ def collect_self_play(
     if not all(environment.done for environment in environments):
         raise RuntimeError("self-play rollout ended before all environments reached DONE")
     return _finish_rollout(
+        architecture,
         fields,
         episode_seeds=np.repeat(
             np.arange(seed_start, seed_start + games, dtype=np.int64), repeats=2
@@ -1100,8 +1300,8 @@ def collect_self_play(
 
 
 def collect_frozen_opponent_play(
-    actor: FarmActor,
-    opponent: FarmActor,
+    actor: FarmActor | StructuredActor,
+    opponent: FarmActor | StructuredActor,
     *,
     games: int,
     seed_start: int,
@@ -1121,6 +1321,7 @@ def collect_frozen_opponent_play(
     started = time.perf_counter()
     actor.eval()
     opponent.eval()
+    architecture = architecture_of(actor).name
     device = next(actor.parameters()).device
     if next(opponent.parameters()).device != device:
         raise ValueError("current and frozen policies must use the same device")
@@ -1137,7 +1338,7 @@ def collect_frozen_opponent_play(
     states = [environment.reset(2) for environment in environments]
     seats = np.asarray([(seed_start + index) % 2 for index in range(games)], dtype=np.int8)
     potentials = [pair_potential(state[0].observation, state[1].observation) for state in states]
-    fields = _new_fields()
+    fields = _new_fields(architecture)
     final_money = np.zeros(games, dtype=np.float32)
     opponent_money = np.zeros(games, dtype=np.float32)
     entropy_sums = np.zeros(games, dtype=np.float64)
@@ -1167,7 +1368,7 @@ def collect_frozen_opponent_play(
             temperature=opponent_temperature,
             generator=opponent_generator,
         )
-        _record_policy_step(fields, current_step)
+        _record_policy_step(architecture, fields, current_step)
         entropy_sums += current_step.factors.entropy_sums
 
         next_states = []
@@ -1204,6 +1405,7 @@ def collect_frozen_opponent_play(
     if not all(environment.done for environment in environments):
         raise RuntimeError("league rollout ended before all environments reached DONE")
     return _finish_rollout(
+        architecture,
         fields,
         episode_seeds=np.arange(seed_start, seed_start + games, dtype=np.int64),
         final_money=final_money,
@@ -1242,9 +1444,10 @@ def slice_trajectories(batch: RolloutBatch, start: int, stop: int) -> RolloutBat
     """
     if not 0 <= start < stop <= batch.trajectories:
         raise ValueError("trajectory slice is out of range")
-    state_fields = tuple(_native_field_specs(1, 1))
     return RolloutBatch(
-        **{field: getattr(batch, field)[start:stop] for field in state_fields},
+        architecture=batch.architecture,
+        states={name: array[start:stop] for name, array in batch.states.items()},
+        **{field: getattr(batch, field)[start:stop] for field in _SHARED_ROLLOUT_FIELDS},
         **{field: getattr(batch, field)[start:stop] for field in _TRAJECTORY_METADATA_FIELDS},
         elapsed_seconds=batch.elapsed_seconds,
     )
@@ -1258,12 +1461,20 @@ def concatenate_rollouts(batches: list[RolloutBatch]) -> RolloutBatch:
         return batches[0]
     if len({batch.horizon for batch in batches}) != 1:
         raise ValueError("rollout horizons must match")
-    state_fields = tuple(_native_field_specs(1, 1))
-    combined = {
-        field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
-        for field in state_fields
-    }
-    return RolloutBatch(**combined, **_combined_rollout_metadata(batches))
+    if len({batch.architecture for batch in batches}) != 1:
+        raise ValueError("rollout architectures must match")
+    return RolloutBatch(
+        architecture=batches[0].architecture,
+        states={
+            name: np.concatenate([batch.states[name] for batch in batches], axis=0)
+            for name in batches[0].states
+        },
+        **{
+            field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
+            for field in _SHARED_ROLLOUT_FIELDS
+        },
+        **_combined_rollout_metadata(batches),
+    )
 
 
 def merge_contiguous_rollouts(
@@ -1279,22 +1490,28 @@ def merge_contiguous_rollouts(
         raise ValueError("at least one rollout batch is required")
     if len({batch.horizon for batch in batches}) != 1:
         raise ValueError("rollout horizons must match")
+    if len({batch.architecture for batch in batches}) != 1:
+        raise ValueError("rollout architectures must match")
+    architecture = batches[0].architecture
+    state_names = tuple(_state_field_specs(architecture))
+    field_names = (*state_names, *_SHARED_ROLLOUT_FIELDS)
     rows = sum(batch.trajectories for batch in batches)
-    state_fields = tuple(_native_field_specs(1, 1))
     offset = 0
     for batch in batches:
-        for field in state_fields:
+        for field in field_names:
             expected = storage[field][offset : offset + batch.trajectories]
-            actual = getattr(batch, field)
+            actual = _rollout_array(batch, field)
             if (
                 actual.shape != expected.shape
                 or actual.__array_interface__["data"][0] != expected.__array_interface__["data"][0]
             ):
                 raise ValueError("rollout batches are not adjacent views of the storage arena")
         offset += batch.trajectories
-    if any(storage[field].shape[0] != rows for field in state_fields):
+    if any(storage[field].shape[0] != rows for field in field_names):
         raise ValueError("storage arena rows do not match the combined batches")
     return RolloutBatch(
-        **{field: storage[field] for field in state_fields},
+        architecture=architecture,
+        states={name: storage[name] for name in state_names},
+        **{field: storage[field] for field in _SHARED_ROLLOUT_FIELDS},
         **_combined_rollout_metadata(batches),
     )

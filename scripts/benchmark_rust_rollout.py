@@ -254,7 +254,7 @@ def main() -> None:
             seed_cursor += games
             diagnostics = rollout_diagnostics(rollout)
             games_per_second = games / rollout.elapsed_seconds
-            states_per_second = rollout.states / rollout.elapsed_seconds
+            states_per_second = rollout.state_count / rollout.elapsed_seconds
             rates.append(games_per_second)
             state_rates.append(states_per_second)
             payload = {

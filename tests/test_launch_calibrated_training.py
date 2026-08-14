@@ -8,7 +8,25 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.production import build_training_command
+from kaggriculture.production import build_training_command, resolve_resume_checkpoint
+
+
+def test_resume_detection_accepts_only_a_regular_latest_checkpoint(tmp_path: Path) -> None:
+    assert resolve_resume_checkpoint(tmp_path) is None
+
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(b"atomic checkpoint")
+    assert resolve_resume_checkpoint(tmp_path) == latest
+
+    latest.unlink()
+    latest.symlink_to(tmp_path / "checkpoint-000005.pt")
+    with pytest.raises(ValueError, match="regular file"):
+        resolve_resume_checkpoint(tmp_path)
+
+    latest.unlink()
+    latest.mkdir()
+    with pytest.raises(ValueError, match="regular file"):
+        resolve_resume_checkpoint(tmp_path)
 
 
 def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -> None:
@@ -25,6 +43,10 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
     )
 
     assert command[-2:] == ["--resume", str(latest)]
+    # External probes are part of the production record: cadence and opponents
+    # must both be emitted so the launch command is complete.
+    assert command[command.index("--external-eval-every") + 1] == "10"
+    assert command[command.index("--external-eval-opponents") + 1] == "starter,public-v27"
 
 
 def test_training_command_requires_digest_and_decision_together(tmp_path: Path) -> None:
@@ -81,8 +103,7 @@ def _records(
         "hardware": _hardware(),
         "self_play_game_counts": game_counts,
         "league_games_per_iteration": 96,
-        "league_opponents": 5,
-        "league_initial_opponents": 1,
+        "league_opponents": 4,
         "league_active_opponents": 2,
         "league_historical_opponents": 2,
         "episode_steps": 720,

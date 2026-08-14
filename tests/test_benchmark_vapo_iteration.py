@@ -81,3 +81,57 @@ def test_emit_rejects_nonfinite_values_without_extending_report(tmp_path: Path) 
     assert [json.loads(line) for line in destination.read_text().splitlines()] == [
         {"event": "configuration"}
     ]
+
+
+def test_first_step_critic_state_verification_covers_both_families() -> None:
+    """The pre-update integrity gate must pass on a genuine mixed wave and
+    fail once a stored critic-only value is corrupted, for each family."""
+    import numpy as np
+
+    from kaggriculture.model import FarmActor, ModelConfig
+    from kaggriculture.registry import CONV_ENTITY, STRUCTURED
+    from kaggriculture.rollout import collect_mixed_play_rust
+    from kaggriculture.structured import StructuredActor, StructuredConfig
+
+    module = _script()
+    torch.manual_seed(0)
+    cases = (
+        (
+            FarmActor(ModelConfig(cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3)),
+            CONV_ENTITY,
+            "critic_features",
+        ),
+        (
+            StructuredActor(
+                StructuredConfig(
+                    model_dim=16,
+                    attention_heads=2,
+                    ffn_multiplier=1,
+                    farm_blocks=1,
+                    opponent_latents=2,
+                    latents=4,
+                    core_layers=1,
+                    quantity_rank=4,
+                )
+            ),
+            STRUCTURED,
+            "critic_products",
+        ),
+    )
+    for actor, architecture, critic_field in cases:
+        rollout = collect_mixed_play_rust(
+            actor,
+            [actor],
+            self_play_games=1,
+            league_games=2,
+            opponent_indices=np.asarray([0, 0]),
+            seed_start=17,
+            sampling_seed=3,
+        )
+        assert rollout.architecture == architecture
+
+        module._verify_first_step_critic_state(rollout, 1, 17)
+
+        rollout.states[critic_field][0, 0] += 1
+        with pytest.raises(RuntimeError, match="fresh native encode"):
+            module._verify_first_step_critic_state(rollout, 1, 17)

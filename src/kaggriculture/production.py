@@ -12,7 +12,6 @@ from kaggriculture.vapo import VapoConfig
 
 PRODUCTION_SELF_PLAY_GAMES = 112
 PRODUCTION_LEAGUE_GAMES = 96
-PRODUCTION_LEAGUE_INITIAL_OPPONENTS = 1
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
 PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 2
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
@@ -20,6 +19,12 @@ PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_EVERY = 5
 PRODUCTION_TEMPERATURE = 1.0
 PRODUCTION_OPPONENT_TEMPERATURE = 0.8
+# Deterministic starter/public-v27 probes every N committed iterations give the
+# journal an absolute progress axis that self-play score rates cannot provide.
+# The opponents are emitted explicitly so the launch command is the complete
+# record; unavailable ones are dropped at launch with a warning, never fatal.
+PRODUCTION_EXTERNAL_EVAL_EVERY = 10
+PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27"
 
 
 def production_model_config() -> dict[str, int | float]:
@@ -28,7 +33,13 @@ def production_model_config() -> dict[str, int | float]:
 
 def production_vapo_config(*, compiled: bool) -> dict[str, int | float | bool]:
     return asdict(
-        VapoConfig(epochs=1, minibatch_size=2048, target_kl=0.03, compile_update=compiled)
+        VapoConfig(
+            epochs=1,
+            critic_epochs=4,
+            minibatch_size=2048,
+            target_kl=0.03,
+            compile_update=compiled,
+        )
     )
 
 
@@ -117,6 +128,10 @@ def build_training_command(
             str(PRODUCTION_TEMPERATURE),
             "--checkpoint-every",
             str(PRODUCTION_CHECKPOINT_EVERY),
+            "--external-eval-every",
+            str(PRODUCTION_EXTERNAL_EVAL_EVERY),
+            "--external-eval-opponents",
+            PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
             "--cnn-width",
             str(model["cnn_width"]),
             "--cnn-blocks",
@@ -141,6 +156,8 @@ def build_training_command(
             str(vapo["weight_decay"]),
             "--epochs",
             str(vapo["epochs"]),
+            "--critic-epochs",
+            str(vapo["critic_epochs"]),
             "--minibatch-size",
             str(vapo["minibatch_size"]),
             "--clip-low",

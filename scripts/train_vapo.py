@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 from collections.abc import Sequence
@@ -18,7 +19,9 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from kaggriculture.inference import load_actor_artifact
 from kaggriculture.league import (
+    PFSP_UNMEASURED_SCORE_RATE,
     FrozenActorPool,
     SnapshotRef,
     SnapshotSelection,
@@ -30,24 +33,24 @@ from kaggriculture.league import (
     select_snapshot_mix,
     snapshot_sha256,
 )
-from kaggriculture.model import (
-    DistributionalCritic,
-    FarmActor,
-    ModelConfig,
-    parameter_count,
-)
+from kaggriculture.model import ModelConfig, parameter_count
+from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.opponents import normalize_opponent
 from kaggriculture.provenance import (
+    file_sha256,
     require_source_identity,
     run_provenance_from_decision,
     source_identity,
     validate_run_provenance,
 )
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
 from kaggriculture.rollout import (
     RolloutBatch,
     allocate_rollout_storage,
     collect_mixed_play_rust,
     slice_trajectories,
 )
+from kaggriculture.structured import StructuredConfig
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import (
     append_iteration_jsonl,
@@ -82,24 +85,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--league-historical-opponents", type=int, default=2)
     parser.add_argument("--league-active-pool-size", type=int, default=16)
     parser.add_argument("--opponent-temperature", type=float, default=0.8)
+    parser.add_argument(
+        "--external-eval-every",
+        type=int,
+        default=0,
+        help="iterations between diagnostic CPU evaluations vs external agents; 0 disables",
+    )
+    parser.add_argument(
+        "--external-eval-opponents",
+        default="starter,public-v27",
+        help="comma-separated opponents forwarded to external_eval_worker.py",
+    )
+    parser.add_argument("--external-eval-seeds", type=int, default=2)
     parser.add_argument("--episode-steps", type=int, default=720)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--max-hours", type=float, default=0.0)
-    parser.add_argument("--cnn-width", type=int, default=48)
-    parser.add_argument("--cnn-blocks", type=int, default=2)
-    parser.add_argument("--model-dim", type=int, default=96)
-    parser.add_argument("--transformer-layers", type=int, default=7)
-    parser.add_argument("--attention-heads", type=int, default=4)
-    parser.add_argument("--ffn-multiplier", type=int, default=4)
-    parser.add_argument("--quantity-rank", type=int, default=32)
+    parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        default=CONV_ENTITY,
+        help="actor/critic family; each family's structural flags default to that "
+        "family's model configuration and a flag from another family is rejected",
+    )
+    add_model_config_arguments(parser)
     parser.add_argument("--actor-lr", type=float, default=2.5e-4)
     parser.add_argument("--critic-lr", type=float, default=2.5e-4)
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--critic-epochs",
+        type=int,
+        default=None,
+        help="total critic epochs (>= --epochs; the excess are critic-only refits); "
+        "defaults to --epochs",
+    )
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-low", type=float, default=0.80)
     parser.add_argument("--clip-high", type=float, default=1.28)
@@ -131,26 +154,34 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="exact calibration decision to bind into every production checkpoint",
     )
+    parser.add_argument(
+        "--init-actor-from",
+        type=Path,
+        help="actor artifact (e.g. a BC clone) whose weights initialize a fresh run's actor",
+    )
+    parser.add_argument(
+        "--critic-warmup-iterations",
+        type=int,
+        default=0,
+        help="iterations of critic-only updates before the actor participates",
+    )
     return parser.parse_args()
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    # Model-configuration flags are validated by the config dataclass itself,
+    # so every entry point that builds one gets the same rules.
     positive = {
         "iterations": args.iterations,
         "games": args.games,
         "league_active_pool_size": args.league_active_pool_size,
         "episode_steps": args.episode_steps,
         "checkpoint_every": args.checkpoint_every,
-        "cnn_width": args.cnn_width,
-        "cnn_blocks": args.cnn_blocks,
-        "model_dim": args.model_dim,
-        "transformer_layers": args.transformer_layers,
-        "attention_heads": args.attention_heads,
-        "ffn_multiplier": args.ffn_multiplier,
-        "quantity_rank": args.quantity_rank,
         "epochs": args.epochs,
         "minibatch_size": args.minibatch_size,
     }
+    if args.critic_epochs is not None:
+        positive["critic_epochs"] = args.critic_epochs
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
         raise ValueError(f"arguments must be positive: {', '.join(invalid)}")
@@ -162,7 +193,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("league opponent counts cannot be negative")
     if args.league_games and not (args.league_active_opponents or args.league_historical_opponents):
         raise ValueError("league games require at least one active or historical opponent")
-    configured_opponents = 1 + args.league_active_opponents + args.league_historical_opponents
+    if args.external_eval_every < 0 or (args.external_eval_every and args.external_eval_seeds < 1):
+        raise ValueError("external evaluation needs a non-negative cadence and positive seeds")
+    configured_opponents = args.league_active_opponents + args.league_historical_opponents
     if args.league_games and args.league_games < configured_opponents:
         raise ValueError(
             "league games must cover the initial anchor and every configured "
@@ -170,6 +203,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not math.isfinite(args.opponent_temperature) or args.opponent_temperature <= 0.0:
         raise ValueError("opponent temperature must be finite and positive")
+    if args.critic_warmup_iterations < 0:
+        raise ValueError("critic warmup iterations cannot be negative")
+    if args.init_actor_from is not None and args.resume is not None:
+        raise ValueError(
+            "--init-actor-from initializes a fresh run; a resumed run's actor "
+            "comes from its checkpoint"
+        )
     if not 0 < args.clip_low < 1 < args.clip_high:
         raise ValueError("clip interval must straddle one")
     if args.lr_warmup_steps < 0:
@@ -193,6 +233,36 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "expected source digest and calibration decision must be supplied together"
         )
+
+
+def _load_initial_actor(
+    path: Path,
+    actor: torch.nn.Module,
+    architecture_name: str,
+    model_config: ModelConfig | StructuredConfig,
+    device: torch.device,
+) -> dict[str, object]:
+    """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
+
+    The artifact must carry exactly this run's model configuration. The critic
+    and both optimizers deliberately start fresh — a clone brings no value
+    function — and the pre-loop league snapshot then seeds the frozen-opponent
+    archive with the pretrained policy automatically, so the learner must keep
+    beating its own starting point.
+    """
+    pretrained, payload = load_actor_artifact(path, device)
+    if resolve_architecture(payload).name != architecture_name:
+        raise ValueError("initial actor artifact architecture does not match arguments")
+    if payload["model_config"] != model_config.to_dict():
+        raise ValueError("initial actor artifact model configuration does not match arguments")
+    actor.load_state_dict(pretrained.state_dict())
+    return {
+        "path": str(path.resolve()),
+        "sha256": file_sha256(path),
+        "format_version": payload["format_version"],
+        "iteration": int(payload.get("iteration", 0)),
+        "bc_provenance": payload.get("bc_provenance"),
+    }
 
 
 def _device(name: str) -> torch.device:
@@ -236,22 +306,157 @@ def _balanced_assignments(games: int, opponents: int, generator: np.random.Gener
     return assignments
 
 
+# Blend of the previous estimate and this iteration's measured score rate for
+# PFSP opponent weighting; each measurement covers only ~20-50 games, so the
+# estimate keeps some memory while still down-weighting a beaten opponent
+# quickly. The prior seeds the blend, so a single clean sweep can never pin
+# an estimate at exactly 1.0 and permanently retire an opponent.
+LEAGUE_SCORE_RATE_EMA = 0.5
+# Unsampled estimates decay toward the unmeasured prior each iteration.
+# A stale estimate is most wrong exactly when the learner has changed the
+# most, and the decay guarantees every opponent is eventually re-measured.
+LEAGUE_SCORE_RATE_DECAY = 0.05
+
+
+def _validate_league_score_rates(rates: object) -> dict[int, float]:
+    if not isinstance(rates, dict):
+        raise ValueError("resume checkpoint has no valid league score-rate state")
+    validated: dict[int, float] = {}
+    for iteration, rate in rates.items():
+        if type(iteration) is not int or iteration < 0:
+            raise ValueError("resume checkpoint has an invalid league score-rate iteration")
+        if type(rate) is not float or not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise ValueError("resume checkpoint has an invalid league score rate")
+        validated[iteration] = rate
+    return validated
+
+
+def _blend_league_score_rates(
+    score_rates: dict[int, float],
+    measured: dict[int, float],
+) -> None:
+    """Fold this iteration's measurements into the persistent PFSP estimates."""
+    for iteration, rate in measured.items():
+        previous = score_rates.get(iteration, PFSP_UNMEASURED_SCORE_RATE)
+        score_rates[iteration] = (
+            LEAGUE_SCORE_RATE_EMA * rate + (1.0 - LEAGUE_SCORE_RATE_EMA) * previous
+        )
+    for iteration in score_rates.keys() - measured.keys():
+        previous = score_rates[iteration]
+        score_rates[iteration] = previous + LEAGUE_SCORE_RATE_DECAY * (
+            PFSP_UNMEASURED_SCORE_RATE - previous
+        )
+
+
 def _league_opponent_diagnostics(
     league: RolloutBatch,
     assignments: np.ndarray,
     selections: list[SnapshotSelection],
-) -> dict[str, float | int | str]:
+) -> tuple[dict[str, float | int | str], dict[int, float]]:
     diagnostics: dict[str, float | int | str] = {}
+    score_rates: dict[int, float] = {}
     margins = league.final_money - league.opponent_money
     outcomes = (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
     for index, selection in enumerate(selections):
         selected = assignments == index
+        games = int(selected.sum())
+        if not games:
+            # An unplayed opponent has no measurement; emitting one would put
+            # a NaN into the journal and poison the PFSP estimates.
+            continue
         prefix = f"league_opponent_{selection.ref.iteration:08d}"
+        score_rate = float(((outcomes[selected] + 1.0) / 2.0).mean())
         diagnostics[f"{prefix}_category"] = selection.category
-        diagnostics[f"{prefix}_games"] = int(selected.sum())
-        diagnostics[f"{prefix}_score_rate"] = float(((outcomes[selected] + 1.0) / 2.0).mean())
+        diagnostics[f"{prefix}_games"] = games
+        diagnostics[f"{prefix}_score_rate"] = score_rate
         diagnostics[f"{prefix}_mean_margin"] = float(margins[selected].mean())
-    return diagnostics
+        score_rates[selection.ref.iteration] = score_rate
+    return diagnostics, score_rates
+
+
+def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
+    """Drop unavailable external-eval opponents instead of blocking training.
+
+    The probes are diagnostics: a public agent file cleaned out of /var/tmp
+    must not make a multi-day production run unlaunchable. Every dropped spec
+    is reported at launch, and losing all of them disables the cadence.
+    """
+    if not args.external_eval_every:
+        return
+    resolved = []
+    for spec in filter(None, (spec.strip() for spec in args.external_eval_opponents.split(","))):
+        try:
+            normalize_opponent(spec)
+        except FileNotFoundError as error:
+            print(f"external eval opponent dropped: {error}", file=sys.stderr, flush=True)
+        else:
+            resolved.append(spec)
+    if not resolved:
+        print(
+            "external evaluation disabled: no configured opponent is available",
+            file=sys.stderr,
+            flush=True,
+        )
+        args.external_eval_every = 0
+    args.external_eval_opponents = ",".join(resolved)
+
+
+def _maybe_launch_external_eval(
+    args: argparse.Namespace,
+    committed_iteration: int,
+    league_directory: Path,
+    process: subprocess.Popen | None,
+) -> subprocess.Popen | None:
+    """Launch at most one CPU worker evaluating the latest durable snapshot.
+
+    The worker is diagnostics only: it appends to metrics-external.jsonl and
+    its absence never blocks training. A still-running worker simply skips
+    the tick, so cadence degrades gracefully when episodes run long.
+    """
+    if (
+        not args.external_eval_every
+        or committed_iteration < 1
+        or committed_iteration % args.external_eval_every
+    ):
+        return process
+    if process is not None and process.poll() is None:
+        return process
+    if process is not None and process.returncode:
+        print(
+            f"external eval worker exited with code {process.returncode}; see external-eval.log",
+            file=sys.stderr,
+            flush=True,
+        )
+    snapshot = league_directory / f"league-actor-{committed_iteration:08d}.pt"
+    log_path = args.run_dir / "external-eval.log"
+    try:
+        with log_path.open("ab") as log:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "external_eval_worker.py"),
+                    "--snapshot",
+                    str(snapshot),
+                    "--iteration",
+                    str(committed_iteration),
+                    "--output",
+                    str(args.run_dir / "metrics-external.jsonl"),
+                    "--opponents",
+                    args.external_eval_opponents,
+                    "--seeds",
+                    str(args.external_eval_seeds),
+                    "--episode-steps",
+                    str(args.episode_steps),
+                ],
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+    except OSError as error:
+        # Diagnostics must never kill training: ENOSPC on the log, EMFILE, or
+        # a failed fork under memory pressure only skips this probe.
+        print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
+        return process
 
 
 def _select_league_opponents(
@@ -259,6 +464,9 @@ def _select_league_opponents(
     refs: Sequence[SnapshotRef],
     iteration: int,
     generator: np.random.Generator,
+    score_rates: dict[int, float],
+    *,
+    pretrained_start: bool,
 ) -> list[SnapshotSelection]:
     """Select a bounded opponent mix without consuming RNG when league play is off."""
     if not args.league_games:
@@ -270,6 +478,8 @@ def _select_league_opponents(
         historical_count=args.league_historical_opponents,
         active_pool_size=args.league_active_pool_size,
         generator=generator,
+        score_rates=score_rates,
+        pretrained_start=pretrained_start,
     )
     if len(selections) > args.league_games:
         raise ValueError("league game budget cannot cover the selected opponent mix")
@@ -346,7 +556,7 @@ def _restore_league_archive(
     checkpoint: Path,
     destination: Path,
     manifest: dict[int, str],
-    model_config: ModelConfig,
+    model_config: ModelConfig | StructuredConfig,
 ) -> None:
     """Restore exactly the immutable archive bound to a training checkpoint."""
     source_directory = checkpoint.resolve().parent / "league"
@@ -400,6 +610,7 @@ def _restore_league_archive(
 def main() -> None:
     args = parse_args()
     _validate_args(args)
+    _resolve_external_eval_opponents(args)
     current_source_identity = source_identity()
     if (
         args.expected_source_digest is not None
@@ -427,21 +638,15 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
-    model_config = ModelConfig(
-        cnn_width=args.cnn_width,
-        cnn_blocks=args.cnn_blocks,
-        model_dim=args.model_dim,
-        transformer_layers=args.transformer_layers,
-        attention_heads=args.attention_heads,
-        ffn_multiplier=args.ffn_multiplier,
-        quantity_rank=args.quantity_rank,
-    )
+    architecture = resolve_architecture(args.architecture)
+    model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
     vapo_config = VapoConfig(
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
         lr_warmup_steps=args.lr_warmup_steps,
         weight_decay=args.weight_decay,
         epochs=args.epochs,
+        critic_epochs=args.critic_epochs,
         minibatch_size=args.minibatch_size,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
@@ -453,14 +658,21 @@ def main() -> None:
         compile_update=args.compile_models,
     )
     training_data_config = _training_data_config(args, device)
-    actor = FarmActor(model_config).to(device)
-    critic = DistributionalCritic(model_config).to(device)
+    actor = architecture.actor_class(model_config).to(device)
+    critic = architecture.critic_class(model_config).to(device)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+    initial_actor_provenance = None
+    if args.init_actor_from is not None:
+        initial_actor_provenance = _load_initial_actor(
+            args.init_actor_from, actor, architecture.name, model_config, device
+        )
     generator = np.random.default_rng(args.seed + 1)
     iteration = 0
     next_seed = args.seed
     resume_payload = None
     if args.resume:
+        # Architecture and model-config identity are validated inside
+        # load_checkpoint before it mutates the freshly constructed models.
         resume_payload = load_checkpoint(
             args.resume,
             actor,
@@ -469,8 +681,6 @@ def main() -> None:
             critic_optimizer,
             device=device,
         )
-        if resume_payload["model_config"] != model_config.to_dict():
-            raise ValueError("resume checkpoint model configuration does not match arguments")
         if resume_payload["vapo_config"] != asdict(vapo_config):
             raise ValueError("resume checkpoint VAPO configuration does not match arguments")
         if resume_payload.get("training_data_config") != training_data_config:
@@ -491,6 +701,9 @@ def main() -> None:
         next_seed = int(resume_payload["next_seed"])
         if resume_payload.get("training_rng") is not None:
             generator.bit_generator.state = resume_payload["training_rng"]
+        # Restore warm-start provenance: the resumed run must keep treating
+        # the iteration-0 league snapshot as a pretrained baseline.
+        initial_actor_provenance = resume_payload.get("initial_actor")
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
     journal_iteration = metrics_journal_iteration(args.run_dir / "metrics.jsonl")
@@ -511,11 +724,17 @@ def main() -> None:
         )
     league_directory = args.run_dir / "league"
     league_snapshot_manifest: dict[int, str] = {}
+    # PFSP score-rate estimates per snapshot iteration. Persisted in every
+    # checkpoint: opponent selection consumes RNG as a function of these
+    # estimates, so a resume that reset them would diverge from the
+    # uninterrupted run's entire downstream RNG stream.
+    league_score_rates: dict[int, float] = {}
     if resume_payload is not None:
         league_snapshot_manifest = _validate_league_manifest(
             resume_payload.get("league_snapshot_manifest"),
             current_iteration=iteration,
         )
+        league_score_rates = _validate_league_score_rates(resume_payload.get("league_score_rates"))
         _restore_league_archive(
             checkpoint=args.resume,
             destination=league_directory,
@@ -528,6 +747,7 @@ def main() -> None:
     serialized_arguments["resume"] = str(args.resume or "")
     configuration = {
         "arguments": serialized_arguments,
+        "architecture": architecture.name,
         "model": model_config.to_dict(),
         "vapo": asdict(vapo_config),
         "actor_parameters": parameter_count(actor),
@@ -536,6 +756,7 @@ def main() -> None:
         "torch_version": torch.__version__,
         "source_identity": current_source_identity,
         "run_provenance": run_provenance,
+        "initial_actor": initial_actor_provenance,
     }
     (args.run_dir / "config.json").write_text(
         json.dumps(configuration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -567,8 +788,10 @@ def main() -> None:
                 training_rng_state=generator.bit_generator.state,
                 training_data_config=training_data_config,
                 league_snapshot_manifest=league_snapshot_manifest,
+                league_score_rates=league_score_rates,
                 source_identity=current_source_identity,
                 run_provenance=run_provenance,
+                initial_actor=initial_actor_provenance,
             )
     if resume_payload is not None and iteration > 0:
         numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
@@ -598,8 +821,10 @@ def main() -> None:
                     training_rng_state=generator.bit_generator.state,
                     training_data_config=training_data_config,
                     league_snapshot_manifest=league_snapshot_manifest,
+                    league_score_rates=league_score_rates,
                     source_identity=current_source_identity,
                     run_provenance=run_provenance,
+                    initial_actor=initial_actor_provenance,
                 )
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", resume_payload["metrics"])
     writer = TensorboardMirror(
@@ -615,6 +840,7 @@ def main() -> None:
     # play, which produce fewer trajectories.
     self_play_rows = args.games * 2
     rollout_arena = allocate_rollout_storage(
+        architecture.name,
         self_play_rows + args.league_games,
         args.episode_steps - 1,
         pin_memory=device.type == "cuda",
@@ -668,11 +894,14 @@ def main() -> None:
             training_rng_state=generator.bit_generator.state,
             training_data_config=training_data_config,
             league_snapshot_manifest=league_snapshot_manifest,
+            league_score_rates=league_score_rates,
             source_identity=current_source_identity,
             run_provenance=run_provenance,
+            initial_actor=initial_actor_provenance,
         )
 
     replay_parity_audited = False
+    external_eval_process: subprocess.Popen | None = None
     while iteration < args.iterations:
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
             break
@@ -685,6 +914,8 @@ def main() -> None:
             list_actor_snapshots(league_directory),
             iteration,
             generator,
+            league_score_rates,
+            pretrained_start=initial_actor_provenance is not None,
         )
         league_games = args.league_games if selections else 0
         if league_games:
@@ -743,9 +974,11 @@ def main() -> None:
                 for name, value in rollout_diagnostics(league_part).items()
                 if name not in indivisible_timings
             }
-            league_diagnostics.update(
-                _league_opponent_diagnostics(league_part, assignments, selections)
+            opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
+                league_part, assignments, selections
             )
+            league_diagnostics.update(opponent_diagnostics)
+            _blend_league_score_rates(league_score_rates, measured_rates)
         # The update pins its importance ratio to one by replaying behavior
         # likelihoods through its own forward, so a staging bug applied
         # identically to both update-path sides would never move the KL guard.
@@ -769,6 +1002,9 @@ def main() -> None:
                 )
             replay_parity_audited = True
         update_started = time.monotonic()
+        # Critic-first warm start: a freshly initialized critic must fit
+        # before its advantages may push a pretrained actor.
+        warmup_active = iteration < args.critic_warmup_iterations
         update_metrics = update_vapo(
             actor,
             critic,
@@ -777,6 +1013,7 @@ def main() -> None:
             rollout,
             vapo_config,
             generator=generator,
+            actor_epochs=0 if warmup_active else None,
         )
         # An inflated first-minibatch KL at unchanged weights means the
         # behavior replay and the minibatch forward disagree beyond numerics;
@@ -788,7 +1025,7 @@ def main() -> None:
                 "first-minibatch KL at unchanged weights exceeded "
                 f"{MAX_FIRST_MINIBATCH_KL}: {first_minibatch_kl}"
             )
-        if int(update_metrics["actor_updates"]) < 1:
+        if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
             raise RuntimeError("VAPO iteration completed without an actor update")
         update_seconds = time.monotonic() - update_started
         iteration += 1
@@ -799,7 +1036,13 @@ def main() -> None:
             "iteration_seconds": time.monotonic() - iteration_started,
             "update_seconds": update_seconds,
             "critic_replayed_states_per_second": (
-                rollout.states * vapo_config.epochs / max(update_seconds, 1e-9)
+                rollout.state_count
+                * (
+                    vapo_config.epochs
+                    if vapo_config.critic_epochs is None
+                    else vapo_config.critic_epochs
+                )
+                / max(update_seconds, 1e-9)
             ),
             "league_checkpoint": opponent_checkpoint,
             **rollout_diagnostics(rollout),
@@ -832,14 +1075,27 @@ def main() -> None:
             training_rng_state=generator.bit_generator.state,
             training_data_config=training_data_config,
             league_snapshot_manifest=league_snapshot_manifest,
+            # Snapshot the estimates: the commit serializes on a worker
+            # thread while the next iteration's blend mutates the live dict.
+            league_score_rates=dict(league_score_rates),
+            initial_actor=initial_actor_provenance,
         )
         if pending_commit is not None:
             pending_commit.result()
+        # The awaited commit belongs to the previous pass, so the newest
+        # durable league snapshot is ``iteration - 1``; the current payload is
+        # only being submitted now.
+        external_eval_process = _maybe_launch_external_eval(
+            args, iteration - 1, league_directory, external_eval_process
+        )
         pending_commit = commit_executor.submit(commit_iteration, payload, actor_state)
         print(json.dumps(metrics, sort_keys=True), flush=True)
         del rollout
     if pending_commit is not None:
         pending_commit.result()
+        # The final snapshot is the one an operator most wants an external
+        # number for; probe it if the cadence lands on it.
+        _maybe_launch_external_eval(args, iteration, league_directory, external_eval_process)
     commit_executor.shutdown(wait=True)
     writer.close()
 

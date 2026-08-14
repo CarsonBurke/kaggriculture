@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -16,7 +17,12 @@ from kaggriculture.model import (
     distributional_value_loss,
 )
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
+from kaggriculture.registry import CONV_ENTITY
 from kaggriculture.rollout import RolloutBatch
+from kaggriculture.structured import StructuredActor, StructuredCritic, StructuredInputs
+
+Critic = DistributionalCritic | StructuredCritic
+Actor = FarmActor | StructuredActor
 
 VAPO_GAE_ALPHA = 0.05
 COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
@@ -49,6 +55,13 @@ class VapoConfig:
     # plain Adam. Zero makes AdamW identical to Adam.
     weight_decay: float = 0.0
     epochs: int = 4
+    # Total epochs for the critic; the actor participates only in the first
+    # `epochs` of them, so values above `epochs` are critic-only refits over
+    # the same rollout. None matches the actor epoch count. The actor's trust
+    # region binds near one pass per state, but a single critic pass leaves
+    # explained variance oscillating and starves rarely-visited states of
+    # value estimates.
+    critic_epochs: int | None = None
     minibatch_size: int = 2048
     clip_low: float = 0.80
     clip_high: float = 1.28
@@ -146,6 +159,8 @@ def _validate_config(config: VapoConfig) -> None:
         raise ValueError("weight decay must be finite and non-negative")
     if config.epochs < 1 or config.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
+    if config.critic_epochs is not None and config.critic_epochs < config.epochs:
+        raise ValueError("critic epochs cannot be fewer than actor epochs")
     if config.lr_warmup_steps < 0:
         raise ValueError("LR warmup steps cannot be negative")
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
@@ -156,11 +171,88 @@ def _validate_config(config: VapoConfig) -> None:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
 
 
+def _leading_tensor(args: tuple[Any, ...]) -> Tensor:
+    head = args[0]
+    while isinstance(head, tuple):
+        head = head[0]
+    return head
+
+
+def _actor_batch_args(
+    architecture: str, staged: dict[str, Tensor], indices: Tensor | slice
+) -> tuple[Any, ...]:
+    """Build one minibatch of actor forward arguments from staged storage.
+
+    The returned tuple is splatted directly into the actor's forward, so its
+    arity is a property of the architecture; the compiled update callables
+    therefore take these arguments last, after every fixed factor tensor.
+    """
+    if architecture == CONV_ENTITY:
+        return (
+            _batch_tensor(staged["board"], indices, torch.float32),
+            _batch_tensor(staged["global_features"], indices, torch.float32),
+            _batch_tensor(staged["units"], indices, torch.float32),
+            _batch_tensor(staged["unit_positions"], indices, torch.long),
+        )
+    return (
+        StructuredInputs(
+            tile_categorical=_batch_tensor(staged["tile_categorical"], indices, torch.long),
+            tile_continuous=_batch_tensor(staged["tile_continuous"], indices, torch.float32),
+            unit_categorical=_batch_tensor(staged["unit_categorical"], indices, torch.long),
+            unit_continuous=_batch_tensor(staged["unit_continuous"], indices, torch.float32),
+            unit_active=_batch_tensor(staged["unit_active"], indices, torch.bool),
+            unit_tile_gather=_batch_tensor(staged["unit_tile_gather"], indices, torch.long),
+            unit_tile_gather_valid=_batch_tensor(
+                staged["unit_tile_gather_valid"], indices, torch.bool
+            ),
+            products=_batch_tensor(staged["products"], indices, torch.float32),
+            crops=_batch_tensor(staged["crops"], indices, torch.float32),
+            farms=_batch_tensor(staged["farms"], indices, torch.float32),
+            town=_batch_tensor(staged["town"], indices, torch.float32),
+        ),
+    )
+
+
+def _critic_batch_args(
+    architecture: str, staged: dict[str, Tensor], indices: Tensor | slice
+) -> tuple[Any, ...]:
+    """Build one minibatch of critic forward arguments from staged storage.
+
+    The structured centralized critic reads the actor's viewpoint with the
+    opponent's private economy columns concatenated onto the product and crop
+    tokens, plus the opponent's unit tokens as attention context.
+    """
+    if architecture == CONV_ENTITY:
+        return (
+            _batch_tensor(staged["board"], indices, torch.float32),
+            _batch_tensor(staged["critic_features"], indices, torch.float32),
+        )
+    (actor_inputs,) = _actor_batch_args(architecture, staged, indices)
+    inputs = actor_inputs._replace(
+        products=torch.cat(
+            (
+                actor_inputs.products,
+                _batch_tensor(staged["critic_products"], indices, torch.float32),
+            ),
+            dim=-1,
+        ),
+        crops=torch.cat(
+            (actor_inputs.crops, _batch_tensor(staged["critic_crops"], indices, torch.float32)),
+            dim=-1,
+        ),
+    )
+    return (
+        inputs,
+        _batch_tensor(staged["opponent_unit_categorical"], indices, torch.long),
+        _batch_tensor(staged["opponent_unit_continuous"], indices, torch.float32),
+        _batch_tensor(staged["opponent_unit_active"], indices, torch.bool),
+    )
+
+
 def _replayed_value_chunk(
-    critic: DistributionalCritic,
-    board: Tensor,
-    critic_features: Tensor,
+    critic: Critic,
     autocast_enabled: bool,
+    *critic_args: Any,
 ) -> Tensor:
     """One critic value forward over a chunk of stored state features.
 
@@ -170,19 +262,19 @@ def _replayed_value_chunk(
     distributional head in fp32 either way.
     """
     with torch.autocast(
-        device_type=board.device.type,
+        device_type=_leading_tensor(critic_args).device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        critic_logits = critic(board.float(), critic_features.float())
+        critic_logits = critic(*critic_args)
     return critic.value(critic_logits)
 
 
 @torch.inference_mode()
 def replay_behavior_values(
-    critic: DistributionalCritic,
-    board: Tensor,
-    critic_features: Tensor,
+    critic: Critic,
+    architecture: str,
+    staged: dict[str, Tensor],
     *,
     # Transient fp32 activations scale with the chunk. At production model
     # size 16384 rows would add several GiB right when the staged rollout
@@ -202,13 +294,13 @@ def replay_behavior_values(
     wall clock when run eagerly, so on CUDA it routes through the same
     Inductor compilation and autocast state as the rest of the update path.
     """
-    if board.ndim < 1 or board.shape[0] != critic_features.shape[0]:
-        raise ValueError("board and critic feature rows must align")
     if chunk_size < 1:
         raise ValueError("chunk size must be positive")
+    rows = staged["unit_actions"].shape[0]
+    device = staged["unit_actions"].device
     forward = (
         _cached_update_callable(critic, "_kaggriculture_value_replay", _replayed_value_chunk)
-        if compile_model and board.device.type == "cuda"
+        if compile_model and device.type == "cuda"
         else _replayed_value_chunk
     )
     was_training = critic.training
@@ -217,11 +309,10 @@ def replay_behavior_values(
         values = [
             forward(
                 critic,
-                board[start : start + chunk_size],
-                critic_features[start : start + chunk_size],
                 autocast_enabled,
+                *_critic_batch_args(architecture, staged, slice(start, start + chunk_size)),
             )
-            for start in range(0, board.shape[0], chunk_size)
+            for start in range(0, rows, chunk_size)
         ]
     finally:
         critic.train(was_training)
@@ -256,7 +347,7 @@ def prepare_advantages(
 
 
 def make_optimizers(
-    actor: FarmActor, critic: DistributionalCritic, config: VapoConfig
+    actor: Actor, critic: Critic, config: VapoConfig
 ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
     _validate_config(config)
     actor_device = next(actor.parameters()).device
@@ -297,8 +388,10 @@ def _stage_tensor(array: np.ndarray, device: torch.device) -> Tensor:
     return flat.to(device=device, non_blocking=flat.is_pinned())
 
 
-def _batch_tensor(staged: Tensor, indices: Tensor, dtype: torch.dtype | None = None) -> Tensor:
-    selected = staged.index_select(0, indices)
+def _batch_tensor(
+    staged: Tensor, indices: Tensor | slice, dtype: torch.dtype | None = None
+) -> Tensor:
+    selected = staged[indices] if isinstance(indices, slice) else staged.index_select(0, indices)
     return selected if dtype is None or selected.dtype == dtype else selected.to(dtype=dtype)
 
 
@@ -337,11 +430,7 @@ def _optimizer_step(
 
 
 def _replayed_component_logprobs(
-    actor: FarmActor,
-    board: Tensor,
-    global_features: Tensor,
-    units: Tensor,
-    positions: Tensor,
+    actor: Actor,
     unit_actions: Tensor,
     market_kinds: Tensor,
     market_quantities: Tensor,
@@ -349,6 +438,7 @@ def _replayed_component_logprobs(
     kind_masks: Tensor,
     quantity_masks: Tensor,
     autocast_enabled: bool,
+    *actor_args: Any,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Replay stored actions through the update-path policy forward.
 
@@ -364,11 +454,11 @@ def _replayed_component_logprobs(
     so the returned log-likelihoods are full precision either way.
     """
     with torch.autocast(
-        device_type=board.device.type,
+        device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        actor_output = actor(board, global_features, units, positions)
+        actor_output = actor(*actor_args)
         return component_logprobs(
             actor_output,
             actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
@@ -383,11 +473,7 @@ def _replayed_component_logprobs(
 
 
 def _replayed_selected_logprobs(
-    actor: FarmActor,
-    board: Tensor,
-    global_features: Tensor,
-    units: Tensor,
-    positions: Tensor,
+    actor: Actor,
     unit_actions: Tensor,
     market_kinds: Tensor,
     market_quantities: Tensor,
@@ -395,6 +481,7 @@ def _replayed_selected_logprobs(
     kind_masks: Tensor,
     quantity_masks: Tensor,
     autocast_enabled: bool,
+    *actor_args: Any,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Entropy-free `_replayed_component_logprobs` for full-batch replays.
 
@@ -403,11 +490,11 @@ def _replayed_selected_logprobs(
     entropy reductions the minibatch objective needs for its metrics.
     """
     with torch.autocast(
-        device_type=board.device.type,
+        device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        actor_output = actor(board, global_features, units, positions)
+        actor_output = actor(*actor_args)
         return component_selected_logprobs(
             actor_output,
             actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
@@ -423,7 +510,8 @@ def _replayed_selected_logprobs(
 
 @torch.no_grad()
 def replay_behavior_logprobs(
-    actor: FarmActor,
+    actor: Actor,
+    architecture: str,
     staged: dict[str, Tensor],
     valid_indices: np.ndarray,
     *,
@@ -455,13 +543,13 @@ def replay_behavior_logprobs(
         raise ValueError("minibatch size must be positive")
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
-    device = staged["board"].device
+    device = staged["unit_actions"].device
     replay = (
         _cached_update_callable(actor, "_kaggriculture_logprob_replay", _replayed_selected_logprobs)
         if compile_model and device.type == "cuda"
         else _replayed_selected_logprobs
     )
-    rows = staged["board"].shape[0]
+    rows = staged["unit_actions"].shape[0]
     replayed = {
         "old_unit_logprobs": torch.zeros(
             (rows, staged["unit_actions"].shape[1]), dtype=torch.float32, device=device
@@ -478,10 +566,6 @@ def replay_behavior_logprobs(
         indices = ordered[batch_slice]
         unit_logprobs, kind_logprobs, quantity_logprobs = replay(
             actor,
-            _batch_tensor(staged["board"], indices, torch.float32),
-            _batch_tensor(staged["global_features"], indices, torch.float32),
-            _batch_tensor(staged["units"], indices, torch.float32),
-            _batch_tensor(staged["unit_positions"], indices, torch.long),
             _batch_tensor(staged["unit_actions"], indices, torch.long),
             _batch_tensor(staged["market_kinds"], indices, torch.long),
             _batch_tensor(staged["market_quantities"], indices, torch.long),
@@ -489,6 +573,7 @@ def replay_behavior_logprobs(
             _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
             _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
             autocast_enabled,
+            *_actor_batch_args(architecture, staged, indices),
         )
         for name, values in (
             ("old_unit_logprobs", unit_logprobs),
@@ -518,11 +603,7 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function):
 
 
 def _actor_minibatch_terms(
-    actor: FarmActor,
-    board: Tensor,
-    global_features: Tensor,
-    units: Tensor,
-    positions: Tensor,
+    actor: Actor,
     unit_actions: Tensor,
     market_kinds: Tensor,
     market_quantities: Tensor,
@@ -539,6 +620,7 @@ def _actor_minibatch_terms(
     clip_low: float,
     clip_high: float,
     autocast_enabled: bool,
+    *actor_args: Any,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """One actor minibatch: policy replay plus clipped surrogate reductions.
 
@@ -555,10 +637,6 @@ def _actor_minibatch_terms(
         quantity_entropy,
     ) = _replayed_component_logprobs(
         actor,
-        board,
-        global_features,
-        units,
-        positions,
         unit_actions,
         market_kinds,
         market_quantities,
@@ -566,11 +644,13 @@ def _actor_minibatch_terms(
         kind_masks,
         quantity_masks,
         autocast_enabled,
+        *actor_args,
     )
-    policy_sum = torch.zeros((), device=board.device)
-    entropy_sum = torch.zeros((), device=board.device)
-    kl_sum = torch.zeros((), device=board.device)
-    clipped_sum = torch.zeros((), device=board.device)
+    device = unit_actions.device
+    policy_sum = torch.zeros((), device=device)
+    entropy_sum = torch.zeros((), device=device)
+    kl_sum = torch.zeros((), device=device)
+    clipped_sum = torch.zeros((), device=device)
     for new, old, active, entropy in (
         (new_unit, old_unit, unit_active, unit_entropy),
         (new_kind, old_kind, kind_active, kind_entropy),
@@ -592,18 +672,17 @@ def _actor_minibatch_terms(
 
 
 def _critic_minibatch_loss(
-    critic: DistributionalCritic,
-    board: Tensor,
-    critic_features: Tensor,
+    critic: Critic,
     value_targets: Tensor,
     autocast_enabled: bool,
+    *critic_args: Any,
 ) -> Tensor:
     with torch.autocast(
-        device_type=board.device.type,
+        device_type=value_targets.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        critic_logits = critic(board, critic_features)
+        critic_logits = critic(*critic_args)
     return distributional_value_loss(
         critic_logits,
         value_targets,
@@ -615,7 +694,7 @@ def _critic_minibatch_loss(
 
 @torch.inference_mode()
 def update_replay_parity(
-    actor: FarmActor,
+    actor: Actor,
     rollout: RolloutBatch,
     *,
     minibatch_size: int,
@@ -641,13 +720,10 @@ def update_replay_parity(
     valid_indices = np.flatnonzero(flat_valid)
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
-    staged = {
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged |= {
         name: _stage_tensor(getattr(rollout, name), device)
         for name in (
-            "board",
-            "global_features",
-            "units",
-            "unit_positions",
             "unit_actions",
             "market_kinds",
             "market_quantities",
@@ -677,10 +753,6 @@ def update_replay_parity(
         market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
         replayed = replay(
             actor,
-            _batch_tensor(staged["board"], indices, torch.float32),
-            _batch_tensor(staged["global_features"], indices, torch.float32),
-            _batch_tensor(staged["units"], indices, torch.float32),
-            _batch_tensor(staged["unit_positions"], indices, torch.long),
             _batch_tensor(staged["unit_actions"], indices, torch.long),
             market_kinds,
             _batch_tensor(staged["market_quantities"], indices, torch.long),
@@ -688,6 +760,7 @@ def update_replay_parity(
             _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
             _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
             autocast_enabled,
+            *_actor_batch_args(rollout.architecture, staged, indices),
         )
         for name, new_logprobs, old_key, active_key in (
             ("unit", replayed[0], "old_unit_logprobs", "unit_active"),
@@ -798,17 +871,29 @@ def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> N
 
 
 def update_vapo(
-    actor: FarmActor,
-    critic: DistributionalCritic,
+    actor: Actor,
+    critic: Critic,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     rollout: RolloutBatch,
     config: VapoConfig,
     *,
     generator: np.random.Generator,
+    actor_epochs: int | None = None,
 ) -> dict[str, float | int]:
-    """Replay one rollout with asymmetric, per-component clipped policy updates."""
+    """Replay one rollout with asymmetric, per-component clipped policy updates.
+
+    `actor_epochs` overrides the actor's participation for this call only —
+    used by the warm-start critic-first phase, where a freshly initialized
+    critic must fit before its advantages are allowed to push a pretrained
+    actor. Zero runs a critic-only refit; the behavior-likelihood replay is
+    skipped entirely because nothing consumes it.
+    """
     _validate_config(config)
+    if actor_epochs is None:
+        actor_epochs = config.epochs
+    elif not 0 <= actor_epochs <= config.epochs:
+        raise ValueError("actor epoch override must lie within the configured epochs")
     device = next(actor.parameters()).device
     if next(critic.parameters()).device != device:
         raise ValueError("actor and critic must use the same device")
@@ -823,12 +908,9 @@ def update_vapo(
     # The complete rollout is reused for several PPO epochs. Stage every array
     # on the accelerator once; repeated NumPy advanced indexing otherwise makes
     # a new host copy and host-to-device transfer for every field/minibatch.
-    staged = {
-        "board": _stage_tensor(rollout.board, device),
-        "global_features": _stage_tensor(rollout.global_features, device),
-        "critic_features": _stage_tensor(rollout.critic_features, device),
-        "units": _stage_tensor(rollout.units, device),
-        "unit_positions": _stage_tensor(rollout.unit_positions, device),
+    architecture = rollout.architecture
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged |= {
         "unit_actions": _stage_tensor(rollout.unit_actions, device),
         "market_kinds": _stage_tensor(rollout.market_kinds, device),
         "market_quantities": _stage_tensor(rollout.market_quantities, device),
@@ -850,8 +932,8 @@ def update_vapo(
     behavior_values = (
         replay_behavior_values(
             critic,
-            staged["board"],
-            staged["critic_features"],
+            architecture,
+            staged,
             compile_model=config.compile_update,
             autocast_enabled=autocast_enabled,
         )
@@ -864,16 +946,18 @@ def update_vapo(
     # taken from the rollout's sampling-path logits. The stored rollout
     # likelihoods remain the sampling ground truth that `update_replay_parity`
     # audits this replay against.
-    staged.update(
-        replay_behavior_logprobs(
-            actor,
-            staged,
-            valid_indices,
-            minibatch_size=config.minibatch_size,
-            autocast_enabled=autocast_enabled,
-            compile_model=config.compile_update,
+    if actor_epochs > 0:
+        staged.update(
+            replay_behavior_logprobs(
+                actor,
+                architecture,
+                staged,
+                valid_indices,
+                minibatch_size=config.minibatch_size,
+                autocast_enabled=autocast_enabled,
+                compile_model=config.compile_update,
+            )
         )
-    )
     actor.train()
     critic.train()
     prepared = prepare_advantages(rollout, behavior_values, config)
@@ -934,26 +1018,23 @@ def update_vapo(
     guard_event = torch.cuda.Event() if device.type == "cuda" else None
     zero_guard = torch.zeros((), dtype=torch.float64, device=device)
 
-    for _epoch in range(config.epochs):
+    critic_epochs = config.epochs if config.critic_epochs is None else config.critic_epochs
+    for epoch_index in range(critic_epochs):
         shuffled = generator.permutation(valid_indices)
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
         for batch_slice in _balanced_minibatch_slices(shuffled.size, config.minibatch_size):
             host_indices = shuffled[batch_slice]
             indices = shuffled_device[batch_slice]
-            board = _batch_tensor(staged["board"], indices, torch.float32)
-            critic_features = _batch_tensor(staged["critic_features"], indices, torch.float32)
+            critic_args = _critic_batch_args(architecture, staged, indices)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
             states = indices.numel()
 
-            run_actor = not stop_for_kl
+            run_actor = epoch_index < actor_epochs and not stop_for_kl
             if run_actor:
                 # Component activity is immutable rollout metadata. Reducing it
                 # on the host avoids a CUDA synchronization in every minibatch
                 # merely to recover a denominator already known before staging.
                 component_count = max(1, int(flat_component_counts[host_indices].sum()))
-                global_features = _batch_tensor(staged["global_features"], indices, torch.float32)
-                units = _batch_tensor(staged["units"], indices, torch.float32)
-                positions = _batch_tensor(staged["unit_positions"], indices, torch.long)
                 unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
                 market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
                 market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
@@ -980,10 +1061,6 @@ def update_vapo(
                 # metric observes that residual.
                 policy_sum, entropy_sum, kl_sum, clipped_sum = actor_terms(
                     actor,
-                    board,
-                    global_features,
-                    units,
-                    positions,
                     unit_actions,
                     market_kinds,
                     market_quantities,
@@ -1000,6 +1077,7 @@ def update_vapo(
                     config.clip_low,
                     config.clip_high,
                     autocast_enabled,
+                    *_actor_batch_args(architecture, staged, indices),
                 )
                 batch_kl = kl_sum.detach().double() / component_count
                 policy_loss = -policy_sum / component_count
@@ -1015,9 +1093,7 @@ def update_vapo(
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch even after policy replay is frozen.
             critic_optimizer.zero_grad(set_to_none=True)
-            value_loss = critic_loss_fn(
-                critic, board, critic_features, value_targets, autocast_enabled
-            )
+            value_loss = critic_loss_fn(critic, value_targets, autocast_enabled, *critic_args)
             guard_values = torch.stack(
                 (
                     batch_kl if run_actor else zero_guard,
@@ -1085,7 +1161,7 @@ def update_vapo(
         "updates": updates,
         "actor_updates": actor_updates,
         "epochs": completed_epochs,
-        "states": rollout.states,
+        "states": rollout.state_count,
         "policy_loss": float(totals["policy_loss"] / max(1, total_components)),
         "value_loss": float(totals["value_loss"] / max(1, total_states)),
         "entropy": float(totals["entropy"] / max(1, total_components)),

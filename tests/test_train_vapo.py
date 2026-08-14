@@ -17,6 +17,9 @@ from kaggriculture.league import (
     snapshot_sha256,
 )
 from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.modelargs import model_config_from_args
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED, resolve_architecture
+from kaggriculture.structured import StructuredConfig
 
 
 def _training_script():
@@ -39,15 +42,9 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.league_active_pool_size == 16
     assert args.epochs == 1
     assert args.minibatch_size == 2048
-    assert (
-        args.cnn_width,
-        args.cnn_blocks,
-        args.model_dim,
-        args.transformer_layers,
-        args.attention_heads,
-        args.ffn_multiplier,
-        args.quantity_rank,
-    ) == (48, 2, 96, 7, 4, 4, 32)
+    # An unflagged run is exactly the family's dataclass configuration, which
+    # is what a warm-start artifact and the calibration benchmark both carry.
+    assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
     assert not hasattr(args, "entropy_coefficient")
     assert args.gamma == 1.0
     assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
@@ -59,6 +56,64 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     args.gamma = 0.99
     with pytest.raises(ValueError, match=r"require --gamma 1\.0"):
         module._validate_args(args)
+
+
+def test_model_flags_are_family_scoped_and_default_to_the_family_configuration(
+    monkeypatch, tmp_path
+) -> None:
+    """Warm starting compares model configurations for equality, so an
+    unflagged run must build the family default and a foreign flag must fail
+    loudly instead of being silently dropped."""
+    module = _training_script()
+
+    monkeypatch.setattr(
+        sys, "argv", ["train_vapo.py", "--run-dir", str(tmp_path), "--architecture", STRUCTURED]
+    )
+    args = module.parse_args()
+    structured = resolve_architecture(STRUCTURED)
+    assert model_config_from_args(structured, args) == StructuredConfig()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_vapo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--architecture",
+            STRUCTURED,
+            "--core-layers",
+            "4",
+            "--model-dim",
+            "64",
+        ],
+    )
+    args = module.parse_args()
+    assert model_config_from_args(structured, args) == StructuredConfig(model_dim=64, core_layers=4)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_vapo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--architecture",
+            STRUCTURED,
+            "--transformer-layers",
+            "7",
+        ],
+    )
+    args = module.parse_args()
+    with pytest.raises(ValueError, match=r"--transformer-layers do not apply"):
+        model_config_from_args(structured, args)
+
+    monkeypatch.setattr(
+        sys, "argv", ["train_vapo.py", "--run-dir", str(tmp_path), "--latents", "16"]
+    )
+    args = module.parse_args()
+    with pytest.raises(ValueError, match=r"--latents do not apply"):
+        model_config_from_args(resolve_architecture(CONV_ENTITY), args)
 
 
 def test_training_rejects_a_league_budget_that_drops_opponent_categories(
@@ -95,18 +150,21 @@ def test_league_diagnostics_remain_separate_per_frozen_policy(tmp_path) -> None:
     )
     assignments = np.asarray([0, 0, 1, 1])
     selections = [
-        SnapshotSelection(SnapshotRef(0, tmp_path / "initial.pt"), "initial"),
+        SnapshotSelection(SnapshotRef(2, tmp_path / "historical.pt"), "historical"),
         SnapshotSelection(SnapshotRef(9, tmp_path / "active.pt"), "active"),
     ]
 
-    diagnostics = module._league_opponent_diagnostics(league, assignments, selections)
+    diagnostics, measured_rates = module._league_opponent_diagnostics(
+        league, assignments, selections
+    )
 
-    assert diagnostics["league_opponent_00000000_category"] == "initial"
-    assert diagnostics["league_opponent_00000000_games"] == 2
-    assert diagnostics["league_opponent_00000000_score_rate"] == 0.5
+    assert diagnostics["league_opponent_00000002_category"] == "historical"
+    assert diagnostics["league_opponent_00000002_games"] == 2
+    assert diagnostics["league_opponent_00000002_score_rate"] == 0.5
     assert diagnostics["league_opponent_00000009_category"] == "active"
     assert diagnostics["league_opponent_00000009_games"] == 2
     assert diagnostics["league_opponent_00000009_score_rate"] == 0.75
+    assert measured_rates == {2: 0.5, 9: 0.75}
 
 
 def test_disabled_league_selection_does_not_advance_training_rng(tmp_path) -> None:
@@ -121,8 +179,135 @@ def test_disabled_league_selection_does_not_advance_training_rng(tmp_path) -> No
     reference = np.random.default_rng(41)
     refs = [SnapshotRef(0, tmp_path / "league-actor-00000000.pt")]
 
-    assert module._select_league_opponents(args, refs, 1, generator) == []
+    assert (
+        module._select_league_opponents(args, refs, 1, generator, {}, pretrained_start=False) == []
+    )
     assert generator.random() == reference.random()
+
+
+def test_league_score_rate_validation_accepts_only_finite_unit_interval_state() -> None:
+    module = _training_script()
+
+    assert module._validate_league_score_rates({}) == {}
+    assert module._validate_league_score_rates({3: 0.25, 7: 1.0}) == {3: 0.25, 7: 1.0}
+    for invalid in (
+        None,
+        [(3, 0.25)],
+        {True: 0.5},
+        {-1: 0.5},
+        {3: 1},
+        {3: float("nan")},
+        {3: 1.5},
+        {3: -0.1},
+    ):
+        with pytest.raises(ValueError):
+            module._validate_league_score_rates(invalid)
+
+
+def test_league_score_rate_blend_seeds_from_prior_and_decays_unmeasured() -> None:
+    module = _training_script()
+    rates = {1: 1.0}
+
+    module._blend_league_score_rates(rates, {2: 1.0})
+
+    # A first measurement blends against the unmeasured prior of 0.5, so one
+    # perfect wave can never pin an estimate at exactly 1.0 and hard-retire a
+    # freshly met opponent.
+    assert rates[2] == pytest.approx(0.75)
+    # Opponents that were not sampled decay toward the prior, keeping
+    # retirement provisional instead of permanent.
+    assert rates[1] == pytest.approx(0.975)
+
+    module._blend_league_score_rates(rates, {2: 0.25})
+    assert rates[2] == pytest.approx(0.5)
+
+
+def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    args = SimpleNamespace(
+        external_eval_every=10,
+        external_eval_opponents="starter",
+        external_eval_seeds=2,
+        episode_steps=720,
+        run_dir=tmp_path,
+    )
+    league_directory = tmp_path / "league"
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **_kwargs):
+            launched.append(command)
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
+
+    # Iteration zero and off-cadence iterations never launch a worker.
+    assert module._maybe_launch_external_eval(args, 0, league_directory, None) is None
+    assert module._maybe_launch_external_eval(args, 7, league_directory, None) is None
+
+    process = module._maybe_launch_external_eval(args, 10, league_directory, None)
+    assert isinstance(process, FakeProcess)
+    command = launched[0]
+    assert command[command.index("--snapshot") + 1].endswith("league-actor-00000010.pt")
+    assert command[command.index("--iteration") + 1] == "10"
+    assert command[command.index("--opponents") + 1] == "starter"
+    assert command[command.index("--output") + 1] == str(tmp_path / "metrics-external.jsonl")
+    assert command[command.index("--seeds") + 1] == "2"
+    assert command[command.index("--episode-steps") + 1] == "720"
+
+    # A still-running worker skips the tick instead of stacking processes; a
+    # finished one is replaced on the next due iteration.
+    assert module._maybe_launch_external_eval(args, 20, league_directory, process) is process
+    assert len(launched) == 1
+    process.returncode = 0
+    replacement = module._maybe_launch_external_eval(args, 20, league_directory, process)
+    assert isinstance(replacement, FakeProcess) and replacement is not process
+    assert len(launched) == 2
+
+    disabled = SimpleNamespace(**{**vars(args), "external_eval_every": 0})
+    assert module._maybe_launch_external_eval(disabled, 30, league_directory, None) is None
+    assert len(launched) == 2
+
+
+def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    args = SimpleNamespace(
+        external_eval_every=10,
+        external_eval_opponents="starter",
+        external_eval_seeds=2,
+        episode_steps=720,
+        run_dir=tmp_path,
+    )
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("fork failed")
+
+    monkeypatch.setattr(module.subprocess, "Popen", refuse)
+
+    assert module._maybe_launch_external_eval(args, 10, tmp_path / "league", None) is None
+
+
+def test_external_eval_opponent_resolution_degrades_instead_of_blocking(capsys, tmp_path) -> None:
+    module = _training_script()
+    missing = tmp_path / "gone.py"
+    args = SimpleNamespace(
+        external_eval_every=10,
+        external_eval_opponents=f"starter,{missing},",
+    )
+
+    module._resolve_external_eval_opponents(args)
+
+    assert args.external_eval_every == 10
+    assert args.external_eval_opponents == "starter"
+    assert "dropped" in capsys.readouterr().err
+
+    args = SimpleNamespace(external_eval_every=10, external_eval_opponents=str(missing))
+    module._resolve_external_eval_opponents(args)
+    assert args.external_eval_every == 0
+    assert "disabled" in capsys.readouterr().err
 
 
 def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) -> None:
@@ -250,7 +435,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
         def close(self) -> None:
             pass
 
-    rollout = SimpleNamespace(states=1)
+    rollout = SimpleNamespace(state_count=1)
     monkeypatch.setattr(module, "SummaryWriter", Writer)
     monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *args, **kwargs: rollout)
     monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
@@ -377,3 +562,77 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     )
     module.main()
     assert (portable_only / "latest.pt").is_file()
+
+
+def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_vapo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--init-actor-from",
+            str(tmp_path / "bc-actor.pt"),
+            "--critic-warmup-iterations",
+            "15",
+        ],
+    )
+    args = module.parse_args()
+    module._validate_args(args)
+    assert args.critic_warmup_iterations == 15
+
+    args.critic_warmup_iterations = -1
+    with pytest.raises(ValueError, match="warmup iterations"):
+        module._validate_args(args)
+
+    args.critic_warmup_iterations = 0
+    args.resume = tmp_path / "latest.pt"
+    with pytest.raises(ValueError, match="fresh run"):
+        module._validate_args(args)
+
+
+def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -> None:
+    from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
+    from kaggriculture.provenance import source_identity
+
+    module = _training_script()
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    pretrained = FarmActor(config)
+    artifact = tmp_path / "bc-actor.pt"
+    torch.save(
+        {
+            "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+            "model_config": config.to_dict(),
+            "actor": pretrained.state_dict(),
+            "iteration": 0,
+            "metrics": {},
+            "source_identity": source_identity(),
+            "run_provenance": None,
+            "bc_provenance": {"teacher": {"label": "public-v27"}},
+        },
+        artifact,
+    )
+    actor = FarmActor(config)
+
+    provenance = module._load_initial_actor(
+        artifact, actor, CONV_ENTITY, config, torch.device("cpu")
+    )
+
+    assert all(
+        torch.equal(value, pretrained.state_dict()[name])
+        for name, value in actor.state_dict().items()
+    )
+    assert provenance["bc_provenance"]["teacher"]["label"] == "public-v27"
+    assert len(provenance["sha256"]) == 64
+
+    other = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    with pytest.raises(ValueError, match="model configuration"):
+        module._load_initial_actor(
+            artifact, FarmActor(other), CONV_ENTITY, other, torch.device("cpu")
+        )

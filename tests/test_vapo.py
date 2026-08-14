@@ -8,9 +8,12 @@ import pytest
 import torch
 
 import kaggriculture.vapo
+from kaggriculture.actions import MarketKind
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import collect_self_play
+from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.vapo import (
     CRITIC_GAE_LAMBDA,
     DEFAULT_ACTOR_GAE_LAMBDA,
@@ -284,13 +287,17 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
     actor = FarmActor(model_config)
     rollout = collect_self_play(actor, games=1, seed_start=92, episode_steps=3, sampling_seed=6)
     flat = rollout.valid.reshape(-1)
-    board = torch.from_numpy(rollout.board.reshape(-1, *rollout.board.shape[2:])[flat]).float()
+    board_states = rollout.states["board"]
+    board = torch.from_numpy(board_states.reshape(-1, *board_states.shape[2:])[flat]).float()
+    global_states = rollout.states["global_features"]
     global_features = torch.from_numpy(
-        rollout.global_features.reshape(-1, *rollout.global_features.shape[2:])[flat]
+        global_states.reshape(-1, *global_states.shape[2:])[flat]
     ).float()
-    units = torch.from_numpy(rollout.units.reshape(-1, *rollout.units.shape[2:])[flat]).float()
+    unit_states = rollout.states["units"]
+    units = torch.from_numpy(unit_states.reshape(-1, *unit_states.shape[2:])[flat]).float()
+    position_states = rollout.states["unit_positions"]
     positions = torch.from_numpy(
-        rollout.unit_positions.reshape(-1, *rollout.unit_positions.shape[2:])[flat]
+        position_states.reshape(-1, *position_states.shape[2:])[flat]
     ).long()
 
     output = actor(board, global_features, units, positions)
@@ -497,6 +504,37 @@ def test_one_vapo_update_is_finite() -> None:
     assert metrics["value_target_max"] == pytest.approx(float(valid_targets.max()))
 
 
+def test_extra_critic_epochs_refit_the_critic_without_touching_the_actor() -> None:
+    model_config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    config = VapoConfig(epochs=1, critic_epochs=3, minibatch_size=8, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(4),
+    )
+
+    # Four minibatches per epoch: the critic steps in all three epochs while
+    # the actor participates only in the first.
+    assert metrics["epochs"] == 3
+    assert metrics["updates"] == 12
+    assert metrics["actor_updates"] == 4
+    assert math.isfinite(metrics["value_loss"])
+
+    with pytest.raises(ValueError, match="critic epochs"):
+        _validate_config(VapoConfig(epochs=4, critic_epochs=2))
+
+
 def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero(monkeypatch) -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
@@ -510,11 +548,11 @@ def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero(monkeypatch) -
     monkeypatch.setattr(
         kaggriculture.vapo,
         "replay_behavior_values",
-        lambda critic, board, critic_features, **kwargs: torch.zeros(board.shape[0]),
+        lambda critic, architecture, staged, **kwargs: torch.zeros(staged["unit_actions"].shape[0]),
     )
     config = VapoConfig(
         epochs=1,
-        minibatch_size=rollout.states,
+        minibatch_size=rollout.state_count,
         lr_warmup_steps=0,
         weight_decay=0.0,
         use_bfloat16=False,
@@ -552,13 +590,13 @@ def test_behavior_values_are_replayed_before_the_update_mutates_the_critic(monke
     observed: dict[str, float | int] = {"calls": 0, "critic_drift": float("inf")}
     real_replay = kaggriculture.vapo.replay_behavior_values
 
-    def recording_replay(critic_module, board, critic_features, **kwargs):
+    def recording_replay(critic_module, architecture, staged, **kwargs):
         observed["calls"] = int(observed["calls"]) + 1
         observed["critic_drift"] = max(
             (parameter - critic_before[name]).abs().max().item()
             for name, parameter in critic_module.named_parameters()
         )
-        return real_replay(critic_module, board, critic_features, **kwargs)
+        return real_replay(critic_module, architecture, staged, **kwargs)
 
     monkeypatch.setattr(kaggriculture.vapo, "replay_behavior_values", recording_replay)
     config = VapoConfig(epochs=2, minibatch_size=8, use_bfloat16=False)
@@ -593,18 +631,153 @@ def test_behavior_value_replay_is_chunk_invariant_and_restores_mode() -> None:
     rollout = collect_self_play(
         FarmActor(model_config), games=1, seed_start=95, episode_steps=4, sampling_seed=12
     )
-    board = _stage_tensor(rollout.board, torch.device("cpu"))
-    critic_features = _stage_tensor(rollout.critic_features, torch.device("cpu"))
+    device = torch.device("cpu")
+    staged = {
+        "board": _stage_tensor(rollout.states["board"], device),
+        "critic_features": _stage_tensor(rollout.states["critic_features"], device),
+        "unit_actions": _stage_tensor(rollout.unit_actions, device),
+    }
     critic.train()
 
-    replayed = replay_behavior_values(critic, board, critic_features, chunk_size=2)
+    replayed = replay_behavior_values(critic, CONV_ENTITY, staged, chunk_size=2)
 
     assert critic.training
     with torch.inference_mode():
         critic.eval()
-        expected = critic.value(critic(board.float(), critic_features.float()))
+        expected = critic.value(critic(staged["board"].float(), staged["critic_features"].float()))
         critic.train()
-    assert replayed.shape == (board.shape[0],)
+    assert replayed.shape == (staged["board"].shape[0],)
     torch.testing.assert_close(replayed, expected)
-    with pytest.raises(ValueError, match="rows must align"):
-        replay_behavior_values(critic, board, critic_features[:1])
+    with pytest.raises(ValueError, match="chunk size"):
+        replay_behavior_values(critic, CONV_ENTITY, staged, chunk_size=0)
+
+
+def test_zero_actor_epochs_runs_a_critic_only_warmup_update(monkeypatch) -> None:
+    """The warm-start phase fits the critic without touching a pretrained actor.
+
+    With `actor_epochs=0` the actor's weights must be byte-identical after the
+    update, the critic must still train, and the behavior-likelihood replay
+    must not run at all (nothing consumes it).
+    """
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(actor, games=1, seed_start=97, episode_steps=3, sampling_seed=14)
+
+    def forbidden_replay(*_args, **_kwargs):
+        raise AssertionError("behavior replay must be skipped when the actor sits out")
+
+    monkeypatch.setattr(kaggriculture.vapo, "replay_behavior_logprobs", forbidden_replay)
+    config = VapoConfig(epochs=2, minibatch_size=8, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
+    critic_before = {name: value.detach().clone() for name, value in critic.named_parameters()}
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(15),
+        actor_epochs=0,
+    )
+
+    assert metrics["actor_updates"] == 0
+    assert metrics["updates"] > 0
+    assert metrics["epochs"] == 2
+    assert all(torch.equal(value, actor_before[name]) for name, value in actor.named_parameters())
+    assert any(
+        not torch.equal(value, critic_before[name]) for name, value in critic.named_parameters()
+    )
+    with pytest.raises(ValueError, match="actor epoch override"):
+        update_vapo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(15),
+            actor_epochs=3,
+        )
+
+
+def _small_structured_config() -> StructuredConfig:
+    return StructuredConfig(
+        model_dim=16,
+        attention_heads=2,
+        ffn_multiplier=1,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+        quantity_rank=4,
+    )
+
+
+def _structured_rollout_with_quantity_orders(seed_start: int, sampling_seed: int):
+    actor = StructuredActor(_small_structured_config())
+    with torch.no_grad():
+        # Pin the market heads to a quantified buy so the quantity component
+        # participates non-vacuously; the conservative production prior can
+        # otherwise sample whole short episodes without one.
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-12.0)
+        actor.market_kind.bias[MarketKind.STOP] = -6.0
+        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
+        actor.market_quantity_context.weight.zero_()
+        actor.market_quantity_value.weight.zero_()
+        actor.market_quantity_bias.fill_(-50.0)
+        actor.market_quantity_bias[MarketKind.BUY_SEED_WHEAT, -1] = 50.0
+    rollout = collect_self_play(
+        actor, games=1, seed_start=seed_start, episode_steps=8, sampling_seed=sampling_seed
+    )
+    return actor, rollout
+
+
+def test_structured_update_replay_parity_covers_every_component() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(seed_start=201, sampling_seed=21)
+    assert rollout.architecture == STRUCTURED
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    parity = update_replay_parity(actor, rollout, minibatch_size=3)
+
+    for component in ("unit", "kind", "quantity"):
+        assert parity[f"update_replay_{component}_active_count"] > 0
+        assert parity[f"update_replay_{component}_ratio_max_abs_error"] < 1e-4
+    for name, parameter in actor.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+
+def test_structured_update_vapo_trains_both_networks() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(seed_start=203, sampling_seed=23)
+    critic = StructuredCritic(_small_structured_config())
+    config = VapoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
+    critic_before = {name: value.detach().clone() for name, value in critic.named_parameters()}
+
+    metrics = update_vapo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(25),
+    )
+
+    assert metrics["states"] == rollout.state_count
+    assert metrics["actor_updates"] >= 1
+    assert math.isfinite(metrics["value_loss"])
+    assert metrics["first_minibatch_approx_kl"] == pytest.approx(0.0, abs=1e-6)
+    assert any(
+        not torch.equal(value, actor_before[name]) for name, value in actor.named_parameters()
+    )
+    assert any(
+        not torch.equal(value, critic_before[name]) for name, value in critic.named_parameters()
+    )
