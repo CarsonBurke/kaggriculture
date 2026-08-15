@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch._dynamo
 
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
@@ -394,6 +395,17 @@ def main() -> None:
         # Keep initial parameters identical across batch sizes so throughput
         # comparisons are not confounded by a different policy/action mix.
         torch.manual_seed(args.seed)
+        # Compilation state is part of that independence. The update path
+        # compiles with dynamic=False, so every distinct minibatch shape
+        # specializes, and each shape specializes twice more because
+        # `_replayed_selected_logprobs` is reached both from the grad-tracking
+        # update and from the no-grad parity audit, whose tensors differ in
+        # their autograd dispatch keys. That is four cache entries per batch
+        # size against Dynamo's limit of eight, so a third batch size used to
+        # abort the sweep outright under fullgraph=True. Resetting also stops
+        # each batch size from measuring a cold start that the previous one
+        # already paid for.
+        torch._dynamo.reset()
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
             torch.cuda.empty_cache()
