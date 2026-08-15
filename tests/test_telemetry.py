@@ -7,7 +7,11 @@ import pytest
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torch.utils.tensorboard import SummaryWriter
 
-from kaggriculture.telemetry import TensorboardMirror, migrate_jsonl_to_tensorboard
+from kaggriculture.telemetry import (
+    TensorboardMirror,
+    migrate_jsonl_to_tensorboard,
+    training_step_field,
+)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -261,3 +265,45 @@ def test_benchmark_jsonl_uses_separate_mode_and_batch_series(tmp_path: Path) -> 
         log_dir,
         "rollout/compiled/batch_summary/steady_state_complete_games_per_second",
     ) == [(16, 5.0)]
+
+
+def test_epoch_keyed_training_journal_mirrors_as_scalars(tmp_path: Path) -> None:
+    """Behavior cloning counts epochs where VAPO counts iterations.
+
+    A training record that is not recognized as one falls through to the
+    metadata branch and is mirrored as a JSON text blob, so the run's curves
+    silently do not appear in TensorBoard at all -- which is exactly how this
+    was found.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    # Exact binary fractions: the event file stores float32, so a decimal
+    # literal would come back rounded and the comparison would be about
+    # floating point rather than about the mirror.
+    records = [
+        {"epoch": 0, "train_loss": 0.5, "holdout_nll": 0.75, "holdout_unit_accuracy": 0.875},
+        {"epoch": 1, "train_loss": 0.25, "holdout_nll": 0.375, "holdout_unit_accuracy": 0.9375},
+    ]
+    _write_jsonl(journal, records)
+
+    result = migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    assert result.records == 2
+    assert _scalars(log_dir, "train_loss") == [(0, 0.5), (1, 0.25)]
+    assert _scalars(log_dir, "holdout_nll") == [(0, 0.75), (1, 0.375)]
+    assert _scalars(log_dir, "holdout_unit_accuracy") == [(0, 0.875), (1, 0.9375)]
+    # The step field itself is a coordinate, not a curve.
+    accumulator = EventAccumulator(str(log_dir)).Reload()
+    assert "epoch" not in accumulator.Tags()["scalars"]
+
+
+def test_training_step_field_distinguishes_journals_from_benchmark_records() -> None:
+    assert training_step_field({"iteration": 3, "loss": 0.1}) == "iteration"
+    assert training_step_field({"epoch": 0, "train_loss": 0.1}) == "epoch"
+    # A benchmark record is tagged, and its `repeat`/`games` fields are not a
+    # training step even though they are integers.
+    assert training_step_field({"event": "iteration", "repeat": 1, "games": 64}) is None
+    assert training_step_field({"event": "configuration", "seed": 7}) is None
+    assert training_step_field({"loss": 0.1}) is None
+    # Booleans are ints in Python; a flag is not a step.
+    assert training_step_field({"epoch": True, "loss": 0.1}) is None

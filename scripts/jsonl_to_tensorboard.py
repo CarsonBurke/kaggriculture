@@ -7,7 +7,11 @@ import argparse
 import json
 from pathlib import Path
 
-from kaggriculture.telemetry import migrate_jsonl_to_tensorboard, read_jsonl_snapshot
+from kaggriculture.telemetry import (
+    migrate_jsonl_to_tensorboard,
+    read_jsonl_snapshot,
+    training_step_field,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,8 +29,7 @@ def parse_args() -> argparse.Namespace:
 def _destination(journal: Path, output_root: Path | None) -> Path:
     snapshot = read_jsonl_snapshot(journal)
     training = bool(snapshot.records) and all(
-        record.get("event") is None and type(record.get("iteration")) is int
-        for record in snapshot.records
+        training_step_field(record) is not None for record in snapshot.records
     )
     if output_root is not None:
         return output_root.expanduser().resolve() / journal.stem

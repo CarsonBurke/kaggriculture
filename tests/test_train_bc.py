@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 from kaggle_environments import make
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig
@@ -213,6 +214,15 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
     ]
     assert [record["epoch"] for record in records] == [0, 1]
     assert all(np.isfinite(record["train_loss"]) for record in records)
+
+    # TensorBoard is written during the run, not by a conversion step someone
+    # has to remember afterwards.
+    accumulator = EventAccumulator(str(output / "tensorboard")).Reload()
+    assert {"train_loss", "holdout_nll", "learning_rate"} <= set(accumulator.Tags()["scalars"])
+    assert [event.step for event in accumulator.Scalars("train_loss")] == [0, 1]
+    assert [event.value for event in accumulator.Scalars("train_loss")] == pytest.approx(
+        [record["train_loss"] for record in records], rel=1e-6
+    )
 
     actor, payload = load_actor_artifact(output / "bc-actor.pt")
     assert payload["architecture"] == CONV_ENTITY

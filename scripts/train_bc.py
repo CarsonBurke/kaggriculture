@@ -47,6 +47,7 @@ from kaggriculture.registry import (
     resolve_architecture,
 )
 from kaggriculture.structured import StructuredActor
+from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.training import write_checkpoint
 from kaggriculture.vapo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
@@ -476,6 +477,11 @@ def train(
     best = math.inf
     best_metrics: dict[str, float] = {}
     stale = 0
+    # The journal stays the durable append-only record the mirror rebuilds
+    # from, and TensorBoard is written live beside it, exactly as VAPO
+    # training does. A clone that only journals is one nobody watches: its
+    # curves appear after a conversion step that has to be remembered.
+    writer = TensorboardMirror(metrics_path, output_dir / "tensorboard")
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         for epoch in range(epochs):
             actor.train()
@@ -522,6 +528,7 @@ def train(
             }
             metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
             metrics_file.flush()
+            writer.record(record)
             print(
                 f"epoch {epoch}: train {record['train_loss']:.4f} "
                 f"holdout {holdout['nll']:.4f} "
@@ -545,6 +552,7 @@ def train(
                 if stale >= patience:
                     print(f"stopping: no holdout improvement in {patience} epochs", flush=True)
                     break
+    writer.close()
     if not best_metrics:
         raise RuntimeError("training produced no holdout evaluation")
     print(f"best holdout nll {best:.4f}; artifact at {artifact_path}", flush=True)

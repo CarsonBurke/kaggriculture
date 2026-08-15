@@ -203,6 +203,29 @@ def _number(value: object) -> float | None:
     return converted
 
 
+#: Step fields a training journal may be keyed by, in precedence order. VAPO
+#: counts iterations and behavior cloning counts epochs; both are a single
+#: monotonic step index over a flat record of scalars, and neither carries the
+#: `event` tag that marks a benchmark record.
+_TRAINING_STEP_FIELDS = ("iteration", "epoch")
+
+
+def training_step_field(record: dict[str, Any]) -> str | None:
+    """The step field of a training journal record, or None if it is not one.
+
+    A record that reaches TensorBoard without matching here is mirrored as a
+    JSON text blob rather than as scalars, which is the right fallback for
+    benchmark metadata and useless for a training curve -- so every training
+    journal has to be recognized here or its curves silently do not appear.
+    """
+    if record.get("event") is not None:
+        return None
+    return next(
+        (name for name in _TRAINING_STEP_FIELDS if type(record.get(name)) is int),
+        None,
+    )
+
+
 def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
     mode = "compiled" if configuration.get("compile_models") is True else "eager"
     kind = "vapo" if "self_play_game_counts" in configuration else "rollout"
@@ -223,15 +246,16 @@ def _write_record(
     record_index: int,
     context: tuple[str, str],
 ) -> None:
-    event = record.get("event")
-    if event is None and type(record.get("iteration")) is int:
-        step = int(record["iteration"])
+    step_field = training_step_field(record)
+    if step_field is not None:
+        step = int(record[step_field])
         for name, value in record.items():
             scalar = _number(value)
-            if name != "iteration" and scalar is not None:
+            if name != step_field and scalar is not None:
                 writer.add_scalar(name, scalar, step)
         return
 
+    event = record.get("event")
     kind, mode = context
     if event in {"iteration", "repeat"}:
         games = record.get("self_play_games", record.get("games"))
