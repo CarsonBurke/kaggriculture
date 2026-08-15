@@ -96,7 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--holdout-seeds", type=int, default=12, help="highest N seeds held out entirely"
     )
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help=(
+            "passes over the corpus; an epoch is a pass, not a fixed step count, "
+            "so a larger corpus needs fewer of them, not more"
+        ),
+    )
     parser.add_argument(
         "--patience", type=int, default=5, help="epochs without holdout improvement before stopping"
     )
