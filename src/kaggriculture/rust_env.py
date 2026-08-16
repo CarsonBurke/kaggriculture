@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import threading
+import tomllib
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -54,8 +55,74 @@ def _cargo_diagnostic(events: list[dict[str, Any]]) -> str:
     return "".join(rendered).strip()
 
 
+def _pinned_toolchain() -> str:
+    pin = _repository_root() / "rust-toolchain.toml"
+    try:
+        with pin.open("rb") as stream:
+            return str(tomllib.load(stream)["toolchain"]["channel"])
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        # A bare errno here is actively misleading, because the likeliest cause
+        # is a tree that predates the pin -- a frozen snapshot or a worktree
+        # taken before `rust-toolchain.toml` joined the source identity. Those
+        # cannot be repaired in place and have to be re-frozen or rebased, which
+        # is not something an ENOENT conveys. `path = ` is also a legal
+        # toolchain table with no channel at all, so a KeyError is reachable
+        # without the file being damaged.
+        raise RuntimeError(
+            f"cannot read the pinned Rust toolchain from {pin}: {error!r}; the file is part "
+            f"of the source identity, so a tree without a usable one predates the pin and "
+            f"must be re-frozen rather than built in place"
+        ) from error
+
+
+def _verify_pinned_toolchain(crate: Path) -> None:
+    """Fail unless the compiler about to run is the one the identity records.
+
+    `rust-toolchain.toml` is hashed into `source_identity`, so a checkpoint's
+    provenance asserts which rustc built its simulator. That assertion is only
+    as good as the file being obeyed, and rustup lets `RUSTUP_TOOLCHAIN`, a
+    `cargo +toolchain` invocation, or a directory override outrank it -- none
+    of which appear anywhere in the identity. Verifying here, against the same
+    working directory the build uses, is what turns the pin from a request into
+    a fact.
+    """
+    expected = _pinned_toolchain()
+    try:
+        completed = subprocess.run(
+            ["rustup", "show", "active-toolchain"],
+            cwd=crate,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot verify the pinned Rust toolchain {expected!r}: rustup could not be run "
+            f"({error!r}), so nothing enforces rust-toolchain.toml and the recorded source "
+            f"identity would misstate which compiler built {_MODULE_NAME}"
+        ) from error
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"cannot verify the pinned Rust toolchain {expected!r}: "
+            f"{completed.stderr.strip() or 'rustup reported no active toolchain'}"
+        )
+    active = completed.stdout.split(maxsplit=1)[0] if completed.stdout.split() else ""
+    # Anchored on the separator rather than a bare prefix. rustup answers with
+    # the full triple, `nightly-2025-12-13-x86_64-...`, so the pin is a prefix
+    # by design -- but a bare startswith would also accept `1.75.0` for a pin
+    # of `1.7`, which is the one comparison this must never get wrong.
+    if not (active == expected or active.startswith(f"{expected}-")):
+        raise RuntimeError(
+            f"the active Rust toolchain is {active!r} but rust-toolchain.toml pins "
+            f"{expected!r}; the source identity records the pin, so building here would "
+            f"stamp checkpoints with a compiler that did not produce them "
+            f"(check RUSTUP_TOOLCHAIN and any `rustup override` for this directory)"
+        )
+
+
 def _build_native(crate: Path, release: bool) -> Path:
     """Build the cdylib and return the exact artifact path reported by Cargo."""
+    _verify_pinned_toolchain(crate)
     manifest = crate / "Cargo.toml"
     command = [
         "cargo",
@@ -147,6 +214,37 @@ def _load_installed() -> ModuleType:
             "extension is not importable; use an editable checkout with Cargo installed or "
             "install a package containing the native extension"
         ) from error
+
+
+def toolchain_identity() -> str | None:
+    """Return the Rust compiler that builds the crate, or None if it is absent.
+
+    Recorded beside a run's configuration because nothing else captures it.
+    `uv.lock` is hashed into source_identity and pins torch down to wheel
+    digests, so the Python side of the simulator's numerics is bound by the
+    identity itself; Cargo.lock pins dependency crates rather than the
+    compiler.
+
+    The binding for rustc is now `rust-toolchain.toml`, which is hashed into
+    the identity and enforced by `_verify_pinned_toolchain` before any build.
+    This stays because the two answer different questions: the pin says which
+    toolchain was demanded, and this says which compiler actually replied. They
+    can differ -- a pin names a channel, not a build, so `nightly-2025-12-13`
+    resolved to `1.94.0-nightly (fa5eda19b)` here and a rustup that re-resolves
+    it would not announce itself. Note also that this reports the compiler, not
+    RUSTFLAGS or the target CPU.
+    """
+    try:
+        completed = subprocess.run(
+            ["rustc", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    version = completed.stdout.strip()
+    return version if completed.returncode == 0 and version else None
 
 
 def _validate_module(module: ModuleType, origin: str) -> ModuleType:

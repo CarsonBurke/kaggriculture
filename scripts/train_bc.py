@@ -2,10 +2,10 @@
 """Behavior-clone an actor on a projected demonstration dataset.
 
 Trains a registered actor family with the exact factored masked likelihood
-VAPO optimizes — `component_selected_logprobs` over teacher-forced masks —
+PPO optimizes — `component_selected_logprobs` over teacher-forced masks —
 with demonstrated selections as targets. The stored raw observations are
 retokenized per architecture, and batches are staged through the same
-helpers as the VAPO update, so every family clones the same projected
+helpers as the PPO update, so every family clones the same projected
 episodes with identical likelihood semantics. Whole seeds are held out
 (steps within an episode are nearly duplicates), the best-holdout weights
 are kept, and the output is a standard architecture-tagged actor artifact
@@ -38,6 +38,7 @@ from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
 from kaggriculture.model import FarmActor
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
+from kaggriculture.ppo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
     ARCHITECTURES,
@@ -50,7 +51,6 @@ from kaggriculture.structured import StructuredActor
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.training import write_checkpoint
-from kaggriculture.vapo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
 
 SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1,))
 
@@ -125,7 +125,7 @@ class DemonstrationTensors:
 
     Storage dtypes mirror the rollout staging path (fp16 features, int8/bool
     factors); minibatches cast to compute dtypes through the same batching
-    helpers as the VAPO update.
+    helpers as the PPO update.
 
     The corpus stays on the host and only the minibatch crosses to the
     accelerator. Staged on the device instead, dataset size and batch size
@@ -257,7 +257,7 @@ def _batch(
 
     The gather runs on the host, where the corpus lives, and moves the narrow
     storage dtypes; the widening casts to the compute dtypes then run on the
-    accelerator through the same helpers the VAPO update uses, so the bus
+    accelerator through the same helpers the PPO update uses, so the bus
     carries fp16 and int8 rather than the fp32 and int64 they become.
     """
     rows = {
@@ -486,7 +486,7 @@ def train(
     best_metrics: dict[str, float] = {}
     stale = 0
     # The journal stays the durable append-only record the mirror rebuilds
-    # from, and TensorBoard is written live beside it, exactly as VAPO
+    # from, and TensorBoard is written live beside it, exactly as PPO
     # training does. A clone that only journals is one nobody watches: its
     # curves appear after a conversion step that has to be remembered.
     writer = TensorboardMirror(metrics_path, output_dir / "tensorboard")
@@ -514,7 +514,7 @@ def train(
                 optimizer.step()
                 schedule.step()
                 # The loss is a mean over active components, so the epoch
-                # average must weight by that same count, exactly as the VAPO
+                # average must weight by that same count, exactly as the PPO
                 # update aggregates its per-minibatch losses.
                 components = float(shuffled_components[indices].sum())
                 epoch_loss += float(loss.detach()) * components
@@ -534,7 +534,10 @@ def train(
                 "seconds": time.perf_counter() - started,
                 **{f"holdout_{name}": value for name, value in holdout.items()},
             }
-            metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+            # A diverged epoch must fail here rather than be written as the
+            # bare `NaN` token, which is not JSON and which every downstream
+            # reader would either reject or silently accept as a real loss.
+            metrics_file.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
             metrics_file.flush()
             writer.record(record)
             print(

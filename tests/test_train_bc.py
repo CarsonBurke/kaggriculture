@@ -218,11 +218,16 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
     # TensorBoard is written during the run, not by a conversion step someone
     # has to remember afterwards.
     accumulator = EventAccumulator(str(output / "tensorboard")).Reload()
-    assert {"train_loss", "holdout_nll", "learning_rate"} <= set(accumulator.Tags()["scalars"])
-    assert [event.step for event in accumulator.Scalars("train_loss")] == [0, 1]
-    assert [event.value for event in accumulator.Scalars("train_loss")] == pytest.approx(
+    assert {"loss/train", "loss/holdout_nll", "schedule/learning_rate"} <= set(
+        accumulator.Tags()["scalars"]
+    )
+    assert [event.step for event in accumulator.Scalars("loss/train")] == [0, 1]
+    assert [event.value for event in accumulator.Scalars("loss/train")] == pytest.approx(
         [record["train_loss"] for record in records], rel=1e-6
     )
+    # Per-head holdout statistics are runs, so the three share one chart.
+    heads = EventAccumulator(str(output / "tensorboard" / "heads" / "unit")).Reload()
+    assert "holdout/accuracy" in heads.Tags()["scalars"]
 
     actor, payload = load_actor_artifact(output / "bc-actor.pt")
     assert payload["architecture"] == CONV_ENTITY

@@ -1,6 +1,6 @@
 """Architecture-aware model-configuration command line surface.
 
-Every entry point that constructs a model — VAPO training, behavior cloning,
+Every entry point that constructs a model — PPO training, behavior cloning,
 the iteration benchmark — exposes the same structural hyperparameters, and
 they must agree exactly: warm-starting a run from a cloned actor compares
 ``model_config`` dictionaries for equality, so a flag whose default silently

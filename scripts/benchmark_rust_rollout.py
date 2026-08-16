@@ -258,8 +258,8 @@ def main() -> None:
                 ),
                 "process_max_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                 "money_mean": diagnostics["money_mean"],
-                "money_min": diagnostics["money_min"],
-                "money_max": diagnostics["money_max"],
+                "money_p10": diagnostics["money_p10"],
+                "money_p90": diagnostics["money_p90"],
                 "tie_fraction": diagnostics["tie_fraction"],
                 "rollout_entropy": diagnostics["rollout_entropy"],
             }

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
+import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 
 def _script():
-    path = Path(__file__).parents[1] / "scripts" / "benchmark_vapo_iteration.py"
-    spec = importlib.util.spec_from_file_location("kaggriculture_benchmark_vapo", path)
+    path = Path(__file__).parents[1] / "scripts" / "benchmark_ppo_iteration.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_benchmark_ppo", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -46,7 +49,7 @@ def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> No
     from kaggriculture.registry import CONV_ENTITY, resolve_architecture
 
     module = _script()
-    monkeypatch.setattr(sys, "argv", ["benchmark_vapo_iteration.py"])
+    monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py"])
 
     config = model_config_from_args(resolve_architecture(CONV_ENTITY), module.parse_args())
 
@@ -152,3 +155,27 @@ def test_first_step_critic_state_verification_covers_both_families() -> None:
         rollout.states[critic_field][0, 0] += 1
         with pytest.raises(RuntimeError, match="fresh native encode"):
             module._verify_first_step_critic_state(rollout, 1, 17)
+
+
+def test_a_gate_override_may_tighten_but_never_loosen_the_shipped_bound() -> None:
+    """A ceiling written beside a constant goes stale when the constant moves.
+
+    The ceiling on `--max-first-minibatch-kl` was 1e-3 while the constant was
+    1e-4. Recalibrating the constant against a behavior-cloned actor -- which
+    diverges four orders of magnitude further than the random init the original
+    number came from -- left every benchmark failing in argument parsing, with
+    an error naming a limit nothing in the tree enforced any more.
+    """
+    module = _script()
+    shipped = {attribute: ceiling for _flag, attribute, ceiling in module._NUMERICS_GATES}
+
+    def validated(**overrides: float) -> None:
+        module._validate_numerics_gates(SimpleNamespace(**{**shipped, **overrides}))
+
+    # Every shipped value is admissible: it is exactly what training enforces.
+    validated()
+    for flag, attribute, ceiling in module._NUMERICS_GATES:
+        validated(**{attribute: ceiling * 0.5})
+        for rejected in (ceiling * 1.5, 0.0, -1.0, math.nan, math.inf):
+            with pytest.raises(ValueError, match=f"{re.escape(flag)} must be finite"):
+                validated(**{attribute: rejected})

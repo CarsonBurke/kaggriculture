@@ -1,4 +1,4 @@
-"""VAPO masked-token update with decoupled actor GAE and critic returns."""
+"""PPO masked-token update with length-adaptive GAE and lambda-return targets."""
 
 from __future__ import annotations
 
@@ -24,26 +24,242 @@ from kaggriculture.structured import StructuredActor, StructuredCritic, Structur
 Critic = DistributionalCritic | StructuredCritic
 Actor = FarmActor | StructuredActor
 
-VAPO_GAE_ALPHA = 0.05
+#: VAPO's length-adaptive GAE constant, the one piece of that paper this update
+#: still takes: it sets lambda from the horizon rather than from a tuned guess.
+LENGTH_ADAPTIVE_GAE_ALPHA = 0.05
 COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
-DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (VAPO_GAE_ALPHA * COMPETITION_ACTION_STEPS)
-CRITIC_GAE_LAMBDA = 1.0
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (LENGTH_ADAPTIVE_GAE_ALPHA * COMPETITION_ACTION_STEPS)
 
 # Numerics gates shared by the calibration benchmark, the training launcher's
-# expected configuration, and the production training loop. The sampling-path
-# versus update-replay ratio divergence is irreducible bf16 noise: measured
-# worst cases are 2.35e-2 over 230k production states at initialization and
-# 1.9e-2 across seed, rollout-size, and sharpened-head sweeps, while real
-# staging or precision bugs present orders of magnitude larger, so 5e-2 keeps
-# roughly 2x headroom while spending only a fraction of the [0.8, 1.28] clip
-# band. The first-minibatch KL at unchanged weights measures ~7e-8 under
-# compile with bf16; 1e-4 bounds the ratio-at-one construction with margin.
-MAX_UPDATE_REPLAY_RATIO_ERROR = 5e-2
-MAX_FIRST_MINIBATCH_KL = 1e-4
+# expected configuration, and the production training loop.
+#
+# The sampling-path versus update-replay divergence is bounded as a KL, not as
+# a worst component. The quantity at risk is off-policy sampling bias — actions
+# were drawn from the rollout forward while the gradient treats them as drawn
+# from the update forward — which is a divergence between two distributions,
+# taken under the one that did the sampling. A maximum over active components
+# does not estimate that: it is an extreme-value statistic whose expectation
+# grows with the component count, so the same policy fails or passes depending
+# on rollout size, and it is dominated by actions whose behavior probability is
+# too small to carry weight in any expectation. The earlier 5e-2 bound came
+# from sweeping a randomly initialized actor, whose near-uniform heads have a
+# thin tail; a behavior-cloned actor measures 20.68 on the identical code path
+# with no defect present, which is what falsified the premise that only bugs
+# reach that magnitude.
+#
+# The estimator is the k3 form `expm1(d) - d`, averaged over each head's active
+# components, matching `_clipped_surrogate_sums` exactly so the two numbers are
+# at least computed the same way. They are not, however, interchangeable as
+# budgets: `target_kl` bounds staleness that the importance ratio *corrects
+# for*, which costs variance and leaves the estimator consistent, whereas this
+# divergence is uncorrected — nothing multiplies by p/q. Reading a bias budget
+# off a variance budget would be a category error, so this bound is not derived
+# from target_kl. Taking the maximum over heads rather than pooling keeps a
+# single-head defect from being diluted by the unit head, which supplies most
+# components.
+#
+# A mean alone would be the wrong single gate, because the bugs this audit
+# exists to catch are characteristically localized — an off-by-one on the final
+# minibatch, one seat, one action type, one mask path — and a mean dilutes them
+# by the corrupted fraction. At production scale a 20% likelihood error confined
+# to the last minibatch moves the mean by well under the bound while being an
+# unambiguous defect. So the tail is gated too, by the *fraction* of sampled
+# actions the two paths disagree about by more than
+# UPDATE_REPLAY_TAIL_LOGPROB, rather than by how far the worst one strayed.
+# Counting is what makes this stable: an indicator mean is bounded in [0, 1] and
+# has finite variance no matter how heavy the log-ratio tail is, whereas a
+# maximum — and, under a sufficiently heavy tail, the k3 mean itself — is
+# dominated by a handful of order statistics and swings across seeds. A bug
+# touching a fraction f of components registers as a tail fraction of about f,
+# so the bound reads directly as the smallest detectable corrupted share.
+#
+# Both bounds are set from measurement on a behavior-cloned actor at production
+# rollout size, because that is the sharp-policy regime the earlier calibration
+# never sampled. Holding one rollout fixed and varying only autocast attributes
+# the divergence almost entirely to bf16 in the update forward: per-component KL
+# 3.0e-3 under bf16 against 2.2e-5 in fp32, a factor of 138, with backend and
+# minibatch shape accounting for only the fp32 remainder. It is a bulk effect,
+# not a tail one — 7.7% of unit components disagree by more than 0.05 nats where
+# a randomly initialized actor has none at all — and it scales with how sharp
+# the policy is, from 4e-7 at initialization to 2.1e-3 for the clone.
+#
+# That divergence is accepted rather than removed, and the reason is structural
+# rather than a matter of magnitude. The importance ratio is unaffected, since
+# `replay_behavior_logprobs` recomputes the behavior side through the same bf16
+# forward; what remains is off-policy sampling bias. Writing d = log q - log p
+# for the update and sampling heads, the bias in the surrogate is
+# -E_p[expm1(d) * A]. Both heads normalize over the same masked support, so
+# E_p[exp(d)] = 1 and therefore E[expm1(d)] = 0 *within each state*; the
+# advantage is a per-state scalar (see `expanded_advantage` below), so it
+# factors out of that inner expectation and the bias in the surrogate objective
+# is exactly zero, not merely small. What survives is the gradient bias,
+# A * E_p[grad log q], which does not vanish because the score varies with the
+# action. Advantages are normalized to zero mean and unit variance and are
+# essentially uncorrelated with a rounding pattern, so this cancels across
+# states as well, but it is systematic where sampling noise is not, and
+# systematic error accumulates linearly against the noise's square root.
+# That is the argument for auditing it repeatedly through a run (see
+# REPLAY_PARITY_AUDIT_INTERVAL) rather than assuming a one-time pass holds.
+#
+# Note also that the magnitude is easy to understate, and the honest reference
+# point is what the update actually moves rather than what it is permitted to.
+# KL is second order in d, so a per-component KL of 2.5e-3 means std[d] =
+# sqrt(2 * KL) = 0.071. Measured across four runs, realized approx_kl has a
+# median of 2.3e-3 per iteration — std 0.068. The uncorrected divergence is
+# therefore about as wide as the corrected one, not a fraction of it; comparing
+# instead against target_kl's 0.245 would report 29% and comparing the KLs
+# directly would report 8%, and both flatter the number by measuring it against
+# a trust region the update never reaches. Removing the divergence would mean an fp32
+# update forward and forfeiting the bf16 speedup. MAX_UPDATE_REPLAY_KL is set
+# at roughly 2.6x the worst production measurement of the clone: 1.77e-3,
+# 1.87e-3 and 1.91e-3 over three waves drawn from disjoint environments, a
+# spread of 1.08x, which is what makes a fixed bound meaningful at all.
+#
+# The materiality threshold must sit above the numerical noise floor of the
+# precision actually in use, or it measures rounding instead of defects, and
+# that floor has to be measured at the threshold rather than extrapolated to it.
+# Swept on a production wave of the behavior clone, the share of components bf16
+# rounding alone pushes past a threshold falls off far more slowly than an
+# exponential — nearer a factor of three per half nat than a factor of two, and
+# slowing as the threshold rises:
+#
+#     0.247 nats 9.8e-3 | 0.50 2.7e-3 | 0.75 1.1e-3 | 1.00 5.1e-4
+#      1.25 nats 2.8e-4 | 1.50 1.6e-4 | 2.00 5.7e-5 | 2.50 1.9e-5
+#      3.00 nats 1.1e-5 | 4.00 3.3e-6
+#
+# For contrast a randomly initialized actor has *zero* components past even
+# 0.247 nats on any head, which is why the earlier calibration could never have
+# predicted any of this.
+#
+# Picking the pair is more constrained than it looks, and the constraint is
+# worth writing down because it decides how much this gate can ever be trusted
+# to do. Call the KL gate's remaining budget B — about 2.5e-3, conservatively,
+# after the clone's own ~1.9e-3. A defect touching a share f of components at
+# log-likelihood error d already fails the KL gate when f * k3(d) > B, so the
+# tail gate only earns its place on defects with f above the bound but
+# f * k3(d) still under B, which caps the useful bound at B / k3(threshold).
+# The bound must also clear the measured floor. Both at once are governed by
+# floor(t) * k3(t), and what that product does is decided by a race: the floor
+# decays faster than k3 grows from half a nat through 2.5, so the product
+# improves, from 4.0e-4 at half a nat to 3.7e-4 at one, 2.5e-4 at two and
+# 1.7e-4 at 2.5 — and then the two rates cross, 1.81x against k3's 1.85x over
+# the half nat from 2.5 to 3, and the product goes flat within 4% through three
+# and four nats. So 2.5 nats is the knee, and the knee is exactly where those
+# rates meet. Below it the product is still sliding and the gate is weaker for
+# no reason; above it there is nothing further to gain on this metric, and the
+# floor grows too sparse to calibrate against — five components at four nats
+# cannot support a three-wave spread estimate, and this whole method depends on
+# a *measured* floor. At no threshold does bf16 turn this into a strong
+# independent detector; the honest most it buys is an extension of the mean's
+# reach to defects too concentrated for a mean to see.
+#
+# 2.5 nats with a 2e-4 bound is pinned from both sides. Above, by redundancy:
+# the ceiling is the KL gate's remaining budget over k3(2.5), which is 2.9e-4
+# against the conservative B and 3.6e-4 against the clone's actual 1.9e-3, so a
+# looser bound would be decoration. Below, by the false-abort rate on the
+# *smallest* head, which is what governs it because the gated statistic is a max
+# over heads. As fractions the heads are comparable; as counts they are not. At
+# production the quantity head carries 75k active components against the unit
+# head's 1.45M, so the same 2e-4 bound is a count of 15 there and 290 there.
+# Measured tail counts over three waves are 29/43/46 on the unit head and 0/1/1
+# on the quantity head: the bound sits 40 Poisson sigma out on the former and
+# still needs a 15-against-0.67 excursion on the latter. Over-dispersion is what
+# could spoil that, and its mechanism is components within one state sharing
+# logits and therefore sharing their rounding — which is why the unit head, at
+# 6.3 active components per state, measures 2.1x over-dispersed (three waves
+# cannot exclude more, so read Poisson as a floor on the noise rather than a
+# model of it), and why the quantity head, at 0.33 per state, has almost nothing
+# to cluster with. Tightening to 1e-4 halves both counts and 0/1/1 does not
+# support it.
+#
+# What the gate uniquely covers is f in (2.0e-4, 3.6e-4], roughly 300 to 520
+# components — severe corruption too small in extent for the mean to notice.
+# That window is not a fixed property of the pair: its ceiling is the KL gate's
+# *remaining* budget, so it narrows as the run's own divergence drifts up and
+# closes altogether once that reaches 3.3e-3, about 44% of the drift available
+# between the clone and the bound. Past that point the tail statistic is
+# redundant as a gate and earns its keep as a numerics-regime monitor in
+# telemetry, which is the honest description of most of its working life.
+#
+# What that leaves the KL gate alone responsible for is stated plainly: the
+# canonical localized defect, one confined to the final minibatch, covers 2048
+# of 320 * 719 = 230,080 states, a 0.89% share, and the KL gate binds there at
+# d <= 0.666. So such a defect is visible from a 1.95x likelihood error up,
+# where the original 0.247-nat threshold caught it from 1.28x. That band, 1.28x
+# to 1.95x on a last-minibatch-sized defect, is what the bf16 update forward
+# costs in detection power. The budget is computed against the unit head's
+# baseline, the largest of the three, so the other heads are caught earlier and
+# this is the worst case.
+#
+# MAX_FIRST_MINIBATCH_KL governs a different comparison from the three bounds
+# above it, and conflating the two is what made the previous value wrong. The
+# bounds above measure the rollout's *sampling* likelihoods against the update
+# replay. The every-iteration gate never sees the sampling likelihoods: by the
+# time the minibatch loop runs, `update_ppo` has overwritten them with
+# `replay_behavior_logprobs`, so its ratio is replay against update forward and
+# its residual is only a separate compiled graph plus shuffle-dependent batch
+# composition. `_replay_to_update_minibatch_kl` measures that quantity, and the
+# audit gates this constant against it.
+#
+# The old 1e-4 came from ~7e-8 measured on a randomly initialized actor, whose
+# heads have no confident components at all. A cloned actor has many, and rare
+# catastrophic cancellation on near-zero-probability components dominates the
+# k3 mean; production training measured 1.98e-3 on the clone's first actor
+# minibatch and the gate stopped a 500-iteration run there. Calibrating a
+# numerical bound against random init and applying it to a clone has now failed
+# three times.
+MAX_UPDATE_REPLAY_KL = 5e-3
+UPDATE_REPLAY_TAIL_LOGPROB = 2.5
+MAX_UPDATE_REPLAY_TAIL_FRACTION = 2e-4
+# Measured on the cloned conv actor at production scale, worst of the 113
+# minibatches in each of three disjoint waves:
+#
+#   4.634e-3   7.338e-3   4.060e-2
+#
+# Unlike its sampling-path siblings, which reproduce to 8% across waves, this
+# spans 8.8x. It is an extreme value over a distribution whose mass sits near
+# 2e-3 -- production training drew 1.98e-3 on its own first minibatch -- with a
+# tail from rare catastrophic cancellation on near-zero-probability components.
+# The gate draws one minibatch per iteration, so a 500-iteration run takes 500
+# draws where this audit takes 339, and a bound that merely cleared the typical
+# draw would fire on a healthy tail with near-certainty.
+#
+# 1.1e-1 is 2.6x the worst of those 339, the margin MAX_UPDATE_REPLAY_KL takes
+# over its own worst wave. It reads loose for a numerical residual, and it is:
+# the tail, not the bound, is what is loose. A real staging or replay desync
+# moves every minibatch rather than one, so it clears 1.1e-1 by orders of
+# magnitude, and `update_replay_mean_minibatch_kl` is the statistic to watch for
+# one arriving gradually.
+MAX_FIRST_MINIBATCH_KL = 1.1e-1
+#: Any shuffle reproduces the gate's residual, so the audit fixes one and the
+#: measurement stays comparable between waves and between trees.
+_REPLAY_AUDIT_SHUFFLE_SEED = 20260815
+
+#: Share of value targets the critic support may saturate before the run is
+#: stopped. The lambda-return adds the critic's own prediction to the reward, so
+#: no support width contains it by construction and a small saturated share is
+#: ordinary critic error escaping the outermost atom. What this catches is the
+#: degenerate end: a critic collapsed onto the edge atom, whose every target is
+#: then clipped to a constant label that holds it there.
+#:
+#: The bound cannot be read off that description, because a categorical critic's
+#: mean is itself bounded by its support -- the runaway saturates a share, never
+#: the whole batch. Measured over 32 production-length trajectories whose
+#: potential is a bounded random walk, with the critic pinned at a constant:
+#:
+#:     V     0.00  1.00  1.50  2.00  2.10  2.15  2.20
+#:     share 0.000 0.000 0.000 0.007 0.072 0.186 0.374
+#:
+#: So a critic pinned at the outermost atom, the worst state reachable, reaches
+#: 0.374 and any bound at or above that is inert. Anything a working critic
+#: produces sits at zero with the whole 0.2 of headroom to spare, which leaves a
+#: wide band to place this in; 0.05 is an order of magnitude above the first
+#: non-zero reading and still fires well before the collapse completes.
+MAX_VALUE_TARGET_SATURATED_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
-class VapoConfig:
+class PpoConfig:
     # Learning rates follow CleanRL's PPO reference (2.5e-4, Adam eps 1e-5)
     # for both networks; CleanRL additionally anneals linearly to zero, which
     # this pipeline deliberately does not adopt (warmup then constant).
@@ -63,11 +279,19 @@ class VapoConfig:
     # value estimates.
     critic_epochs: int | None = None
     minibatch_size: int = 2048
+    # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
+    # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
+    # collapse: a symmetric band clips a low-probability action's upside at the
+    # same ratio as a high-probability one's, which is a much tighter bound on
+    # its absolute probability, so exploration dies faster than it should.
     clip_low: float = 0.80
     clip_high: float = 1.28
     # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
-    # competition's fixed 719-action horizon. The critic is deliberately
-    # decoupled below and always learns from lambda-one Monte Carlo returns.
+    # competition's fixed 719-action horizon. The critic shares it: VAPO's
+    # decoupled lambda-one critic answers a sparse terminal-reward setting
+    # where the only unbiased signal is the whole trajectory, and this
+    # environment's reward is a dense potential difference at every one of the
+    # 719 transitions instead.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     gamma: float = 1.0
     max_gradient_norm: float = 1.0
@@ -90,6 +314,19 @@ class VapoConfig:
 class AdvantageBatch:
     advantages: np.ndarray
     value_targets: np.ndarray
+    # The undiscounted suffix return. Nothing trains on it: it is the target the
+    # critic used to fit, kept as the one measurement of critic quality the
+    # critic cannot move. Explained variance against `value_targets` is scored
+    # against a target that contains the prediction, so it improves when the
+    # critic merely agrees with itself; against this it does not.
+    monte_carlo_returns: np.ndarray
+    # Location and scale of the advantages before normalization. The normalized
+    # array is zero-mean and unit-variance by construction, so measuring it
+    # reports the normalizer rather than the rollout; the scale here is the
+    # actual size of the advantage signal, which shrinks as the critic starts
+    # explaining the return.
+    raw_advantage_mean: float
+    raw_advantage_std: float
 
 
 def generalized_advantage_and_targets(
@@ -99,7 +336,17 @@ def generalized_advantage_and_targets(
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
     gamma: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
-    """Compute actor lambda-GAE and decoupled lambda-one critic targets."""
+    """Compute lambda-GAE advantages and the matching lambda-return targets.
+
+    The critic target is the standard PPO return, `advantage + value`, which is
+    the lambda-return under the same lambda the actor uses. It is unbiased
+    wherever the value function is exact and trades the remaining bias for a
+    variance reduction that grows with the horizon: over 719 transitions the
+    lambda-one Monte Carlo suffix return accumulates the noise of every later
+    action into every earlier state's target, and the dense potential-difference
+    reward makes that trade lopsided -- almost all of the return is already
+    observable within the lambda's ~36-step effective window.
+    """
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")
     if values.ndim != 2:
@@ -127,26 +374,21 @@ def generalized_advantage_and_targets(
     next_valids = torch.cat((valid[:, 1:], torch.zeros_like(valid[:, :1])), dim=1)
     deltas = rewards + gamma * next_values * next_valids - values
     running_advantage = torch.zeros(values.size(0), dtype=values.dtype, device=values.device)
-    running_return = torch.zeros_like(running_advantage)
     advantage_columns: list[Tensor] = []
-    target_columns: list[Tensor] = []
     for step in range(values.size(1) - 1, -1, -1):
         next_valid = next_valids[:, step]
         running_advantage = (
             deltas[:, step] + gamma * actor_gae_lambda * running_advantage * next_valid
         ) * valid[:, step]
-        # This is the undiscounted Monte Carlo suffix return when gamma=1.
-        # Computing it directly from rewards makes the critic target exactly
-        # independent of its own predictions, including in floating point.
-        running_return = (rewards[:, step] + gamma * running_return * next_valid) * valid[:, step]
         advantage_columns.append(running_advantage)
-        target_columns.append(running_return)
     advantages = torch.stack(advantage_columns[::-1], dim=1).to(values.dtype)
-    value_targets = torch.stack(target_columns[::-1], dim=1).to(values.dtype)
+    # Padding was selected away from both terms above, so the target stays
+    # exactly zero there rather than picking up a stale value prediction.
+    value_targets = advantages + values
     return advantages, value_targets
 
 
-def _validate_config(config: VapoConfig) -> None:
+def _validate_config(config: PpoConfig) -> None:
     for name, value in (
         ("actor learning rate", config.actor_learning_rate),
         ("critic learning rate", config.critic_learning_rate),
@@ -320,7 +562,7 @@ def replay_behavior_values(
 
 
 def prepare_advantages(
-    rollout: RolloutBatch, values: np.ndarray, config: VapoConfig
+    rollout: RolloutBatch, values: np.ndarray, config: PpoConfig
 ) -> AdvantageBatch:
     _validate_config(config)
     if values.shape != rollout.rewards.shape:
@@ -338,16 +580,30 @@ def prepare_advantages(
     selected = advantages[valid.bool()]
     if selected.numel() == 0:
         raise ValueError("rollout contains no valid states")
-    normalized = (advantages - selected.mean()) / selected.std(unbiased=False).clamp_min(1e-6)
+    raw_mean = selected.mean()
+    raw_std = selected.std(unbiased=False)
+    normalized = (advantages - raw_mean) / raw_std.clamp_min(1e-6)
     normalized *= valid
+    # Lambda one against a zero reference: the residuals telescope, so the
+    # advantage is the exact suffix return and the same recurrence yields it.
+    monte_carlo = generalized_advantage_and_targets(
+        rewards,
+        torch.zeros_like(values),
+        valid,
+        actor_gae_lambda=1.0,
+        gamma=config.gamma,
+    )[1]
     return AdvantageBatch(
         advantages=normalized.numpy(),
         value_targets=targets.numpy(),
+        monte_carlo_returns=monte_carlo.numpy(),
+        raw_advantage_mean=float(raw_mean),
+        raw_advantage_std=float(raw_std),
     )
 
 
 def make_optimizers(
-    actor: Actor, critic: Critic, config: VapoConfig
+    actor: Actor, critic: Critic, config: PpoConfig
 ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
     _validate_config(config)
     actor_device = next(actor.parameters()).device
@@ -676,23 +932,41 @@ def _critic_minibatch_loss(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
+    """One critic minibatch: the distributional loss and the mean it implies.
+
+    The predicted mean rides along because the forward that produced the logits
+    is the only place it is free. Scoring the critic's fit to its own target
+    otherwise costs a second full-rollout replay -- 230k states at the
+    measured 42k states/s, about 15% of an iteration -- to recover numbers the
+    update already computed and threw away.
+    """
     with torch.autocast(
         device_type=value_targets.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
         critic_logits = critic(*critic_args)
-    return distributional_value_loss(
+    loss = distributional_value_loss(
         critic_logits,
         value_targets,
         critic.support,
         sigma_ratio=critic.config.value_sigma_ratio,
         validate=False,
     ).mean()
+    return loss, critic.value(critic_logits).detach()
 
 
-@torch.inference_mode()
+# `torch.no_grad` rather than inference mode, and the choice is load-bearing
+# twice over. Dynamo specializes on the grad context, so an inference-mode
+# audit compiles a *second* entry per minibatch shape on the same code object
+# `replay_behavior_logprobs` already compiled under no_grad. That doubles the
+# cache from four entries to eight against a per-code-object limit of eight,
+# which a `fullgraph=True` region overruns as a hard failure rather than a
+# fallback. Sharing the context also means the audit executes literally the
+# graph the update executes, which is the whole point of an audit that exists
+# to compare against it.
+@torch.no_grad()
 def update_replay_parity(
     actor: Actor,
     rollout: RolloutBatch,
@@ -704,7 +978,7 @@ def update_replay_parity(
     """Measure rollout-sampling versus update-replay likelihood divergence.
 
     Runs the same staging, minibatch slicing, and policy forward as
-    `update_vapo`'s behavior replay and compares its log-likelihoods with the
+    `update_ppo`'s behavior replay and compares its log-likelihoods with the
     likelihoods the rollout sampler actually drew actions from. Since
     `replay_behavior_logprobs` pins the update's importance ratio to one at
     unchanged weights by construction, this difference no longer enters the
@@ -712,6 +986,17 @@ def update_replay_parity(
     between the distribution actions were drawn from and the distribution the
     gradient assumes. Pass the production `use_bfloat16` flag so the audited
     path is the deployed one.
+
+    Two statistics are gated, both means over active components and therefore
+    both invariant to rollout size. `update_replay_max_kl` is the k3 divergence
+    estimator, an estimate of KL(sampling policy || update policy) under the
+    sampling distribution — the bias itself. `update_replay_max_tail_fraction`
+    is the share of sampled actions the two paths disagree about by more than
+    `UPDATE_REPLAY_TAIL_LOGPROB`, which is what catches a localized defect that
+    a mean would dilute. The per-head maxima are retained as diagnostics — they
+    locate the worst component when something does go wrong — but they are
+    extreme values over hundreds of thousands of samples, so they grow with the
+    component count and are not thresholds.
     """
     if minibatch_size < 1:
         raise ValueError("minibatch size must be positive")
@@ -748,8 +1033,20 @@ def update_replay_parity(
     maximum_logprob_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
     maximum_ratio_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
     active_counts = dict.fromkeys(("unit", "kind", "quantity"), 0)
+    # Accumulated in float64 on the host: the per-head sums run to hundreds of
+    # thousands of terms whose individual magnitudes are near the float32
+    # rounding floor, which is precisely the regime where a float32 running sum
+    # loses the quantity being measured.
+    kl_sums = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
+    tail_counts = dict.fromkeys(("unit", "kind", "quantity"), 0)
+    # Joint over all three heads on one minibatch, reported as a diagnostic for
+    # how far a 2048-row slice strays from the full-batch mean. It is *not* the
+    # every-iteration gate's statistic; see `_replay_to_update_minibatch_kl`.
+    worst_minibatch_kl = 0.0
     for batch_slice in _balanced_minibatch_slices(valid_indices.size, minibatch_size):
         indices = ordered[batch_slice]
+        minibatch_kl_sum = 0.0
+        minibatch_active = 0
         market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
         replayed = replay(
             actor,
@@ -768,8 +1065,9 @@ def update_replay_parity(
             ("quantity", replayed[2], "old_market_quantity_logprobs", "market_quantity_active"),
         ):
             active = _batch_tensor(staged[active_key], indices, torch.bool)
-            active_counts[name] += int(active.sum())
-            if not bool(active.any()):
+            active_count = int(active.sum())
+            active_counts[name] += active_count
+            if not active_count:
                 continue
             difference = (
                 new_logprobs[active].float()
@@ -783,6 +1081,43 @@ def update_replay_parity(
             maximum_ratio_error[name] = max(
                 maximum_ratio_error[name], float((difference.exp() - 1.0).abs().max())
             )
+            # k3, the same estimator the objective's own KL uses. Both heads
+            # normalize over the same masked support, so E[exp(d)] is one and
+            # this is exactly unbiased for KL(sampling || update) rather than
+            # merely a proxy. The plain -d mean is unbiased too but can go
+            # negative; k3 cannot, which is what lets it be compared against a
+            # one-sided bound. It is not the lower-variance of the two here —
+            # under a heavy log-ratio tail k3 is the more variable one — so the
+            # tail statistics below, not this mean, carry bug detection.
+            # Promote to float64 before expm1: `expm1(d) - d` is d^2/2 to
+            # leading order and cancels catastrophically in float32.
+            widened = difference.double()
+            head_kl_sum = float((torch.expm1(widened) - widened).sum())
+            kl_sums[name] += head_kl_sum
+            minibatch_kl_sum += head_kl_sum
+            minibatch_active += active_count
+            tail_counts[name] += int((widened.abs() > UPDATE_REPLAY_TAIL_LOGPROB).sum())
+        if minibatch_active:
+            worst_minibatch_kl = max(worst_minibatch_kl, minibatch_kl_sum / minibatch_active)
+    first_minibatch_kl, mean_first_minibatch_kl = _replay_to_update_minibatch_kl(
+        actor,
+        rollout,
+        staged,
+        valid_indices,
+        minibatch_size=minibatch_size,
+        compile_model=compile_model,
+        autocast_enabled=autocast_enabled,
+    )
+    total_active = sum(active_counts.values())
+    total_kl_sum = sum(kl_sums.values())
+    replay_kl = {
+        name: kl_sums[name] / active_counts[name] if active_counts[name] else 0.0
+        for name in kl_sums
+    }
+    tail_fraction = {
+        name: tail_counts[name] / active_counts[name] if active_counts[name] else 0.0
+        for name in tail_counts
+    }
     return {
         **{
             f"update_replay_{name}_logprob_max_abs_error": value
@@ -792,9 +1127,143 @@ def update_replay_parity(
             f"update_replay_{name}_ratio_max_abs_error": value
             for name, value in maximum_ratio_error.items()
         },
+        **{f"update_replay_{name}_kl": value for name, value in replay_kl.items()},
+        **{f"update_replay_{name}_tail_fraction": value for name, value in tail_fraction.items()},
         **{f"update_replay_{name}_active_count": value for name, value in active_counts.items()},
         "update_replay_max_ratio_error": max(maximum_ratio_error.values()),
+        "update_replay_max_kl": max(replay_kl.values()),
+        "update_replay_max_tail_fraction": max(tail_fraction.values()),
+        # A component-weighted mean of the three heads, so it can never exceed
+        # the largest of them and MAX_UPDATE_REPLAY_KL bounds it by
+        # construction. Reported so the relationship is visible rather than
+        # merely true.
+        "update_replay_joint_kl": total_kl_sum / total_active if total_active else 0.0,
+        # The same sampling-versus-replay mean on the worst single minibatch.
+        # Diagnostic only: it says how much a 2048-row slice of a heavy-tailed
+        # per-component distribution strays from the full-batch mean, which is
+        # what makes the tail statistics rather than the mean the bug detector.
+        "update_replay_minibatch_kl": worst_minibatch_kl,
+        # The statistic `MAX_FIRST_MINIBATCH_KL` actually bounds. It is a
+        # different comparison from every number above, which is easy to miss:
+        # those measure the *sampling* likelihoods against the update replay,
+        # while the every-iteration gate never sees the sampling likelihoods at
+        # all -- `update_ppo` overwrites them with the replay, so its ratio is
+        # replay against update forward and its residual is only compiled-graph
+        # and shuffle-dependent batch composition.
+        "update_replay_first_minibatch_kl": first_minibatch_kl,
+        # The same residual averaged over every minibatch instead of maximized.
+        # It is the stable half of the pair: the maximum is an extreme value over
+        # a distribution whose mass sits orders of magnitude below its tail, so
+        # the mean is what shows a real desync arriving, and the gap between the
+        # two is what shows the tail is only a tail.
+        "update_replay_mean_minibatch_kl": mean_first_minibatch_kl,
     }
+
+
+def _replay_to_update_minibatch_kl(
+    actor: Actor,
+    rollout: RolloutBatch,
+    staged: dict[str, Tensor],
+    valid_indices: np.ndarray,
+    *,
+    minibatch_size: int,
+    compile_model: bool,
+    autocast_enabled: bool,
+) -> tuple[float, float]:
+    """Worst and mean per-minibatch KL between behavior replay and update forward.
+
+    This is the quantity `MAX_FIRST_MINIBATCH_KL` bounds, and it is not any of
+    the sampling-versus-replay numbers this module's other statistics report.
+    `update_ppo` replaces the rollout's sampling likelihoods with a replay
+    through the update path, so its importance ratio starts at one by
+    construction and the residual its gate observes comes only from a separate
+    compiled graph and a shuffled batch composition. Auditing a sampling-path
+    number against that bound compares two different quantities that happen to
+    sit at a similar magnitude on a cloned actor.
+
+    Both sides are therefore produced the way the update produces them: the
+    replay through `replay_behavior_logprobs`, the comparison through the same
+    `_actor_minibatch_terms` callable and the same permuted slicing. Advantages
+    are zero because the k3 sum does not depend on them, and every minibatch of
+    one epoch is measured rather than only the first, since the gate draws one
+    at random each iteration and the worst draw is the one that has to clear.
+    """
+    device = next(actor.parameters()).device
+    compile_enabled = compile_model and device.type == "cuda"
+    # The k3 sum ignores both the advantages and the clip bounds, so the
+    # defaults stand in for a config this audit is not otherwise given.
+    clip = PpoConfig()
+    replayed = replay_behavior_logprobs(
+        actor,
+        rollout.architecture,
+        staged,
+        valid_indices,
+        minibatch_size=minibatch_size,
+        autocast_enabled=autocast_enabled,
+        compile_model=compile_model,
+    )
+    staged = staged | replayed
+    flat_valid_size = rollout.valid.size
+    flat_component_counts = (
+        rollout.unit_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_quantity_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
+    )
+    terms = (
+        _cached_update_callable(actor, "_kaggriculture_update_terms", _actor_minibatch_terms)
+        if compile_enabled
+        else _actor_minibatch_terms
+    )
+    # The permutation only has to be *a* shuffle, not the training run's: the
+    # residual comes from minibatches being composed differently than the replay
+    # composed them, and any shuffle does that.
+    shuffled = np.random.default_rng(_REPLAY_AUDIT_SHUFFLE_SEED).permutation(valid_indices)
+    shuffled_device = torch.from_numpy(shuffled).to(device=device)
+    zero_advantages = torch.zeros(minibatch_size, dtype=torch.float32, device=device)
+    worst = 0.0
+    total = 0.0
+    measured = 0
+    for batch_slice in _balanced_minibatch_slices(shuffled.size, minibatch_size):
+        host_indices = shuffled[batch_slice]
+        indices = shuffled_device[batch_slice]
+        component_count = max(1, int(flat_component_counts[host_indices].sum()))
+        # Grad is re-enabled inside this no_grad audit deliberately. Dynamo
+        # specializes on the grad context, so measuring under no_grad would both
+        # compile a second entry for a code object already at two of its eight
+        # and -- far worse for an audit whose subject is compiled-graph
+        # divergence -- execute a different graph from the one the update runs.
+        # No backward follows, so nothing frees the activations on its own and
+        # they are dropped explicitly at the end of the loop body instead. That
+        # placement is load-bearing: rebinding here would evaluate the next
+        # minibatch's forward *before* releasing this one's graph, holding two
+        # at once, and the update this mirrors only ever holds one.
+        with torch.enable_grad():
+            policy_sum, entropy_sum, kl_sum, clipped_sum = terms(
+                actor,
+                _batch_tensor(staged["unit_actions"], indices, torch.long),
+                _batch_tensor(staged["market_kinds"], indices, torch.long),
+                _batch_tensor(staged["market_quantities"], indices, torch.long),
+                _batch_tensor(staged["unit_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+                _batch_tensor(staged["unit_active"], indices, torch.float32),
+                _batch_tensor(staged["market_active"], indices, torch.float32),
+                _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
+                _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
+                _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
+                _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
+                zero_advantages[: indices.numel()],
+                clip.clip_low,
+                clip.clip_high,
+                autocast_enabled,
+                *_actor_batch_args(rollout.architecture, staged, indices),
+            )
+        minibatch_kl = float(kl_sum.detach().double()) / component_count
+        del policy_sum, entropy_sum, kl_sum, clipped_sum
+        worst = max(worst, minibatch_kl)
+        total += minibatch_kl
+        measured += 1
+    return worst, total / measured if measured else 0.0
 
 
 def _clipped_surrogate_sums(
@@ -805,7 +1274,7 @@ def _clipped_surrogate_sums(
     clip_low: float,
     clip_high: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return VAPO token objective, non-negative k3 KL, and clipped count."""
+    """Return the PPO token objective, non-negative k3 KL, and clipped count."""
     log_ratio = torch.where(active.bool(), new_logprobs.float() - old_logprobs.float(), 0.0)
     expanded_advantage = advantages.float()[:, None]
     effective_log_ratio = torch.where(
@@ -822,6 +1291,50 @@ def _clipped_surrogate_sums(
     return objective_sum, approximate_kl_sum, clipped_sum
 
 
+def _target_correlation(targets: np.ndarray, predictions: np.ndarray, valid: np.ndarray) -> float:
+    """Pearson correlation of critic predictions with their targets.
+
+    Separates the two ways explained variance goes negative. Predictions that
+    are uncorrelated noise and predictions that rank states correctly but at
+    the wrong scale or offset both score below zero on explained variance;
+    they score near zero and near one respectively here, and the fixes are not
+    the same. Returns 0.0 when either side is constant, since a correlation
+    with a constant is undefined rather than absent.
+    """
+    selected_targets = targets[valid]
+    selected_predictions = predictions[valid]
+    if selected_targets.size < 2:
+        return 0.0
+    target_deviation = selected_targets - selected_targets.mean()
+    prediction_deviation = selected_predictions - selected_predictions.mean()
+    denominator = float(
+        np.sqrt(float((target_deviation**2).sum()) * float((prediction_deviation**2).sum()))
+    )
+    if denominator < 1e-12:
+        return 0.0
+    return float((target_deviation * prediction_deviation).sum()) / denominator
+
+
+def _epoch_value_losses(marks: list[tuple[Tensor, int]]) -> tuple[float, float]:
+    """Mean critic loss over the first and last epoch, from cumulative marks.
+
+    A single epoch is its own first and last. Both are returned as 0.0 when the
+    critic did not run, which is not a loss of zero but the absence of one, and
+    matches how the other critic statistics report an update that never happened.
+    """
+    if not marks:
+        return 0.0, 0.0
+    first_total, first_states = marks[0]
+    first = float(first_total) / max(1, first_states)
+    if len(marks) == 1:
+        return first, first
+    last_total, last_states = marks[-1]
+    previous_total, previous_states = marks[-2]
+    span = last_states - previous_states
+    last = float(last_total - previous_total) / max(1, span)
+    return first, last
+
+
 def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.ndarray) -> float:
     selected_targets = targets[valid]
     selected_predictions = predictions[valid]
@@ -829,6 +1342,58 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.
     if variance < 1e-12:
         return 0.0
     return 1.0 - float(np.var(selected_targets - selected_predictions)) / variance
+
+
+def _fit_moments(device: torch.device) -> dict[str, Tensor]:
+    """Zeroed float64 accumulators for one critic epoch's fit statistics."""
+    return {
+        key: torch.zeros((), device=device, dtype=torch.float64)
+        for key in ("target", "target_square", "residual", "residual_square")
+    }
+
+
+def _accumulate_fit_moments(sums: dict[str, Tensor], targets: Tensor, predictions: Tensor) -> None:
+    """Stream one minibatch's target and residual moments into float64 sums."""
+    residuals = targets - predictions
+    sums["target"] += targets.sum()
+    sums["target_square"] += targets.square().sum()
+    sums["residual"] += residuals.sum()
+    sums["residual_square"] += residuals.square().sum()
+
+
+def _fit_explained_variance(sums: dict[str, Tensor], states: int) -> float:
+    """Explained variance of the critic's own regression, from streamed sums.
+
+    The two explained variances taken from the pre-update replay cannot answer
+    whether the regression worked. Against the suffix return the critic is
+    scored on a quantity it never fits, and under potential-shaped rewards with
+    gamma one that return is the terminal outcome minus the current potential,
+    so most of its variance is the game's coin flip and no critic can explain
+    it. Against the lambda-return the residual is identically the advantage --
+    the target is `advantages + values` and the prediction is those same
+    `values` -- so the number rises whenever the critic's predictions merely
+    gain variance, agreeing with themselves.
+
+    This one is neither: the targets are fixed before the update and the
+    predictions are the critic's own, so a critic that is fitting what it was
+    asked to fit drives this up and one that is not cannot, whatever its
+    predictions do. It is reported twice, once per scoring epoch, because a
+    single reading cannot separate fitting from memorizing -- see the two
+    accumulators in `update_ppo`.
+
+    Population variances, matching `_explained_variance`'s `np.var`, taken from
+    float64 running sums rather than a retained per-state array.
+    """
+    if states < 2:
+        return 0.0
+    count = float(states)
+    target_mean = float(sums["target"]) / count
+    target_variance = float(sums["target_square"]) / count - target_mean * target_mean
+    if target_variance < 1e-12:
+        return 0.0
+    residual_mean = float(sums["residual"]) / count
+    residual_variance = float(sums["residual_square"]) / count - residual_mean * residual_mean
+    return 1.0 - residual_variance / target_variance
 
 
 def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> None:
@@ -870,13 +1435,13 @@ def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> N
             raise ValueError(message)
 
 
-def update_vapo(
+def update_ppo(
     actor: Actor,
     critic: Critic,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     rollout: RolloutBatch,
-    config: VapoConfig,
+    config: PpoConfig,
     *,
     generator: np.random.Generator,
     actor_epochs: int | None = None,
@@ -972,13 +1537,19 @@ def update_vapo(
         raise ValueError("critic value support must be finite, increasing, and evenly spaced")
     if not np.isfinite(valid_value_targets).all():
         raise ValueError("value targets must be finite")
-    if (
-        valid_value_targets.min() < value_support[0]
-        or valid_value_targets.max() > value_support[-1]
-    ):
-        raise ValueError("value targets fall outside the critic support")
+    # The lambda-return bootstraps off the critic's own prediction, so its range
+    # is the reward range plus the critic's rather than the reward range alone;
+    # no bounded support can contain it by construction, and every categorical
+    # critic saturates the target at the outermost atom for exactly this reason.
+    # Saturation is therefore measured rather than fatal: it is the critic's own
+    # error escaping the support, and the fraction over time is the signal --
+    # killing a run on one excursion would report the same fact by crashing.
+    saturated = np.count_nonzero(
+        (valid_value_targets < value_support[0]) | (valid_value_targets > value_support[-1])
+    )
+    value_targets = np.clip(prepared.value_targets, value_support[0], value_support[-1])
     staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
-    staged["value_targets"] = torch.from_numpy(prepared.value_targets.reshape(-1)).to(device)
+    staged["value_targets"] = torch.from_numpy(value_targets.reshape(-1)).to(device)
     totals = {
         key: torch.zeros((), device=device, dtype=torch.float64)
         for key in (
@@ -991,6 +1562,14 @@ def update_vapo(
             "critic_gradient_norm",
         )
     }
+    # Streamed moments of the scoring critic epochs' targets and residuals.
+    # Kept on the device in float64 and reduced once at the end, so scoring the
+    # regression costs four reductions over a minibatch already resident rather
+    # than a retained copy of every prediction.
+    first_fit_sums = _fit_moments(device)
+    last_fit_sums = _fit_moments(device)
+    first_fit_states = 0
+    last_fit_states = 0
     total_states = 0
     actor_states = 0
     total_components = 0
@@ -1019,6 +1598,14 @@ def update_vapo(
     zero_guard = torch.zeros((), dtype=torch.float64, device=device)
 
     critic_epochs = config.epochs if config.critic_epochs is None else config.critic_epochs
+    # Cumulative marks at each epoch boundary. The reported `value_loss` averages
+    # every critic epoch, so it cannot distinguish a critic that predicts fresh
+    # rollouts well from one that merely memorizes each batch over four passes.
+    # The first epoch is scored on states the critic has never been fit to and
+    # the last on states it has seen three times; their difference is what
+    # separates those, and both are deltas of a running device total rather than
+    # a second accumulator.
+    epoch_marks: list[tuple[Tensor, int]] = []
     for epoch_index in range(critic_epochs):
         shuffled = generator.permutation(valid_indices)
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
@@ -1093,7 +1680,25 @@ def update_vapo(
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch even after policy replay is frozen.
             critic_optimizer.zero_grad(set_to_none=True)
-            value_loss = critic_loss_fn(critic, value_targets, autocast_enabled, *critic_args)
+            value_loss, predicted_values = critic_loss_fn(
+                critic, value_targets, autocast_enabled, *critic_args
+            )
+            # The first and last critic epochs, accumulated separately. The
+            # first scores every state before this update has fitted it, so it
+            # reads out of sample; the last scores each one on its fourth pass.
+            # A critic that is generalizing keeps the two together, one that is
+            # memorizing the batch pulls them apart. The epochs between are
+            # never mixed in: averaging predictions from weights three passes
+            # apart reports a fit no single critic ever had.
+            if epoch_index == 0 or epoch_index == critic_epochs - 1:
+                targets = value_targets.double()
+                predictions = predicted_values.double()
+                if epoch_index == 0:
+                    _accumulate_fit_moments(first_fit_sums, targets, predictions)
+                    first_fit_states += states
+                if epoch_index == critic_epochs - 1:
+                    _accumulate_fit_moments(last_fit_sums, targets, predictions)
+                    last_fit_states += states
             guard_values = torch.stack(
                 (
                     batch_kl if run_actor else zero_guard,
@@ -1155,8 +1760,10 @@ def update_vapo(
             totals["critic_gradient_norm"] += critic_gradient_norm * states
             total_states += states
             updates += 1
+        epoch_marks.append((totals["value_loss"].clone(), total_states))
         completed_epochs += 1
 
+    first_epoch_value_loss, last_epoch_value_loss = _epoch_value_losses(epoch_marks)
     metrics: dict[str, float | int] = {
         "updates": updates,
         "actor_updates": actor_updates,
@@ -1164,6 +1771,8 @@ def update_vapo(
         "states": rollout.state_count,
         "policy_loss": float(totals["policy_loss"] / max(1, total_components)),
         "value_loss": float(totals["value_loss"] / max(1, total_states)),
+        "value_loss_first_epoch": first_epoch_value_loss,
+        "value_loss_last_epoch": last_epoch_value_loss,
         "entropy": float(totals["entropy"] / max(1, total_components)),
         "approx_kl": float(totals["approx_kl"] / max(1, total_components)),
         "max_approx_kl": max_approx_kl,
@@ -1172,19 +1781,83 @@ def update_vapo(
         "clip_fraction": float(totals["clip_fraction"] / max(1, total_components)),
         "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, actor_states)),
         "critic_gradient_norm": float(totals["critic_gradient_norm"] / max(1, total_states)),
-        "advantage_mean": float(prepared.advantages[rollout.valid].mean()),
-        "advantage_std": float(prepared.advantages[rollout.valid].std()),
+        "advantage_mean": prepared.raw_advantage_mean,
+        "advantage_std": prepared.raw_advantage_std,
         "value_target_mean": float(prepared.value_targets[rollout.valid].mean()),
         "value_target_std": float(prepared.value_targets[rollout.valid].std()),
         "value_target_min": float(prepared.value_targets[rollout.valid].min()),
         "value_target_max": float(prepared.value_targets[rollout.valid].max()),
+        # Every target statistic here, and the suffix-return and lambda-return
+        # explained variances and the correlation below, are taken from the
+        # unclipped return, so they all describe one quantity -- what the
+        # target was, and how much of it the support could not hold.
+        # `value_loss` and the two critic-fit explained variances are the
+        # exceptions by necessity, since the critic regresses on the saturated
+        # copy and scoring a fit against a target no bounded support can reach
+        # would measure the support width. During a saturation episode the two
+        # conventions diverge -- a fixed-error critic reads about +0.16 higher
+        # on the clipped target at this fraction's run-killing bound -- and
+        # this fraction is what says so.
+        "value_target_saturated_fraction": float(saturated) / float(valid_value_targets.size),
         "actor_gae_lambda": config.actor_gae_lambda,
-        "critic_gae_lambda": CRITIC_GAE_LAMBDA,
         "gamma": config.gamma,
         "actor_learning_rate": float(actor_optimizer.param_groups[0]["lr"]),
         "critic_learning_rate": float(critic_optimizer.param_groups[0]["lr"]),
-        "explained_variance": _explained_variance(
+        # Four explained variances against three targets, because one number
+        # cannot carry the questions the run has been misread for want of
+        # separating.
+        #
+        # Against the undiscounted suffix return. The critic does not regress
+        # on it, and under this environment's potential-shaped reward with
+        # gamma one the suffix return telescopes to the terminal outcome minus
+        # the current potential -- so its variance is mostly the game's coin
+        # flip, and a healthy critic still scores near zero here. Read the
+        # correlation below, not this, for whether the critic knows anything
+        # about how the game ends: this conflates that correlation with the
+        # scale the critic was fitted at, which belongs to a different target.
+        "monte_carlo_explained_variance": _explained_variance(
+            prepared.monte_carlo_returns, behavior_values, rollout.valid
+        ),
+        # Against the target actually regressed on, from the pre-update
+        # predictions -- which are inside that target, since it is
+        # `advantages + values`. The residual is therefore identically the
+        # advantage and this is exactly `1 - Var(A)/Var(G_lambda)`: the
+        # conventional PPO reading, and one the critic can raise by merely
+        # gaining prediction variance.
+        "lambda_return_explained_variance": _explained_variance(
             prepared.value_targets, behavior_values, rollout.valid
+        ),
+        # Against the same target with predictions taken during the update, so
+        # the residual is a fit error rather than an algebraic identity. These
+        # two are what say whether the regression is working, and the gap
+        # between them says whether it is generalizing rather than memorizing
+        # the batch: the first epoch scores every state before this update has
+        # fitted it, the last scores each one on its fourth pass. With a single
+        # configured critic epoch they coincide, that epoch being both.
+        "critic_fit_explained_variance_first_epoch": _fit_explained_variance(
+            first_fit_sums, first_fit_states
+        ),
+        "critic_fit_explained_variance_last_epoch": _fit_explained_variance(
+            last_fit_sums, last_fit_states
+        ),
+        # An explained variance alone cannot say why it is what it is, and the
+        # suffix-return one was measured at -0.4 to -0.75 across a whole
+        # 40-iteration critic warmup, flat, while the distributional
+        # cross-entropy fell from 3.38 to 1.84. Those two are consistent with a
+        # critic whose predicted distribution is sharpening while the mean taken
+        # from it is not, and separating that from a mean that is simply
+        # mis-scaled needs the predictions themselves. A collapsed critic shows
+        # a near-zero prediction std against the target's; a mis-scaled one
+        # shows a std of the wrong magnitude; a critic learning the right shape
+        # but the wrong location shows a correlation near one with a displaced
+        # mean. One scalar cannot be all three, so all three are recorded -- and
+        # the correlation is taken against the suffix return because it is the
+        # scale-free half of that reading: it is what the critic knows about how
+        # the game ends, with the fitted scale divided out.
+        "value_prediction_mean": float(behavior_values[rollout.valid].mean()),
+        "value_prediction_std": float(behavior_values[rollout.valid].std()),
+        "value_target_correlation": _target_correlation(
+            prepared.monte_carlo_returns, behavior_values, rollout.valid
         ),
     }
     return metrics

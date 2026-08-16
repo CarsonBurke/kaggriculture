@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a from-scratch Kaggriculture policy with self-play VAPO."""
+"""Train a from-scratch Kaggriculture policy with self-play PPO."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import random
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -36,6 +36,17 @@ from kaggriculture.league import (
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.opponents import normalize_opponent
+from kaggriculture.ppo import (
+    DEFAULT_ACTOR_GAE_LAMBDA,
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_KL,
+    MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    MAX_VALUE_TARGET_SATURATED_FRACTION,
+    PpoConfig,
+    make_optimizers,
+    update_ppo,
+    update_replay_parity,
+)
 from kaggriculture.provenance import (
     file_sha256,
     require_source_identity,
@@ -50,6 +61,7 @@ from kaggriculture.rollout import (
     collect_mixed_play_rust,
     slice_trajectories,
 )
+from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.structured import StructuredConfig
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import (
@@ -62,15 +74,6 @@ from kaggriculture.training import (
     save_checkpoint,
     training_rng_states,
     write_checkpoint,
-)
-from kaggriculture.vapo import (
-    DEFAULT_ACTOR_GAE_LAMBDA,
-    MAX_FIRST_MINIBATCH_KL,
-    MAX_UPDATE_REPLAY_RATIO_ERROR,
-    VapoConfig,
-    make_optimizers,
-    update_replay_parity,
-    update_vapo,
 )
 
 
@@ -137,13 +140,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            "actor GAE lambda; defaults to VAPO's alpha=0.05 value for the "
-            "fixed 719-action competition horizon; critic targets always use lambda=1"
+            "GAE lambda; defaults to VAPO's alpha=0.05 value for the fixed "
+            "719-action competition horizon. It sets the critic too: the target "
+            "is the lambda-return the advantage came from"
         ),
     )
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
-    parser.add_argument("--compile-models", action="store_true")
+    # Separate knobs, decided separately by calibration: the rollout
+    # collector and the update compile different graphs, and their measured
+    # speedups on the conv model fall on opposite sides of the threshold.
+    parser.add_argument("--compile-rollout", action="store_true")
+    parser.add_argument("--compile-update", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument(
         "--expected-source-digest",
@@ -189,6 +197,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"arguments must be positive: {', '.join(invalid)}")
     if args.episode_steps != 720:
         raise ValueError("training requires the competition horizon: --episode-steps 720")
+    # The k3 estimator is non-negative, and the trust region stops on
+    # `batch_kl > target_kl`, so zero admits only the exactly-parity first
+    # minibatch and anything negative admits nothing at all. Either collapses
+    # the update to near-zero optimizer steps silently rather than erroring.
+    if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
+        raise ValueError("target KL must be finite and positive")
     if args.league_games < 0:
         raise ValueError("league games cannot be negative")
     if args.league_active_opponents < 0 or args.league_historical_opponents < 0:
@@ -246,7 +260,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.seed < 0:
         raise ValueError("seed cannot be negative")
     if args.temperature != 1.0:
-        raise ValueError("on-policy VAPO currently requires --temperature 1.0")
+        raise ValueError("on-policy PPO currently requires --temperature 1.0")
     if args.expected_source_digest is not None and (
         len(args.expected_source_digest) != 64
         or any(character not in "0123456789abcdef" for character in args.expected_source_digest)
@@ -344,6 +358,354 @@ LEAGUE_SCORE_RATE_EMA = 0.5
 # A stale estimate is most wrong exactly when the learner has changed the
 # most, and the decay guarantees every opponent is eventually re-measured.
 LEAGUE_SCORE_RATE_DECAY = 0.05
+# Iterations between sampling-vs-update replay audits. The divergence this
+# audits is a function of how sharp the policy has become -- a randomly
+# initialized actor measures it near 4e-7 where a behavior-cloned one measures
+# 2e-3 -- so auditing only at iteration zero measures it at the one moment it
+# is smallest and never rechecks as training sharpens the heads. The audit is
+# a full extra replay forward over the rollout, roughly five percent of an
+# iteration, so this cadence costs about two parts in a thousand.
+REPLAY_PARITY_AUDIT_INTERVAL = 25
+# How far a parity measurement must exceed the same staging configuration's
+# previous measurement before a breach is read as a defect rather than drift.
+#
+# Two things push a breach past the bound and they call for opposite
+# responses. A staging defect -- a buffer the wave failed to rewrite, a dtype
+# that stopped matching, a compiled graph specialized on the wrong shape --
+# is a step change: the divergence it produces has nothing to do with the
+# divergence numerics produce, and the original failure that motivated this
+# gate measured a likelihood error of 20.7 against a healthy 3e-3. Drift is
+# the opposite: the divergence is a function of how sharp the heads have
+# become, it grows monotonically as RL sharpens them, and it crosses the
+# bound by a hair. So the discriminator is a derivative, not a level, and the
+# comparison is against what this configuration measured one interval ago --
+# which is why the previous measurement is checkpointed rather than held in
+# process memory, where every restart would forget it.
+#
+# One consequence is worth stating outright because the naming hides it:
+# MAX_UPDATE_REPLAY_KL is the launch check and the warning line, not the
+# in-run abort line. A running process aborts at five times the previous
+# audit, so with the clone's 1.9e-3 the real abort line is 9.5e-3. The bound
+# is the fatal one only where there is no previous measurement -- a fresh run,
+# or a staging configuration this run has never exercised.
+#
+# Five, because the two populations are separated by orders of magnitude and
+# the factor only has to sit between them. On the drift side it cannot fire
+# by accident: sustained 5x growth per 25 iterations compounds to 5^20, about
+# 1e14, over a 500-iteration run, so no amount of real sharpening produces
+# it. On the defect side the step it has to clear is the difference between a
+# staging path that works and one that does not, which is not a factor of
+# five. Note that the baseline advances after every audit including a warned
+# one, so drift is always measured against recent drift and can never
+# accumulate into a false defect.
+#
+# The blind spot the factor opens is a window in *severity*, and it is worth
+# stating precisely because the tempting argument from extent is simply wrong.
+# A component enters the tail statistic only once it disagrees by more than
+# UPDATE_REPLAY_TAIL_LOGPROB, so a defect of any extent whatsoever is
+# tail-silent while its severity stays under that, and a gate cannot escalate
+# what it cannot see. That leaves arithmetic on the mean: a defect over a
+# share f at severity d adds f * k3(d), so it warns rather than aborts
+# whenever that lands between the bound and the step change, and the tail
+# stays blind to it throughout while d <= 2.5. Against the clone's 1.9e-3 the
+# smallest extent that reaches the band is f = 3.6e-4, some 530 components or
+# an eighth of one trajectory, and the windows are wide: one step index across
+# every trajectory warns silently from a 4.8x likelihood error to an 8.6x one,
+# one trajectory in three hundred and twenty from 3.1x to 5.1x.
+#
+# What makes that acceptable is where the abort line falls, not that the
+# window is empty. For every structural unit big enough to reach the band it
+# sits at 1.6 to 2.2 nats, and a staging path that is genuinely broken --
+# replaying one state's logits against another state's sampled action, on a
+# policy sharp enough to measure 1.9e-3 at all -- disagrees by far more than
+# that, which is also where the tail statistic starts seeing it. What fits
+# inside the window is the mild, uniform perturbation, which is a description
+# of numerics rather than of staging. And nothing in the band is silent: a
+# warned breach prints and lands in telemetry next to the abort line it was
+# judged against, so the run announces it within one interval.
+#
+# The band widens as the baseline drifts up, since the abort line is a
+# multiple of it -- at a baseline of 4e-3 a defect may add 16e-3 and still only
+# warn -- and that widening is what the ceiling below exists to stop. Up to the
+# ceiling it is the price of the drift tolerance this rule buys, and the two
+# genuinely cannot both be had: a gate aborts on every breach only where its
+# bound sits at least this factor above its own baseline. That is false of the
+# KL gate at 2.63 and true of the tail gate on every head -- 6.3x on the unit
+# head's measured 3.2e-5, and far wider on the two small heads, whose floors
+# are 3e-6 and 9e-6 -- so the unit head loses the property first, if its tail
+# floor ever passes 4e-5. Which head is soft, and by how much, is exactly what
+# the `_fatal_at` telemetry reports, so it is legible while a run is in
+# progress rather than afterwards.
+REPLAY_PARITY_STEP_CHANGE_FACTOR = 5.0
+# The audited heads, and the two statistics gated on each of them.
+#
+# Per head, not on the max over heads, and the difference is load-bearing. The
+# aggregate exists so a single-head defect cannot be diluted by the unit head,
+# which carries 1.45M of the 1.9M active components; baselining the aggregate
+# would hand that dilution straight back, because every head would then be
+# judged against the largest head's level. Measured healthy KL is 1.9e-3 on
+# the unit head against 8.0e-4 on the kind head, so a kind-head defect judged
+# against the aggregate is excused to 11.9x its own healthy level rather than
+# the 5x intended -- and a defect lifting kind to 8e-3 would warn, where
+# against its own head it is a 10x step and aborts.
+PARITY_COMPONENTS = ("unit", "kind", "quantity")
+PARITY_STATISTICS: tuple[tuple[str, float, str], ...] = (
+    ("kl", MAX_UPDATE_REPLAY_KL, "sampling-vs-update policy divergence exceeded"),
+    # The KL is a mean and a localized defect dilutes into it, so the share of
+    # materially disagreeing components is bounded separately.
+    (
+        "tail_fraction",
+        MAX_UPDATE_REPLAY_TAIL_FRACTION,
+        "sampling-vs-update materially divergent component share exceeded",
+    ),
+)
+PARITY_STAGING_KEYS = ("self-play", "league")
+
+
+def _parity_metric_key(component: str, statistic: str) -> str:
+    return f"update_replay_{component}_{statistic}"
+
+
+def _parity_staging_key(league_games: int) -> str:
+    """Name the staging configuration a wave exercises.
+
+    League play and pure self-play stage the rollout arena differently -- the
+    full arena, or the self-play prefix view of it -- so the audit *cadence*
+    tracks them separately. A cadence blind to the difference could audit
+    whichever one the interval landed on while never examining the other,
+    including the iteration where the league rows past the prefix are written
+    for the first time.
+    """
+    return PARITY_STAGING_KEYS[1] if league_games else PARITY_STAGING_KEYS[0]
+
+
+def _parity_audit_due(
+    last_audits: Mapping[str, int],
+    iteration: int,
+    staging: str,
+) -> bool:
+    """Decide whether this iteration re-runs the sampling-vs-update audit.
+
+    A configuration this process has not yet audited is always due, which is
+    what makes a resumed process audit its first iteration: a resume rebuilds
+    the compiled callables and restages every buffer, so it is exactly when a
+    staging bug appears.
+    """
+    previous = last_audits.get(staging)
+    return previous is None or iteration - previous >= REPLAY_PARITY_AUDIT_INTERVAL
+
+
+def _parity_headroom(measured: float, previous: float, ceiling: float) -> str:
+    """Describe how much room is left before this statistic becomes fatal.
+
+    Warned drift otherwise reads as a stream of identical lines, which says
+    that something is off but not whether it is settling or converging on the
+    ceiling. The distance is only meaningful in units of the growth producing
+    it, so it is reported as audits remaining at the rate the last two
+    measured: with r = measured / previous, r^n reaches the ceiling at
+    n = log(ceiling / measured) / log(r).
+
+    Two points make a noisy slope, so this is labelled as an observed rate
+    rather than offered as a prediction. Its purpose is a stop-at-a-checkpoint
+    decision taken while the run is still healthy, instead of the same decision
+    taken after the ceiling has already ended it. Recovery means a fresh run
+    warm-started from the last actor either way, so the choice worth informing
+    is when to take it, not whether.
+
+    Only ever called for a warned breach, which bounds the arithmetic: warning
+    requires measured <= factor * previous and measured > bound > 0, so
+    previous >= measured / factor > 0 and the ratio is well defined.
+    """
+    rate = measured / previous
+    if rate <= 1.0:
+        return "not climbing toward the ceiling at the last observed rate"
+    audits = math.log(ceiling / measured) / math.log(rate)
+    return f"about {audits:.1f} audits of headroom at the last observed rate"
+
+
+def _parity_ceilings() -> dict[str, float]:
+    """Return the absolute level at which each statistic is a defect regardless.
+
+    The step-change test alone cannot supply this. That test is a derivative,
+    so it says nothing about level: a value growing by less than the factor at
+    every audit is never fatal at any magnitude, and since the baseline
+    advances after every warned audit the accepted level ratchets upward. Nine
+    consecutive warned audits, 225 iterations at this cadence, take 1.9e-3 past
+    1e3. Without a ceiling MAX_UPDATE_REPLAY_KL stops being a bound on accepted
+    bias and becomes only the level at which warnings start.
+
+    The ceiling is one full step change past the calibrated bound, stated
+    purely in this gate's own terms: drift is tolerated up to the point where
+    the accumulated excess equals what a single audit would have had to jump to
+    be called a defect outright. Past that the drift story is no longer
+    credible however gradually it arrived, because the run has quietly
+    travelled the whole distance the step test exists to catch.
+
+    It deliberately imports nothing. An earlier version derived this from the
+    update's trust region -- std[d] = sqrt(2 * KL), so a parity KL of target_kl
+    would mean the uncorrected divergence had the same width as the divergence
+    the update allows and then corrects. The run telemetry falsifies that:
+    across four runs, including a full 500-iteration one at target_kl = 0.03,
+    realized approx_kl has a median of 2.3e-3 and a maximum of 5.4e-3, and the
+    worst single minibatch ever recorded is 2.2e-2. target_kl is a safety valve
+    the update never reaches, so a ceiling placed there would permit a std[d]
+    of 0.245 against a realized 0.068. Worse, the same argument applied
+    honestly to the realized movement puts the ceiling near 2.3e-3, *below*
+    MAX_UPDATE_REPLAY_KL -- so the coherence argument cannot select a level at
+    all. Deriving it from the step factor also keeps ceiling >= bound true by
+    construction, which is what makes _validate_parity_baseline's invariant
+    sound rather than merely true today: a ceiling under its own bound would
+    let a never-breaching measurement be persisted and then rejected on the
+    next resume, wedging the run at its first restart.
+
+    What that telemetry does establish, and what this file should not imply
+    otherwise: the healthy parity divergence is not negligible next to the
+    update's real movement. The clone measures 1.9e-3 against a realized 2.3e-3
+    per iteration -- the same number. The uncorrected divergence is already
+    about as wide as the corrected one at the healthy operating point, which is
+    why the bound is 5e-3 rather than anything looser, and why the drift
+    tolerance above is a tolerance for measurement spread, not for growth.
+
+    Unlike a step change, a ceiling breach is deliberately unrecoverable: a
+    resume re-measures the same level and dies again, and there is no flag to
+    raise the ceiling, because a gate whose last line can be waved through is a
+    warning. A step change is a staging defect, which a resume genuinely might
+    not reproduce; a run that has drifted a full step past its bound has
+    instead reached a numerics regime nothing here can correct for, and the
+    answer is a decision about the update forward -- fp32 rather than bf16 --
+    not another attempt at the same configuration. That decision edits the
+    tree, so the repaired run cannot resume these checkpoints; it warm-starts
+    from the last actor instead, which is what the abort tells the operator.
+    """
+    return {
+        statistic: REPLAY_PARITY_STEP_CHANGE_FACTOR * bound
+        for statistic, bound, _description in PARITY_STATISTICS
+    }
+
+
+def _parity_fatal_thresholds(
+    baseline: Mapping[str, float] | None,
+    ceilings: Mapping[str, float],
+) -> dict[str, float]:
+    """Report the value at which each gated statistic actually aborts.
+
+    Not the same number as the bound, which is why it belongs in telemetry
+    rather than in someone's head. With no baseline the bound is the abort
+    line; once a head has been measured the abort line floats up to the step
+    change above it, capped by the ceiling. A head whose bound sits less than
+    REPLAY_PARITY_STEP_CHANGE_FACTOR above its own baseline therefore has a
+    band in which a breach only warns -- the KL gate's normal condition -- and
+    plotting the measurement against this shows both that band and the rate it
+    is opening.
+    """
+    thresholds: dict[str, float] = {}
+    for component in PARITY_COMPONENTS:
+        for statistic, bound, _description in PARITY_STATISTICS:
+            key = _parity_metric_key(component, statistic)
+            previous = None if baseline is None else baseline.get(key)
+            step = (
+                bound
+                if previous is None
+                else max(bound, REPLAY_PARITY_STEP_CHANGE_FACTOR * previous)
+            )
+            thresholds[f"{key}_fatal_at"] = min(step, ceilings[statistic])
+    return thresholds
+
+
+def _parity_breaches(
+    metrics: Mapping[str, float | int],
+    baseline: Mapping[str, float] | None,
+    ceilings: Mapping[str, float],
+) -> list[tuple[str, bool]]:
+    """Report each breached parity bound, and whether it reads as a defect.
+
+    A bound that is not breached is not reported at all: the step-change test
+    only ever escalates a value that has already left the budget, so a jump
+    inside the budget is a number for telemetry rather than a failure.
+
+    A breach is a defect when it steps away from what this head last measured,
+    when it passes the absolute ceiling however gradually it got there, or when
+    there is no previous measurement to compare against -- the last covering a
+    fresh run's first audit, where the measurement is the launch check itself
+    and there is nothing yet to have drifted from. A non-finite measurement is
+    a defect too, and explicitly so: it fails every ordered comparison, so
+    without naming it the step-change test would silently read NaN as drift and
+    write it into the baseline.
+    """
+    breaches: list[tuple[str, bool]] = []
+    for component in PARITY_COMPONENTS:
+        for statistic, bound, description in PARITY_STATISTICS:
+            key = _parity_metric_key(component, statistic)
+            measured = float(metrics[key])
+            if math.isfinite(measured) and measured <= bound:
+                continue
+            message = f"{component} {description} {bound}: {measured}"
+            if not math.isfinite(measured):
+                breaches.append((message, True))
+                continue
+            previous = None if baseline is None else baseline.get(key)
+            if previous is None:
+                breaches.append((message, True))
+                continue
+            is_defect = (
+                measured > REPLAY_PARITY_STEP_CHANGE_FACTOR * previous
+                or measured > ceilings[statistic]
+            )
+            detail = f"previous audit {previous}, trend in {key}"
+            if not is_defect:
+                detail += f", {_parity_headroom(measured, previous, ceilings[statistic])}"
+            breaches.append((f"{message} ({detail})", is_defect))
+    return breaches
+
+
+def _parity_measurements(metrics: Mapping[str, float | int]) -> dict[str, float]:
+    """Extract the per-head values a later audit will be compared against."""
+    return {
+        _parity_metric_key(component, statistic): float(
+            metrics[_parity_metric_key(component, statistic)]
+        )
+        for component in PARITY_COMPONENTS
+        for statistic, _bound, _description in PARITY_STATISTICS
+    }
+
+
+def _validate_parity_baseline(
+    baseline: object,
+    ceilings: Mapping[str, float],
+) -> dict[str, float]:
+    """Validate the persisted previous audit, or return an empty baseline.
+
+    Bounded by the same ceilings the live gate enforces, because a measurement
+    above one can never have been persisted: the audit that produced it would
+    have aborted before any checkpoint was written. A value above the ceiling
+    in a checkpoint is therefore corruption, and accepting it would excuse
+    every breach below five times it.
+
+    That reasoning needs ceiling >= bound to hold, and it does only because
+    _parity_ceilings derives the ceiling as a multiple of the bound. A ceiling
+    below its bound would leave a window in which a measurement never breaches
+    -- _parity_breaches gates on the bound, and the ceiling only escalates an
+    already-breaching value -- yet is rejected here on the next resume, wedging
+    the run at its first restart over a value the gate itself called healthy.
+    """
+    if not isinstance(baseline, dict):
+        raise ValueError("resume checkpoint has no valid replay-parity baseline state")
+    if not baseline:
+        return {}
+    expected = {
+        _parity_metric_key(component, statistic)
+        for component in PARITY_COMPONENTS
+        for statistic, _bound, _description in PARITY_STATISTICS
+    }
+    if set(baseline) != expected:
+        raise ValueError("resume checkpoint replay-parity baseline is incomplete")
+    validated: dict[str, float] = {}
+    for key, measurement in baseline.items():
+        statistic = key.rsplit("update_replay_", 1)[1].split("_", 1)[1]
+        if type(measurement) is not float or not 0.0 <= measurement <= ceilings[statistic]:
+            raise ValueError("resume checkpoint has an invalid replay-parity measurement")
+        validated[key] = measurement
+    return validated
 
 
 def _validate_league_score_rates(rates: object) -> dict[int, float]:
@@ -525,7 +887,8 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "opponent_temperature": args.opponent_temperature,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
-        "compile_models": args.compile_models,
+        "compile_rollout": args.compile_rollout,
+        "compile_update": args.compile_update,
         "device_type": device.type,
         "device_index": (
             torch.cuda.current_device()
@@ -635,6 +998,32 @@ def _restore_league_archive(
             raise ValueError(f"league snapshot digest mismatch: {target}")
 
 
+def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: bool) -> None:
+    """Stop the run on an update whose numbers say the next one is wasted.
+
+    Ordered by cause, not by severity. An inflated first-minibatch KL at
+    unchanged weights trips the trust region on minibatch zero, so checking the
+    update count first would report the symptom; and a saturated value target
+    explains a missing actor update rather than the other way round.
+    """
+    first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
+    if first_minibatch_kl > MAX_FIRST_MINIBATCH_KL:
+        raise RuntimeError(
+            "first-minibatch KL at unchanged weights exceeded "
+            f"{MAX_FIRST_MINIBATCH_KL}: {first_minibatch_kl}"
+        )
+    # A target the support cannot hold is regressed onto a constant edge label,
+    # which then holds the critic where it is. A few are ordinary critic error.
+    saturated_fraction = float(update_metrics["value_target_saturated_fraction"])
+    if saturated_fraction > MAX_VALUE_TARGET_SATURATED_FRACTION:
+        raise RuntimeError(
+            "value targets saturated the critic support beyond "
+            f"{MAX_VALUE_TARGET_SATURATED_FRACTION}: {saturated_fraction}"
+        )
+    if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
+        raise RuntimeError("PPO iteration completed without an actor update")
+
+
 def main() -> None:
     args = parse_args()
     _validate_args(args)
@@ -653,8 +1042,9 @@ def main() -> None:
         current_source_identity,
         bind_command=args.resume is None,
     )
-    if run_provenance is not None and (
-        run_provenance["calibration"]["compile_models"] is not args.compile_models
+    if run_provenance is not None and any(
+        run_provenance["calibration"][knob] is not getattr(args, knob)
+        for knob in ("compile_rollout", "compile_update")
     ):
         raise ValueError("training compile mode does not match calibration run provenance")
     device = _device(args.device)
@@ -668,7 +1058,7 @@ def main() -> None:
 
     architecture = resolve_architecture(args.architecture)
     model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
-    vapo_config = VapoConfig(
+    ppo_config = PpoConfig(
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
         lr_warmup_steps=args.lr_warmup_steps,
@@ -683,12 +1073,16 @@ def main() -> None:
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
-        compile_update=args.compile_models,
+        compile_update=args.compile_update,
     )
     training_data_config = _training_data_config(args, device)
+    # Derived from the configured trust region rather than fixed, because that
+    # is what the ceiling means: the level at which the uncorrected parity
+    # divergence matches the divergence this run's update deliberately allows.
+    parity_ceilings = _parity_ceilings()
     actor = architecture.actor_class(model_config).to(device)
     critic = architecture.critic_class(model_config).to(device)
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
     initial_actor_provenance = None
     critic_warmup_iterations = 0
     if args.init_actor_from is not None:
@@ -714,16 +1108,17 @@ def main() -> None:
             critic_optimizer,
             device=device,
         )
-        if resume_payload["vapo_config"] != asdict(vapo_config):
-            raise ValueError("resume checkpoint VAPO configuration does not match arguments")
+        if resume_payload["ppo_config"] != asdict(ppo_config):
+            raise ValueError("resume checkpoint PPO configuration does not match arguments")
         if resume_payload.get("training_data_config") != training_data_config:
             raise ValueError(
                 "resume checkpoint data-generation configuration does not match arguments"
             )
         require_source_identity(resume_payload.get("source_identity"))
         checkpoint_run_provenance = validate_run_provenance(resume_payload.get("run_provenance"))
-        if checkpoint_run_provenance is not None and (
-            checkpoint_run_provenance["calibration"]["compile_models"] is not args.compile_models
+        if checkpoint_run_provenance is not None and any(
+            checkpoint_run_provenance["calibration"][knob] is not getattr(args, knob)
+            for knob in ("compile_rollout", "compile_update")
         ):
             raise ValueError("resume checkpoint compile mode does not match calibration")
         if run_provenance is None:
@@ -766,12 +1161,38 @@ def main() -> None:
     # estimates, so a resume that reset them would diverge from the
     # uninterrupted run's entire downstream RNG stream.
     league_score_rates: dict[int, float] = {}
+    # The most recent audit's per-head measurements, which is what a later
+    # breach is judged a defect or drift against. Persisted because the
+    # judgement is a comparison across audits, and a run long enough to drift
+    # is a run long enough to be restarted -- --max-hours makes chunked
+    # restarts the designed operating mode -- so a process-scoped baseline
+    # would make the first audit after every restart a fresh launch check and
+    # abort a run that had merely drifted. It carries no version tag because it
+    # does not need one: a resume already requires the checkpoint's source
+    # identity to equal the tree exactly, so a baseline can never be read back
+    # under constants that changed what it measured.
+    #
+    # One baseline, not one per staging configuration, even though the cadence
+    # is per configuration. What it tracks is a property of how sharp the heads
+    # have become, which the two configurations share -- they audit the same
+    # actor over largely the same states, differing only in which opponents
+    # generated them. Keying it per configuration would mean a configuration
+    # that lapses for hundreds of iterations gets compared against its own
+    # stale measurement from a much less sharpened policy, which is a step
+    # change of thousands and a dead run. A level difference between the two
+    # configurations that is large enough to trip the factor is not noise to be
+    # tolerated anyway; it is one of them staging differently from the other,
+    # which is the defect this whole audit exists to find.
+    parity_baseline: dict[str, float] = {}
     if resume_payload is not None:
         league_snapshot_manifest = _validate_league_manifest(
             resume_payload.get("league_snapshot_manifest"),
             current_iteration=iteration,
         )
         league_score_rates = _validate_league_score_rates(resume_payload.get("league_score_rates"))
+        parity_baseline = _validate_parity_baseline(
+            resume_payload.get("replay_parity_baseline"), parity_ceilings
+        )
         _restore_league_archive(
             checkpoint=args.resume,
             destination=league_directory,
@@ -786,11 +1207,14 @@ def main() -> None:
         "arguments": serialized_arguments,
         "architecture": architecture.name,
         "model": model_config.to_dict(),
-        "vapo": asdict(vapo_config),
+        "ppo": asdict(ppo_config),
         "actor_parameters": parameter_count(actor),
         "critic_parameters": parameter_count(critic),
         "device": str(device),
         "torch_version": torch.__version__,
+        # torch is pinned by uv.lock, which source_identity hashes; the Rust
+        # toolchain is pinned by nothing, so it is recorded to be comparable.
+        "native_toolchain": toolchain_identity(),
         "source_identity": current_source_identity,
         "run_provenance": run_provenance,
         "initial_actor": initial_actor_provenance,
@@ -818,7 +1242,7 @@ def main() -> None:
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
                 model_config=model_config,
-                vapo_config=vapo_config,
+                ppo_config=ppo_config,
                 iteration=iteration,
                 next_seed=next_seed,
                 metrics=resume_payload["metrics"],
@@ -826,6 +1250,7 @@ def main() -> None:
                 training_data_config=training_data_config,
                 league_snapshot_manifest=league_snapshot_manifest,
                 league_score_rates=league_score_rates,
+                replay_parity_baseline=dict(parity_baseline),
                 source_identity=current_source_identity,
                 run_provenance=run_provenance,
                 initial_actor=initial_actor_provenance,
@@ -851,7 +1276,7 @@ def main() -> None:
                     actor_optimizer=actor_optimizer,
                     critic_optimizer=critic_optimizer,
                     model_config=model_config,
-                    vapo_config=vapo_config,
+                    ppo_config=ppo_config,
                     iteration=iteration,
                     next_seed=next_seed,
                     metrics=resume_payload["metrics"],
@@ -859,6 +1284,7 @@ def main() -> None:
                     training_data_config=training_data_config,
                     league_snapshot_manifest=league_snapshot_manifest,
                     league_score_rates=league_score_rates,
+                    replay_parity_baseline=dict(parity_baseline),
                     source_identity=current_source_identity,
                     run_provenance=run_provenance,
                     initial_actor=initial_actor_provenance,
@@ -924,7 +1350,7 @@ def main() -> None:
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
             model_config=model_config,
-            vapo_config=vapo_config,
+            ppo_config=ppo_config,
             iteration=0,
             next_seed=next_seed,
             metrics={"iteration": 0},
@@ -932,12 +1358,17 @@ def main() -> None:
             training_data_config=training_data_config,
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=league_score_rates,
+            replay_parity_baseline=dict(parity_baseline),
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
         )
 
-    replay_parity_audited = False
+    # Iteration of the most recent audit per staging configuration. Deliberately
+    # process-scoped rather than checkpointed: a resume rebuilds the compiled
+    # callables and restages every buffer, so it should audit its first
+    # iteration rather than wait out the cadence.
+    last_parity_audit: dict[str, int] = {}
     external_eval_process: subprocess.Popen | None = None
     while iteration < args.iterations:
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
@@ -990,7 +1421,7 @@ def main() -> None:
             opponent_temperatures=opponent_temperatures if league_games else None,
             deterministic_opponents=deterministic_opponents if league_games else None,
             sampling_seed=sampling_seed,
-            compile_models=args.compile_models,
+            compile_models=args.compile_rollout,
             storage=rollout_arena if league_games else self_play_storage,
         )
         next_seed += args.games + league_games
@@ -1020,50 +1451,94 @@ def main() -> None:
         # likelihoods through its own forward, so a staging bug applied
         # identically to both update-path sides would never move the KL guard.
         # Comparing that replay against the rollout's stored sampling
-        # likelihoods once per process catches exactly that class of bug; the
-        # bound is the measured bf16 noise floor with ~2x headroom.
+        # likelihoods catches exactly that class of bug. The bound is a KL
+        # against the trust region the update already accepts, not a worst
+        # component: see MAX_UPDATE_REPLAY_KL for why the extreme value is
+        # reported but not gated.
+        #
+        # A breach aborts only when it reads as a defect rather than as drift,
+        # and REPLAY_PARITY_STEP_CHANGE_FACTOR is where that distinction is
+        # argued. The asymmetry matters because aborting is unrecoverable: the
+        # audit precedes the update, so no checkpoint covers the iteration, and
+        # a resume re-audits the same actor through the same code and dies
+        # again. That is the correct outcome for a defect, which a human has to
+        # go fix, and the wrong one for numerics drifting past a calibrated
+        # bound in an otherwise healthy multi-day run -- which warns instead,
+        # and leaves the trend in telemetry where it is the useful artifact.
         replay_parity_metrics: dict[str, float | int] = {}
-        if not replay_parity_audited:
+        audited_staging = _parity_staging_key(league_games)
+        if _parity_audit_due(last_parity_audit, iteration, audited_staging):
             replay_parity_metrics = update_replay_parity(
                 actor,
                 rollout,
-                minibatch_size=vapo_config.minibatch_size,
-                compile_model=vapo_config.compile_update,
-                autocast_enabled=vapo_config.use_bfloat16 and device.type == "cuda",
+                minibatch_size=ppo_config.minibatch_size,
+                compile_model=ppo_config.compile_update,
+                autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
             )
-            parity_error = float(replay_parity_metrics["update_replay_max_ratio_error"])
-            if parity_error > MAX_UPDATE_REPLAY_RATIO_ERROR:
-                raise RuntimeError(
-                    "sampling-vs-update likelihood divergence exceeded "
-                    f"{MAX_UPDATE_REPLAY_RATIO_ERROR}: {parity_error}"
+            # A head with no active components reports zero divergence, which
+            # would pass the bound without having audited anything. The
+            # calibration benchmark already refuses that; training must too,
+            # or an audit can pass while having examined nothing. This one is
+            # always fatal: it means the audit examined nothing, at any point
+            # in the run, which is never expected drift.
+            for component in PARITY_COMPONENTS:
+                if replay_parity_metrics[f"update_replay_{component}_active_count"] < 1:
+                    raise RuntimeError(f"update replay parity saw no active {component} components")
+            breaches = _parity_breaches(
+                replay_parity_metrics, parity_baseline or None, parity_ceilings
+            )
+            replay_parity_metrics["replay_parity_breached"] = len(breaches)
+            replay_parity_metrics.update(
+                _parity_fatal_thresholds(parity_baseline or None, parity_ceilings)
+            )
+            for message, is_defect in breaches:
+                if is_defect:
+                    continue
+                # The journalled metrics carry iteration + 1, since the counter
+                # advances before the record is written, so the warning names
+                # the row it will appear in rather than the loop variable.
+                print(
+                    f"warning: iteration {iteration + 1} {message} — this is "
+                    f"within {REPLAY_PARITY_STEP_CHANGE_FACTOR}x of the previous "
+                    "audit and under the absolute ceiling, so it reads as drift "
+                    "rather than a defect and the run continues",
+                    file=sys.stderr,
+                    flush=True,
                 )
-            replay_parity_audited = True
+            # The baseline advances after every audit, warned breaches
+            # included, so drift is always compared against recent drift and
+            # can never accumulate into a false step change. The ceiling is
+            # what stops that from ratcheting without limit.
+            parity_baseline = _parity_measurements(replay_parity_metrics)
+            last_parity_audit[audited_staging] = iteration
+            defects = [message for message, is_defect in breaches if is_defect]
+            if defects:
+                raise RuntimeError(
+                    "; ".join(defects)
+                    + " — a step change away from the previous audit, or past the "
+                    "absolute ceiling, rather than drift; resuming reproduces it. "
+                    "A step change is a staging defect worth diagnosing directly; "
+                    "a ceiling breach means the update forward's numerics no "
+                    "longer support this bound, and the run continues as a fresh "
+                    "one warm-started from the last actor under the repaired tree, "
+                    "since repairing it changes the source identity these "
+                    "checkpoints are bound to"
+                )
         update_started = time.monotonic()
         # Critic-first warm start: a freshly initialized critic must fit
         # before its advantages may push a pretrained actor.
         warmup_active = iteration < critic_warmup_iterations
-        update_metrics = update_vapo(
+        update_metrics = update_ppo(
             actor,
             critic,
             actor_optimizer,
             critic_optimizer,
             rollout,
-            vapo_config,
+            ppo_config,
             generator=generator,
             actor_epochs=0 if warmup_active else None,
         )
-        # An inflated first-minibatch KL at unchanged weights means the
-        # behavior replay and the minibatch forward disagree beyond numerics;
-        # gate it before the update count so the cause is reported, not the
-        # tripped trust region it produces.
-        first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
-        if first_minibatch_kl > MAX_FIRST_MINIBATCH_KL:
-            raise RuntimeError(
-                "first-minibatch KL at unchanged weights exceeded "
-                f"{MAX_FIRST_MINIBATCH_KL}: {first_minibatch_kl}"
-            )
-        if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
-            raise RuntimeError("VAPO iteration completed without an actor update")
+        _gate_update_metrics(update_metrics, warmup_active=warmup_active)
         update_seconds = time.monotonic() - update_started
         iteration += 1
         metrics = {
@@ -1075,9 +1550,9 @@ def main() -> None:
             "critic_replayed_states_per_second": (
                 rollout.state_count
                 * (
-                    vapo_config.epochs
-                    if vapo_config.critic_epochs is None
-                    else vapo_config.critic_epochs
+                    ppo_config.epochs
+                    if ppo_config.critic_epochs is None
+                    else ppo_config.critic_epochs
                 )
                 / max(update_seconds, 1e-9)
             ),
@@ -1102,7 +1577,7 @@ def main() -> None:
             actor_optimizer_state=cpu_state_copy(actor_optimizer.state_dict()),
             critic_optimizer_state=cpu_state_copy(critic_optimizer.state_dict()),
             model_config=model_config,
-            vapo_config=vapo_config,
+            ppo_config=ppo_config,
             iteration=iteration,
             next_seed=next_seed,
             metrics=metrics,
@@ -1115,6 +1590,9 @@ def main() -> None:
             # Snapshot the estimates: the commit serializes on a worker
             # thread while the next iteration's blend mutates the live dict.
             league_score_rates=dict(league_score_rates),
+            # Snapshot for the same reason: the audit at the next interval
+            # replaces this configuration's entry while the commit serializes.
+            replay_parity_baseline=dict(parity_baseline),
             initial_actor=initial_actor_provenance,
         )
         if pending_commit is not None:

@@ -32,7 +32,7 @@ PACKAGE_FILES = (
     "structured.py",
     "tokens.py",
 )
-MAIN = '''"""Kaggriculture VAPO submission entrypoint."""
+MAIN = '''"""Kaggriculture PPO submission entrypoint."""
 from pathlib import Path
 
 import kaggriculture

@@ -94,11 +94,11 @@ an accelerant for the post-BC RL fine-tune, not as the headline fix.
    minibatch's episodes. Transitions whose successor falls outside the
    minibatch are supervised in a second gather against latents computed under
    no_grad — the stop-gradient target needs no fresh graph.
-5. **Objective**: add `latent_dynamics_coefficient` to `VapoConfig`
+5. **Objective**: add `latent_dynamics_coefficient` to `PpoConfig`
    (0.0 = term absent). Add the term to the actor loss only; the critic
    tower stays untouched. p_psi parameters join the actor optimizer.
 6. **Evidence gate** (per machine-learning skill, no smoke runs):
-   - `benchmark_vapo_iteration` before/after: accept <= 3% throughput cost.
+   - `benchmark_ppo_iteration` before/after: accept <= 3% throughput cost.
    - Full calibration A/B at production config: the auxiliary must not
      degrade money_mean progression at matched wall-clock; success criterion
      is a measurable improvement in early-phase sample efficiency

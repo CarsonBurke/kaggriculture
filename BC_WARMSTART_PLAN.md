@@ -4,7 +4,7 @@ Status: design (no implementation yet). Owner: training pipeline.
 
 ## Why
 
-Self-play VAPO from scratch has converged to a local optimum around 34-36k
+Self-play PPO from scratch has converged to a local optimum around 34-36k
 money that exploits none of the game's compounding subsystems. Measured
 evidence (iteration ~95-346 of run `vapo-lv2-20260813`):
 
@@ -85,10 +85,10 @@ New script `scripts/train_bc.py`, queued through `mlq`:
 
 - Forward the standard `FarmActor`; compute per-component masked
   log-probabilities with the existing `component_selected_logprobs`
-  machinery (same masking semantics as VAPO replay — no new code path).
+  machinery (same masking semantics as PPO replay — no new code path).
 - Loss: negative mean log-likelihood over active components (unit
   components where `unit_active`, market kind slots reached, quantity
-  slots for quantified kinds), i.e. exactly the factored likelihood VAPO
+  slots for quantified kinds), i.e. exactly the factored likelihood PPO
   optimizes, with demonstration actions substituted. AdamW, cosine decay,
   early stop on held-out episode NLL (hold out whole episodes, not steps —
   steps within an episode are nearly duplicates across the dataset).
@@ -108,7 +108,7 @@ New script `scripts/train_bc.py`, queued through `mlq`:
 2. Critic-first fitting: for the first ~10-20 iterations run rollouts and
    critic-only updates so the actor is not pushed by advantages from an
    unfit critic. This reuses the `critic_epochs` split in
-   `update_vapo` — one small extension (allow actor participation in zero
+   `update_ppo` — one small extension (allow actor participation in zero
    epochs for a configured warmup) rather than a new code path. The
    existing `target_kl` gate then governs the transition, no LR hacks.
 3. League: seed the frozen-opponent archive with the BC snapshot so the

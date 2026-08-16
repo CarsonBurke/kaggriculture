@@ -7,8 +7,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from kaggriculture.model import ModelConfig
+from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import repository_root
-from kaggriculture.vapo import VapoConfig
 
 PRODUCTION_SELF_PLAY_GAMES = 112
 PRODUCTION_LEAGUE_GAMES = 96
@@ -31,14 +31,14 @@ def production_model_config() -> dict[str, int | float]:
     return ModelConfig().to_dict()
 
 
-def production_vapo_config(*, compiled: bool) -> dict[str, int | float | bool]:
+def production_ppo_config(*, compile_update: bool) -> dict[str, int | float | bool]:
     return asdict(
-        VapoConfig(
+        PpoConfig(
             epochs=1,
             critic_epochs=4,
             minibatch_size=2048,
             target_kl=0.03,
-            compile_update=compiled,
+            compile_update=compile_update,
         )
     )
 
@@ -47,7 +47,7 @@ def require_repository_launcher(script_file: Path) -> None:
     """Reject launchers running outside the tree that provides kaggriculture.
 
     A launcher script from one checkout combined with an importable package
-    from another would exec that other tree's train_vapo.py while stamping its
+    from another would exec that other tree's train_ppo.py while stamping its
     source identity — silently launching foreign code.  Both trees must agree.
     """
     expected = repository_root() / "scripts"
@@ -75,18 +75,19 @@ def build_training_command(
     iterations: int,
     max_hours: float,
     seed: int,
-    compile_models: bool,
+    compile_rollout: bool,
+    compile_update: bool,
     expected_source_digest: str | None = None,
     calibration_decision: Path | None = None,
     resume_checkpoint: Path | None = None,
     initial_actor: Path | None = None,
     critic_warmup_iterations: int | None = None,
 ) -> list[str]:
-    """Build the exact production train_vapo.py invocation."""
+    """Build the exact production train_ppo.py invocation."""
     if (expected_source_digest is None) != (calibration_decision is None):
         raise ValueError("source digest and calibration decision must be provided together")
     # A warm start initializes iteration zero; a resume continues a run that
-    # already has an actor. train_vapo rejects the pair, and it must fail here
+    # already has an actor. train_ppo rejects the pair, and it must fail here
     # rather than after the launcher has already rewritten the run's evidence.
     if initial_actor is not None and resume_checkpoint is not None:
         raise ValueError("a resumed run already has an actor; --init-actor-from initializes one")
@@ -95,10 +96,10 @@ def build_training_command(
     if critic_warmup_iterations is not None and not 0 < critic_warmup_iterations < iterations:
         raise ValueError("critic warmup must be positive and leave iterations for the actor")
     model = production_model_config()
-    vapo = production_vapo_config(compiled=compile_models)
+    ppo = production_ppo_config(compile_update=compile_update)
     command = [
         sys.executable,
-        str(repository_root() / "scripts" / "train_vapo.py"),
+        str(repository_root() / "scripts" / "train_ppo.py"),
         "--run-dir",
         str(run_directory),
         "--iterations",
@@ -158,35 +159,37 @@ def build_training_command(
             "--quantity-rank",
             str(model["quantity_rank"]),
             "--actor-lr",
-            str(vapo["actor_learning_rate"]),
+            str(ppo["actor_learning_rate"]),
             "--critic-lr",
-            str(vapo["critic_learning_rate"]),
+            str(ppo["critic_learning_rate"]),
             "--lr-warmup-steps",
-            str(vapo["lr_warmup_steps"]),
+            str(ppo["lr_warmup_steps"]),
             "--weight-decay",
-            str(vapo["weight_decay"]),
+            str(ppo["weight_decay"]),
             "--epochs",
-            str(vapo["epochs"]),
+            str(ppo["epochs"]),
             "--critic-epochs",
-            str(vapo["critic_epochs"]),
+            str(ppo["critic_epochs"]),
             "--minibatch-size",
-            str(vapo["minibatch_size"]),
+            str(ppo["minibatch_size"]),
             "--clip-low",
-            str(vapo["clip_low"]),
+            str(ppo["clip_low"]),
             "--clip-high",
-            str(vapo["clip_high"]),
+            str(ppo["clip_high"]),
             "--gamma",
-            str(vapo["gamma"]),
+            str(ppo["gamma"]),
             "--actor-gae-lambda",
-            str(vapo["actor_gae_lambda"]),
+            str(ppo["actor_gae_lambda"]),
             "--target-kl",
-            str(vapo["target_kl"]),
+            str(ppo["target_kl"]),
             "--max-gradient-norm",
-            str(vapo["max_gradient_norm"]),
+            str(ppo["max_gradient_norm"]),
         )
     )
-    if compile_models:
-        command.append("--compile-models")
+    if compile_rollout:
+        command.append("--compile-rollout")
+    if compile_update:
+        command.append("--compile-update")
     if initial_actor is not None:
         command.extend(("--init-actor-from", str(initial_actor)))
         if critic_warmup_iterations is not None:

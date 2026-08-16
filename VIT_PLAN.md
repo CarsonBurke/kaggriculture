@@ -22,7 +22,7 @@ The model should:
   unrelated coordinates;
 - align products, inventories, prices, crops, units, and actions semantically;
 - model local geometry and global economic interactions;
-- support the exact masked categorical likelihoods required by VAPO;
+- support the exact masked categorical likelihoods required by PPO;
 - improve deterministic deployed play, not merely sampled self-play behavior;
 - remain practical for 719 actor calls per game, batched self-play, CPU submission
   inference, checkpointing, and frozen-league evaluation;
@@ -65,7 +65,7 @@ Relevant implementation:
 - `src/kaggriculture/model.py`
 - `src/kaggriculture/policy.py`
 - `src/kaggriculture/rollout.py`
-- `src/kaggriculture/vapo.py`
+- `src/kaggriculture/ppo.py`
 
 ### Misaligned inductive biases
 
@@ -556,7 +556,7 @@ Likely modules affected:
 - `src/kaggriculture/policy.py`: new output contracts and conditional sampling;
 - `src/kaggriculture/rollout.py`: storage, compiled rollout, cached decoding, and
   recurrent state;
-- `src/kaggriculture/vapo.py`: replay, conditional likelihoods, possible ratio
+- `src/kaggriculture/ppo.py`: replay, conditional likelihoods, possible ratio
   grouping, and sequence minibatches;
 - `src/kaggriculture/inference.py`: architecture registry, new artifact format, and
   eventual recurrent state;

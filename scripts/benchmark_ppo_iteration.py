@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark one complete native rollout plus VAPO replay at realistic batch sizes."""
+"""Benchmark one complete native rollout plus PPO replay at realistic batch sizes."""
 
 from __future__ import annotations
 
@@ -22,6 +22,17 @@ import torch._dynamo
 
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.ppo import (
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_KL,
+    MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    MAX_VALUE_TARGET_SATURATED_FRACTION,
+    UPDATE_REPLAY_TAIL_LOGPROB,
+    PpoConfig,
+    make_optimizers,
+    update_ppo,
+    update_replay_parity,
+)
 from kaggriculture.production import (
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
@@ -29,7 +40,7 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
     PRODUCTION_OPPONENT_TEMPERATURE,
     PRODUCTION_TEMPERATURE,
-    production_vapo_config,
+    production_ppo_config,
 )
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
@@ -43,14 +54,6 @@ from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredConfig
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
-from kaggriculture.vapo import (
-    MAX_FIRST_MINIBATCH_KL,
-    MAX_UPDATE_REPLAY_RATIO_ERROR,
-    VapoConfig,
-    make_optimizers,
-    update_replay_parity,
-    update_vapo,
-)
 
 _REPORT_PATH: Path | None = None
 _REPORT_LINES: list[str] = []
@@ -61,7 +64,7 @@ _REPORT_TENSORBOARD_DIR: Path | None = None
 # matches production exactly, so every default derives from the shared source.
 # The model is the exception only in form: production_model_config() *is* the
 # conv dataclass defaults, which is what an unflagged entity-cnn run builds.
-_PRODUCTION_VAPO = production_vapo_config(compiled=False)
+_PRODUCTION_PPO = production_ppo_config(compile_update=False)
 _PRODUCTION_LEAGUE_OPPONENTS = (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS
 )
@@ -147,7 +150,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repeats",
         type=int,
-        default=2,
+        default=6,
+        # Six, not two, because the calibration launcher requires six and the
+        # default should produce a report it accepts. Two drops the cold start
+        # and leaves a single steady iteration, so every "median" downstream is
+        # one sample, and one clock-boost dip can decide a knob for a
+        # 500-iteration run.
         help="full rollout+update iterations per size; first is cold, later repeats are steady",
     )
     parser.add_argument("--seed", type=int, default=20260812)
@@ -162,29 +170,40 @@ def parse_args() -> argparse.Namespace:
         "entity-cnn run is valid calibration evidence",
     )
     add_model_config_arguments(parser)
-    parser.add_argument("--epochs", type=int, default=_PRODUCTION_VAPO["epochs"])
+    parser.add_argument("--epochs", type=int, default=_PRODUCTION_PPO["epochs"])
     parser.add_argument(
         "--critic-epochs",
         type=int,
-        default=_PRODUCTION_VAPO["critic_epochs"],
+        default=_PRODUCTION_PPO["critic_epochs"],
         help="total critic epochs (>= --epochs); the actor trains only in the first --epochs",
     )
-    parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_VAPO["minibatch_size"])
+    parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
     parser.add_argument(
         "--opponent-temperature", type=float, default=PRODUCTION_OPPONENT_TEMPERATURE
     )
-    parser.add_argument("--target-kl", type=float, default=_PRODUCTION_VAPO["target_kl"])
+    parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
     parser.add_argument(
-        "--max-update-replay-error",
+        "--max-update-replay-kl",
         type=float,
-        default=MAX_UPDATE_REPLAY_RATIO_ERROR,
+        default=MAX_UPDATE_REPLAY_KL,
         help=(
-            "maximum likelihood-ratio divergence between the rollout sampling "
-            "path and the update-path behavior replay; this bounds off-policy "
-            "sampling bias (the importance ratio itself starts at one via "
-            "replay_behavior_logprobs), so its budget is a fraction of the "
-            "clip band sitting above the measured ~2.4e-2 bf16 noise floor"
+            "maximum KL divergence between the rollout sampling path and the "
+            "update-path behavior replay; this bounds off-policy sampling bias "
+            "(the importance ratio itself starts at one via "
+            "replay_behavior_logprobs), so its budget is a small fraction of "
+            "the per-iteration trust region --target-kl already allows"
+        ),
+    )
+    parser.add_argument(
+        "--max-update-replay-tail-fraction",
+        type=float,
+        default=MAX_UPDATE_REPLAY_TAIL_FRACTION,
+        help=(
+            "maximum share of sampled action components whose sampling-path and "
+            f"update-path likelihoods disagree by more than {UPDATE_REPLAY_TAIL_LOGPROB} "
+            "nats; this extends the mean KL's reach to localized staging defects "
+            "too small in extent for it to notice"
         ),
     )
     parser.add_argument(
@@ -199,7 +218,27 @@ def parse_args() -> argparse.Namespace:
             "construction"
         ),
     )
-    parser.add_argument("--compile-models", action="store_true")
+    parser.add_argument(
+        "--max-value-target-saturated-fraction",
+        type=float,
+        default=MAX_VALUE_TARGET_SATURATED_FRACTION,
+        help=(
+            "maximum share of value targets the critic support may saturate; "
+            "the lambda-return adds the critic's own prediction to the reward, "
+            "so no support width contains it and this gates the degenerate end "
+            "where the critic has collapsed onto the outermost atom"
+        ),
+    )
+    # Two knobs, not one. The rollout collector and the update share the model
+    # weights and nothing else: the collector captures a `cudagraphs` inference
+    # graph, the update compiles its own forward and backward, and a device
+    # synchronization separates the phases so their timings add exactly. Both
+    # are measured here against the same eager baseline because the answers
+    # differ in sign -- on the conv model compilation is a large win on the
+    # update and a large loss on the rollout, and a single flag would force the
+    # losing phase to ride along with the winning one.
+    parser.add_argument("--compile-rollout", action="store_true")
+    parser.add_argument("--compile-update", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tensorboard-dir", type=Path)
@@ -297,6 +336,40 @@ def _completion_record(game_counts: list[int], repeats: int) -> dict[str, object
     }
 
 
+#: Each gate override, paired with the shipped constant that ceilings it.
+_NUMERICS_GATES: tuple[tuple[str, str, float], ...] = (
+    ("--max-update-replay-kl", "max_update_replay_kl", MAX_UPDATE_REPLAY_KL),
+    (
+        "--max-update-replay-tail-fraction",
+        "max_update_replay_tail_fraction",
+        MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    ),
+    ("--max-first-minibatch-kl", "max_first_minibatch_kl", MAX_FIRST_MINIBATCH_KL),
+    (
+        "--max-value-target-saturated-fraction",
+        "max_value_target_saturated_fraction",
+        MAX_VALUE_TARGET_SATURATED_FRACTION,
+    ),
+)
+
+
+def _validate_numerics_gates(args: argparse.Namespace) -> None:
+    """Allow an override to tighten a gate, never to loosen it past training.
+
+    The ceiling is the shipped constant itself rather than a number written
+    beside it. A hardcoded ceiling goes stale silently and in the worse
+    direction: this one sat at 1e-3 against a 1e-4 constant, so recalibrating
+    the constant against a behavior-cloned actor -- which diverges four orders
+    of magnitude further than the random init the original came from -- turned
+    every calibration benchmark into an argument-parsing failure citing a limit
+    nothing in the tree enforced any more.
+    """
+    for flag, attribute, ceiling in _NUMERICS_GATES:
+        value = getattr(args, attribute)
+        if not math.isfinite(value) or value <= 0.0 or value > ceiling:
+            raise ValueError(f"{flag} must be finite, positive, and at most {ceiling}")
+
+
 def main() -> None:
     args = parse_args()
     _configure_report(args.output, args.tensorboard_dir)
@@ -323,19 +396,8 @@ def main() -> None:
     ):
         raise ValueError("temperatures must be finite and positive")
     if args.temperature != 1.0:
-        raise ValueError("on-policy VAPO benchmarking requires --temperature 1.0")
-    if (
-        not math.isfinite(args.max_update_replay_error)
-        or args.max_update_replay_error <= 0.0
-        or args.max_update_replay_error > 1e-1
-    ):
-        raise ValueError("--max-update-replay-error must be finite, positive, and at most 1e-1")
-    if (
-        not math.isfinite(args.max_first_minibatch_kl)
-        or args.max_first_minibatch_kl <= 0.0
-        or args.max_first_minibatch_kl > 1e-3
-    ):
-        raise ValueError("--max-first-minibatch-kl must be finite, positive, and at most 1e-3")
+        raise ValueError("on-policy PPO benchmarking requires --temperature 1.0")
+    _validate_numerics_gates(args)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -345,13 +407,13 @@ def main() -> None:
 
     architecture = resolve_architecture(args.architecture)
     model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
-    vapo_config = VapoConfig(
+    ppo_config = PpoConfig(
         epochs=args.epochs,
         critic_epochs=args.critic_epochs,
         minibatch_size=args.minibatch_size,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
-        compile_update=args.compile_models,
+        compile_update=args.compile_update,
     )
     identity = source_identity()
     emit(
@@ -377,16 +439,18 @@ def main() -> None:
             "source_identity": identity,
             "temperature": args.temperature,
             "opponent_temperature": args.opponent_temperature,
-            "max_update_replay_error": args.max_update_replay_error,
+            "max_update_replay_kl": args.max_update_replay_kl,
+            "max_update_replay_tail_fraction": args.max_update_replay_tail_fraction,
             "max_first_minibatch_kl": args.max_first_minibatch_kl,
+            "max_value_target_saturated_fraction": args.max_value_target_saturated_fraction,
             "precision": {
-                "use_bfloat16": vapo_config.use_bfloat16,
+                "use_bfloat16": ppo_config.use_bfloat16,
                 "float32_matmul_precision": torch.get_float32_matmul_precision(),
                 "cudnn_benchmark": torch.backends.cudnn.benchmark,
             },
             "model": model_config.to_dict(),
-            "vapo": asdict(vapo_config),
-            "compile_models": args.compile_models,
+            "ppo": asdict(ppo_config),
+            "compile_rollout": args.compile_rollout,
             "torch": torch.__version__,
         }
     )
@@ -414,7 +478,7 @@ def main() -> None:
         frozen_opponent_state = {
             name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
         }
-        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
         generator = np.random.default_rng(args.seed)
         seed_cursor = args.seed
         physical_games = self_play_games + args.league_games
@@ -432,7 +496,7 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             _synchronize(device)
-            iteration_started = time.perf_counter()
+            setup_started = time.perf_counter()
 
             opponents = []
             assignments = None
@@ -461,7 +525,22 @@ def main() -> None:
                 opponent_temperatures[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = (
                     args.opponent_temperature
                 )
+            # Opponent reconstruction is a real per-iteration cost and belongs
+            # in the iteration total, but it is compile-invariant: the same
+            # module construction and state-dict load happens whichever way the
+            # knobs are set. Leaving it inside the rollout span made the
+            # measured rollout ratio (c + r_eager) / (c + r_compiled), which is
+            # biased toward 1.0 in both directions -- it shrinks a loss and a
+            # win alike. That was harmless while the blended total decided one
+            # knob; now that the rollout median decides its own knob against a
+            # 1.05 gate, a constant added to both sides is a thumb on the
+            # scale. Timed separately so the phase the knob turns on contains
+            # only what the knob changes.
+            _synchronize(device)
+            opponent_setup_seconds = time.perf_counter() - setup_started
+
             wave_seed_start = seed_cursor
+            rollout_started = time.perf_counter()
             rollout = collect_mixed_play_rust(
                 actor,
                 opponents,
@@ -475,12 +554,12 @@ def main() -> None:
                 opponent_temperatures=opponent_temperatures,
                 deterministic_opponents=deterministic_opponents,
                 sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-                compile_models=args.compile_models,
+                compile_models=args.compile_rollout,
                 storage=arena,
             )
             seed_cursor += physical_games
             _synchronize(device)
-            rollout_seconds = time.perf_counter() - iteration_started
+            rollout_seconds = time.perf_counter() - rollout_started
             del opponents
 
             # Audit the divergence between the sampling-path likelihoods and
@@ -492,30 +571,36 @@ def main() -> None:
             parity = update_replay_parity(
                 actor,
                 rollout,
-                minibatch_size=vapo_config.minibatch_size,
-                compile_model=vapo_config.compile_update,
-                autocast_enabled=vapo_config.use_bfloat16 and device.type == "cuda",
+                minibatch_size=ppo_config.minibatch_size,
+                compile_model=ppo_config.compile_update,
+                autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
             )
             _synchronize(device)
             parity_seconds = time.perf_counter() - parity_started
             for component in ("unit", "kind", "quantity"):
                 if parity[f"update_replay_{component}_active_count"] < 1:
                     raise RuntimeError(f"update replay parity saw no active {component} components")
-            if parity["update_replay_max_ratio_error"] > args.max_update_replay_error:
+            if parity["update_replay_max_kl"] > args.max_update_replay_kl:
                 raise RuntimeError(
-                    "sampling-vs-update likelihood divergence exceeded "
-                    f"{args.max_update_replay_error}: {parity['update_replay_max_ratio_error']}"
+                    "sampling-vs-update policy divergence exceeded "
+                    f"{args.max_update_replay_kl}: {parity['update_replay_max_kl']}"
+                )
+            if parity["update_replay_max_tail_fraction"] > args.max_update_replay_tail_fraction:
+                raise RuntimeError(
+                    "sampling-vs-update materially divergent component share exceeded "
+                    f"{args.max_update_replay_tail_fraction}: "
+                    f"{parity['update_replay_max_tail_fraction']}"
                 )
             _verify_first_step_critic_state(rollout, self_play_games, wave_seed_start)
 
             update_started = time.perf_counter()
-            update_metrics = update_vapo(
+            update_metrics = update_ppo(
                 actor,
                 critic,
                 actor_optimizer,
                 critic_optimizer,
                 rollout,
-                vapo_config,
+                ppo_config,
                 generator=generator,
             )
             _synchronize(device)
@@ -530,12 +615,20 @@ def main() -> None:
                     "first-minibatch KL at unchanged weights exceeded "
                     f"{args.max_first_minibatch_kl}: {first_minibatch_kl}"
                 )
+            saturated_fraction = float(update_metrics["value_target_saturated_fraction"])
+            if saturated_fraction > args.max_value_target_saturated_fraction:
+                raise RuntimeError(
+                    "value targets saturated the critic support beyond "
+                    f"{args.max_value_target_saturated_fraction}: {saturated_fraction}"
+                )
             if int(update_metrics["actor_updates"]) < 1:
                 raise RuntimeError("benchmark iteration completed without an actor update")
             # The parity gate is benchmark-only instrumentation; production
-            # iterations are rollout plus update, so the calibration decision
-            # must be based on exactly that.
-            total_seconds = rollout_seconds + update_seconds
+            # iterations are opponent reconstruction plus rollout plus update,
+            # so the calibration decision must be based on exactly that. Setup
+            # is a term of the total but a term neither knob moves, which is
+            # why it is added here rather than folded into a phase.
+            total_seconds = opponent_setup_seconds + rollout_seconds + update_seconds
             diagnostics = rollout_diagnostics(rollout)
             payload = {
                 "event": "iteration",
@@ -546,6 +639,7 @@ def main() -> None:
                 "physical_games": physical_games,
                 "learner_trajectories": rollout.trajectories,
                 "learner_states": rollout.state_count,
+                "opponent_setup_seconds": opponent_setup_seconds,
                 "rollout_seconds": rollout_seconds,
                 "update_replay_parity_seconds": parity_seconds,
                 "update_seconds": update_seconds,
@@ -555,9 +649,9 @@ def main() -> None:
                 "critic_replayed_states_per_second": (
                     rollout.state_count
                     * (
-                        vapo_config.epochs
-                        if vapo_config.critic_epochs is None
-                        else vapo_config.critic_epochs
+                        ppo_config.epochs
+                        if ppo_config.critic_epochs is None
+                        else ppo_config.critic_epochs
                     )
                     / update_seconds
                 ),
@@ -592,6 +686,22 @@ def main() -> None:
                 ],
                 "steady_total_seconds_median": statistics.median(
                     item["total_seconds"] for item in steady
+                ),
+                # The phases are summarized separately because compilation is
+                # decided separately for each. `total_seconds` is exactly these
+                # three summed -- a device synchronization ends each -- so a
+                # per phase median is a measurement rather than an attribution.
+                # Setup is reported alongside them because it belongs to the
+                # total the projection has to reconstruct, even though no knob
+                # moves it.
+                "steady_opponent_setup_seconds_median": statistics.median(
+                    item["opponent_setup_seconds"] for item in steady
+                ),
+                "steady_rollout_seconds_median": statistics.median(
+                    item["rollout_seconds"] for item in steady
+                ),
+                "steady_update_seconds_median": statistics.median(
+                    item["update_seconds"] for item in steady
                 ),
                 "steady_iterations_per_hour_median": statistics.median(
                     item["iterations_per_hour"] for item in steady

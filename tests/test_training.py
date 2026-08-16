@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.provenance import source_identity
 from kaggriculture.training import (
     CHECKPOINT_FORMAT_VERSION,
@@ -15,17 +16,16 @@ from kaggriculture.training import (
     metrics_journal_iteration,
     save_checkpoint,
 )
-from kaggriculture.vapo import VapoConfig, make_optimizers
 
 
 def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
-    vapo_config = VapoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
+    ppo_config = PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
     generator = np.random.default_rng(17)
     generator.random(5)
     path = tmp_path / "checkpoint.pt"
@@ -37,7 +37,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
         actor_optimizer=actor_optimizer,
         critic_optimizer=critic_optimizer,
         model_config=model_config,
-        vapo_config=vapo_config,
+        ppo_config=ppo_config,
         iteration=3,
         next_seed=41,
         metrics={"score_rate": 0.75},
@@ -94,7 +94,7 @@ def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_p
     from kaggriculture.registry import architecture_of_config
     from kaggriculture.structured import StructuredConfig
 
-    vapo_config = VapoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
+    ppo_config = PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
     conv = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
@@ -103,7 +103,7 @@ def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_p
         architecture = architecture_of_config(model_config)
         actor = architecture.actor_class(model_config)
         critic = architecture.critic_class(model_config)
-        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, vapo_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
         save_checkpoint(
             path,
             actor=actor,
@@ -111,7 +111,7 @@ def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_p
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
             model_config=model_config,
-            vapo_config=vapo_config,
+            ppo_config=ppo_config,
             iteration=1,
             next_seed=2,
             metrics={},

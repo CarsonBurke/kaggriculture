@@ -1,4 +1,4 @@
-"""Checkpointing and diagnostics for long-running VAPO jobs."""
+"""Checkpointing and diagnostics for long-running PPO jobs."""
 
 from __future__ import annotations
 
@@ -17,11 +17,11 @@ from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import validate_run_provenance, validate_source_identity
 from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.vapo import VapoConfig
 
 AnyActor = FarmActor | StructuredActor
 AnyCritic = DistributionalCritic | StructuredCritic
@@ -46,8 +46,10 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
         raise ValueError("checkpoint run provenance source does not match source identity")
     if run_provenance is not None and (
         not isinstance(payload.get("training_data_config"), dict)
-        or payload["training_data_config"].get("compile_models")
-        is not run_provenance["calibration"]["compile_models"]
+        or any(
+            payload["training_data_config"].get(knob) is not run_provenance["calibration"][knob]
+            for knob in ("compile_rollout", "compile_update")
+        )
     ):
         raise ValueError("checkpoint compile mode does not match run provenance")
 
@@ -68,10 +70,18 @@ def rollout_diagnostics(rollout: RolloutBatch) -> dict[str, float | int]:
         "rollout_seconds": rollout.elapsed_seconds,
         "rollout_states_per_second": rollout.state_count / max(rollout.elapsed_seconds, 1e-9),
         "rollout_entropy": rollout.mean_entropy,
+        # Quantiles rather than extremes. Final money floors at zero and most
+        # games end near it -- a production wave measured a median of 63 against
+        # a mean of 27,903 and a maximum of 126,405 -- so the minimum is a flat
+        # zero line the moment any one trajectory goes broke, and the maximum is
+        # a single lucky game that grows with the sample count rather than
+        # describing the policy. The mean is kept because the total economy is
+        # the thing being maximized, but under that skew it moves with the tail
+        # and the quantiles are what show the distribution.
         "money_mean": float(rollout.final_money.mean()),
+        "money_p10": float(np.quantile(rollout.final_money, 0.10)),
         "money_median": float(np.median(rollout.final_money)),
-        "money_min": float(rollout.final_money.min()),
-        "money_max": float(rollout.final_money.max()),
+        "money_p90": float(np.quantile(rollout.final_money, 0.90)),
         "margin_abs_mean": float(np.abs(margins).mean()),
         "score_rate": float(((outcomes + 1.0) / 2.0).mean()),
         "seat_zero_score_rate": float(
@@ -182,7 +192,7 @@ def checkpoint_payload(
     actor_optimizer_state: dict[str, Any],
     critic_optimizer_state: dict[str, Any],
     model_config: AnyModelConfig,
-    vapo_config: VapoConfig,
+    ppo_config: PpoConfig,
     iteration: int,
     next_seed: int,
     metrics: dict[str, Any],
@@ -193,6 +203,7 @@ def checkpoint_payload(
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[int, float] | None = None,
+    replay_parity_baseline: dict[str, float] | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
@@ -205,10 +216,26 @@ def checkpoint_payload(
         raise ValueError("checkpoint run provenance source does not match source identity")
     if normalized_run_provenance is not None and (
         not isinstance(training_data_config, dict)
-        or training_data_config.get("compile_models")
-        is not normalized_run_provenance["calibration"]["compile_models"]
+        or any(
+            training_data_config.get(knob) is not normalized_run_provenance["calibration"][knob]
+            for knob in ("compile_rollout", "compile_update")
+        )
     ):
         raise ValueError("checkpoint compile mode does not match run provenance")
+    # `training_data_config` is a record; `ppo_config.compile_update` is what
+    # actually drives compilation in the update (see ppo.py). They arrive here
+    # as independent parameters, so nothing but this makes them agree, and a
+    # checkpoint whose record says compiled while its config says eager would
+    # carry provenance for a run that did not happen. `compile_rollout` needs
+    # no equivalent: the record is the only place it is stored.
+    if (
+        isinstance(training_data_config, dict)
+        and "compile_update" in training_data_config
+        and training_data_config["compile_update"] is not ppo_config.compile_update
+    ):
+        raise ValueError(
+            "checkpoint training data config compile_update does not match its ppo config"
+        )
     if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
         raise ValueError("checkpoint RNG capture is incomplete")
     return {
@@ -217,7 +244,7 @@ def checkpoint_payload(
         "next_seed": next_seed,
         "architecture": architecture_of_config(model_config).name,
         "model_config": model_config.to_dict(),
-        "vapo_config": asdict(vapo_config),
+        "ppo_config": asdict(ppo_config),
         "actor": actor_state,
         "critic": critic_state,
         "actor_optimizer": actor_optimizer_state,
@@ -231,6 +258,12 @@ def checkpoint_payload(
         # them a resume replays retired opponents and perturbs the RNG
         # stream that opponent selection consumes.
         "league_score_rates": league_score_rates,
+        # The most recent sampling-vs-update parity measurement, per audited
+        # head. Persisted because the training gate decides defect versus
+        # drift by comparing an audit against the previous one, and a run
+        # restarted under --max-hours would otherwise judge its first audit
+        # with no history and abort a merely drifted run.
+        "replay_parity_baseline": replay_parity_baseline,
         # Warm-start provenance travels with the run: opponent selection
         # keeps the iteration-0 league snapshot eligible only when it is a
         # pretrained baseline, and a resume must preserve that decision.
@@ -263,7 +296,7 @@ def save_checkpoint(
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     model_config: AnyModelConfig,
-    vapo_config: VapoConfig,
+    ppo_config: PpoConfig,
     iteration: int,
     next_seed: int,
     metrics: dict[str, Any],
@@ -273,6 +306,7 @@ def save_checkpoint(
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[int, float] | None = None,
+    replay_parity_baseline: dict[str, float] | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> None:
     payload = checkpoint_payload(
@@ -281,7 +315,7 @@ def save_checkpoint(
         actor_optimizer_state=actor_optimizer.state_dict(),
         critic_optimizer_state=critic_optimizer.state_dict(),
         model_config=model_config,
-        vapo_config=vapo_config,
+        ppo_config=ppo_config,
         iteration=iteration,
         next_seed=next_seed,
         metrics=metrics,
@@ -292,6 +326,7 @@ def save_checkpoint(
         training_data_config=training_data_config,
         league_snapshot_manifest=league_snapshot_manifest,
         league_score_rates=league_score_rates,
+        replay_parity_baseline=replay_parity_baseline,
         initial_actor=initial_actor,
     )
     write_checkpoint(path, payload)
