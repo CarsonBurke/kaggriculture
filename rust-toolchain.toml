@@ -1,0 +1,22 @@
+# The exact compiler the native simulator is built with.
+#
+# The extension is a build output, so it is deliberately outside
+# `source_identity` -- which means nothing else in the identity records which
+# rustc produced it. Without a pin, a `rustup update` silently changes the
+# binary that every rollout runs while the identity, and therefore every
+# checkpoint's provenance claim, stays byte-identical. That is the one way a
+# content-addressed identity can be wrong rather than merely incomplete, so the
+# compiler is pinned here and the file is hashed into the identity itself.
+#
+# At the repository root rather than beside the crate because rustup resolves
+# the override by walking up from the *working* directory: the training build
+# runs with `cwd` set to the crate, while the correctness and lint gates run
+# from the root. Only a root file is found by both.
+#
+# Nightly is the current default toolchain and this pins the version it was on;
+# no `#![feature(...)]` in the crate requires it, so moving to stable is a
+# deliberate change to make against the parity oracle, not a drift to allow.
+[toolchain]
+channel = "nightly-2025-12-13"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
