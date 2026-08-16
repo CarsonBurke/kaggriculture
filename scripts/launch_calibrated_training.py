@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch production VAPO with compilation selected by matched benchmark evidence."""
+"""Launch production PPO with compilation selected by matched benchmark evidence."""
 
 from __future__ import annotations
 
@@ -12,11 +12,18 @@ import shutil
 import statistics
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
 
+from kaggriculture.ppo import (
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_KL,
+    MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    MAX_VALUE_TARGET_SATURATED_FRACTION,
+)
 from kaggriculture.production import (
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
@@ -27,14 +34,47 @@ from kaggriculture.production import (
     PRODUCTION_TEMPERATURE,
     build_training_command,
     production_model_config,
-    production_vapo_config,
+    production_ppo_config,
     require_repository_launcher,
     resolve_resume_checkpoint,
 )
-from kaggriculture.provenance import source_identity, validate_source_identity
-from kaggriculture.vapo import MAX_FIRST_MINIBATCH_KL, MAX_UPDATE_REPLAY_RATIO_ERROR
+from kaggriculture.provenance import (
+    MINIMUM_COMPILE_SPEEDUP,
+    source_identity,
+    validate_source_identity,
+)
 
-MINIMUM_COMPILE_SPEEDUP = 1.05
+#: Steady iterations each report must contain for a median to mean anything.
+#: The old floor was two repeats, which drops the cold start and leaves exactly
+#: one steady iteration -- so every "median" was a single sample, and a knob
+#: could be decided by one clock-boost dip or one noisy neighbour on the GPU.
+#: That decision is then irreversible for the run: it is stamped into run
+#: provenance and train_ppo refuses to resume under a different compile mode.
+#: Five is what the eager side measured as stable (the steady update within
+#: 0.15%, the steady total median within 0.24% of the two-repeat value), and
+#: the compiled side needs at least as many because it has warmup eager does
+#: not.
+MINIMUM_STEADY_SAMPLES = 5
+MINIMUM_CALIBRATION_REPEATS = MINIMUM_STEADY_SAMPLES + 1
+
+#: The knobs a calibration decides. The chain's reports declare which of these
+#: each step turns on, so this fixes the set and the names, not an order.
+COMPILE_KNOBS = ("compile_rollout", "compile_update")
+#: The steady phase median each knob is expected to move, and so the one term
+#: of the iteration budget its attribution swaps.
+KNOB_PHASE_MEDIANS = {
+    "compile_rollout": "steady_rollout_seconds_median",
+    "compile_update": "steady_update_seconds_median",
+}
+#: Every steady median an iteration's total is made of. Opponent reconstruction
+#: is compile-invariant by construction and belongs to no knob, which is
+#: exactly the claim each step's held-phase drift measures.
+PHASE_MEDIANS = ("steady_opponent_setup_seconds_median", *KNOB_PHASE_MEDIANS.values())
+#: How far a summary's summed phase medians may sit from the steady total
+#: median drawn from the same iterations, as a fraction of that total. Matched
+#: production reports measure 0.07 %; see `_validate_report` for why the gap is
+#: not zero and why it must still be bounded.
+MAXIMUM_PHASE_BUDGET_DIVERGENCE = 0.01
 
 
 class ReportDocument(NamedTuple):
@@ -115,10 +155,12 @@ def _validate_json_value(value: Any, path: str) -> None:
     raise ValueError(f"benchmark report has a non-JSON value at {path}: {type(value).__name__}")
 
 
-def _configuration(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _configuration(records: list[dict[str, Any]], context: str) -> dict[str, Any]:
     matches = [record for record in records if record.get("event") == "configuration"]
     if len(matches) != 1:
-        raise ValueError("benchmark report must contain exactly one configuration record")
+        raise ValueError(
+            f"{context} benchmark report must contain exactly one configuration record"
+        )
     return matches[0]
 
 
@@ -178,13 +220,13 @@ def _validate_hardware(hardware: Any, context: str) -> None:
 def _validate_configuration(
     config: dict[str, Any],
     *,
-    compiled: bool,
+    knobs: dict[str, bool],
     expected_seed: int,
     context: str,
 ) -> tuple[list[int], int]:
     expected = {
         "event": "configuration",
-        "compile_models": compiled,
+        "compile_rollout": knobs["compile_rollout"],
         "device": "cuda",
         "league_games_per_iteration": PRODUCTION_LEAGUE_GAMES,
         "league_opponents": (
@@ -202,9 +244,11 @@ def _validate_configuration(
             "cudnn_benchmark": True,
         },
         "model": production_model_config(),
-        "vapo": production_vapo_config(compiled=compiled),
-        "max_update_replay_error": MAX_UPDATE_REPLAY_RATIO_ERROR,
+        "ppo": production_ppo_config(compile_update=knobs["compile_update"]),
+        "max_update_replay_kl": MAX_UPDATE_REPLAY_KL,
+        "max_update_replay_tail_fraction": MAX_UPDATE_REPLAY_TAIL_FRACTION,
         "max_first_minibatch_kl": MAX_FIRST_MINIBATCH_KL,
+        "max_value_target_saturated_fraction": MAX_VALUE_TARGET_SATURATED_FRACTION,
         "torch": str(torch.__version__),
     }
     for key, expected_value in expected.items():
@@ -235,8 +279,12 @@ def _validate_configuration(
     if physical_counts != expected_physical:
         raise ValueError(f"{context} benchmark physical game counts are inconsistent")
     repeats = config.get("repeats")
-    if type(repeats) is not int or repeats < 2:
-        raise ValueError(f"{context} benchmark repeats must be an integer of at least two")
+    if type(repeats) is not int or repeats < MINIMUM_CALIBRATION_REPEATS:
+        raise ValueError(
+            f"{context} benchmark repeats must be an integer of at least "
+            f"{MINIMUM_CALIBRATION_REPEATS}; the first is a cold start and is dropped, so "
+            f"fewer leaves under {MINIMUM_STEADY_SAMPLES} steady iterations to take a median of"
+        )
     return game_counts, repeats
 
 
@@ -261,7 +309,7 @@ def _expected_completion(game_counts: list[int], repeats: int) -> dict[str, Any]
 def _validate_report(
     records: list[dict[str, Any]],
     *,
-    compiled: bool,
+    knobs: dict[str, bool],
     expected_seed: int,
     context: str,
 ) -> ValidatedReport:
@@ -271,12 +319,12 @@ def _validate_report(
         if not isinstance(record, dict):
             raise ValueError(f"{context} benchmark record {index} is not an object")
         _validate_json_value(record, f"{context}[{index}]")
-    config = _configuration(records)
+    config = _configuration(records, context)
     if records[0] is not config:
         raise ValueError(f"{context} benchmark configuration must be the first record")
     game_counts, repeats = _validate_configuration(
         config,
-        compiled=compiled,
+        knobs=knobs,
         expected_seed=expected_seed,
         context=context,
     )
@@ -308,6 +356,7 @@ def _validate_report(
                         f"{context} benchmark iteration {games}/{repeat} has invalid {key}"
                     )
             for key in (
+                "opponent_setup_seconds",
                 "rollout_seconds",
                 "update_replay_parity_seconds",
                 "update_seconds",
@@ -319,6 +368,36 @@ def _validate_report(
                 _require_positive_number(record, key, f"{context} benchmark iteration")
             if type(record.get("actor_updates")) is not int or record["actor_updates"] < 1:
                 raise ValueError(f"{context} benchmark iteration has no actor update")
+            # Every knob attribution rests on total_seconds being exactly the
+            # three phases summed, which is how the benchmark computes it.
+            # Check it here rather than trusting it: without this a report
+            # whose phases and total disagree passes every other gate, because
+            # each summary median is only checked against the median of the
+            # same key. A step's attributed speedup swaps one phase inside a
+            # budget summed from those medians, so a report whose phases do not
+            # add up would have that budget describe no iteration it contains,
+            # and the attribution would silently be arithmetic on unrelated
+            # numbers. Tolerance is float-addition slack on a sum of three
+            # positive perf_counter deltas, not a measurement allowance.
+            summed = (
+                record["opponent_setup_seconds"]
+                + record["rollout_seconds"]
+                + record["update_seconds"]
+            )
+            if abs(summed - record["total_seconds"]) > 1e-6 * max(summed, 1.0):
+                raise ValueError(
+                    f"{context} benchmark iteration {games}/{repeat} total seconds "
+                    f"{record['total_seconds']} is not its rollout and update phases "
+                    f"summed ({summed})"
+                )
+            # Same reasoning one step further: the derived rate has to describe
+            # the total it was derived from, or a forged report can state an
+            # honest total and an inflated throughput beside it.
+            if abs(record["iterations_per_hour"] * record["total_seconds"] - 3600.0) > 1e-3:
+                raise ValueError(
+                    f"{context} benchmark iteration {games}/{repeat} iterations per hour "
+                    f"{record['iterations_per_hour']} does not match its total seconds"
+                )
             iterations.append(record)
 
         summary = records[cursor]
@@ -340,6 +419,15 @@ def _validate_report(
             "steady_total_seconds_median": statistics.median(
                 row["total_seconds"] for row in iterations[1:]
             ),
+            "steady_opponent_setup_seconds_median": statistics.median(
+                row["opponent_setup_seconds"] for row in iterations[1:]
+            ),
+            "steady_rollout_seconds_median": statistics.median(
+                row["rollout_seconds"] for row in iterations[1:]
+            ),
+            "steady_update_seconds_median": statistics.median(
+                row["update_seconds"] for row in iterations[1:]
+            ),
             "steady_iterations_per_hour_median": statistics.median(
                 row["iterations_per_hour"] for row in iterations[1:]
             ),
@@ -356,6 +444,23 @@ def _validate_report(
                 raise ValueError(
                     f"{context} benchmark {games}-game summary {key} does not match iterations"
                 )
+        # The decision divides sums of these three medians, so a sum has to
+        # describe iterations the report actually timed. Every iteration is
+        # checked above to satisfy total = setup + rollout + update exactly,
+        # but that constrains the median of the sums, not the sum of the
+        # medians: when the phases disagree about which iteration was the slow
+        # one the two diverge, without bound if they are anti-correlated, and
+        # a budget assembled from three different iterations is a fiction no
+        # per-iteration check can catch. Rank agreement is why the real gap is
+        # small rather than why it is zero, so this is a bound and not an
+        # equality.
+        budget = sum(float(summary[key]) for key in PHASE_MEDIANS)
+        total = float(summary["steady_total_seconds_median"])
+        if abs(budget - total) > MAXIMUM_PHASE_BUDGET_DIVERGENCE * total:
+            raise ValueError(
+                f"{context} benchmark {games}-game summary phase medians sum to {budget} "
+                f"against a steady total median of {total}, so they describe no iteration"
+            )
         summaries[games] = summary
 
     completion = records[cursor]
@@ -365,63 +470,212 @@ def _validate_report(
     return ValidatedReport(config, summaries[PRODUCTION_SELF_PLAY_GAMES], completion)
 
 
+def _chain_context(index: int, length: int) -> str:
+    """The name a chain node is reported and complained about under."""
+    if index == 0:
+        return "eager"
+    if index == length - 1:
+        return "compiled"
+    return "mixed"
+
+
+def _declared_knobs(records: list[dict[str, Any]], context: str) -> dict[str, bool]:
+    """The compilation each report says it ran under, taken from the report.
+
+    The chain's shape is evidence, not an argument: which knob a step turns on
+    is read out of the two reports it spans. Passing the shape in beside the
+    reports would let a mislabelled pair name a knob neither run moved.
+    """
+    config = _configuration(records, context)
+    ppo = config.get("ppo")
+    declared = {
+        "compile_rollout": config.get("compile_rollout"),
+        "compile_update": ppo.get("compile_update") if isinstance(ppo, dict) else None,
+    }
+    for knob, value in declared.items():
+        if type(value) is not bool:
+            raise ValueError(f"{context} benchmark configuration does not declare {knob}")
+    return declared
+
+
+def _comparable_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    """A configuration with only the knobs removed, so everything else must match.
+
+    The batch-size sweep stays in the comparison. Only the production point's
+    median is read below, so excluding it would be sound -- but the cost it was
+    excluded to save is better saved by running every node of the chain at the
+    production batch, which is what the recipe prescribes. That keeps the
+    timings the same protocol as well as the same configuration, which an
+    asymmetric sweep cannot claim: the archive pairs single-batch runs at
+    2.374-2.418x against full-sweep runs at 2.545-2.694x, and since every
+    source digest was measured under exactly one sweep, nothing in it separates
+    the protocol from the tree.
+    """
+    comparable = dict(config)
+    del comparable["compile_rollout"]
+    comparable["ppo"] = {
+        key: value for key, value in comparable["ppo"].items() if key != "compile_update"
+    }
+    return comparable
+
+
 def choose_compilation(
-    eager_records: list[dict[str, Any]],
-    compiled_records: list[dict[str, Any]],
+    chain_records: Sequence[list[dict[str, Any]]],
     *,
     expected_seed: int = 20260812,
 ) -> dict[str, Any]:
-    """Require matched production evidence and return a deterministic launch decision."""
+    """Decide each compile knob against the benchmark pair that isolates it.
+
+    The reports form a chain from all-eager to all-compiled in which every step
+    turns on exactly one knob and changes nothing else. Two knobs therefore
+    need three reports, and the middle one is what makes the decision
+    attributable: differencing all-eager against all-compiled moves both knobs
+    at once, so each phase's ratio carries whatever between-run drift the pair
+    happened to have. That is not hypothetical. The conv calibration this
+    design replaces measured the rollout phase at 8.5054 s eager and 8.0847 s
+    in a run that also left the rollout uncompiled -- 4.9% apart with the knob
+    unchanged -- while crediting the knob itself with 8.0%. Against the report
+    that isolates it the rollout knob measures 1.027 and loses; against the
+    contaminated pair it measured 1.080 and won.
+
+    Each knob is scored by what it does to the whole iteration, not to its own
+    phase: the isolating pair's iteration budget with that knob's phase, and
+    only that phase, moved to its measured value under the knob. A per-phase
+    ratio flatters a knob whose phase is a small share of the iteration -- the
+    rollout knob's 1.027 on an 8 s phase is 1.006 on a 37 s iteration, worth
+    under two minutes across a 500-iteration run -- and compilation is not
+    free: it costs warmup, replay divergence against the collector, and a
+    decision that is stamped into provenance and cannot be revised mid-run.
+    Holding every other phase at its measured value on the same side of the
+    pair is what keeps the drift out of the number.
+
+    Because each knob is enabled only on top of the knobs before it in the
+    chain, the decided configuration is a node of the chain and so was measured
+    rather than projected.
+    """
     if type(expected_seed) is not int or expected_seed < 0:
         raise ValueError("expected seed must be a non-negative integer")
-    eager_validated = _validate_report(
-        eager_records,
-        compiled=False,
-        expected_seed=expected_seed,
-        context="eager",
-    )
-    compiled_validated = _validate_report(
-        compiled_records,
-        compiled=True,
-        expected_seed=expected_seed,
-        context="compiled",
-    )
-    eager_comparable = dict(eager_validated.configuration)
-    compiled_comparable = dict(compiled_validated.configuration)
-    del eager_comparable["compile_models"]
-    del compiled_comparable["compile_models"]
-    # vapo.compile_update tracks each run's compilation mode by construction;
-    # every other vapo field must still match exactly across the two reports.
-    eager_comparable["vapo"] = {
-        key: value for key, value in eager_comparable["vapo"].items() if key != "compile_update"
-    }
-    compiled_comparable["vapo"] = {
-        key: value for key, value in compiled_comparable["vapo"].items() if key != "compile_update"
-    }
-    if eager_comparable != compiled_comparable:
-        differing = sorted(
-            key
-            for key in eager_comparable.keys() | compiled_comparable.keys()
-            if eager_comparable.get(key) != compiled_comparable.get(key)
+    reports = list(chain_records)
+    if len(reports) != len(COMPILE_KNOBS) + 1:
+        raise ValueError(
+            f"a calibration chain over {len(COMPILE_KNOBS)} knobs needs "
+            f"{len(COMPILE_KNOBS) + 1} reports, one per configuration from all-eager to "
+            f"all-compiled; {len(reports)} were supplied"
         )
-        raise ValueError(f"eager and compiled benchmark configurations differ at {differing}")
+    contexts = [_chain_context(index, len(reports)) for index in range(len(reports))]
+    declared = [
+        _declared_knobs(records, context)
+        for records, context in zip(reports, contexts, strict=True)
+    ]
+    validated = [
+        _validate_report(
+            records,
+            knobs=knobs,
+            expected_seed=expected_seed,
+            context=context,
+        )
+        for records, knobs, context in zip(reports, declared, contexts, strict=True)
+    ]
+    baseline = _comparable_configuration(validated[0].configuration)
+    for report, context in zip(validated[1:], contexts[1:], strict=True):
+        comparable = _comparable_configuration(report.configuration)
+        if comparable != baseline:
+            differing = sorted(
+                key
+                for key in comparable.keys() | baseline.keys()
+                if comparable.get(key) != baseline.get(key)
+            )
+            raise ValueError(
+                f"{contexts[0]} and {context} benchmark configurations differ at {differing}"
+            )
 
-    eager_seconds = float(eager_validated.production_summary["steady_total_seconds_median"])
-    compiled_seconds = float(compiled_validated.production_summary["steady_total_seconds_median"])
-    speedup = eager_seconds / compiled_seconds
-    enabled = speedup >= MINIMUM_COMPILE_SPEEDUP
+    if any(declared[0].values()):
+        enabled = sorted(knob for knob, value in declared[0].items() if value)
+        raise ValueError(
+            f"the calibration chain must start all-eager; its first report has {enabled}"
+        )
+    steps: list[str] = []
+    for index in range(len(COMPILE_KNOBS)):
+        before, after = declared[index], declared[index + 1]
+        moved = [knob for knob in COMPILE_KNOBS if after[knob] != before[knob]]
+        if len(moved) != 1 or not after[moved[0]]:
+            raise ValueError(
+                f"the {contexts[index]} to {contexts[index + 1]} step of the calibration chain "
+                f"must turn exactly one knob on; it changes {sorted(moved)}"
+            )
+        steps.append(moved[0])
+
+    summaries = [report.production_summary for report in validated]
+    totals = [float(summary["steady_total_seconds_median"]) for summary in summaries]
+    evidence: dict[str, dict[str, Any]] = {}
+    for index, knob in enumerate(steps):
+        before, after = summaries[index], summaries[index + 1]
+        phase = KNOB_PHASE_MEDIANS[knob]
+        # The numerator is a measured iteration total, not a sum of phase
+        # medians, and the denominator is that same measured total with only
+        # this knob's phase replaced by what the step's other node measured for
+        # it. So the ratio is the whole-iteration counterfactual "this knob and
+        # nothing else", anchored at both ends on an iteration the benchmark
+        # actually ran. Substituting one median into another is only meaningful
+        # while the phase medians describe the iterations the total was taken
+        # from, which `_validate_report` is what enforces.
+        attributed = totals[index] / (totals[index] - float(before[phase]) + float(after[phase]))
+        evidence[knob] = {
+            "isolated_by": [contexts[index], contexts[index + 1]],
+            "attributed_iteration_speedup": attributed,
+            "phase_speedup": float(before[phase]) / float(after[phase]),
+            "step_total_speedup": totals[index] / totals[index + 1],
+            # What the pair did to the phases the step did not compile. These
+            # should be 1.0 and the amount they are not is this pair's drift,
+            # which is the only reason the attributed speedup above is worth
+            # more than the step's raw total ratio beside it.
+            "held_phase_drift": {
+                key: float(after[key]) / float(before[key]) for key in PHASE_MEDIANS if key != phase
+            },
+        }
+
+    clears = [
+        evidence[knob]["attributed_iteration_speedup"] >= MINIMUM_COMPILE_SPEEDUP for knob in steps
+    ]
+    enabled_steps = clears.index(False) if False in clears else len(clears)
+    # A knob that clears the floor behind a knob that does not was measured on
+    # top of a configuration this decision will not run, so the chain does not
+    # say what it is worth on its own. Refuse rather than guess: the chain that
+    # answers it is the one that enables this knob first, and it is one
+    # benchmark away.
+    late = [
+        knob
+        for knob, cleared in zip(
+            steps[enabled_steps + 1 :], clears[enabled_steps + 1 :], strict=True
+        )
+        if cleared
+    ]
+    if late:
+        raise ValueError(
+            f"the calibration chain enables {sorted(late)} only on top of "
+            f"{steps[enabled_steps]}, which does not clear "
+            f"{MINIMUM_COMPILE_SPEEDUP}; re-run the chain enabling {sorted(late)} first so each "
+            "knob is measured against the configuration that would actually run"
+        )
+    decided_index = enabled_steps
+    decided = {knob: steps.index(knob) < enabled_steps for knob in COMPILE_KNOBS}
     return {
-        "compile_models": enabled,
+        **decided,
         "minimum_compile_speedup": MINIMUM_COMPILE_SPEEDUP,
-        "measured_compile_speedup": speedup,
-        "eager_steady_total_seconds": eager_seconds,
-        "compiled_steady_total_seconds": compiled_seconds,
+        "measured_compile_speedup": totals[0] / totals[-1],
+        "attributed_knob_speedups": {
+            knob: evidence[knob]["attributed_iteration_speedup"] for knob in COMPILE_KNOBS
+        },
+        "knob_evidence": {knob: evidence[knob] for knob in COMPILE_KNOBS},
+        "chain": contexts,
+        "chain_steps": steps,
+        "decided_configuration": contexts[decided_index],
+        "decided_steady_total_seconds": totals[decided_index],
+        "eager_steady_total_seconds": totals[0],
+        "compiled_steady_total_seconds": totals[-1],
         "self_play_games": PRODUCTION_SELF_PLAY_GAMES,
         "league_games": PRODUCTION_LEAGUE_GAMES,
-        "validated_evidence": {
-            "eager": eager_records,
-            "compiled": compiled_records,
-        },
+        "validated_evidence": dict(zip(contexts, reports, strict=True)),
     }
 
 
@@ -504,8 +758,27 @@ def _retain_report(document: ReportDocument, destination: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--eager-report", type=Path, required=True)
-    parser.add_argument("--compiled-report", type=Path, required=True)
+    parser.add_argument(
+        "--eager-report",
+        type=Path,
+        required=True,
+        help="benchmark report with both compile knobs off; the chain's baseline",
+    )
+    parser.add_argument(
+        "--mixed-report",
+        type=Path,
+        required=True,
+        help=(
+            "benchmark report with exactly one compile knob on; it is what makes each knob "
+            "attributable, since the all-eager and all-compiled reports differ in both at once"
+        ),
+    )
+    parser.add_argument(
+        "--compiled-report",
+        type=Path,
+        required=True,
+        help="benchmark report with both compile knobs on",
+    )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--max-hours", type=float, default=0.0)
@@ -552,11 +825,13 @@ def main() -> None:
         and args.critic_warmup_iterations >= args.iterations
     ):
         raise ValueError("critic warmup must leave iterations for the actor to train in")
-    eager_report = _read_report(args.eager_report)
-    compiled_report = _read_report(args.compiled_report)
+    documents = {
+        "eager": _read_report(args.eager_report),
+        "mixed": _read_report(args.mixed_report),
+        "compiled": _read_report(args.compiled_report),
+    }
     decision = choose_compilation(
-        eager_report.records,
-        compiled_report.records,
+        [document.records for document in documents.values()],
         expected_seed=args.seed,
     )
     identity = source_identity()
@@ -572,7 +847,7 @@ def main() -> None:
     # Relaunching the identical command is how a killed run continues, so the
     # warm-start flags must not turn that into an error. Once the run exists
     # its actor and its remaining critic warmup both come from the checkpoint,
-    # which is why train_vapo rejects restating them; the launch record still
+    # which is why train_ppo rejects restating them; the launch record still
     # has to name the clone the weights came from, so it is carried forward
     # from the decision this run was started with rather than dropped.
     warm_start = _warm_start_record(requested_actor, args.critic_warmup_iterations)
@@ -583,16 +858,16 @@ def main() -> None:
     if resume_checkpoint is not None:
         warm_start = _recorded_warm_start(decision_path) or warm_start
     evidence_directory = run_directory / "provenance"
-    eager_retained = evidence_directory / "eager-vapo.jsonl"
-    compiled_retained = evidence_directory / "compiled-vapo.jsonl"
-    _retain_report(eager_report, eager_retained)
-    _retain_report(compiled_report, compiled_retained)
+    retained = {name: evidence_directory / f"{name}-ppo.jsonl" for name in documents}
+    for name, document in documents.items():
+        _retain_report(document, retained[name])
     command = build_training_command(
         run_directory,
         iterations=args.iterations,
         max_hours=args.max_hours,
         seed=args.seed,
-        compile_models=bool(decision["compile_models"]),
+        compile_rollout=bool(decision["compile_rollout"]),
+        compile_update=bool(decision["compile_update"]),
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
         resume_checkpoint=resume_checkpoint,
@@ -601,12 +876,15 @@ def main() -> None:
     )
     decision.update(
         {
-            "eager_report": str(eager_retained),
-            "eager_report_sha256": eager_report.sha256,
-            "eager_report_size_bytes": eager_report.size_bytes,
-            "compiled_report": str(compiled_retained),
-            "compiled_report_sha256": compiled_report.sha256,
-            "compiled_report_size_bytes": compiled_report.size_bytes,
+            **{
+                key: value
+                for name, document in documents.items()
+                for key, value in (
+                    (f"{name}_report", str(retained[name])),
+                    (f"{name}_report_sha256", document.sha256),
+                    (f"{name}_report_size_bytes", document.size_bytes),
+                )
+            },
             "iterations": args.iterations,
             "max_hours": args.max_hours,
             "seed": args.seed,

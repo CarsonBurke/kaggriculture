@@ -19,7 +19,11 @@ from kaggriculture.inference import (
     load_actor_artifact,
 )
 from kaggriculture.model import FarmActor, ModelConfig
-from kaggriculture.provenance import run_provenance_from_decision, source_identity
+from kaggriculture.provenance import (
+    is_legacy_run_provenance,
+    run_provenance_from_decision,
+    source_identity,
+)
 
 
 @pytest.mark.parametrize(
@@ -107,13 +111,16 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         run_provenance = run_provenance_from_decision(
             {
                 "source_identity": source_identity(),
-                "compile_models": False,
+                "compile_rollout": False,
+                "compile_update": False,
                 "eager_report_sha256": "a" * 64,
                 "eager_report_size_bytes": 100,
+                "mixed_report_sha256": "c" * 64,
+                "mixed_report_size_bytes": 110,
                 "compiled_report_sha256": "b" * 64,
                 "compiled_report_size_bytes": 120,
                 "minimum_compile_speedup": 1.05,
-                "measured_compile_speedup": 1.0,
+                "attributed_knob_speedups": {"compile_rollout": 1.0, "compile_update": 1.0},
             },
         )
     torch.save(
@@ -255,6 +262,64 @@ print(json.dumps({"max_action_seconds": max(elapsed), "action": action}))
     # probe result, so treat the final non-empty line as the machine payload.
     result = json.loads([line for line in completed.stdout.splitlines() if line][-1])
     assert result["max_action_seconds"] < 1.0
+
+
+def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Path) -> None:
+    """Loading weights and carrying a calibration claim forward are different
+    operations, and only the second needs the claim to be interpretable.
+
+    `load_actor_artifact` is the read path for deliberately cross-tree work --
+    `--init-actor-from`, replay viewing, behavior audits -- none of which reads
+    run provenance. Refusing those over a pre-split calibration record would
+    reject good weights for a field the caller never touches. Export is the
+    opposite case: it copies provenance into a submission, where an
+    uninterpretable claim would be asserted as though it were recoverable.
+    """
+    config = ModelConfig(cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3)
+    actor = FarmActor(config)
+    checkpoint = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model_config": config.to_dict(),
+        "actor": actor.state_dict(),
+        "source_identity": source_identity(),
+        # A well-formed record from before the rollout/update split.
+        "run_provenance": {"format_version": 1, "sha256": "a" * 64, "calibration": {}},
+    }
+    path = tmp_path / "checkpoint.pt"
+    torch.save(checkpoint, path)
+
+    restored, payload = load_actor_artifact(path)
+    for expected, actual in zip(actor.parameters(), restored.parameters(), strict=True):
+        assert torch.equal(expected, actual)
+    # The stale record is dropped from the loader's view, not rewritten on disk.
+    assert payload["run_provenance"]["format_version"] == 1
+
+    # Version 2 is dropped on the same read path for a different reason: it did
+    # split the decision per knob, but its per-phase speedups were differenced
+    # across a pair of runs that moved both knobs at once, so each phase's ratio
+    # carries whatever drift that pair happened to have. The configuration that
+    # isolates a single knob was never run, so those numbers cannot be
+    # re-attributed after the fact and the record is rejected, not migrated.
+    assert is_legacy_run_provenance({"format_version": 2, "sha256": "a" * 64, "calibration": {}})
+
+    with pytest.raises(ValueError, match="carries superseded calibration provenance"):
+        actor_artifact_from_checkpoint(checkpoint)
+    # And version 2 is refused at the same boundary, so a checkpoint written by
+    # the immediately preceding tree cannot export a decision whose evidence no
+    # longer substantiates it.
+    with pytest.raises(ValueError, match="carries superseded calibration provenance"):
+        actor_artifact_from_checkpoint(
+            {
+                **checkpoint,
+                "run_provenance": {"format_version": 2, "sha256": "a" * 64, "calibration": {}},
+            }
+        )
+
+    # Corruption is not leniency's business: only a well-formed older version
+    # is dropped, and anything else still raises on the read path.
+    torch.save({**checkpoint, "run_provenance": {"nonsense": True}}, path)
+    with pytest.raises(ValueError, match="invalid schema"):
+        load_actor_artifact(path)
 
 
 @pytest.mark.parametrize("version", [None, 1, 2, 3, 4])
