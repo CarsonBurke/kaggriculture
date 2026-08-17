@@ -161,6 +161,36 @@ def _flatten_states(values: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(values.reshape(-1, *values.shape[2:]))
 
 
+def _force_quantity_orders(
+    actor: FarmActor | StructuredActor, *, pin_quantity_bin: bool = True
+) -> None:
+    """Pin the market heads to a quantified buy so the quantity path is live.
+
+    The conservative production prior otherwise legitimately produces whole
+    episodes with no quantified market order at initialization, which would
+    leave the quantity component's replay assertions vacuous.
+
+    `pin_quantity_bin` additionally collapses the quantity head onto a single
+    bin, which the native comparisons need in order to name the exact bin they
+    expect. Turn it off where the quantity log-probability is itself the
+    measurement: a bias-only head puts the selected bin's log-probability at
+    zero on both sides of a replay comparison, so the assertion degenerates to
+    0 == 0, while a randomly initialized quantity head keeps real values on both
+    sides -- measured -9.5 to -0.46 on the eight-step self-play fixture.
+    """
+    with torch.no_grad():
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-12.0)
+        actor.market_kind.bias[MarketKind.STOP] = -6.0
+        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
+        if not pin_quantity_bin:
+            return
+        actor.market_quantity_context.weight.zero_()
+        actor.market_quantity_value.weight.zero_()
+        actor.market_quantity_bias.fill_(-50.0)
+        actor.market_quantity_bias[MarketKind.BUY_SEED_WHEAT, -1] = 50.0
+
+
 def _assert_stored_rows_replay_from_current_actor(actor: FarmActor, rollout) -> None:
     """Replay every stored row through the current actor and check it matches.
 
@@ -192,15 +222,21 @@ def _assert_stored_rows_replay_from_current_actor(actor: FarmActor, rollout) -> 
             _flatten_states(rollout.market_quantity_masks).bool(),
         )
 
-    old_unit = _flatten_states(rollout.old_unit_logprobs)
-    old_kind = _flatten_states(rollout.old_market_kind_logprobs)
-    old_quantity = _flatten_states(rollout.old_market_quantity_logprobs)
     unit_active = _flatten_states(rollout.unit_active).bool()
     kind_active = _flatten_states(rollout.market_active).bool()
     quantity_active = _flatten_states(rollout.market_quantity_active).bool()
-    np.testing.assert_allclose(unit[unit_active], old_unit[unit_active], atol=2e-6)
-    np.testing.assert_allclose(kind[kind_active], old_kind[kind_active], atol=2e-6)
-    np.testing.assert_allclose(quantity[quantity_active], old_quantity[quantity_active], atol=2e-6)
+    for replayed, behavior, active in (
+        (unit, _flatten_states(rollout.old_unit_logprobs), unit_active),
+        (kind, _flatten_states(rollout.old_market_kind_logprobs), kind_active),
+        (quantity, _flatten_states(rollout.old_market_quantity_logprobs), quantity_active),
+    ):
+        # An empty mask makes `assert_allclose` pass without comparing anything,
+        # and that is not hypothetical here: on the eight-step fixture below the
+        # quantity mask was empty at three of 24 global-RNG stream positions
+        # measured, so which tests ran first decided whether this line checked
+        # the quantity head at all. The structured mirror already guards it.
+        assert active.any()
+        np.testing.assert_allclose(replayed[active], behavior[active], atol=2e-6)
 
     def per_trajectory(entropy: torch.Tensor, active: torch.Tensor) -> np.ndarray:
         contributions = torch.where(active, entropy.double(), torch.zeros((), dtype=torch.float64))
@@ -219,6 +255,15 @@ def test_stored_behavior_likelihoods_replay_from_identical_features() -> None:
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
     actor = FarmActor(config)
+    # Pinned because the quantity component's coverage here is otherwise a
+    # function of the global RNG stream position: over 24 positions, three left
+    # `market_quantity_active` empty and the other twenty-one had exactly one
+    # active component. Pinning the kind head alone puts 280 active components
+    # at every one of those 24 positions, with the replay agreeing to
+    # 4.8e-7..9.5e-7 against the helper's 2e-6 -- and leaving the quantity head
+    # randomly initialized is what keeps that a measurement rather than a
+    # comparison of two zeros (see `_force_quantity_orders`).
+    _force_quantity_orders(actor, pin_quantity_bin=False)
     rollout = collect_self_play(actor, games=2, seed_start=110, episode_steps=8, sampling_seed=5)
 
     _assert_stored_rows_replay_from_current_actor(actor, rollout)
@@ -637,24 +682,6 @@ def _small_structured_config() -> StructuredConfig:
         core_layers=1,
         quantity_rank=4,
     )
-
-
-def _force_quantity_orders(actor: FarmActor | StructuredActor) -> None:
-    """Pin the market heads to a quantified buy so the quantity path is live.
-
-    The conservative production prior otherwise legitimately produces whole
-    episodes with no quantified market order at initialization, which would
-    leave the quantity component's replay assertions vacuous.
-    """
-    with torch.no_grad():
-        actor.market_kind.weight.zero_()
-        actor.market_kind.bias.fill_(-12.0)
-        actor.market_kind.bias[MarketKind.STOP] = -6.0
-        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
-        actor.market_quantity_context.weight.zero_()
-        actor.market_quantity_value.weight.zero_()
-        actor.market_quantity_bias.fill_(-50.0)
-        actor.market_quantity_bias[MarketKind.BUY_SEED_WHEAT, -1] = 50.0
 
 
 def _structured_replay_inputs(rollout) -> StructuredInputs:

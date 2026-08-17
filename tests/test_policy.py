@@ -26,6 +26,23 @@ class _FixedGenerator:
         return np.full(shape, self.value)
 
 
+def _pin_kind_head_to_a_quantified_buy(actor: FarmActor) -> None:
+    """Make a deterministic decode choose a quantified market order.
+
+    The production prior is conservative enough that an argmax decode picks STOP
+    in every order slot, which leaves every quantity-conditioned selection empty
+    and the assertions over it vacuous. Only the kind head is pinned: the
+    quantity head keeps its random initialization so its log-probabilities stay
+    data-dependent, which is what makes a replay comparison on that head a
+    measurement instead of a comparison of two zeros.
+    """
+    with torch.no_grad():
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-12.0)
+        actor.market_kind.bias[MarketKind.STOP] = -6.0
+        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
+
+
 def test_numpy_categorical_roundoff_fallback_stays_on_last_valid_action() -> None:
     logits = np.asarray([[0.0, -1.0, -2.0, 20.0, 20.0]], dtype=np.float32)
     mask = np.asarray([[True, True, True, False, False]])
@@ -223,6 +240,14 @@ def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(config)
+    # Without this the comparison at the end of the test runs over an empty
+    # selection: `market_quantity_active` was measured empty at all 24 global-RNG
+    # stream positions sampled, and numpy passes an empty-vs-empty
+    # `assert_allclose` silently, so the quantity head this test is named for was
+    # never compared at all. Pinned, 20 components are active at every one of
+    # those positions, the stored log-probabilities land near -0.49, and the
+    # replay agrees to 8.9e-8..2.7e-7 -- inside the tolerance below.
+    _pin_kind_head_to_a_quantified_buy(actor)
     policy_step = act_batch(actor, observations, deterministic=True)
     encoded = policy_step.encoded
     with torch.inference_mode():
@@ -246,6 +271,10 @@ def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
         )
 
     active = policy_step.factors.market_quantity_active
+    # The guard is the finding, not ceremony: with no active component the
+    # comparison below is empty and passes without comparing anything, which is
+    # the state this test was in before the pinning above.
+    assert active.any()
     np.testing.assert_allclose(
         quantity_logprobs.numpy()[active],
         policy_step.factors.market_quantity_logprobs[active],
@@ -260,6 +289,14 @@ def test_component_selected_logprobs_matches_component_logprobs() -> None:
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
     actor = FarmActor(config)
+    # Same reason as above, one head further on: with no quantified order both
+    # paths returned identically zero quantity log-probabilities at all 24 stream
+    # positions measured, so the "every head" claim below held as 0 == 0 for the
+    # head that takes the externally supplied logits. Pinned, that head carries
+    # 20 nonzero components and the two paths still agree exactly -- worst
+    # deviation 0.0 across those 24 positions on all three heads, which is what
+    # `rtol=0.0, atol=0.0` asks for.
+    _pin_kind_head_to_a_quantified_buy(actor)
     policy_step = act_batch(actor, observations, deterministic=True)
     encoded = policy_step.encoded
     with torch.inference_mode():
@@ -283,6 +320,10 @@ def test_component_selected_logprobs_matches_component_logprobs() -> None:
         full = component_logprobs(*arguments)
         selected = component_selected_logprobs(*arguments)
 
+    # Nonzero on the quantity head specifically: masked-out rows are zero in
+    # both paths, so a comparison over zeros alone would leave the head the
+    # externally supplied logits reach unchecked.
+    assert (full[2] != 0).any()
     # The entropy-free path must be the same masking/log_softmax/gather ops,
     # so it agrees bit-for-bit with the full statistics on every head.
     for lean, reference in zip(selected, full[:3], strict=True):
