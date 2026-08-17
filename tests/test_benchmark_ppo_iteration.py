@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -179,3 +180,119 @@ def test_a_gate_override_may_tighten_but_never_loosen_the_shipped_bound() -> Non
         for rejected in (ceiling * 1.5, 0.0, -1.0, math.nan, math.inf):
             with pytest.raises(ValueError, match=f"{re.escape(flag)} must be finite"):
                 validated(**{attribute: rejected})
+
+
+#: A tiny conv model and a two-opponent wave: these tests are about which
+#: collection configuration the script records and passes on, which is decided
+#: before any of it runs. The knobs themselves are inert here by construction --
+#: `rollout._rollout_model_forward` returns an eager forward off CUDA whatever
+#: the mode says -- so nothing is gained by making the model production-sized.
+_SMALL_WAVE = (
+    "--device",
+    "cpu",
+    "--games",
+    "1",
+    "--league-games",
+    "2",
+    "--league-opponents",
+    "2",
+    "--repeats",
+    "2",
+    "--cnn-width",
+    "8",
+    "--cnn-blocks",
+    "1",
+    "--model-dim",
+    "16",
+    "--transformer-layers",
+    "3",
+)
+
+
+class _ReachedCollector(Exception):
+    """Raised in place of a collection, to end a run at the call under test."""
+
+
+def _capturing_collector(captured: dict[str, object]):
+    """A collector that records its keywords and ends the run there."""
+
+    def collect(*_arguments: object, **keywords: object) -> None:
+        captured.update(keywords)
+        raise _ReachedCollector
+
+    return collect
+
+
+def test_the_report_and_the_collector_agree_on_the_collection_configuration(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The collection mode and precision decide what the rollout phase median
+    means -- eager/fp32 measures 8.91 s against inductor/bf16's 5.36 s on the
+    production wave -- and that median is what selects the shipped
+    configuration. So a report has to name the configuration it timed, and it
+    has to be the one the collector was actually given.
+
+    The knob is the mode alone. No boolean projection of it is recorded, because
+    the launcher requires every configuration key it does not strip to be
+    identical across the three chain nodes, and a boolean derived from the mode
+    differs exactly where the chain varies it -- so recording both would reject
+    every chain.
+    """
+    module = _script()
+    from kaggriculture.rollout import ROLLOUT_FORWARD_MODES
+
+    cases = (
+        ((), "inductor", True),
+        (("--rollout-forward-mode", "eager", "--no-rollout-bfloat16"), "eager", False),
+        (("--rollout-forward-mode", "cudagraphs"), "cudagraphs", True),
+        (("--rollout-forward-mode", "inductor", "--no-rollout-bfloat16"), "inductor", False),
+    )
+    # Every mode is evidence here, so adding one to the tuple without measuring
+    # it fails rather than passing untested.
+    assert {mode for _flags, mode, _bfloat16 in cases} == set(ROLLOUT_FORWARD_MODES)
+
+    for index, (flags, mode, bfloat16) in enumerate(cases):
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(module, "collect_mixed_play_rust", _capturing_collector(captured))
+        report = tmp_path / str(index) / "benchmark.jsonl"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["benchmark_ppo_iteration.py", *_SMALL_WAVE, "--output", str(report), *flags],
+        )
+        try:
+            with pytest.raises(_ReachedCollector):
+                module.main()
+        finally:
+            module._configure_report(None)
+
+        configuration = json.loads(report.read_text(encoding="utf-8").splitlines()[0])
+        assert configuration["event"] == "configuration"
+        assert configuration["rollout_forward_mode"] == mode
+        assert configuration["rollout_bfloat16"] is bfloat16
+        assert "compile_rollout" not in configuration
+        assert captured["forward_mode"] == mode
+        assert captured["forward_autocast"] is bfloat16
+        # The mode is now the collector's only execution knob: the retired
+        # `compile_models` boolean is gone from its signature, so a league wave
+        # cannot compile one of its two forwards and not the other.
+        assert "compile_models" not in captured
+
+
+@pytest.mark.parametrize("flags", [("--compile-rollout",), ("--no-compile-rollout",)])
+def test_the_retired_compile_rollout_boolean_is_rejected(
+    monkeypatch, flags: tuple[str, ...]
+) -> None:
+    """A recipe still passing the old boolean must fail loudly. It cannot be
+    honoured: the mode is what the collector consults, so the boolean could only
+    agree redundantly or contradict, and it cannot be ignored either -- a run
+    that accepted `--compile-rollout` while timing an eager collector would put
+    a configuration nothing measured into the launcher's evidence.
+    """
+    module = _script()
+    monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py", *_SMALL_WAVE, *flags])
+
+    with pytest.raises(SystemExit) as failure:
+        module.main()
+
+    assert failure.value.code != 0

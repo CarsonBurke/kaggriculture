@@ -18,7 +18,7 @@ import torch
 from kaggriculture.model import FarmActor, ModelConfig, parameter_count
 from kaggriculture.policy import component_logprobs
 from kaggriculture.provenance import source_identity
-from kaggriculture.rollout import collect_self_play_rust
+from kaggriculture.rollout import ROLLOUT_FORWARD_MODES, collect_self_play_rust
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 
@@ -79,7 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--compile-models", action="store_true")
+    # This benchmark's recorded drift artifacts were taken with an eager
+    # collector, so eager stays its default: changing it would silently make
+    # new rows incomparable to artifacts/benchmarks/drift-*.jsonl.
+    parser.add_argument("--rollout-forward-mode", choices=ROLLOUT_FORWARD_MODES, default="eager")
+    parser.add_argument("--rollout-bfloat16", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--replay-minibatch-size", type=int, default=2048)
     parser.add_argument(
         "--max-replay-error",
@@ -188,7 +192,7 @@ def main() -> None:
         raise ValueError("--games must be a comma-separated list of positive integers")
     if args.repeats < 1:
         raise ValueError("--repeats must be positive")
-    if args.compile_models and args.repeats < 2:
+    if args.rollout_forward_mode != "eager" and args.repeats < 2:
         raise ValueError("compiled benchmarks require at least two repeats (cold and steady)")
     if args.replay_minibatch_size < 1:
         raise ValueError("--replay-minibatch-size must be positive")
@@ -215,7 +219,8 @@ def main() -> None:
         {
             "event": "configuration",
             "device": str(device),
-            "compile_models": args.compile_models,
+            "rollout_forward_mode": args.rollout_forward_mode,
+            "rollout_bfloat16": args.rollout_bfloat16,
             "max_replay_error": args.max_replay_error,
             "actor_parameters": parameter_count(actor),
             "model": config.to_dict(),
@@ -237,7 +242,8 @@ def main() -> None:
                 games=games,
                 seed_start=seed_cursor,
                 sampling_seed=args.seed ^ (games << 16) ^ repeat,
-                compile_models=args.compile_models,
+                forward_mode=args.rollout_forward_mode,
+                forward_autocast=args.rollout_bfloat16,
             )
             seed_cursor += games
             diagnostics = rollout_diagnostics(rollout)

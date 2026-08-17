@@ -344,10 +344,10 @@ def test_run_provenance_is_portable_canonical_and_tamper_evident(tmp_path: Path)
             "mixed_report_size_bytes": 110,
             "compiled_report_sha256": "b" * 64,
             "compiled_report_size_bytes": 120,
-            "compile_rollout": False,
+            "rollout_forward_mode": "eager",
             "compile_update": True,
             "minimum_compile_speedup": 1.05,
-            "attributed_knob_speedups": {"compile_rollout": 0.5, "compile_update": 1.2},
+            "attributed_knob_speedups": {"rollout_forward_mode": 0.5, "compile_update": 1.2},
             "training_command": ["intentionally", "excluded"],
             "run_dir": "/also/excluded",
         }
@@ -355,12 +355,15 @@ def test_run_provenance_is_portable_canonical_and_tamper_evident(tmp_path: Path)
 
     assert validate_run_provenance(provenance, required=True) == provenance
     assert "training_command" not in provenance["calibration"]
-    # Either knob, flipped on its own, must contradict the speedup recorded
-    # beside it or fail the digest. A decision that survives being flipped is
-    # a decision the evidence does not actually constrain.
-    for knob in ("compile_rollout", "compile_update"):
+    # Either knob, moved on its own, must contradict the speedup recorded
+    # beside it or fail the digest. A decision that survives being moved is
+    # a decision the evidence does not actually constrain. The rollout knob is
+    # moved to another mode rather than negated: it is mode-valued, `not "eager"`
+    # is not a configuration anything could have run, and what has to be caught
+    # is a mode that compiles sitting beside a 0.5x measurement.
+    for knob, moved in (("rollout_forward_mode", "inductor"), ("compile_update", False)):
         calibration = provenance["calibration"]
-        tampered = provenance | {"calibration": calibration | {knob: not calibration[knob]}}
+        tampered = provenance | {"calibration": calibration | {knob: moved}}
         with pytest.raises(ValueError, match=r"contradicts|digest"):
             validate_run_provenance(tampered, required=True)
 
@@ -388,10 +391,10 @@ def test_an_integral_threshold_round_trips_instead_of_reading_as_tampering(
             "mixed_report_size_bytes": 110,
             "compiled_report_sha256": "b" * 64,
             "compiled_report_size_bytes": 120,
-            "compile_rollout": False,
+            "rollout_forward_mode": "eager",
             "compile_update": True,
             "minimum_compile_speedup": 2,
-            "attributed_knob_speedups": {"compile_rollout": 0.5, "compile_update": 3},
+            "attributed_knob_speedups": {"rollout_forward_mode": 0.5, "compile_update": 3},
         }
     )
 
@@ -424,10 +427,10 @@ def test_a_threshold_below_one_cannot_certify_a_phase_measured_slower(
         "mixed_report_size_bytes": 110,
         "compiled_report_sha256": "b" * 64,
         "compiled_report_size_bytes": 120,
-        "compile_rollout": True,
+        "rollout_forward_mode": "inductor",
         "compile_update": True,
         "minimum_compile_speedup": threshold,
-        "attributed_knob_speedups": {"compile_rollout": 0.5, "compile_update": 2.3333},
+        "attributed_knob_speedups": {"rollout_forward_mode": 0.5, "compile_update": 2.3333},
     }
 
     # Pinned to the whole floor, not a prefix of it: `1\.0` is a substring of
@@ -436,3 +439,35 @@ def test_a_threshold_below_one_cannot_certify_a_phase_measured_slower(
     # which is precisely the regression this test is here to catch.
     with pytest.raises(ValueError, match=r"must be at least 1\.05;"):
         validate_run_provenance(run_provenance_from_decision(decision), required=True)
+
+
+@pytest.mark.parametrize("value", [False, True, None, "", 1])
+def test_a_rollout_knob_that_is_not_a_mode_is_rejected_rather_than_read_as_eager(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    """This is what the bump to format version 4 is for.
+
+    A format-3 record carries a boolean where the mode now goes, and `False` is
+    not a mode: reading it as `eager` would let a record that never stated one
+    validate as though it had, and `True` meant `cudagraphs` -- the one mode
+    measurement rejects, at 5.309 ms against eager's 4.907 ms on the isolated
+    collection forward. The knob has to be a mode name or nothing.
+    """
+    _minimal_source(tmp_path)
+    decision = {
+        "source_identity": source_identity(tmp_path),
+        "eager_report_sha256": "a" * 64,
+        "eager_report_size_bytes": 100,
+        "mixed_report_sha256": "c" * 64,
+        "mixed_report_size_bytes": 110,
+        "compiled_report_sha256": "b" * 64,
+        "compiled_report_size_bytes": 120,
+        "rollout_forward_mode": value,
+        "compile_update": True,
+        "minimum_compile_speedup": 1.05,
+        "attributed_knob_speedups": {"rollout_forward_mode": 0.5, "compile_update": 1.2},
+    }
+
+    with pytest.raises(ValueError, match="must be a collection forward mode"):
+        run_provenance_from_decision(decision)

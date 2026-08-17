@@ -19,6 +19,25 @@ PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_EVERY = 5
 PRODUCTION_TEMPERATURE = 1.0
 PRODUCTION_OPPONENT_TEMPERATURE = 0.8
+# The collection forward is ~64% of a wave's wall clock, and measurement picked
+# both of these rather than taste. Production 112-game waves, real BC actor:
+# the rollout sweep moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x,
+# while the shipped 4-wave `scripts/audit_replay_parity.py` gate on the
+# league-mixed path moves worst max_kl 1.9089e-03 -> 2.2786e-04, 8.4x lower
+# drift: the update path is already Inductor + bf16, so matching its backend
+# and precision cancels most of the collect/update gap instead of widening it.
+#
+# They are not the same kind of setting. The forward mode is the calibrated
+# rollout knob -- the chain varies it and attributes a speedup to it -- so it
+# reaches the command as a parameter, and this constant is only what the
+# uncalibrated direct launch (`scripts/launch_production.py`) states. The
+# precision is not a knob: it is pinned identical on every chain node, so it
+# is fixed configuration and this constant is the value.
+# `ROLLOUT_FORWARD_MODES` owns the valid mode strings; train_ppo.py's
+# `--rollout-forward-mode` choices validate whatever is passed, exercised by
+# the launcher round-trip test.
+PRODUCTION_ROLLOUT_FORWARD_MODE = "inductor"
+PRODUCTION_ROLLOUT_BFLOAT16 = True
 # Deterministic starter/public-v27 probes every N committed iterations give the
 # journal an absolute progress axis that self-play score rates cannot provide.
 # The opponents are emitted explicitly so the launch command is the complete
@@ -75,8 +94,9 @@ def build_training_command(
     iterations: int,
     max_hours: float,
     seed: int,
-    compile_rollout: bool,
+    rollout_forward_mode: str,
     compile_update: bool,
+    rollout_bfloat16: bool = PRODUCTION_ROLLOUT_BFLOAT16,
     expected_source_digest: str | None = None,
     calibration_decision: Path | None = None,
     resume_checkpoint: Path | None = None,
@@ -186,10 +206,14 @@ def build_training_command(
             str(ppo["max_gradient_norm"]),
         )
     )
-    if compile_rollout:
-        command.append("--compile-rollout")
     if compile_update:
         command.append("--compile-update")
+    # Stated unconditionally, in both directions: these move the sampled
+    # behavior policy, so the command has to be the complete record of the
+    # collection backend and precision a run actually used rather than leaning
+    # on whatever train_ppo currently defaults to.
+    command.extend(("--rollout-forward-mode", rollout_forward_mode))
+    command.append("--rollout-bfloat16" if rollout_bfloat16 else "--no-rollout-bfloat16")
     if initial_actor is not None:
         command.extend(("--init-actor-from", str(initial_actor)))
         if critic_warmup_iterations is not None:

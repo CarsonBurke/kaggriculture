@@ -24,7 +24,12 @@ from typing import Any, Protocol
 #: would keep serving `ppo-eager` for runs the new derivation calls
 #: `update-only` and go unrebuilt -- exactly the silent failure this number
 #: exists to prevent.
-_LAYOUT_EPOCH = 4
+#: 5: the collection knob became a mode, so the label names it. The same
+#: failure applies with the same force: a run epoch 4 filed as `rollout-only`
+#: is now `rollout-cudagraphs-update-eager` or `rollout-inductor-update-eager`,
+#: two configurations epoch 4 could not tell apart, and their isolated
+#: collection forwards measure 5.309 ms against 2.720 ms.
+_LAYOUT_EPOCH = 5
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -284,12 +289,31 @@ def training_step_field(record: dict[str, Any]) -> str | None:
     )
 
 
-_COMPILE_MODES = {
-    (False, False): "eager",
-    (True, False): "rollout-only",
-    (False, True): "update-only",
-    (True, True): "compiled",
-}
+#: What a benchmark whose configuration record names no collection mode is
+#: labelled as. Reached with no configuration record at all -- a training
+#: journal has none, and `_benchmark_context` falls back to an empty mapping
+#: rather than failing a mirror over a label.
+_UNCOMPILED_COLLECTION = "eager"
+
+
+def _compile_mode_label(collection_mode: str, compile_update: bool) -> str:
+    """The compilation a benchmark's series is filed under, both phases named.
+
+    Both, because the mixed configurations are real: production runs a compiled
+    update against a collector whose mode is decided separately, and calling that
+    "eager" would file a run whose update phase is ~1.8x faster in the same
+    series as a true eager one, where the difference reads as hardware noise
+    instead of as the knob it is.
+
+    The collection half is a mode rather than a flag, and names itself, because
+    its values are not one measurement: `cudagraphs` and `inductor` differ by
+    5.309 ms against 2.720 ms on the isolated fp32 collection forward, which is
+    further apart than either is from eager's 4.907 ms. A boolean would file them
+    together. The mode strings are whatever the report declared; their domain is
+    `ROLLOUT_FORWARD_MODES`, enforced where a report becomes a decision rather
+    than here, since a mirror must not refuse to plot a run it cannot name.
+    """
+    return f"rollout-{collection_mode}-update-{'compiled' if compile_update else 'eager'}"
 
 
 def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
@@ -297,46 +321,38 @@ def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
     # compilation differently because each compiles different things. Reading
     # one key for all of them labels the others "eager" whatever they measured.
     #
-    #   ppo      the iteration benchmark: a rollout phase and an update phase,
-    #            decided independently. `compile_rollout` sits at top level and
-    #            `compile_update` is nested under `ppo` -- a schema asymmetry,
-    #            so both have to be read from where they actually are.
-    #   audit    the replay-parity audit: both knobs at top level, and no
-    #            `self_play_game_counts` (it takes a single `self_play_games`),
-    #            which is why it must be discriminated explicitly rather than
-    #            falling through to the rollout branch and reading a key it
-    #            never writes.
-    #   rollout  the rust rollout benchmark: only a collector, so the single
-    #            `compile_models` is the whole of its mode.
+    #   ppo      the iteration benchmark: a collection phase and an update
+    #            phase, decided independently. `rollout_forward_mode` sits at
+    #            top level and `compile_update` is nested under `ppo` -- a schema
+    #            asymmetry, so both have to be read from where they actually are.
+    #   audit    the replay-parity audit: the mode and `compile_update` both at
+    #            top level, and no `self_play_game_counts` (it takes a single
+    #            `self_play_games`), which is why it must be discriminated
+    #            explicitly rather than falling through to the rollout branch and
+    #            reading a key it never writes.
+    #   rollout  the rust rollout benchmark: only a collector, and it declares
+    #            only `compile_models`, so that boolean is the whole of its mode.
     #
-    # The mode is four-valued rather than a boolean because the mixed
-    # configurations are real: production runs an eager collector against a
-    # compiled update, and calling that "eager" would put a run whose update
-    # phase is ~1.8x faster in the same series as a true eager one, where the
-    # difference reads as hardware noise instead of as the knob it is.
-    #
-    # Absent means off throughout, because this is also reached with no
-    # configuration record at all -- a training journal has none, and
-    # `_benchmark_context` falls back to an empty mapping rather than failing a
-    # mirror over a label.
+    # The collection half is read as a mode string rather than a flag: it is one
+    # knob with three values, and `_compile_mode_label` explains why filing
+    # `cudagraphs` and `inductor` together would hide the larger of the two
+    # differences. A record without one is labelled uncompiled rather than
+    # rejected, because a mirror must not fail over a label.
+    collection = configuration.get("rollout_forward_mode")
+    if not isinstance(collection, str) or not collection:
+        collection = _UNCOMPILED_COLLECTION
     if "self_play_game_counts" in configuration:
         kind = "ppo"
         ppo = configuration.get("ppo")
-        knobs = (
-            configuration.get("compile_rollout") is True,
-            isinstance(ppo, dict) and ppo.get("compile_update") is True,
-        )
+        compile_update = isinstance(ppo, dict) and ppo.get("compile_update") is True
     elif "self_play_games" in configuration:
         kind = "audit"
-        knobs = (
-            configuration.get("compile_rollout") is True,
-            configuration.get("compile_update") is True,
-        )
+        compile_update = configuration.get("compile_update") is True
     else:
         kind = "rollout"
         collector = configuration.get("compile_models") is True
         return kind, "compiled" if collector else "eager"
-    return kind, _COMPILE_MODES[knobs]
+    return kind, _compile_mode_label(collection, compile_update)
 
 
 def _benchmark_context(records: tuple[dict[str, Any], ...]) -> tuple[str, str]:

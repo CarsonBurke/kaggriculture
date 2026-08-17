@@ -30,6 +30,7 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
     PRODUCTION_OPPONENT_TEMPERATURE,
+    PRODUCTION_ROLLOUT_BFLOAT16,
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
     build_training_command,
@@ -39,10 +40,14 @@ from kaggriculture.production import (
     resolve_resume_checkpoint,
 )
 from kaggriculture.provenance import (
+    CALIBRATION_KNOBS,
     MINIMUM_COMPILE_SPEEDUP,
+    ROLLOUT_FORWARD_MODE_KNOB,
+    UNCOMPILED_ROLLOUT_FORWARD_MODE,
     source_identity,
     validate_source_identity,
 )
+from kaggriculture.rollout import ROLLOUT_FORWARD_MODES
 
 #: Steady iterations each report must contain for a median to mean anything.
 #: The old floor was two repeats, which drops the cold start and leaves exactly
@@ -57,14 +62,26 @@ from kaggriculture.provenance import (
 MINIMUM_STEADY_SAMPLES = 5
 MINIMUM_CALIBRATION_REPEATS = MINIMUM_STEADY_SAMPLES + 1
 
-#: The knobs a calibration decides. The chain's reports declare which of these
-#: each step turns on, so this fixes the set and the names, not an order.
-COMPILE_KNOBS = ("compile_rollout", "compile_update")
 #: The steady phase median each knob is expected to move, and so the one term
-#: of the iteration budget its attribution swaps.
+#: of the iteration budget its attribution swaps. The knob names themselves come
+#: from `provenance.CALIBRATION_KNOBS`, which is the schema the decision this
+#: writes is validated against; naming them twice is how the two drift apart.
 KNOB_PHASE_MEDIANS = {
-    "compile_rollout": "steady_rollout_seconds_median",
+    ROLLOUT_FORWARD_MODE_KNOB: "steady_rollout_seconds_median",
     "compile_update": "steady_update_seconds_median",
+}
+#: What each knob reads as while its phase is uncompiled: what the chain's
+#: all-eager first node must declare, and what a knob this decision leaves off
+#: keeps. The rollout knob's is a mode name rather than `False` because the knob
+#: is mode-valued -- `eager` is one of `ROLLOUT_FORWARD_MODES`, an execution mode
+#: like the others, not the absence of a choice. The measured ranking is why:
+#: isolated collection forward, median of 60, eager fp32 4.907 ms, cudagraphs
+#: fp32 5.309 ms, inductor fp32 2.720 ms, inductor bf16 1.626 ms. A boolean
+#: whose "on" value is `cudagraphs` selects the one mode slower than eager,
+#: which is what this rename exists to stop this launcher from certifying.
+UNCOMPILED_KNOBS = {
+    ROLLOUT_FORWARD_MODE_KNOB: UNCOMPILED_ROLLOUT_FORWARD_MODE,
+    "compile_update": False,
 }
 #: Every steady median an iteration's total is made of. Opponent reconstruction
 #: is compile-invariant by construction and belongs to no knob, which is
@@ -220,13 +237,27 @@ def _validate_hardware(hardware: Any, context: str) -> None:
 def _validate_configuration(
     config: dict[str, Any],
     *,
-    knobs: dict[str, bool],
+    knobs: dict[str, Any],
     expected_seed: int,
     context: str,
 ) -> tuple[list[int], int]:
     expected = {
         "event": "configuration",
-        "compile_rollout": knobs["compile_rollout"],
+        ROLLOUT_FORWARD_MODE_KNOB: knobs[ROLLOUT_FORWARD_MODE_KNOB],
+        # Fixed across the chain rather than decided by it. Three reports
+        # attribute two knobs because each step moves exactly one, so a third
+        # knob would need a fourth report; folding the precision into the mode's
+        # value instead would conflate two dimensions and make inductor/fp32
+        # unmeasurable. It is a decision measurement already settled outside the
+        # chain: the isolated collection forward runs 2.720 ms in fp32 against
+        # 1.626 ms in bf16, and matching the update path's precision *lowers*
+        # the drift it is audited for -- the shipped parity gate over four
+        # production waves measures inductor/bf16 at max_kl 2.2786e-04, tail
+        # 0.0 and first_minibatch_kl 4.9855e-03, against eager/fp32's
+        # 1.9089e-03, 3.1850e-05 and 4.0598e-02. Faster and 8.4x further inside
+        # the gate, so a chain measured in fp32 is not evidence for the run this
+        # launches and is rejected here.
+        "rollout_bfloat16": PRODUCTION_ROLLOUT_BFLOAT16,
         "device": "cuda",
         "league_games_per_iteration": PRODUCTION_LEAGUE_GAMES,
         "league_opponents": (
@@ -479,27 +510,43 @@ def _chain_context(index: int, length: int) -> str:
     return "mixed"
 
 
-def _declared_knobs(records: list[dict[str, Any]], context: str) -> dict[str, bool]:
+def _declared_knobs(records: list[dict[str, Any]], context: str) -> dict[str, Any]:
     """The compilation each report says it ran under, taken from the report.
 
     The chain's shape is evidence, not an argument: which knob a step turns on
     is read out of the two reports it spans. Passing the shape in beside the
     reports would let a mislabelled pair name a knob neither run moved.
+
+    This is also where the rollout knob's value domain is enforced, because this
+    is the last point in the pipeline that can: `provenance` re-derives the
+    decision inside the submission bundle, which does not ship `rollout.py`, so
+    it can only check that the knob is a mode-shaped value. A report naming a
+    mode outside `ROLLOUT_FORWARD_MODES` therefore has to die here, before it
+    becomes a decision.
     """
     config = _configuration(records, context)
     ppo = config.get("ppo")
     declared = {
-        "compile_rollout": config.get("compile_rollout"),
+        ROLLOUT_FORWARD_MODE_KNOB: config.get(ROLLOUT_FORWARD_MODE_KNOB),
         "compile_update": ppo.get("compile_update") if isinstance(ppo, dict) else None,
     }
-    for knob, value in declared.items():
-        if type(value) is not bool:
-            raise ValueError(f"{context} benchmark configuration does not declare {knob}")
+    if declared[ROLLOUT_FORWARD_MODE_KNOB] not in ROLLOUT_FORWARD_MODES:
+        raise ValueError(
+            f"{context} benchmark configuration does not declare a collection forward mode "
+            f"from {list(ROLLOUT_FORWARD_MODES)}: {declared[ROLLOUT_FORWARD_MODE_KNOB]!r}"
+        )
+    if type(declared["compile_update"]) is not bool:
+        raise ValueError(f"{context} benchmark configuration does not declare compile_update")
     return declared
 
 
 def _comparable_configuration(config: dict[str, Any]) -> dict[str, Any]:
     """A configuration with only the knobs removed, so everything else must match.
+
+    Only the knobs: the collection precision stays in the comparison, because it
+    is not one. It is held at `PRODUCTION_ROLLOUT_BFLOAT16` on every node and
+    pinned there by `_validate_configuration`, so a chain that moved it would be
+    attributing a precision change to whichever knob its step happened to name.
 
     The batch-size sweep stays in the comparison. Only the production point's
     median is read below, so excluding it would be sound -- but the cost it was
@@ -512,7 +559,7 @@ def _comparable_configuration(config: dict[str, Any]) -> dict[str, Any]:
     the protocol from the tree.
     """
     comparable = dict(config)
-    del comparable["compile_rollout"]
+    del comparable[ROLLOUT_FORWARD_MODE_KNOB]
     comparable["ppo"] = {
         key: value for key, value in comparable["ppo"].items() if key != "compile_update"
     }
@@ -552,14 +599,22 @@ def choose_compilation(
     Because each knob is enabled only on top of the knobs before it in the
     chain, the decided configuration is a node of the chain and so was measured
     rather than projected.
+
+    The rollout knob is a collection forward mode rather than a boolean, so a
+    step turns it from `eager` to whichever mode the next node declares, and the
+    decision carries that mode rather than a `True`. The boolean it replaces
+    could only ever mean `cudagraphs`, which measures 5.309 ms against eager's
+    4.907 ms on the isolated collection forward: the only rollout knob a chain
+    could offer was the one mode worth refusing, and no attribution over it
+    could reach the 1.626 ms configuration that inductor with bf16 measures.
     """
     if type(expected_seed) is not int or expected_seed < 0:
         raise ValueError("expected seed must be a non-negative integer")
     reports = list(chain_records)
-    if len(reports) != len(COMPILE_KNOBS) + 1:
+    if len(reports) != len(CALIBRATION_KNOBS) + 1:
         raise ValueError(
-            f"a calibration chain over {len(COMPILE_KNOBS)} knobs needs "
-            f"{len(COMPILE_KNOBS) + 1} reports, one per configuration from all-eager to "
+            f"a calibration chain over {len(CALIBRATION_KNOBS)} knobs needs "
+            f"{len(CALIBRATION_KNOBS) + 1} reports, one per configuration from all-eager to "
             f"all-compiled; {len(reports)} were supplied"
         )
     contexts = [_chain_context(index, len(reports)) for index in range(len(reports))]
@@ -589,16 +644,31 @@ def choose_compilation(
                 f"{contexts[0]} and {context} benchmark configurations differ at {differing}"
             )
 
-    if any(declared[0].values()):
-        enabled = sorted(knob for knob, value in declared[0].items() if value)
+    enabled = sorted(
+        f"{knob}={declared[0][knob]!r}"
+        for knob in CALIBRATION_KNOBS
+        if declared[0][knob] != UNCOMPILED_KNOBS[knob]
+    )
+    if enabled:
         raise ValueError(
             f"the calibration chain must start all-eager; its first report has {enabled}"
         )
     steps: list[str] = []
-    for index in range(len(COMPILE_KNOBS)):
+    for index in range(len(CALIBRATION_KNOBS)):
         before, after = declared[index], declared[index + 1]
-        moved = [knob for knob in COMPILE_KNOBS if after[knob] != before[knob]]
-        if len(moved) != 1 or not after[moved[0]]:
+        moved = [knob for knob in CALIBRATION_KNOBS if after[knob] != before[knob]]
+        # A step turns exactly one knob on: that knob leaves its uncompiled
+        # value and no knob returns to one. With a mode-valued knob "on" is not
+        # a truth value, so both ends are compared against the uncompiled value
+        # rather than tested for truth. Otherwise a step from `cudagraphs` to
+        # `inductor` would read as turning the rollout knob on, and the pair
+        # said to isolate it would be two compiled runs -- the attribution below
+        # substitutes one node's phase median into the other's iteration total,
+        # which only answers "this knob or nothing" when one side is nothing.
+        if len(moved) != 1 or (
+            before[moved[0]] != UNCOMPILED_KNOBS[moved[0]]
+            or after[moved[0]] == UNCOMPILED_KNOBS[moved[0]]
+        ):
             raise ValueError(
                 f"the {contexts[index]} to {contexts[index + 1]} step of the calibration chain "
                 f"must turn exactly one knob on; it changes {sorted(moved)}"
@@ -658,15 +728,22 @@ def choose_compilation(
             "knob is measured against the configuration that would actually run"
         )
     decided_index = enabled_steps
-    decided = {knob: steps.index(knob) < enabled_steps for knob in COMPILE_KNOBS}
+    # Read back from the node that will run rather than reconstructed: for a
+    # mode-valued knob "on" is a particular mode, and the only honest source for
+    # which one is the report whose timings decided it.
+    decided = dict(declared[decided_index])
     return {
         **decided,
+        # Not a knob (see `_validate_configuration`), carried so the launched
+        # command states the collection precision its evidence was measured at
+        # instead of inheriting whatever the default is that day.
+        "rollout_bfloat16": validated[decided_index].configuration["rollout_bfloat16"],
         "minimum_compile_speedup": MINIMUM_COMPILE_SPEEDUP,
         "measured_compile_speedup": totals[0] / totals[-1],
         "attributed_knob_speedups": {
-            knob: evidence[knob]["attributed_iteration_speedup"] for knob in COMPILE_KNOBS
+            knob: evidence[knob]["attributed_iteration_speedup"] for knob in CALIBRATION_KNOBS
         },
-        "knob_evidence": {knob: evidence[knob] for knob in COMPILE_KNOBS},
+        "knob_evidence": {knob: evidence[knob] for knob in CALIBRATION_KNOBS},
         "chain": contexts,
         "chain_steps": steps,
         "decided_configuration": contexts[decided_index],
@@ -866,8 +943,9 @@ def main() -> None:
         iterations=args.iterations,
         max_hours=args.max_hours,
         seed=args.seed,
-        compile_rollout=bool(decision["compile_rollout"]),
+        rollout_forward_mode=decision[ROLLOUT_FORWARD_MODE_KNOB],
         compile_update=bool(decision["compile_update"]),
+        rollout_bfloat16=decision["rollout_bfloat16"],
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
         resume_checkpoint=resume_checkpoint,

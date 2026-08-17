@@ -111,7 +111,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         run_provenance = run_provenance_from_decision(
             {
                 "source_identity": source_identity(),
-                "compile_rollout": False,
+                "rollout_forward_mode": "eager",
                 "compile_update": False,
                 "eager_report_sha256": "a" * 64,
                 "eager_report_size_bytes": 100,
@@ -120,7 +120,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
                 "compiled_report_sha256": "b" * 64,
                 "compiled_report_size_bytes": 120,
                 "minimum_compile_speedup": 1.05,
-                "attributed_knob_speedups": {"compile_rollout": 1.0, "compile_update": 1.0},
+                "attributed_knob_speedups": {"rollout_forward_mode": 1.0, "compile_update": 1.0},
             },
         )
     torch.save(
@@ -300,20 +300,30 @@ def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Pat
     # carries whatever drift that pair happened to have. The configuration that
     # isolates a single knob was never run, so those numbers cannot be
     # re-attributed after the fact and the record is rejected, not migrated.
-    assert is_legacy_run_provenance({"format_version": 2, "sha256": "a" * 64, "calibration": {}})
 
     with pytest.raises(ValueError, match="carries superseded calibration provenance"):
         actor_artifact_from_checkpoint(checkpoint)
-    # And version 2 is refused at the same boundary, so a checkpoint written by
-    # the immediately preceding tree cannot export a decision whose evidence no
-    # longer substantiates it.
-    with pytest.raises(ValueError, match="carries superseded calibration provenance"):
-        actor_artifact_from_checkpoint(
-            {
-                **checkpoint,
-                "run_provenance": {"format_version": 2, "sha256": "a" * 64, "calibration": {}},
-            }
+    # Both superseded versions are refused at the same boundary, so a checkpoint
+    # written by an earlier tree cannot export a decision whose evidence no
+    # longer substantiates it. Version 3's rollout knob is a boolean whose
+    # only "on" value was `cudagraphs`, so the speedup it certifies belongs to a
+    # mode measurement rejects -- 5.309 ms against eager's 4.907 ms on the
+    # isolated collection forward -- and no mode can be recovered from `False`.
+    for superseded in (2, 3):
+        assert is_legacy_run_provenance(
+            {"format_version": superseded, "sha256": "a" * 64, "calibration": {}}
         )
+        with pytest.raises(ValueError, match="carries superseded calibration provenance"):
+            actor_artifact_from_checkpoint(
+                {
+                    **checkpoint,
+                    "run_provenance": {
+                        "format_version": superseded,
+                        "sha256": "a" * 64,
+                        "calibration": {},
+                    },
+                }
+            )
 
     # Corruption is not leniency's business: only a well-formed older version
     # is dropped, and anything else still raises on the read path.

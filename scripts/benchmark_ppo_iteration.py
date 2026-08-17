@@ -47,6 +47,7 @@ from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architect
 from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
+    ROLLOUT_FORWARD_MODES,
     allocate_rollout_storage,
     collect_mixed_play_rust,
 )
@@ -229,15 +230,55 @@ def parse_args() -> argparse.Namespace:
             "where the critic has collapsed onto the outermost atom"
         ),
     )
-    # Two knobs, not one. The rollout collector and the update share the model
-    # weights and nothing else: the collector captures a `cudagraphs` inference
-    # graph, the update compiles its own forward and backward, and a device
-    # synchronization separates the phases so their timings add exactly. Both
-    # are measured here against the same eager baseline because the answers
-    # differ in sign -- on the conv model compilation is a large win on the
-    # update and a large loss on the rollout, and a single flag would force the
-    # losing phase to ride along with the winning one.
-    parser.add_argument("--compile-rollout", action="store_true")
+    # Two phases, decided separately, because the answers differ in sign. The
+    # collector and the update share model weights and nothing else: the
+    # collector runs an inference forward under its own backend and precision,
+    # the update compiles its own forward and backward, and a device
+    # synchronization separates the phases so their timings add exactly. A
+    # single flag would force the losing phase to ride along with the winning
+    # one.
+    #
+    # The collection knob is a mode rather than a boolean because the measured
+    # ranking is not binary. Isolated learner forward on this box, median of
+    # 60: eager fp32 4.907 ms, cudagraphs fp32 5.309 ms, inductor fp32
+    # 2.720 ms, inductor bf16 1.626 ms. So `cudagraphs` -- the only mode the
+    # old `--compile-rollout` boolean could select -- is slower than not
+    # compiling at all, while `inductor` under bf16 is 3.0x faster than eager
+    # and 3.3x faster than cudagraphs. Whole rollout phase at the production
+    # 112-game wave, with the league ensemble following the mode as it does at
+    # the collector call below: eager/fp32 8.91 s, cudagraphs/fp32 8.02 s,
+    # eager/bf16 6.82 s, inductor/fp32 5.93 s, inductor/bf16 5.36 s. A boolean
+    # cannot pick a winner out of a ranking that puts its own "on" value
+    # fourth of five.
+    #
+    # The defaults are that winner, and it is not a speed-against-correctness
+    # trade. The collection forward's drift from the update-path replay is
+    # dominated by systematic differences between the two paths rather than by
+    # rounding, and the update path is already Inductor plus bf16, so matching
+    # it cancels most of the difference: the shipped parity gate over four
+    # production waves measures worst max_kl 2.2786e-04 under inductor/bf16
+    # against 1.9089e-03 under eager/fp32, on a bound of 5e-3. Faster by 1.66x
+    # and 8.4x further inside the gate.
+    parser.add_argument(
+        "--rollout-forward-mode",
+        choices=ROLLOUT_FORWARD_MODES,
+        default="inductor",
+        help="execution mode of the collection forward; `eager` is one of the modes, so this "
+        "alone decides whether the collector compiles",
+    )
+    parser.add_argument(
+        "--rollout-bfloat16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the collection forward under bf16 autocast; the update path is bf16 "
+        "regardless, so an fp32 collection is a second precision rather than a safer one",
+    )
+    # `--compile-rollout` is gone rather than kept as the mode's projection: the
+    # calibration chain identifies this phase's knob by the mode now, so nothing
+    # read the boolean, and a report carrying it would break the chain outright
+    # -- the launcher requires every non-knob configuration key to be identical
+    # across nodes, and a boolean derived from the mode differs exactly where
+    # the chain varies it.
     parser.add_argument("--compile-update", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -450,7 +491,16 @@ def main() -> None:
             },
             "model": model_config.to_dict(),
             "ppo": asdict(ppo_config),
-            "compile_rollout": args.compile_rollout,
+            # The collection configuration the rollout phase median was measured
+            # under; a benchmark that cannot say which mode it timed is not
+            # evidence for one, and this median is what the launcher attributes
+            # the rollout knob's speedup from. `rollout_forward_mode` is that
+            # knob, whole -- no boolean projection of it is recorded, because a
+            # projection would be a second name for one decision and the chain
+            # would have two places to disagree. `precision.use_bfloat16` above
+            # is the update path; `rollout_bfloat16` is this one.
+            "rollout_forward_mode": args.rollout_forward_mode,
+            "rollout_bfloat16": args.rollout_bfloat16,
             "torch": torch.__version__,
         }
     )
@@ -554,7 +604,13 @@ def main() -> None:
                 opponent_temperatures=opponent_temperatures,
                 deterministic_opponents=deterministic_opponents,
                 sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-                compile_models=args.compile_rollout,
+                # The frozen league ensemble follows the learner. Since the
+                # mode became authoritative, `compile_models` decides only
+                # whether that stacked forward compiles, and the configuration
+                # measurement selected compiled both -- a compiled learner
+                # beside an eager ensemble is a mix nothing trains in.
+                forward_mode=args.rollout_forward_mode,
+                forward_autocast=args.rollout_bfloat16,
                 storage=arena,
             )
             seed_cursor += physical_games

@@ -48,6 +48,7 @@ from kaggriculture.ppo import (
     update_replay_parity,
 )
 from kaggriculture.provenance import (
+    CALIBRATION_KNOBS,
     file_sha256,
     require_source_identity,
     run_provenance_from_decision,
@@ -56,6 +57,7 @@ from kaggriculture.provenance import (
 )
 from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
 from kaggriculture.rollout import (
+    ROLLOUT_FORWARD_MODES,
     RolloutBatch,
     allocate_rollout_storage,
     collect_mixed_play_rust,
@@ -147,12 +149,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
-    # Separate knobs, decided separately by calibration: the rollout
-    # collector and the update compile different graphs, and their measured
-    # speedups on the conv model fall on opposite sides of the threshold.
-    parser.add_argument("--compile-rollout", action="store_true")
+    # Two phases, two knobs, decided separately by calibration: the collection
+    # forward and the update compile different graphs, and their measured
+    # speedups on the conv model fall on opposite sides of the threshold. The
+    # collection knob is the forward mode below rather than a boolean, because
+    # the backend choice is what the measurement separates: on production
+    # 112-game waves with a real BC actor the isolated forward runs 4.907 ms
+    # eager, 5.309 ms cudagraphs and 2.720 ms inductor in fp32, so the old
+    # boolean's `cudagraphs` was a pessimization dressed as an optimization.
     parser.add_argument("--compile-update", action="store_true")
     parser.add_argument("--no-bfloat16", action="store_true")
+    # The collection forward is ~64% of a wave's wall clock, and these two
+    # defaults are where the measurement landed on both axes rather than a
+    # preference. Production 112-game waves, real BC actor: the rollout sweep
+    # moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x, and the
+    # shipped 4-wave `scripts/audit_replay_parity.py` gate on the league-mixed
+    # path moves worst max_kl 1.9089e-03 -> 2.2786e-04, 8.4x lower drift.
+    # Faster and closer to parity at once: the update path is already Inductor
+    # + bf16, so most of the collect/update gap is a systematic backend and
+    # precision difference, and matching the update path's backend and
+    # precision cancels it instead of adding to it. `--rollout-bfloat16` is the
+    # collection precision; `--no-bfloat16` above is the update's, and they are
+    # decided separately.
+    parser.add_argument(
+        "--rollout-forward-mode",
+        choices=ROLLOUT_FORWARD_MODES,
+        default="inductor",
+        help="collection forward backend, and the whole compile decision for "
+        "collection: eager does not compile; default inductor",
+    )
+    parser.add_argument(
+        "--rollout-bfloat16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the collection forward under bf16 autocast; default enabled",
+    )
     parser.add_argument(
         "--expected-source-digest",
         help="require the immutable source digest selected by the calibration launcher",
@@ -887,8 +918,14 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "opponent_temperature": args.opponent_temperature,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
-        "compile_rollout": args.compile_rollout,
         "compile_update": args.compile_update,
+        # The collection backend and precision both change the sampled behavior
+        # policy, so a resume that changes either is a different data generator
+        # and this record is what refuses it. The mode is also the calibrated
+        # rollout knob, cross-checked against the decision in
+        # `training.load_checkpoint`; the precision is fixed configuration.
+        "rollout_forward_mode": args.rollout_forward_mode,
+        "rollout_bfloat16": args.rollout_bfloat16,
         "device_type": device.type,
         "device_index": (
             torch.cuda.current_device()
@@ -1042,9 +1079,15 @@ def main() -> None:
         current_source_identity,
         bind_command=args.resume is None,
     )
+    # Exactly the knobs the decision attributes a speedup to, taken from the
+    # validator that re-derives them rather than restated here. The rollout knob
+    # is mode-valued, so `!=` rather than the `is not` a boolean allowed.
+    # `rollout_bfloat16` is deliberately not among them: collection precision is
+    # fixed configuration, pinned identical on every chain node instead of
+    # attributed, so the decision carries nothing to compare it against. It is
+    # recorded in `_training_data_config`, where a resume must match it exactly.
     if run_provenance is not None and any(
-        run_provenance["calibration"][knob] is not getattr(args, knob)
-        for knob in ("compile_rollout", "compile_update")
+        run_provenance["calibration"][knob] != getattr(args, knob) for knob in CALIBRATION_KNOBS
     ):
         raise ValueError("training compile mode does not match calibration run provenance")
     device = _device(args.device)
@@ -1116,9 +1159,13 @@ def main() -> None:
             )
         require_source_identity(resume_payload.get("source_identity"))
         checkpoint_run_provenance = validate_run_provenance(resume_payload.get("run_provenance"))
+        # The same attributed knobs as the launch-time check above, compared the
+        # same way. Collection precision is again left out; the
+        # `training_data_config` equality a few lines above already refuses a
+        # resume that changes it.
         if checkpoint_run_provenance is not None and any(
-            checkpoint_run_provenance["calibration"][knob] is not getattr(args, knob)
-            for knob in ("compile_rollout", "compile_update")
+            checkpoint_run_provenance["calibration"][knob] != getattr(args, knob)
+            for knob in CALIBRATION_KNOBS
         ):
             raise ValueError("resume checkpoint compile mode does not match calibration")
         if run_provenance is None:
@@ -1421,7 +1468,14 @@ def main() -> None:
             opponent_temperatures=opponent_temperatures if league_games else None,
             deterministic_opponents=deterministic_opponents if league_games else None,
             sampling_seed=sampling_seed,
-            compile_models=args.compile_rollout,
+            # One decision, stated once. `forward_mode` drives the learner
+            # forward, and `compile_models` -- which now governs only the
+            # frozen-league ensemble -- follows it, because the pairing the
+            # 1.66x speedup and the 4-wave parity gate were measured under had
+            # both compiled together. A non-eager mode must not leave the
+            # ensemble eager.
+            forward_mode=args.rollout_forward_mode,
+            forward_autocast=args.rollout_bfloat16,
             storage=rollout_arena if league_games else self_play_storage,
         )
         next_seed += args.games + league_games

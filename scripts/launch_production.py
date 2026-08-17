@@ -41,6 +41,8 @@ import tempfile
 from pathlib import Path
 
 from kaggriculture.production import (
+    PRODUCTION_ROLLOUT_BFLOAT16,
+    PRODUCTION_ROLLOUT_FORWARD_MODE,
     build_training_command,
     require_repository_launcher,
     resolve_resume_checkpoint,
@@ -88,13 +90,14 @@ def main() -> None:
         iterations=args.iterations,
         max_hours=args.max_hours,
         seed=args.seed,
-        compile_rollout=False,
+        rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
         compile_update=True,
         resume_checkpoint=resume_checkpoint,
     )
     launch = {
         "event": "direct_launch",
-        "compile_rollout": False,
+        "rollout_forward_mode": PRODUCTION_ROLLOUT_FORWARD_MODE,
+        "rollout_bfloat16": PRODUCTION_ROLLOUT_BFLOAT16,
         "compile_update": True,
         "iterations": args.iterations,
         "max_hours": args.max_hours,

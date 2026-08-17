@@ -18,7 +18,11 @@ from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.ppo import PpoConfig
-from kaggriculture.provenance import validate_run_provenance, validate_source_identity
+from kaggriculture.provenance import (
+    CALIBRATION_KNOBS,
+    validate_run_provenance,
+    validate_source_identity,
+)
 from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
@@ -47,8 +51,8 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
     if run_provenance is not None and (
         not isinstance(payload.get("training_data_config"), dict)
         or any(
-            payload["training_data_config"].get(knob) is not run_provenance["calibration"][knob]
-            for knob in ("compile_rollout", "compile_update")
+            payload["training_data_config"].get(knob) != run_provenance["calibration"][knob]
+            for knob in CALIBRATION_KNOBS
         )
     ):
         raise ValueError("checkpoint compile mode does not match run provenance")
@@ -217,8 +221,8 @@ def checkpoint_payload(
     if normalized_run_provenance is not None and (
         not isinstance(training_data_config, dict)
         or any(
-            training_data_config.get(knob) is not normalized_run_provenance["calibration"][knob]
-            for knob in ("compile_rollout", "compile_update")
+            training_data_config.get(knob) != normalized_run_provenance["calibration"][knob]
+            for knob in CALIBRATION_KNOBS
         )
     ):
         raise ValueError("checkpoint compile mode does not match run provenance")
@@ -226,8 +230,8 @@ def checkpoint_payload(
     # actually drives compilation in the update (see ppo.py). They arrive here
     # as independent parameters, so nothing but this makes them agree, and a
     # checkpoint whose record says compiled while its config says eager would
-    # carry provenance for a run that did not happen. `compile_rollout` needs
-    # no equivalent: the record is the only place it is stored.
+    # carry provenance for a run that did not happen. `rollout_forward_mode`
+    # needs no equivalent: the record is the only place it is stored.
     if (
         isinstance(training_data_config, dict)
         and "compile_update" in training_data_config

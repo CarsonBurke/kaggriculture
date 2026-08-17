@@ -639,48 +639,55 @@ def test_each_producer_is_labeled_by_the_knobs_it_actually_records() -> None:
     """Three producers name their compilation differently, so one key cannot
     label all of them.
 
-    The PPO iteration benchmark compiles a rollout phase and an update phase
-    and decides them separately, carrying `compile_rollout` at top level and
-    `compile_update` nested under `ppo`. The replay-parity audit carries both
-    at top level and has no `self_play_game_counts`. The rollout benchmark has
-    only the collector and carries `compile_models`. Reading one key for all
-    three does not raise -- it silently labels the others "eager", which drops
-    unlike runs into one TensorBoard series where the difference reads as noise
-    rather than as the knob it is.
+    The PPO iteration benchmark decides a collection phase and an update phase
+    separately, carrying `rollout_forward_mode` at top level and `compile_update`
+    nested under `ppo`. The replay-parity audit carries both at top level and has
+    no `self_play_game_counts`. The rollout benchmark has only the collector and
+    carries `compile_models`. Reading one key for all three does not raise -- it
+    silently labels the others "eager", which drops unlike runs into one
+    TensorBoard series where the difference reads as noise rather than as the
+    knob it is.
+
+    The collection half is a mode, so it is named rather than flagged: filing
+    `cudagraphs` and `inductor` together would hide a difference larger than
+    either one's difference from eager, 5.309 ms against 2.720 ms against
+    4.907 ms on the isolated fp32 forward.
     """
     ppo = {
         "event": "configuration",
         "self_play_game_counts": [112],
-        "compile_rollout": True,
+        "rollout_forward_mode": "inductor",
         "ppo": {"compile_update": True},
     }
     audit = {
         "event": "configuration",
         "self_play_games": 112,
-        "compile_rollout": True,
+        "rollout_forward_mode": "inductor",
         "compile_update": True,
     }
     rollout = {"event": "configuration", "games": [16], "compile_models": True}
 
-    assert telemetry._configuration_context(ppo) == ("ppo", "compiled")
-    assert telemetry._configuration_context(audit) == ("audit", "compiled")
+    assert telemetry._configuration_context(ppo) == ("ppo", "rollout-inductor-update-compiled")
+    assert telemetry._configuration_context(audit) == ("audit", "rollout-inductor-update-compiled")
     assert telemetry._configuration_context(rollout) == ("rollout", "compiled")
 
     # The mixed pairings are the point of the split, and the eager-collector
-    # against compiled-update one is what production actually runs. Labeling it
-    # "eager" would file a run whose update phase is ~1.8x faster alongside a
-    # genuinely eager one.
+    # against compiled-update one is what an update-only decision runs. Labeling
+    # it "eager" would file a run whose update phase is ~1.8x faster alongside a
+    # genuinely eager one. The two compiling modes are equally unmixable.
     for record, expected in (
-        ({**ppo, "compile_rollout": False}, "update-only"),
-        ({**ppo, "ppo": {"compile_update": False}}, "rollout-only"),
-        ({**audit, "compile_rollout": False}, "update-only"),
-        ({**audit, "compile_update": False}, "rollout-only"),
+        ({**ppo, "rollout_forward_mode": "eager"}, "rollout-eager-update-compiled"),
+        ({**ppo, "ppo": {"compile_update": False}}, "rollout-inductor-update-eager"),
+        ({**ppo, "rollout_forward_mode": "cudagraphs"}, "rollout-cudagraphs-update-compiled"),
+        ({**audit, "rollout_forward_mode": "eager"}, "rollout-eager-update-compiled"),
+        ({**audit, "compile_update": False}, "rollout-inductor-update-eager"),
+        ({**audit, "rollout_forward_mode": "cudagraphs"}, "rollout-cudagraphs-update-compiled"),
     ):
         assert telemetry._configuration_context(record)[1] == expected
 
     assert telemetry._configuration_context(
-        {**ppo, "compile_rollout": False, "ppo": {"compile_update": False}}
-    ) == ("ppo", "eager")
+        {**ppo, "rollout_forward_mode": "eager", "ppo": {"compile_update": False}}
+    ) == ("ppo", "rollout-eager-update-eager")
     assert telemetry._configuration_context({**rollout, "compile_models": False}) == (
         "rollout",
         "eager",
@@ -691,15 +698,21 @@ def test_each_producer_is_labeled_by_the_knobs_it_actually_records() -> None:
     # report a compiled run as eager.
     assert telemetry._configuration_context(
         {"event": "configuration", "self_play_game_counts": [112], "compile_models": True}
-    ) == ("ppo", "eager")
+    ) == ("ppo", "rollout-eager-update-eager")
     assert telemetry._configuration_context(
-        {"event": "configuration", "games": [16], "compile_rollout": True}
+        {"event": "configuration", "games": [16], "rollout_forward_mode": "inductor"}
     ) == ("rollout", "eager")
     # The ppo kind must not read `compile_update` from top level: that is the
     # audit's schema, and the two are distinguished precisely so this does not
     # silently succeed.
     assert telemetry._configuration_context(
         {"event": "configuration", "self_play_game_counts": [112], "compile_update": True}
-    ) == ("ppo", "eager")
+    ) == ("ppo", "rollout-eager-update-eager")
+    # A mode that is not a mode name is a label problem, not a mirror failure:
+    # the domain is enforced where a report becomes a decision.
+    assert telemetry._configuration_context({**ppo, "rollout_forward_mode": True}) == (
+        "ppo",
+        "rollout-eager-update-compiled",
+    )
     # A training journal carries no configuration record at all.
     assert telemetry._configuration_context({}) == ("rollout", "eager")

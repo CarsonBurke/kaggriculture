@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.production import build_training_command, resolve_resume_checkpoint
+from kaggriculture.production import (
+    PRODUCTION_ROLLOUT_FORWARD_MODE,
+    build_training_command,
+    resolve_resume_checkpoint,
+)
+from kaggriculture.registry import CONV_ENTITY
 
 
 def test_resume_detection_accepts_only_a_regular_latest_checkpoint(tmp_path: Path) -> None:
@@ -38,7 +43,7 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
         iterations=500,
         max_hours=0.0,
         seed=7,
-        compile_rollout=False,
+        rollout_forward_mode="eager",
         compile_update=False,
         expected_source_digest="a" * 64,
         calibration_decision=tmp_path / "decision.json",
@@ -65,7 +70,7 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
         iterations=500,
         max_hours=0.0,
         seed=7,
-        compile_rollout=False,
+        rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
         compile_update=False,
     )
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", *command[2:]])
@@ -75,6 +80,14 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
 
     assert args.architecture == CONV_ENTITY
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
+    # The collection backend and precision move the sampled behavior policy the
+    # parity gate bounds, so the command must state both rather than inherit a
+    # default, and the mode the production constant names has to be one
+    # train_ppo accepts -- argparse choices come from ROLLOUT_FORWARD_MODES.
+    assert command[command.index("--rollout-forward-mode") + 1] == PRODUCTION_ROLLOUT_FORWARD_MODE
+    assert "--rollout-bfloat16" in command
+    assert args.rollout_forward_mode == PRODUCTION_ROLLOUT_FORWARD_MODE
+    assert args.rollout_bfloat16 is True
 
 
 def test_warm_started_command_round_trips_through_the_training_parser(monkeypatch, tmp_path):
@@ -89,7 +102,7 @@ def test_warm_started_command_round_trips_through_the_training_parser(monkeypatc
         iterations=500,
         max_hours=0.0,
         seed=7,
-        compile_rollout=False,
+        rollout_forward_mode="eager",
         compile_update=False,
         initial_actor=artifact,
         critic_warmup_iterations=15,
@@ -113,7 +126,7 @@ def test_warm_start_and_resume_are_rejected_together(tmp_path: Path) -> None:
             iterations=500,
             max_hours=0.0,
             seed=7,
-            compile_rollout=False,
+            rollout_forward_mode="eager",
             compile_update=False,
             initial_actor=tmp_path / "bc-actor.pt",
             resume_checkpoint=tmp_path / "checkpoint-000010.pt",
@@ -127,7 +140,7 @@ def test_critic_warmup_without_a_warm_start_is_rejected(tmp_path: Path) -> None:
             iterations=500,
             max_hours=0.0,
             seed=7,
-            compile_rollout=False,
+            rollout_forward_mode="eager",
             compile_update=False,
             critic_warmup_iterations=15,
         )
@@ -140,7 +153,7 @@ def test_training_command_requires_digest_and_decision_together(tmp_path: Path) 
             iterations=1,
             max_hours=0.0,
             seed=7,
-            compile_rollout=False,
+            rollout_forward_mode="eager",
             compile_update=True,
             expected_source_digest="a" * 64,
         )
@@ -177,8 +190,10 @@ def _records(
     # Each report declares its own two knobs, and the chain's shape is read
     # back out of those declarations, so a fixture has to be able to set them
     # independently -- a single `compiled` flag can only express the two ends
-    # of the chain and not the middle report that makes it attributable.
-    compile_rollout: bool,
+    # of the chain and not the middle report that makes it attributable. The
+    # rollout knob is a mode name rather than a flag, so this takes the mode the
+    # report declares, which is also what the launcher reads back.
+    rollout_forward_mode: str,
     compile_update: bool,
     seconds: float,
     # The two phases are timed independently and decided independently, so
@@ -204,7 +219,16 @@ def _records(
     repeats = module.MINIMUM_CALIBRATION_REPEATS
     configuration: dict[str, object] = {
         "event": "configuration",
-        "compile_rollout": compile_rollout,
+        # Every key the benchmark emits belongs here, knob or not: the launcher
+        # compares all of them across the chain, so a key this fixture omits is
+        # a key nothing in this file exercises. The test at the end of this
+        # module is what keeps the two in step.
+        "architecture": CONV_ENTITY,
+        "rollout_forward_mode": rollout_forward_mode,
+        # Not a knob: fixed on every node, and the launcher pins it to
+        # production's value, so a chain that moved it is rejected rather than
+        # attributed to whichever knob its step named.
+        "rollout_bfloat16": module.PRODUCTION_ROLLOUT_BFLOAT16,
         "device": "cuda",
         "hardware": _hardware(),
         "self_play_game_counts": game_counts,
@@ -306,7 +330,13 @@ def _records(
 #: measured win, so the report that isolates the rollout knob is the one that
 #: already has the update compiled -- which is also the configuration a run
 #: with the update compiled would actually be launched in.
-_CHAIN_STEPS = ("compile_update", "compile_rollout")
+_CHAIN_STEPS = ("compile_update", "rollout_forward_mode")
+#: What each knob declares while its phase is uncompiled and once its step has
+#: turned it on. The rollout knob's values are mode names, `inductor` being the
+#: mode measurement selects; a fixture writing `True` there would describe a
+#: report the launcher refuses, since the mode is what the collector consults.
+_UNCOMPILED_KNOBS = {"rollout_forward_mode": "eager", "compile_update": False}
+_COMPILED_KNOBS = {"rollout_forward_mode": "inductor", "compile_update": True}
 
 
 def _chain(
@@ -334,16 +364,12 @@ def _chain(
     below is a median of a real sample rather than a point measurement wearing
     the name.
     """
-    knobs = [
-        {"compile_rollout": False, "compile_update": False},
-        {"compile_rollout": False, "compile_update": False},
-        {"compile_rollout": True, "compile_update": True},
-    ]
-    knobs[1][steps[0]] = True
+    knobs = [dict(_UNCOMPILED_KNOBS), dict(_UNCOMPILED_KNOBS), dict(_COMPILED_KNOBS)]
+    knobs[1][steps[0]] = _COMPILED_KNOBS[steps[0]]
     return [
         _records(
             module,
-            compile_rollout=node["compile_rollout"],
+            rollout_forward_mode=node["rollout_forward_mode"],
             compile_update=node["compile_update"],
             seconds=rollout[index] + update[index],
             rollout_share=rollout[index] / (rollout[index] + update[index]),
@@ -460,15 +486,15 @@ def test_a_chain_whose_every_step_earns_its_keep_compiles_every_knob() -> None:
 
     decision = module.choose_compilation(chain)
 
-    assert decision["compile_rollout"] is True
+    assert decision["rollout_forward_mode"] == "inductor"
     assert decision["compile_update"] is True
     assert decision["chain"] == ["eager", "mixed", "compiled"]
-    assert decision["chain_steps"] == ["compile_update", "compile_rollout"]
+    assert decision["chain_steps"] == ["compile_update", "rollout_forward_mode"]
     assert decision["minimum_compile_speedup"] == module.MINIMUM_COMPILE_SPEEDUP
     assert decision["measured_compile_speedup"] == pytest.approx(30.1 / 15.1)
     assert decision["attributed_knob_speedups"] == {
         "compile_update": pytest.approx(30.1 / 20.1),
-        "compile_rollout": pytest.approx(20.1 / 15.1),
+        "rollout_forward_mode": pytest.approx(20.1 / 15.1),
     }
     assert decision["knob_evidence"]["compile_update"]["isolated_by"] == ["eager", "mixed"]
     assert decision["decided_configuration"] == "compiled"
@@ -502,7 +528,9 @@ def test_a_chain_whose_steps_are_both_marginal_compiles_nothing() -> None:
         _chain(module, rollout=(10.0, 10.0, 9.8), update=(20.0, 19.6, 19.6))
     )
 
-    assert decision["compile_rollout"] is False
+    # The knob a chain leaves off reads as the mode that compiles nothing, not
+    # as a `False` the collector could not act on.
+    assert decision["rollout_forward_mode"] == "eager"
     assert decision["compile_update"] is False
     assert decision["decided_configuration"] == "eager"
     assert decision["decided_steady_total_seconds"] == pytest.approx(30.1)
@@ -535,19 +563,19 @@ def test_a_knob_is_decided_against_the_report_that_isolates_it() -> None:
     assert decision["measured_compile_speedup"] == pytest.approx(36.8054 / 16.7818)
     assert decision["measured_compile_speedup"] >= module.MINIMUM_COMPILE_SPEEDUP
     assert decision["compile_update"] is True
-    assert decision["compile_rollout"] is False
+    assert decision["rollout_forward_mode"] == "eager"
     assert decision["attributed_knob_speedups"]["compile_update"] == pytest.approx(
         36.8054 / 17.0054
     )
-    assert decision["attributed_knob_speedups"]["compile_rollout"] == pytest.approx(
+    assert decision["attributed_knob_speedups"]["rollout_forward_mode"] == pytest.approx(
         17.0054 / 16.7818
     )
-    assert decision["attributed_knob_speedups"]["compile_rollout"] < 1.05
+    assert decision["attributed_knob_speedups"]["rollout_forward_mode"] < 1.05
     assert decision["decided_configuration"] == "mixed"
     # The decided node is the mixed one, so the total the launcher records is
     # that node's own measured median rather than a configuration nobody ran.
     assert decision["decided_steady_total_seconds"] == pytest.approx(17.0054)
-    evidence = decision["knob_evidence"]["compile_rollout"]
+    evidence = decision["knob_evidence"]["rollout_forward_mode"]
     # The rollout knob is scored against the node that already has the update
     # compiled, not against all-eager: that is the configuration it would run
     # in, and it is the pair in which nothing but the rollout moved.
@@ -582,8 +610,8 @@ def test_a_knobs_attribution_ignores_drift_in_the_phases_its_step_held() -> None
         )
     )
 
-    steady_evidence = steady["knob_evidence"]["compile_rollout"]
-    drifted_evidence = drifted["knob_evidence"]["compile_rollout"]
+    steady_evidence = steady["knob_evidence"]["rollout_forward_mode"]
+    drifted_evidence = drifted["knob_evidence"]["rollout_forward_mode"]
     assert drifted_evidence["attributed_iteration_speedup"] == pytest.approx(
         steady_evidence["attributed_iteration_speedup"]
     )
@@ -601,7 +629,7 @@ def test_a_knobs_attribution_ignores_drift_in_the_phases_its_step_held() -> None
     }
     # The drift is not large enough to change the outcome here, which is the
     # point: the decision is the same because the attribution did not move.
-    assert drifted["compile_rollout"] is True
+    assert drifted["rollout_forward_mode"] == "inductor"
     assert drifted["decided_configuration"] == "compiled"
 
 
@@ -621,11 +649,11 @@ def test_a_large_speedup_on_a_small_phase_does_not_clear_the_iteration_floor() -
         _chain(module, rollout=(0.5, 0.5, 0.1), update=(40.0, 10.0, 10.0))
     )
 
-    evidence = decision["knob_evidence"]["compile_rollout"]
+    evidence = decision["knob_evidence"]["rollout_forward_mode"]
     assert evidence["phase_speedup"] == pytest.approx(5.0)
     assert evidence["attributed_iteration_speedup"] == pytest.approx(10.6 / 10.2)
     assert evidence["attributed_iteration_speedup"] < module.MINIMUM_COMPILE_SPEEDUP
-    assert decision["compile_rollout"] is False
+    assert decision["rollout_forward_mode"] == "eager"
     assert decision["compile_update"] is True
     assert decision["decided_configuration"] == "mixed"
 
@@ -666,9 +694,22 @@ def test_a_chain_that_is_not_a_single_knob_walk_from_all_eager_is_rejected() -> 
     # A chain starting with a knob already on never measures that knob: no pair
     # in it brackets the knob's own change.
     with pytest.raises(
-        ValueError, match=r"must start all-eager; its first report has \['compile_update'\]"
+        ValueError,
+        match=r"must start all-eager; its first report has \['compile_update=True'\]",
     ):
         module.choose_compilation([chain[1], chain[1], chain[2]])
+
+    # The same, stated as a mode: a first report already naming a compiling mode
+    # is a chain with no uncompiled end. The value is reported beside the knob
+    # because "on" is a particular mode now, and which one it was is what a
+    # reader has to see to fix the chain.
+    mode_first = _chain(module, **_EARNED, steps=("rollout_forward_mode", "compile_update"))
+    with pytest.raises(
+        ValueError,
+        match=r"must start all-eager; its first report has "
+        r"\[.rollout_forward_mode=.inductor..\]",
+    ):
+        module.choose_compilation([mode_first[1], mode_first[1], mode_first[2]])
 
     # A step that moves both knobs is the contaminated pair the middle report
     # exists to replace.
@@ -679,6 +720,36 @@ def test_a_chain_that_is_not_a_single_knob_walk_from_all_eager_is_rejected() -> 
     # the chain has no node in which both knobs are on to compare against.
     with pytest.raises(ValueError, match="must turn exactly one knob on"):
         module.choose_compilation([chain[0], chain[1], chain[0]])
+
+    # A step from one compiling mode to another moves the knob without leaving
+    # its uncompiled value, so the pair called on to isolate it is two compiled
+    # runs. Substituting one node's phase median into the other's total then
+    # answers "cudagraphs against inductor", which is not the question the floor
+    # is applied to, and the chain has no measurement of compiling at all.
+    walk = [
+        _records(module, rollout_forward_mode=mode, compile_update=False, seconds=10.0)
+        for mode in ("eager", "cudagraphs", "inductor")
+    ]
+    with pytest.raises(ValueError, match="must turn exactly one knob on"):
+        module.choose_compilation(walk)
+
+    # A mode outside the domain dies here, at the last point that can see the
+    # domain: `provenance` re-derives this decision inside a submission bundle
+    # that does not ship `rollout.py`, so it can only check that the knob is
+    # mode-shaped.
+    with pytest.raises(ValueError, match="does not declare a collection forward mode"):
+        module.choose_compilation(
+            [
+                _records(
+                    module,
+                    rollout_forward_mode="reduce-overhead",
+                    compile_update=False,
+                    seconds=10.0,
+                ),
+                chain[1],
+                chain[2],
+            ]
+        )
 
 
 def test_an_iteration_whose_phases_do_not_sum_to_its_total_is_rejected() -> None:
@@ -752,7 +823,7 @@ def test_a_summary_whose_phase_medians_describe_no_iteration_is_rejected() -> No
     decision = _decide_with_divergence_allowed(module, chain)
     assert decision["attributed_knob_speedups"]["compile_update"] == pytest.approx(10.1 / 10.0)
     assert decision["compile_update"] is False
-    assert decision["compile_rollout"] is False
+    assert decision["rollout_forward_mode"] == "eager"
 
 
 def test_a_knobs_attribution_is_anchored_on_a_measured_iteration_total() -> None:
@@ -842,7 +913,7 @@ def test_a_calibration_may_time_only_the_production_batch_on_every_node() -> Non
 
     decision = module.choose_compilation(_chain(module, **_EARNED, game_counts=[112]))
 
-    assert decision["compile_rollout"] is True
+    assert decision["rollout_forward_mode"] == "inductor"
     assert decision["compile_update"] is True
     assert decision["measured_compile_speedup"] == pytest.approx(30.1 / 15.1)
 
@@ -906,7 +977,8 @@ def test_report_reader_hashes_exact_bytes_and_rejects_nonstandard_json(tmp_path:
     module = _script()
     report = tmp_path / "report.jsonl"
     contents = _write_report(
-        report, _records(module, compile_rollout=False, compile_update=False, seconds=10.0)
+        report,
+        _records(module, rollout_forward_mode="eager", compile_update=False, seconds=10.0),
     )
 
     document = module._read_report(report)
@@ -976,7 +1048,10 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert invocation["command"] == decision["training_command"]
     assert decision["resume_checkpoint"] == str(latest_checkpoint)
     assert decision["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
-    assert "--compile-rollout" in decision["training_command"]
+    forward_mode = decision["training_command"].index("--rollout-forward-mode") + 1
+    assert decision["training_command"][forward_mode] == "inductor"
+    assert "--rollout-bfloat16" in decision["training_command"]
+    assert "--compile-rollout" not in decision["training_command"]
     assert "--compile-update" in decision["training_command"]
     assert "--entropy-coefficient" not in decision["training_command"]
     assert "entropy_coefficient" not in module.production_ppo_config(compile_update=False)
@@ -1037,8 +1112,10 @@ def test_direct_launch_compiles_without_calibration_evidence(
     launch = json.loads((run_directory / "launch.json").read_text())
     assert launch["event"] == "direct_launch"
     # The direct launcher carries no measurement, so it takes the standing
-    # per-phase evidence: the update is compiled and the rollout is not.
-    assert launch["compile_rollout"] is False
+    # per-phase evidence: the update is compiled, and collection runs the mode
+    # and precision the rollout sweep and the parity gate both selected.
+    assert launch["rollout_forward_mode"] == PRODUCTION_ROLLOUT_FORWARD_MODE
+    assert launch["rollout_bfloat16"] is True
     assert launch["compile_update"] is True
     assert launch["iterations"] == 17
     assert launch["resume_checkpoint"] == str(latest_checkpoint)
@@ -1046,6 +1123,11 @@ def test_direct_launch_compiles_without_calibration_evidence(
     assert invocation["executable"] == sys.executable
     assert invocation["command"] == launch["training_command"]
     assert "--compile-rollout" not in launch["training_command"]
+    assert (
+        launch["training_command"][launch["training_command"].index("--rollout-forward-mode") + 1]
+        == PRODUCTION_ROLLOUT_FORWARD_MODE
+    )
+    assert "--rollout-bfloat16" in launch["training_command"]
     assert "--compile-update" in launch["training_command"]
     assert "--expected-source-digest" not in launch["training_command"]
     assert "--calibration-decision" not in launch["training_command"]
@@ -1149,8 +1231,82 @@ def test_a_warmup_that_outlasts_the_run_is_rejected(tmp_path: Path) -> None:
             iterations=15,
             max_hours=0.0,
             seed=7,
-            compile_rollout=False,
+            rollout_forward_mode="eager",
             compile_update=False,
             initial_actor=tmp_path / "bc-actor.pt",
             critic_warmup_iterations=15,
         )
+
+
+def test_the_chain_fixture_declares_every_key_a_real_benchmark_emits(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`_records` writes a configuration record by hand, and that is how a real
+    breakage hid in this file.
+
+    `_comparable_configuration` removes the knobs and requires every remaining
+    key to be identical across the three nodes, so a key the benchmark emits and
+    this fixture omits is enforced by the launcher and exercised by nothing here.
+    When the collection mode and precision were added to the report, every real
+    chain began failing with "eager and compiled benchmark configurations differ
+    at ['rollout_bfloat16', 'rollout_forward_mode']" while every chain test above
+    stayed green, because the fixture had never heard of either key.
+
+    So the fixture is checked against the script rather than against itself. Only
+    the key set: the values differ by design (this fixture runs cuda medians the
+    benchmark below cannot produce on cpu), and it is the key set that decides
+    what the launcher compares.
+    """
+    module = _script()
+    benchmark = _script("benchmark_ppo_iteration.py")
+
+    class Collected(Exception):
+        """Ends the benchmark at its first collection, after the record is written."""
+
+    def collect(*_arguments: object, **_keywords: object) -> None:
+        raise Collected
+
+    monkeypatch.setattr(benchmark, "collect_mixed_play_rust", collect)
+    report = tmp_path / "benchmark.jsonl"
+    # A one-game cpu wave with a small model: the configuration record is emitted
+    # before any of the timing happens, and the knobs are inert off cuda anyway.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_ppo_iteration.py",
+            "--device",
+            "cpu",
+            "--games",
+            "1",
+            "--league-games",
+            "2",
+            "--league-opponents",
+            "2",
+            "--repeats",
+            "2",
+            "--cnn-width",
+            "8",
+            "--cnn-blocks",
+            "1",
+            "--model-dim",
+            "16",
+            "--transformer-layers",
+            "3",
+            "--output",
+            str(report),
+        ],
+    )
+    try:
+        with pytest.raises(Collected):
+            benchmark.main()
+    finally:
+        benchmark._configure_report(None)
+
+    emitted = json.loads(report.read_text(encoding="utf-8").splitlines()[0])
+    fixture = _records(module, rollout_forward_mode="inductor", compile_update=True, seconds=10.0)[
+        0
+    ]
+
+    assert emitted["event"] == "configuration"
+    assert set(emitted) == set(fixture)

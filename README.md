@@ -74,13 +74,17 @@ benchmark() {
     --output "$repo/artifacts/benchmarks/$name-ppo.jsonl"
 }
 
-benchmark eager
-benchmark mixed --compile-update
-benchmark compiled --compile-rollout --compile-update
+benchmark eager    --rollout-forward-mode eager    --rollout-bfloat16
+benchmark mixed    --rollout-forward-mode eager    --rollout-bfloat16 --compile-update
+benchmark compiled --rollout-forward-mode inductor --rollout-bfloat16 --compile-update
 ```
 
 All three time the production batch from the same source snapshot and differ
-only in the compile flags. Launch training from the complete set:
+only in the knob each step turns on. The collection precision is stated on every
+node rather than left to the default because it is not a knob: the launcher
+requires it to be identical across the chain and equal to production's, so a
+chain measured in fp32 is rejected instead of launched. Launch training from the
+complete set:
 
 ```bash
 .venv/bin/python scripts/launch_calibrated_training.py \
@@ -134,17 +138,36 @@ configuration that would actually run.
 
 The two knobs are not a formality: at six repeats on the conv model they land
 on opposite sides of the threshold. The update knob is worth about 2.73x on the
-whole iteration and is enabled. The rollout knob is worth about 1.006x on the
-whole iteration -- 1.027x on its own phase, roughly 0.2 s out of 37 s -- and is
-rejected. An earlier two-repeat calibration reported the rollout at about
-0.46x, the collector's per-step graph replay supposedly costing more than the
-kernel launches it removes; that figure is withdrawn rather than explained. It
+whole iteration and is enabled. The boolean rollout knob these numbers come
+from measured about 1.006x on the whole iteration -- 1.027x on its own phase,
+roughly 0.2 s out of 37 s -- and was rejected. An earlier two-repeat
+calibration reported the rollout at about 0.46x, the collector's per-step graph
+replay supposedly costing more than the kernel launches it removes; that figure
+is withdrawn rather than explained. It
 does not survive six repeats, where the compiled rollout median is 7.876 s
 against an eager 8.200 s in that earlier run and 8.505 s in the current one. A
 single blended total would still enable both knobs, since their sum favors
 compiling, and the run would carry the rollout's warmup and replay risk to buy
 two tenths of a second. Read each run's own decision file for its numbers
 rather than these; the point that survives is the shape, not the magnitude.
+
+That rejection was right about the mode it was offered, and it is why the
+rollout knob is a mode rather than a flag. The boolean's only "on" value was
+`cudagraphs`, which measures 5.309 ms against eager's 4.907 ms on the isolated
+collection forward, median of 60 waves in fp32: slower than not compiling at
+all, so no chain over that flag could have found anything better than eager.
+`inductor` with `reduce-overhead` measures 2.720 ms in fp32 and 1.626 ms under
+bf16 autocast, and end to end on the stage profile it is 1.87x faster -- 9.408
+ms per step against 5.035 ms, a projected rollout phase of 6.76 s against
+3.62 s. It is also 8.4x further inside the gate it risks: over four production
+waves the shipped replay-parity audit measures a worst max_kl of 2.2786e-04
+under inductor/bf16 against 1.9089e-03 under eager/fp32, on a bound of 5e-3.
+The drift is dominated by systematic differences between the collection and the
+update path rather than by rounding, and the update path is already Inductor
+plus bf16, so matching it cancels most of the difference. That is also why the
+collection precision is held fixed at bf16 on every node instead of becoming a
+third knob: three reports attribute two knobs because each step moves exactly
+one, and the precision's answer is settled by measurement outside the chain.
 
 All three reports time the production batch and nothing else, because the
 decision reads the steady medians at 112 games and nothing from the other
@@ -295,9 +318,9 @@ silently excluded:
 
 Use at least `--seeds 128` for finalists. Rank stable-panel results, not the
 training self-play score (which is 0.5 by symmetry) or `latest.pt`. Evaluation
-takes no compilation flag: `--compile-rollout` and `--compile-update` are
-training knobs, decided by the calibration described above, and the evaluation
-and selection scripts accept neither.
+takes no compilation flag: `--rollout-forward-mode`, `--rollout-bfloat16` and
+`--compile-update` are training knobs, decided by the calibration described
+above, and the evaluation and selection scripts accept none of them.
 
 To screen every numbered checkpoint on identical paired seeds and atomically
 promote the strongest lower-confidence-bound result:

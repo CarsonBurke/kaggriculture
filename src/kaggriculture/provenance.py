@@ -26,7 +26,17 @@ SOURCE_IDENTITY_FORMAT_VERSION = 1
 # version-2 record retains cannot be re-attributed after the fact, because the
 # configuration that isolates each knob was never run, so it is rejected rather
 # than migrated.
-RUN_PROVENANCE_FORMAT_VERSION = 3
+#
+# Bumped to 4 when the rollout knob stopped being a boolean. The execution mode
+# of the collection forward is the knob now, because the measured ranking is not
+# binary: isolated collection forward, median of 60, eager fp32 4.907 ms,
+# cudagraphs fp32 5.309 ms, inductor fp32 2.720 ms, inductor bf16 1.626 ms. A
+# version-3 record spells `compile_rollout: true` for what was always
+# `cudagraphs`, the one mode slower than not compiling at all, so its attributed
+# speedup certifies a configuration nothing would now select; and `false` names
+# no mode whatsoever. Neither value is a mode, so a version-3 record is rejected
+# rather than read as one.
+RUN_PROVENANCE_FORMAT_VERSION = 4
 #: The speedup floor a knob must clear to be enabled, measured on the whole
 #: iteration rather than on the knob's own phase: a knob that halves a phase
 #: worth 2% of an iteration has not earned the compile. It lives here rather
@@ -36,6 +46,34 @@ RUN_PROVENANCE_FORMAT_VERSION = 3
 #: launcher imports this; provenance.py cannot import the launcher, since this
 #: module ships inside the submission bundle and scripts/ does not.
 MINIMUM_COMPILE_SPEEDUP = 1.05
+#: The knobs a calibration decides, which is also the schema of the speedups
+#: recorded beside them. They live here for the same reason the floor above
+#: does: this module re-derives every decision, so the set it validates against
+#: cannot be owned by the launcher it is validating. The rollout knob is named
+#: separately because its value is a mode rather than a boolean, and two places
+#: below have to agree on which knob that is.
+ROLLOUT_FORWARD_MODE_KNOB = "rollout_forward_mode"
+CALIBRATION_KNOBS = (ROLLOUT_FORWARD_MODE_KNOB, "compile_update")
+#: The rollout knob's value when the collection forward is not compiled.
+#:
+#: The knob is mode-valued and its domain is `ROLLOUT_FORWARD_MODES` in
+#: `kaggriculture.rollout`, which this module deliberately does not import:
+#: `build_submission.PACKAGE_FILES` ships provenance.py into the submission
+#: bundle but not rollout.py, and rollout.py pulls in `kaggle_environments` and
+#: the native extension, so the import would be a ModuleNotFoundError at agent
+#: startup -- exactly where `inference.CheckpointAgent` validates a checkpoint's
+#: run provenance. Only the off value is needed here, because all this module
+#: re-derives is whether the knob was enabled, and an inference agent has no
+#: legitimate interest in which backend collected the rollouts it learned from.
+#:
+#: Membership in the domain is enforced wherever the domain is knowable:
+#: argparse `choices=ROLLOUT_FORWARD_MODES` at every entrypoint, and the
+#: launcher's `_declared_knobs`, which reads the mode out of the benchmark
+#: reports a decision is derived from. That is what makes the structural check
+#: below sufficient rather than lax -- a mode outside the domain cannot match
+#: any launchable `--rollout-forward-mode`, so training refuses the record whose
+#: calibration names it.
+UNCOMPILED_ROLLOUT_FORWARD_MODE = "eager"
 
 
 def is_legacy_run_provenance(value: object) -> bool:
@@ -295,6 +333,27 @@ def _run_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
 
+def _decided_knob_enabled(knob: str, value: object) -> bool:
+    """Whether a recorded knob decision turned its phase's compilation on.
+
+    Every knob is re-derived from the speedup recorded beside it, and a speedup
+    can only certify a yes or a no, so a mode-valued knob is projected onto one.
+    Which mode was chosen is not derivable from a ratio and is not re-derived
+    here: it is pinned by the three report digests the record already carries,
+    because the chain node that produced them declared it.
+    """
+    if knob != ROLLOUT_FORWARD_MODE_KNOB:
+        if type(value) is not bool:
+            raise ValueError(f"run provenance {knob} decision must be boolean")
+        return value
+    # A missing key or a boolean here is a format-3 record wearing a version-4
+    # number: `False` is not a mode, and reading it as `eager` would let a record
+    # that never stated one pass as though it had.
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"run provenance {knob} decision must be a collection forward mode")
+    return value != UNCOMPILED_ROLLOUT_FORWARD_MODE
+
+
 def _normalized_run_provenance(value: dict[str, Any]) -> dict[str, Any]:
     """Validate and canonicalize everything a run provenance digest covers.
 
@@ -312,8 +371,7 @@ def _normalized_run_provenance(value: dict[str, Any]) -> dict[str, Any]:
         "eager_report",
         "mixed_report",
         "compiled_report",
-        "compile_rollout",
-        "compile_update",
+        *CALIBRATION_KNOBS,
         "minimum_compile_speedup",
         "attributed_knob_speedups",
     }:
@@ -368,22 +426,20 @@ def _normalized_run_provenance(value: dict[str, Any]) -> dict[str, Any]:
     # iteration, and a raw total ratio across the pair would credit the knob
     # with the pair's drift on phases it does not touch.
     measured = calibration["attributed_knob_speedups"]
-    knobs = ("compile_rollout", "compile_update")
-    if not isinstance(measured, dict) or set(measured) != set(knobs):
+    if not isinstance(measured, dict) or set(measured) != set(CALIBRATION_KNOBS):
         raise ValueError("run provenance attributed knob speedups have an invalid schema")
     speedups = {}
-    for knob in knobs:
-        if type(calibration[knob]) is not bool:
-            raise ValueError(f"run provenance {knob} decision must be boolean")
+    for knob in CALIBRATION_KNOBS:
+        enabled = _decided_knob_enabled(knob, calibration[knob])
         speedups[knob] = _positive_number(measured[knob], f"attributed {knob} speedup")
-        if calibration[knob] != (speedups[knob] >= minimum_speedup):
+        if enabled != (speedups[knob] >= minimum_speedup):
             raise ValueError(f"run provenance {knob} decision contradicts measured speedup")
     return {
         "format_version": RUN_PROVENANCE_FORMAT_VERSION,
         "source_identity": identity,
         "calibration": {
             **reports,
-            **{knob: calibration[knob] for knob in knobs},
+            **{knob: calibration[knob] for knob in CALIBRATION_KNOBS},
             "minimum_compile_speedup": minimum_speedup,
             "attributed_knob_speedups": speedups,
         },
@@ -425,8 +481,7 @@ def run_provenance_from_decision(decision: object) -> dict[str, Any]:
                 }
                 for name in ("eager", "mixed", "compiled")
             },
-            "compile_rollout": decision.get("compile_rollout"),
-            "compile_update": decision.get("compile_update"),
+            **{knob: decision.get(knob) for knob in CALIBRATION_KNOBS},
             "minimum_compile_speedup": decision.get("minimum_compile_speedup"),
             "attributed_knob_speedups": decision.get("attributed_knob_speedups"),
         },
