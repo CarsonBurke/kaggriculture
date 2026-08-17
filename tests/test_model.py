@@ -23,6 +23,7 @@ from kaggriculture.encoding import (
 from kaggriculture.model import (
     AxialRotaryEmbedding,
     DistributionalCritic,
+    EntityTransformer,
     FarmActor,
     ModelConfig,
     SelfAttention,
@@ -371,3 +372,55 @@ def test_quantity_head_rejects_misaligned_selected_kinds() -> None:
 
     with pytest.raises(ValueError, match="must align"):
         actor.quantity_logits(context, torch.zeros(2, MAX_MARKET_ORDERS - 1, dtype=torch.long))
+
+
+def _trunk_case() -> tuple[EntityTransformer, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(0)
+    config = _small_config()
+    trunk = EntityTransformer(config).eval()
+    tokens = torch.randn(3, 12, config.model_dim)
+    positions = torch.randint(0, BOARD_SIZE, (3, 12, 2))
+    return trunk, tokens, positions
+
+
+def test_unmasked_trunk_matches_an_all_true_mask() -> None:
+    """`valid=None` is the claim that masking every row true changes nothing.
+
+    The critic relies on it to skip 26 full-tensor writes, so the two spellings
+    must agree exactly, not approximately.
+    """
+    trunk, tokens, positions = _trunk_case()
+    every_row = torch.ones(*tokens.shape[:2], 1, dtype=torch.bool)
+
+    with torch.no_grad():
+        masked = trunk(tokens, positions, every_row)
+        unmasked = trunk(tokens, positions, None)
+
+    assert torch.equal(masked, unmasked)
+
+
+def test_single_query_readout_matches_the_full_width_trunk() -> None:
+    """A narrowed final block must reproduce the rows it still computes.
+
+    Every token stays a key and a value; only the queries are dropped. So the
+    kept prefix has to match the full-width result, which is what lets the
+    critic read its value from one row without paying for a hundred others.
+    """
+    trunk, tokens, positions = _trunk_case()
+
+    with torch.no_grad():
+        full = trunk(tokens, positions, None)
+        narrowed = trunk(tokens, positions, None, readout=2)
+
+    assert narrowed.shape == (tokens.shape[0], 2, tokens.shape[2])
+    torch.testing.assert_close(narrowed, full[:, :2], rtol=0.0, atol=1e-6)
+
+
+def test_a_masked_block_refuses_to_drop_query_rows() -> None:
+    """Zeroed rows are still attended to, so a mixed mask cannot skip queries."""
+    trunk, tokens, positions = _trunk_case()
+    mixed = torch.ones(*tokens.shape[:2], 1, dtype=torch.bool)
+    mixed[:, -1] = False
+
+    with pytest.raises(ValueError, match="cannot drop query rows"):
+        trunk(tokens, positions, mixed, readout=1)

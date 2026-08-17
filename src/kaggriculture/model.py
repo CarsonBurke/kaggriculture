@@ -91,10 +91,20 @@ def _group_count(width: int) -> int:
 
 
 class ReluSquared(nn.Module):
-    """Parameter-free ReLU-squared activation used throughout the network."""
+    """Parameter-free ReLU-squared activation used throughout the network.
+
+    Written as a self-multiply rather than `.square()` because `aten::pow` sits on
+    autocast's fp32 cast list while `aten::mul` does not. Under the production
+    bf16 autocast `.square()` therefore upcast its input, ran in fp32, and returned
+    fp32 -- on the FFN's 4x-wide activation, the widest tensor in the model. The
+    precision bought nothing: every consumer is a `Linear` or `Conv2d`, which
+    autocast casts straight back down, so both spellings round exactly once. The
+    self-multiply keeps the activation in the compute dtype and halves its traffic.
+    """
 
     def forward(self, inputs: Tensor) -> Tensor:
-        return F.relu(inputs).square()
+        activated = F.relu(inputs)
+        return activated * activated
 
 
 class ResidualBlock(nn.Module):
@@ -272,19 +282,37 @@ class SelfAttention(nn.Module):
         self.key_norm = nn.RMSNorm(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
 
-    def forward(self, inputs: Tensor, rotation: tuple[Tensor, Tensor]) -> Tensor:
+    def forward(
+        self,
+        inputs: Tensor,
+        rotation: tuple[Tensor, Tensor],
+        readout: int | None = None,
+    ) -> Tensor:
         batch, tokens, width = inputs.shape
+        if readout is not None and not 0 < readout <= tokens:
+            raise ValueError("readout must name a nonempty prefix of the tokens")
         qkv = self.qkv(inputs).view(batch, tokens, 3, self.heads, self.head_dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
         query = self.query_norm(query)
         key = self.key_norm(key)
         query, key = AxialRotaryEmbedding.apply_rotation(query, key, rotation)
+        query_tokens = tokens
+        if readout is not None:
+            # Every token stays a key and a value; only the leading `readout` rows
+            # are still queried, and the slice sits after the rotation, so the kept
+            # rows are algebraically the same computation. They are not bit-equal
+            # on CUDA: a one-row query selects a different Flash tiling and
+            # `_sdpa_inputs` has already dropped to bf16, so the kept rows move by
+            # roughly one bf16 rounding. Only the critic narrows, and its value
+            # estimate carries no cross-path parity contract.
+            query = query[:, :, :readout]
+            query_tokens = readout
         query, key, value = _sdpa_inputs(query, key, value)
         # Inactive unit tokens are explicitly zeroed at every block boundary.
         # Omitting an attention mask keeps this static-shape call Flash-eligible.
         attended = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
         attended = attended.to(dtype=inputs.dtype)
-        attended = attended.transpose(1, 2).reshape(batch, tokens, width)
+        attended = attended.transpose(1, 2).reshape(batch, query_tokens, width)
         return self.output(attended)
 
 
@@ -310,7 +338,19 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = nn.RMSNorm(config.model_dim)
         self.ffn = ReluSquaredFeedForward(config)
 
-    def forward(self, inputs: Tensor, rotation: tuple[Tensor, Tensor], valid: Tensor) -> Tensor:
+    def forward(
+        self,
+        inputs: Tensor,
+        rotation: tuple[Tensor, Tensor],
+        valid: Tensor | None,
+        readout: int | None = None,
+    ) -> Tensor:
+        if valid is None:
+            attended = self.attention(self.attention_norm(inputs), rotation, readout)
+            hidden = (inputs if readout is None else inputs[:, :readout]) + attended
+            return hidden + self.ffn(self.ffn_norm(hidden))
+        if readout is not None:
+            raise ValueError("a masked block cannot drop query rows")
         hidden = torch.where(valid, inputs, 0.0)
         hidden = torch.where(
             valid,
@@ -332,18 +372,44 @@ class EntityTransformer(nn.Module):
         self.decoder = nn.ModuleList(TransformerBlock(config) for _ in range(side_depth))
         self.output_norm = nn.RMSNorm(config.model_dim)
 
-    def forward(self, inputs: Tensor, positions: Tensor, valid: Tensor) -> Tensor:
+    def forward(
+        self,
+        inputs: Tensor,
+        positions: Tensor,
+        valid: Tensor | None,
+        readout: int | None = None,
+    ) -> Tensor:
+        """Run the trunk, optionally narrowing the final block to a token prefix.
+
+        `valid` gates the residual stream rather than attention itself, so an
+        all-true mask is arithmetically the identity. Passing `None` says so and
+        drops 3 full-tensor `torch.where` per block plus 2 more here -- 26 masked
+        writes over the critic's [B, 101, 96] stream that provably changed nothing.
+        Callers whose mask is genuinely mixed must keep passing it: invalid rows are
+        still attended to as zero-valued keys, so zeroing them is load-bearing.
+
+        `readout` says the caller reads only the leading rows of the result. The last
+        block then queries just those, while every token still supplies a key and a
+        value, so the returned rows are the same computation up to the attention
+        backend's tiling. A consumer reading one row of 101 was paying for the final
+        block's output projection and 4x-wide FFN on a hundred token rows that
+        nothing downstream could observe; those rows already received no gradient,
+        since the value head discarded them.
+        """
         rotation = self.rope.rotation(positions)
-        hidden = torch.where(valid, inputs, 0.0)
+        hidden = inputs if valid is None else torch.where(valid, inputs, 0.0)
         skips: list[Tensor] = []
         for block in self.encoder:
             hidden = block(hidden, rotation, valid)
             skips.append(hidden)
         hidden = self.bottleneck(hidden, rotation, valid)
-        for block, skip in zip(self.decoder, reversed(skips), strict=True):
-            hidden = torch.where(valid, (hidden + skip) * math.sqrt(0.5), 0.0)
-            hidden = block(hidden, rotation, valid)
-        return torch.where(valid, self.output_norm(hidden), 0.0)
+        last = len(self.decoder) - 1
+        for index, (block, skip) in enumerate(zip(self.decoder, reversed(skips), strict=True)):
+            merged = (hidden + skip) * math.sqrt(0.5)
+            hidden = merged if valid is None else torch.where(valid, merged, 0.0)
+            hidden = block(hidden, rotation, valid, readout if index == last else None)
+        normalized = self.output_norm(hidden)
+        return normalized if valid is None else torch.where(valid, normalized, 0.0)
 
 
 def _board_positions() -> Tensor:
@@ -589,13 +655,6 @@ class DistributionalCritic(nn.Module):
         board_tokens = self.spatial(board).flatten(2).transpose(1, 2)
         board_tokens = board_tokens + self.token_types.weight[1]
         tokens = torch.cat((state_token, board_tokens), dim=1)
-        valid = torch.ones(
-            batch,
-            tokens.shape[1],
-            1,
-            device=tokens.device,
-            dtype=torch.bool,
-        )
         zero_position = torch.zeros(
             batch,
             1,
@@ -604,9 +663,14 @@ class DistributionalCritic(nn.Module):
             dtype=self.board_positions.dtype,
         )
         positions = torch.cat(
-            (zero_position, self.board_positions.unsqueeze(0).expand(batch, -1, -1)), dim=1
+            (zero_position, self.board_positions.unsqueeze(0).expand(batch, -1, -1)),
+            dim=1,
         )
-        return self.value_head(self.transformer(tokens, positions, valid)[:, 0]).contiguous()
+        # The state token and all hundred board tokens are always present, so this
+        # critic has no invalid rows to mask, and the value is read from the state
+        # token alone -- a single query into the final block.
+        value_token = self.transformer(tokens, positions, None, readout=1)[:, 0]
+        return self.value_head(value_token).contiguous()
 
     def value(self, logits: Tensor) -> Tensor:
         return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)

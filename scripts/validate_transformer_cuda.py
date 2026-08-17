@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove CUDA Flash-Attention dispatch and finite transformer gradients."""
+"""Prove CUDA Flash dispatch, autocast dtypes, and finite transformer gradients."""
 
 from __future__ import annotations
 
@@ -17,7 +17,13 @@ from kaggriculture.encoding import (
     GLOBAL_FEATURES,
     UNIT_FEATURES,
 )
-from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig, parameter_count
+from kaggriculture.model import (
+    DistributionalCritic,
+    FarmActor,
+    ModelConfig,
+    ReluSquaredFeedForward,
+    parameter_count,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +56,26 @@ def _gradient_issues(module: torch.nn.Module) -> tuple[list[str], list[str]]:
         elif not bool(torch.isfinite(parameter.grad).all()):
             nonfinite.append(name)
     return missing, nonfinite
+
+
+def _autocast_residual_dtypes(config: ModelConfig, device: torch.device) -> dict[str, str]:
+    """Record the dtype each hot activation actually carries under bf16 autocast.
+
+    Autocast's fp32 cast list is device-specific, and on CUDA it contains `pow`
+    but not `mul`. Spelling ReLU-squared as `x.square()` therefore upcast the
+    FFN's widest activation to fp32 and doubled its traffic, while the CPU
+    autocast policy this repo's test suite runs under shows no such thing. This
+    check is the only place that discrepancy is observable, so it belongs here.
+    """
+    block = ReluSquaredFeedForward(config).to(device)
+    hidden = torch.randn(8, 16, config.model_dim, device=device)
+    with torch.autocast("cuda", dtype=torch.bfloat16), torch.inference_mode():
+        projected = block.input(hidden)
+        return {
+            "projection": str(projected.dtype),
+            "activation": str(block.activation(projected).dtype),
+            "output": str(block(hidden).dtype),
+        }
 
 
 def main() -> None:
@@ -112,12 +138,20 @@ def main() -> None:
             + json.dumps(details, sort_keys=True)
         )
 
+    autocast_dtypes = _autocast_residual_dtypes(config, device)
+    if autocast_dtypes["activation"] != "torch.bfloat16":
+        raise TypeError(
+            "the ReLU-squared activation left the autocast compute dtype: "
+            + json.dumps(autocast_dtypes, sort_keys=True)
+        )
+
     result = {
         "batch_size": args.batch_size,
         "actor_parameters": parameter_count(actor),
         "critic_parameters": parameter_count(critic),
         "device": torch.cuda.get_device_name(device),
         "flash_events": flash_events,
+        "autocast_dtypes": autocast_dtypes,
         "finite_backward": True,
         "model": config.to_dict(),
         "torch": torch.__version__,
