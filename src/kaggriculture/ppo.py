@@ -331,6 +331,22 @@ class PpoConfig:
     # 719 transitions instead.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     gamma: float = 1.0
+    # Measured to bind on EVERY minibatch, which makes this the step-size
+    # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
+    # 1264 production-shaped minibatches in four configurations -- BC actor with
+    # a fresh critic, BC actor with a trained critic, the iteration-12 actor and
+    # critic together, and a doubled 224-game wave -- reports
+    # `minibatch_fraction_above_clip` of 1.000 in every partition of every one.
+    # Norm medians are 3.81-4.24 with a per-minibatch range of 2.22 to 21.37.
+    #
+    # So the applied step is `lr * g / ||g||` rather than `lr * g`: the effective
+    # learning rate is about a quarter of `actor_learning_rate` and varies about
+    # tenfold between minibatches, and `lr_warmup_steps` warms a quantity that
+    # clipping then overrides. Whether 1.0 is the right value is a learning
+    # question that only a training run answers, so it is left at the value every
+    # measurement above was taken under rather than tuned against a proxy. What
+    # is recorded here is that the constant is load-bearing: raising it changes
+    # the step size on 100% of updates, not on the tail it reads as bounding.
     max_gradient_norm: float = 1.0
     target_kl: float = 0.03
     # BF16 autocast for both update-path forwards. The actor's importance
