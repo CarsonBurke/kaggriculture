@@ -799,6 +799,49 @@ def test_one_ppo_update_is_finite() -> None:
     assert not unfiled, unfiled
 
 
+def test_a_critic_only_refit_aborts_on_a_non_finite_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A poisoned critic loss must still stop the run when no actor is present.
+
+    Critic-only minibatches no longer read their loss back to the host every
+    step, so the abort has moved. On an unfused optimizer it stays immediate; on
+    a fused one the step is skipped on the device and the raise lands at the
+    epoch boundary. Either way the run must not continue, and the critic must
+    never have absorbed the poisoned gradient.
+    """
+    model_config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    config = PpoConfig(epochs=1, critic_epochs=2, minibatch_size=8, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = {name: value.detach().clone() for name, value in critic.named_parameters()}
+
+    original = kaggriculture.ppo._critic_minibatch_loss
+
+    def poisoned(*args: object, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+        loss, predicted = original(*args, **kwargs)  # type: ignore[arg-type]
+        return loss * float("nan"), predicted
+
+    monkeypatch.setattr(kaggriculture.ppo, "_critic_minibatch_loss", poisoned)
+
+    with pytest.raises(FloatingPointError, match="non-finite critic loss"):
+        update_ppo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(4),
+            actor_epochs=0,
+        )
+
+    for name, value in critic.named_parameters():
+        assert torch.equal(before[name], value.detach()), name
+
+
 def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     """A bootstrapped target has no bound the support can be sized against.
 

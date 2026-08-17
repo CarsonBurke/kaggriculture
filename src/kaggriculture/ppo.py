@@ -675,14 +675,38 @@ def _optimizer_step(
     optimizer: torch.optim.Optimizer,
     base_learning_rate: float,
     warmup_steps: int,
+    found_inf: Tensor | None = None,
 ) -> None:
+    """Advance the warmup schedule and step, optionally skipping on the device.
+
+    `found_inf` is the fused optimizer's own skip signal, the mechanism
+    `GradScaler` uses: a nonzero value leaves the parameters, both moment
+    buffers, and the per-parameter step counter untouched. Passing a device
+    predicate therefore expresses "this minibatch was never applied" without
+    the host ever learning which way it went, so no synchronization is needed.
+    Callers use it only where a nonzero value is fatal to the run anyway, since
+    the warmup counter below advances regardless of the outcome.
+    """
     for group in optimizer.param_groups:
         step = int(group.get("warmup_step", 0)) + 1
         group["warmup_step"] = step
         group_base_lr = float(group.get("base_lr", base_learning_rate))
         scale = min(step / warmup_steps, 1.0) if warmup_steps else 1.0
         group["lr"] = group_base_lr * scale
-    optimizer.step()
+    if found_inf is None:
+        optimizer.step()
+        return
+    # Set, step, delete -- the same lifecycle `GradScaler` uses. The optimizer
+    # reads these through `getattr(..., None)`, so leaving them behind would
+    # make an absent skip indistinguishable from a decided one to any other
+    # caller, and a stale `grad_scale` of None faults a real scaler's arithmetic.
+    optimizer.grad_scale = None
+    optimizer.found_inf = found_inf
+    try:
+        optimizer.step()
+    finally:
+        del optimizer.grad_scale
+        del optimizer.found_inf
 
 
 def _replayed_component_logprobs(
@@ -1589,13 +1613,28 @@ def update_ppo(
         else _critic_minibatch_loss
     )
     stop_for_kl = False
-    # Guard scalars leave the device through one pinned async copy per
+    # Guard scalars leave the device through one pinned async copy per ACTOR
     # minibatch. A CUDA event scopes the host wait to that tiny copy, so the
     # KL/finiteness decisions overlap the already-queued critic backward
     # instead of serializing the stream after every actor forward.
+    #
+    # Critic-only minibatches take no such wait. The host wait exists to enforce
+    # the actor's trust region inside the epoch that produced it, and on the
+    # production schedule (epochs=1, critic_epochs=4) three of every four epochs
+    # have no actor at all -- 219 of 292 minibatches were paying for a decision
+    # with no branch to inform. Those gate the critic step with the fused
+    # optimizer's own device-side skip and report finiteness at the epoch
+    # boundary, which is the first point the outcome can change what runs next.
     guard_host = torch.empty(3, dtype=torch.float64, pin_memory=device.type == "cuda")
     guard_event = torch.cuda.Event() if device.type == "cuda" else None
-    zero_guard = torch.zeros((), dtype=torch.float64, device=device)
+    critic_nonfinite = torch.zeros((), dtype=torch.float64, device=device)
+    # `found_inf` is a fused-implementation facility; the single-tensor and
+    # foreach paths assert it is unused. Ask the optimizer that will receive the
+    # skip whether it can honour one, rather than inferring it from the device
+    # that happened to imply `fused` back in `make_optimizers`.
+    critic_step_is_gateable = any(
+        group.get("fused", False) for group in critic_optimizer.param_groups
+    )
 
     critic_epochs = config.epochs if config.critic_epochs is None else config.critic_epochs
     # Cumulative marks at each epoch boundary. The reported `value_loss` averages
@@ -1699,27 +1738,28 @@ def update_ppo(
                 if epoch_index == critic_epochs - 1:
                     _accumulate_fit_moments(last_fit_sums, targets, predictions)
                     last_fit_states += states
-            guard_values = torch.stack(
-                (
-                    batch_kl if run_actor else zero_guard,
-                    policy_loss.detach().double() if run_actor else zero_guard,
-                    value_loss.detach().double(),
+            if run_actor:
+                guard_values = torch.stack(
+                    (
+                        batch_kl,
+                        policy_loss.detach().double(),
+                        value_loss.detach().double(),
+                    )
                 )
-            )
-            guard_host.copy_(guard_values, non_blocking=True)
-            if guard_event is not None:
-                guard_event.record()
+                guard_host.copy_(guard_values, non_blocking=True)
+                if guard_event is not None:
+                    guard_event.record()
             value_loss.backward()
             critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
                 critic.parameters(), config.max_gradient_norm
             ).detach()
 
-            # The event covers only the three-scalar copy, so this wait
-            # overlaps the critic backward still executing on the stream.
-            if guard_event is not None:
-                guard_event.synchronize()
-            batch_kl_value, policy_loss_value, value_loss_value = guard_host.tolist()
             if run_actor:
+                # The event covers only the three-scalar copy, so this wait
+                # overlaps the critic backward still executing on the stream.
+                if guard_event is not None:
+                    guard_event.synchronize()
+                batch_kl_value, policy_loss_value, value_loss_value = guard_host.tolist()
                 if updates == 0:
                     # At unchanged weights this KL is pure numerics: the drift
                     # between the behavior replay above and this minibatch
@@ -1748,12 +1788,28 @@ def update_ppo(
                     total_components += component_count
                     actor_states += states
                     actor_updates += 1
-            if not math.isfinite(value_loss_value):
-                raise FloatingPointError("non-finite critic loss")
+                if not math.isfinite(value_loss_value):
+                    raise FloatingPointError("non-finite critic loss")
+                critic_skip = None
+            elif not critic_step_is_gateable:
+                # Nothing to defer for: an unfused step cannot be skipped on the
+                # device, and without a stream to stall the read costs nothing.
+                if not math.isfinite(float(value_loss.detach())):
+                    raise FloatingPointError("non-finite critic loss")
+                critic_skip = None
+            else:
+                # The only decision this minibatch can inform is whether to abort,
+                # and aborting cannot come sooner than the epoch boundary without
+                # a host wait. Gate the step instead: a poisoned minibatch leaves
+                # the critic, its moments, and its step counter untouched.
+                # fp32, which is the only dtype the fused optimizer's skip accepts.
+                critic_skip = (~torch.isfinite(value_loss.detach())).float()
+                critic_nonfinite += critic_skip
             _optimizer_step(
                 critic_optimizer,
                 config.critic_learning_rate,
                 config.lr_warmup_steps,
+                found_inf=critic_skip,
             )
 
             totals["value_loss"] += value_loss.detach().double() * states
@@ -1761,6 +1817,11 @@ def update_ppo(
             total_states += states
             updates += 1
         epoch_marks.append((totals["value_loss"].clone(), total_states))
+        # One host read per epoch, covering every critic-only minibatch it ran.
+        # Their steps were already gated on the device, so the critic reaching
+        # this line has never absorbed a non-finite loss.
+        if critic_nonfinite.item():
+            raise FloatingPointError("non-finite critic loss")
         completed_epochs += 1
 
     first_epoch_value_loss, last_epoch_value_loss = _epoch_value_losses(epoch_marks)
