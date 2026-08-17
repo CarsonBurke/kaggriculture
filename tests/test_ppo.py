@@ -1387,6 +1387,12 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
+    # Pinned because the readings below are compared against thresholds, and an
+    # unseeded init makes those a property of whichever tests ran first: this
+    # file seeds nothing, so the global stream's position when it arrives here
+    # decides the numbers. It previously drew a last-epoch fit of 0.052 -- below
+    # this test's own floor -- purely because tests were added above it.
+    torch.manual_seed(6)
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=32, sampling_seed=3)
@@ -1441,13 +1447,19 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     identity = 1.0 - (metrics["advantage_std"] / metrics["value_target_std"]) ** 2
     assert metrics["lambda_return_explained_variance"] == pytest.approx(identity, abs=1e-5)
 
-    # The fit reading is materially positive on a critic the conventional
-    # reading calls near-worthless. Observed across a dozen initializations the
-    # last-epoch fit stays above 0.18 and the identity below 0.08; the bounds
-    # here leave room for the unseeded weight init without letting the two
-    # overlap.
+    # The fit reading is materially positive on a critic the conventional reading
+    # calls near-worthless, and their SEPARATION is what the pair exists for.
+    # Swept over twelve initializations, the absolute levels do not support a
+    # fixed threshold -- the last-epoch fit spans 0.111 to 0.412 and the identity
+    # 0.018 to 0.096, so the two ranges overlap and either bound can be a hair
+    # from firing. The ratio is the stable statistic: 3.8x at its tightest,
+    # 16.8x at its widest, so a factor of three separates them on every init
+    # sampled while still failing if the fit reading collapses onto the identity.
     assert metrics["critic_fit_explained_variance_last_epoch"] > 0.1
     assert abs(metrics["lambda_return_explained_variance"]) < 0.1
+    assert metrics["critic_fit_explained_variance_last_epoch"] > 3.0 * abs(
+        metrics["lambda_return_explained_variance"]
+    )
 
     # Twenty-four critic epochs over 64 states is deliberately the memorizing
     # end of the scale, so the in-sample reading must sit above the epoch that
