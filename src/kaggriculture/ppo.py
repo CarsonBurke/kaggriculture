@@ -302,6 +302,19 @@ class PpoConfig:
     # explained variance oscillating and starves rarely-visited states of
     # value estimates.
     critic_epochs: int | None = None
+    # Measured optimal, not a convention. `scripts/sweep_update_batch.py` runs
+    # the production schedule at 2048/4096/8192/16384 nominal rows against both
+    # compiled modes: 2048 is the fastest cell in every run, 4096 is 2.2-4.8%
+    # slower despite halving the minibatch count, and 8192 and 16384 do not fit.
+    # Larger batches lose because device time per row rises (critic 20.88 ->
+    # 22.20 us/row) while kernel count per minibatch stays flat -- the count is a
+    # property of the compiled graph, so doubling rows doubles the work inside
+    # each kernel instead of removing kernels. Activation memory is linear at
+    # 4.22-4.25 MiB/row, which puts 8192 effective rows at ~32.5 GiB against a
+    # 31.36 GiB card: above 4096 there is no headroom on this axis at all.
+    # Raising it would also halve the points at which `target_kl` can bind and
+    # double the warmup measured in iterations, so there is no wall-clock win to
+    # weigh against those.
     minibatch_size: int = 2048
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
@@ -926,14 +939,39 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function, m
         max-autotune                 16.152 s    8.43 GiB   522.6 s
         max-autotune-no-cudagraphs   16.377 s   16.76 GiB   204.4 s
 
-    Graph capture RESERVES 2.9 GiB LESS than the default mode, because the graph
-    pool is reused across replays where the caching allocator otherwise
-    fragments across minibatches; the mode that actually inflates memory is the
-    autotuned one with capture disabled, at 16.76 GiB. Compilation itself is
-    worth 2.42x and is not optional. `max-autotune` is a net loss despite being
-    fastest: 0.955 s per iteration over a 500-iteration run saves 8.0 minutes
-    and costs 8.7 minutes compiling, and it is the same trap as the collection
-    knob -- a mode that wins the microbenchmark and loses the run.
+    Compilation itself is worth 2.42x and is not optional. `max-autotune` is a
+    net loss despite being fastest: 0.955 s per iteration over a 500-iteration
+    run saves 8.0 minutes and costs 8.7 minutes compiling, and it is the same
+    trap as the collection knob -- a mode that wins the microbenchmark and loses
+    the run.
+
+    The memory column above is a warmup artifact, not a footprint, and an earlier
+    revision of this docstring drew a conclusion from it: that graph capture
+    reserves 2.9 GiB less because the graph pool is reused where the caching
+    allocator otherwise fragments. `scripts/sweep_update_batch.py` measures the
+    same schedule with a full untimed schedule discarded before
+    `reset_peak_memory_stats`, rather than a single warmup minibatch pair, and
+    reads 8.45 GiB for `default` against 8.47 GiB for `reduce-overhead` -- equal.
+    Its wall clock reproduces the table above to within 0.4%, so the two
+    harnesses disagree only about memory, and the 11.34 GiB is first-schedule
+    allocator growth that one warmup pair does not reach. Steady-state reserved
+    is the same in both modes; `reduce-overhead`'s only measured advantage is a
+    lower cold compile (29.0 s against 43.9 s at 4096 rows). Note also that
+    `max_memory_allocated` cannot be compared across these modes at all: CUDA
+    graph private pools are excluded from it, so capture reports 0.09 GiB
+    allocated against 8.47 GiB reserved. Only reserved is comparable.
+
+    What the modes cannot buy is launch overhead, because this path does not pay
+    any. Wall clock equals summed device time to within 0.4% at 2048 and 4096
+    rows in both compiled modes and in eager, and `reduce-overhead` removes 97.5%
+    of the host launch submissions -- 906 launch API calls per actor minibatch
+    down to 23 -- for a 0.2% change in wall clock. A compiled actor minibatch is
+    906 kernels over 55.4 ms of device time, about 61 us each, so the GPU is
+    saturated and the launches hide behind it. Compilation's 2.42x is fusion
+    doing less total device work, not fewer launches: eager runs 1967 actor
+    kernels over 143.6 ms against compiled's 907 over 56.2 ms. The consequence is
+    that this phase shortens only by reducing device work -- fusion, precision,
+    architecture, or fewer minibatches -- and not by launch-count engineering.
 
     The compiled wrapper is attached outside the module hierarchy so checkpoints
     stay clean.
