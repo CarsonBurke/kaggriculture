@@ -62,10 +62,49 @@ def production_model_config() -> dict[str, int | float]:
 
 
 def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float | bool | str]:
+    """The schedule the calibrated launcher runs and every benchmark measures.
+
+    `critic_epochs` is 2 because that is where the measurement leaves it, not
+    because it is the actor count doubled. `scripts/probe_critic_epochs.py`
+    refits the critic on 80% of the GAMES in a production wave and scores the
+    held-out 20%, splitting by `episode_seeds` rather than by state: states along
+    one trajectory are near-duplicates, so a random state split puts copies of
+    fitted states in the holdout and reports memorization as generalization.
+    That distinction is the whole result. Under a state-level reading the critic
+    looks like it reaches 0.86 explained variance; on a game-level holdout it
+    explains 0.5-2% of value variance at EVERY epoch count from 1 to 8.
+
+    So no epoch measurably buys generalization. The remaining holdout explained
+    variance gain after epoch 0 is +0.0017 +/- 0.0021 over five repeats from a
+    fresh critic and -0.0442 +/- 0.0786 over three from a warm one, both inside
+    their own spread, while fit explained variance climbs to 0.87 and the
+    memorization gap to 1.15. A warm critic's holdout explained variance goes
+    from +0.005 to -0.283 across eight epochs -- worse than predicting the
+    holdout mean.
+
+    Two is a DELIBERATE OVERSPEND, not the optimum, and the number it costs is
+    known. On the distributional loss the critic actually optimizes, the marginal
+    per-epoch change in holdout loss is -0.081 +/- 0.049 for epoch 1 and
+    +0.072 +/- 0.021 for epoch 2 once the critic is warm, so epoch 2 gives back
+    slightly more than epoch 1 wins, and epoch 1 is the best epoch in all three
+    warm repeats. A fresh critic wants three epochs (epoch 3 worth -0.087 +/-
+    0.030, epoch 4 break-even at +0.003 +/- 0.018); a warm one wants one. The two
+    regimes have different optima and this constant has to serve both.
+
+    What buys the overspend is the one thing no single-rollout curve can measure:
+    the critic also accumulates fit ACROSS iterations, and the same probe shows
+    data dominating passes -- eight epochs over one wave leaves explained variance
+    at 0.002, while four epochs over each of six disjoint waves reaches 0.54 and
+    0.79 on two of three seeds for the same 24 gradient epochs. A second pass is
+    held as insurance against one pass per iteration failing to keep up over 500
+    of them, at a measured price of 4.6 s per iteration and a small known
+    degradation in the warm-regime holdout fit. Four cost 18.5 s of the 28.0 s
+    update phase; two costs 9.2 s and takes the iteration from 32.5 s to 23.2 s.
+    """
     return asdict(
         PpoConfig(
             epochs=1,
-            critic_epochs=4,
+            critic_epochs=2,
             minibatch_size=2048,
             target_kl=0.03,
             update_compile_mode=update_compile_mode,
