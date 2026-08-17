@@ -259,6 +259,14 @@ def _validate_configuration(
         # 1.9089e-03, 3.1850e-05 and 4.0598e-02. Faster and 8.4x further inside
         # the gate, so a chain measured in fp32 is not evidence for the run this
         # launches and is rejected here.
+        #
+        # Pinning it is also what makes the chain constructible at all. The
+        # chain's first node collects in `eager`, and eager's first-minibatch KL
+        # is a function of the collection precision: 1.418e-02 in bf16 against
+        # 1.388e-01 in fp32, and `MAX_FIRST_MINIBATCH_KL` is 1.1e-01. An fp32
+        # chain therefore aborts inside its own all-eager baseline before it can
+        # time anything, so this pin is a feasibility condition and not only a
+        # comparability one.
         "rollout_bfloat16": PRODUCTION_ROLLOUT_BFLOAT16,
         "device": "cuda",
         "league_games_per_iteration": PRODUCTION_LEAGUE_GAMES,
