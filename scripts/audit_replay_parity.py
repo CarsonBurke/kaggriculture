@@ -43,6 +43,7 @@ from kaggriculture.ppo import (
     MAX_FIRST_MINIBATCH_KL,
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    UPDATE_COMPILE_MODES,
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
     update_replay_parity,
@@ -105,20 +106,28 @@ def parse_args() -> argparse.Namespace:
     # exit zero, and nothing downstream reads this report to catch that -- the
     # same failure the cuda guard below refuses for the same reason.
     #
-    # There is deliberately no `--compile-rollout` here. The collection mode is
-    # three-valued, so a boolean cannot name it, and letting the two be set
-    # independently would allow auditing an Inductor learner against an eager
-    # frozen league ensemble: a mix train_ppo.py cannot produce, because it
-    # derives the ensemble decision from the mode. An audit that can express
-    # unlaunchable pairings is not evidence about a launch.
-    for knob in ("--compile-update", "--rollout-bfloat16"):
-        parser.add_argument(knob, action=argparse.BooleanOptionalAction, required=True)
+    # Both compile knobs are modes, and neither has a boolean here. A boolean
+    # cannot name a three- or five-valued decision, and letting a mode and a
+    # boolean be set independently would allow auditing an Inductor learner
+    # against an eager frozen league ensemble: a mix train_ppo.py cannot produce,
+    # because it derives the ensemble decision from the mode. An audit that can
+    # express unlaunchable pairings is not evidence about a launch.
+    parser.add_argument("--rollout-bfloat16", action=argparse.BooleanOptionalAction, required=True)
     # The knob with the largest measured effect on collection cost: `cudagraphs`
     # is slower than not compiling at all in fp32 (5.309 ms against 4.907 ms on
     # the production wave) and `inductor` is 1.8x faster at 2.720 ms.
     parser.add_argument(
         "--rollout-forward-mode",
         choices=ROLLOUT_FORWARD_MODES,
+        required=True,
+    )
+    # No default for the same reason: an audit that can default the update knob
+    # measures a pairing nothing trains in, and the modes differ in whether they
+    # capture CUDA graphs and whether they benchmark kernel selection -- all of
+    # which move the graphs whose divergence from the collector this measures.
+    parser.add_argument(
+        "--update-compile-mode",
+        choices=UPDATE_COMPILE_MODES,
         required=True,
     )
     parser.add_argument(
@@ -214,7 +223,7 @@ def _measure(
         actor,
         rollout,
         minibatch_size=ppo_config.minibatch_size,
-        compile_model=ppo_config.compile_update,
+        compile_mode=ppo_config.update_compile_mode,
         autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
     )
 
@@ -233,7 +242,7 @@ def main() -> None:
     architecture_name = resolve_architecture(payload).name
     # The launcher chooses compilation from a measured speedup rather than
     # unconditionally, so the audit has to be able to follow it either way.
-    ppo_config = PpoConfig(**production_ppo_config(compile_update=args.compile_update))
+    ppo_config = PpoConfig(**production_ppo_config(update_compile_mode=args.update_compile_mode))
 
     # One arena for the whole audit, exactly as training holds one for the
     # whole run. A defect in "every field is rewritten each wave" leaves the
@@ -286,7 +295,7 @@ def main() -> None:
                 "episode_steps": args.episode_steps,
                 "rollout_forward_mode": args.rollout_forward_mode,
                 "rollout_bfloat16": args.rollout_bfloat16,
-                "compile_update": ppo_config.compile_update,
+                "update_compile_mode": ppo_config.update_compile_mode,
                 "use_bfloat16": ppo_config.use_bfloat16,
                 "minibatch_size": ppo_config.minibatch_size,
                 "max_update_replay_kl": MAX_UPDATE_REPLAY_KL,

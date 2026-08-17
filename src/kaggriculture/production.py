@@ -38,6 +38,17 @@ PRODUCTION_OPPONENT_TEMPERATURE = 0.8
 # the launcher round-trip test.
 PRODUCTION_ROLLOUT_FORWARD_MODE = "inductor"
 PRODUCTION_ROLLOUT_BFLOAT16 = True
+# The update knob's counterpart to the mode above, and the same kind of setting:
+# the calibrated knob reaches the command as a parameter, and this constant is
+# only what the uncalibrated direct launch states. `default` is Inductor's
+# fusion without CUDA graph capture, which is the mode production has been
+# running; the three modes above it in `UPDATE_COMPILE_MODES` add graph capture
+# or benchmarked kernel selection and are not yet measured on this update path
+# -- `scripts/profile_update_backends.py` is what measures them. Stating the
+# mode that has run rather than the fastest mode nobody has timed is the whole
+# point of the direct launch being uncalibrated: the chain is what earns a
+# change here.
+PRODUCTION_UPDATE_COMPILE_MODE = "default"
 # Deterministic starter/public-v27 probes every N committed iterations give the
 # journal an absolute progress axis that self-play score rates cannot provide.
 # The opponents are emitted explicitly so the launch command is the complete
@@ -50,14 +61,14 @@ def production_model_config() -> dict[str, int | float]:
     return ModelConfig().to_dict()
 
 
-def production_ppo_config(*, compile_update: bool) -> dict[str, int | float | bool]:
+def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float | bool | str]:
     return asdict(
         PpoConfig(
             epochs=1,
             critic_epochs=4,
             minibatch_size=2048,
             target_kl=0.03,
-            compile_update=compile_update,
+            update_compile_mode=update_compile_mode,
         )
     )
 
@@ -95,7 +106,7 @@ def build_training_command(
     max_hours: float,
     seed: int,
     rollout_forward_mode: str,
-    compile_update: bool,
+    update_compile_mode: str,
     rollout_bfloat16: bool = PRODUCTION_ROLLOUT_BFLOAT16,
     expected_source_digest: str | None = None,
     calibration_decision: Path | None = None,
@@ -116,7 +127,7 @@ def build_training_command(
     if critic_warmup_iterations is not None and not 0 < critic_warmup_iterations < iterations:
         raise ValueError("critic warmup must be positive and leave iterations for the actor")
     model = production_model_config()
-    ppo = production_ppo_config(compile_update=compile_update)
+    ppo = production_ppo_config(update_compile_mode=update_compile_mode)
     command = [
         sys.executable,
         str(repository_root() / "scripts" / "train_ppo.py"),
@@ -206,14 +217,16 @@ def build_training_command(
             str(ppo["max_gradient_norm"]),
         )
     )
-    if compile_update:
-        command.append("--compile-update")
-    # Stated unconditionally, in both directions: these move the sampled
-    # behavior policy, so the command has to be the complete record of the
-    # collection backend and precision a run actually used rather than leaning
-    # on whatever train_ppo currently defaults to.
+    # Stated unconditionally, all three: the collection backend and precision
+    # move the sampled behavior policy and the update mode moves the graphs that
+    # consume it, so the command has to be the complete record of what a run
+    # actually used rather than leaning on whatever train_ppo currently defaults
+    # to. `--update-compile-mode` carries the whole update knob; no boolean
+    # projection of it is emitted, because two names for one decision give the
+    # command two places to disagree with the calibration it was launched from.
     command.extend(("--rollout-forward-mode", rollout_forward_mode))
     command.append("--rollout-bfloat16" if rollout_bfloat16 else "--no-rollout-bfloat16")
+    command.extend(("--update-compile-mode", update_compile_mode))
     if initial_actor is not None:
         command.extend(("--init-actor-from", str(initial_actor)))
         if critic_warmup_iterations is not None:

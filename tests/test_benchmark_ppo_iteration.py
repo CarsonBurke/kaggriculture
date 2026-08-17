@@ -279,15 +279,63 @@ def test_the_report_and_the_collector_agree_on_the_collection_configuration(
         assert "compile_models" not in captured
 
 
-@pytest.mark.parametrize("flags", [("--compile-rollout",), ("--no-compile-rollout",)])
-def test_the_retired_compile_rollout_boolean_is_rejected(
-    monkeypatch, flags: tuple[str, ...]
+def test_the_report_declares_the_update_mode_the_launcher_reads(
+    monkeypatch, tmp_path: Path
 ) -> None:
-    """A recipe still passing the old boolean must fail loudly. It cannot be
-    honoured: the mode is what the collector consults, so the boolean could only
-    agree redundantly or contradict, and it cannot be ignored either -- a run
-    that accepted `--compile-rollout` while timing an eager collector would put
-    a configuration nothing measured into the launcher's evidence.
+    """The update knob rides in the report's nested `ppo` block, whole.
+
+    `launch_calibrated_training._declared_knobs` reads it from exactly there,
+    and `_comparable_configuration` strips exactly that key from the cross-node
+    comparison. A boolean projection beside it would differ precisely where the
+    chain varies the knob, so recording both would reject every chain -- the
+    same failure the retired collection boolean caused one phase over.
+    """
+    module = _script()
+
+    for index, mode in enumerate(module.UPDATE_COMPILE_MODES):
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(module, "collect_mixed_play_rust", _capturing_collector(captured))
+        report = tmp_path / str(index) / "benchmark.jsonl"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "benchmark_ppo_iteration.py",
+                *_SMALL_WAVE,
+                "--output",
+                str(report),
+                "--update-compile-mode",
+                mode,
+            ],
+        )
+        try:
+            with pytest.raises(_ReachedCollector):
+                module.main()
+        finally:
+            module._configure_report(None)
+
+        configuration = json.loads(report.read_text(encoding="utf-8").splitlines()[0])
+        assert configuration["ppo"]["update_compile_mode"] == mode
+        assert "compile_update" not in configuration["ppo"]
+        assert "update_compile_mode" not in configuration
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("--compile-rollout",),
+        ("--no-compile-rollout",),
+        ("--compile-update",),
+        ("--no-compile-update",),
+    ],
+)
+def test_the_retired_compile_booleans_are_rejected(monkeypatch, flags: tuple[str, ...]) -> None:
+    """A recipe still passing either old boolean must fail loudly. Neither can be
+    honoured: the mode is what its phase consults, so a boolean could only agree
+    redundantly or contradict, and neither can be ignored either -- a run that
+    accepted `--compile-rollout` while timing an eager collector, or
+    `--compile-update` while timing an eager update, would put a configuration
+    nothing measured into the launcher's evidence.
     """
     module = _script()
     monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py", *_SMALL_WAVE, *flags])

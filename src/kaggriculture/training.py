@@ -20,6 +20,7 @@ from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
+    UPDATE_COMPILE_MODE_KNOB,
     validate_run_provenance,
     validate_source_identity,
 )
@@ -226,19 +227,22 @@ def checkpoint_payload(
         )
     ):
         raise ValueError("checkpoint compile mode does not match run provenance")
-    # `training_data_config` is a record; `ppo_config.compile_update` is what
+    # `training_data_config` is a record; `ppo_config.update_compile_mode` is what
     # actually drives compilation in the update (see ppo.py). They arrive here
     # as independent parameters, so nothing but this makes them agree, and a
-    # checkpoint whose record says compiled while its config says eager would
-    # carry provenance for a run that did not happen. `rollout_forward_mode`
-    # needs no equivalent: the record is the only place it is stored.
+    # checkpoint whose record names one mode while its config names another would
+    # carry provenance for a run that did not happen. Compared by value rather
+    # than identity now that the knob is a string: `is not` on two equal strings
+    # is true whenever they are not the same interned object, which for a mode
+    # read back out of JSON is exactly the case. `rollout_forward_mode` needs no
+    # equivalent: the record is the only place it is stored.
     if (
         isinstance(training_data_config, dict)
-        and "compile_update" in training_data_config
-        and training_data_config["compile_update"] is not ppo_config.compile_update
+        and UPDATE_COMPILE_MODE_KNOB in training_data_config
+        and training_data_config[UPDATE_COMPILE_MODE_KNOB] != ppo_config.update_compile_mode
     ):
         raise ValueError(
-            "checkpoint training data config compile_update does not match its ppo config"
+            "checkpoint training data config update_compile_mode does not match its ppo config"
         )
     if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
         raise ValueError("checkpoint RNG capture is incomplete")

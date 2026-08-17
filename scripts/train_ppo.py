@@ -42,6 +42,7 @@ from kaggriculture.ppo import (
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     MAX_VALUE_TARGET_SATURATED_FRACTION,
+    UPDATE_COMPILE_MODES,
     PpoConfig,
     make_optimizers,
     update_ppo,
@@ -151,13 +152,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
     # Two phases, two knobs, decided separately by calibration: the collection
     # forward and the update compile different graphs, and their measured
-    # speedups on the conv model fall on opposite sides of the threshold. The
-    # collection knob is the forward mode below rather than a boolean, because
-    # the backend choice is what the measurement separates: on production
-    # 112-game waves with a real BC actor the isolated forward runs 4.907 ms
-    # eager, 5.309 ms cudagraphs and 2.720 ms inductor in fp32, so the old
-    # boolean's `cudagraphs` was a pessimization dressed as an optimization.
-    parser.add_argument("--compile-update", action="store_true")
+    # speedups on the conv model fall on opposite sides of the threshold.
+    # Neither knob is a boolean, and for the same reason on both sides -- the
+    # decision is which execution mode, and the modes are not one measurement.
+    # On the collection side that is measured: on production 112-game waves with
+    # a real BC actor the isolated forward runs 4.907 ms eager, 5.309 ms
+    # cudagraphs and 2.720 ms inductor in fp32, so the old boolean's
+    # `cudagraphs` was a pessimization dressed as an optimization. On the update
+    # side the modes differ in whether they capture CUDA graphs and whether they
+    # benchmark kernel selection, so a boolean could not have said which of the
+    # four ran even when it said `true`.
+    parser.add_argument(
+        "--update-compile-mode",
+        choices=UPDATE_COMPILE_MODES,
+        default="default",
+        help="execution mode of the update-path forward/backward, and the whole compile "
+        "decision for the update: eager does not compile; default `default`, Inductor "
+        "fusion without CUDA graph capture",
+    )
     parser.add_argument("--no-bfloat16", action="store_true")
     # The collection forward is ~64% of a wave's wall clock, and these two
     # defaults are where the measurement landed on both axes rather than a
@@ -918,7 +930,10 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "opponent_temperature": args.opponent_temperature,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
-        "compile_update": args.compile_update,
+        # Both calibrated knobs are modes, and both are cross-checked against the
+        # calibration decision by name (`provenance.CALIBRATION_KNOBS`), so the
+        # record stores the mode itself rather than any boolean projection of it.
+        "update_compile_mode": args.update_compile_mode,
         # The collection backend and precision both change the sampled behavior
         # policy, so a resume that changes either is a different data generator
         # and this record is what refuses it. The mode is also the calibrated
@@ -1116,7 +1131,7 @@ def main() -> None:
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
-        compile_update=args.compile_update,
+        update_compile_mode=args.update_compile_mode,
     )
     training_data_config = _training_data_config(args, device)
     # Derived from the configured trust region rather than fixed, because that
@@ -1526,7 +1541,7 @@ def main() -> None:
                 actor,
                 rollout,
                 minibatch_size=ppo_config.minibatch_size,
-                compile_model=ppo_config.compile_update,
+                compile_mode=ppo_config.update_compile_mode,
                 autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
             )
             # A head with no active components reports zero divergence, which

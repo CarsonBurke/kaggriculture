@@ -36,7 +36,17 @@ SOURCE_IDENTITY_FORMAT_VERSION = 1
 # speedup certifies a configuration nothing would now select; and `false` names
 # no mode whatsoever. Neither value is a mode, so a version-3 record is rejected
 # rather than read as one.
-RUN_PROVENANCE_FORMAT_VERSION = 4
+#
+# Bumped to 5 when the update knob stopped being a boolean, for the reason the
+# rollout knob's bump above records. `torch.compile` takes a mode, and the modes
+# are not one measurement: `UPDATE_COMPILE_MODES` spans Inductor fusion alone,
+# fusion plus CUDA graph capture, and benchmarked kernel selection with and
+# without that capture. Migration is impossible rather than merely unwanted -- a
+# version-4 record's `compile_update: true` is compatible with all four of those
+# configurations at once and names none of them, so there is nothing to migrate
+# it to, and its attributed speedup certifies only that something compiled. No
+# version-4 provenance exists on disk.
+RUN_PROVENANCE_FORMAT_VERSION = 5
 #: The speedup floor a knob must clear to be enabled, measured on the whole
 #: iteration rather than on the knob's own phase: a knob that halves a phase
 #: worth 2% of an iteration has not earned the compile. It lives here rather
@@ -49,31 +59,50 @@ MINIMUM_COMPILE_SPEEDUP = 1.05
 #: The knobs a calibration decides, which is also the schema of the speedups
 #: recorded beside them. They live here for the same reason the floor above
 #: does: this module re-derives every decision, so the set it validates against
-#: cannot be owned by the launcher it is validating. The rollout knob is named
-#: separately because its value is a mode rather than a boolean, and two places
-#: below have to agree on which knob that is.
+#: cannot be owned by the launcher it is validating. Both knobs are named
+#: separately because both values are execution modes rather than booleans, and
+#: several places below have to agree on which knob is which.
 ROLLOUT_FORWARD_MODE_KNOB = "rollout_forward_mode"
-CALIBRATION_KNOBS = (ROLLOUT_FORWARD_MODE_KNOB, "compile_update")
-#: The rollout knob's value when the collection forward is not compiled.
+UPDATE_COMPILE_MODE_KNOB = "update_compile_mode"
+CALIBRATION_KNOBS = (ROLLOUT_FORWARD_MODE_KNOB, UPDATE_COMPILE_MODE_KNOB)
+#: Each knob's value while its phase is not compiled.
 #:
-#: The knob is mode-valued and its domain is `ROLLOUT_FORWARD_MODES` in
-#: `kaggriculture.rollout`, which this module deliberately does not import:
-#: `build_submission.PACKAGE_FILES` ships provenance.py into the submission
-#: bundle but not rollout.py, and rollout.py pulls in `kaggle_environments` and
-#: the native extension, so the import would be a ModuleNotFoundError at agent
-#: startup -- exactly where `inference.CheckpointAgent` validates a checkpoint's
-#: run provenance. Only the off value is needed here, because all this module
-#: re-derives is whether the knob was enabled, and an inference agent has no
-#: legitimate interest in which backend collected the rollouts it learned from.
+#: Both knobs are mode-valued, and each domain lives in the module that executes
+#: it: `ROLLOUT_FORWARD_MODES` in `kaggriculture.rollout` and
+#: `UPDATE_COMPILE_MODES` in `kaggriculture.ppo`. This module deliberately
+#: imports neither. `build_submission.PACKAGE_FILES` ships provenance.py into
+#: the submission bundle and ships neither of those two, and both pull in
+#: dependencies the bundle does not have -- rollout.py `kaggle_environments` and
+#: the native extension, ppo.py the whole update path -- so either import would
+#: be a ModuleNotFoundError at agent startup, exactly where
+#: `inference.CheckpointAgent` validates a checkpoint's run provenance. Only the
+#: off value of each knob is needed here, because all this module re-derives is
+#: whether a knob was enabled, and an inference agent has no legitimate interest
+#: in which backend collected the rollouts it learned from or compiled the
+#: update that consumed them.
 #:
-#: Membership in the domain is enforced wherever the domain is knowable:
-#: argparse `choices=ROLLOUT_FORWARD_MODES` at every entrypoint, and the
-#: launcher's `_declared_knobs`, which reads the mode out of the benchmark
-#: reports a decision is derived from. That is what makes the structural check
-#: below sufficient rather than lax -- a mode outside the domain cannot match
-#: any launchable `--rollout-forward-mode`, so training refuses the record whose
-#: calibration names it.
+#: Membership in a domain is enforced wherever that domain is knowable: argparse
+#: `choices=` at every entrypoint, and the launcher's `_declared_knobs`, which
+#: reads both modes out of the benchmark reports a decision is derived from. That
+#: is what makes the structural check in `_decided_knob_enabled` sufficient
+#: rather than lax -- a mode outside its domain cannot match any launchable
+#: `--rollout-forward-mode` or `--update-compile-mode`, so training refuses the
+#: record whose calibration names it.
+#:
+#: Two constants spelling the same word: they are values drawn from two disjoint
+#: domains, and one shared constant would make `eager` a single fact about two
+#: phases that are measured and decided independently.
 UNCOMPILED_ROLLOUT_FORWARD_MODE = "eager"
+UNCOMPILED_UPDATE_COMPILE_MODE = "eager"
+#: The uncompiled value of every knob, keyed by knob, for the two readers that
+#: need it per knob rather than by name: `_decided_knob_enabled` below and the
+#: launcher's chain validation. It lives beside `CALIBRATION_KNOBS` for the same
+#: reason that does -- the launcher used to keep its own copy, and a second
+#: mapping is how the pair drifts.
+UNCOMPILED_CALIBRATION_MODES = {
+    ROLLOUT_FORWARD_MODE_KNOB: UNCOMPILED_ROLLOUT_FORWARD_MODE,
+    UPDATE_COMPILE_MODE_KNOB: UNCOMPILED_UPDATE_COMPILE_MODE,
+}
 
 
 def is_legacy_run_provenance(value: object) -> bool:
@@ -341,17 +370,16 @@ def _decided_knob_enabled(knob: str, value: object) -> bool:
     Which mode was chosen is not derivable from a ratio and is not re-derived
     here: it is pinned by the three report digests the record already carries,
     because the chain node that produced them declared it.
+
+    Both knobs are mode-valued, so no boolean branch is left. A boolean reaching
+    here is a format-4 record wearing a version-5 number: `False` names no mode,
+    and reading it as `eager` would let a record that never stated one pass as
+    though it had, while `True` is the value version 5 exists to refuse -- it is
+    compatible with every compiled mode of its phase at once.
     """
-    if knob != ROLLOUT_FORWARD_MODE_KNOB:
-        if type(value) is not bool:
-            raise ValueError(f"run provenance {knob} decision must be boolean")
-        return value
-    # A missing key or a boolean here is a format-3 record wearing a version-4
-    # number: `False` is not a mode, and reading it as `eager` would let a record
-    # that never stated one pass as though it had.
     if not isinstance(value, str) or not value:
-        raise ValueError(f"run provenance {knob} decision must be a collection forward mode")
-    return value != UNCOMPILED_ROLLOUT_FORWARD_MODE
+        raise ValueError(f"run provenance {knob} decision must be an execution mode")
+    return value != UNCOMPILED_CALIBRATION_MODES[knob]
 
 
 def _normalized_run_provenance(value: dict[str, Any]) -> dict[str, Any]:

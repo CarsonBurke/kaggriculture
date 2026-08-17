@@ -330,16 +330,22 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
 
     assert config["games"] == 112
     assert config["league_games"] == 96
-    assert config["compile_update"] is False
+    assert config["update_compile_mode"] == "default"
     assert config["device_type"] == "cpu"
     # Measurement selected inductor + bf16 for collection, so an unflagged run
     # is the configuration the parity gate was measured on, and the record says
     # which one it was.
     assert config["rollout_forward_mode"] == "inductor"
     assert config["rollout_bfloat16"] is True
-    # Both move the sampled behavior policy, so a resume that changes either is
-    # a different data generator and must not match the checkpoint's record.
-    for knob, value in (("rollout_forward_mode", "eager"), ("rollout_bfloat16", False)):
+    # All three move what a resume would produce -- the collection pair moves the
+    # sampled behavior policy and the update mode moves the graphs that consume
+    # it -- so a resume that changes any of them is a different data generator
+    # and must not match the checkpoint's record.
+    for knob, value in (
+        ("rollout_forward_mode", "eager"),
+        ("rollout_bfloat16", False),
+        ("update_compile_mode", "eager"),
+    ):
         changed = SimpleNamespace(**{**vars(args), knob: value})
         assert module._training_data_config(changed, module._device("cpu")) != config
     args.games += 1
@@ -377,6 +383,34 @@ def test_collection_forward_defaults_to_the_measured_configuration(monkeypatch, 
         parsed("--rollout-forward-mode", "manual_graph")
 
 
+def test_the_update_compile_knob_is_a_mode_with_no_boolean_beside_it(monkeypatch, tmp_path) -> None:
+    """The update knob is `torch.compile`'s `mode=`, so a boolean cannot name it.
+
+    `--compile-update` is deleted rather than kept as a projection: with both a
+    boolean and a mode at the CLI the two could disagree, and the calibration
+    chain identifies this phase's knob by the mode. The domain is enforced here,
+    at the boundary, because `provenance` re-derives the decision inside the
+    submission bundle and cannot import `ppo.py` to learn what the modes are.
+    """
+    module = _training_script()
+
+    def parsed(*flags: str):
+        monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path), *flags])
+        return module.parse_args()
+
+    default = parsed()
+    assert default.update_compile_mode == "default"
+    module._validate_args(default)
+    assert not hasattr(default, "compile_update")
+
+    for mode in module.UPDATE_COMPILE_MODES:
+        assert parsed("--update-compile-mode", mode).update_compile_mode == mode
+
+    for rejected in ("cudagraphs", "true", "1", "reduce_overhead"):
+        with pytest.raises(SystemExit):
+            parsed("--update-compile-mode", rejected)
+
+
 def test_calibration_provenance_binds_initial_command_but_remains_portable(
     monkeypatch, tmp_path
 ) -> None:
@@ -386,7 +420,7 @@ def test_calibration_provenance_binds_initial_command_but_remains_portable(
     decision = {
         "source_identity": identity,
         "rollout_forward_mode": "eager",
-        "compile_update": False,
+        "update_compile_mode": "eager",
         "eager_report_sha256": "a" * 64,
         "eager_report_size_bytes": 100,
         "mixed_report_sha256": "c" * 64,
@@ -394,7 +428,7 @@ def test_calibration_provenance_binds_initial_command_but_remains_portable(
         "compiled_report_sha256": "b" * 64,
         "compiled_report_size_bytes": 120,
         "minimum_compile_speedup": 1.05,
-        "attributed_knob_speedups": {"rollout_forward_mode": 1.0, "compile_update": 1.0},
+        "attributed_knob_speedups": {"rollout_forward_mode": 1.0, "update_compile_mode": 1.0},
         "training_command": [
             sys.executable,
             str((Path(__file__).parents[1] / "scripts" / "train_ppo.py").resolve()),

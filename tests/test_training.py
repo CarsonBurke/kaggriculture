@@ -87,6 +87,54 @@ def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
         )
 
 
+def test_a_checkpoints_update_mode_record_must_match_its_ppo_config() -> None:
+    """The record and the config are independent parameters, so nothing else
+    makes them agree, and a checkpoint whose record names one update mode while
+    its config names another carries provenance for a run that did not happen.
+
+    Compared by value rather than by identity: the knob is a mode string now, and
+    a string read back out of a checkpoint or a JSON decision is not the same
+    object as the interned literal the config was built from. An `is not`
+    comparison here would reject agreeing pairs -- which the non-interned
+    spelling below is built to catch.
+    """
+    from kaggriculture.training import checkpoint_payload
+
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    ppo_config = PpoConfig(epochs=1, minibatch_size=4, update_compile_mode="max-autotune")
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
+    rng_states = dict.fromkeys(("torch_rng", "cuda_rng", "numpy_rng", "python_rng"))
+
+    def build(recorded: str):
+        return checkpoint_payload(
+            actor_state=actor.state_dict(),
+            critic_state=critic.state_dict(),
+            actor_optimizer_state=actor_optimizer.state_dict(),
+            critic_optimizer_state=critic_optimizer.state_dict(),
+            model_config=model_config,
+            ppo_config=ppo_config,
+            iteration=1,
+            next_seed=2,
+            metrics={},
+            source_identity=source_identity(),
+            rng_states=rng_states,
+            training_data_config={"update_compile_mode": recorded},
+        )
+
+    # Built at runtime rather than written as a literal, so it is a distinct
+    # object from the one `PpoConfig` holds: an identity comparison would reject
+    # this agreeing pair, which is the regression this line exists to catch.
+    agreeing = "-".join(("max", "autotune"))
+    assert build(agreeing)["training_data_config"]["update_compile_mode"] == "max-autotune"
+
+    with pytest.raises(ValueError, match="update_compile_mode does not match its ppo config"):
+        build("default")
+
+
 def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_path) -> None:
     """A resume whose checkpoint was written by another architecture, or by
     the same architecture at another capacity, must fail on model identity --

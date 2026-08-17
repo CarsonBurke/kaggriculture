@@ -27,6 +27,7 @@ from kaggriculture.ppo import (
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     MAX_VALUE_TARGET_SATURATED_FRACTION,
+    UPDATE_COMPILE_MODES,
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
     make_optimizers,
@@ -42,7 +43,7 @@ from kaggriculture.production import (
     PRODUCTION_TEMPERATURE,
     production_ppo_config,
 )
-from kaggriculture.provenance import source_identity
+from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, source_identity
 from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
 from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
@@ -65,7 +66,7 @@ _REPORT_TENSORBOARD_DIR: Path | None = None
 # matches production exactly, so every default derives from the shared source.
 # The model is the exception only in form: production_model_config() *is* the
 # conv dataclass defaults, which is what an unflagged entity-cnn run builds.
-_PRODUCTION_PPO = production_ppo_config(compile_update=False)
+_PRODUCTION_PPO = production_ppo_config(update_compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE)
 _PRODUCTION_LEAGUE_OPPONENTS = (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS
 )
@@ -273,13 +274,19 @@ def parse_args() -> argparse.Namespace:
         help="run the collection forward under bf16 autocast; the update path is bf16 "
         "regardless, so an fp32 collection is a second precision rather than a safer one",
     )
-    # `--compile-rollout` is gone rather than kept as the mode's projection: the
-    # calibration chain identifies this phase's knob by the mode now, so nothing
-    # read the boolean, and a report carrying it would break the chain outright
-    # -- the launcher requires every non-knob configuration key to be identical
-    # across nodes, and a boolean derived from the mode differs exactly where
-    # the chain varies it.
-    parser.add_argument("--compile-update", action="store_true")
+    # `--compile-rollout` and `--compile-update` are both gone rather than kept
+    # as their modes' projections: the calibration chain identifies each phase's
+    # knob by the mode now, so nothing read either boolean, and a report carrying
+    # one would break the chain outright -- the launcher requires every non-knob
+    # configuration key to be identical across nodes, and a boolean derived from
+    # a mode differs exactly where the chain varies it.
+    parser.add_argument(
+        "--update-compile-mode",
+        choices=UPDATE_COMPILE_MODES,
+        default="default",
+        help="execution mode of the update-path forward/backward; `eager` is one of the modes, "
+        "so this alone decides whether the update compiles",
+    )
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tensorboard-dir", type=Path)
@@ -454,7 +461,7 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         target_kl=args.target_kl,
         use_bfloat16=not args.no_bfloat16,
-        compile_update=args.compile_update,
+        update_compile_mode=args.update_compile_mode,
     )
     identity = source_identity()
     emit(
@@ -490,15 +497,19 @@ def main() -> None:
                 "cudnn_benchmark": torch.backends.cudnn.benchmark,
             },
             "model": model_config.to_dict(),
+            # `asdict` carries `update_compile_mode`, which is the update knob
+            # whole: the launcher reads it from here (`_declared_knobs`), so the
+            # only record of what the update phase median was measured under is
+            # the mode itself rather than any boolean beside it.
             "ppo": asdict(ppo_config),
             # The collection configuration the rollout phase median was measured
             # under; a benchmark that cannot say which mode it timed is not
             # evidence for one, and this median is what the launcher attributes
             # the rollout knob's speedup from. `rollout_forward_mode` is that
-            # knob, whole -- no boolean projection of it is recorded, because a
-            # projection would be a second name for one decision and the chain
-            # would have two places to disagree. `precision.use_bfloat16` above
-            # is the update path; `rollout_bfloat16` is this one.
+            # knob, whole -- no boolean projection of either knob is recorded,
+            # because a projection would be a second name for one decision and
+            # the chain would have two places to disagree. `precision.use_bfloat16`
+            # above is the update path; `rollout_bfloat16` is this one.
             "rollout_forward_mode": args.rollout_forward_mode,
             "rollout_bfloat16": args.rollout_bfloat16,
             "torch": torch.__version__,
@@ -628,7 +639,7 @@ def main() -> None:
                 actor,
                 rollout,
                 minibatch_size=ppo_config.minibatch_size,
-                compile_model=ppo_config.compile_update,
+                compile_mode=ppo_config.update_compile_mode,
                 autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
             )
             _synchronize(device)

@@ -17,6 +17,7 @@ from kaggriculture.model import (
     distributional_value_loss,
 )
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
+from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
 from kaggriculture.registry import CONV_ENTITY
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredCritic, StructuredInputs
@@ -257,6 +258,29 @@ _REPLAY_AUDIT_SHUFFLE_SEED = 20260815
 #: non-zero reading and still fires well before the collapse completes.
 MAX_VALUE_TARGET_SATURATED_FRACTION = 0.05
 
+#: Execution modes for the update path's forward+backward, as `torch.compile`
+#: `mode=` values plus `eager` for not compiling at all. A boolean cannot name
+#: this decision: the same mistake was already made on the collection side,
+#: where the one mode a boolean could select turned out to be slower than eager
+#: (`ROLLOUT_FORWARD_MODES`). `default` is Inductor's fusion without CUDA
+#: graphs, `reduce-overhead` adds graph capture, and the `max-autotune` pair
+#: separates benchmarked kernel selection from that capture so a win is
+#: attributable to one of them rather than to both at once.
+UPDATE_COMPILE_MODES = (
+    "eager",
+    "default",
+    "reduce-overhead",
+    "max-autotune",
+    "max-autotune-no-cudagraphs",
+)
+# The off value lives in `provenance` rather than here, because the submission
+# bundle ships `provenance.py` but not this module, so the run-provenance
+# validator has to be able to recognise an uncompiled record without importing
+# the training stack. `UNCOMPILED_ROLLOUT_FORWARD_MODE` sits there for exactly
+# the same reason. Callers needing a boolean derive it as
+# `mode != UNCOMPILED_UPDATE_COMPILE_MODE` at their single point of use rather
+# than carrying a second switch that could contradict the first.
+
 
 @dataclass(frozen=True)
 class PpoConfig:
@@ -301,13 +325,13 @@ class PpoConfig:
     # behavior side through the update path's forward at the same precision;
     # log_softmax stays fp32 under autocast either way.
     use_bfloat16: bool = True
-    # Compile the update-path forward/backward with Inductor. Fusion collapses
-    # the launch-bound logprob/surrogate math into a few large kernels while
-    # keeping memory eager-like, unlike CUDA-graph capture whose per-minibatch
-    # forward+backward recordings pin multiple GiB of activation pools. The
-    # resulting importance-ratio drift against stored behavior likelihoods is
-    # gated end to end by `update_replay_parity`.
-    compile_update: bool = True
+    # Execution mode for the update-path forward/backward, one of
+    # `UPDATE_COMPILE_MODES`. Fusion collapses the launch-bound
+    # logprob/surrogate math into a few large kernels; the modes above `default`
+    # additionally capture CUDA graphs or benchmark kernel selection, and what
+    # each one costs in importance-ratio drift against the stored behavior
+    # likelihoods is gated end to end by `update_replay_parity`.
+    update_compile_mode: str = "default"
 
 
 @dataclass(frozen=True)
@@ -523,7 +547,7 @@ def replay_behavior_values(
     # already occupies the device; 4096 keeps the pass large enough to stay
     # bandwidth-bound without that spike.
     chunk_size: int = 4096,
-    compile_model: bool = False,
+    compile_mode: str = UNCOMPILED_UPDATE_COMPILE_MODE,
     autocast_enabled: bool = False,
 ) -> Tensor:
     """Replay behavior-time value predictions from stored state features.
@@ -540,10 +564,11 @@ def replay_behavior_values(
         raise ValueError("chunk size must be positive")
     rows = staged["unit_actions"].shape[0]
     device = staged["unit_actions"].device
-    forward = (
-        _cached_update_callable(critic, "_kaggriculture_value_replay", _replayed_value_chunk)
-        if compile_model and device.type == "cuda"
-        else _replayed_value_chunk
+    forward = _cached_update_callable(
+        critic,
+        "_kaggriculture_value_replay",
+        _replayed_value_chunk,
+        _device_compile_mode(compile_mode, device),
     )
     was_training = critic.training
     critic.eval()
@@ -797,7 +822,7 @@ def replay_behavior_logprobs(
     *,
     minibatch_size: int,
     autocast_enabled: bool,
-    compile_model: bool = False,
+    compile_mode: str = UNCOMPILED_UPDATE_COMPILE_MODE,
 ) -> dict[str, Tensor]:
     """Recompute behavior log-likelihoods through the update-path forward.
 
@@ -824,10 +849,11 @@ def replay_behavior_logprobs(
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
     device = staged["unit_actions"].device
-    replay = (
-        _cached_update_callable(actor, "_kaggriculture_logprob_replay", _replayed_selected_logprobs)
-        if compile_model and device.type == "cuda"
-        else _replayed_selected_logprobs
+    replay = _cached_update_callable(
+        actor,
+        "_kaggriculture_logprob_replay",
+        _replayed_selected_logprobs,
+        _device_compile_mode(compile_mode, device),
     )
     rows = staged["unit_actions"].shape[0]
     replayed = {
@@ -864,21 +890,66 @@ def replay_behavior_logprobs(
     return replayed
 
 
-def _cached_update_callable(module: torch.nn.Module, attribute: str, function):
-    """Compile an update-path computation with Inductor, cached per module.
+def _device_compile_mode(mode: str, device: torch.device) -> str:
+    """Collapse a compile mode to `eager` on any device Inductor cannot serve.
 
-    Rollout collection deliberately uses the fusion-free cudagraphs backend,
-    but graph-capturing the update's forward+backward would permanently pin
-    every minibatch's activations in private pools. Inductor keeps memory
-    eager-like and instead removes launch overhead by fusing the elementwise
-    logprob/surrogate math; the numeric drift fusion introduces is bounded by
-    the `update_replay_parity` gate. The compiled wrapper is attached outside
-    the module hierarchy so checkpoints stay clean.
+    Every update-path entry point resolves the mode through here exactly once, so
+    the CUDA test lives in one place instead of being repeated beside each
+    `torch.compile` call. That repetition is what previously let a caller name a
+    compiled mode while a stale second switch selected the eager path.
     """
-    compiled = getattr(module, attribute, None)
+    if mode not in UPDATE_COMPILE_MODES:
+        raise ValueError(f"unknown update compile mode {mode!r}")
+    return mode if device.type == "cuda" else UNCOMPILED_UPDATE_COMPILE_MODE
+
+
+def _cached_update_callable(module: torch.nn.Module, attribute: str, function, mode: str):
+    """Compile an update-path computation, cached per module AND per mode.
+
+    The cache is keyed by mode because a run can measure several in one process
+    -- the calibration chain and `update_replay_parity` both do -- and a single
+    slot would hand back the first mode's artifact under a later mode's name,
+    silently reporting one configuration's cost as another's.
+
+    Which mode is worth its cost is a measured question, not an assumed one. The
+    earlier version of this helper compiled with Inductor's default mode and
+    justified refusing CUDA graphs on the claim that capturing the update's
+    forward+backward "would permanently pin every minibatch's activations in
+    private pools". That is false, and false in the opposite direction. Measured
+    by `scripts/profile_update_backends.py` over the production schedule -- 73
+    actor and 292 critic minibatches at 2048 -- as wall clock / peak reserved /
+    compile time:
+
+        eager                        41.444 s   11.34 GiB     0.8 s
+        default                      17.107 s   11.34 GiB    34.3 s
+        reduce-overhead              17.026 s    8.44 GiB    29.2 s
+        max-autotune                 16.152 s    8.43 GiB   522.6 s
+        max-autotune-no-cudagraphs   16.377 s   16.76 GiB   204.4 s
+
+    Graph capture RESERVES 2.9 GiB LESS than the default mode, because the graph
+    pool is reused across replays where the caching allocator otherwise
+    fragments across minibatches; the mode that actually inflates memory is the
+    autotuned one with capture disabled, at 16.76 GiB. Compilation itself is
+    worth 2.42x and is not optional. `max-autotune` is a net loss despite being
+    fastest: 0.955 s per iteration over a 500-iteration run saves 8.0 minutes
+    and costs 8.7 minutes compiling, and it is the same trap as the collection
+    knob -- a mode that wins the microbenchmark and loses the run.
+
+    The compiled wrapper is attached outside the module hierarchy so checkpoints
+    stay clean.
+    """
+    if mode not in UPDATE_COMPILE_MODES:
+        raise ValueError(f"unknown update compile mode {mode!r}")
+    if mode == UNCOMPILED_UPDATE_COMPILE_MODE:
+        return function
+    cache = getattr(module, attribute, None)
+    if cache is None:
+        cache = {}
+        object.__setattr__(module, attribute, cache)
+    compiled = cache.get(mode)
     if compiled is None:
-        compiled = torch.compile(function, fullgraph=True, dynamic=False)
-        object.__setattr__(module, attribute, compiled)
+        compiled = torch.compile(function, mode=mode, fullgraph=True, dynamic=False)
+        cache[mode] = compiled
     return compiled
 
 
@@ -996,8 +1067,8 @@ def update_replay_parity(
     rollout: RolloutBatch,
     *,
     minibatch_size: int,
-    compile_model: bool = False,
-    autocast_enabled: bool = False,
+    compile_mode: str,
+    autocast_enabled: bool,
 ) -> dict[str, float | int]:
     """Measure rollout-sampling versus update-replay likelihood divergence.
 
@@ -1048,11 +1119,11 @@ def update_replay_parity(
         )
     }
     ordered = torch.from_numpy(valid_indices).to(device=device)
-    compile_enabled = compile_model and device.type == "cuda"
-    replay = (
-        _cached_update_callable(actor, "_kaggriculture_logprob_replay", _replayed_selected_logprobs)
-        if compile_enabled
-        else _replayed_selected_logprobs
+    replay = _cached_update_callable(
+        actor,
+        "_kaggriculture_logprob_replay",
+        _replayed_selected_logprobs,
+        _device_compile_mode(compile_mode, device),
     )
     maximum_logprob_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
     maximum_ratio_error = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
@@ -1129,7 +1200,7 @@ def update_replay_parity(
         staged,
         valid_indices,
         minibatch_size=minibatch_size,
-        compile_model=compile_model,
+        compile_mode=compile_mode,
         autocast_enabled=autocast_enabled,
     )
     total_active = sum(active_counts.values())
@@ -1191,7 +1262,7 @@ def _replay_to_update_minibatch_kl(
     valid_indices: np.ndarray,
     *,
     minibatch_size: int,
-    compile_model: bool,
+    compile_mode: str,
     autocast_enabled: bool,
 ) -> tuple[float, float]:
     """Worst and mean per-minibatch KL between behavior replay and update forward.
@@ -1213,7 +1284,7 @@ def _replay_to_update_minibatch_kl(
     at random each iteration and the worst draw is the one that has to clear.
     """
     device = next(actor.parameters()).device
-    compile_enabled = compile_model and device.type == "cuda"
+    resolved_mode = _device_compile_mode(compile_mode, device)
     # The k3 sum ignores both the advantages and the clip bounds, so the
     # defaults stand in for a config this audit is not otherwise given.
     clip = PpoConfig()
@@ -1224,7 +1295,7 @@ def _replay_to_update_minibatch_kl(
         valid_indices,
         minibatch_size=minibatch_size,
         autocast_enabled=autocast_enabled,
-        compile_model=compile_model,
+        compile_mode=compile_mode,
     )
     staged = staged | replayed
     flat_valid_size = rollout.valid.size
@@ -1233,10 +1304,8 @@ def _replay_to_update_minibatch_kl(
         + rollout.market_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
         + rollout.market_quantity_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
     )
-    terms = (
-        _cached_update_callable(actor, "_kaggriculture_update_terms", _actor_minibatch_terms)
-        if compile_enabled
-        else _actor_minibatch_terms
+    terms = _cached_update_callable(
+        actor, "_kaggriculture_update_terms", _actor_minibatch_terms, resolved_mode
     )
     # The permutation only has to be *a* shuffle, not the training run's: the
     # residual comes from minibatches being composed differently than the replay
@@ -1517,13 +1586,13 @@ def update_ppo(
     # full batch instead of one small synchronous critic forward per rollout
     # step. The critic still holds exactly the behavior weights at this point.
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
-    compile_enabled = config.compile_update and device.type == "cuda"
+    compile_mode = _device_compile_mode(config.update_compile_mode, device)
     behavior_values = (
         replay_behavior_values(
             critic,
             architecture,
             staged,
-            compile_model=config.compile_update,
+            compile_mode=compile_mode,
             autocast_enabled=autocast_enabled,
         )
         .cpu()
@@ -1544,7 +1613,7 @@ def update_ppo(
                 valid_indices,
                 minibatch_size=config.minibatch_size,
                 autocast_enabled=autocast_enabled,
-                compile_model=config.compile_update,
+                compile_mode=compile_mode,
             )
         )
     actor.train()
@@ -1602,15 +1671,11 @@ def update_ppo(
     completed_epochs = 0
     max_approx_kl = 0.0
     first_minibatch_kl = 0.0
-    actor_terms = (
-        _cached_update_callable(actor, "_kaggriculture_update_terms", _actor_minibatch_terms)
-        if compile_enabled
-        else _actor_minibatch_terms
+    actor_terms = _cached_update_callable(
+        actor, "_kaggriculture_update_terms", _actor_minibatch_terms, compile_mode
     )
-    critic_loss_fn = (
-        _cached_update_callable(critic, "_kaggriculture_update_loss", _critic_minibatch_loss)
-        if compile_enabled
-        else _critic_minibatch_loss
+    critic_loss_fn = _cached_update_callable(
+        critic, "_kaggriculture_update_loss", _critic_minibatch_loss, compile_mode
     )
     stop_for_kl = False
     # Guard scalars leave the device through one pinned async copy per ACTOR

@@ -112,7 +112,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
             {
                 "source_identity": source_identity(),
                 "rollout_forward_mode": "eager",
-                "compile_update": False,
+                "update_compile_mode": "eager",
                 "eager_report_sha256": "a" * 64,
                 "eager_report_size_bytes": 100,
                 "mixed_report_sha256": "c" * 64,
@@ -120,7 +120,10 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
                 "compiled_report_sha256": "b" * 64,
                 "compiled_report_size_bytes": 120,
                 "minimum_compile_speedup": 1.05,
-                "attributed_knob_speedups": {"rollout_forward_mode": 1.0, "compile_update": 1.0},
+                "attributed_knob_speedups": {
+                    "rollout_forward_mode": 1.0,
+                    "update_compile_mode": 1.0,
+                },
             },
         )
     torch.save(
@@ -303,13 +306,16 @@ def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Pat
 
     with pytest.raises(ValueError, match="carries superseded calibration provenance"):
         actor_artifact_from_checkpoint(checkpoint)
-    # Both superseded versions are refused at the same boundary, so a checkpoint
+    # Every superseded version is refused at the same boundary, so a checkpoint
     # written by an earlier tree cannot export a decision whose evidence no
     # longer substantiates it. Version 3's rollout knob is a boolean whose
     # only "on" value was `cudagraphs`, so the speedup it certifies belongs to a
     # mode measurement rejects -- 5.309 ms against eager's 4.907 ms on the
     # isolated collection forward -- and no mode can be recovered from `False`.
-    for superseded in (2, 3):
+    # Version 4's update knob is the same defect one phase over: its `true`
+    # names all four compiled modes at once, so nothing in the record says which
+    # one the speedup beside it was measured under.
+    for superseded in (2, 3, 4):
         assert is_legacy_run_provenance(
             {"format_version": superseded, "sha256": "a" * 64, "calibration": {}}
         )

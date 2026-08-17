@@ -74,17 +74,20 @@ benchmark() {
     --output "$repo/artifacts/benchmarks/$name-ppo.jsonl"
 }
 
-benchmark eager    --rollout-forward-mode eager    --rollout-bfloat16
-benchmark mixed    --rollout-forward-mode eager    --rollout-bfloat16 --compile-update
-benchmark compiled --rollout-forward-mode inductor --rollout-bfloat16 --compile-update
+benchmark eager    --rollout-forward-mode eager    --rollout-bfloat16 --update-compile-mode eager
+benchmark mixed    --rollout-forward-mode eager    --rollout-bfloat16 --update-compile-mode default
+benchmark compiled --rollout-forward-mode inductor --rollout-bfloat16 --update-compile-mode default
 ```
 
 All three time the production batch from the same source snapshot and differ
-only in the knob each step turns on. The collection precision is stated on every
-node rather than left to the default because it is not a knob: the launcher
-requires it to be identical across the chain and equal to production's, so a
-chain measured in fp32 is rejected instead of launched. Launch training from the
-complete set:
+only in the knob each step turns on. Neither knob is a boolean: each names the
+execution mode of its phase, and `eager` is one of those modes rather than the
+absence of a choice, so the chain's first node states `eager` on both sides and
+each step moves one of them to a compiling mode. The collection precision is
+stated on every node rather than left to the default because it is not a knob:
+the launcher requires it to be identical across the chain and equal to
+production's, so a chain measured in fp32 is rejected instead of launched.
+Launch training from the complete set:
 
 ```bash
 .venv/bin/python scripts/launch_calibrated_training.py \
@@ -319,7 +322,7 @@ silently excluded:
 Use at least `--seeds 128` for finalists. Rank stable-panel results, not the
 training self-play score (which is 0.5 by symmetry) or `latest.pt`. Evaluation
 takes no compilation flag: `--rollout-forward-mode`, `--rollout-bfloat16` and
-`--compile-update` are training knobs, decided by the calibration described
+`--update-compile-mode` are training knobs, decided by the calibration described
 above, and the evaluation and selection scripts accept none of them.
 
 To screen every numbered checkpoint on identical paired seeds and atomically

@@ -78,7 +78,8 @@ def _run(
     measure,
     *extra: str,
     pairing: tuple[str, ...] = (
-        "--no-compile-update",
+        "--update-compile-mode",
+        "eager",
         "--no-rollout-bfloat16",
         "--rollout-forward-mode",
         "eager",
@@ -136,34 +137,37 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
         (
             (
                 (
-                    "--no-compile-update",
+                    "--update-compile-mode",
+                    "eager",
                     "--no-rollout-bfloat16",
                     "--rollout-forward-mode",
                     "eager",
                 ),
-                False,
+                "eager",
                 "eager",
                 False,
             ),
             (
                 (
-                    "--compile-update",
+                    "--update-compile-mode",
+                    "default",
                     "--no-rollout-bfloat16",
                     "--rollout-forward-mode",
                     "cudagraphs",
                 ),
-                True,
+                "default",
                 "cudagraphs",
                 False,
             ),
             (
                 (
-                    "--compile-update",
+                    "--update-compile-mode",
+                    "max-autotune",
                     "--rollout-bfloat16",
                     "--rollout-forward-mode",
                     "inductor",
                 ),
-                True,
+                "max-autotune",
                 "inductor",
                 True,
             ),
@@ -179,7 +183,7 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
         module.main()
         configuration, *_records = _report_records(report)
 
-        assert configuration["compile_update"] is update
+        assert configuration["update_compile_mode"] == update
         assert configuration["rollout_forward_mode"] == mode
         assert configuration["rollout_bfloat16"] is bf16
         assert configuration["use_bfloat16"] is True
@@ -189,11 +193,29 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
     "flags",
     [
         (),
-        ("--compile-update",),
+        ("--update-compile-mode", "default"),
         # The collection knobs are the same kind of assumption: they move the
         # gated statistic further than the update knob does.
-        ("--no-compile-update", "--no-rollout-bfloat16"),
-        ("--no-compile-update", "--rollout-forward-mode", "eager"),
+        ("--update-compile-mode", "eager", "--no-rollout-bfloat16"),
+        ("--update-compile-mode", "eager", "--rollout-forward-mode", "eager"),
+        # A mode outside its knob's domain is the same defect stated positively:
+        # the two domains are disjoint, so each knob wearing the other's mode
+        # names a pairing no launch can produce. argparse `choices` is what
+        # refuses it, at the only boundary that knows both domains.
+        (
+            "--update-compile-mode",
+            "cudagraphs",
+            "--no-rollout-bfloat16",
+            "--rollout-forward-mode",
+            "eager",
+        ),
+        (
+            "--update-compile-mode",
+            "eager",
+            "--no-rollout-bfloat16",
+            "--rollout-forward-mode",
+            "max-autotune",
+        ),
     ],
 )
 def test_the_audit_refuses_to_assume_a_pairing_it_was_not_told(monkeypatch, tmp_path, flags):
@@ -225,7 +247,6 @@ def test_the_audit_cannot_express_a_pairing_a_launch_cannot_produce(
     # can disagree with the mode. Pinned here because the defect was invisible
     # to a suite in which two files asserted opposite things about the boolean.
     module = _audit_script()
-    assert not hasattr(module.parse_args, "compile_rollout")
     seen: dict[str, object] = {}
 
     def collect(*args, **kwargs):
@@ -243,12 +264,20 @@ def test_the_audit_cannot_express_a_pairing_a_launch_cannot_produce(
         "--league-games",
         "0",
         pairing=(
-            "--compile-update",
+            "--update-compile-mode",
+            "default",
             "--rollout-bfloat16",
             "--rollout-forward-mode",
             mode,
         ),
     )
+    # The parsed namespace is where a second knob for either phase would show
+    # up. Asserting on `parse_args` itself asserts nothing -- a function has no
+    # such attribute either way -- which is how a stale boolean could survive a
+    # test that looked like it forbade one.
+    parsed = module.parse_args()
+    assert not hasattr(parsed, "compile_rollout")
+    assert not hasattr(parsed, "compile_update")
     with pytest.raises(SystemExit):
         module.main()
 

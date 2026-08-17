@@ -98,7 +98,7 @@ def main() -> None:
                         actor,
                         rollout,
                         minibatch_size=ppo_config.minibatch_size,
-                        compile_model=ppo_config.compile_update,
+                        compile_mode=ppo_config.update_compile_mode,
                         autocast_enabled=ppo_config.use_bfloat16,
                     )
                     parity.append({key: float(value) for key, value in metrics.items()})

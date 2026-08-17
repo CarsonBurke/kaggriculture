@@ -29,7 +29,14 @@ from typing import Any, Protocol
 #: is now `rollout-cudagraphs-update-eager` or `rollout-inductor-update-eager`,
 #: two configurations epoch 4 could not tell apart, and their isolated
 #: collection forwards measure 5.309 ms against 2.720 ms.
-_LAYOUT_EPOCH = 5
+#: 6: the update knob became a mode too, so the label names it instead of
+#: saying `compiled`. Same failure, same force: a run epoch 5 filed as
+#: `rollout-inductor-update-compiled` is now one of four labels -- `default`,
+#: `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs` -- which
+#: epoch 5 could not tell apart, and separating graph capture from benchmarked
+#: kernel selection is the entire reason those modes are enumerated separately
+#: (`ppo.UPDATE_COMPILE_MODES`).
+_LAYOUT_EPOCH = 6
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -289,14 +296,22 @@ def training_step_field(record: dict[str, Any]) -> str | None:
     )
 
 
-#: What a benchmark whose configuration record names no collection mode is
-#: labelled as. Reached with no configuration record at all -- a training
-#: journal has none, and `_benchmark_context` falls back to an empty mapping
-#: rather than failing a mirror over a label.
-_UNCOMPILED_COLLECTION = "eager"
+#: What a phase whose configuration record names no execution mode is labelled
+#: as. Reached with no configuration record at all -- a training journal has
+#: none, and `_benchmark_context` falls back to an empty mapping rather than
+#: failing a mirror over a label. Spelled here rather than imported from
+#: `provenance`, because this is a label of last resort rather than a knob
+#: value: a mirror must plot a run it cannot name, and coupling the fallback to
+#: the schema would make an unnameable run a hard error.
+_UNCOMPILED_MODE = "eager"
 
 
-def _compile_mode_label(collection_mode: str, compile_update: bool) -> str:
+def _declared_mode(value: object) -> str:
+    """A record's declared execution mode, or the uncompiled label if it has none."""
+    return value if isinstance(value, str) and value else _UNCOMPILED_MODE
+
+
+def _compile_mode_label(collection_mode: str, update_mode: str) -> str:
     """The compilation a benchmark's series is filed under, both phases named.
 
     Both, because the mixed configurations are real: production runs a compiled
@@ -305,15 +320,18 @@ def _compile_mode_label(collection_mode: str, compile_update: bool) -> str:
     series as a true eager one, where the difference reads as hardware noise
     instead of as the knob it is.
 
-    The collection half is a mode rather than a flag, and names itself, because
-    its values are not one measurement: `cudagraphs` and `inductor` differ by
-    5.309 ms against 2.720 ms on the isolated fp32 collection forward, which is
-    further apart than either is from eager's 4.907 ms. A boolean would file them
-    together. The mode strings are whatever the report declared; their domain is
-    `ROLLOUT_FORWARD_MODES`, enforced where a report becomes a decision rather
+    Each half is a mode rather than a flag, and names itself, because neither
+    knob's values are one measurement. On the collection side `cudagraphs` and
+    `inductor` differ by 5.309 ms against 2.720 ms on the isolated fp32 forward,
+    which is further apart than either is from eager's 4.907 ms; on the update
+    side the modes differ in whether they capture CUDA graphs and whether they
+    benchmark kernel selection, which is why they are enumerated separately at
+    all. A boolean either side would file them together. The mode strings are
+    whatever the report declared; their domains are `ROLLOUT_FORWARD_MODES` and
+    `UPDATE_COMPILE_MODES`, enforced where a report becomes a decision rather
     than here, since a mirror must not refuse to plot a run it cannot name.
     """
-    return f"rollout-{collection_mode}-update-{'compiled' if compile_update else 'eager'}"
+    return f"rollout-{collection_mode}-update-{update_mode}"
 
 
 def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
@@ -323,36 +341,35 @@ def _configuration_context(configuration: dict[str, Any]) -> tuple[str, str]:
     #
     #   ppo      the iteration benchmark: a collection phase and an update
     #            phase, decided independently. `rollout_forward_mode` sits at
-    #            top level and `compile_update` is nested under `ppo` -- a schema
-    #            asymmetry, so both have to be read from where they actually are.
-    #   audit    the replay-parity audit: the mode and `compile_update` both at
-    #            top level, and no `self_play_game_counts` (it takes a single
-    #            `self_play_games`), which is why it must be discriminated
-    #            explicitly rather than falling through to the rollout branch and
-    #            reading a key it never writes.
+    #            top level and `update_compile_mode` is nested under `ppo` -- a
+    #            schema asymmetry, so both have to be read from where they
+    #            actually are.
+    #   audit    the replay-parity audit: both modes at top level, and no
+    #            `self_play_game_counts` (it takes a single `self_play_games`),
+    #            which is why it must be discriminated explicitly rather than
+    #            falling through to the rollout branch and reading a key it
+    #            never writes.
     #   rollout  the rust rollout benchmark: only a collector, and it declares
     #            only `compile_models`, so that boolean is the whole of its mode.
     #
-    # The collection half is read as a mode string rather than a flag: it is one
-    # knob with three values, and `_compile_mode_label` explains why filing
-    # `cudagraphs` and `inductor` together would hide the larger of the two
-    # differences. A record without one is labelled uncompiled rather than
-    # rejected, because a mirror must not fail over a label.
-    collection = configuration.get("rollout_forward_mode")
-    if not isinstance(collection, str) or not collection:
-        collection = _UNCOMPILED_COLLECTION
+    # Both halves are read as mode strings rather than flags: each is one knob
+    # with several values, and `_compile_mode_label` explains why filing two of
+    # them together would hide the larger of the differences. A record without
+    # one is labelled uncompiled rather than rejected, because a mirror must not
+    # fail over a label.
+    collection = _declared_mode(configuration.get("rollout_forward_mode"))
     if "self_play_game_counts" in configuration:
         kind = "ppo"
         ppo = configuration.get("ppo")
-        compile_update = isinstance(ppo, dict) and ppo.get("compile_update") is True
+        update = _declared_mode(ppo.get("update_compile_mode") if isinstance(ppo, dict) else None)
     elif "self_play_games" in configuration:
         kind = "audit"
-        compile_update = configuration.get("compile_update") is True
+        update = _declared_mode(configuration.get("update_compile_mode"))
     else:
         kind = "rollout"
         collector = configuration.get("compile_models") is True
         return kind, "compiled" if collector else "eager"
-    return kind, _compile_mode_label(collection, compile_update)
+    return kind, _compile_mode_label(collection, update)
 
 
 def _benchmark_context(records: tuple[dict[str, Any], ...]) -> tuple[str, str]:

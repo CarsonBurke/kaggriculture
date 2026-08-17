@@ -43,6 +43,7 @@ from pathlib import Path
 from kaggriculture.production import (
     PRODUCTION_ROLLOUT_BFLOAT16,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
+    PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
     require_repository_launcher,
     resolve_resume_checkpoint,
@@ -91,14 +92,14 @@ def main() -> None:
         max_hours=args.max_hours,
         seed=args.seed,
         rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
-        compile_update=True,
+        update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
         resume_checkpoint=resume_checkpoint,
     )
     launch = {
         "event": "direct_launch",
         "rollout_forward_mode": PRODUCTION_ROLLOUT_FORWARD_MODE,
         "rollout_bfloat16": PRODUCTION_ROLLOUT_BFLOAT16,
-        "compile_update": True,
+        "update_compile_mode": PRODUCTION_UPDATE_COMPILE_MODE,
         "iterations": args.iterations,
         "max_hours": args.max_hours,
         "seed": args.seed,

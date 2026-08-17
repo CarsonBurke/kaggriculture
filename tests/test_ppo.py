@@ -17,6 +17,7 @@ from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    UNCOMPILED_UPDATE_COMPILE_MODE,
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
     _balanced_minibatch_slices,
@@ -417,7 +418,13 @@ def test_update_replay_parity_gates_the_update_path_forward() -> None:
     rollout = collect_self_play(actor, games=1, seed_start=94, episode_steps=32, sampling_seed=12)
     before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
 
-    parity = update_replay_parity(actor, rollout, minibatch_size=3)
+    parity = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=3,
+        compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+        autocast_enabled=False,
+    )
 
     for component in ("unit", "kind", "quantity"):
         assert parity[f"update_replay_{component}_active_count"] > 0
@@ -445,7 +452,13 @@ def test_update_replay_parity_gates_the_update_path_forward() -> None:
     # while the untouched unit head stays at the numerical floor.
     rollout.old_market_kind_logprobs[...] -= math.log(2.0)
     rollout.old_market_quantity_logprobs[...] -= math.log(2.0)
-    drifted = update_replay_parity(actor, rollout, minibatch_size=3)
+    drifted = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=3,
+        compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+        autocast_enabled=False,
+    )
     assert drifted["update_replay_kind_ratio_max_abs_error"] > 0.9
     assert drifted["update_replay_quantity_ratio_max_abs_error"] > 0.9
     expected_kl = 1.0 - math.log(2.0)
@@ -455,7 +468,13 @@ def test_update_replay_parity_gates_the_update_path_forward() -> None:
     assert drifted["update_replay_max_kl"] > MAX_UPDATE_REPLAY_KL
 
     with pytest.raises(ValueError, match="minibatch size"):
-        update_replay_parity(actor, rollout, minibatch_size=0)
+        update_replay_parity(
+            actor,
+            rollout,
+            minibatch_size=0,
+            compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+            autocast_enabled=False,
+        )
 
 
 def test_the_joint_kl_is_the_statistic_the_every_iteration_gate_samples() -> None:
@@ -482,7 +501,13 @@ def test_the_joint_kl_is_the_statistic_the_every_iteration_gate_samples() -> Non
     # equal to any one head, so the weighting is actually exercised.
     rollout.old_market_kind_logprobs[...] -= math.log(2.0)
     rollout.old_market_quantity_logprobs[...] -= math.log(2.0)
-    parity = update_replay_parity(actor, rollout, minibatch_size=3)
+    parity = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=3,
+        compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+        autocast_enabled=False,
+    )
 
     heads = ("unit", "kind", "quantity")
     counts = {head: parity[f"update_replay_{head}_active_count"] for head in heads}
@@ -533,7 +558,13 @@ def test_update_replay_kl_averages_over_components_while_the_maximum_does_not() 
         shift_mask = np.zeros(flat_active.shape, dtype=bool)
         shift_mask[np.flatnonzero(flat_active)[:count]] = True
         fresh.old_market_kind_logprobs[shift_mask.reshape(active.shape)] -= shift
-        parity = update_replay_parity(actor, fresh, minibatch_size=3)
+        parity = update_replay_parity(
+            actor,
+            fresh,
+            minibatch_size=3,
+            compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+            autocast_enabled=False,
+        )
         assert parity["update_replay_kind_active_count"] == total_active
         return parity, count / total_active
 
@@ -603,7 +634,13 @@ def test_the_tail_statistic_separates_concentration_from_the_mean_it_shares() ->
         mask = np.zeros(active.reshape(-1).shape, dtype=bool)
         mask[flat_active[:count]] = True
         fresh.old_unit_logprobs[mask.reshape(active.shape)] -= shift
-        return update_replay_parity(actor, fresh, minibatch_size=3)
+        return update_replay_parity(
+            actor,
+            fresh,
+            minibatch_size=3,
+            compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+            autocast_enabled=False,
+        )
 
     concentrated = parity_after(concentrated_shift, concentrated_count)
     diffuse = parity_after(diffuse_shift, total_active)
@@ -1120,7 +1157,13 @@ def test_structured_update_replay_parity_covers_every_component() -> None:
     assert rollout.architecture == STRUCTURED
     before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
 
-    parity = update_replay_parity(actor, rollout, minibatch_size=3)
+    parity = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=3,
+        compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+        autocast_enabled=False,
+    )
 
     for component in ("unit", "kind", "quantity"):
         assert parity[f"update_replay_{component}_active_count"] > 0
@@ -1452,7 +1495,13 @@ def test_the_audited_first_minibatch_kl_is_the_replay_to_update_residual() -> No
     actor = FarmActor(model_config)
     rollout = collect_self_play(actor, games=2, seed_start=41, episode_steps=4, sampling_seed=7)
 
-    metrics = update_replay_parity(actor, rollout, minibatch_size=8)
+    metrics = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=8,
+        compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+        autocast_enabled=False,
+    )
 
     sampling = metrics["update_replay_minibatch_kl"]
     replay = metrics["update_replay_first_minibatch_kl"]
