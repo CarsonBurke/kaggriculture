@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -10,13 +11,34 @@ from pathlib import Path
 
 import pytest
 
+from kaggriculture.ppo import PpoConfig, _validate_config
 from kaggriculture.production import (
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
+    production_ppo_config,
     resolve_resume_checkpoint,
 )
 from kaggriculture.registry import CONV_ENTITY
+
+
+def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
+    # Every other test builds its own PpoConfig, so nothing until now has asked
+    # whether the constants actually launched pass the update's own validation.
+    # They are reachable only through a calibration chain and a multi-hour run,
+    # which is the most expensive possible place to discover an unrunnable pair.
+    shipped = production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE)
+    fields = {field.name for field in dataclasses.fields(PpoConfig) if field.init}
+    # A field added to PpoConfig and not to the shipped schedule would otherwise
+    # be silently defaulted here rather than decided, so the keys are pinned too.
+    assert set(shipped) == fields
+    _validate_config(PpoConfig(**shipped))
+
+    # The pairing this guards: critic epochs are the critic-only refits that run
+    # after the actor's epochs, so a schedule asking for fewer of them than actor
+    # epochs describes a loop that cannot run.
+    with pytest.raises(ValueError, match="critic epochs"):
+        _validate_config(PpoConfig(**{**shipped, "critic_epochs": 0}))
 
 
 def test_resume_detection_accepts_only_a_regular_latest_checkpoint(tmp_path: Path) -> None:
