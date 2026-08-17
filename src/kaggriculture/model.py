@@ -108,6 +108,16 @@ class RMSNorm(nn.RMSNorm):
     end and the cast kernels disappear. Measured 1.158x on the forward, 1.033x on
     forward+backward, with the largest head logit moving 0.65%.
 
+    End to end at the shipped configuration, median over 11 steady iterations: the
+    iteration goes 33.679 s -> 32.473 s, rollout 5.087 -> 4.381 and update 28.373
+    -> 28.027, for 107 -> 110.9 iterations/hour. The split is the interesting part.
+    The rollout is forward-only and collects -13.9% against the -13.7% the forward
+    microbenchmark predicts; the update carries a backward whose cast traffic
+    Inductor was already fusing, so it collects -1.2% rather than the -3.2% the
+    forward+backward microbenchmark suggested. A 2-sample run of the same
+    configuration read -4.7% for the total and was resampled to 11, because two
+    samples do not survive this machine's background contention.
+
     ATen cannot use its fused kernel on a bf16 input with an fp32 weight and warns
     once about it. Casting the weight per call does unlock the fused kernel and
     measures *slower* -- 3.849 ms against 3.718 ms -- because 31 extra launches
