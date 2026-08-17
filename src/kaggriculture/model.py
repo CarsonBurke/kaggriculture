@@ -90,6 +90,35 @@ def _group_count(width: int) -> int:
     return groups
 
 
+class RMSNorm(nn.RMSNorm):
+    """`nn.RMSNorm` that returns the compute dtype instead of promoting to fp32.
+
+    `aten::rms_norm` sits on autocast's fp32 cast list, so under the production
+    bf16 autocast every one of the 31 norms in an actor forward upcast its input,
+    ran in fp32, and returned fp32 -- which then set the dtype of the residual
+    add, the RoPE application, and the next norm's input. The residual stream was
+    fp32 with bf16 islands at the GEMMs, and each island cost a cast in and a cast
+    back out. Measured at 1.022 ms across 31 launches, 13% of a 4.1 ms forward.
+
+    Disabling autocast for the call inverts that: `F.rms_norm` on a bf16 input
+    returns bf16 even with an fp32 weight, because the weight does not promote the
+    output. The master weight stays fp32 -- storing it in bf16 is not an option,
+    since at |w| = 1 a 2.5e-4 AdamW step is 6x below bf16's 3.906e-3 relative ULP
+    and would round away entirely -- while the residual stream becomes bf16 end to
+    end and the cast kernels disappear. Measured 1.158x on the forward, 1.033x on
+    forward+backward, with the largest head logit moving 0.65%.
+
+    ATen cannot use its fused kernel on a bf16 input with an fp32 weight and warns
+    once about it. Casting the weight per call does unlock the fused kernel and
+    measures *slower* -- 3.849 ms against 3.718 ms -- because 31 extra launches
+    cost more than the fusion saves at this width. The unfused path is the fast one.
+    """
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        with torch.autocast(inputs.device.type, enabled=False):
+            return F.rms_norm(inputs, self.normalized_shape, self.weight, self.eps)
+
+
 class ReluSquared(nn.Module):
     """Parameter-free ReLU-squared activation used throughout the network.
 
@@ -278,8 +307,8 @@ class SelfAttention(nn.Module):
         self.heads = config.attention_heads
         self.head_dim = config.model_dim // self.heads
         self.qkv = nn.Linear(config.model_dim, 3 * config.model_dim, bias=False)
-        self.query_norm = nn.RMSNorm(self.head_dim)
-        self.key_norm = nn.RMSNorm(self.head_dim)
+        self.query_norm = RMSNorm(self.head_dim)
+        self.key_norm = RMSNorm(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
 
     def forward(
@@ -333,9 +362,9 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.attention_norm = nn.RMSNorm(config.model_dim)
+        self.attention_norm = RMSNorm(config.model_dim)
         self.attention = SelfAttention(config)
-        self.ffn_norm = nn.RMSNorm(config.model_dim)
+        self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = ReluSquaredFeedForward(config)
 
     def forward(
@@ -370,7 +399,7 @@ class EntityTransformer(nn.Module):
         self.encoder = nn.ModuleList(TransformerBlock(config) for _ in range(side_depth))
         self.bottleneck = TransformerBlock(config)
         self.decoder = nn.ModuleList(TransformerBlock(config) for _ in range(side_depth))
-        self.output_norm = nn.RMSNorm(config.model_dim)
+        self.output_norm = RMSNorm(config.model_dim)
 
     def forward(
         self,
@@ -528,10 +557,10 @@ class FarmActor(nn.Module):
         self.token_types = nn.Embedding(4, config.model_dim)
         self.transformer = EntityTransformer(config)
         self.unit_head = nn.Sequential(
-            nn.RMSNorm(config.model_dim),
+            RMSNorm(config.model_dim),
             nn.Linear(config.model_dim, N_UNIT_ACTIONS),
         )
-        self.market_norm = nn.RMSNorm(config.model_dim)
+        self.market_norm = RMSNorm(config.model_dim)
         self.market_kind = nn.Linear(config.model_dim, N_MARKET_KINDS)
         # A dense model_dim -> kind x exact-quantity head would be a material
         # fraction of the policy. This state x kind factorization retains a

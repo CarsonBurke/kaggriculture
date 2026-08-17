@@ -22,6 +22,7 @@ from kaggriculture.model import (
     FarmActor,
     ModelConfig,
     ReluSquaredFeedForward,
+    RMSNorm,
     parameter_count,
 )
 
@@ -61,20 +62,35 @@ def _gradient_issues(module: torch.nn.Module) -> tuple[list[str], list[str]]:
 def _autocast_residual_dtypes(config: ModelConfig, device: torch.device) -> dict[str, str]:
     """Record the dtype each hot activation actually carries under bf16 autocast.
 
-    Autocast's fp32 cast list is device-specific, and on CUDA it contains `pow`
-    but not `mul`. Spelling ReLU-squared as `x.square()` therefore upcast the
-    FFN's widest activation to fp32 and doubled its traffic, while the CPU
-    autocast policy this repo's test suite runs under shows no such thing. This
-    check is the only place that discrepancy is observable, so it belongs here.
+    Autocast's fp32 cast list is device-specific. Measured on this build, under
+    `torch.autocast(dtype=bfloat16)`:
+
+                      rms_norm    pow     mul     linear
+        cpu           bf16        bf16    bf16    bf16
+        cuda          fp32        fp32    bf16    bf16
+
+    Both fp32 entries were live defects and neither is observable from the test
+    suite, which runs on CPU. `pow` upcast the FFN's 4x-wide activation, the
+    widest tensor in the model, so ReLU-squared is spelled as a self-multiply.
+    `rms_norm` upcast the residual stream at all 31 norms, which then set the
+    dtype of the residual add, RoPE, and the next norm's input, so `RMSNorm`
+    disables autocast for the call and returns the compute dtype.
+
+    This check is the only place either discrepancy is observable, so it belongs
+    here rather than in `tests/`.
     """
     block = ReluSquaredFeedForward(config).to(device)
+    norm = RMSNorm(config.model_dim).to(device)
     hidden = torch.randn(8, 16, config.model_dim, device=device)
     with torch.autocast("cuda", dtype=torch.bfloat16), torch.inference_mode():
         projected = block.input(hidden)
+        normalized = norm(block(hidden))
         return {
             "projection": str(projected.dtype),
             "activation": str(block.activation(projected).dtype),
             "output": str(block(hidden).dtype),
+            "norm": str(normalized.dtype),
+            "residual": str((block(hidden) + normalized).dtype),
         }
 
 
@@ -139,9 +155,10 @@ def main() -> None:
         )
 
     autocast_dtypes = _autocast_residual_dtypes(config, device)
-    if autocast_dtypes["activation"] != "torch.bfloat16":
+    upcast = sorted(name for name, dtype in autocast_dtypes.items() if dtype != "torch.bfloat16")
+    if upcast:
         raise TypeError(
-            "the ReLU-squared activation left the autocast compute dtype: "
+            f"{', '.join(upcast)} left the autocast compute dtype: "
             + json.dumps(autocast_dtypes, sort_keys=True)
         )
 

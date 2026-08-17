@@ -28,6 +28,7 @@ from kaggriculture.model import (
     ActorOutput,
     AxialRotaryEmbedding,
     ReluSquared,
+    RMSNorm,
     _sdpa_inputs,
     factored_quantity_logits,
     initialize_policy_heads,
@@ -194,8 +195,8 @@ class Attention(nn.Module):
         self.head_dim = config.model_dim // self.heads
         self.query = nn.Linear(config.model_dim, config.model_dim, bias=False)
         self.key_value = nn.Linear(config.model_dim, 2 * config.model_dim, bias=False)
-        self.query_norm = nn.RMSNorm(self.head_dim)
-        self.key_norm = nn.RMSNorm(self.head_dim)
+        self.query_norm = RMSNorm(self.head_dim)
+        self.key_norm = RMSNorm(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
 
     def forward(
@@ -258,10 +259,10 @@ class Block(nn.Module):
 
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
-        self.attention_norm = nn.RMSNorm(config.model_dim)
+        self.attention_norm = RMSNorm(config.model_dim)
         self.attention = Attention(config)
         self.attention_gate = GatedResidual(config.model_dim)
-        self.ffn_norm = nn.RMSNorm(config.model_dim)
+        self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = FeedForward(config)
         self.ffn_gate = GatedResidual(config.model_dim)
 
@@ -430,12 +431,12 @@ class StructuredTrunk(nn.Module):
             torch.randn(config.opponent_latents, config.model_dim) * 0.02
         )
         self.opponent_summary = Block(config)
-        self.opponent_context_norm = nn.RMSNorm(config.model_dim)
+        self.opponent_context_norm = RMSNorm(config.model_dim)
         self.latent_queries = nn.Parameter(torch.randn(config.latents, config.model_dim) * 0.02)
         self.latent_read = Block(config)
-        self.latent_context_norm = nn.RMSNorm(config.model_dim)
+        self.latent_context_norm = RMSNorm(config.model_dim)
         self.core = nn.ModuleList(Block(config) for _ in range(config.core_layers))
-        self.core_norm = nn.RMSNorm(config.model_dim)
+        self.core_norm = RMSNorm(config.model_dim)
         board = torch.stack(
             torch.meshgrid(
                 torch.arange(BOARD_SIZE),
@@ -528,17 +529,17 @@ class StructuredActor(nn.Module):
         self.unit_local_decoder = Block(config)
         # The trunk's latents leave core_norm already normalized; raw local
         # tiles and economy tokens each get their own context norm.
-        self.local_context_norm = nn.RMSNorm(config.model_dim)
+        self.local_context_norm = RMSNorm(config.model_dim)
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
         self.market_decoder = Block(config)
         self.market_economy_decoder = Block(config)
-        self.economy_context_norm = nn.RMSNorm(config.model_dim)
+        self.economy_context_norm = RMSNorm(config.model_dim)
 
         self.unit_head = nn.Sequential(
-            nn.RMSNorm(config.model_dim),
+            RMSNorm(config.model_dim),
             nn.Linear(config.model_dim, N_UNIT_ACTIONS),
         )
-        self.market_norm = nn.RMSNorm(config.model_dim)
+        self.market_norm = RMSNorm(config.model_dim)
         self.market_kind = nn.Linear(config.model_dim, N_MARKET_KINDS)
         self.market_quantity_context = nn.Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
