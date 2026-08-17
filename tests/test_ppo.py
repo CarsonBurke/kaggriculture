@@ -710,17 +710,9 @@ def test_update_ratio_is_pinned_to_one_regardless_of_stored_likelihoods() -> Non
     assert metrics["kl_early_stop"] == 0
 
 
-def test_over_target_pre_step_kl_does_not_update_actor(monkeypatch) -> None:
-    model_config = ModelConfig(
-        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
-    )
-    actor = FarmActor(model_config)
-    critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
-    # Simulate a behavior policy far from the current actor at the interface
-    # where behavior likelihoods now enter the update: the in-update replay.
-    # The unchanged actor is then already beyond the trust region before any
-    # optimizer step.
+def _stale_behavior_replay(monkeypatch) -> None:
+    """Put the behavior policy far from the actor at the interface the update
+    reads it from, so every minibatch's k3 divergence is ~0.72 nats."""
     genuine_replay = kaggriculture.ppo.replay_behavior_logprobs
 
     def stale_replay(*args, **kwargs):
@@ -728,6 +720,59 @@ def test_over_target_pre_step_kl_does_not_update_actor(monkeypatch) -> None:
         return {name: values - 1.0 for name, values in replayed.items()}
 
     monkeypatch.setattr(kaggriculture.ppo, "replay_behavior_logprobs", stale_replay)
+
+
+def _small_update_models():
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    return FarmActor(model_config), DistributionalCritic(model_config)
+
+
+def test_the_first_minibatch_is_exempt_from_the_trust_region(monkeypatch) -> None:
+    """At unchanged weights the first minibatch's divergence is numerical
+    residual between the replay's graph and the update's, not policy movement.
+    Feeding it to the trust region reads rounding as staleness and can stop the
+    actor before it takes a single step -- the audit's worst recorded draw over
+    339 minibatches was 4.060e-2, above the production trust region of 0.03.
+    Its own gate is MAX_FIRST_MINIBATCH_KL, which `train_ppo` raises on.
+    """
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
+    _stale_behavior_replay(monkeypatch)
+    config = PpoConfig(epochs=1, minibatch_size=1 << 12, target_kl=1e-4, use_bfloat16=False)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(9),
+    )
+
+    assert metrics["updates"] == 1
+    assert metrics["first_minibatch_approx_kl"] > config.target_kl
+    assert metrics["actor_updates"] == 1
+    assert metrics["kl_early_stop"] == 0
+    # The exempt minibatch is excluded from the statistic paired with the bound,
+    # so with no later actor minibatch this stays at its initial value.
+    assert metrics["max_approx_kl"] == 0.0
+    assert any(
+        not torch.equal(parameter, before[name]) for name, parameter in actor.named_parameters()
+    )
+
+
+def test_over_target_kl_stops_the_actor_after_the_first_minibatch(monkeypatch) -> None:
+    """Past the exempt first minibatch the trust region is enforced before the
+    policy is mutated, and the stop latches for the rest of the update while the
+    critic keeps refitting."""
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
+    _stale_behavior_replay(monkeypatch)
     config = PpoConfig(
         epochs=2,
         minibatch_size=8,
@@ -735,7 +780,6 @@ def test_over_target_pre_step_kl_does_not_update_actor(monkeypatch) -> None:
         use_bfloat16=False,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
     critic_before = {
         name: parameter.detach().clone() for name, parameter in critic.named_parameters()
     }
@@ -751,11 +795,11 @@ def test_over_target_pre_step_kl_does_not_update_actor(monkeypatch) -> None:
     )
 
     assert metrics["updates"] == config.epochs
-    assert metrics["actor_updates"] == 0
+    # Two actor minibatches ran; only the exempt first one was applied, which is
+    # the proof the violating one was skipped rather than merely counted.
+    assert metrics["actor_updates"] == 1
     assert metrics["kl_early_stop"] == 1
     assert metrics["max_approx_kl"] > config.target_kl
-    for name, parameter in actor.named_parameters():
-        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
     assert any(
         not torch.equal(parameter, critic_before[name])
         for name, parameter in critic.named_parameters()

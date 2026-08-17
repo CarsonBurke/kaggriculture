@@ -319,7 +319,7 @@ class PpoConfig:
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     gamma: float = 1.0
     max_gradient_norm: float = 1.0
-    target_kl: float = 0.08
+    target_kl: float = 0.03
     # BF16 autocast for both update-path forwards. The actor's importance
     # ratio starts at one because `replay_behavior_logprobs` recomputes the
     # behavior side through the update path's forward at the same precision;
@@ -1830,14 +1830,32 @@ def update_ppo(
                     # between the behavior replay above and this minibatch
                     # forward.
                     first_minibatch_kl = batch_kl_value
-                max_approx_kl = max(max_approx_kl, batch_kl_value)
+                else:
+                    # Paired with `target_kl`, so it measures what the trust
+                    # region governs. Mixing the numerical residual above into
+                    # the same maximum would report rounding as policy movement.
+                    max_approx_kl = max(max_approx_kl, batch_kl_value)
                 # Non-finite losses abort training; the already-queued backward
                 # of a poisoned minibatch is never observed past this raise.
                 if not math.isfinite(policy_loss_value):
                     raise FloatingPointError("non-finite policy loss")
-                # The KL belongs to the policy that produced these gradients,
-                # so enforce the trust region before mutating that policy.
-                if batch_kl_value > config.target_kl:
+                # The KL belongs to the policy that produced these gradients, so
+                # enforce the trust region before mutating that policy.
+                #
+                # The first minibatch is exempt, and must be: at unchanged
+                # weights its divergence is numerical residual between two
+                # separately compiled graphs over differently composed batches,
+                # not policy movement, so comparing it to a trust region reads
+                # rounding as staleness. It is not a hypothetical -- the audit's
+                # worst draw over 339 minibatches was 4.060e-2, above this
+                # bound, which would latch the early stop before a single actor
+                # step was taken and report a full iteration of `actor_updates:
+                # 0` with a healthy policy. The residual has its own gate,
+                # MAX_FIRST_MINIBATCH_KL, which `train_ppo` gives every
+                # iteration and which raises rather than skipping, so a real
+                # staging or replay desync still stops the run -- and stops it
+                # with the right diagnosis instead of a silent trust-region hit.
+                if updates > 0 and batch_kl_value > config.target_kl:
                     stop_for_kl = True
                 else:
                     _optimizer_step(
