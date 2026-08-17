@@ -77,7 +77,12 @@ def _run(
     tmp_path: Path,
     measure,
     *extra: str,
-    pairing: tuple[str, ...] = ("--no-compile-rollout", "--no-compile-update"),
+    pairing: tuple[str, ...] = (
+        "--no-compile-update",
+        "--no-rollout-bfloat16",
+        "--rollout-forward-mode",
+        "eager",
+    ),
 ) -> Path:
     # The audit refuses to assume either knob, so every invocation states the
     # pairing. Tests about something else state the all-eager one explicitly
@@ -117,20 +122,51 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
     monkeypatch,
     tmp_path,
 ) -> None:
-    # The launcher chooses compilation per phase from a measured speedup rather
-    # than unconditionally, and roughly 138x of the divergence is bf16 in the
-    # update forward, so a report that did not say which paths it measured
-    # would be evidence about a configuration nothing necessarily trains in.
-    # The middle case is the one measurement selected on the conv model -- an
-    # eager collector against a compiled update -- and it is exactly the
-    # pairing this audit used to be unable to express.
+    # The launcher chooses each knob from a measured speedup rather than
+    # unconditionally, and the collection forward's mode and precision move the
+    # gated divergence by more than an order of magnitude in either direction,
+    # so a report that did not say which paths it measured would be evidence
+    # about a configuration nothing necessarily trains in. The last case is the
+    # one measurement selects on the conv model: a collector matching the
+    # update path's Inductor bf16, which is both the fastest and the lowest
+    # drift precisely because it matches.
     module = _audit_script()
 
-    for index, (flags, rollout, update) in enumerate(
+    for index, (flags, update, mode, bf16) in enumerate(
         (
-            (("--no-compile-rollout", "--no-compile-update"), False, False),
-            (("--no-compile-rollout", "--compile-update"), False, True),
-            (("--compile-rollout", "--compile-update"), True, True),
+            (
+                (
+                    "--no-compile-update",
+                    "--no-rollout-bfloat16",
+                    "--rollout-forward-mode",
+                    "eager",
+                ),
+                False,
+                "eager",
+                False,
+            ),
+            (
+                (
+                    "--compile-update",
+                    "--no-rollout-bfloat16",
+                    "--rollout-forward-mode",
+                    "cudagraphs",
+                ),
+                True,
+                "cudagraphs",
+                False,
+            ),
+            (
+                (
+                    "--compile-update",
+                    "--rollout-bfloat16",
+                    "--rollout-forward-mode",
+                    "inductor",
+                ),
+                True,
+                "inductor",
+                True,
+            ),
         )
     ):
         report = _run(
@@ -143,8 +179,9 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
         module.main()
         configuration, *_records = _report_records(report)
 
-        assert configuration["compile_rollout"] is rollout
         assert configuration["compile_update"] is update
+        assert configuration["rollout_forward_mode"] == mode
+        assert configuration["rollout_bfloat16"] is bf16
         assert configuration["use_bfloat16"] is True
 
 
@@ -153,18 +190,19 @@ def test_the_audit_records_the_phase_configuration_it_actually_measured(
     [
         (),
         ("--compile-update",),
-        ("--compile-rollout",),
-        ("--no-compile-rollout",),
+        # The collection knobs are the same kind of assumption: they move the
+        # gated statistic further than the update knob does.
+        ("--no-compile-update", "--no-rollout-bfloat16"),
+        ("--no-compile-update", "--rollout-forward-mode", "eager"),
     ],
 )
 def test_the_audit_refuses_to_assume_a_pairing_it_was_not_told(monkeypatch, tmp_path, flags):
     # An unstated knob is the failure this audit exists to prevent, not a
-    # convenience. Production runs an eager collector against a compiled
-    # update, so a defaulted store_true would make the zero-flag invocation --
-    # the one an operator reaches for -- measure eager/eager and pass, having
-    # audited a pairing nothing trains in. Nothing downstream reads this report
-    # to catch that, so the CLI has to. Both knobs must be stated, in either
-    # direction; stating only one is still an assumption about the other.
+    # convenience. A defaulted flag would make the zero-flag invocation -- the
+    # one an operator reaches for -- measure some pairing and pass, having
+    # audited a configuration nothing trains in. Nothing downstream reads this
+    # report to catch that, so the CLI has to. Every knob must be stated;
+    # stating only some is still an assumption about the rest.
     module = _audit_script()
     _run(monkeypatch, module, tmp_path, lambda *a, **k: _passing_metrics(), pairing=flags)
 
@@ -172,6 +210,50 @@ def test_the_audit_refuses_to_assume_a_pairing_it_was_not_told(monkeypatch, tmp_
         module.main()
 
     assert failure.value.code != 0
+
+
+@pytest.mark.parametrize("mode", ["eager", "cudagraphs", "inductor"])
+def test_the_audit_cannot_express_a_pairing_a_launch_cannot_produce(
+    monkeypatch,
+    tmp_path,
+    mode,
+) -> None:
+    # This audit once took a `--compile-rollout` boolean alongside the mode,
+    # which let it certify an Inductor learner against an eager frozen league
+    # ensemble -- a mix `train_ppo.py` cannot produce. The collector now has a
+    # single execution knob and the ensemble follows it, so no second parameter
+    # can disagree with the mode. Pinned here because the defect was invisible
+    # to a suite in which two files asserted opposite things about the boolean.
+    module = _audit_script()
+    assert not hasattr(module.parse_args, "compile_rollout")
+    seen: dict[str, object] = {}
+
+    def collect(*args, **kwargs):
+        seen.update(kwargs)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(module, "collect_mixed_play_rust", collect)
+    _run(
+        monkeypatch,
+        module,
+        tmp_path,
+        module._measure,
+        # No league seats: this test is about the derivation the collector call
+        # receives, and building frozen opponents needs a real actor.
+        "--league-games",
+        "0",
+        pairing=(
+            "--compile-update",
+            "--rollout-bfloat16",
+            "--rollout-forward-mode",
+            mode,
+        ),
+    )
+    with pytest.raises(SystemExit):
+        module.main()
+
+    assert seen["forward_mode"] == mode
+    assert "compile_models" not in seen
 
 
 def test_the_audit_refuses_a_device_that_would_measure_a_different_number(

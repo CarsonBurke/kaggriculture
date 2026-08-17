@@ -59,7 +59,11 @@ from kaggriculture.production import (
 )
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import resolve_architecture
-from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
+from kaggriculture.rollout import (
+    ROLLOUT_FORWARD_MODES,
+    allocate_rollout_storage,
+    collect_mixed_play_rust,
+)
 
 COMPONENTS = ("unit", "kind", "quantity")
 _PRODUCTION_LEAGUE_OPPONENTS = (
@@ -95,17 +99,28 @@ def parse_args() -> argparse.Namespace:
         "--opponent-temperature", type=float, default=PRODUCTION_OPPONENT_TEMPERATURE
     )
     parser.add_argument("--device", default="cuda")
-    # The same two knobs train_ppo.py takes, because this audit is only
-    # evidence about a launch it matches exactly. Required rather than
-    # store_true: with a default, `--actor X` alone audits eager/eager, while
-    # production runs eager rollout against a compiled update
-    # (launch_production.py). A defaulted flag would let the audit exit zero
-    # having measured a pairing nothing trains in -- the same failure the cuda
-    # guard below refuses for the same reason -- and nothing downstream reads
-    # this report to catch it. Calibration decides each knob, so the audit must
-    # be told the decision rather than assume half of it.
-    for knob in ("--compile-rollout", "--compile-update"):
+    # The same knobs train_ppo.py takes, because this audit is only evidence
+    # about a launch it matches exactly. Required rather than defaulted: with a
+    # default, `--actor X` alone would audit some pairing nothing trains in and
+    # exit zero, and nothing downstream reads this report to catch that -- the
+    # same failure the cuda guard below refuses for the same reason.
+    #
+    # There is deliberately no `--compile-rollout` here. The collection mode is
+    # three-valued, so a boolean cannot name it, and letting the two be set
+    # independently would allow auditing an Inductor learner against an eager
+    # frozen league ensemble: a mix train_ppo.py cannot produce, because it
+    # derives the ensemble decision from the mode. An audit that can express
+    # unlaunchable pairings is not evidence about a launch.
+    for knob in ("--compile-update", "--rollout-bfloat16"):
         parser.add_argument(knob, action=argparse.BooleanOptionalAction, required=True)
+    # The knob with the largest measured effect on collection cost: `cudagraphs`
+    # is slower than not compiling at all in fp32 (5.309 ms against 4.907 ms on
+    # the production wave) and `inductor` is 1.8x faster at 2.720 ms.
+    parser.add_argument(
+        "--rollout-forward-mode",
+        choices=ROLLOUT_FORWARD_MODES,
+        required=True,
+    )
     parser.add_argument(
         "--report",
         type=Path,
@@ -179,12 +194,19 @@ def _measure(
         deterministic_opponents=deterministic_opponents,
         sampling_seed=seed ^ 0x5EED,
         # The sampling forward is one of the two sides this audit measures, so
-        # it takes the rollout knob and the update below takes the update one.
-        # These are set independently on purpose: calibration decides each
-        # phase separately, and the pairing that measurement selects here --
-        # eager sampling against a compiled update -- is exactly the pairing
+        # it takes the collection knobs and the update below takes the update
+        # one. Whichever mode and precision measurement selects is the pairing
         # production runs, so it is the one whose divergence must be audited.
-        compile_models=args.compile_rollout,
+        # Matching the update path's bf16 is not the riskier choice: on this
+        # actor it measures 8.4x LOWER drift than fp32 collection, because the
+        # drift is dominated by systematic differences between the two paths
+        # rather than by rounding noise. It still moves the sampled policy, so
+        # it is measured rather than assumed.
+        #
+        # The frozen league ensemble follows the learner, exactly as train_ppo.py
+        # derives it, so this audit cannot express a pairing a launch cannot.
+        forward_mode=args.rollout_forward_mode,
+        forward_autocast=args.rollout_bfloat16,
         storage=arena,
     )
     del opponents
@@ -262,7 +284,8 @@ def main() -> None:
                 "self_play_games": args.self_play_games,
                 "league_games": args.league_games,
                 "episode_steps": args.episode_steps,
-                "compile_rollout": args.compile_rollout,
+                "rollout_forward_mode": args.rollout_forward_mode,
+                "rollout_bfloat16": args.rollout_bfloat16,
                 "compile_update": ppo_config.compile_update,
                 "use_bfloat16": ppo_config.use_bfloat16,
                 "minibatch_size": ppo_config.minibatch_size,

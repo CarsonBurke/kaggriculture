@@ -361,6 +361,7 @@ class _NativeEncodedWave:
     arrays: dict[str, np.ndarray]
     host_features: torch.Tensor
     host_positions: torch.Tensor
+    staged_features: torch.Tensor
     device_features: torch.Tensor
     board: torch.Tensor
     global_features: torch.Tensor
@@ -369,8 +370,25 @@ class _NativeEncodedWave:
     unit_positions: torch.Tensor
 
     def copy_to_device(self) -> None:
+        """Upload the encoded block, then widen it in a separate device kernel.
+
+        The Rust encoder emits fp16 and the model consumes fp32. A single
+        cross-dtype `copy_` does not transfer fp32 across the bus: ATen's
+        `copy_requires_temporaries` sends a CPU-to-CUDA copy with mismatched
+        dtypes down a staged path that allocates a device temporary, transfers at
+        the source dtype, then widens on the device. This spells that out with a
+        buffer owned by the wave, so the temporary is allocated once at
+        construction instead of per step, and both destinations are persistent,
+        which keeps the captured rollout graph's input addresses static.
+
+        The two steps are therefore value-identical to the one they replace. The
+        matched-dtype transfer is measurably cheaper than the mismatched one on
+        this box, but that gap is not yet attributed to a mechanism, so treat the
+        split as a clarification whose payoff is still being measured.
+        """
         non_blocking = self.device_features.device.type == "cuda"
-        self.device_features.copy_(self.host_features, non_blocking=non_blocking)
+        self.staged_features.copy_(self.host_features, non_blocking=non_blocking)
+        self.device_features.copy_(self.staged_features, non_blocking=non_blocking)
         self.unit_positions.copy_(self.host_positions, non_blocking=non_blocking)
 
     def refresh(self, environment: Any) -> None:
@@ -387,6 +405,7 @@ def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncod
     feature_sizes = [arrays[name].size for name in feature_names]
     pin_memory = device.type == "cuda"
     host_features = torch.empty(sum(feature_sizes), dtype=torch.float16, pin_memory=pin_memory)
+    staged_features = torch.empty(sum(feature_sizes), dtype=host_features.dtype, device=device)
     device_features = torch.empty(sum(feature_sizes), dtype=torch.float32, device=device)
     device_views: dict[str, torch.Tensor] = {}
     cursor = 0
@@ -408,6 +427,7 @@ def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncod
         arrays=arrays,
         host_features=host_features,
         host_positions=host_positions,
+        staged_features=staged_features,
         device_features=device_features,
         board=device_views["board"],
         global_features=device_views["global_features"],
@@ -515,11 +535,40 @@ class _HostActorOutput:
     market_quantity_context: np.ndarray
 
 
+@dataclass(frozen=True)
+class _PackedTransfer:
+    """Persistent staging pair for the single D2H copy of a collection step.
+
+    `device` is a flat fp32 block on the model's device and `host` is its pinned
+    mirror. Both are allocated once per collection call and reused by every
+    step, so the steady-state transfer path performs no allocation at all.
+    """
+
+    device: torch.Tensor
+    host: torch.Tensor
+
+
 def _packed_outputs_to_host(
     outputs: tuple[ActorOutput, ...],
-    pinned_buffer: torch.Tensor | None,
-) -> tuple[list[_HostActorOutput], torch.Tensor | None]:
-    """Transfer all policy heads with one device sync."""
+    transfer: _PackedTransfer | None,
+) -> tuple[list[_HostActorOutput], _PackedTransfer | None]:
+    """Move every policy head into pinned host memory with one device sync.
+
+    This stage measures 2.42 ms of the 17.72 ms collection step (11.9%) and runs
+    719 times per iteration. Most of that was not transfer: the previous
+    implementation widened each of the three heads with `.float()` and then
+    concatenated them, so a step allocated four short-lived device tensors and
+    read every logit twice before the D2H copy even started. Under bf16 autocast
+    the `.float()` calls are real conversion kernels rather than no-ops.
+
+    A persistent packed device block removes both costs. `copy_` into a slice of
+    that block performs the dtype widen as part of the placement, so the separate
+    `.float()` disappears and the concatenation has nothing left to do: the heads
+    land directly in the memory the D2H reads. The pair is allocated on the first
+    step of a collection call and reused by every later step; the element-count
+    guard reallocates it should a block ever be carried into a wave of a
+    different width.
+    """
     if outputs[0].unit_logits.device.type == "cpu":
         return (
             [
@@ -530,76 +579,140 @@ def _packed_outputs_to_host(
                 )
                 for output in outputs
             ],
-            pinned_buffer,
+            transfer,
         )
 
-    tensors: list[torch.Tensor] = []
-    shapes: list[tuple[int, ...]] = []
-    for output in outputs:
+    heads = [
+        tensor
+        for output in outputs
         for tensor in (
             output.unit_logits,
             output.market_kind_logits,
             output.market_quantity_context,
-        ):
-            tensor = tensor.float()
-            tensors.append(tensor.reshape(-1))
-            shapes.append(tuple(tensor.shape))
-    packed = torch.cat(tensors)
-    if pinned_buffer is None or pinned_buffer.numel() != packed.numel():
-        pinned_buffer = torch.empty(
-            packed.numel(), dtype=torch.float32, device="cpu", pin_memory=True
         )
-    pinned_buffer.copy_(packed, non_blocking=True)
-    # Native sampling consumes the host buffer immediately. This is the
-    # single required D2H synchronization for the complete model wave.
-    torch.cuda.current_stream(packed.device).synchronize()
-    flat = pinned_buffer.numpy()
+    ]
+    total = sum(tensor.numel() for tensor in heads)
+    if transfer is None or transfer.device.numel() != total:
+        transfer = _PackedTransfer(
+            device=torch.empty(total, dtype=torch.float32, device=heads[0].device),
+            host=torch.empty(total, dtype=torch.float32, device="cpu", pin_memory=True),
+        )
+    flat = transfer.host.numpy()
 
     cursor = 0
-    arrays = []
-    for shape in shapes:
-        size = int(np.prod(shape))
+    arrays: list[np.ndarray] = []
+    for tensor in heads:
+        size = tensor.numel()
+        shape = tuple(tensor.shape)
+        transfer.device[cursor : cursor + size].view(shape).copy_(tensor)
         arrays.append(flat[cursor : cursor + size].reshape(shape))
         cursor += size
+    transfer.host.copy_(transfer.device, non_blocking=True)
+    # Native sampling consumes the host buffer immediately. This is the
+    # single required D2H synchronization for the complete model wave.
+    torch.cuda.current_stream(heads[0].device).synchronize()
     host_outputs = [
         _HostActorOutput(*arrays[index : index + 3]) for index in range(0, 3 * len(outputs), 3)
     ]
-    return host_outputs, pinned_buffer
+    return host_outputs, transfer
 
 
-def _cached_compiled_forward(model: FarmActor | StructuredActor) -> Any:
-    """Capture the native ATen rollout forward in a CUDA graph.
+#: Execution mode for the collection forward. Collection spends roughly two
+#: thirds of its wall clock in this one call, so the choice here is the single
+#: largest lever on rollout cost -- and the shipped default was measurably the
+#: wrong one on both axes it trades off.
+#:
+#: Isolated forward, median of 60 on the production 224-row wave over identical
+#: persistent input buffers (artifacts/benchmarks/backends-*.json):
+#:
+#:     mode                     fp32       bf16
+#:     eager                    4.907 ms   4.396 ms
+#:     cudagraphs               5.309 ms   4.268 ms
+#:     inductor                 2.720 ms   1.626 ms
+#:
+#: `cudagraphs` is a pessimization in fp32: slower than not compiling at all,
+#: which is why enabling it only ever moved the measured rollout by 3.4%. The
+#: forward issues ~859 kernels whose summed device time is well under the
+#: measured wall clock, so the cost is per-kernel overhead; removing launch cost
+#: alone does not touch it, and Inductor's fusion reduces the kernel count.
+#:
+#: Every mode perturbs the sampled behavior policy relative to the distribution
+#: the update path reconstructs, and `update_replay_parity` gates exactly that.
+#: Faster is therefore not automatically admissible -- but here the two axes
+#: agree, because the drift is dominated by *systematic* differences between the
+#: collection and update paths rather than by rounding noise, and the update path
+#: is already Inductor plus bf16. Matching it cancels most of the difference.
+#: Shipped gate, 4 waves, production league-mixed path, cloned conv actor
+#: (artifacts/benchmarks/parity-*.jsonl; bounds 5e-3 / 2e-4 / 1.1e-1):
+#:
+#:     configuration     max_kl      tail       first_minibatch_kl   rollout
+#:     eager / fp32      1.9089e-3   3.185e-5   4.0598e-2            8.91 s
+#:     inductor / bf16   2.2786e-4   0.0        4.9855e-3            5.36 s
+#:
+#: So the selected configuration is 1.66x faster with 8.4x lower drift. Note
+#: `eager` with bf16 alone measures 2.908e-3, worse than fp32: it is the
+#: matching that pays, not the precision. The mode stays a named knob the audit
+#: must be told rather than a silent default, and the library defaults below
+#: preserve the previous behavior so `benchmark_rust_rollout.py` and its
+#: recorded drift artifacts stay comparable; the training and calibration
+#: entrypoints state the measured decision explicitly.
+ROLLOUT_FORWARD_MODES = ("eager", "cudagraphs", "inductor")
 
-    PPO replays stored behavior likelihoods through the eager FP32 actor. The
-    CUDA-graphs-only backend retains native ATen operations while removing their
-    repeated launch overhead. CUDA convolution and GEMM kernels are not bitwise
-    invariant across eager/graph execution or batch shapes; the rollout benchmark
-    therefore enforces a tight semantic importance-ratio bound. Keep Inductor out
-    of this path: its additional fusion creates materially larger policy drift.
+
+def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cudagraphs") -> Any:
+    """Return the cached compiled collection forward for `mode`.
+
+    CUDA convolution and GEMM kernels are not bitwise invariant across eager,
+    graph, and fused execution, nor across batch shapes, so any mode here moves
+    the behavior policy relative to the update-path replay. That drift is bounded
+    semantically rather than bitwise, by `update_replay_parity`.
+
+    `reduce-overhead` is what makes the Inductor mode worth its drift: plain
+    Inductor keeps the launch cost this forward is dominated by, so the fused
+    kernels alone would not pay. One compiled callable is cached per mode so a
+    parity audit can measure several in one process without recompiling.
     """
-    compiled = getattr(model, "_kaggriculture_rollout_forward", None)
+    if mode not in ROLLOUT_FORWARD_MODES:
+        raise ValueError(f"unknown rollout forward mode {mode!r}")
+    cache = getattr(model, "_kaggriculture_rollout_forwards", None)
+    if cache is None:
+        cache = {}
+        # Avoid registering compiled wrappers as child modules, which would
+        # pollute checkpoints with a second copy of every parameter.
+        object.__setattr__(model, "_kaggriculture_rollout_forwards", cache)
+    compiled = cache.get(mode)
     if compiled is None:
-        compiled = torch.compile(
-            model.forward,
-            backend="cudagraphs",
-            fullgraph=True,
-            dynamic=False,
-        )
-        # Avoid registering the compiled wrapper as a child module, which
-        # would pollute checkpoints with a second copy of every parameter.
-        object.__setattr__(model, "_kaggriculture_rollout_forward", compiled)
+        if mode == "cudagraphs":
+            compiled = torch.compile(
+                model.forward, backend="cudagraphs", fullgraph=True, dynamic=False
+            )
+        else:
+            compiled = torch.compile(
+                model.forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+            )
+        cache[mode] = compiled
     return compiled
 
 
 def _rollout_model_forward(
     model: FarmActor | StructuredActor,
     *inputs: Any,
-    compile_model: bool,
+    mode: str = "cudagraphs",
 ) -> ActorOutput | torch.Tensor:
-    """Run one static rollout wave, optionally through a cached compiled graph."""
-    if not compile_model or _leading_tensor(inputs).device.type != "cuda":
+    """Run one static rollout wave through the execution mode `mode` names.
+
+    The mode is the only thing consulted here. An earlier shape took a separate
+    `compile_model` boolean as well, which could veto the mode: a caller stating
+    `inductor` while that boolean was false silently got an eager forward, and a
+    run's provenance would record a configuration it did not execute. One knob
+    cannot contradict itself, so `eager` is spelled as a mode rather than as the
+    absence of a flag. The frozen league ensemble takes the same mode, so a
+    league wave cannot end up compiling one of its two forwards and not the
+    other.
+    """
+    if mode == "eager" or _leading_tensor(inputs).device.type != "cuda":
         return model(*inputs)
-    return _cached_compiled_forward(model)(*inputs)
+    return _cached_compiled_forward(model, mode)(*inputs)
 
 
 class _StackedFrozenEnsemble:
@@ -627,7 +740,7 @@ class _StackedFrozenEnsemble:
             self.buffers = self._stacked("named_buffers", models)
         for tensor in (*self.params.values(), *self.buffers.values()):
             torch._dynamo.mark_static_address(tensor)
-        self._compiled: dict[int, Any] = {}
+        self._compiled: dict[tuple[str, int], Any] = {}
 
     @staticmethod
     def _stacked(
@@ -656,23 +769,36 @@ class _StackedFrozenEnsemble:
 
         return torch.vmap(run)(self.params, self.buffers, *inputs)
 
-    def __call__(self, *inputs: Any, compile_model: bool) -> ActorOutput:
+    def __call__(self, *inputs: Any, mode: str) -> ActorOutput:
+        """Run every frozen league seat under the same mode as the learner.
+
+        A league wave runs this forward once per step in addition to the
+        learner's, so leaving it on a backend the learner abandoned would cap the
+        collection speedup at whatever fraction of steps are pure self-play. It
+        takes the same mode for the same measured reason: `cudagraphs` is slower
+        here than not compiling, because this forward is limited by per-kernel
+        overhead rather than launch cost, and only fusion reduces the kernel
+        count.
+        """
         leading = _leading_tensor(inputs)
-        if not compile_model or leading.device.type != "cuda":
+        if mode == "eager" or leading.device.type != "cuda":
             return self._forward(*inputs)
-        # One compiled callable per lane width: league assignments may change
-        # the padded width between waves, and sharing one callable would burn
-        # through Dynamo's per-code recompile budget before falling back to
+        # One compiled callable per lane width and mode: league assignments may
+        # change the padded width between waves, and sharing one callable would
+        # burn through Dynamo's per-code recompile budget before falling back to
         # eager silently.
-        compiled = self._compiled.get(leading.shape[1])
+        key = (mode, leading.shape[1])
+        compiled = self._compiled.get(key)
         if compiled is None:
-            compiled = torch.compile(
-                self._forward,
-                backend="cudagraphs",
-                fullgraph=True,
-                dynamic=False,
-            )
-            self._compiled[leading.shape[1]] = compiled
+            if mode == "cudagraphs":
+                compiled = torch.compile(
+                    self._forward, backend="cudagraphs", fullgraph=True, dynamic=False
+                )
+            else:
+                compiled = torch.compile(
+                    self._forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+                )
+            self._compiled[key] = compiled
         return compiled(*inputs)
 
 
@@ -836,7 +962,8 @@ def collect_mixed_play_rust(
     deterministic_opponent: bool = False,
     deterministic_opponents: Sequence[bool] | np.ndarray | None = None,
     sampling_seed: int = 0,
-    compile_models: bool = False,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect self-play and frozen-league games in one native wave.
@@ -940,7 +1067,7 @@ def collect_mixed_play_rust(
     temperatures[frozen_rows] = frozen_temperatures[assignments]
     entropy_sums = np.zeros(trajectories, dtype=np.float64)
     final = None
-    packed_host = None
+    packed_transfer: _PackedTransfer | None = None
 
     # A pure self-play wave keeps the learner forward over the contiguous full
     # batch and stores every row, avoiding gather/scatter work entirely.
@@ -974,37 +1101,41 @@ def collect_mixed_play_rust(
         quantity_context = np.empty(
             (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
         )
+    # Collection runs the actor under whatever precision the audited decision
+    # chose. It is bf16 in the update path regardless, so an fp32 collection
+    # forward is not the conservative option: it is a second precision, and the
+    # gap between the two is what `update_replay_parity` measures.
+    autocast_forward = forward_autocast and device.type == "cuda"
+    compiled_forward = forward_mode != "eager"
+
+    def run_actor(*inputs: Any) -> ActorOutput:
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+            output = _rollout_model_forward(actor, *inputs, mode=forward_mode)
+        assert isinstance(output, ActorOutput)
+        return output
+
     for step in range(horizon):
         encoded_wave.refresh(environment)
         encoded_wave.copy_to_device()
-        _mark_cuda_graph_step(device, compile_models)
+        _mark_cuda_graph_step(device, compiled_forward)
         if not league_games:
-            output = _rollout_model_forward(
-                actor,
-                *encoded_wave.inputs(),
-                compile_model=compile_models,
-            )
-            assert isinstance(output, ActorOutput)
-            host_outputs, packed_host = _packed_outputs_to_host((output,), packed_host)
+            output = run_actor(*encoded_wave.inputs())
+            host_outputs, packed_transfer = _packed_outputs_to_host((output,), packed_transfer)
             host = host_outputs[0]
             step_unit_logits = host.unit_logits
             step_kind_logits = host.market_kind_logits
             step_quantity_context = host.market_quantity_context
             unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
         else:
-            current_output = _rollout_model_forward(
-                actor,
-                *_select_inputs(encoded_wave.inputs(), current_tensor),
-                compile_model=compile_models,
-            )
-            assert isinstance(current_output, ActorOutput)
-            lane_output = ensemble(
-                *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
-                compile_model=compile_models,
-            )
+            current_output = run_actor(*_select_inputs(encoded_wave.inputs(), current_tensor))
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+                lane_output = ensemble(
+                    *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
+                    mode=forward_mode,
+                )
             frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
-            host_outputs, packed_host = _packed_outputs_to_host(
-                (current_output, frozen_output), packed_host
+            host_outputs, packed_transfer = _packed_outputs_to_host(
+                (current_output, frozen_output), packed_transfer
             )
             current_host, frozen_host = host_outputs
             for destination, current_values, frozen_values in (
@@ -1112,7 +1243,8 @@ def collect_self_play_rust(
     deterministic: bool = False,
     temperature: float = 1.0,
     sampling_seed: int = 0,
-    compile_models: bool = False,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect both on-policy seats through the exact batched Rust simulator."""
@@ -1126,7 +1258,8 @@ def collect_self_play_rust(
         deterministic=deterministic,
         temperature=temperature,
         sampling_seed=sampling_seed,
-        compile_models=compile_models,
+        forward_mode=forward_mode,
+        forward_autocast=forward_autocast,
         storage=storage,
     )
 
@@ -1146,7 +1279,8 @@ def collect_frozen_opponents_play_rust(
     deterministic_opponents: Sequence[bool] | np.ndarray | None = None,
     deterministic: bool = False,
     sampling_seed: int = 0,
-    compile_models: bool = False,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect one current-policy seat per native game against assigned frozen actors."""
@@ -1166,7 +1300,8 @@ def collect_frozen_opponents_play_rust(
         deterministic_opponent=deterministic_opponent,
         deterministic_opponents=deterministic_opponents,
         sampling_seed=sampling_seed,
-        compile_models=compile_models,
+        forward_mode=forward_mode,
+        forward_autocast=forward_autocast,
         storage=storage,
     )
 
@@ -1183,7 +1318,8 @@ def collect_frozen_opponent_play_rust(
     deterministic_opponent: bool = False,
     deterministic: bool = False,
     sampling_seed: int = 0,
-    compile_models: bool = False,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
 ) -> RolloutBatch:
     """Collect one current-policy seat per native game against one frozen actor."""
     return collect_frozen_opponents_play_rust(
@@ -1197,7 +1333,8 @@ def collect_frozen_opponent_play_rust(
         deterministic_opponent=deterministic_opponent,
         deterministic=deterministic,
         sampling_seed=sampling_seed,
-        compile_models=compile_models,
+        forward_mode=forward_mode,
+        forward_autocast=forward_autocast,
     )
 
 
