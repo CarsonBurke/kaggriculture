@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -154,6 +155,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
                 "seed_count": 128,
                 "seed_start": 20_000_000,
                 "paired_seats": True,
+                "summary": {"score_rate": 0.75},
                 "selection_provenance": {
                     "best_output_sha256": checkpoint_digest,
                     "sha256": "d" * 64,
@@ -178,6 +180,24 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         ),
         encoding="utf-8",
     )
+    starter_evaluation = tmp_path / "starter.json"
+    starter_evaluation.write_text(
+        json.dumps(
+            {
+                "valid_for_selection": True,
+                "opponent_label": "starter",
+                "seed_count": 64,
+                "paired_seats": True,
+                "summary": {"score_rate": 1.0},
+                "artifact_provenance": {
+                    "sha256": checkpoint_digest,
+                    "source_identity": source_identity(),
+                    "run_provenance": run_provenance,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     subprocess.run(
         [
             sys.executable,
@@ -186,6 +206,8 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
             str(checkpoint),
             "--evaluation-report",
             str(evaluation),
+            "--builtin-evaluation-report",
+            str(starter_evaluation),
             "--output",
             str(archive),
         ],
@@ -265,6 +287,139 @@ print(json.dumps({"max_action_seconds": max(elapsed), "action": action}))
     # probe result, so treat the final non-empty line as the machine payload.
     result = json.loads([line for line in completed.stdout.splitlines() if line][-1])
     assert result["max_action_seconds"] < 1.0
+
+
+def _build_submission_module():
+    path = Path(__file__).parents[1] / "scripts" / "build_submission.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_build_submission", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
+    """A checkpoint and the two reports a submission needs, all mutually bound."""
+    config = ModelConfig()
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "model_config": config.to_dict(),
+            "actor": FarmActor(config).state_dict(),
+            "iteration": 5,
+            "source_identity": source_identity(),
+            "run_provenance": None,
+        },
+        checkpoint,
+    )
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    provenance = {
+        "sha256": digest,
+        "source_identity": source_identity(),
+        "run_provenance": None,
+    }
+    finalist = {
+        "valid_for_selection": True,
+        "opponent_label": "public-v27",
+        "seed_count": 128,
+        "seed_start": 20_000_000,
+        "paired_seats": True,
+        "summary": {"score_rate": 0.75},
+        "selection_provenance": {
+            "best_output_sha256": digest,
+            "sha256": "d" * 64,
+            "run_provenance": None,
+            "screening_seed_start": 10_000_000,
+            "screening_seed_count": 32,
+            "opponent_provenance": {
+                "public-v27": {"kind": "python_file", "sha256": "c" * 64, "size_bytes": 100}
+            },
+        },
+        "opponent_provenance": {
+            "kind": "python_file",
+            "path": "/var/tmp/public-v27.py",
+            "sha256": "c" * 64,
+            "size_bytes": 100,
+        },
+        "artifact_provenance": provenance,
+    }
+    starter = {
+        "valid_for_selection": True,
+        "opponent_label": "starter",
+        "seed_count": 64,
+        "paired_seats": True,
+        "summary": {"score_rate": 1.0},
+        "artifact_provenance": provenance,
+    }
+    return checkpoint, finalist, starter
+
+
+def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
+    """The provenance gate cannot see strength, and both shipped finalists prove it.
+
+    `evaluations/vapo-lv2-iter415-finalist-v27.json` and its `vapo-main` sibling
+    each record `score_rate` 0.0 with 0 wins over 256 seats while stamped
+    `valid_for_selection: True`. That flag means the evaluation ran, so a gate
+    reading only provenance packaged agents that never won a game.
+    """
+    build_submission = _build_submission_module()
+    checkpoint, finalist, starter = _submission_inputs(tmp_path)
+    finalist_path = tmp_path / "finalist.json"
+    starter_path = tmp_path / "starter.json"
+    output = tmp_path / "submission.tar.gz"
+
+    def write(finalist_payload: dict, starter_payload: dict) -> None:
+        finalist_path.write_text(json.dumps(finalist_payload), encoding="utf-8")
+        starter_path.write_text(json.dumps(starter_payload), encoding="utf-8")
+
+    def attempt(**overrides) -> dict:
+        return build_submission.build(
+            checkpoint,
+            finalist_path,
+            output,
+            builtin_evaluation_reports=[starter_path],
+            minimum_score_rate=0.5,
+            minimum_builtin_score_rate=0.9,
+            minimum_builtin_seed_count=32,
+            **overrides,
+        )
+
+    write(finalist, starter)
+    manifest = attempt()
+    assert manifest["evaluation"]["score_rate"] == 0.75
+    assert manifest["strength_gate"]["builtin_score_rates"] == {"starter": 1.0}
+
+    # The exact historical failure: every seat lost, provenance immaculate.
+    write({**finalist, "summary": {"score_rate": 0.0}}, starter)
+    with pytest.raises(ValueError, match="below the required"):
+        attempt()
+
+    # Losing to the carrot-loop heuristic must block a submission on its own,
+    # even when the public-v27 number is healthy.
+    write(finalist, {**starter, "summary": {"score_rate": 0.4}})
+    with pytest.raises(ValueError, match="against the built-in starter"):
+        attempt()
+
+    # A tiny sample is not evidence of beating it.
+    write(finalist, {**starter, "seed_count": 4})
+    with pytest.raises(ValueError, match="seed clusters, below the required"):
+        attempt()
+
+    # An aborted evaluation writes a null rate, which must not read as zero or crash.
+    write({**finalist, "summary": {"score_rate": None}}, starter)
+    with pytest.raises(ValueError, match="no finite score rate"):
+        attempt()
+
+    write(finalist, starter)
+    with pytest.raises(ValueError, match="requires an evaluation against the built-in starter"):
+        build_submission.build(
+            checkpoint,
+            finalist_path,
+            output,
+            builtin_evaluation_reports=[],
+            minimum_score_rate=0.5,
+        )
 
 
 def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Path) -> None:

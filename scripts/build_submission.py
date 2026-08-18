@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Build a minimal actor-only Kaggriculture submission tarball."""
+"""Build a minimal actor-only Kaggriculture submission tarball.
+
+Two independent gates must pass. The provenance gate binds the shipped bytes to
+the checkpoint, the run, and the seeds that selected it. The strength gate reads
+what the agent actually scored, which the provenance gate cannot see: a report's
+`valid_for_selection` means the evaluation itself ran correctly, not that the
+agent won anything. Both finalists in `evaluations/` carry `score_rate` 0.0 with
+0 wins over 256 seats against `public-v27` and are stamped valid, so provenance
+alone has already packaged agents that lose every game they play.
+"""
 
 from __future__ import annotations
 
@@ -7,17 +16,24 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from kaggriculture.inference import actor_artifact_from_checkpoint
+from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.provenance import file_sha256, require_source_identity, validate_run_provenance
+
+# `starter` actually farms; `pass` and `random` do not, so it is the only
+# built-in whose defeat is evidence of competence rather than of merely acting.
+_REQUIRED_BUILTIN = "starter"
 
 PACKAGE_FILES = (
     "__init__.py",
@@ -56,14 +72,111 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="successful finalist evaluation that cryptographically binds the checkpoint",
     )
+    parser.add_argument(
+        "--builtin-evaluation-report",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="REPORT",
+        help=(
+            "evaluation against a built-in reference agent, repeatable; a report for "
+            f"{_REQUIRED_BUILTIN!r} is mandatory because it is the strongest built-in and "
+            "the one this pipeline has measurably lost to"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-score-rate",
+        type=float,
+        default=0.5,
+        help=(
+            "floor on the finalist score rate against the public opponent. The default "
+            "refuses to ship an agent that loses more than it wins; lower it only as a "
+            "deliberate deadline decision, which then appears in the shipped manifest"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-builtin-score-rate",
+        type=float,
+        default=0.9,
+        help=(
+            "floor on the score rate against each built-in. These are heuristics a "
+            "competent farmer beats nearly always, so the default leaves only enough "
+            "room for genuine seed variance"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-builtin-seed-count",
+        type=int,
+        default=32,
+        help="paired-seat seed clusters required per built-in report, so a pass is not a fluke",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
+
+
+def _score_rate(payload: dict[str, Any], context: str) -> float:
+    """Read a report's score rate, refusing anything that is not a real number.
+
+    A missing or null rate is what an aborted evaluation writes, and `float(None)`
+    would raise a TypeError far from the cause, so it is named here instead.
+    """
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise ValueError(f"{context} evaluation has no summary")
+    rate = summary.get("score_rate")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or not math.isfinite(rate):
+        raise ValueError(f"{context} evaluation has no finite score rate")
+    return float(rate)
+
+
+def _load_builtin_evaluation(
+    contents: bytes,
+    checkpoint_digest: str,
+    source: dict[str, Any],
+    minimum_score_rate: float,
+    minimum_seed_count: int,
+) -> tuple[str, float]:
+    """Check one built-in report and return its label and score rate.
+
+    Deliberately lighter than the finalist gate: the selection-provenance and
+    seed-disjointness machinery there exists to stop a checkpoint being chosen and
+    validated on the same seeds, and these reports choose nothing. What they must
+    still do is bind these exact checkpoint bytes, or they would license shipping a
+    different agent than the one that was measured.
+    """
+    payload = json.loads(contents.decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
+        raise ValueError("built-in evaluation did not complete successfully")
+    label = payload.get("opponent_label")
+    if label not in BUILTIN_OPPONENTS:
+        raise ValueError(f"built-in evaluation names a non-built-in opponent: {label!r}")
+    provenance = payload.get("artifact_provenance")
+    if not isinstance(provenance, dict) or provenance.get("sha256") != checkpoint_digest:
+        raise ValueError(f"{label} evaluation does not bind the selected checkpoint bytes")
+    if provenance.get("source_identity") != source:
+        raise ValueError(f"{label} evaluation source identity does not match the checkpoint")
+    if payload.get("paired_seats") is not True:
+        raise ValueError(f"{label} evaluation must use paired seats to cancel the seat advantage")
+    seed_count = payload.get("seed_count", 0)
+    if not isinstance(seed_count, int) or seed_count < minimum_seed_count:
+        raise ValueError(
+            f"{label} evaluation has {seed_count} seed clusters, below the required "
+            f"{minimum_seed_count}"
+        )
+    rate = _score_rate(payload, label)
+    if rate < minimum_score_rate:
+        raise ValueError(
+            f"submission scores {rate:.4f} against the built-in {label}, below the required "
+            f"{minimum_score_rate:.4f}"
+        )
+    return label, rate
 
 
 def _load_evaluation(
     contents: bytes,
     checkpoint_digest: str,
     source: dict[str, Any],
+    minimum_score_rate: float,
 ) -> dict[str, Any]:
     payload = json.loads(contents.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
@@ -112,10 +225,27 @@ def _load_evaluation(
         or selected_v27.get("size_bytes") != finalist_v27.get("size_bytes")
     ):
         raise ValueError("finalist public v27 bytes differ from checkpoint selection")
+    # Last, so a report that fails provenance is reported as such rather than as a
+    # weak score: the bytes must be trustworthy before the number means anything.
+    rate = _score_rate(payload, "finalist")
+    if rate < minimum_score_rate:
+        raise ValueError(
+            f"submission scores {rate:.4f} against public-v27, below the required "
+            f"{minimum_score_rate:.4f}"
+        )
     return payload
 
 
-def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[str, Any]:
+def build(
+    checkpoint_path: Path,
+    evaluation_report: Path,
+    output: Path,
+    *,
+    builtin_evaluation_reports: Sequence[Path] = (),
+    minimum_score_rate: float = 0.0,
+    minimum_builtin_score_rate: float = 0.0,
+    minimum_builtin_seed_count: int = 1,
+) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.expanduser().resolve()
     evaluation_report = evaluation_report.expanduser().resolve()
     output = output.expanduser().resolve()
@@ -123,17 +253,38 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
         raise FileNotFoundError(checkpoint_path)
     if not evaluation_report.is_file():
         raise FileNotFoundError(evaluation_report)
+    builtin_paths = [path.expanduser().resolve() for path in builtin_evaluation_reports]
+    for path in builtin_paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
     checkpoint_contents = checkpoint_path.read_bytes()
     checkpoint_digest = hashlib.sha256(checkpoint_contents).hexdigest()
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
     artifact = actor_artifact_from_checkpoint(checkpoint)
     source = require_source_identity(artifact["source_identity"])
     run_provenance = validate_run_provenance(artifact.get("run_provenance"))
+    builtin_score_rates: dict[str, float] = {}
+    for path in builtin_paths:
+        label, rate = _load_builtin_evaluation(
+            path.read_bytes(),
+            checkpoint_digest,
+            source,
+            minimum_builtin_score_rate,
+            minimum_builtin_seed_count,
+        )
+        if label in builtin_score_rates:
+            raise ValueError(f"two evaluations supplied for the built-in {label}")
+        builtin_score_rates[label] = rate
+    if _REQUIRED_BUILTIN not in builtin_score_rates:
+        raise ValueError(
+            f"submission requires an evaluation against the built-in {_REQUIRED_BUILTIN}"
+        )
     evaluation_contents = evaluation_report.read_bytes()
     evaluation = _load_evaluation(
         evaluation_contents,
         checkpoint_digest,
         source,
+        minimum_score_rate,
     )
     if evaluation["artifact_provenance"].get("run_provenance") != run_provenance:
         raise ValueError("finalist evaluation run provenance does not match the checkpoint")
@@ -182,6 +333,16 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
                 "opponent": evaluation.get("opponent_label"),
                 "seed_count": evaluation.get("seed_count"),
                 "opponent_sha256": evaluation.get("opponent_provenance", {}).get("sha256"),
+                "score_rate": _score_rate(evaluation, "finalist"),
+            },
+            # The thresholds ride along with the rates they admitted, so a bundle
+            # built under a relaxed deadline floor says so on its face instead of
+            # looking identical to one that cleared the default.
+            "strength_gate": {
+                "builtin_score_rates": dict(sorted(builtin_score_rates.items())),
+                "minimum_score_rate": minimum_score_rate,
+                "minimum_builtin_score_rate": minimum_builtin_score_rate,
+                "minimum_builtin_seed_count": minimum_builtin_seed_count,
             },
             "files": dict(sorted(files.items())),
         }
@@ -216,7 +377,15 @@ def build(checkpoint_path: Path, evaluation_report: Path, output: Path) -> dict[
 
 def main() -> None:
     args = parse_args()
-    manifest = build(args.checkpoint, args.evaluation_report, args.output)
+    manifest = build(
+        args.checkpoint,
+        args.evaluation_report,
+        args.output,
+        builtin_evaluation_reports=args.builtin_evaluation_report,
+        minimum_score_rate=args.minimum_score_rate,
+        minimum_builtin_score_rate=args.minimum_builtin_score_rate,
+        minimum_builtin_seed_count=args.minimum_builtin_seed_count,
+    )
     print(
         json.dumps(
             {
