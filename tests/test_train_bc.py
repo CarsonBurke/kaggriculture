@@ -634,3 +634,92 @@ def test_run_record_carries_one_provenance_entry_per_dataset(
     # misdescribe the run as having cloned it alone.
     assert "teacher" not in provenance
     assert "opponent" not in provenance
+
+
+def test_staging_preserves_row_order_and_releases_each_episode() -> None:
+    """Staging is the corpus's memory ceiling, so it must not hold parts and whole.
+
+    A 2,048-seat mixture was killed by the kernel because `np.concatenate` keeps
+    every episode alive alongside the copy it builds. Filling a preallocated array
+    only helps if the caller's references die with each copy, so the release is
+    part of the contract, and so is the row order it must not disturb.
+    """
+    module = _load_trainer()
+    rng = np.random.default_rng(0)
+    members = [
+        {
+            "unit_actions": rng.integers(0, 3, size=(rows, 4), dtype=np.int8),
+            "unit_active": rng.integers(0, 2, size=(rows, 4)).astype(bool),
+            "market_active": rng.integers(0, 2, size=(rows, 2)).astype(bool),
+            "market_quantity_active": rng.integers(0, 2, size=(rows, 2)).astype(bool),
+            "board": rng.random((rows, 3, 2, 2)).astype(np.float16),
+        }
+        for rows in (5, 3, 7)
+    ]
+    expected = {name: np.concatenate([member[name] for member in members]) for name in members[0]}
+    expected_components = sum(
+        expected[name].astype(np.float64).sum(axis=1)
+        for name in ("unit_active", "market_active", "market_quantity_active")
+    )
+
+    staged = module._stage_split(members)
+
+    assert staged.rows == 15
+    for name, value in expected.items():
+        np.testing.assert_array_equal(staged.staged[name].numpy(), value)
+        assert staged.staged[name].dtype == torch.from_numpy(value).dtype
+    np.testing.assert_allclose(staged.row_components, expected_components)
+    # Every episode released: a member that still holds its arrays is a member the
+    # allocator cannot reclaim while the whole-corpus copy is being built.
+    assert members == [{}, {}, {}]
+
+
+def test_a_seed_cap_takes_a_stable_prefix_of_each_corpus(dataset_dir: Path, tmp_path: Path) -> None:
+    """The cap must select a prefix, so a directory can grow without moving it.
+
+    The corpus is staged whole in host memory, so a wide mixture needs a cap --
+    an uncapped four-opponent mixture was killed by the kernel. Taking the lowest
+    seeds means extending a directory later adds episodes rather than silently
+    reshuffling which ones a previous run trained on, and the holdout still comes
+    off the top of what is kept rather than off seeds the cap discarded.
+    """
+    trainer = _load_trainer()
+    directory = _copy_dataset(dataset_dir, tmp_path / "three-seeds")
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    # A third seed, so a cap of two has a seed to discard. Its arrays are the
+    # lowest seed's; only the seed the manifest reports decides what the cap keeps.
+    lowest = min(int(entry["seed"]) for entry in manifest["episodes"])
+    highest = max(int(entry["seed"]) for entry in manifest["episodes"]) + 1
+    for seat in (0, 1):
+        shutil.copyfile(
+            directory / f"episode-{lowest:08d}-seat{seat}.npz",
+            directory / f"episode-{highest:08d}-seat{seat}.npz",
+        )
+        manifest["episodes"].append(
+            {"file": f"episode-{highest:08d}-seat{seat}.npz", "seed": highest, "seat": seat}
+        )
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    train_split, holdout_split, records = trainer.load_dataset(
+        [directory],
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        encode_workers=1,
+        seeds_per_dataset=2,
+    )
+
+    # Two seeds of two seats kept, the highest seed discarded entirely.
+    assert records[0]["episodes"] == 4
+    assert records[0]["seeds_kept"] == 2
+    assert train_split.rows == 2 * (EPISODE_STEPS - 1)
+    assert holdout_split.rows == 2 * (EPISODE_STEPS - 1)
+    # The holdout comes off the top of what survived the cap, never off a seed
+    # the cap removed -- otherwise a capped run would train on everything it kept.
+    with pytest.raises(ValueError, match="holdout of 2 seeds needs"):
+        trainer.load_dataset(
+            [directory],
+            architecture=CONV_ENTITY,
+            holdout_seeds=2,
+            encode_workers=1,
+            seeds_per_dataset=2,
+        )

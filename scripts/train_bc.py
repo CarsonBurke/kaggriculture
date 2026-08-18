@@ -114,6 +114,17 @@ def parse_args() -> argparse.Namespace:
         "--holdout-seeds", type=int, default=12, help="highest N seeds held out entirely"
     )
     parser.add_argument(
+        "--seeds-per-dataset",
+        type=int,
+        default=None,
+        help=(
+            "lowest N seeds to take from each corpus; the whole corpus is staged in "
+            "host memory at ~10 MiB per episode-seat, so this is what keeps a wide "
+            "mixture affordable. Breadth beats depth here: an uncapped single-opponent "
+            "clone reached 99.996% accuracy and still could not act off its own regime"
+        ),
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=20,
@@ -210,12 +221,47 @@ def _validate_targets_satisfy_masks(arrays: dict[str, np.ndarray], name: str) ->
             raise ValueError(f"{name}: demonstrated {factor} violate their own masks")
 
 
+def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
+    """Concatenate one split's episodes into whole-corpus arrays.
+
+    Filling a preallocated array and releasing each episode as it is copied,
+    rather than `np.concatenate`, is what makes a mixture affordable: the encoding
+    is ~10 MiB per episode-seat, and concatenating holds the parts and the whole at
+    once, so a 2,048-seat corpus peaked near 40 GiB and was killed where 20 GiB of
+    steady state fits. `members` is consumed, and row order is preserved so a
+    corpus stages identically however it was built.
+    """
+    rows = sum(member["unit_actions"].shape[0] for member in members)
+    template = members[0]
+    stacked = {
+        name: np.empty((rows, *value.shape[1:]), dtype=value.dtype)
+        for name, value in template.items()
+    }
+    components = np.zeros(rows, dtype=np.float64)
+    offset = 0
+    for position, member in enumerate(members):
+        span = member["unit_actions"].shape[0]
+        for name, value in member.items():
+            stacked[name][offset : offset + span] = value
+        components[offset : offset + span] = sum(
+            member[name].astype(np.float64).sum(axis=1)
+            for name in ("unit_active", "market_active", "market_quantity_active")
+        )
+        offset += span
+        members[position] = {}
+    return DemonstrationTensors(
+        staged={name: torch.from_numpy(value) for name, value in stacked.items()},
+        row_components=components,
+    )
+
+
 def load_dataset(
     dataset_dirs: Sequence[Path],
     *,
     architecture: str,
     holdout_seeds: int,
     encode_workers: int,
+    seeds_per_dataset: int | None = None,
 ) -> tuple[DemonstrationTensors, DemonstrationTensors, list[dict[str, Any]]]:
     """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
 
@@ -224,6 +270,12 @@ def load_dataset(
     on v27-vs-v27 games alone earned 92 money against `starter` while earning
     ~28.9k against a copy of itself, having latched onto "opponent is rich" —
     a constant in that corpus — as a condition for farming at all.
+
+    `seeds_per_dataset` caps how many seeds each directory contributes. The whole
+    corpus is staged in host memory at ~10 MiB per episode-seat, so it is the knob
+    that trades breadth against that ceiling -- and breadth is what wins: the
+    uncapped clone reached 99.996% accuracy on the distribution it saw and still
+    could not act off it, so a fifth of four opponents beats all of one.
     """
     # Reject an unknown family before paying for the encode, not inside a
     # worker process after every episode has been tokenized.
@@ -268,6 +320,15 @@ def load_dataset(
     for index, (directory, manifest) in enumerate(zip(dataset_dirs, manifests, strict=True)):
         episodes = manifest["episodes"]
         seeds = sorted({int(entry["seed"]) for entry in episodes})
+        if seeds_per_dataset is not None:
+            # The lowest seeds, so the corpus a cap selects is a prefix of the one
+            # it would have used uncapped and does not move when a directory is
+            # extended. The holdout still comes off the top of what is kept.
+            seeds = seeds[:seeds_per_dataset]
+            kept = set(seeds)
+            episodes = [entry for entry in episodes if int(entry["seed"]) in kept]
+            records[index]["episodes"] = len(episodes)
+            records[index]["seeds_kept"] = len(seeds)
         if not 0 < holdout_seeds < len(seeds):
             raise ValueError(
                 f"{directory}: holdout of {holdout_seeds} seeds needs "
@@ -288,21 +349,12 @@ def load_dataset(
     for (index, directory, entry), arrays in zip(entries, encoded, strict=True):
         _validate_targets_satisfy_masks(arrays, str(directory / entry["file"]))
         splits[(index, int(entry["seed"])) in held_out].append(arrays)
+    # The split lists alias the same dicts, so dropping this one only frees the
+    # list itself -- but it is what lets `stage` below release each episode as it
+    # copies it, instead of the corpus being reachable from two places at once.
+    encoded.clear()
 
-    def stage(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
-        stacked = {
-            name: np.concatenate([arrays[name] for arrays in members]) for name in members[0]
-        }
-        components = sum(
-            stacked[name].astype(np.float64).sum(axis=1)
-            for name in ("unit_active", "market_active", "market_quantity_active")
-        )
-        return DemonstrationTensors(
-            staged={name: torch.from_numpy(value) for name, value in stacked.items()},
-            row_components=components,
-        )
-
-    return stage(splits[False]), stage(splits[True]), records
+    return _stage_split(splits[False]), _stage_split(splits[True]), records
 
 
 def _batch(
@@ -488,6 +540,7 @@ def train(
     seed: int,
     device: torch.device,
     encode_workers: int,
+    seeds_per_dataset: int | None = None,
 ) -> dict[str, float]:
     """Run the full clone; returns the best holdout metrics."""
     if epochs < 1 or patience < 1 or batch_size < 1:
@@ -516,6 +569,7 @@ def train(
         architecture=architecture,
         holdout_seeds=holdout_seeds,
         encode_workers=encode_workers,
+        seeds_per_dataset=seeds_per_dataset,
     )
     print(
         f"dataset: {len(datasets)} corpora, {train_split.rows} train rows, "
@@ -638,6 +692,7 @@ def main() -> None:
         architecture=args.architecture,
         config=model_config_from_args(resolve_architecture(args.architecture), args),
         holdout_seeds=args.holdout_seeds,
+        seeds_per_dataset=args.seeds_per_dataset,
         epochs=args.epochs,
         patience=args.patience,
         batch_size=args.batch_size,
