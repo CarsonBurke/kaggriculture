@@ -410,10 +410,24 @@ class PpoConfig:
     # So the policy's own entropy is the only exploration that exists, which is
     # what makes this a term in the objective rather than a sampling knob.
     #
-    # Left at zero until measured. A nonzero default shipped from a reference
-    # value would be a guess: CleanRL's 0.01 is tuned against a single softmax
-    # over an Atari action set, not against 36 masked components per state whose
-    # legal counts vary by two orders of magnitude.
+    # Measured, and the answer is zero. Four coefficients ran 12 iterations each
+    # from the same warm checkpoint on the same wave sequence, against the native
+    # built-ins (`scripts/probe_schedule_sweep.py`, `artifacts/probes/entropy.json`).
+    # The mechanism works and is monotone -- terminal entropy 0.294, 0.303, 0.324,
+    # 0.371 nats at 0, 0.003, 0.01, 0.03 -- but it buys no play. Money against
+    # `starter` over the last six iterations was 649 +/- 74 at zero against
+    # 653 +/- 143 at 0.003, a difference of 4 on a standard error of 161, while
+    # 0.01 and 0.03 were worse, and 0.03 much worse: 52-341 money over its last
+    # six iterations, scoring 0.000 against `starter` in five of them.
+    # That is a policy paying for noise.
+    #
+    # The premise the term was added to oppose turned out to be false once the
+    # built-ins entered the league: entropy climbed from 0.185 to 0.294 nats with
+    # NO bonus at all, because a policy with real gradient spreads on its own. The
+    # collapse was caused by training only against itself, and the league is its
+    # fix -- not the objective. The term stays because it is the only exploration
+    # knob that exists and is provably inert at zero, but a nonzero value now has
+    # a measurement to beat rather than a reference default to copy.
     entropy_coefficient: float = 0.0
     # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
     # competition's fixed 719-action horizon. The critic shares it: VAPO's
