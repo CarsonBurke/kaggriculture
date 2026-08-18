@@ -279,6 +279,11 @@ pub struct CompactAction {
     pub market_kinds: [u8; MAX_MARKET_ORDERS],
     /// Exact quantity index: 0..99 decodes to 1..100.
     pub market_quantities: [u8; MAX_MARKET_ORDERS],
+    /// Whether these factors are an external agent's submitted dict rather than
+    /// our own policy's masked sample. It decides which legality contract `step`
+    /// screens them against, so it has to travel with the action: one wave step
+    /// can hold a learner in one seat and a ported built-in in the other.
+    pub external: bool,
 }
 
 impl Default for CompactAction {
@@ -287,6 +292,8 @@ impl Default for CompactAction {
             units: [0; MAX_UNITS],
             market_kinds: [0; MAX_MARKET_ORDERS],
             market_quantities: [0; MAX_MARKET_ORDERS],
+            // Our own policy is the default producer; the built-in ports set this.
+            external: false,
         }
     }
 }
@@ -447,17 +454,41 @@ impl UnitLedger {
     }
 
     fn action_valid(&self, unit: usize, action: u8, day: u16) -> bool {
-        unit_action_is_valid(&self.farm, &self.private, &self.config, unit, action, day)
+        unit_action_is_valid(
+            &self.farm,
+            &self.private,
+            &self.config,
+            unit,
+            action,
+            day,
+            LegalityScope::PolicyMask,
+        )
     }
 }
 
-/// Whether one unit action can have an effect, from the engine's own rules.
+/// Which contract a unit action is being judged against.
+///
+/// The two differ in exactly one clause, and conflating them is a trap: the
+/// engine's rule is what an opponent's submitted dict gets, while the mask is
+/// part of *our agent* and ships with it. Widening the mask to the engine's rule
+/// is not a fidelity fix, it is a capability change -- masked actions receive no
+/// gradient, so every trained artifact holds arbitrary logits there. Measured:
+/// admitting partial pickups took the cloned policy from 136,425 median dollars
+/// against `starter` to 10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegalityScope {
+    /// Actions our own policy may choose, and what `compile_action` emits.
+    PolicyMask,
+    /// The reference interpreter's rules, for an external agent's dict.
+    SubmittedDict,
+}
+
+/// Whether one unit action can have an effect.
 ///
 /// Borrowed rather than a method on either holder because both the mask ledger
 /// and `Game` need it: the ledger clones a farm per sequential reservation,
-/// which `Game::unit_action_valid` cannot afford per unit per step, and the
-/// hand-copied second version that used to serve it drifted -- it kept
-/// requiring a pickup's full quantity after the ledger stopped.
+/// which `Game::unit_action_valid` cannot afford per unit per step. They used to
+/// be hand-copied, which is how one of them kept a rule the other had changed.
 fn unit_action_is_valid(
     farm: &Farm,
     private: &PrivateState,
@@ -465,6 +496,7 @@ fn unit_action_is_valid(
     unit: usize,
     action: u8,
     day: u16,
+    scope: LegalityScope,
 ) -> bool {
     if action >= UNIT_ACTIONS as u8 || unit >= usize::from(farm.units) {
         return false;
@@ -488,14 +520,16 @@ fn unit_action_is_valid(
                 .iter()
                 .any(|&quantity| quantity > 0);
     }
-    if let Some((item, _)) = pickup_spec(action) {
-        // The engine clamps a pickup to what the shed holds rather than refusing
-        // it (kaggriculture.py:357), so any nonzero stock makes the action
-        // effective. Requiring the full requested quantity made a partially
-        // fillable pickup illegal and `step` then turned it into PASS: two units
-        // wanting 2 and 4 of a 5-unit stock left the second with nothing where
-        // the reference engine hands it the remaining 3.
-        return at_shed && private.shed[item] > 0;
+    if let Some((item, quantity)) = pickup_spec(action) {
+        // The interpreter clamps a pickup to the stock on hand rather than
+        // refusing it (kaggriculture.py:357), so for a submitted dict any nonzero
+        // stock is effective. Our own policy instead only asks for pickups it can
+        // fill completely, which is the space every artifact was trained on.
+        let floor = match scope {
+            LegalityScope::PolicyMask => quantity,
+            LegalityScope::SubmittedDict => 1,
+        };
+        return at_shed && private.shed[item] >= floor;
     }
     let tile = farm.tiles[y * BOARD_SIZE + x];
     if let Some(animal) = place_animal(action) {
@@ -1169,14 +1203,18 @@ impl Game {
         rng: &mut PyRandom,
         v27: &mut V27State,
     ) -> CompactAction {
-        match agent {
+        let mut action = match agent {
             // Unit action 0 is PASS and market kind 0 is STOP, so the default
             // compact action already is "every unit passes, no orders".
             BuiltinAgent::Pass => CompactAction::default(),
             BuiltinAgent::Random => self.random_agent_action(player, rng),
             BuiltinAgent::Starter => self.starter_agent_action(player),
             BuiltinAgent::ScriptedV27 => self.scripted_v27_action(player, v27),
-        }
+        };
+        // These agents emit the dict the reference interpreter reads, never our
+        // masked factor space, so `step` owes them the interpreter's own rules.
+        action.external = true;
+        action
     }
 
     /// The public v27 agent: replay this step's scripted action, repair weeds,
@@ -1676,34 +1714,47 @@ impl Game {
 
     fn apply_unit_actions(&mut self, player: usize, actions: &CompactAction, day: u16) {
         let units = usize::from(self.farms[player].units);
+        let scope = if actions.external {
+            LegalityScope::SubmittedDict
+        } else {
+            LegalityScope::PolicyMask
+        };
         // The interpreter counts every PLANT request for a crop before applying
         // any of them and drops all of them when the total exceeds the seeds held
-        // at the start of the turn (kaggriculture.py:907-920). Sequential
-        // reservation, which lets the first plant through, is what `compile_action`
-        // does to the policy's own factors -- and because masked sampling never
-        // requests more plants of a crop than it holds seeds, this rule is vacuous
-        // for the learner and decides only agents that submit a raw dict, such as
-        // the ported built-ins.
-        let mut demand = [0u16; CROPS];
-        for unit in 0..units {
-            if let Some(crop) = unit_plant_crop(actions.units[unit]) {
-                demand[crop] += 1;
-            }
-        }
+        // at the start of the turn (kaggriculture.py:907-920). Only a submitted
+        // dict meets that rule: our own factors reach the engine through
+        // `compile_action`, which reserves seeds sequentially and lets the first
+        // plant through, and masked sampling never asks for more plants of a crop
+        // than it holds seeds for -- so the two agree on everything we produce.
         let mut blocked = [false; CROPS];
-        for (crop, held) in self.privates[player].seeds.iter().enumerate() {
-            blocked[crop] = demand[crop] > *held;
+        if scope == LegalityScope::SubmittedDict {
+            let mut demand = [0u16; CROPS];
+            for unit in 0..units {
+                if let Some(crop) = unit_plant_crop(actions.units[unit]) {
+                    demand[crop] += 1;
+                }
+            }
+            for (crop, held) in self.privates[player].seeds.iter().enumerate() {
+                blocked[crop] = demand[crop] > *held;
+            }
         }
         for unit in 0..units {
             let selected = actions.units[unit];
             let refused = unit_plant_crop(selected).is_some_and(|crop| blocked[crop])
-                || !self.unit_action_valid(player, unit, selected, day);
+                || !self.unit_action_valid(player, unit, selected, day, scope);
             let action = if refused { 0 } else { selected };
             self.apply_unit_action(player, unit, action, day);
         }
     }
 
-    pub fn unit_action_valid(&self, player: usize, unit: usize, action: u8, day: u16) -> bool {
+    pub fn unit_action_valid(
+        &self,
+        player: usize,
+        unit: usize,
+        action: u8,
+        day: u16,
+        scope: LegalityScope,
+    ) -> bool {
         unit_action_is_valid(
             &self.farms[player],
             &self.privates[player],
@@ -1711,6 +1762,7 @@ impl Game {
             unit,
             action,
             day,
+            scope,
         )
     }
 
@@ -3249,7 +3301,7 @@ mod tests {
     }
 
     #[test]
-    fn pickup_clamps_to_stock_so_a_later_unit_takes_the_remainder() {
+    fn pickup_clamps_to_stock_for_a_submitted_dict_but_our_mask_refuses_it() {
         let mut game = Game::new(0, GameConfig::default());
         let mut hire = CompactAction::default();
         hire.market_kinds[0] = 1;
@@ -3262,16 +3314,26 @@ mod tests {
         let mut pickup = CompactAction::default();
         pickup.units[0] = 7; // wheat 2
         pickup.units[1] = 9; // wheat 4
-        game.step(&[pickup, CompactAction::default()]);
-        assert_eq!(game.privates[0].inventories[0][0], 2);
+        pickup.external = true;
+        let mut submitted = game.clone();
+        submitted.step(&[pickup, CompactAction::default()]);
+        assert_eq!(submitted.privates[0].inventories[0][0], 2);
         // Three of the four asked for: the reference clamps a pickup to the stock
         // instead of refusing it, so the shortfall costs only the missing unit.
-        assert_eq!(game.privates[0].inventories[1][0], 3);
-        assert_eq!(game.privates[0].shed[0], 0);
+        assert_eq!(submitted.privates[0].inventories[1][0], 3);
+        assert_eq!(submitted.privates[0].shed[0], 0);
+        // Our own action space excludes a pickup it cannot fill, and the apply loop
+        // reserves sequentially, so by the time the second unit is judged the stock
+        // is already short and its request drops entirely rather than clamping.
+        pickup.external = false;
+        game.step(&[pickup, CompactAction::default()]);
+        assert_eq!(game.privates[0].inventories[0][0], 2);
+        assert_eq!(game.privates[0].inventories[1][0], 0);
+        assert_eq!(game.privates[0].shed[0], 3);
     }
 
     #[test]
-    fn plant_demand_over_seeds_blocks_every_plant_of_that_crop() {
+    fn plant_demand_over_seeds_blocks_every_plant_only_for_a_submitted_dict() {
         let mut game = Game::new(0, GameConfig::default());
         let mut hire = CompactAction::default();
         hire.market_kinds[0] = 1;
@@ -3284,17 +3346,27 @@ mod tests {
         let mut plant = CompactAction::default();
         plant.units[0] = 45;
         plant.units[1] = 45;
-        game.step(&[plant, CompactAction::default()]);
+        plant.external = true;
+        let mut submitted = game.clone();
+        submitted.step(&[plant, CompactAction::default()]);
         // All-or-none, not first-come: one seed against two requests plants neither
         // and spends nothing.
-        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Empty);
-        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Empty);
-        assert_eq!(game.privates[0].seeds[0], 1);
-        game.privates[0].seeds[0] = 2;
+        assert_eq!(submitted.farms[0].tiles[44].kind, TileKind::Empty);
+        assert_eq!(submitted.farms[0].tiles[43].kind, TileKind::Empty);
+        assert_eq!(submitted.privates[0].seeds[0], 1);
+        // `compile_action` reserves seeds sequentially, so the same over-demand
+        // from our policy plants the first and drops only the second.
+        plant.external = false;
         game.step(&[plant, CompactAction::default()]);
         assert_eq!(game.farms[0].tiles[44].kind, TileKind::Plant);
-        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Plant);
+        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Empty);
         assert_eq!(game.privates[0].seeds[0], 0);
+        submitted.privates[0].seeds[0] = 2;
+        plant.external = true;
+        submitted.step(&[plant, CompactAction::default()]);
+        assert_eq!(submitted.farms[0].tiles[44].kind, TileKind::Plant);
+        assert_eq!(submitted.farms[0].tiles[43].kind, TileKind::Plant);
+        assert_eq!(submitted.privates[0].seeds[0], 0);
     }
 
     #[test]

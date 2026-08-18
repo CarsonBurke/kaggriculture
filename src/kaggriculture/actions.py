@@ -239,11 +239,16 @@ def unit_action_mask(
         mask[UnitAction.DROP] = shed_room > 0 and any(
             int(value or 0) > 0 for value in inventory.values()
         )
-        # A pickup is clamped to the stock on hand, never refused
-        # (kaggriculture.py:357), so any nonzero stock leaves it effective and
-        # `unit_action_command` below reports the quantity it actually takes.
-        for action, (item, _) in _PICKUP_SPEC.items():
-            mask[action] = int(shed.get(item, 0) or 0) > 0
+        # Our policy only asks for pickups it can fill completely. The engine
+        # would clamp a short one instead of refusing it (kaggriculture.py:357),
+        # so this is a deliberate narrowing of our own action space and not a
+        # model of the rules -- `Game::unit_action_valid` carries the engine's
+        # version for opponents that submit a raw dict. Widening it is a
+        # capability change that invalidates every trained artifact, because a
+        # masked action never receives gradient: admitting partial pickups took
+        # the cloned policy from 136,425 median dollars against `starter` to 10.
+        for action, (item, quantity) in _PICKUP_SPEC.items():
+            mask[action] = int(shed.get(item, 0) or 0) >= quantity
         for action, animal in _PLACE_ANIMAL.items():
             mask[action] = shed_room > 0 and int(inventory.get(animal, 0) or 0) > 0
 

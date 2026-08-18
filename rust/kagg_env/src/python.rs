@@ -138,6 +138,7 @@ impl BatchEnv {
             unit_actions,
             market_kinds,
             market_quantities,
+            false,
         )?;
         let masks = py.detach(|| {
             self.games
@@ -581,18 +582,27 @@ impl BatchEnv {
         Ok(())
     }
 
+    /// Advance every game by one supplied factor row.
+    ///
+    /// `external` marks the rows as an outside agent's submitted dict rather than
+    /// our policy's masked sample, which is what the parity harnesses replay: the
+    /// interpreter clamps a partial pickup and drops over-demanded plants, while
+    /// our own factor space excludes both by construction.
+    #[pyo3(signature = (unit_actions, market_kinds, market_quantities, external = false))]
     fn step_factors<'py>(
         &mut self,
         py: Python<'py>,
         unit_actions: PyReadonlyArray3<'py, u8>,
         market_kinds: PyReadonlyArray3<'py, u8>,
         market_quantities: PyReadonlyArray3<'py, u8>,
+        external: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let compact = extract_compact_actions(
             self.games.len(),
             unit_actions,
             market_kinds,
             market_quantities,
+            external,
         )?;
         let previous_potentials = self.potential_cache.clone();
         let results = py.detach(|| {
@@ -1324,6 +1334,7 @@ fn extract_compact_actions(
     unit_actions: PyReadonlyArray3<'_, u8>,
     market_kinds: PyReadonlyArray3<'_, u8>,
     market_quantities: PyReadonlyArray3<'_, u8>,
+    external: bool,
 ) -> PyResult<Vec<[CompactAction; PLAYERS]>> {
     let expected_units = [games, PLAYERS, MAX_UNITS];
     let expected_market = [games, PLAYERS, MAX_MARKET_ORDERS];
@@ -1349,6 +1360,7 @@ fn extract_compact_actions(
                 units: std::array::from_fn(|unit| units[[game, player, unit]]),
                 market_kinds: std::array::from_fn(|slot| kinds[[game, player, slot]]),
                 market_quantities: std::array::from_fn(|slot| quantities[[game, player, slot]]),
+                external,
             })
         })
         .collect())

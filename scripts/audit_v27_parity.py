@@ -259,10 +259,13 @@ def _compare_actions(
                     divergences.append({"where": where, "reason": reason})
         if divergences:
             break
+        # Both seats are the reference agent here, whose emission is a submitted
+        # dict: the engine owes it the interpreter's rules, not our policy mask.
         environment.step_factors(
             units.reshape(games, PLAYERS, -1),
             kinds.reshape(games, PLAYERS, -1),
             quantities.reshape(games, PLAYERS, -1),
+            external=True,
         )
     return {"actions_compared": compared, "divergences": divergences}
 

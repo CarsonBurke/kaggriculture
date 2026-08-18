@@ -189,7 +189,9 @@ def main() -> int:
             units[0, player, :active] = values
             kinds[0, player] = order_kinds
             quantities[0, player] = order_quantities
-        native.step_factors(units, kinds, quantities)
+        # The reference's own dict, so the engine screen owed here is the
+        # interpreter's -- our policy mask never produces these rows.
+        native.step_factors(units, kinds, quantities, external=True)
         official.step(submitted)
 
     report = {

@@ -222,14 +222,22 @@ def test_pickup_masks_and_compilation_reserve_stock_sequentially() -> None:
     compiled = compile_action(observation, units, kinds, quantities)
 
     assert compiled["farmer"] == ["PICKUP", "FERTILIZER", 4]
-    # The third unit asked for two of the one the first two left. The engine
-    # clamps a pickup to the stock rather than refusing it, so the shortfall
-    # costs one unit of fertilizer and not the whole action.
-    assert compiled["hands"] == [["PICKUP", "FERTILIZER", 2], ["PICKUP", "FERTILIZER", 1]]
+    # The third unit asked for two of the one the first two left. Our mask only
+    # offers pickups it can fill completely, so the short request becomes PASS
+    # rather than a partial take.
+    assert compiled["hands"] == [["PICKUP", "FERTILIZER", 2], ["PASS"]]
 
 
-def test_partial_pickup_matches_official_engine() -> None:
-    """Two units asking for six of a five-unit stock both come away holding."""
+def test_our_mask_declines_a_pickup_the_engine_would_have_clamped() -> None:
+    """The deliberate narrowing, measured against what the engine actually allows.
+
+    The reference clamps a short pickup instead of refusing it, so this row is
+    legal to submit -- our action space excludes it anyway. That is a capability
+    choice, not a fidelity gap: masked actions receive no gradient, and widening
+    the mask took the cloned policy from 136,425 median dollars against `starter`
+    to 10. `test_official_engine_clamps_an_oversized_pickup_rather_than_refusing`
+    pins the rule this declines to use.
+    """
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
     state = environment.reset(2)
     observation = state[0].observation
@@ -245,10 +253,10 @@ def test_partial_pickup_matches_official_engine() -> None:
     following = environment.step([compiled, {}])[0].observation
 
     assert compiled["farmer"] == ["PICKUP", "WHEAT", 2]
-    assert compiled["hands"] == [["PICKUP", "WHEAT", 3]]
-    assert following["private"]["shed"].get("WHEAT", 0) == 0
+    assert compiled["hands"] == [["PASS"]]
+    assert following["private"]["shed"]["WHEAT"] == 3
     assert following["private"]["inventories"][0]["WHEAT"] == 2
-    assert following["private"]["inventories"][1]["WHEAT"] == 3
+    assert "WHEAT" not in following["private"]["inventories"][1]
 
 
 def test_official_engine_clamps_an_oversized_pickup_rather_than_refusing() -> None:
