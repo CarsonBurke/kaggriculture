@@ -108,6 +108,14 @@ const ILLIQUID_PLANTED_SEED_CREDIT: f64 = 0.8;
 const ILLIQUID_PENDING_YIELD_CREDIT: f64 = 0.72;
 const ILLIQUID_LAND_CREDIT: f64 = 0.9;
 
+// Dollars of margin at which the scored potential reaches tanh's knee. The
+// potential squashes a margin rather than normalizing one by the pot: under
+// `(a - b) / (a + b)` a dollar of margin is worth `2b / (a + b)^2`, a 50x
+// premium on keeping the economy small, which a run took by destroying 85% of
+// its own bank while its score rose. Must stay identical to MARGIN_SCALE in
+// src/kaggriculture/encoding.py.
+const MARGIN_SCALE: f64 = 75_000.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TileKind {
@@ -1022,27 +1030,27 @@ impl Game {
         value
     }
 
-    /// Bounded relative farm value from player zero's perspective.
+    /// Bounded farm-value margin from player zero's perspective.
     ///
     /// The dense shaping potential: an exact liquidation core (market product
     /// trades stay exactly potential-neutral and harvested-but-unsold output
     /// is credited at true sale proceeds) plus the heuristic cost-basis
     /// credit for illiquid assets.
     pub fn pair_potential(&self) -> f32 {
-        relative_score(
+        margin_score(
             self.liquidation_value(0) + self.illiquid_value(0),
             self.liquidation_value(1) + self.illiquid_value(1),
         )
     }
 
-    /// Bounded relative bank score, the quantity the engine actually scores.
+    /// Bounded banked-money margin, scoring the quantity the engine banks.
     pub fn terminal_potential(&self) -> f32 {
-        relative_score(self.farms[0].money as f64, self.farms[1].money as f64)
+        margin_score(self.farms[0].money as f64, self.farms[1].money as f64)
     }
 
-    /// Post-step shaping potential: relative liquidation value mid-episode and
-    /// relative bank at termination, so the telescoped shaped return equals
-    /// the exact relative final bank score.
+    /// Post-step shaping potential: the farm-value margin mid-episode and the
+    /// banked-money margin at termination, so the telescoped shaped return
+    /// equals the exact final scored margin.
     pub fn post_step_potential(&self) -> f32 {
         if self.done {
             self.terminal_potential()
@@ -2586,13 +2594,16 @@ fn shape(kind: Shape, x: f64) -> f64 {
     }
 }
 
-fn relative_score(zero: f64, one: f64) -> f32 {
-    let total = zero + one;
-    if total == 0.0 {
-        0.0
-    } else {
-        ((zero - one) / total) as f32
-    }
+/// Bounded dollar margin from player zero's perspective.
+///
+/// Both potentials squash through this identically, so the shaped reward stays
+/// the difference of one function and its telescoped return is exact. Only the
+/// argument changes at the terminal transition: farm value during the episode,
+/// banked money at the end. Computed in f64 and narrowed once, matching
+/// `encoding._margin_score` so replay parity holds to the same tolerance the
+/// division did.
+fn margin_score(zero: f64, one: f64) -> f32 {
+    ((zero - one) / MARGIN_SCALE).tanh() as f32
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
@@ -2847,18 +2858,31 @@ mod tests {
     }
 
     #[test]
-    fn pair_potential_is_relative_farm_value_with_exact_liquid_core() {
+    fn pair_potential_squashes_the_dollar_margin_over_an_exact_liquid_core() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
-        assert_eq!(game.pair_potential(), 0.5);
+        let lead = game.pair_potential();
+        assert_eq!(
+            lead,
+            ((game.farms[0].money - game.farms[1].money) as f64 / MARGIN_SCALE).tanh() as f32
+        );
+        assert!(lead > 0.0);
 
+        // Antisymmetric in the two players, so the zero-sum pair is scored by
+        // one number and the trailing seat sees the exact negation.
         game.farms[0].money = 1000;
         game.farms[1].money = 3000;
-        assert_eq!(game.pair_potential(), -0.5);
+        assert_eq!(game.pair_potential(), -lead);
 
+        // Equal farms are exactly zero at any wealth. That is what makes the
+        // symmetric start's potential 0.0, so the telescoped shaped return is
+        // the terminal potential alone and stays inside [-2, 2].
         game.farms[0].money = 0;
         game.farms[1].money = 0;
+        assert_eq!(game.pair_potential(), 0.0);
+        game.farms[0].money = 250_000;
+        game.farms[1].money = 250_000;
         assert_eq!(game.pair_potential(), 0.0);
 
         // Held products count at their exact sale proceeds, whether they sit
@@ -2873,11 +2897,35 @@ mod tests {
         let one = game.liquidation_value(1);
         assert!(zero > 1000.0);
         assert!(one > 1000.0);
-        assert_eq!(game.pair_potential(), ((zero - one) / (zero + one)) as f32);
+        assert_eq!(
+            game.pair_potential(),
+            ((zero - one) / MARGIN_SCALE).tanh() as f32
+        );
 
         // Unhired unit slots are outside the observation and must not count.
         game.privates[0].inventories[5][0] = 99;
         assert_eq!(game.liquidation_value(0), zero);
+    }
+
+    #[test]
+    fn pair_potential_grows_with_dollars_rather_than_with_the_margin_ratio() {
+        // This is the property the squashed margin exists to create. Under the
+        // old `(a - b) / (a + b)` a 3:1 lead scored 0.5 whether the pot was
+        // 4,000 or 400,000, so a dollar of margin was worth 1.67e-4 at a 6,000
+        // pot and 3.3e-6 at a 300,000 one: a 50x reward premium on keeping the
+        // economy small, which a measured run took by destroying 85% of its own
+        // bank while its score rose.
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 3_000;
+        game.farms[1].money = 1_000;
+        let small = game.pair_potential();
+        game.farms[0].money = 300_000;
+        game.farms[1].money = 100_000;
+        let large = game.pair_potential();
+        assert!(large > small);
+        // Still bounded in (-1, 1) at any wealth, so the critic's HL-Gauss
+        // support over the [-2, 2] return range is untouched.
+        assert!(large < 1.0);
     }
 
     #[test]
@@ -2891,6 +2939,10 @@ mod tests {
         // floor, exercising the floor-conditional market restock.
         game.market_inventory[4] = 10_320;
         let predicted = game.liquidation_value(0);
+        // Selling at the quoted price only moves proceeds from the shed into
+        // the bank, so a market product trade is exactly potential-neutral and
+        // the shaped reward never pays or charges for trading itself.
+        let potential_before = game.pair_potential();
 
         for item in [0, 4, 8] {
             while game.privates[0].shed[item] > 0 {
@@ -2905,6 +2957,7 @@ mod tests {
         }
 
         assert_eq!(predicted, game.farms[0].money as f64);
+        assert_eq!(game.pair_potential(), potential_before);
     }
 
     #[test]
@@ -2954,12 +3007,16 @@ mod tests {
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
         game.privates[1].shed.fill(100);
-        assert_eq!(game.terminal_potential(), 0.5);
-        assert!(game.pair_potential() < 0.5);
+        let banked =
+            ((game.farms[0].money - game.farms[1].money) as f64 / MARGIN_SCALE).tanh() as f32;
+        assert_eq!(game.terminal_potential(), banked);
+        // The loser's unsold shed counts mid-episode but is worth nothing once
+        // the episode scores the bank.
+        assert!(game.pair_potential() < banked);
 
         assert_eq!(game.post_step_potential(), game.pair_potential());
         game.done = true;
-        assert_eq!(game.post_step_potential(), 0.5);
+        assert_eq!(game.post_step_potential(), banked);
     }
 
     #[test]

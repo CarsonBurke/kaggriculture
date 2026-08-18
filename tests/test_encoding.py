@@ -17,6 +17,7 @@ from kaggriculture.encoding import (
     ILLIQUID_PLANTED_SEED_CREDIT,
     ILLIQUID_SHED_ANIMAL_CREDIT,
     ILLIQUID_SHED_SEED_CREDIT,
+    MARGIN_SCALE,
     UNIT_FEATURES,
     encode_observation,
     illiquid_value,
@@ -51,16 +52,23 @@ def test_encoding_shapes_and_viewpoint_symmetry() -> None:
     assert pair_potential(zero, one) == 0.0
 
 
-def test_pair_potential_is_relative_farm_value_with_exact_liquid_core() -> None:
+def test_pair_potential_squashes_the_farm_value_margin_over_an_exact_liquid_core() -> None:
     zero, one = _observations()
     zero["farms"][0]["money"] = 9000
     one["farms"][1]["money"] = 3000
 
-    assert pair_potential(zero, one) == 0.5
+    assert pair_potential(zero, one) == math.tanh(6000 / MARGIN_SCALE)
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 9000
-    assert pair_potential(zero, one) == -0.5
+    # Antisymmetric between the seats, which is what makes the shaped reward it
+    # generates exactly zero-sum.
+    assert pair_potential(zero, one) == -math.tanh(6000 / MARGIN_SCALE)
 
+    # No margin is exactly no signal, rich or broke, so a mirror position never
+    # drifts the critic's target.
+    zero["farms"][0]["money"] = 5000
+    one["farms"][1]["money"] = 5000
+    assert pair_potential(zero, one) == 0.0
     zero["farms"][0]["money"] = 0
     one["farms"][1]["money"] = 0
     assert pair_potential(zero, one) == 0.0
@@ -74,11 +82,11 @@ def test_pair_potential_is_relative_farm_value_with_exact_liquid_core() -> None:
     value_one = liquidation_value(one, 1)
     assert value_zero > 1000.0
     assert value_one > 1000.0
-    assert pair_potential(zero, one) == (value_zero - value_one) / (value_zero + value_one)
+    assert pair_potential(zero, one) == math.tanh((value_zero - value_one) / MARGIN_SCALE)
 
 
 def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
-    zero, _ = _observations()
+    zero, one = _observations()
     zero["private"]["shed"]["WHEAT"] = 3
     zero["private"]["inventories"][0]["WHEAT"] = 2
 
@@ -91,6 +99,18 @@ def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
             inventory_level += 1
 
     assert liquidation_value(zero, 0) == expected
+
+    # Walking that same curve is what keeps a market product sale exactly
+    # potential-neutral: the proceeds land in the bank at precisely the quotes
+    # the held units were already credited at, so no amount of trading back and
+    # forth manufactures shaped reward. Any monotone squash of the same value
+    # difference preserves this, so the margin rescale cannot have broken it.
+    before = pair_potential(zero, one)
+    zero["farms"][0]["money"] = expected
+    zero["private"]["shed"]["WHEAT"] = 0
+    zero["private"]["inventories"][0]["WHEAT"] = 0
+    zero["market"]["inventory"]["WHEAT"] = inventory_level
+    assert pair_potential(zero, one) == before
 
 
 def test_illiquid_value_credits_cost_basis_fractions() -> None:
@@ -125,8 +145,40 @@ def test_terminal_pair_potential_scores_bank_only() -> None:
     one["farms"][1]["money"] = 1000
     zero["private"]["shed"]["WHEAT"] = 100
 
-    assert terminal_pair_potential(zero, one) == 0.5
-    assert pair_potential(zero, one) > 0.5
+    assert terminal_pair_potential(zero, one) == math.tanh(2000 / MARGIN_SCALE)
+    # A hundred unsold WHEAT is farm value the engine never banks, so the dense
+    # potential sits strictly above the terminal one at this same state.
+    assert pair_potential(zero, one) > terminal_pair_potential(zero, one)
+
+
+def test_pair_potential_never_pays_for_shrinking_the_economy() -> None:
+    """Guards the defect the squash exists to remove.
+
+    Normalizing the margin by the pot made a dollar of margin worth
+    `2b / (a + b)^2`: 1.67e-4 at a 6,000 pot against 3.3e-6 at a 300,000 one, a
+    50x premium on keeping the economy small that was live at every step. A
+    measured run took it, destroying 85% of its own bank while its score rose.
+    """
+    zero, one = _observations()
+    zero["farms"][0]["money"] = 9000
+    one["farms"][1]["money"] = 3000
+
+    wide = pair_potential(zero, one)
+
+    zero["farms"][0]["money"] = 7000
+    one["farms"][1]["money"] = 1000
+    # The same 6,000 margin in an 8,000 pot instead of a 12,000 one: burning
+    # 2,000 of the learner's own bank used to be worth 0.75 against 0.50, and
+    # now pays exactly nothing.
+    assert pair_potential(zero, one) == wide
+
+    zero["farms"][0]["money"] = 180_000
+    one["farms"][1]["money"] = 60_000
+    # The same 3:1 ratio twenty times larger, which the old form scored at
+    # exactly 0.5 either way. A rich win must score strictly above a poor one,
+    # so holding a ratio while shrinking the pot can never be an improvement.
+    assert pair_potential(zero, one) > wide
+    assert pair_potential(zero, one) == math.tanh(120_000 / MARGIN_SCALE)
 
 
 def test_dense_bank_rewards_telescope_without_a_terminal_override() -> None:

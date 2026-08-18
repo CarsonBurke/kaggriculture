@@ -106,7 +106,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="league lanes reserved for admitted built-ins; unwon lanes go to snapshots",
     )
-    parser.add_argument("--opponent-temperature", type=float, default=0.8)
     parser.add_argument(
         "--external-eval-every",
         type=int,
@@ -312,8 +311,6 @@ def _validate_args(args: argparse.Namespace) -> None:
             "league games must cover the initial anchor and every configured "
             f"active/historical/built-in lane ({configured_opponents})"
         )
-    if not math.isfinite(args.opponent_temperature) or args.opponent_temperature <= 0.0:
-        raise ValueError("opponent temperature must be finite and positive")
     if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 0:
         raise ValueError("critic warmup iterations cannot be negative")
     if args.init_actor_from is not None and args.resume is not None:
@@ -991,7 +988,6 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         # either would be generating different data under the same run.
         "league_builtin_opponents": ",".join(_league_builtin_opponents(args)),
         "league_builtin_lanes": args.league_builtin_lanes,
-        "opponent_temperature": args.opponent_temperature,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
         # Both calibrated knobs are modes, and both are cross-checked against the
@@ -1552,17 +1548,6 @@ def main() -> None:
                 len(selections),
                 generator,
             )
-            opponent_temperatures = np.asarray(
-                [
-                    args.opponent_temperature if row.category == "active" else 1.0
-                    for row in snapshots
-                ],
-                dtype=np.float32,
-            )
-            deterministic_opponents = np.asarray(
-                [row.category != "active" for row in snapshots],
-                dtype=np.bool_,
-            )
             opponent_checkpoint = ",".join(row.label for row in selections)
         # Self-play and league games advance in one native wave, so the
         # learner forward covers every current-policy row at once and the
@@ -1577,9 +1562,19 @@ def main() -> None:
             seed_start=next_seed,
             episode_steps=args.episode_steps,
             temperature=args.temperature,
-            opponent_temperature=args.opponent_temperature,
-            opponent_temperatures=opponent_temperatures if league_games else None,
-            deterministic_opponents=deterministic_opponents if league_games else None,
+            # Every league seat decodes exactly as the learner does. Sharpening
+            # them instead -- active lanes at 0.8, historical ones at argmax --
+            # handed the learner an opponent that was a strictly better executor
+            # of its own policy, so an identical snapshot beat it: iteration 40
+            # scored 0.302 in league lanes against copies of itself, and a
+            # temperature-1.0 seat loses to a temperature-0.8 one of the same
+            # weights at a 0.4375 win rate. The learner cannot answer that by
+            # playing better, only by playing something whose payoff survives
+            # its own sampling noise, and it found one: farming 143,000 needs
+            # roughly 8,000 correct decisions in a row while denying an opponent
+            # needs far fewer, so the gradient preferred the noise-robust
+            # strategy and the economy went with it.
+            opponent_temperature=args.temperature,
             sampling_seed=sampling_seed,
             # One decision, stated once. `forward_mode` drives the learner
             # forward, and `compile_models` -- which now governs only the

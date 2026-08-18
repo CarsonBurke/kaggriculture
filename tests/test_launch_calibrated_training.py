@@ -269,7 +269,6 @@ def _records(
         "repeats": repeats,
         "seed": seed,
         "temperature": 1.0,
-        "opponent_temperature": 0.8,
         "precision": {
             "use_bfloat16": True,
             "float32_matmul_precision": "high",

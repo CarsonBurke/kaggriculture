@@ -29,8 +29,14 @@ PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter"
 PRODUCTION_LEAGUE_BUILTIN_LANES = 3
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_EVERY = 5
+# Every seat in a wave decodes at this one temperature, learner and league
+# alike. Splitting them is what a separate opponent temperature did, and it
+# was not neutral: the learner sampled at 1.0 while active lanes ran 0.8 and
+# historical lanes ran argmax, so an identical snapshot was a strictly better
+# executor of the learner's own policy and iteration 40 scored 0.302 in league
+# lanes against copies of itself. A knob whose only correct value is the
+# learner's temperature is not a knob.
 PRODUCTION_TEMPERATURE = 1.0
-PRODUCTION_OPPONENT_TEMPERATURE = 0.8
 # The collection forward is ~64% of a wave's wall clock, and measurement picked
 # both of these rather than taste. Production 112-game waves, real BC actor:
 # the rollout sweep moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x,
@@ -218,8 +224,6 @@ def build_training_command(
             PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
             "--league-builtin-lanes",
             str(PRODUCTION_LEAGUE_BUILTIN_LANES),
-            "--opponent-temperature",
-            str(PRODUCTION_OPPONENT_TEMPERATURE),
             "--episode-steps",
             str(PRODUCTION_EPISODE_STEPS),
             "--temperature",

@@ -30,7 +30,6 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
-    PRODUCTION_OPPONENT_TEMPERATURE,
     PRODUCTION_ROLLOUT_BFLOAT16,
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
@@ -278,7 +277,6 @@ def _validate_configuration(
         "episode_steps": PRODUCTION_EPISODE_STEPS,
         "seed": expected_seed,
         "temperature": PRODUCTION_TEMPERATURE,
-        "opponent_temperature": PRODUCTION_OPPONENT_TEMPERATURE,
         "precision": {
             "use_bfloat16": True,
             "float32_matmul_precision": "high",

@@ -370,20 +370,47 @@ def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
     return value
 
 
-def _relative_score(zero: float, one: float) -> float:
-    total = zero + one
-    return 0.0 if total == 0.0 else (zero - one) / total
+#: Dollars of margin at which the scored potential reaches tanh's knee. The
+#: potential squashes a *margin* rather than normalizing one by the pot, because
+#: normalizing by the pot makes a dollar's reward inversely proportional to the
+#: pot: under `(a - b) / (a + b)` a dollar of margin is worth `2b / (a + b)^2`,
+#: which is 1.67e-4 at a 6,000 pot and 3.3e-6 at a 300,000 one. That 50x premium
+#: on keeping the economy small is live at every step, and a run took it --
+#: destroying 85% of its own bank while its score rose, because 166,862 and
+#: 56,033 against `starter` score 0.959 and 0.883 under the old form, and mirror
+#: lanes score 0.000 at any wealth at all.
+#:
+#: Chosen from the measured margin distribution: neural-versus-neural games sit
+#: at a median absolute margin of 9,440 and a p90 of 27,136, inside tanh's
+#: near-linear region here, while a healthy policy's ~104,000 margin against a
+#: built-in lands at 0.88 to 0.98 rather than saturating. That widens the gap
+#: between a rich and a poor built-in result from 0.076 to 0.370 and the gap
+#: between beating and losing to `public-v27` from 0.450 to 0.629, and still
+#: leaves the typical mirror-lane signal slightly stronger than it was, 0.077
+#: against 0.068, so nothing was traded away to buy the anchor.
+MARGIN_SCALE = 75_000.0
+
+
+def _margin_score(zero: float, one: float) -> float:
+    """Bounded dollar margin from player zero's perspective.
+
+    Both potentials squash through this identically, so the reward remains the
+    difference of a single function and the shaped return still telescopes
+    exactly. Only the argument changes at the terminal transition: farm value
+    during the episode, banked money at the end.
+    """
+    return math.tanh((zero - one) / MARGIN_SCALE)
 
 
 def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
-    """Bounded relative farm value from player zero's perspective.
+    """Bounded farm-value margin from player zero's perspective.
 
     The dense shaping potential: an exact liquidation core (market product
     trades stay exactly potential-neutral and harvested-but-unsold output is
     credited at true sale proceeds) plus the heuristic cost-basis credit for
     illiquid assets.
     """
-    return _relative_score(
+    return _margin_score(
         liquidation_value(observation_zero, 0) + illiquid_value(observation_zero, 0),
         liquidation_value(observation_one, 1) + illiquid_value(observation_one, 1),
     )
@@ -392,12 +419,12 @@ def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, 
 def terminal_pair_potential(
     observation_zero: dict[str, Any], observation_one: dict[str, Any]
 ) -> float:
-    """Bounded relative bank score, the quantity the engine actually scores.
+    """Bounded banked-money margin, scoring the quantity the engine banks.
 
     Used as the potential of terminal states so the telescoped shaped return
-    equals the exact relative final bank score.
+    equals the exact final scored margin.
     """
-    return _relative_score(
+    return _margin_score(
         _scored_money(observation_zero, 0),
         _scored_money(observation_one, 1),
     )
@@ -407,7 +434,7 @@ def shaped_pair_reward(
     previous_potential: float,
     next_potential: float,
 ) -> tuple[float, float]:
-    """Dense zero-sum change in exact relative scored-bank value."""
+    """Dense zero-sum change in the exact scored-bank margin."""
     if not math.isfinite(previous_potential) or not math.isfinite(next_potential):
         raise ValueError("pair potentials must be finite")
     reward_zero = next_potential - previous_potential

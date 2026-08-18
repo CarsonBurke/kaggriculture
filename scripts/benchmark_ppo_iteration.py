@@ -39,7 +39,6 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
-    PRODUCTION_OPPONENT_TEMPERATURE,
     PRODUCTION_TEMPERATURE,
     production_ppo_config,
 )
@@ -181,9 +180,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
-    parser.add_argument(
-        "--opponent-temperature", type=float, default=PRODUCTION_OPPONENT_TEMPERATURE
-    )
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
     parser.add_argument(
         "--max-update-replay-kl",
@@ -438,11 +434,8 @@ def main() -> None:
         raise ValueError("epochs and minibatch size must be positive")
     if args.critic_epochs < args.epochs:
         raise ValueError("--critic-epochs cannot be fewer than --epochs")
-    if any(
-        not math.isfinite(value) or value <= 0.0
-        for value in (args.temperature, args.opponent_temperature)
-    ):
-        raise ValueError("temperatures must be finite and positive")
+    if not math.isfinite(args.temperature) or args.temperature <= 0.0:
+        raise ValueError("temperature must be finite and positive")
     if args.temperature != 1.0:
         raise ValueError("on-policy PPO benchmarking requires --temperature 1.0")
     _validate_numerics_gates(args)
@@ -486,7 +479,6 @@ def main() -> None:
             "source_digest": identity["sha256"],
             "source_identity": identity,
             "temperature": args.temperature,
-            "opponent_temperature": args.opponent_temperature,
             "max_update_replay_kl": args.max_update_replay_kl,
             "max_update_replay_tail_fraction": args.max_update_replay_tail_fraction,
             "max_first_minibatch_kl": args.max_first_minibatch_kl,
@@ -561,8 +553,6 @@ def main() -> None:
 
             opponents = []
             assignments = None
-            opponent_temperatures = None
-            deterministic_opponents = None
             if args.league_games:
                 # Production reconstructs selected frozen actors from archive
                 # snapshots on every iteration. Keep that object lifecycle in
@@ -577,15 +567,11 @@ def main() -> None:
                     opponent.requires_grad_(False)
                 assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
                 generator.shuffle(assignments)
-                # Match production decode: active opponents lead the mix and
-                # sample at the opponent temperature; historical ones are
-                # deterministic at temperature one.
-                deterministic_opponents = np.ones(len(opponents), dtype=np.bool_)
-                deterministic_opponents[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = False
-                opponent_temperatures = np.ones(len(opponents), dtype=np.float32)
-                opponent_temperatures[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = (
-                    args.opponent_temperature
-                )
+                # No per-lane temperature or determinism arrays: they existed to
+                # reproduce production's split between stochastic active lanes
+                # and argmax historical ones, and production is now uniform at
+                # the learner's temperature. Keeping them would benchmark a wave
+                # production no longer runs.
             # Opponent reconstruction is a real per-iteration cost and belongs
             # in the iteration total, but it is compile-invariant: the same
             # module construction and state-dict load happens whichever way the
@@ -611,9 +597,7 @@ def main() -> None:
                 seed_start=wave_seed_start,
                 episode_steps=PRODUCTION_EPISODE_STEPS,
                 temperature=args.temperature,
-                opponent_temperature=args.opponent_temperature,
-                opponent_temperatures=opponent_temperatures,
-                deterministic_opponents=deterministic_opponents,
+                opponent_temperature=args.temperature,
                 sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
                 # The frozen league ensemble follows the learner. Since the
                 # mode became authoritative, `compile_models` decides only

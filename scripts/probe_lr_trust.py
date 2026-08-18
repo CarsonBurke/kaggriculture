@@ -35,6 +35,7 @@ from kaggriculture.ppo import PpoConfig, make_optimizers, update_ppo, update_rep
 from kaggriculture.production import (
     PRODUCTION_ROLLOUT_BFLOAT16,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
+    PRODUCTION_TEMPERATURE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     production_ppo_config,
 )
@@ -92,7 +93,10 @@ def main() -> None:
         if len(snapshots) < 4:
             raise SystemExit(f"need at least 4 league snapshots, found {len(snapshots)}")
         # The four the shipped selector would hold: the two most recent as
-        # sampling "active" opponents, two older ones played deterministically.
+        # "active" opponents and two older ones as historical. Every one of them
+        # decodes at the learner's own temperature, because production no longer
+        # splits active sampling from argmax history, and a probe of the trust
+        # region has to sample from the wave the trust region is measured on.
         chosen = [snapshots[-1], snapshots[-2], snapshots[len(snapshots) // 2], snapshots[0]]
         opponents = [
             load_actor_snapshot(path, expected_model_config=model_config, device=device).eval()
@@ -105,8 +109,8 @@ def main() -> None:
             league_games=args.league_games,
             opponent_indices=np.arange(args.league_games) % len(opponents),
             seed_start=args.seed,
-            opponent_temperatures=np.asarray([0.8, 0.8, 1.0, 1.0], dtype=np.float32),
-            deterministic_opponents=np.asarray([False, False, True, True], dtype=np.bool_),
+            temperature=PRODUCTION_TEMPERATURE,
+            opponent_temperature=PRODUCTION_TEMPERATURE,
             sampling_seed=args.seed,
             forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
             forward_autocast=PRODUCTION_ROLLOUT_BFLOAT16,

@@ -53,7 +53,6 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
-    PRODUCTION_OPPONENT_TEMPERATURE,
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
     production_ppo_config,
@@ -96,9 +95,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--league-games", type=int, default=PRODUCTION_LEAGUE_GAMES)
     parser.add_argument("--episode-steps", type=int, default=PRODUCTION_EPISODE_STEPS)
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
-    parser.add_argument(
-        "--opponent-temperature", type=float, default=PRODUCTION_OPPONENT_TEMPERATURE
-    )
     parser.add_argument("--device", default="cuda")
     # The same knobs train_ppo.py takes, because this audit is only evidence
     # about a launch it matches exactly. Required rather than defaulted: with a
@@ -162,18 +158,21 @@ def _measure(
     arena: dict[str, np.ndarray],
     seed: int,
 ) -> dict[str, float | int]:
-    # The steady-state league composition -- a full opponent slate, the active
-    # ones stochastic at the opponent temperature and the historical ones
-    # deterministic -- which is what training plays from the moment the
-    # snapshot archive fills. Iteration zero of a warm start is thinner than
-    # this: `select_league_mix` has only the initial snapshot to draw on and
-    # returns a single active opponent. Auditing the steady state is the right
-    # choice because training enforces the same bound at every later audit,
-    # and the weights are the actor's own either way.
+    # The steady-state league composition -- a full opponent slate, every seat
+    # decoding at the learner's own temperature -- which is what training plays
+    # from the moment the snapshot archive fills. Iteration zero of a warm start
+    # is thinner than this: `select_league_mix` has only the initial snapshot to
+    # draw on and returns a single active opponent. Auditing the steady state is
+    # the right choice because training enforces the same bound at every later
+    # audit, and the weights are the actor's own either way.
+    #
+    # There are no per-lane temperature or determinism arrays here, and their
+    # absence is the point: they existed to reproduce production's split between
+    # stochastic active lanes and argmax historical ones, and production no
+    # longer runs that wave. Keeping them would make this audit evidence about a
+    # launch that does not exist.
     opponents: list[torch.nn.Module] = []
     assignments = None
-    opponent_temperatures = None
-    deterministic_opponents = None
     if args.league_games:
         state = actor.state_dict()
         for _ in range(_PRODUCTION_LEAGUE_OPPONENTS):
@@ -184,10 +183,6 @@ def _measure(
         generator = np.random.default_rng(seed)
         assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
         generator.shuffle(assignments)
-        deterministic_opponents = np.ones(len(opponents), dtype=np.bool_)
-        deterministic_opponents[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = False
-        opponent_temperatures = np.ones(len(opponents), dtype=np.float32)
-        opponent_temperatures[:PRODUCTION_LEAGUE_ACTIVE_OPPONENTS] = args.opponent_temperature
 
     rollout = collect_mixed_play_rust(
         actor,
@@ -198,9 +193,7 @@ def _measure(
         seed_start=seed,
         episode_steps=args.episode_steps,
         temperature=args.temperature,
-        opponent_temperature=args.opponent_temperature,
-        opponent_temperatures=opponent_temperatures,
-        deterministic_opponents=deterministic_opponents,
+        opponent_temperature=args.temperature,
         sampling_seed=seed ^ 0x5EED,
         # The sampling forward is one of the two sides this audit measures, so
         # it takes the collection knobs and the update below takes the update

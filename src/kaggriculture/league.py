@@ -555,11 +555,11 @@ def select_league_mix(
     games return to competitive opponents instead of 100%-win blowouts.
 
     Selections list every active snapshot (sorted by iteration), then every
-    historical one (also sorted), then every built-in (sorted by name).
-    Positional consumers — the iteration benchmark reconstructs production's
-    temperature/deterministic decode from this ordering, and the wave numbers
-    its frozen-module lanes before its built-in lanes — depend on it, so it is
-    part of the contract.
+    historical one (also sorted), then every built-in (sorted by name). The
+    wave numbers its frozen-module lanes before its built-in lanes, so that
+    ordering is part of the contract. The active/historical boundary decides
+    only which snapshots are eligible for a lane, not how they decode: every
+    seat in a wave samples at the learner's own temperature.
     """
     if current_iteration < 0:
         raise ValueError("current iteration cannot be negative")
