@@ -310,36 +310,57 @@ class PpoConfig:
     # once the actor is warm-started from behavior cloning. A full epoch is 113
     # sequential updates over one 230,080-state wave, and a BC-cloned policy is
     # sharp, so it moves far more KL per unit of parameter movement than the
-    # from-scratch policy the reference rate was inherited for. Measured on the
-    # iteration-66 actor of the run this replaces, worst minibatch KL against the
-    # stored behavior and the updates completed of 113, on a self-play wave of
-    # production's shape and then on the shipped league mixture itself:
+    # from-scratch policy the reference rate was inherited for.
     #
-    #   lr                1e-12     1.5e-5    3.0e-5    5.0e-5    1.0e-4   2.5e-4
-    #   self-play  upd    113       113       113       28        5        1
-    #              maxKL  1.44e-4   8.42e-3   2.02e-2   3.55e-2   1.73e-1  --
-    #   league-mix upd    113       --        113       102       --       2
-    #              maxKL  1.40e-4   --        1.59e-2   3.04e-2   --       --
+    # Measured three times, and only the third measurement decides it, because
+    # the first two used proxies for the state the actor actually starts from.
+    # Worst minibatch KL against the stored behavior, and the updates completed
+    # of 113:
     #
-    # The 1e-12 control matters as much as the rest: it completes all 113 with
-    # 1.4e-4 on both waves, which is the replay-parity floor exactly, so the gate
-    # never fires on numerics and every reading above it is policy movement.
+    #   lr                    1e-12    3e-6    1e-5     1.5e-5   3e-5    2.5e-4
+    #   iter-66, self-play    113      --      --       113      113     1
+    #     max KL              1.44e-4  --      --       8.4e-3*  2.0e-2  --
+    #   iter-66, league-mix   113      --      --       --       113     2
+    #     max KL              1.40e-4  --      --       --       1.6e-2  --
+    #   iter-40, league-mix   113      113     113      18       4       --
+    #     max KL              3.73e-3  7.0e-3  1.58e-2  3.3e-2   3.3e-2  --
     #
-    # 3.0e-5 is the largest rate whose whole epoch fits, and the opponent mixture
-    # widens rather than narrows its margin -- 1.88x on the wave that ships,
-    # against 1.49x on self-play alone. 5.0e-5 is the reason the next rate up is
-    # not taken: it reads 0.99x on the shipped wave, which is the cliff itself,
-    # and its self-play margin of 0.85x would have understated how close. The
-    # margin taken is the one `runs/vapo-lv2-20260813` carried for 500 iterations
-    # without ever stopping early (0.03 against a worst minibatch of 2.179e-2),
-    # which is the only evidence available that a margin this size survives a run.
+    #   (* that column is 1.5e-5 on the first row only; the sweeps do not share
+    #    every rate, since each narrowed around the previous one's answer.)
     #
-    # At 2.5e-4 the trust region stopped the actor after 1 of 113 minibatches on
-    # every post-warmup iteration, so the run trained on 0.9% of each wave while
-    # every logged statistic looked healthy: `approx_kl` is a mean over the
-    # minibatches that stepped, so it read 6e-4 precisely because almost none of
-    # them did.
-    actor_learning_rate: float = 3.0e-5
+    # The iteration-40 row is the one that counts: it is the checkpoint the actor
+    # first updates from, with the critic its own 40 warmup iterations produced,
+    # on the wave that ships. The iteration-66 rows understate movement 5.8x --
+    # that actor had already taken 66 steps and carried a differently trained
+    # critic -- and a run launched on their answer of 3.0e-5 stopped at 4-37 of
+    # 113 on its first actor-active iteration.
+    #
+    # The 1e-12 control is why the readings above it mean anything: it completes
+    # all 113 and reports the replay-parity floor, the divergence at unchanged
+    # weights. That floor is 1.4e-4 on the trained actor and 3.73e-3 on this one
+    # -- 26x larger and 12% of the whole budget -- because a sharp softmax
+    # amplifies the same logit noise into far more KL. It is the clearest single
+    # number for why a cloned policy cannot use a from-scratch policy's rate.
+    #
+    # 1.0e-5 is the largest rate whose whole epoch fits, at 1.89x margin, which
+    # is the margin `runs/vapo-lv2-20260813` carried for 500 iterations without
+    # ever stopping early (0.03 against a worst minibatch of 2.179e-2) -- the only
+    # evidence available that a margin this size survives a full run. 1.5e-5 is
+    # already past the cliff at 18 of 113.
+    #
+    # What this costs is real and was accepted deliberately: 113 steps at 1.0e-5
+    # is 1.13e-3 of total per-iteration movement against `vapo-lv2`'s 2.8e-2, so
+    # this run travels 25x less far per iteration than the only one known to
+    # converge -- from a competent starting policy rather than random init. The
+    # counterweight is that it is 4.5x more movement than the 2.5e-4 latch
+    # delivered, over the whole wave instead of one minibatch of it.
+    #
+    # A further observation, measured but not acted on: `clip_fraction` is 0.036
+    # here and 0.042 at 3.0e-5, so PPO's own clip band is barely engaging while
+    # `target_kl` binds hard. The bound is stricter than the mechanism it backs
+    # up. Relaxing it is a design decision with 500 iterations of evidence on the
+    # other side, so it stays where it is and the rate moves instead.
+    actor_learning_rate: float = 1.0e-5
     critic_learning_rate: float = 2.5e-4
     lr_warmup_steps: int = 32
     # No weight decay: with decay the AdamW update is not scale-invariant and
