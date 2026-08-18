@@ -38,8 +38,8 @@ THIS MEASURES SPEED ONLY, AND SPEED IS NOT THE WHOLE DECISION. Minibatch size
 is not a free performance knob, because it changes optimization at the same
 time as it changes cost. At 2048 the actor takes 73 gradient steps per epoch; at
 4096 it takes 37 larger ones. That changes the granularity at which PPO's
-per-minibatch KL trust region is enforced (`target_kl` 0.03 against a realized
-`approx_kl` median of 2.3e-3), changes how many optimizer steps the
+per-minibatch KL trust region is enforced (`PpoConfig.target_kl` against a
+realized `approx_kl` median of 2.3e-3), changes how many optimizer steps the
 learning-rate warmup (`lr_warmup_steps` 32) sees before reaching the base rate,
 and changes the gradient noise each step is taken under. A wall-clock win
 measured here is therefore not automatically adoptable; adopting one needs a

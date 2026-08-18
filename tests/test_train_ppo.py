@@ -56,7 +56,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.gamma == 1.0
     assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
     assert not hasattr(args, "gae_lambda")
-    assert args.target_kl == 0.03
+    assert args.target_kl == PpoConfig.target_kl
     assert args.checkpoint_every == 5
     module._validate_args(args)
 
@@ -1369,6 +1369,7 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     from kaggriculture.ppo import (
         MAX_FIRST_MINIBATCH_KL,
         MAX_VALUE_TARGET_SATURATED_FRACTION,
+        MINIMUM_ACTOR_EPOCH_FRACTION,
         MINIMUM_POLICY_ENTROPY,
     )
 
@@ -1410,7 +1411,7 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     # minibatch reports one update, not zero, so every gate above passes while
     # the iteration trains on 0.9% of the wave. That is the exact shape of the
     # run this gate was added for -- 1 of 113 with `kl_early_stop` set.
-    with pytest.raises(RuntimeError, match="below 50% of the epoch"):
+    with pytest.raises(RuntimeError, match="of the epoch"):
         module._gate_update_metrics(
             {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
             warmup_active=False,
@@ -1420,27 +1421,33 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
         {**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True
     )
     # An early stop that still applied most of the epoch is the safety valve
-    # working, and must not stop a run that is making progress.
+    # working, and must not stop a run that is making progress. The shipped
+    # schedule's own worst wave applies 31%, so this is not a hypothetical band.
     module._gate_update_metrics(
         {**healthy, "actor_updates": 96, "kl_early_stop": 1}, warmup_active=False
     )
-    # Exactly half is the comparator's own boundary, and the only place a `<`
-    # relaxed to `<=` shows up. An even intended count makes half exact.
+    module._gate_update_metrics(
+        {**healthy, "actor_updates": 35, "kl_early_stop": 1}, warmup_active=False
+    )
+    # The comparator's own boundary, and the only place a `<` relaxed to `<=`
+    # would show up. Read from the constant so raising the floor cannot silently
+    # turn this into an assertion about somewhere else on the scale.
+    boundary = round(MINIMUM_ACTOR_EPOCH_FRACTION * 100)
     module._gate_update_metrics(
         {
             **healthy,
-            "actor_minibatches_intended": 112,
-            "actor_updates": 56,
+            "actor_minibatches_intended": 100,
+            "actor_updates": boundary,
             "kl_early_stop": 1,
         },
         warmup_active=False,
     )
-    with pytest.raises(RuntimeError, match="below 50% of the epoch"):
+    with pytest.raises(RuntimeError, match="of the epoch"):
         module._gate_update_metrics(
             {
                 **healthy,
-                "actor_minibatches_intended": 112,
-                "actor_updates": 55,
+                "actor_minibatches_intended": 100,
+                "actor_updates": boundary - 1,
                 "kl_early_stop": 1,
             },
             warmup_active=False,

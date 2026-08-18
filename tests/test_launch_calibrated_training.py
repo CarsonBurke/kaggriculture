@@ -1132,7 +1132,10 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
             "--actor-gae-lambda",
             str(module.production_ppo_config(update_compile_mode="eager")["actor_gae_lambda"]),
         ),
-        ("--target-kl", "0.03"),
+        (
+            "--target-kl",
+            str(module.production_ppo_config(update_compile_mode="eager")["target_kl"]),
+        ),
     ):
         index = decision["training_command"].index(flag)
         assert decision["training_command"][index + 1] == expected

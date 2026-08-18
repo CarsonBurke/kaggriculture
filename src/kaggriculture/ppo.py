@@ -293,13 +293,21 @@ MINIMUM_POLICY_ENTROPY = 0.01
 #: because it is a mean over the minibatches that stepped and almost none did.
 #: Nothing in the telemetry looked wrong.
 #:
-#: A healthy iteration applies all of them: 113 of 113 at every learning rate
-#: whose movement fits inside `target_kl`, and 113 of 113 in the 500-iteration
-#: run this replaces. So the honest reading of a partial epoch is that the trust
-#: region and the step size disagree, which no later iteration repairs. Half is
-#: far enough below one to leave an unlucky wave its early stop, and far enough
-#: above the 0.009 this is here to catch that it cannot be reached by accident.
-MINIMUM_ACTOR_EPOCH_FRACTION = 0.5
+#: The premise that set this at half was that a healthy iteration applies all of
+#: them -- 113 of 113 at every rate whose movement fits inside `target_kl`, and
+#: 113 of 113 for the 500 iterations of the run this replaces. That premise was
+#: measured on waves the actor had almost no gradient on: self-play against its
+#: own snapshots. Against opponents it cannot beat, the schedule that learns
+#: fastest applies 89% of the epoch on average and 31% on its worst wave, so half
+#: forbids the best configuration measured while the pathology it exists to catch
+#: reads 1%.
+#:
+#: 0.15 keeps both properties. It is 2x below the worst wave of the shipped
+#: schedule, which is the margin an unlucky draw needs, and 17x above the 0.009
+#: that burned 66 iterations -- a gap no partial epoch can cross by accident.
+#: The mismatch it guards against is still measurable at the far end of the same
+#: sweep: 3.0e-4 against a 0.03 bound applies exactly 1 of 113 on every iteration.
+MINIMUM_ACTOR_EPOCH_FRACTION = 0.15
 
 #: Execution modes for the update path's forward+backward, as `torch.compile`
 #: `mode=` values plus `eager` for not compiling at all. A boolean cannot name
@@ -367,25 +375,50 @@ class PpoConfig:
     # amplifies the same logit noise into far more KL. It is the clearest single
     # number for why a cloned policy cannot use a from-scratch policy's rate.
     #
-    # 1.0e-5 is the largest rate whose whole epoch fits, at 1.89x margin, which
-    # is the margin `runs/vapo-lv2-20260813` carried for 500 iterations without
-    # ever stopping early (0.03 against a worst minibatch of 2.179e-2) -- the only
-    # evidence available that a margin this size survives a full run. 1.5e-5 is
-    # already past the cliff at 18 of 113.
+    # 1.0e-5 was the largest rate whose whole epoch fits inside a 0.03 bound, and
+    # shipping on that criterion was the mistake. Fitting the bound is necessary
+    # and says nothing about learning: at 1.0e-5 the bound never even binds --
+    # worst minibatch 0.024 against a 0.03 budget over 12 iterations -- so the
+    # rate was tuned against a constraint that was not the constraint.
     #
-    # What this costs is real and was accepted deliberately: 113 steps at 1.0e-5
-    # is 1.13e-3 of total per-iteration movement against `vapo-lv2`'s 2.8e-2, so
-    # this run travels 25x less far per iteration than the only one known to
-    # converge -- from a competent starting policy rather than random init. The
-    # counterweight is that it is 4.5x more movement than the 2.5e-4 latch
-    # delivered, over the whole wave instead of one minibatch of it.
+    # What decides it is play. Every candidate below ran 12 to 16 iterations from
+    # `checkpoint-000040`, drawing the same waves in the same order, on the
+    # production lane shape (4 frozen snapshots beside the 3 native built-ins),
+    # judged on score rate against `starter` -- the objective -- with entropy as
+    # the liveness check and the applied share of the epoch as the operational
+    # one (`scripts/probe_schedule_sweep.py`, `artifacts/probes/trust-*.json`):
     #
-    # A further observation, measured but not acted on: `clip_fraction` is 0.036
-    # here and 0.042 at 3.0e-5, so PPO's own clip band is barely engaging while
-    # `target_kl` binds hard. The bound is stricter than the mechanism it backs
-    # up. Relaxing it is a design decision with 500 iterations of evidence on the
-    # other side, so it stays where it is and the rate moves instead.
-    actor_learning_rate: float = 1.0e-5
+    #   lr      target_kl  epoch applied  entropy  money  score vs starter
+    #   3.0e-6  0.03       100% / 100%    0.169     235   0.000
+    #   1.0e-5  0.03        98% /  79%    0.206     367   0.026   <- shipped
+    #   1.0e-5  0.10       100% / 100%    0.206     360   0.000
+    #   3.0e-5  0.03        22% /   8%    0.291    1074   0.064
+    #   3.0e-5  0.10        89% /  31%    0.311     826   0.051
+    #   3.0e-5  0.30       100% / 100%    0.161    2383   0.000
+    #   6.0e-5  0.30        99% /  87%    0.001    3000   0.000
+    #   1.0e-4  0.03        15% /   1%    0.000    1833   0.000
+    #   1.0e-4  0.10        49% /   3%    0.000    2993   0.000
+    #   1.0e-4  0.30        90% /  34%    0.001    3000   0.000
+    #   3.0e-4  0.03         1% /   1%    0.502     551   0.026
+    #
+    # Two failure modes bracket the answer. Below 3.0e-5 the policy barely moves
+    # and never wins. At and above 6.0e-5 it converges onto passing every turn --
+    # entropy 0.001, money exactly the untouched 3000 starting bank, and zero
+    # score against everything, which is the reward's inaction basin and is
+    # terminal (see MINIMUM_POLICY_ENTROPY). Money alone cannot rank these: it is
+    # MAXIMIZED by the collapse, so a row is only readable with its entropy.
+    #
+    # 3.0e-5 is the whole viable band, and its two bounds are tied on the
+    # objective: 0.064 against 0.051 is 5 wins against 4 over ~82 games. What
+    # separates them is the data budget -- 0.03 discards 78% of every wave it
+    # collects, 0.10 discards 11% -- so the bound moves to 0.10 and pays for
+    # itself in rollout that is actually used. That reverses the earlier decision
+    # to hold 0.03 and move the rate instead, on evidence the earlier decision did
+    # not have: `clip_fraction` was already telling us the bound was stricter than
+    # the clip band it backs up (0.036 at a barely-engaging 0.80/1.28), and a
+    # 12-iteration trajectory at 0.10 ends with the highest entropy of any run
+    # measured, rising rather than falling.
+    actor_learning_rate: float = 3.0e-5
     critic_learning_rate: float = 2.5e-4
     lr_warmup_steps: int = 32
     # No weight decay: with decay the AdamW update is not scale-invariant and
@@ -479,7 +512,18 @@ class PpoConfig:
     # is recorded here is that the constant is load-bearing: raising it changes
     # the step size on 100% of updates, not on the tail it reads as bounding.
     max_gradient_norm: float = 1.0
-    target_kl: float = 0.03
+    # Raised from 0.03 on the measured surface tabulated at `actor_learning_rate`,
+    # which is where the pair is decided together: 0.03 and 0.10 score the same
+    # against `starter` at 3.0e-5, and 0.03 gets there while discarding 78% of
+    # every wave it collects against 11% at 0.10. 0.30 is past the far edge -- it
+    # completes every epoch and walks the policy into the inaction basin.
+    #
+    # The 0.03 it replaces was inherited from a from-scratch run that never
+    # stopped early against a worst minibatch of 2.179e-2. That run's evidence
+    # remains valid and does not transfer: a BC-cloned policy's replay-parity
+    # floor alone is 3.73e-3 against its 1.4e-4, so 26x of the same budget is
+    # spent on numerics before any policy movement is counted.
+    target_kl: float = 0.10
     # BF16 autocast for both update-path forwards. The actor's importance
     # ratio starts at one because `replay_behavior_logprobs` recomputes the
     # behavior side through the update path's forward at the same precision;

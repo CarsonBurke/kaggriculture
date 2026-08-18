@@ -118,7 +118,7 @@ def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float 
             epochs=1,
             critic_epochs=2,
             minibatch_size=2048,
-            target_kl=0.03,
+            target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
         )
     )

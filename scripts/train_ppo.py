@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
             "is the lambda-return the advantage came from"
         ),
     )
-    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
     parser.add_argument(
