@@ -1344,3 +1344,24 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     module._gate_update_metrics(
         {**healthy, "actor_updates": 96, "kl_early_stop": 1}, warmup_active=False
     )
+    # Exactly half is the comparator's own boundary, and the only place a `<`
+    # relaxed to `<=` shows up. An even intended count makes half exact.
+    module._gate_update_metrics(
+        {
+            **healthy,
+            "actor_minibatches_intended": 112,
+            "actor_updates": 56,
+            "kl_early_stop": 1,
+        },
+        warmup_active=False,
+    )
+    with pytest.raises(RuntimeError, match="below 50% of the epoch"):
+        module._gate_update_metrics(
+            {
+                **healthy,
+                "actor_minibatches_intended": 112,
+                "actor_updates": 55,
+                "kl_early_stop": 1,
+            },
+            warmup_active=False,
+        )

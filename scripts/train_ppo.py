@@ -118,8 +118,14 @@ def parse_args() -> argparse.Namespace:
         "family's model configuration and a flag from another family is rejected",
     )
     add_model_config_arguments(parser)
-    parser.add_argument("--actor-lr", type=float, default=2.5e-4)
-    parser.add_argument("--critic-lr", type=float, default=2.5e-4)
+    # These two read the dataclass rather than restating it. `actor_learning_rate`
+    # is a measurement -- the largest rate whose full epoch fits inside
+    # `target_kl` -- and a second copy here would silently outrank it whenever
+    # this script is driven by hand. The neighbours below deliberately do not
+    # follow: `--epochs` defaults to 1 against the dataclass's 4, because the
+    # shipped schedule reaches its critic epochs through `--critic-epochs`.
+    parser.add_argument("--actor-lr", type=float, default=PpoConfig.actor_learning_rate)
+    parser.add_argument("--critic-lr", type=float, default=PpoConfig.critic_learning_rate)
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=1)
