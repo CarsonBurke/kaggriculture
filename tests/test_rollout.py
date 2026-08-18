@@ -13,6 +13,7 @@ from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
+    _builtin_agent_rows,
     _cached_compiled_forward,
     _categorical_draws,
     _state_field_specs,
@@ -918,3 +919,73 @@ def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None
     # The shaped return telescopes to the exact relative final bank, not to
     # the liquidation score of the unsold shed.
     assert telescoped == pytest.approx(relative_bank, abs=1e-5)
+
+
+def test_builtin_agent_rows_codes_only_the_assigned_frozen_seats() -> None:
+    # Two self-play games (rows 0-3) then two league games; the learner holds
+    # rows 4 and 7, so its opponents are rows 5 and 6.
+    frozen_rows = np.asarray([5, 6])
+    learner_rows = np.asarray([0, 1, 2, 3, 4, 7])
+    lane_codes = np.asarray([0, 3], dtype=np.uint8)
+
+    codes = _builtin_agent_rows(
+        8, frozen_rows, learner_rows, np.asarray([1, 0]), lane_codes, ("frozen-0", "starter")
+    )
+
+    assert codes.dtype == np.uint8
+    assert codes.tolist() == [0, 0, 0, 0, 0, 3, 0, 0]
+
+
+def test_builtin_agent_rows_refuses_a_built_in_on_a_learner_seat() -> None:
+    """The binding cannot see seats, so this side has to refuse the mix-up."""
+    frozen_rows = np.asarray([2, 3])
+    learner_rows = np.asarray([0, 1, 3])
+    lane_codes = np.asarray([0, 2], dtype=np.uint8)
+
+    with pytest.raises(ValueError, match=r"built-in lane 1 \(random\).*learner row 3"):
+        _builtin_agent_rows(
+            4, frozen_rows, learner_rows, np.asarray([0, 1]), lane_codes, ("frozen-0", "random")
+        )
+
+
+def test_native_builtin_lanes_are_played_by_the_engine_reference_agents() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(config)
+    opponent = FarmActor(config)
+
+    rollout = collect_mixed_play_rust(
+        actor,
+        (opponent,),
+        league_games=3,
+        opponent_indices=np.asarray([0, 1, 2]),
+        builtin_lanes=("starter", "pass"),
+        seed_start=7,
+        forward_mode="eager",
+    )
+
+    # Lane 2 is `pass`, which never issues a market order, so its bank has to
+    # be the untouched starting money to the coin. Lane 1 is `starter`, whose
+    # single-tile carrot loop is worth thousands: nothing sampled from an
+    # untrained network reproduces either number by accident.
+    assert rollout.opponent_money[2] == 3000.0
+    assert 3000.0 < rollout.opponent_money[1] < 5000.0
+
+
+def test_native_builtin_lane_needs_no_frozen_network() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    rollout = collect_mixed_play_rust(
+        FarmActor(config),
+        league_games=2,
+        opponent_indices=np.asarray([0, 0]),
+        builtin_lanes=("pass",),
+        seed_start=11,
+        forward_mode="eager",
+    )
+
+    assert rollout.trajectories == 2
+    assert rollout.opponent_money.tolist() == [3000.0, 3000.0]

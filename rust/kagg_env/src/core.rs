@@ -1,4 +1,4 @@
-use crate::rng::PyRandom;
+pub use crate::rng::PyRandom;
 use serde::Serialize;
 
 pub const PLAYERS: usize = 2;
@@ -260,6 +260,29 @@ impl Default for CompactAction {
             units: [0; MAX_UNITS],
             market_kinds: [0; MAX_MARKET_ORDERS],
             market_quantities: [0; MAX_MARKET_ORDERS],
+        }
+    }
+}
+
+/// A built-in reference agent from `kaggle_environments`, ported so the league
+/// can field it inside the batched wave instead of only at evaluation time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinAgent {
+    Pass,
+    Random,
+    Starter,
+}
+
+impl BuiltinAgent {
+    /// 0 => None (sample from the network); 1 => Pass, 2 => Random, 3 => Starter.
+    #[allow(clippy::result_unit_err)]
+    pub fn from_code(code: u8) -> Result<Option<Self>, ()> {
+        match code {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Pass)),
+            2 => Ok(Some(Self::Random)),
+            3 => Ok(Some(Self::Starter)),
+            _ => Err(()),
         }
     }
 }
@@ -1026,6 +1049,114 @@ impl Game {
         } else {
             self.pair_potential()
         }
+    }
+
+    /// The action the named built-in reference agent takes for `player`.
+    ///
+    /// Ports of `kaggle_environments.envs.kaggriculture` `pass_agent`,
+    /// `random_agent` and `starter_agent`. They stay faithful even where the
+    /// reference emits something the rules reject: `step` turns an invalid unit
+    /// action into PASS and abandons an order that fails to commit, exactly as
+    /// the Python interpreter does, so screening the emission here would field
+    /// a stronger opponent than the one the leaderboard actually runs.
+    pub fn builtin_action(
+        &self,
+        player: usize,
+        agent: BuiltinAgent,
+        rng: &mut PyRandom,
+    ) -> CompactAction {
+        match agent {
+            // Unit action 0 is PASS and market kind 0 is STOP, so the default
+            // compact action already is "every unit passes, no orders".
+            BuiltinAgent::Pass => CompactAction::default(),
+            BuiltinAgent::Random => self.random_agent_action(player, rng),
+            BuiltinAgent::Starter => self.starter_agent_action(player),
+        }
+    }
+
+    /// A uniform operation per unit, sprinkled with seed buys and plants.
+    fn random_agent_action(&self, player: usize, rng: &mut PyRandom) -> CompactAction {
+        /// The reference's `farmer_ops`: NORTH, SOUTH, EAST, WEST, WATER,
+        /// HARVEST, PASS.
+        const OPS: [u8; 7] = [1, 2, 3, 4, 50, 51, 0];
+        let farm = &self.farms[player];
+        let private = &self.privates[player];
+        let mut action = CompactAction::default();
+
+        // The reference guards each probability with `if candidates and ...`,
+        // so an empty candidate list must consume no draw at all.
+        let mut affordable = [0u8; CROPS];
+        let mut affordable_count = 0;
+        for (crop, cost) in SEED_COST.iter().enumerate() {
+            if *cost <= farm.money {
+                affordable[affordable_count] = crop as u8;
+                affordable_count += 1;
+            }
+        }
+        if affordable_count > 0 && rng.random() < 0.1 {
+            // Quantity index 0 is the reference's single seed.
+            action.market_kinds[0] =
+                3 + affordable[rng.randbelow(affordable_count as u32) as usize];
+        }
+
+        let mut sown = [0u8; CROPS];
+        let mut sown_count = 0;
+        for (crop, held) in private.seeds.iter().enumerate() {
+            if *held > 0 {
+                sown[sown_count] = crop as u8;
+                sown_count += 1;
+            }
+        }
+        action.units[0] = if sown_count > 0 && rng.random() < 0.3 {
+            45 + sown[rng.randbelow(sown_count as u32) as usize]
+        } else {
+            OPS[rng.randbelow(OPS.len() as u32) as usize]
+        };
+        for unit in 1..usize::from(farm.units) {
+            action.units[unit] = OPS[rng.randbelow(OPS.len() as u32) as usize];
+        }
+        action
+    }
+
+    /// The single-tile carrot loop: sell, restock, plant, water, harvest.
+    fn starter_agent_action(&self, player: usize) -> CompactAction {
+        const CARROT: usize = 1;
+        let farm = &self.farms[player];
+        let private = &self.privates[player];
+        let mut action = CompactAction::default();
+
+        let mut slot = 0;
+        let harvested = private.shed[CARROT];
+        if harvested > 0 {
+            // The shed holds at most `shed_capacity` of everything together and
+            // one order carries up to MARKET_QUANTITIES, so at the stock
+            // capacity a whole-shed sale is always a single order; the clamp
+            // keeps the quantity index in range for a wider configured shed.
+            action.market_kinds[slot] = 13 + CARROT as u8;
+            action.market_quantities[slot] = (harvested.min(MARKET_QUANTITIES as u16) - 1) as u8;
+            slot += 1;
+        }
+        if private.seeds[CARROT] == 0 && farm.money >= SEED_COST[CARROT] {
+            action.market_kinds[slot] = 3 + CARROT as u8;
+        }
+
+        let position = farm.positions[0];
+        let tile = farm.tiles[usize::from(position.1) * BOARD_SIZE + usize::from(position.0)];
+        let day = self.step / self.config.turns_per_day;
+        action.units[0] = if tile.kind == TileKind::Empty && private.seeds[CARROT] > 0 {
+            45 + CARROT as u8
+        } else if tile.kind == TileKind::Plant && usize::from(tile.species) == CARROT {
+            if day.saturating_sub(tile.origin_day) >= MAX_YIELD_DAY[CARROT] {
+                51
+            } else if tile.watered_or_fed {
+                0
+            } else {
+                50
+            }
+        } else {
+            0
+        };
+        action
     }
 
     pub fn factor_masks(&self, player: usize, actions: &CompactAction) -> FactorMasks {
@@ -3067,5 +3198,135 @@ mod tests {
             sample_categorical(&logits, &mask, false, 1.0, 0.999_999_94).0,
             1
         );
+    }
+
+    #[test]
+    fn builtin_codes_outside_the_roster_are_rejected() {
+        assert_eq!(BuiltinAgent::from_code(0), Ok(None));
+        assert_eq!(BuiltinAgent::from_code(1), Ok(Some(BuiltinAgent::Pass)));
+        assert_eq!(BuiltinAgent::from_code(2), Ok(Some(BuiltinAgent::Random)));
+        assert_eq!(BuiltinAgent::from_code(3), Ok(Some(BuiltinAgent::Starter)));
+        for code in [4, 42, u8::MAX] {
+            assert!(BuiltinAgent::from_code(code).is_err());
+        }
+    }
+
+    #[test]
+    fn pass_agent_passes_every_unit_and_places_no_order() {
+        let mut game = Game::new(7, GameConfig::default());
+        game.farms[0].units = 4;
+        game.privates[0].shed[1] = 10;
+        let mut rng = PyRandom::seed_u64(0);
+        let action = game.builtin_action(0, BuiltinAgent::Pass, &mut rng);
+        assert!(action.units.iter().all(|&unit| unit == 0));
+        assert!(action.market_kinds.iter().all(|&kind| kind == 0));
+    }
+
+    #[test]
+    fn starter_opens_by_buying_one_carrot_seed() {
+        let game = Game::new(7, GameConfig::default());
+        let mut rng = PyRandom::seed_u64(0);
+        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        assert_eq!(action.market_kinds[0], 4);
+        assert_eq!(action.market_quantities[0], 0);
+        assert_eq!(action.market_kinds[1], 0);
+        assert_eq!(action.units, [0; MAX_UNITS]);
+    }
+
+    #[test]
+    fn starter_plants_the_seed_it_holds_on_its_own_tile() {
+        let mut game = Game::new(7, GameConfig::default());
+        game.privates[0].seeds[1] = 1;
+        let mut rng = PyRandom::seed_u64(0);
+        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        assert_eq!(action.units[0], 46);
+        // Holding a seed suppresses the restock order.
+        assert_eq!(action.market_kinds[0], 0);
+
+        game.farms[0].tiles[44] = Tile::structure(TileKind::Coop);
+        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        assert_eq!(action.units[0], 0);
+    }
+
+    #[test]
+    fn starter_waters_a_young_carrot_and_harvests_it_at_max_yield_day() {
+        let mut game = Game::new(7, GameConfig::default());
+        game.farms[0].tiles[44] = Tile::plant(1, 0, game.config.turns_per_day);
+        let mut rng = PyRandom::seed_u64(0);
+        assert_eq!(
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+                .units[0],
+            50
+        );
+        game.farms[0].tiles[44].watered_or_fed = true;
+        assert_eq!(
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+                .units[0],
+            0
+        );
+        game.step = MAX_YIELD_DAY[1] * game.config.turns_per_day;
+        assert_eq!(
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+                .units[0],
+            51
+        );
+    }
+
+    #[test]
+    fn starter_sells_the_whole_carrot_shed_in_one_order() {
+        let mut game = Game::new(7, GameConfig::default());
+        game.privates[0].seeds[1] = 1;
+        game.privates[0].shed[1] = 37;
+        let mut rng = PyRandom::seed_u64(0);
+        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        assert_eq!(action.market_kinds[0], 14);
+        assert_eq!(u16::from(action.market_quantities[0]) + 1, 37);
+
+        // A shed filled to capacity still fits a single order.
+        game.privates[0].shed[1] = game.config.shed_capacity;
+        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        assert_eq!(
+            u16::from(action.market_quantities[0]) + 1,
+            game.config.shed_capacity
+        );
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.privates[0].shed[1], 0);
+    }
+
+    #[test]
+    fn random_agent_emits_only_reference_operations() {
+        let mut game = Game::new(11, GameConfig::default());
+        game.farms[0].units = 3;
+        game.privates[0].seeds[1] = 1;
+        let mut rng = PyRandom::seed_u64(5);
+        for _ in 0..256 {
+            let action = game.builtin_action(0, BuiltinAgent::Random, &mut rng);
+            assert!(matches!(action.units[0], 0..=4 | 46 | 50 | 51));
+            for unit in 1..3 {
+                assert!(matches!(action.units[unit], 0..=4 | 50 | 51));
+            }
+            assert!(action.units[3..].iter().all(|&unit| unit == 0));
+            // At most the one single-seed purchase the reference can emit.
+            assert!(matches!(action.market_kinds[0], 0 | 3..=7));
+            assert_eq!(action.market_quantities[0], 0);
+            assert!(action.market_kinds[1..].iter().all(|&kind| kind == 0));
+        }
+    }
+
+    #[test]
+    fn starter_outfarms_pass_over_a_full_episode() {
+        let mut game = Game::new(2024, GameConfig::default());
+        let mut rng = PyRandom::seed_u64(0);
+        while !game.done {
+            let actions = [
+                game.builtin_action(0, BuiltinAgent::Starter, &mut rng),
+                game.builtin_action(1, BuiltinAgent::Pass, &mut rng),
+            ];
+            game.step(&actions);
+        }
+        assert_eq!(game.farms[1].money, game.config.starting_money);
+        // The reference `starter` banks a few hundred over its stake across an
+        // episode; anything near the stake means the carrot loop stalled.
+        assert!(game.farms[0].money > game.config.starting_money + 300);
     }
 }

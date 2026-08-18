@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-BUILTIN_OPPONENTS = frozenset(("pass", "random", "starter"))
+# Ordered because the batched Rust wave addresses these agents by code
+# (`BuiltinAgent::from_code`), and the code is this tuple's index plus one.
+BUILTIN_AGENT_ORDER = ("pass", "random", "starter")
+BUILTIN_OPPONENTS = frozenset(BUILTIN_AGENT_ORDER)
 PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
 PUBLIC_V27_ALIASES = frozenset(("v27", "public-v27"))
 

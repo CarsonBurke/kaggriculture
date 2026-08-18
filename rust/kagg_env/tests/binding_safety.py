@@ -35,6 +35,7 @@ def sampler_inputs() -> list[np.ndarray]:
         np.zeros((ROWS, 10), dtype=np.float32),
         np.zeros(ROWS, dtype=np.bool_),
         np.ones(ROWS, dtype=np.float32),
+        np.zeros(ROWS, dtype=np.uint8),
     ]
 
 
@@ -66,6 +67,7 @@ def child_noncontiguous_inputs() -> None:
         "market_quantity_draws",
         "deterministic_rows",
         "temperatures",
+        "builtin_agents",
     )
     for index, name in enumerate(names):
         environment = native.BatchEnv(seeds)
@@ -79,6 +81,21 @@ def child_noncontiguous_inputs() -> None:
         else:
             raise AssertionError(f"strided {name} was accepted")
         assert step_of(environment) == before, name
+
+
+def assert_unknown_builtin_code_rejected() -> None:
+    native = load_native(release=True)
+    environment = native.BatchEnv(np.arange(BATCH, dtype=np.uint64))
+    inputs = sampler_inputs()
+    inputs[-1] = np.full(ROWS, 4, dtype=np.uint8)
+    before = step_of(environment)
+    try:
+        environment.sample_and_step_into(*inputs, environment.sample_buffers())
+    except ValueError as error:
+        assert "unknown agent code" in str(error), error
+    else:
+        raise AssertionError("unknown builtin agent code was accepted")
+    assert step_of(environment) == before
 
 
 def assert_output_rejected_without_step(
@@ -136,7 +153,8 @@ def main() -> None:
     assert_output_rejected_without_step(
         lambda output: output.__setitem__("market_quantities", output["market_kinds"])
     )
-    print("binding safety: 12 strided inputs + 6 malformed/aliased outputs rejected pre-step")
+    assert_unknown_builtin_code_rejected()
+    print("binding safety: 13 strided inputs + 6 malformed/aliased outputs rejected pre-step")
 
 
 if __name__ == "__main__":

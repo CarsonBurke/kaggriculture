@@ -1,9 +1,10 @@
 use crate::core::{
-    BOARD_CHANNELS, BOARD_SIZE, CRITIC_FEATURES, CROP_TOKEN_FIELDS, CROPS, CompactAction,
-    FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig, MARKET_KINDS, MARKET_QUANTITIES,
-    MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS, PRODUCT_TOKEN_FIELDS, PRODUCTS,
-    SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS,
-    UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS,
+    BOARD_CHANNELS, BOARD_SIZE, BuiltinAgent, CRITIC_FEATURES, CROP_TOKEN_FIELDS, CROPS,
+    CompactAction, FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig, MARKET_KINDS,
+    MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS, PRODUCT_TOKEN_FIELDS,
+    PRODUCTS, PyRandom, SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS,
+    TOWN_TOKEN_FIELDS, UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES,
+    UNIT_GATHERS,
 };
 use half::f16;
 use numpy::ndarray::{Array1, Array2, Array3};
@@ -216,13 +217,60 @@ impl BatchEnv {
         allocate_sample_buffers(py, self.games.len())
     }
 
+    /// The built-in reference agents' actions for the current state, without
+    /// stepping, in the same row order as `sample_and_step_into`. A row whose
+    /// code is 0 comes back as an all-PASS action: this path never samples.
+    fn builtin_actions<'py>(
+        &self,
+        py: Python<'py>,
+        builtin_agents: PyReadonlyArray1<'py, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rows = self.games.len() * PLAYERS;
+        ensure_shape(builtin_agents.shape(), &[rows], "builtin_agents")?;
+        if !builtin_agents.is_c_contiguous() {
+            return Err(PyValueError::new_err("builtin_agents must be C-contiguous"));
+        }
+        let codes = builtin_agents.as_slice()?;
+        validate_builtin_agents(codes)?;
+        let mut units = Vec::with_capacity(rows * MAX_UNITS);
+        let mut kinds = Vec::with_capacity(rows * MAX_MARKET_ORDERS);
+        let mut quantities = Vec::with_capacity(rows * MAX_MARKET_ORDERS);
+        for (row, &code) in codes.iter().enumerate() {
+            let game = &self.games[row / PLAYERS];
+            let player = row % PLAYERS;
+            let action = match BuiltinAgent::from_code(code).expect("codes are validated above") {
+                Some(agent) => game.builtin_action(player, agent, &mut builtin_rng(game, player)),
+                None => CompactAction::default(),
+            };
+            units.extend(action.units);
+            kinds.extend(action.market_kinds);
+            quantities.extend(action.market_quantities);
+        }
+        let output = PyDict::new(py);
+        output.set_item(
+            "unit_actions",
+            Array2::from_shape_vec((rows, MAX_UNITS), units)
+                .expect("built-in unit shape is internal")
+                .into_pyarray(py),
+        )?;
+        for (name, values) in [("market_kinds", kinds), ("market_quantities", quantities)] {
+            output.set_item(
+                name,
+                Array2::from_shape_vec((rows, MAX_MARKET_ORDERS), values)
+                    .expect("built-in market shape is internal")
+                    .into_pyarray(py),
+            )?;
+        }
+        Ok(output)
+    }
+
     /// Allocating convenience wrapper around `sample_and_step_into`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         unit_logits, market_kind_logits, market_quantity_context,
         quantity_kind_gate, quantity_values, quantity_bias, head_ids,
         unit_draws, market_kind_draws, market_quantity_draws,
-        deterministic_rows, temperatures
+        deterministic_rows, temperatures, builtin_agents
     ))]
     fn sample_and_step<'py>(
         &mut self,
@@ -239,6 +287,7 @@ impl BatchEnv {
         market_quantity_draws: PyReadonlyArray2<'py, f32>,
         deterministic_rows: PyReadonlyArray1<'py, bool>,
         temperatures: PyReadonlyArray1<'py, f32>,
+        builtin_agents: PyReadonlyArray1<'py, u8>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let output = allocate_sample_buffers(py, self.games.len())?;
         self.sample_and_step_into(
@@ -255,6 +304,7 @@ impl BatchEnv {
             market_quantity_draws,
             deterministic_rows,
             temperatures,
+            builtin_agents,
             &output,
         )?;
         Ok(output)
@@ -270,7 +320,7 @@ impl BatchEnv {
         unit_logits, market_kind_logits, market_quantity_context,
         quantity_kind_gate, quantity_values, quantity_bias, head_ids,
         unit_draws, market_kind_draws, market_quantity_draws,
-        deterministic_rows, temperatures, output
+        deterministic_rows, temperatures, builtin_agents, output
     ))]
     fn sample_and_step_into<'py>(
         &mut self,
@@ -287,6 +337,7 @@ impl BatchEnv {
         market_quantity_draws: PyReadonlyArray2<'py, f32>,
         deterministic_rows: PyReadonlyArray1<'py, bool>,
         temperatures: PyReadonlyArray1<'py, f32>,
+        builtin_agents: PyReadonlyArray1<'py, u8>,
         output: &Bound<'py, PyDict>,
     ) -> PyResult<()> {
         let rows = self.games.len() * PLAYERS;
@@ -344,6 +395,7 @@ impl BatchEnv {
         ensure_shape(head_ids.shape(), &[rows], "head_ids")?;
         ensure_shape(deterministic_rows.shape(), &[rows], "deterministic_rows")?;
         ensure_shape(temperatures.shape(), &[rows], "temperatures")?;
+        ensure_shape(builtin_agents.shape(), &[rows], "builtin_agents")?;
         ensure_shape(unit_draws.shape(), &[rows, MAX_UNITS], "unit_draws")?;
         ensure_shape(
             market_kind_draws.shape(),
@@ -368,6 +420,7 @@ impl BatchEnv {
         require_c_input!(market_quantity_draws, "market_quantity_draws");
         require_c_input!(deterministic_rows, "deterministic_rows");
         require_c_input!(temperatures, "temperatures");
+        require_c_input!(builtin_agents, "builtin_agents");
 
         let unit_logits = unit_logits.as_slice()?;
         let kind_logits = market_kind_logits.as_slice()?;
@@ -381,6 +434,8 @@ impl BatchEnv {
         let quantity_draws = market_quantity_draws.as_slice()?;
         let deterministic_rows = deterministic_rows.as_slice()?;
         let temperatures = temperatures.as_slice()?;
+        let builtin_agents = builtin_agents.as_slice()?;
+        validate_builtin_agents(builtin_agents)?;
         if head_ids.iter().any(|&head| usize::from(head) >= heads) {
             return Err(PyValueError::new_err(
                 "head_ids contains an out-of-range head",
@@ -421,6 +476,29 @@ impl BatchEnv {
                     .for_each(|(row, output)| {
                         let game = &games[row / PLAYERS];
                         let player = row % PLAYERS;
+                        // A nonzero code only ever lands on a frozen opponent's
+                        // seat. Nothing here can see which row belongs to the
+                        // learner, so `collect_mixed_play_rust` in
+                        // src/kaggriculture/rollout.py is where that invariant
+                        // is enforced.
+                        let builtin = BuiltinAgent::from_code(builtin_agents[row])
+                            .expect("codes are validated above");
+                        if let Some(agent) = builtin {
+                            let action =
+                                game.builtin_action(player, agent, &mut builtin_rng(game, player));
+                            output.masks = game.factor_masks(player, &action);
+                            output.action = action;
+                            // The row's action never passed through the network,
+                            // so it carries no policy density to report.
+                            output.unit_logprobs.fill(0.0);
+                            output.market_kind_logprobs.fill(0.0);
+                            output.market_quantity_logprobs.fill(0.0);
+                            output.unit_entropies.fill(0.0);
+                            output.market_kind_entropies.fill(0.0);
+                            output.market_quantity_entropies.fill(0.0);
+                            output.mean_entropy = 0.0;
+                            return;
+                        }
                         let head_id = usize::from(head_ids[row]);
                         let gate_offset = head_id * MARKET_KINDS * rank;
                         let values_offset = head_id * MARKET_QUANTITIES * rank;
@@ -1189,6 +1267,32 @@ fn validate_seeds(seeds: &[u64]) -> PyResult<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_builtin_agents(codes: &[u8]) -> PyResult<()> {
+    if let Some(&code) = codes
+        .iter()
+        .find(|&&code| BuiltinAgent::from_code(code).is_err())
+    {
+        return Err(PyValueError::new_err(format!(
+            "builtin_agents contains unknown agent code {code}, expected 0..=3"
+        )));
+    }
+    Ok(())
+}
+
+/// Deterministic draw stream for the built-in `random` agent.
+///
+/// The reference agent uses an unseeded `random.Random()`, so there is no draw
+/// sequence to reproduce and seeding costs no fidelity; deriving the stream
+/// from the game's own seed, step and seat instead makes a league rollout that
+/// fields the random opponent exactly replayable. The salt keeps it clear of
+/// the end-of-day stream, which mixes the same seed with the day index.
+fn builtin_rng(game: &Game, player: usize) -> PyRandom {
+    const SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+    PyRandom::seed_u64(
+        SALT ^ (game.seed * 1_000_003) ^ (u64::from(game.step) * PLAYERS as u64 + player as u64),
+    )
 }
 
 fn extract_compact_actions(

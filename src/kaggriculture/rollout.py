@@ -23,6 +23,7 @@ from kaggriculture.encoding import (
     terminal_pair_potential,
 )
 from kaggriculture.model import ActorOutput, FarmActor
+from kaggriculture.opponents import BUILTIN_AGENT_ORDER
 from kaggriculture.policy import PolicyStep, act_batch
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
@@ -43,6 +44,11 @@ from kaggriculture.tokens import (
 )
 
 _MAX_FLOAT32_CATEGORICAL_DRAW = np.nextafter(np.float32(1.0), np.float32(0.0))
+
+# Per-row codes for the wave's `builtin_agents` argument: 0 samples the row
+# from the network, anything else hands the row to the named engine reference
+# agent inside Rust. Mirrors `BuiltinAgent::from_code` in rust/kagg_env.
+BUILTIN_AGENT_CODES = {name: code for code, name in enumerate(BUILTIN_AGENT_ORDER, start=1)}
 
 
 @dataclass(frozen=True)
@@ -848,6 +854,35 @@ def _categorical_draws(
     return units, kinds, quantities
 
 
+def _builtin_agent_rows(
+    rows: int,
+    frozen_rows: np.ndarray,
+    learner_rows: np.ndarray,
+    assignments: np.ndarray,
+    lane_codes: np.ndarray,
+    lane_names: Sequence[str],
+) -> np.ndarray:
+    """Per-row built-in codes for the wave, refusing any on a learner seat.
+
+    The native binding takes a code for every row and cannot tell a learner
+    row from an opponent row, so it deliberately checks nothing here. This
+    side knows the seats. A built-in code that landed on a learner row would
+    train the policy on an action it never chose, under log-probabilities the
+    binding writes as zero — a corruption that looks exactly like ordinary
+    data, so it has to be an error rather than a surprise in the journal.
+    """
+    codes = np.zeros(rows, dtype=np.uint8)
+    codes[frozen_rows] = lane_codes[assignments]
+    violations = np.flatnonzero(codes[learner_rows])
+    if violations.size:
+        row = int(learner_rows[violations[0]])
+        lane = int(assignments[int(np.flatnonzero(frozen_rows == row)[0])])
+        raise ValueError(
+            f"built-in lane {lane} ({lane_names[lane]}) was assigned to learner row {row}"
+        )
+    return codes
+
+
 def _validate_learner_temperature(temperature: float) -> None:
     """Require behavior logits to match the unit-temperature PPO replay policy."""
     if not np.isfinite(temperature) or temperature != 1.0:
@@ -953,6 +988,7 @@ def collect_mixed_play_rust(
     self_play_games: int = 0,
     league_games: int = 0,
     opponent_indices: Sequence[int] | np.ndarray | None = None,
+    builtin_lanes: Sequence[str] = (),
     seed_start: int,
     episode_steps: int = 720,
     deterministic: bool = False,
@@ -976,6 +1012,16 @@ def collect_mixed_play_rust(
     assigned. Stored trajectories are ordered self-play first, then league,
     matching a caller-provided storage arena.
 
+    ``builtin_lanes`` names engine reference agents that play league lanes
+    natively inside the wave, with no network behind them. They extend the
+    lane index space that ``opponent_indices`` addresses: lanes below
+    ``len(opponents)`` are frozen networks, the rest are these built-ins in
+    order. A built-in lane still occupies a slot in the stacked frozen
+    forward, borrowing the last frozen opponent's weights and discarding the
+    result, so the ensemble's batch shape depends on the total lane count and
+    not on how many lanes happen to be built-in this iteration — a CUDA graph
+    captured for one mix stays valid for every other.
+
     Rollouts capture only behavior policy state. Value predictions for GAE
     are replayed from the stored features in one large batched critic pass
     at update time, where the critic weights are still exactly the behavior
@@ -988,10 +1034,17 @@ def collect_mixed_play_rust(
     if episode_steps != 720:
         raise ValueError("the native simulator currently supports the competition horizon 720")
     opponents = tuple(opponents)
-    if league_games and not opponents:
-        raise ValueError("league games require at least one frozen opponent")
-    if opponents and not league_games:
-        raise ValueError("frozen opponents require league games")
+    builtin_lanes = tuple(builtin_lanes)
+    unknown = sorted(set(builtin_lanes) - BUILTIN_AGENT_CODES.keys())
+    if unknown:
+        raise ValueError(f"unknown built-in league agents: {', '.join(unknown)}")
+    if len(set(builtin_lanes)) != len(builtin_lanes):
+        raise ValueError("built-in league agents must be distinct")
+    lane_count = len(opponents) + len(builtin_lanes)
+    if league_games and not lane_count:
+        raise ValueError("league games require at least one frozen or built-in opponent")
+    if lane_count and not league_games:
+        raise ValueError("league opponents require league games")
     if len(opponents) > np.iinfo(np.uint16).max:
         raise ValueError("too many frozen opponents for native head identifiers")
     _validate_learner_temperature(temperature)
@@ -1023,8 +1076,8 @@ def collect_mixed_play_rust(
         if not np.issubdtype(raw_assignments.dtype, np.integer):
             raise ValueError("opponent indices must be integers")
         assignments = raw_assignments.astype(np.int64, copy=False)
-    if (assignments < 0).any() or (assignments >= max(1, len(opponents))).any():
-        raise ValueError("opponent index is outside the frozen opponent list")
+    if (assignments < 0).any() or (assignments >= max(1, lane_count)).any():
+        raise ValueError("opponent index is outside the league lane list")
     started = time.perf_counter()
     actor.eval()
     for opponent in opponents:
@@ -1059,12 +1112,27 @@ def collect_mixed_play_rust(
     generator = np.random.default_rng(sampling_seed)
     frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
     kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
+    # Per-lane decode of everything a frozen row needs. A built-in lane has no
+    # network, so it borrows the learner's quantity head and neutral sampling
+    # settings; the native agent replaces that row's whole action regardless.
+    lane_names = (*(f"frozen-{index}" for index in range(len(opponents))), *builtin_lanes)
+    lane_heads = np.zeros(lane_count, dtype=np.uint16)
+    lane_heads[: len(opponents)] = np.arange(1, len(opponents) + 1, dtype=np.uint16)
+    lane_temperatures = np.ones(lane_count, dtype=np.float32)
+    lane_temperatures[: len(opponents)] = frozen_temperatures
+    lane_deterministic = np.zeros(lane_count, dtype=np.bool_)
+    lane_deterministic[: len(opponents)] = frozen_deterministic
+    lane_codes = np.zeros(lane_count, dtype=np.uint8)
+    lane_codes[len(opponents) :] = [BUILTIN_AGENT_CODES[name] for name in builtin_lanes]
     head_ids = np.zeros(rows, dtype=np.uint16)
-    head_ids[frozen_rows] = (assignments + 1).astype(np.uint16)
+    head_ids[frozen_rows] = lane_heads[assignments]
     deterministic_rows = np.full(rows, deterministic, dtype=np.bool_)
-    deterministic_rows[frozen_rows] = frozen_deterministic[assignments]
+    deterministic_rows[frozen_rows] = lane_deterministic[assignments]
     temperatures = np.full(rows, temperature, dtype=np.float32)
-    temperatures[frozen_rows] = frozen_temperatures[assignments]
+    temperatures[frozen_rows] = lane_temperatures[assignments]
+    builtin_agents = _builtin_agent_rows(
+        rows, frozen_rows, stored_rows, assignments, lane_codes, lane_names
+    )
     entropy_sums = np.zeros(trajectories, dtype=np.float64)
     final = None
     packed_transfer: _PackedTransfer | None = None
@@ -1076,8 +1144,7 @@ def collect_mixed_play_rust(
     current_tensor = None if not league_games else torch.as_tensor(stored_rows, device=device)
     if league_games:
         frozen_groups = tuple(
-            frozen_rows[np.flatnonzero(assignments == opponent_index)]
-            for opponent_index in range(len(opponents))
+            frozen_rows[np.flatnonzero(assignments == lane)] for lane in range(lane_count)
         )
         active_indices = [index for index, group in enumerate(frozen_groups) if group.size]
         active_groups = [frozen_groups[index] for index in active_indices]
@@ -1095,10 +1162,24 @@ def collect_mixed_play_rust(
         lane_valid_flat = lane_valid.reshape(-1)
         frozen_store_rows = np.concatenate(active_groups)
         frozen_tensor = torch.as_tensor(lane_rows.reshape(-1), device=device)
-        ensemble = _stacked_frozen_ensemble([opponents[index] for index in active_indices])
-        unit_logits = np.empty((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
-        kind_logits = np.empty((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
-        quantity_context = np.empty(
+        # Built-in lanes keep their slot in the stack, borrowing the last
+        # frozen opponent's weights, so the ensemble's batch shape follows the
+        # lane count instead of this iteration's snapshot/built-in mix and a
+        # captured CUDA graph survives the next draw. Their logits are never
+        # read. A wave with no frozen network at all runs no ensemble.
+        ensemble = (
+            _stacked_frozen_ensemble(
+                [opponents[min(index, len(opponents) - 1)] for index in active_indices]
+            )
+            if opponents
+            else None
+        )
+        # Zeroed rather than uninitialized: with no ensemble nothing scatters
+        # into the frozen rows, and handing the sampler uninitialized memory --
+        # even in rows it is contracted to ignore -- is not worth the page.
+        unit_logits = np.zeros((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
+        kind_logits = np.zeros((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
+        quantity_context = np.zeros(
             (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
         )
     # Collection runs the actor under whatever precision the audited decision
@@ -1128,27 +1209,42 @@ def collect_mixed_play_rust(
             unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
         else:
             current_output = run_actor(*_select_inputs(encoded_wave.inputs(), current_tensor))
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
-                lane_output = ensemble(
-                    *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
-                    mode=forward_mode,
+            if ensemble is None:
+                host_outputs, packed_transfer = _packed_outputs_to_host(
+                    (current_output,), packed_transfer
                 )
-            frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
-            host_outputs, packed_transfer = _packed_outputs_to_host(
-                (current_output, frozen_output), packed_transfer
-            )
-            current_host, frozen_host = host_outputs
-            for destination, current_values, frozen_values in (
-                (unit_logits, current_host.unit_logits, frozen_host.unit_logits),
-                (kind_logits, current_host.market_kind_logits, frozen_host.market_kind_logits),
+                (current_host,) = host_outputs
+                frozen_host = None
+            else:
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+                    lane_output = ensemble(
+                        *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
+                        mode=forward_mode,
+                    )
+                frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+                host_outputs, packed_transfer = _packed_outputs_to_host(
+                    (current_output, frozen_output), packed_transfer
+                )
+                current_host, frozen_host = host_outputs
+            for destination, current_values, frozen_values in zip(
+                (unit_logits, kind_logits, quantity_context),
                 (
-                    quantity_context,
+                    current_host.unit_logits,
+                    current_host.market_kind_logits,
                     current_host.market_quantity_context,
+                ),
+                (None, None, None)
+                if frozen_host is None
+                else (
+                    frozen_host.unit_logits,
+                    frozen_host.market_kind_logits,
                     frozen_host.market_quantity_context,
                 ),
+                strict=True,
             ):
                 destination[stored_rows] = current_values
-                destination[frozen_store_rows] = frozen_values[lane_valid_flat]
+                if frozen_values is not None:
+                    destination[frozen_store_rows] = frozen_values[lane_valid_flat]
             step_unit_logits = unit_logits
             step_kind_logits = kind_logits
             step_quantity_context = quantity_context
@@ -1178,6 +1274,7 @@ def collect_mixed_play_rust(
             quantity_draws,
             deterministic_rows,
             temperatures,
+            builtin_agents,
             sampled,
         )
         rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)

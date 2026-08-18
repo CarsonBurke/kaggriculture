@@ -86,6 +86,8 @@ def main() -> None:
     head_ids = np.zeros(rows, dtype=np.uint16)
     deterministic_rows = np.zeros(rows, dtype=np.bool_)
     temperatures = np.ones(rows, dtype=np.float32)
+    # The profile times the network path, so no row is handed to a built-in.
+    builtin_agents = np.zeros(rows, dtype=np.uint8)
     generator = np.random.default_rng(args.seed)
 
     samples: dict[str, list[float]] = {name: [] for name in STAGES}
@@ -147,6 +149,7 @@ def main() -> None:
                     *uniforms,
                     deterministic_rows,
                     temperatures,
+                    builtin_agents,
                     sampled,
                 )
 

@@ -1,13 +1,13 @@
 //! CPython `random.Random` compatibility for deterministic environment events.
 
 #[derive(Clone, Debug)]
-pub(crate) struct PyRandom {
+pub struct PyRandom {
     state: [u32; 624],
     index: usize,
 }
 
 impl PyRandom {
-    pub(crate) fn seed_u64(seed: u64) -> Self {
+    pub fn seed_u64(seed: u64) -> Self {
         let mut key = vec![seed as u32];
         let high = (seed >> 32) as u32;
         if high != 0 {
@@ -22,13 +22,13 @@ impl PyRandom {
     }
 
     #[inline]
-    pub(crate) fn random(&mut self) -> f64 {
+    pub fn random(&mut self) -> f64 {
         let a = (self.gen_u32() >> 5) as u64;
         let b = (self.gen_u32() >> 6) as u64;
         ((a * 67_108_864 + b) as f64) / 9_007_199_254_740_992.0
     }
 
-    pub(crate) fn randbelow(&mut self, n: u32) -> u32 {
+    pub fn randbelow(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0);
         // CPython uses n.bit_length(), including one rejection bit for powers of two.
         let bits = 32 - n.leading_zeros();
