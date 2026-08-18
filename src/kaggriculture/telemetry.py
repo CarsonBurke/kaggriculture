@@ -36,7 +36,15 @@ from typing import Any, Protocol
 #: epoch 5 could not tell apart, and separating graph capture from benchmarked
 #: kernel selection is the entire reason those modes are enumerated separately
 #: (`ppo.UPDATE_COMPILE_MODES`).
-_LAYOUT_EPOCH = 6
+#: 7: a training mirror is one event file. Cohorts, policy heads and league
+#: strata were runs, so mirroring one run wrote ten event files and a parent
+#: `--logdir` showed ten selector rows for every run it held; each is now the
+#: tag's last segment. This is the epoch's whole purpose in the one case the
+#: fingerprint below cannot cover: it hashes the lookup tables, and their values
+#: did not change -- only the placement logic reading them did. Without the bump
+#: an epoch 6 mirror would be judged current and appended to under the new
+#: scheme, serving both layouts from one directory.
+_LAYOUT_EPOCH = 7
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -382,10 +390,14 @@ def _benchmark_context(records: tuple[dict[str, Any], ...]) -> tuple[str, str]:
 
 #: Behavioral statistics reach the journal three times over: once for the whole
 #: mixed wave, once for its self-play half under a `self_play_` prefix, and once
-#: for its league half under a `league_` prefix. Left as tags that is one chart
-#: drawn three times in three categories; made TensorBoard *runs* it is one
-#: chart carrying three series, which is the comparison the three exist to
-#: support. The empty prefix is last because it matches everything.
+#: for its league half under a `league_` prefix. The cohort is the tag's last
+#: segment, so the three land as adjacent sibling charts in one run. They were
+#: TensorBoard runs once, which drew them as one chart carrying three series --
+#: a better comparison, paid for by turning a training mirror into ten event
+#: files and, at a parent `--logdir`, ten selector rows per run. One event file
+#: per run is worth more than the overlay; TensorBoard cannot have both, since
+#: two tags of one run never share a chart. The empty prefix is last because it
+#: matches everything.
 _COHORT_RUNS: tuple[tuple[str, str], ...] = (
     ("self_play_", "self-play"),
     ("league_", "league"),
@@ -584,26 +596,26 @@ _TRAINING_TAGS = {
 #: time says nothing about training and costs a chart to say it.
 _UNPLOTTED = frozenset(("next_seed",))
 
-#: Statistics measured once per policy head, as (field prefix, run directory,
-#: tag category). The head becomes a run so that unit, kind and quantity land
-#: as three series on one chart, which is how they are actually read -- a
-#: replay-parity breach is recognized by one head departing from the others,
-#: and that comparison is invisible across three separate charts.
-_PER_HEAD_PREFIXES: tuple[tuple[str, str, str], ...] = (
-    ("update_replay_", "parity", "parity"),
-    ("holdout_", "heads", "holdout"),
+#: Statistics measured once per policy head, as (field prefix, tag category).
+#: The head is the tag's last segment, so unit, kind and quantity land as
+#: adjacent sibling charts. It was a run once, which drew them as three series on
+#: one chart -- the comparison a replay-parity breach is actually recognized by,
+#: one head departing from the others -- but that cost the mirror an event file
+#: per head. Adjacency is the affordable substitute.
+_PER_HEAD_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("update_replay_", "parity"),
+    ("holdout_", "holdout"),
 )
 
 _OPPONENT_PREFIX = "league_opponent_"
 
-#: The run and tags the aggregated league-opponent curves are written at, and
-#: the per-opponent fields reduced into them. Hoisted out of
-#: `_opponent_scalars` so `_layout_fingerprint` below can cover them. While they
-#: were literals inside that function the fingerprint did not see them, so
-#: renaming `opponents/score_rate` left every mirror serving two schemes at once
-#: with the format version unchanged -- the exact failure the fingerprint exists
-#: to prevent, in the one part of the namespace it did not reach.
-_OPPONENT_RUN_ROOT = "opponents"
+#: The tags the aggregated league-opponent curves are written at, and the
+#: per-opponent fields reduced into them. Hoisted out of `_opponent_scalars` so
+#: `_layout_fingerprint` below can cover them. While they were literals inside
+#: that function the fingerprint did not see them, so renaming
+#: `opponents/score_rate` left every mirror serving two schemes at once with the
+#: format version unchanged -- the exact failure the fingerprint exists to
+#: prevent, in the one part of the namespace it did not reach.
 _OPPONENT_CATEGORY = "opponents"
 _OPPONENT_AGGREGATE_FIELDS = ("score_rate", "mean_margin")
 _OPPONENT_UNCLASSIFIED = "unclassified"
@@ -649,7 +661,6 @@ def _layout_fingerprint() -> str:
             "unplotted": sorted(_UNPLOTTED),
             "opponents": {
                 "prefix": _OPPONENT_PREFIX,
-                "run_root": _OPPONENT_RUN_ROOT,
                 "category": _OPPONENT_CATEGORY,
                 "aggregates": _OPPONENT_AGGREGATE_FIELDS,
                 "unclassified": _OPPONENT_UNCLASSIFIED,
@@ -673,33 +684,47 @@ TENSORBOARD_MIRROR_FORMAT_VERSION = f"{_LAYOUT_EPOCH}-{_layout_fingerprint()}"
 
 
 def _placement(name: str) -> tuple[str, str] | None:
-    """Return the (run, tag) a training-journal field is mirrored at, or None."""
+    """Return the (run, tag) a training-journal field is mirrored at, or None.
+
+    A training mirror is one event file, so the run is always empty here and every
+    distinction the layout draws lives in the tag. Only the benchmark mirror still
+    opens runs, where each is a whole configuration -- one batch size, one compile
+    mode -- rather than a facet of one wave.
+
+    The facet joins the *category*, not the chart name. TensorBoard groups charts
+    by the first path segment alone, so appending it instead -- `parity/kl/unit` --
+    collects every head in one accordion and takes `parity` from 10 charts to 30,
+    past the readable budget the cohorts were runs to respect. As `parity-unit/kl`
+    each accordion keeps the size it had as a run, and the facets of one category
+    sort adjacently, which is as close to the old overlaid series as a single run
+    can get.
+    """
     if name in _UNPLOTTED:
         return None
     tag = _TRAINING_TAGS.get(name)
     if tag is not None:
         return "", tag
-    for prefix, run_root, category in _PER_HEAD_PREFIXES:
+    for prefix, category in _PER_HEAD_PREFIXES:
         if not name.startswith(prefix):
             continue
         head, _, statistic = name[len(prefix) :].partition("_")
         if statistic:
-            return f"{run_root}/{head}", f"{category}/{statistic}"
-    for prefix, run in _COHORT_RUNS:
+            return "", f"{category}-{head}/{statistic}"
+    for prefix, cohort in _COHORT_RUNS:
         if not name.startswith(prefix):
             continue
         statistic = name[len(prefix) :]
         placement = _BEHAVIOR_CATEGORIES.get(statistic)
         if placement is not None:
             category, chart = placement
-            return run, f"{category}/{chart}"
+            return "", f"{category}-{cohort}/{chart}"
         for family, category, absorbs in _BEHAVIOR_FAMILIES:
             if statistic.startswith(family):
                 # A statistic named after the bare family has nothing left once
                 # the family is dropped, and a tag ending in a slash is not a
                 # chart, so it keeps its name.
                 chart = statistic[len(family) :] if absorbs else statistic
-                return run, f"{category}/{chart or statistic}"
+                return "", f"{category}-{cohort}/{chart or statistic}"
     return "", f"{_UNCATEGORIZED}/{name}"
 
 
@@ -736,10 +761,13 @@ def _opponent_scalars(record: dict[str, Any]) -> Iterator[tuple[str, str, float]
         categories.setdefault(key, []).append(opponent)
 
     for category, members in sorted(categories.items()):
-        run = f"{_OPPONENT_RUN_ROOT}/{category}"
+        # The stratum joins the category, not the chart name: a training mirror is
+        # one event file, and `opponents/score_rate/{active,builtin,historical}`
+        # would collect all three strata into one accordion.
+        stratum = f"{_OPPONENT_CATEGORY}-{category}/{{field}}"
         games = [max(_number(member.get("games")) or 0.0, 0.0) for member in members]
-        yield run, f"{_OPPONENT_CATEGORY}/count", float(len(members))
-        yield run, f"{_OPPONENT_CATEGORY}/games", sum(games)
+        yield "", stratum.format(field="count"), float(len(members))
+        yield "", stratum.format(field="games"), sum(games)
         for field in _OPPONENT_AGGREGATE_FIELDS:
             weighted = [
                 (value, weight)
@@ -753,8 +781,8 @@ def _opponent_scalars(record: dict[str, Any]) -> Iterator[tuple[str, str, float]
             # games still has a defined membership, so it falls back to the
             # unweighted mean rather than dividing by zero or vanishing.
             yield (
-                run,
-                f"{_OPPONENT_CATEGORY}/{field}",
+                "",
+                stratum.format(field=field),
                 sum(value * weight for value, weight in weighted) / total
                 if total > 0
                 else sum(value for value, _ in weighted) / len(weighted),
@@ -766,8 +794,8 @@ def _opponent_scalars(record: dict[str, Any]) -> Iterator[tuple[str, str, float]
             rate for member in members if (rate := _number(member.get("score_rate"))) is not None
         ]
         if rates:
-            yield run, f"{_OPPONENT_CATEGORY}/score_rate_min", min(rates)
-            yield run, f"{_OPPONENT_CATEGORY}/score_rate_max", max(rates)
+            yield "", stratum.format(field="score_rate_min"), min(rates)
+            yield "", stratum.format(field="score_rate_max"), max(rates)
 
 
 def _write_record(

@@ -28,6 +28,10 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     )
 
 
+def _tags(log_dir: Path) -> list[str]:
+    return EventAccumulator(str(log_dir)).Reload().Tags()["scalars"]
+
+
 def _scalars(log_dir: Path, tag: str) -> list[tuple[int, float]]:
     accumulator = EventAccumulator(str(log_dir)).Reload()
     return [(event.step, event.value) for event in accumulator.Scalars(tag)]
@@ -290,7 +294,7 @@ def test_benchmark_batches_are_runs_sharing_the_training_categories(tmp_path: Pa
     assert _scalars(log_dir / "rollout-compiled/games_16", "timing/total_seconds") == [(0, 4.5)]
     # A per-head run composes under the batch rather than escaping to the root,
     # so two batches cannot write one head's series over each other.
-    assert _scalars(log_dir / "rollout-compiled/games_16/parity/unit", "parity/kl") == [(0, 0.25)]
+    assert _scalars(log_dir / "rollout-compiled/games_16", "parity-unit/kl") == [(0, 0.25)]
     assert _scalars(log_dir / "rollout-compiled/games_16", "misc/some_metric_added_later") == [
         (0, 0.125)
     ]
@@ -327,7 +331,7 @@ def test_epoch_keyed_training_journal_mirrors_as_scalars(tmp_path: Path) -> None
     assert _scalars(log_dir, "loss/holdout_nll") == [(0, 0.75), (1, 0.375)]
     # Per-head holdout statistics are a run each, so unit, kind and quantity
     # share one accuracy chart instead of occupying three.
-    assert _scalars(log_dir / "heads/unit", "holdout/accuracy") == [(0, 0.875), (1, 0.9375)]
+    assert _scalars(log_dir, "holdout-unit/accuracy") == [(0, 0.875), (1, 0.9375)]
     # The step field itself is a coordinate, not a curve.
     accumulator = EventAccumulator(str(log_dir)).Reload()
     assert "epoch" not in accumulator.Tags()["scalars"]
@@ -394,22 +398,22 @@ def test_league_opponents_aggregate_instead_of_minting_a_tag_each(tmp_path: Path
 
     migrate_jsonl_to_tensorboard(journal, log_dir)
 
-    active = EventAccumulator(str(log_dir / "opponents/active")).Reload().Tags()["scalars"]
-    assert set(active) == {
-        "opponents/count",
-        "opponents/games",
-        "opponents/score_rate",
-        "opponents/mean_margin",
-        "opponents/score_rate_min",
-        "opponents/score_rate_max",
+    active = EventAccumulator(str(log_dir)).Reload().Tags()["scalars"]
+    assert {tag for tag in active if tag.startswith("opponents-active/")} == {
+        "opponents-active/count",
+        "opponents-active/games",
+        "opponents-active/score_rate",
+        "opponents-active/mean_margin",
+        "opponents-active/score_rate_min",
+        "opponents-active/score_rate_max",
     }
     # Rates are weighted by games played, so the opponent drawn for 24 games
     # counts for three times the one drawn for 8: (0.5*24 + 0.25*8)/32.
-    assert _scalars(log_dir / "opponents/active", "opponents/score_rate")[0] == (1, 0.4375)
-    assert _scalars(log_dir / "opponents/active", "opponents/mean_margin")[0] == (1, 62.5)
-    assert _scalars(log_dir / "opponents/active", "opponents/count") == [(1, 2.0), (2, 1.0)]
-    assert _scalars(log_dir / "opponents/active", "opponents/score_rate_min")[0] == (1, 0.25)
-    assert _scalars(log_dir / "opponents/historical", "opponents/games") == [(1, 16.0)]
+    assert _scalars(log_dir, "opponents-active/score_rate")[0] == (1, 0.4375)
+    assert _scalars(log_dir, "opponents-active/mean_margin")[0] == (1, 62.5)
+    assert _scalars(log_dir, "opponents-active/count") == [(1, 2.0), (2, 1.0)]
+    assert _scalars(log_dir, "opponents-active/score_rate_min")[0] == (1, 0.25)
+    assert _scalars(log_dir, "opponents-historical/games") == [(1, 16.0)]
 
     # No tag anywhere names an individual opponent, whatever its index.
     for path in log_dir.rglob("events.out.tfevents.*"):
@@ -448,19 +452,18 @@ def test_an_opponent_key_containing_an_underscore_still_resolves(tmp_path: Path)
 
     migrate_jsonl_to_tensorboard(journal, log_dir)
 
-    builtin = log_dir / "opponents/builtin"
-    assert _scalars(builtin, "opponents/count") == [(1, 2.0)]
-    assert _scalars(builtin, "opponents/games") == [(1, 27.0)]
+    assert _scalars(log_dir, "opponents-builtin/count") == [(1, 2.0)]
+    assert _scalars(log_dir, "opponents-builtin/games") == [(1, 27.0)]
     # Both built-ins are present and weighted by games: (0.0*14 + 0.25*13)/27.
-    assert _scalars(builtin, "opponents/score_rate")[0][1] == pytest.approx(0.25 * 13 / 27)
-    assert _scalars(builtin, "opponents/score_rate_min") == [(1, 0.0)]
-    assert _scalars(builtin, "opponents/score_rate_max") == [(1, 0.25)]
+    assert _scalars(log_dir, "opponents-builtin/score_rate")[0][1] == pytest.approx(0.25 * 13 / 27)
+    assert _scalars(log_dir, "opponents-builtin/score_rate_min") == [(1, 0.0)]
+    assert _scalars(log_dir, "opponents-builtin/score_rate_max") == [(1, 0.25)]
     # The snapshot key beside them, which has no underscore, is unaffected.
-    assert _scalars(log_dir / "opponents/active", "opponents/games") == [(1, 14.0)]
-    assert not (log_dir / "opponents/unclassified").exists()
+    assert _scalars(log_dir, "opponents-active/games") == [(1, 14.0)]
+    assert not any(tag.startswith("opponents-unclassified/") for tag in _tags(log_dir))
 
 
-def test_a_cohort_is_a_run_so_its_statistics_share_one_chart(tmp_path: Path) -> None:
+def test_a_cohort_is_a_category_so_one_mirror_stays_one_event_file(tmp_path: Path) -> None:
     """The wave, its self-play half and its league half report the same things.
 
     As tag prefixes those are three charts in three categories that have to be
@@ -486,15 +489,19 @@ def test_a_cohort_is_a_run_so_its_statistics_share_one_chart(tmp_path: Path) -> 
 
     migrate_jsonl_to_tensorboard(journal, log_dir)
 
-    for run, expected in (("wave", 0.5), ("self-play", 0.25), ("league", 0.75)):
-        assert _scalars(log_dir / run, "outcome/score_rate") == [(1, expected)]
+    # One event file for the whole mirror: the cohort is the category's suffix,
+    # not a run of its own, so `outcome-wave` and `outcome-league` sort adjacently
+    # in one selector row instead of opening three.
+    assert [path.parent for path in log_dir.rglob("events.out.tfevents.*")] == [log_dir]
+    for cohort, expected in (("wave", 0.5), ("self-play", 0.25), ("league", 0.75)):
+        assert _scalars(log_dir, f"outcome-{cohort}/score_rate") == [(1, expected)]
     # A shipped unit action is filed by what it acts on, and an action the game
     # grows still lands on a chart of its own under the family fallback.
-    assert _scalars(log_dir / "wave", "logistics/move_fraction") == [(1, 0.125)]
-    assert _scalars(log_dir / "wave", "unit-actions/teleport_fraction") == [(1, 0.0625)]
+    assert _scalars(log_dir, "logistics-wave/move_fraction") == [(1, 0.125)]
+    assert _scalars(log_dir, "unit-actions-wave/teleport_fraction") == [(1, 0.0625)]
     # The family token is absorbed by the category where it would only stutter,
     # and kept where the category holds more than one family.
-    assert _scalars(log_dir / "league", "economy/money_median") == [(1, 0.0)]
+    assert _scalars(log_dir, "economy-league/money_median") == [(1, 0.0)]
 
 
 def test_every_field_is_placed_and_an_unrecognized_one_stays_visible(tmp_path: Path) -> None:
