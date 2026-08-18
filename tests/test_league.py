@@ -11,7 +11,7 @@ from kaggriculture.league import (
     list_actor_snapshots,
     load_actor_snapshot,
     save_actor_snapshot,
-    select_snapshot_mix,
+    select_league_mix,
     snapshot_sha256,
 )
 from kaggriculture.model import FarmActor, ModelConfig
@@ -183,12 +183,12 @@ def test_listing_ignores_noncanonical_files_and_sorts_numerically(tmp_path) -> N
     assert [ref.iteration for ref in list_actor_snapshots(tmp_path)] == [0, 3, 12]
 
 
-def test_snapshot_mix_is_distinct_reproducible_and_separates_age_windows(tmp_path) -> None:
+def test_league_mix_is_distinct_reproducible_and_separates_age_windows(tmp_path) -> None:
     refs = [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
         for iteration in range(33)
     ]
-    first = select_snapshot_mix(
+    first = select_league_mix(
         refs,
         current_iteration=33,
         active_count=2,
@@ -196,7 +196,7 @@ def test_snapshot_mix_is_distinct_reproducible_and_separates_age_windows(tmp_pat
         active_pool_size=8,
         generator=np.random.default_rng(91),
     )
-    second = select_snapshot_mix(
+    second = select_league_mix(
         refs,
         current_iteration=33,
         active_count=2,
@@ -220,13 +220,134 @@ def test_snapshot_mix_is_distinct_reproducible_and_separates_age_windows(tmp_pat
     assert historical == sorted(historical)
 
 
-def test_snapshot_mix_excludes_the_random_init_snapshot_from_tiny_pools(tmp_path) -> None:
+def _snapshot_refs(tmp_path, iterations) -> list[SnapshotRef]:
+    return [
+        SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
+        for iteration in iterations
+    ]
+
+
+def test_league_mix_reserves_lanes_for_built_ins_after_every_snapshot(tmp_path) -> None:
+    refs = _snapshot_refs(tmp_path, range(1, 20))
+
+    selected = select_league_mix(
+        refs,
+        current_iteration=20,
+        active_count=2,
+        historical_count=2,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        builtins=["pass", "random", "starter"],
+        builtin_lanes=3,
+        score_rates={"builtin_pass": 0.0, "builtin_random": 0.0, "builtin_starter": 0.0},
+    )
+
+    # Positional contract: the wave numbers its frozen-module lanes first, so
+    # every built-in has to trail every snapshot.
+    assert [row.category for row in selected] == ["active"] * 2 + ["historical"] * 2 + [
+        "builtin"
+    ] * 3
+    assert [row.key for row in selected[-3:]] == [
+        "builtin_pass",
+        "builtin_random",
+        "builtin_starter",
+    ]
+    assert [row.label for row in selected[-3:]] == ["pass", "random", "starter"]
+
+
+def test_league_mix_drains_beaten_built_in_lanes_back_to_snapshots(tmp_path) -> None:
+    """A beaten built-in must lose its lane, not merely lose weight inside it."""
+    refs = _snapshot_refs(tmp_path, range(1, 20))
+    arguments = {
+        "current_iteration": 20,
+        "active_count": 2,
+        "historical_count": 2,
+        "active_pool_size": 16,
+        "builtins": ["pass", "random", "starter"],
+        "builtin_lanes": 3,
+    }
+    beaten = {"builtin_pass": 1.0, "builtin_random": 1.0, "builtin_starter": 1.0}
+
+    for seed in range(16):
+        selected = select_league_mix(
+            refs, generator=np.random.default_rng(seed), score_rates=beaten, **arguments
+        )
+        # The reserved lanes are released, not dropped: the lane count that
+        # the wave's stacked frozen forward is captured for stays put.
+        assert len(selected) == 7
+        assert not [row for row in selected if row.category == "builtin"]
+
+
+def test_league_mix_gives_reserved_lanes_to_the_unbeaten_built_in(tmp_path) -> None:
+    refs = _snapshot_refs(tmp_path, range(1, 20))
+    counts = {"pass": 0, "random": 0, "starter": 0}
+
+    for seed in range(64):
+        selected = select_league_mix(
+            refs,
+            current_iteration=20,
+            active_count=2,
+            historical_count=2,
+            active_pool_size=16,
+            generator=np.random.default_rng(seed),
+            builtins=["pass", "random", "starter"],
+            builtin_lanes=1,
+            # Only `starter` still beats the learner; the other two are done.
+            score_rates={"builtin_pass": 1.0, "builtin_random": 1.0, "builtin_starter": 0.0},
+        )
+        for row in selected:
+            if row.category == "builtin":
+                counts[row.label] += 1
+
+    # The single reserved lane is contested against one more snapshot at
+    # weight (1 - 0.5)^2 = 0.25 against starter's 1.0, so starter takes about
+    # four fifths of them and the retired pair take none.
+    assert counts["pass"] == counts["random"] == 0
+    assert counts["starter"] > 40
+
+
+def test_league_mix_plays_built_ins_before_any_snapshot_exists(tmp_path) -> None:
+    selected = select_league_mix(
+        [],
+        current_iteration=1,
+        active_count=2,
+        historical_count=2,
+        active_pool_size=16,
+        generator=np.random.default_rng(3),
+        builtins=["starter"],
+        builtin_lanes=1,
+    )
+
+    assert [(row.label, row.category) for row in selected] == [("starter", "builtin")]
+
+
+def test_league_mix_rejects_unknown_and_duplicated_built_ins(tmp_path) -> None:
+    arguments = {
+        "current_iteration": 2,
+        "active_count": 1,
+        "historical_count": 0,
+        "active_pool_size": 16,
+        "builtin_lanes": 2,
+    }
+    refs = _snapshot_refs(tmp_path, (1,))
+
+    with pytest.raises(ValueError, match="unknown built-in"):
+        select_league_mix(
+            refs, generator=np.random.default_rng(0), builtins=["starter", "v27"], **arguments
+        )
+    with pytest.raises(ValueError, match="distinct"):
+        select_league_mix(
+            refs, generator=np.random.default_rng(0), builtins=["starter", "starter"], **arguments
+        )
+
+
+def test_league_mix_excludes_the_random_init_snapshot_from_tiny_pools(tmp_path) -> None:
     refs = [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
         for iteration in (0, 1)
     ]
 
-    selected = select_snapshot_mix(
+    selected = select_league_mix(
         refs,
         current_iteration=2,
         active_count=4,
@@ -238,7 +359,7 @@ def test_snapshot_mix_excludes_the_random_init_snapshot_from_tiny_pools(tmp_path
     assert [(row.ref.iteration, row.category) for row in selected] == [(1, "active")]
 
 
-def test_snapshot_mix_keeps_a_pretrained_start_as_a_baseline_opponent(tmp_path) -> None:
+def test_league_mix_keeps_a_pretrained_start_as_a_baseline_opponent(tmp_path) -> None:
     """A warm-started run's iteration-0 snapshot stays a league candidate.
 
     The default exclusion targets the random-init snapshot; under a
@@ -250,7 +371,7 @@ def test_snapshot_mix_keeps_a_pretrained_start_as_a_baseline_opponent(tmp_path) 
         for iteration in (0, 1)
     ]
 
-    selected = select_snapshot_mix(
+    selected = select_league_mix(
         refs,
         current_iteration=2,
         active_count=4,
@@ -266,10 +387,10 @@ def test_snapshot_mix_keeps_a_pretrained_start_as_a_baseline_opponent(tmp_path) 
     ]
 
 
-def test_snapshot_mix_treats_a_lone_resume_snapshot_as_active(tmp_path) -> None:
+def test_league_mix_treats_a_lone_resume_snapshot_as_active(tmp_path) -> None:
     resumed = SnapshotRef(12, tmp_path / "league-actor-00000012.pt")
 
-    selected = select_snapshot_mix(
+    selected = select_league_mix(
         [resumed],
         current_iteration=13,
         active_count=1,
@@ -281,16 +402,16 @@ def test_snapshot_mix_treats_a_lone_resume_snapshot_as_active(tmp_path) -> None:
     assert [(row.ref.iteration, row.category) for row in selected] == [(12, "active")]
 
 
-def test_snapshot_mix_retires_fully_beaten_opponents(tmp_path) -> None:
+def test_league_mix_retires_fully_beaten_opponents(tmp_path) -> None:
     refs = [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
         for iteration in range(1, 9)
     ]
-    score_rates = {iteration: 1.0 for iteration in range(1, 9)}
-    score_rates[6] = 0.4
+    score_rates = {f"{iteration:08d}": 1.0 for iteration in range(1, 9)}
+    score_rates["00000006"] = 0.4
 
     for seed in range(32):
-        selected = select_snapshot_mix(
+        selected = select_league_mix(
             refs,
             current_iteration=9,
             active_count=2,
@@ -304,26 +425,26 @@ def test_snapshot_mix_retires_fully_beaten_opponents(tmp_path) -> None:
         assert [(row.ref.iteration, row.category) for row in selected] == [(6, "active")]
 
 
-def test_snapshot_mix_returns_empty_when_every_opponent_is_beaten(tmp_path) -> None:
+def test_league_mix_returns_empty_when_every_opponent_is_beaten(tmp_path) -> None:
     refs = [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
         for iteration in range(1, 9)
     ]
 
-    selected = select_snapshot_mix(
+    selected = select_league_mix(
         refs,
         current_iteration=9,
         active_count=2,
         historical_count=2,
         active_pool_size=4,
         generator=np.random.default_rng(11),
-        score_rates={iteration: 1.0 for iteration in range(1, 9)},
+        score_rates={f"{iteration:08d}": 1.0 for iteration in range(1, 9)},
     )
 
     assert selected == []
 
 
-def test_snapshot_mix_prioritizes_competitive_over_unmeasured_opponents(tmp_path) -> None:
+def test_league_mix_prioritizes_competitive_over_unmeasured_opponents(tmp_path) -> None:
     refs = [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
         for iteration in (1, 2)
@@ -331,14 +452,14 @@ def test_snapshot_mix_prioritizes_competitive_over_unmeasured_opponents(tmp_path
     counts = {1: 0, 2: 0}
 
     for seed in range(400):
-        selected = select_snapshot_mix(
+        selected = select_league_mix(
             refs,
             current_iteration=3,
             active_count=1,
             historical_count=0,
             active_pool_size=16,
             generator=np.random.default_rng(seed),
-            score_rates={1: 0.0},
+            score_rates={"00000001": 0.0},
         )
         counts[selected[0].ref.iteration] += 1
 
@@ -349,23 +470,23 @@ def test_snapshot_mix_prioritizes_competitive_over_unmeasured_opponents(tmp_path
     assert counts[2] > 20
 
 
-def test_snapshot_mix_rejects_invalid_score_rates(tmp_path) -> None:
+def test_league_mix_rejects_invalid_score_rates(tmp_path) -> None:
     refs = [SnapshotRef(1, tmp_path / "league-actor-00000001.pt")]
 
     for invalid in (-0.1, 1.5, float("nan")):
         with pytest.raises(ValueError, match="score rates"):
-            select_snapshot_mix(
+            select_league_mix(
                 refs,
                 current_iteration=2,
                 active_count=1,
                 historical_count=0,
                 active_pool_size=16,
                 generator=np.random.default_rng(0),
-                score_rates={1: invalid},
+                score_rates={"00000001": invalid},
             )
 
 
-def test_snapshot_mix_rejects_conflicting_duplicate_refs(tmp_path) -> None:
+def test_league_mix_rejects_conflicting_duplicate_refs(tmp_path) -> None:
     first = SnapshotRef(1, tmp_path / "first.pt")
     second = SnapshotRef(1, tmp_path / "second.pt")
     reused = SnapshotRef(2, tmp_path / "first.pt")
@@ -378,9 +499,9 @@ def test_snapshot_mix_rejects_conflicting_duplicate_refs(tmp_path) -> None:
     }
 
     with pytest.raises(ValueError, match="conflicting paths"):
-        select_snapshot_mix([first, second], **arguments)
+        select_league_mix([first, second], **arguments)
     with pytest.raises(ValueError, match="reused"):
-        select_snapshot_mix([first, reused], **arguments)
+        select_league_mix([first, reused], **arguments)
 
 
 @pytest.mark.parametrize(
@@ -392,7 +513,7 @@ def test_snapshot_mix_rejects_conflicting_duplicate_refs(tmp_path) -> None:
         {"active_pool_size": 0},
     ],
 )
-def test_snapshot_mix_rejects_invalid_configuration(tmp_path, kwargs) -> None:
+def test_league_mix_rejects_invalid_configuration(tmp_path, kwargs) -> None:
     arguments = {
         "current_iteration": 1,
         "active_count": 1,
@@ -403,7 +524,7 @@ def test_snapshot_mix_rejects_invalid_configuration(tmp_path, kwargs) -> None:
     arguments.update(kwargs)
 
     with pytest.raises(ValueError):
-        select_snapshot_mix([SnapshotRef(0, tmp_path / "unused")], **arguments)
+        select_league_mix([SnapshotRef(0, tmp_path / "unused")], **arguments)
 
 
 def test_frozen_actor_pool_reuses_slots_and_reloads_in_place(tmp_path) -> None:

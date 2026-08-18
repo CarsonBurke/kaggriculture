@@ -1,4 +1,4 @@
-"""Immutable actor snapshots and reproducible active/historical league selection."""
+"""Immutable actor snapshots and reproducible league selection over snapshots and built-ins."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.registry import (
     Architecture,
     architecture_of_config,
@@ -31,6 +32,10 @@ AnyModelConfig = ModelConfig | StructuredConfig
 LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
 _SNAPSHOT_NAME = re.compile(r"league-actor-(\d{8})\.pt")
 _MAX_CANONICAL_ITERATION = 99_999_999
+# Identity of a league opponent in the PFSP score-rate state and in the journal.
+# Snapshots key on their zero-padded iteration; built-ins on their engine name.
+# One keyspace, because one weighting decides which of them plays.
+LEAGUE_OPPONENT_KEY = re.compile(r"\d{8}|builtin_[a-z]+")
 
 
 @dataclass(frozen=True, order=True)
@@ -39,10 +44,46 @@ class SnapshotRef:
     path: Path
 
 
+@dataclass(frozen=True, order=True)
+class BuiltinRef:
+    """A built-in reference agent, played natively inside the batched wave."""
+
+    name: str
+
+
+def _opponent_key(ref: SnapshotRef | BuiltinRef) -> str:
+    return f"builtin_{ref.name}" if isinstance(ref, BuiltinRef) else f"{ref.iteration:08d}"
+
+
 @dataclass(frozen=True)
 class SnapshotSelection:
     ref: SnapshotRef
     category: Literal["active", "historical"]
+
+    @property
+    def key(self) -> str:
+        return _opponent_key(self.ref)
+
+    @property
+    def label(self) -> str:
+        return self.ref.path.name
+
+
+@dataclass(frozen=True)
+class BuiltinSelection:
+    ref: BuiltinRef
+    category: Literal["builtin"] = "builtin"
+
+    @property
+    def key(self) -> str:
+        return _opponent_key(self.ref)
+
+    @property
+    def label(self) -> str:
+        return self.ref.name
+
+
+LeagueSelection = SnapshotSelection | BuiltinSelection
 
 
 def _snapshot_path(directory: Path, iteration: int) -> Path:
@@ -348,20 +389,21 @@ def list_actor_snapshots(directory: Path) -> list[SnapshotRef]:
 # Prioritized fictitious self-play weighting: an opponent's sampling weight is
 # (1 - score_rate)^2, so competitive opponents dominate and a fully beaten one
 # (score rate 1.0) retires from sampling entirely. Unmeasured opponents count
-# as even (0.5) so new snapshots enter the rotation at moderate priority.
+# as even (0.5) so new snapshots and built-ins enter the rotation at moderate
+# priority.
 PFSP_UNMEASURED_SCORE_RATE = 0.5
 
 
 def _pfsp_weights(
-    values: Sequence[SnapshotRef],
-    score_rates: Mapping[int, float] | None,
+    values: Sequence[SnapshotRef | BuiltinRef],
+    score_rates: Mapping[str, float] | None,
 ) -> np.ndarray:
     rates = np.asarray(
         [
             (
                 PFSP_UNMEASURED_SCORE_RATE
                 if score_rates is None
-                else float(score_rates.get(ref.iteration, PFSP_UNMEASURED_SCORE_RATE))
+                else float(score_rates.get(_opponent_key(ref), PFSP_UNMEASURED_SCORE_RATE))
             )
             for ref in values
         ],
@@ -373,11 +415,11 @@ def _pfsp_weights(
 
 
 def _weighted_sample_without_replacement(
-    values: Sequence[SnapshotRef],
+    values: Sequence[SnapshotRef | BuiltinRef],
     count: int,
     generator: np.random.Generator,
     weights: np.ndarray,
-) -> list[SnapshotRef]:
+) -> list[SnapshotRef | BuiltinRef]:
     if count <= 0 or not values:
         return []
     total = float(weights.sum())
@@ -389,6 +431,41 @@ def _weighted_sample_without_replacement(
         generator.choice(len(values), size=size, replace=False, p=weights / total)
     )
     return [values[int(index)] for index in indices]
+
+
+def _contest_builtin_lanes(
+    builtins: Sequence[BuiltinRef],
+    budget: int,
+    snapshot_weight: float,
+    generator: np.random.Generator,
+    weights: np.ndarray,
+) -> list[BuiltinRef]:
+    """Fill the reserved built-in lanes, contesting each against a snapshot.
+
+    Every reserved lane is decided between the built-ins that have not taken
+    one yet and the alternative of one more frozen snapshot, all on the same
+    PFSP scale. This is where a built-in retires: a fixed lane per admitted
+    agent would leave the weight nothing to allocate, whereas here a beaten
+    built-in loses its lane to a still-competitive one, and once none of them
+    is worth games the whole budget goes to snapshots. Lanes the built-ins do
+    not win are returned to the caller as the shortfall.
+    """
+    remaining = list(builtins)
+    remaining_weights = [float(weight) for weight in weights]
+    chosen: list[BuiltinRef] = []
+    for _ in range(budget):
+        total = sum(remaining_weights) + snapshot_weight
+        if not remaining or total <= 0.0:
+            break
+        probabilities = np.asarray([*remaining_weights, snapshot_weight], dtype=np.float64)
+        index = int(generator.choice(len(probabilities), p=probabilities / total))
+        if index == len(remaining):
+            # The snapshot alternative took this lane; the rest are contested
+            # on their own, so one loss does not close the stratum.
+            continue
+        chosen.append(remaining.pop(index))
+        remaining_weights.pop(index)
+    return chosen
 
 
 def _sample_log_age_strata(
@@ -431,7 +508,7 @@ def _sample_log_age_strata(
     return selected
 
 
-def select_snapshot_mix(
+def select_league_mix(
     refs: Sequence[SnapshotRef],
     *,
     current_iteration: int,
@@ -439,10 +516,12 @@ def select_snapshot_mix(
     historical_count: int,
     active_pool_size: int,
     generator: np.random.Generator,
-    score_rates: Mapping[int, float] | None = None,
+    builtins: Sequence[str] = (),
+    builtin_lanes: int = 0,
+    score_rates: Mapping[str, float] | None = None,
     pretrained_start: bool = False,
-) -> list[SnapshotSelection]:
-    """Select distinct recent-active and log-age historical opponents.
+) -> list[LeagueSelection]:
+    """Select distinct recent-active, log-age historical, and built-in opponents.
 
     Active candidates are the newest ``active_pool_size`` frozen iterations.
     Historical candidates must be strictly older than that complete active
@@ -453,15 +532,34 @@ def select_snapshot_mix(
     against the learner's own starting point.
     Undersized pools return fewer selections without duplicating a policy.
 
-    ``score_rates`` maps snapshot iteration to the learner's recent score rate
-    against that snapshot; sampling is prioritized fictitious self-play with
+    ``builtins`` names engine reference agents and ``builtin_lanes`` reserves
+    that many lanes for them. Each reserved lane is contested between the
+    admitted built-ins that have not taken one and one more frozen snapshot,
+    decided by the same PFSP weight, so the budget is a ceiling rather than a
+    floor: while a built-in is unbeaten it outweighs the snapshot alternative
+    and holds its lane, and as the learner beats them the reserved lanes drain
+    back into the active stratum with no threshold anywhere. Reserving lanes
+    rather than letting built-ins contest the active slots matters because the
+    active window holds sixteen candidates — inside it an unbeaten built-in
+    would win well under half a lane per wave, and the learner has to actually
+    learn a farming loop against these agents, not be exposed to one
+    occasionally. Built-in lanes need no snapshot pool, so a run with nothing
+    frozen yet still plays them from its first iteration. The total lane count
+    stays ``active_count + historical_count + builtin_lanes`` however the
+    contest goes, which is what keeps the wave's stacked frozen forward on one
+    captured shape.
+
+    ``score_rates`` maps opponent key to the learner's recent score rate
+    against that opponent; sampling is prioritized fictitious self-play with
     weight (1 - score_rate)^2, so fully beaten opponents retire and their
     games return to competitive opponents instead of 100%-win blowouts.
 
-    Selections list every active snapshot (sorted by iteration) before every
-    historical one (also sorted). Positional consumers — the iteration
-    benchmark reconstructs production's temperature/deterministic decode from
-    this ordering — depend on it, so it is part of the contract.
+    Selections list every active snapshot (sorted by iteration), then every
+    historical one (also sorted), then every built-in (sorted by name).
+    Positional consumers — the iteration benchmark reconstructs production's
+    temperature/deterministic decode from this ordering, and the wave numbers
+    its frozen-module lanes before its built-in lanes — depend on it, so it is
+    part of the contract.
     """
     if current_iteration < 0:
         raise ValueError("current iteration cannot be negative")
@@ -469,6 +567,13 @@ def select_snapshot_mix(
         raise ValueError("snapshot selection counts cannot be negative")
     if active_pool_size < 1:
         raise ValueError("active pool size must be positive")
+    if builtin_lanes < 0:
+        raise ValueError("built-in lane budget cannot be negative")
+    unknown = sorted(set(builtins) - BUILTIN_OPPONENTS)
+    if unknown:
+        raise ValueError(f"unknown built-in league opponents: {', '.join(unknown)}")
+    if len(set(builtins)) != len(builtins):
+        raise ValueError("built-in league opponents must be distinct")
     eligible_by_iteration: dict[int, SnapshotRef] = {}
     iteration_by_path: dict[Path, int] = {}
     for ref in refs:
@@ -488,16 +593,26 @@ def select_snapshot_mix(
         eligible_by_iteration[ref.iteration] = ref
         iteration_by_path[normalized_path] = ref.iteration
     eligible = sorted(eligible_by_iteration.values())
-    if not eligible:
-        return []
 
     trained = eligible if pretrained_start else [ref for ref in eligible if ref.iteration != 0]
     active_window = trained[-active_pool_size:]
+    active_weights = _pfsp_weights(active_window, score_rates)
+    builtin_refs = [BuiltinRef(name) for name in builtins]
+    drawn_builtins = _contest_builtin_lanes(
+        builtin_refs,
+        min(builtin_lanes, len(builtin_refs)),
+        # What one more snapshot lane is worth, on the same scale, so the
+        # contest compares like with like instead of against the whole window.
+        float(active_weights.mean()) if active_weights.size else 0.0,
+        generator,
+        _pfsp_weights(builtin_refs, score_rates),
+    )
+    released = min(builtin_lanes, len(builtin_refs)) - len(drawn_builtins)
     active = _weighted_sample_without_replacement(
         active_window,
-        active_count,
+        active_count + released,
         generator,
-        _pfsp_weights(active_window, score_rates),
+        active_weights,
     )
     active_iterations = {ref.iteration for ref in active_window}
     historical_candidates = [ref for ref in trained if ref.iteration not in active_iterations]
@@ -509,7 +624,8 @@ def select_snapshot_mix(
         _pfsp_weights(historical_candidates, score_rates),
     )
 
-    selections = []
+    selections: list[LeagueSelection] = []
     selections.extend(SnapshotSelection(ref, "active") for ref in sorted(active))
     selections.extend(SnapshotSelection(ref, "historical") for ref in sorted(historical))
+    selections.extend(BuiltinSelection(ref) for ref in sorted(drawn_builtins))
     return selections

@@ -15,6 +15,18 @@ PRODUCTION_LEAGUE_GAMES = 96
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
 PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 2
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
+# Engine reference agents admitted to the TRAINING league, and the lanes
+# reserved for them. They are here because self-play alone never produced an
+# opponent the learner had to beat from outside its own lineage: the cloned
+# policy loses every game to `starter`, a twenty-eight-line carrot loop, and
+# a league it can only lose to itself cannot notice. The lanes are a ceiling,
+# not a floor -- `select_league_mix` contests each reserved lane against one
+# more snapshot on the shared PFSP weight, so beaten built-ins hand their
+# lanes back to the snapshot strata without anyone editing this constant.
+# Evaluation stays separate: `PRODUCTION_EXTERNAL_EVAL_OPPONENTS` below is a
+# diagnostic probe and shares nothing with these lanes.
+PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter"
+PRODUCTION_LEAGUE_BUILTIN_LANES = 3
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_EVERY = 5
 PRODUCTION_TEMPERATURE = 1.0
@@ -202,6 +214,10 @@ def build_training_command(
             str(PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS),
             "--league-active-pool-size",
             str(PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE),
+            "--league-builtin-opponents",
+            PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
+            "--league-builtin-lanes",
+            str(PRODUCTION_LEAGUE_BUILTIN_LANES),
             "--opponent-temperature",
             str(PRODUCTION_OPPONENT_TEMPERATURE),
             "--episode-steps",

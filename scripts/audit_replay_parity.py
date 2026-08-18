@@ -166,7 +166,7 @@ def _measure(
     # ones stochastic at the opponent temperature and the historical ones
     # deterministic -- which is what training plays from the moment the
     # snapshot archive fills. Iteration zero of a warm start is thinner than
-    # this: `select_snapshot_mix` has only the initial snapshot to draw on and
+    # this: `select_league_mix` has only the initial snapshot to draw on and
     # returns a single active opponent. Auditing the steady state is the right
     # choice because training enforces the same bound at every later audit,
     # and the weights are the actor's own either way.

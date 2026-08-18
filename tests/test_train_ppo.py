@@ -12,6 +12,8 @@ import pytest
 import torch
 
 from kaggriculture.league import (
+    BuiltinRef,
+    BuiltinSelection,
     SnapshotRef,
     SnapshotSelection,
     save_actor_snapshot,
@@ -19,6 +21,7 @@ from kaggriculture.league import (
 )
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import model_config_from_args
+from kaggriculture.ppo import PpoConfig
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, resolve_architecture
 from kaggriculture.structured import StructuredConfig
 
@@ -67,6 +70,60 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
         args.target_kl = rejected
         with pytest.raises(ValueError, match="target KL"):
             module._validate_args(args)
+
+
+def test_built_in_league_flags_reach_selection_and_the_data_provenance(
+    monkeypatch, tmp_path
+) -> None:
+    """A resume that changed which reference agents play is a different data
+    generator, so the setting has to be inside `_training_data_config`."""
+    module = _training_script()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ppo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--league-builtin-opponents",
+            " starter , pass ",
+            "--league-builtin-lanes",
+            "2",
+        ],
+    )
+
+    args = module.parse_args()
+    module._validate_args(args)
+
+    assert module._league_builtin_opponents(args) == ["starter", "pass"]
+    recorded = module._training_data_config(args, torch.device("cpu"))
+    assert recorded["league_builtin_opponents"] == "starter,pass"
+    assert recorded["league_builtin_lanes"] == 2
+
+
+def test_built_in_league_configuration_must_be_admitted_and_reserved_together(
+    monkeypatch, tmp_path
+) -> None:
+    module = _training_script()
+    monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path)])
+    args = module.parse_args()
+
+    args.league_builtin_opponents = "starter"
+    with pytest.raises(ValueError, match="must be set together"):
+        module._validate_args(args)
+
+    args.league_builtin_opponents = ""
+    args.league_builtin_lanes = 2
+    with pytest.raises(ValueError, match="must be set together"):
+        module._validate_args(args)
+
+    args.league_builtin_opponents = "public-v27"
+    with pytest.raises(ValueError, match="unknown built-in"):
+        module._validate_args(args)
+
+    args.league_builtin_opponents = "starter,starter"
+    with pytest.raises(ValueError, match="distinct"):
+        module._validate_args(args)
 
 
 def test_model_flags_are_family_scoped_and_default_to_the_family_configuration(
@@ -156,13 +213,14 @@ def test_balanced_opponent_assignments_are_reproducible_and_nearly_equal() -> No
 def test_league_diagnostics_remain_separate_per_frozen_policy(tmp_path) -> None:
     module = _training_script()
     league = SimpleNamespace(
-        final_money=np.asarray([100.0, 50.0, 80.0, 90.0]),
-        opponent_money=np.asarray([90.0, 60.0, 80.0, 20.0]),
+        final_money=np.asarray([100.0, 50.0, 80.0, 90.0, 200.0, 10.0]),
+        opponent_money=np.asarray([90.0, 60.0, 80.0, 20.0, 30.0, 40.0]),
     )
-    assignments = np.asarray([0, 0, 1, 1])
+    assignments = np.asarray([0, 0, 1, 1, 2, 2])
     selections = [
         SnapshotSelection(SnapshotRef(2, tmp_path / "historical.pt"), "historical"),
         SnapshotSelection(SnapshotRef(9, tmp_path / "active.pt"), "active"),
+        BuiltinSelection(BuiltinRef("starter")),
     ]
 
     diagnostics, measured_rates = module._league_opponent_diagnostics(
@@ -175,7 +233,12 @@ def test_league_diagnostics_remain_separate_per_frozen_policy(tmp_path) -> None:
     assert diagnostics["league_opponent_00000009_category"] == "active"
     assert diagnostics["league_opponent_00000009_games"] == 2
     assert diagnostics["league_opponent_00000009_score_rate"] == 0.75
-    assert measured_rates == {2: 0.5, 9: 0.75}
+    # A built-in earns its own journal series and its own PFSP estimate, which
+    # is what lets it retire from the league on its own measurements.
+    assert diagnostics["league_opponent_builtin_starter_category"] == "builtin"
+    assert diagnostics["league_opponent_builtin_starter_games"] == 2
+    assert diagnostics["league_opponent_builtin_starter_score_rate"] == 0.5
+    assert measured_rates == {"00000002": 0.5, "00000009": 0.75, "builtin_starter": 0.5}
 
 
 def test_disabled_league_selection_does_not_advance_training_rng(tmp_path) -> None:
@@ -185,6 +248,8 @@ def test_disabled_league_selection_does_not_advance_training_rng(tmp_path) -> No
         league_active_opponents=2,
         league_historical_opponents=2,
         league_active_pool_size=16,
+        league_builtin_opponents="pass,random,starter",
+        league_builtin_lanes=3,
     )
     generator = np.random.default_rng(41)
     reference = np.random.default_rng(41)
@@ -200,16 +265,20 @@ def test_league_score_rate_validation_accepts_only_finite_unit_interval_state() 
     module = _training_script()
 
     assert module._validate_league_score_rates({}) == {}
-    assert module._validate_league_score_rates({3: 0.25, 7: 1.0}) == {3: 0.25, 7: 1.0}
+    assert module._validate_league_score_rates({"00000003": 0.25, "builtin_starter": 1.0}) == {
+        "00000003": 0.25,
+        "builtin_starter": 1.0,
+    }
     for invalid in (
         None,
-        [(3, 0.25)],
-        {True: 0.5},
-        {-1: 0.5},
-        {3: 1},
-        {3: float("nan")},
-        {3: 1.5},
-        {3: -0.1},
+        [("00000003", 0.25)],
+        {3: 0.5},
+        {"3": 0.5},
+        {"builtin_v27": 0.5},
+        {"00000003": 1},
+        {"00000003": float("nan")},
+        {"00000003": 1.5},
+        {"00000003": -0.1},
     ):
         with pytest.raises(ValueError):
             module._validate_league_score_rates(invalid)
@@ -217,20 +286,20 @@ def test_league_score_rate_validation_accepts_only_finite_unit_interval_state() 
 
 def test_league_score_rate_blend_seeds_from_prior_and_decays_unmeasured() -> None:
     module = _training_script()
-    rates = {1: 1.0}
+    rates = {"00000001": 1.0}
 
-    module._blend_league_score_rates(rates, {2: 1.0})
+    module._blend_league_score_rates(rates, {"builtin_starter": 1.0})
 
     # A first measurement blends against the unmeasured prior of 0.5, so one
     # perfect wave can never pin an estimate at exactly 1.0 and hard-retire a
     # freshly met opponent.
-    assert rates[2] == pytest.approx(0.75)
+    assert rates["builtin_starter"] == pytest.approx(0.75)
     # Opponents that were not sampled decay toward the prior, keeping
     # retirement provisional instead of permanent.
-    assert rates[1] == pytest.approx(0.975)
+    assert rates["00000001"] == pytest.approx(0.975)
 
-    module._blend_league_score_rates(rates, {2: 0.25})
-    assert rates[2] == pytest.approx(0.5)
+    module._blend_league_score_rates(rates, {"builtin_starter": 0.25})
+    assert rates["builtin_starter"] == pytest.approx(0.5)
 
 
 def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch, tmp_path) -> None:

@@ -21,8 +21,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.league import (
+    LEAGUE_OPPONENT_KEY,
     PFSP_UNMEASURED_SCORE_RATE,
+    BuiltinSelection,
     FrozenActorPool,
+    LeagueSelection,
     SnapshotRef,
     SnapshotSelection,
     copy_actor_snapshot,
@@ -30,12 +33,12 @@ from kaggriculture.league import (
     load_actor_snapshot,
     save_actor_snapshot,
     save_actor_state_snapshot,
-    select_snapshot_mix,
+    select_league_mix,
     snapshot_sha256,
 )
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
-from kaggriculture.opponents import normalize_opponent
+from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
     MAX_FIRST_MINIBATCH_KL,
@@ -91,6 +94,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--league-active-opponents", type=int, default=2)
     parser.add_argument("--league-historical-opponents", type=int, default=2)
     parser.add_argument("--league-active-pool-size", type=int, default=16)
+    parser.add_argument(
+        "--league-builtin-opponents",
+        default="",
+        help="comma-separated engine reference agents admitted to the training league",
+    )
+    parser.add_argument(
+        "--league-builtin-lanes",
+        type=int,
+        default=0,
+        help="league lanes reserved for admitted built-ins; unwon lanes go to snapshots",
+    )
     parser.add_argument("--opponent-temperature", type=float, default=0.8)
     parser.add_argument(
         "--external-eval-every",
@@ -257,15 +271,34 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("league games cannot be negative")
     if args.league_active_opponents < 0 or args.league_historical_opponents < 0:
         raise ValueError("league opponent counts cannot be negative")
-    if args.league_games and not (args.league_active_opponents or args.league_historical_opponents):
-        raise ValueError("league games require at least one active or historical opponent")
+    if args.league_builtin_lanes < 0:
+        raise ValueError("league built-in lane budget cannot be negative")
+    builtins = _league_builtin_opponents(args)
+    unknown = sorted(set(builtins) - BUILTIN_OPPONENTS)
+    if unknown:
+        raise ValueError(f"unknown built-in league opponents: {', '.join(unknown)}")
+    if len(set(builtins)) != len(builtins):
+        raise ValueError("built-in league opponents must be distinct")
+    # A reserved lane with nothing admitted to fill it is silently nothing, and
+    # admitted agents with no reserved lane never play. Either is a launch
+    # command that does not mean what it says.
+    if bool(builtins) != bool(args.league_builtin_lanes):
+        raise ValueError(
+            "--league-builtin-opponents and --league-builtin-lanes must be set together"
+        )
+    configured_opponents = (
+        args.league_active_opponents
+        + args.league_historical_opponents
+        + min(args.league_builtin_lanes, len(builtins))
+    )
+    if args.league_games and not configured_opponents:
+        raise ValueError("league games require at least one active, historical, or built-in lane")
     if args.external_eval_every < 0 or (args.external_eval_every and args.external_eval_seeds < 1):
         raise ValueError("external evaluation needs a non-negative cadence and positive seeds")
-    configured_opponents = args.league_active_opponents + args.league_historical_opponents
     if args.league_games and args.league_games < configured_opponents:
         raise ValueError(
             "league games must cover the initial anchor and every configured "
-            f"active/historical opponent ({configured_opponents})"
+            f"active/historical/built-in lane ({configured_opponents})"
         )
     if not math.isfinite(args.opponent_temperature) or args.opponent_temperature <= 0.0:
         raise ValueError("opponent temperature must be finite and positive")
@@ -758,32 +791,30 @@ def _validate_parity_baseline(
     return validated
 
 
-def _validate_league_score_rates(rates: object) -> dict[int, float]:
+def _validate_league_score_rates(rates: object) -> dict[str, float]:
     if not isinstance(rates, dict):
         raise ValueError("resume checkpoint has no valid league score-rate state")
-    validated: dict[int, float] = {}
-    for iteration, rate in rates.items():
-        if type(iteration) is not int or iteration < 0:
-            raise ValueError("resume checkpoint has an invalid league score-rate iteration")
+    validated: dict[str, float] = {}
+    for key, rate in rates.items():
+        if type(key) is not str or LEAGUE_OPPONENT_KEY.fullmatch(key) is None:
+            raise ValueError("resume checkpoint has an invalid league score-rate opponent")
         if type(rate) is not float or not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
             raise ValueError("resume checkpoint has an invalid league score rate")
-        validated[iteration] = rate
+        validated[key] = rate
     return validated
 
 
 def _blend_league_score_rates(
-    score_rates: dict[int, float],
-    measured: dict[int, float],
+    score_rates: dict[str, float],
+    measured: dict[str, float],
 ) -> None:
     """Fold this iteration's measurements into the persistent PFSP estimates."""
-    for iteration, rate in measured.items():
-        previous = score_rates.get(iteration, PFSP_UNMEASURED_SCORE_RATE)
-        score_rates[iteration] = (
-            LEAGUE_SCORE_RATE_EMA * rate + (1.0 - LEAGUE_SCORE_RATE_EMA) * previous
-        )
-    for iteration in score_rates.keys() - measured.keys():
-        previous = score_rates[iteration]
-        score_rates[iteration] = previous + LEAGUE_SCORE_RATE_DECAY * (
+    for key, rate in measured.items():
+        previous = score_rates.get(key, PFSP_UNMEASURED_SCORE_RATE)
+        score_rates[key] = LEAGUE_SCORE_RATE_EMA * rate + (1.0 - LEAGUE_SCORE_RATE_EMA) * previous
+    for key in score_rates.keys() - measured.keys():
+        previous = score_rates[key]
+        score_rates[key] = previous + LEAGUE_SCORE_RATE_DECAY * (
             PFSP_UNMEASURED_SCORE_RATE - previous
         )
 
@@ -791,10 +822,10 @@ def _blend_league_score_rates(
 def _league_opponent_diagnostics(
     league: RolloutBatch,
     assignments: np.ndarray,
-    selections: list[SnapshotSelection],
-) -> tuple[dict[str, float | int | str], dict[int, float]]:
+    selections: list[LeagueSelection],
+) -> tuple[dict[str, float | int | str], dict[str, float]]:
     diagnostics: dict[str, float | int | str] = {}
-    score_rates: dict[int, float] = {}
+    score_rates: dict[str, float] = {}
     margins = league.final_money - league.opponent_money
     outcomes = (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
     for index, selection in enumerate(selections):
@@ -804,13 +835,13 @@ def _league_opponent_diagnostics(
             # An unplayed opponent has no measurement; emitting one would put
             # a NaN into the journal and poison the PFSP estimates.
             continue
-        prefix = f"league_opponent_{selection.ref.iteration:08d}"
+        prefix = f"league_opponent_{selection.key}"
         score_rate = float(((outcomes[selected] + 1.0) / 2.0).mean())
         diagnostics[f"{prefix}_category"] = selection.category
         diagnostics[f"{prefix}_games"] = games
         diagnostics[f"{prefix}_score_rate"] = score_rate
         diagnostics[f"{prefix}_mean_margin"] = float(margins[selected].mean())
-        score_rates[selection.ref.iteration] = score_rate
+        score_rates[selection.key] = score_rate
     return diagnostics, score_rates
 
 
@@ -899,25 +930,34 @@ def _maybe_launch_external_eval(
         return process
 
 
+def _league_builtin_opponents(args: argparse.Namespace) -> list[str]:
+    """Names admitted to the training league, in launch-command order."""
+    return [
+        name for name in (name.strip() for name in args.league_builtin_opponents.split(",")) if name
+    ]
+
+
 def _select_league_opponents(
     args: argparse.Namespace,
     refs: Sequence[SnapshotRef],
     iteration: int,
     generator: np.random.Generator,
-    score_rates: dict[int, float],
+    score_rates: dict[str, float],
     *,
     pretrained_start: bool,
-) -> list[SnapshotSelection]:
+) -> list[LeagueSelection]:
     """Select a bounded opponent mix without consuming RNG when league play is off."""
     if not args.league_games:
         return []
-    selections = select_snapshot_mix(
+    selections = select_league_mix(
         refs,
         current_iteration=max(1, iteration),
         active_count=args.league_active_opponents,
         historical_count=args.league_historical_opponents,
         active_pool_size=args.league_active_pool_size,
         generator=generator,
+        builtins=_league_builtin_opponents(args),
+        builtin_lanes=args.league_builtin_lanes,
         score_rates=score_rates,
         pretrained_start=pretrained_start,
     )
@@ -934,6 +974,11 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "league_active_opponents": args.league_active_opponents,
         "league_historical_opponents": args.league_historical_opponents,
         "league_active_pool_size": args.league_active_pool_size,
+        # Which reference agents share the wave, and how many lanes they may
+        # hold, decide what the learner plays against; a resume that changed
+        # either would be generating different data under the same run.
+        "league_builtin_opponents": ",".join(_league_builtin_opponents(args)),
+        "league_builtin_lanes": args.league_builtin_lanes,
         "opponent_temperature": args.opponent_temperature,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
@@ -1242,7 +1287,7 @@ def main() -> None:
     # checkpoint: opponent selection consumes RNG as a function of these
     # estimates, so a resume that reset them would diverge from the
     # uninterrupted run's entire downstream RNG stream.
-    league_score_rates: dict[int, float] = {}
+    league_score_rates: dict[str, float] = {}
     # The most recent audit's per-head measurements, which is what a later
     # breach is judged a defect or drift against. Persisted because the
     # judgement is a comparison across audits, and a run long enough to drift
@@ -1469,24 +1514,31 @@ def main() -> None:
         )
         league_games = args.league_games if selections else 0
         if league_games:
-            opponents = opponent_pool.acquire([selection.ref.path for selection in selections])
+            # The selection's contract puts every snapshot lane before every
+            # built-in lane, which is exactly the lane index space the wave
+            # addresses: frozen modules first, built-ins after them.
+            snapshots = [row for row in selections if isinstance(row, SnapshotSelection)]
+            builtin_lanes = [
+                row.ref.name for row in selections if isinstance(row, BuiltinSelection)
+            ]
+            opponents = opponent_pool.acquire([row.ref.path for row in snapshots])
             assignments = _balanced_assignments(
                 league_games,
-                len(opponents),
+                len(selections),
                 generator,
             )
             opponent_temperatures = np.asarray(
                 [
                     args.opponent_temperature if row.category == "active" else 1.0
-                    for row in selections
+                    for row in snapshots
                 ],
                 dtype=np.float32,
             )
             deterministic_opponents = np.asarray(
-                [row.category != "active" for row in selections],
+                [row.category != "active" for row in snapshots],
                 dtype=np.bool_,
             )
-            opponent_checkpoint = ",".join(row.ref.path.name for row in selections)
+            opponent_checkpoint = ",".join(row.label for row in selections)
         # Self-play and league games advance in one native wave, so the
         # learner forward covers every current-policy row at once and the
         # collector writes straight into the shared arena.
@@ -1496,6 +1548,7 @@ def main() -> None:
             self_play_games=args.games,
             league_games=league_games,
             opponent_indices=assignments if league_games else None,
+            builtin_lanes=builtin_lanes if league_games else (),
             seed_start=next_seed,
             episode_steps=args.episode_steps,
             temperature=args.temperature,
