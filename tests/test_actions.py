@@ -222,7 +222,74 @@ def test_pickup_masks_and_compilation_reserve_stock_sequentially() -> None:
     compiled = compile_action(observation, units, kinds, quantities)
 
     assert compiled["farmer"] == ["PICKUP", "FERTILIZER", 4]
-    assert compiled["hands"] == [["PICKUP", "FERTILIZER", 2], ["PASS"]]
+    # The third unit asked for two of the one the first two left. The engine
+    # clamps a pickup to the stock rather than refusing it, so the shortfall
+    # costs one unit of fertilizer and not the whole action.
+    assert compiled["hands"] == [["PICKUP", "FERTILIZER", 2], ["PICKUP", "FERTILIZER", 1]]
+
+
+def test_partial_pickup_matches_official_engine() -> None:
+    """Two units asking for six of a five-unit stock both come away holding."""
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    state = environment.reset(2)
+    observation = state[0].observation
+    observation["farms"][0]["hands"] = [list(observation["farms"][0]["farmer"])]
+    observation["private"]["inventories"].append({})
+    observation["private"]["shed"]["WHEAT"] = 5
+    units = np.full(MAX_UNITS, UnitAction.PASS, dtype=np.int64)
+    units[:2] = (UnitAction.PICKUP_WHEAT_2, UnitAction.PICKUP_WHEAT_4)
+    kinds = np.full(MAX_MARKET_ORDERS, MarketKind.STOP, dtype=np.int64)
+    quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int64)
+
+    compiled = compile_action(observation, units, kinds, quantities)
+    following = environment.step([compiled, {}])[0].observation
+
+    assert compiled["farmer"] == ["PICKUP", "WHEAT", 2]
+    assert compiled["hands"] == [["PICKUP", "WHEAT", 3]]
+    assert following["private"]["shed"].get("WHEAT", 0) == 0
+    assert following["private"]["inventories"][0]["WHEAT"] == 2
+    assert following["private"]["inventories"][1]["WHEAT"] == 3
+
+
+def test_official_engine_clamps_an_oversized_pickup_rather_than_refusing() -> None:
+    """The reference rule both engines mirror, asked of the reference directly.
+
+    Pinned here because a mask that instead demanded the full requested quantity
+    reads as merely conservative while silently converting the action to PASS,
+    and nothing in our own code can reveal which of the two the engine does.
+    """
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    state = environment.reset(2)
+    state[0].observation["private"]["shed"]["WHEAT"] = 3
+    action = {"farmer": ["PICKUP", "WHEAT", 4], "hands": [], "market": []}
+
+    following = environment.step([action, {}])[0].observation
+
+    assert following["private"]["shed"].get("WHEAT", 0) == 0
+    assert following["private"]["inventories"][0]["WHEAT"] == 3
+
+
+def test_official_engine_blocks_every_plant_when_demand_exceeds_seeds() -> None:
+    """Planting is all-or-none per crop, not first-come.
+
+    Two requests against one seed plant nothing and spend nothing. Sequential
+    reservation, which serves the first request, is what our own compiler does
+    to the policy's factors, and it only agrees with the engine because masked
+    sampling never asks for more plants of a crop than it holds seeds for.
+    """
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    state = environment.reset(2)
+    observation = state[0].observation
+    position = list(observation["farms"][0]["farmer"])
+    observation["farms"][0]["hands"] = [position]
+    observation["private"]["inventories"].append({})
+    observation["private"]["seeds"]["WHEAT"] = 1
+    action = {"farmer": ["PLANT", "WHEAT"], "hands": [["PLANT", "WHEAT"]], "market": []}
+
+    following = environment.step([action, {}])[0].observation
+
+    assert following["private"]["seeds"]["WHEAT"] == 1
+    assert following["farms"][0]["tiles"][position[1]][position[0]] is None
 
 
 def test_compiler_allows_build_then_place_on_same_turn() -> None:

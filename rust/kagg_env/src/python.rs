@@ -4,8 +4,9 @@ use crate::core::{
     MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS, PRODUCT_TOKEN_FIELDS,
     PRODUCTS, PyRandom, SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS,
     TOWN_TOKEN_FIELDS, UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES,
-    UNIT_GATHERS,
+    UNIT_GATHERS, V27State,
 };
+use crate::v27_script::{V27_SOURCE_NAME, V27_SOURCE_SHA256, V27_STEPS};
 use half::f16;
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
@@ -27,6 +28,11 @@ pub(crate) struct BatchEnv {
     /// path so the next step's previous potential is a carry-forward instead
     /// of a recomputed liquidation walk.
     potential_cache: Vec<f32>,
+    /// Per-seat memory for the scripted v27 opponent, one row per game seat in
+    /// the same order as `sampled_scratch`. It needs no reset hook: the agent
+    /// clears its own row when the step index restarts, exactly as the
+    /// reference's module-level state does.
+    v27_states: Vec<V27State>,
 }
 
 #[pymethods]
@@ -49,6 +55,7 @@ impl BatchEnv {
                 .collect(),
             results_scratch: vec![StepResult::default(); games.len()],
             potential_cache: games.iter().map(Game::pair_potential).collect(),
+            v27_states: vec![V27State::default(); games.len() * PLAYERS],
             games,
         })
     }
@@ -220,8 +227,12 @@ impl BatchEnv {
     /// The built-in reference agents' actions for the current state, without
     /// stepping, in the same row order as `sample_and_step_into`. A row whose
     /// code is 0 comes back as an all-PASS action: this path never samples.
+    /// Exactly one call per step is required for the scripted v27 rows: that
+    /// agent advances its weed repair as a side effect, and the reference is
+    /// not idempotent within a step either -- a second call at the same step
+    /// sees age zero and abandons the repair it had just begun.
     fn builtin_actions<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         builtin_agents: PyReadonlyArray1<'py, u8>,
     ) -> PyResult<Bound<'py, PyDict>> {
@@ -235,11 +246,18 @@ impl BatchEnv {
         let mut units = Vec::with_capacity(rows * MAX_UNITS);
         let mut kinds = Vec::with_capacity(rows * MAX_MARKET_ORDERS);
         let mut quantities = Vec::with_capacity(rows * MAX_MARKET_ORDERS);
+        let games = &self.games;
+        let v27_states = &mut self.v27_states;
         for (row, &code) in codes.iter().enumerate() {
-            let game = &self.games[row / PLAYERS];
+            let game = &games[row / PLAYERS];
             let player = row % PLAYERS;
             let action = match BuiltinAgent::from_code(code).expect("codes are validated above") {
-                Some(agent) => game.builtin_action(player, agent, &mut builtin_rng(game, player)),
+                Some(agent) => game.builtin_action(
+                    player,
+                    agent,
+                    &mut builtin_rng(game, player),
+                    &mut v27_states[row],
+                ),
                 None => CompactAction::default(),
             };
             units.extend(action.units);
@@ -469,11 +487,13 @@ impl BatchEnv {
         {
             let games = &self.games;
             let sampled = &mut self.sampled_scratch;
+            let v27_states = &mut self.v27_states;
             py.detach(|| {
                 sampled
                     .par_iter_mut()
+                    .zip(v27_states.par_iter_mut())
                     .enumerate()
-                    .for_each(|(row, output)| {
+                    .for_each(|(row, (output, v27_state))| {
                         let game = &games[row / PLAYERS];
                         let player = row % PLAYERS;
                         // A nonzero code only ever lands on a frozen opponent's
@@ -484,8 +504,12 @@ impl BatchEnv {
                         let builtin = BuiltinAgent::from_code(builtin_agents[row])
                             .expect("codes are validated above");
                         if let Some(agent) = builtin {
-                            let action =
-                                game.builtin_action(player, agent, &mut builtin_rng(game, player));
+                            let action = game.builtin_action(
+                                player,
+                                agent,
+                                &mut builtin_rng(game, player),
+                                v27_state,
+                            );
                             output.masks = game.factor_masks(player, &action);
                             output.action = action;
                             // The row's action never passed through the network,
@@ -1275,7 +1299,7 @@ fn validate_builtin_agents(codes: &[u8]) -> PyResult<()> {
         .find(|&&code| BuiltinAgent::from_code(code).is_err())
     {
         return Err(PyValueError::new_err(format!(
-            "builtin_agents contains unknown agent code {code}, expected 0..=3"
+            "builtin_agents contains unknown agent code {code}, expected 0..=4"
         )));
     }
     Ok(())
@@ -1414,5 +1438,12 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("N_UNIT_ACTIONS", UNIT_ACTIONS)?;
     module.add("N_MARKET_KINDS", MARKET_KINDS)?;
     module.add("N_QUANTITIES", MARKET_QUANTITIES)?;
+    // The scripted v27 built-in replays a table compiled from one exact agent
+    // file. Publishing that file's digest lets a parity audit prove it is
+    // comparing the native port against the very bytes it was built from,
+    // rather than against a copy that has since moved.
+    module.add("V27_SOURCE_SHA256", V27_SOURCE_SHA256)?;
+    module.add("V27_SOURCE_NAME", V27_SOURCE_NAME)?;
+    module.add("V27_STEPS", V27_STEPS)?;
     Ok(())
 }

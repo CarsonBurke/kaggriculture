@@ -3,6 +3,7 @@
 mod core;
 mod python;
 mod rng;
+mod v27_script;
 
 pub use core::*;
 

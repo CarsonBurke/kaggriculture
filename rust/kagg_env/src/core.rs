@@ -1,4 +1,5 @@
 pub use crate::rng::PyRandom;
+use crate::v27_script::{V27_SCRIPT, V27_STEPS};
 use serde::Serialize;
 
 pub const PLAYERS: usize = 2;
@@ -95,6 +96,24 @@ const ANIMAL_PRODUCT: [usize; ANIMALS] = [5, 6, 7];
 const LAND_PRICES: [i64; 3] = [1000, 2000, 4000];
 const PRICE_FLOOR: i64 = 1;
 const MARKET_I0: i32 = 10_000;
+
+// The scripted v27 opponent. Unit and market codes are written as literals to
+// match the surrounding built-ins, with the name each one decodes to.
+/// Steps the reference trails the script by after digging a weed out.
+const V27_WEED_REPLAY_STEPS: i32 = 8;
+/// BUILD_PASTURE and the five PLANT actions: the only intents it repairs.
+const V27_REPAIRED_ACTIONS: [u8; 6] = [55, 45, 46, 47, 48, 49];
+/// DIG.
+const V27_DIG: u8 = 53;
+/// SELL_WHEAT, the first of the nine consecutive sell kinds.
+const V27_SELL_FIRST: u8 = 13;
+/// FERTILIZER, the one product the town center does not buy.
+const V27_FERTILIZER: usize = 8;
+/// Town-center interval at or above which the reference takes its "rebalance"
+/// branch and scales a sale's score by how overstocked the item is.
+const V27_REBALANCE_INTERVAL: u16 = 24;
+/// Weight the rebalance branch gives that overstock urgency.
+const V27_DEMAND_ALPHA: f64 = 0.25;
 
 // Illiquid cost-basis credit fractions for the shaping potential.  Kept near
 // engine cost so buying an asset is only a small potential dip: a deep dip
@@ -274,15 +293,24 @@ impl Default for CompactAction {
 
 /// A built-in reference agent from `kaggle_environments`, ported so the league
 /// can field it inside the batched wave instead of only at evaluation time.
+///
+/// `ScriptedV27` is not from `kaggle_environments`: it is the public
+/// `public-v27` agent, whose whole plan is a hardcoded action per step. It
+/// earns its place here because it is the strength the leaderboard actually
+/// fields, and training against our own lineage instead taught a strategy that
+/// only beats other neural policies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinAgent {
     Pass,
     Random,
     Starter,
+    ScriptedV27,
 }
 
 impl BuiltinAgent {
-    /// 0 => None (sample from the network); 1 => Pass, 2 => Random, 3 => Starter.
+    /// 0 => None (sample from the network); 1 => Pass, 2 => Random,
+    /// 3 => Starter, 4 => ScriptedV27. The codes are
+    /// `opponents.BUILTIN_AGENT_ORDER`'s index plus one.
     #[allow(clippy::result_unit_err)]
     pub fn from_code(code: u8) -> Result<Option<Self>, ()> {
         match code {
@@ -290,7 +318,43 @@ impl BuiltinAgent {
             1 => Ok(Some(Self::Pass)),
             2 => Ok(Some(Self::Random)),
             3 => Ok(Some(Self::Starter)),
+            4 => Ok(Some(Self::ScriptedV27)),
             _ => Err(()),
+        }
+    }
+
+    /// Whether this agent carries memory between steps, so a caller that must
+    /// hand out per-seat state knows which rows need it.
+    pub fn is_stateful(self) -> bool {
+        matches!(self, Self::ScriptedV27)
+    }
+}
+
+/// The scripted v27 opponent's per-seat memory.
+///
+/// Its weed repair is the only part of that agent which remembers anything: on
+/// finding a WEED under a unit it was told to PLANT or BUILD_PASTURE on, it
+/// digs instead, performs the intended action one step later, and then trails
+/// the script by one step for eight more steps before rejoining it.
+///
+/// The reference keeps this in a module-level dict keyed by seat and clears it
+/// whenever the step index restarts or moves backwards. Mirroring that rule
+/// exactly is what lets a fresh episode need no external reset here.
+#[derive(Clone, Copy, Debug)]
+pub struct V27State {
+    last_step: i32,
+    /// Step the repair began on, or -1 when this unit is not repairing.
+    repair_start: [i32; MAX_UNITS],
+    /// Action the script asked for, replayed one step after the dig.
+    repair_intended: [u8; MAX_UNITS],
+}
+
+impl Default for V27State {
+    fn default() -> Self {
+        Self {
+            last_step: -1,
+            repair_start: [-1; MAX_UNITS],
+            repair_intended: [0; MAX_UNITS],
         }
     }
 }
@@ -383,65 +447,96 @@ impl UnitLedger {
     }
 
     fn action_valid(&self, unit: usize, action: u8, day: u16) -> bool {
-        if action >= UNIT_ACTIONS as u8 || unit >= usize::from(self.farm.units) {
-            return false;
-        }
-        if action == 0 {
-            return true;
-        }
-        let position = self.farm.positions[unit];
-        let x = usize::from(position.0);
-        let y = usize::from(position.1);
-        if let Some((dx, dy)) = move_delta(action) {
-            let nx = x as i16 + dx;
-            let ny = y as i16 + dy;
-            return (0..BOARD_SIZE as i16).contains(&nx) && (0..BOARD_SIZE as i16).contains(&ny);
-        }
-        let at_shed = is_shed_access(x, y);
-        if action == 5 {
-            return at_shed
-                && self.shed_total() < self.config.shed_capacity
-                && self.private.inventories[unit]
-                    .iter()
-                    .any(|&quantity| quantity > 0);
-        }
-        if let Some((item, quantity)) = pickup_spec(action) {
-            return at_shed && self.private.shed[item] >= quantity;
-        }
-        let tile = self.farm.tiles[y * BOARD_SIZE + x];
-        if let Some(animal) = place_animal(action) {
-            let has_animal = self.private.inventories[unit][9 + animal] > 0;
-            let installs_animal = tile.kind == animal_structure(animal) && !tile.has_animal;
-            let deposits_animal = at_shed && self.shed_total() < self.config.shed_capacity;
-            return has_animal && (installs_animal || deposits_animal);
-        }
-        if tile.kind == TileKind::Locked {
-            return false;
-        }
-        if let Some(crop) = unit_plant_crop(action) {
-            return tile.kind == TileKind::Empty && self.private.seeds[crop] > 0;
-        }
-        match action {
-            50 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
-            51 if tile.kind == TileKind::Plant => {
-                tile.yield_units > 0
-                    && day.saturating_sub(tile.origin_day) >= FIRST_YIELD[usize::from(tile.species)]
-            }
-            51 => tile.has_animal && tile.yield_units > 0,
-            52 => {
-                tile.kind == TileKind::Plant
-                    && self.private.inventories[unit][8] > 0
-                    && tile.fertilized_until_day < day as i16 + 2
-            }
-            53 => tile.kind != TileKind::Empty && !tile.has_animal,
-            54 | 55 => tile.kind == TileKind::Empty,
-            56 => tile.has_animal && !tile.watered_or_fed && self.private.inventories[unit][0] > 0,
-            57 => tile.has_animal && tile.fertilizer_available,
-            58 => tile.has_animal && !tile.cared_today,
-            _ => false,
-        }
+        unit_action_is_valid(&self.farm, &self.private, &self.config, unit, action, day)
     }
+}
 
+/// Whether one unit action can have an effect, from the engine's own rules.
+///
+/// Borrowed rather than a method on either holder because both the mask ledger
+/// and `Game` need it: the ledger clones a farm per sequential reservation,
+/// which `Game::unit_action_valid` cannot afford per unit per step, and the
+/// hand-copied second version that used to serve it drifted -- it kept
+/// requiring a pickup's full quantity after the ledger stopped.
+fn unit_action_is_valid(
+    farm: &Farm,
+    private: &PrivateState,
+    config: &GameConfig,
+    unit: usize,
+    action: u8,
+    day: u16,
+) -> bool {
+    if action >= UNIT_ACTIONS as u8 || unit >= usize::from(farm.units) {
+        return false;
+    }
+    if action == 0 {
+        return true;
+    }
+    let position = farm.positions[unit];
+    let x = usize::from(position.0);
+    let y = usize::from(position.1);
+    if let Some((dx, dy)) = move_delta(action) {
+        let nx = x as i16 + dx;
+        let ny = y as i16 + dy;
+        return (0..BOARD_SIZE as i16).contains(&nx) && (0..BOARD_SIZE as i16).contains(&ny);
+    }
+    let at_shed = is_shed_access(x, y);
+    if action == 5 {
+        return at_shed
+            && shed_total(private) < config.shed_capacity
+            && private.inventories[unit]
+                .iter()
+                .any(|&quantity| quantity > 0);
+    }
+    if let Some((item, _)) = pickup_spec(action) {
+        // The engine clamps a pickup to what the shed holds rather than refusing
+        // it (kaggriculture.py:357), so any nonzero stock makes the action
+        // effective. Requiring the full requested quantity made a partially
+        // fillable pickup illegal and `step` then turned it into PASS: two units
+        // wanting 2 and 4 of a 5-unit stock left the second with nothing where
+        // the reference engine hands it the remaining 3.
+        return at_shed && private.shed[item] > 0;
+    }
+    let tile = farm.tiles[y * BOARD_SIZE + x];
+    if let Some(animal) = place_animal(action) {
+        let has_animal = private.inventories[unit][9 + animal] > 0;
+        let installs_animal = tile.kind == animal_structure(animal) && !tile.has_animal;
+        let deposits_animal = at_shed && shed_total(private) < config.shed_capacity;
+        return has_animal && (installs_animal || deposits_animal);
+    }
+    if tile.kind == TileKind::Locked {
+        return false;
+    }
+    if let Some(crop) = unit_plant_crop(action) {
+        return tile.kind == TileKind::Empty && private.seeds[crop] > 0;
+    }
+    match action {
+        50 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
+        51 if tile.kind == TileKind::Plant => {
+            tile.yield_units > 0
+                && day.saturating_sub(tile.origin_day) >= FIRST_YIELD[usize::from(tile.species)]
+        }
+        51 => tile.has_animal && tile.yield_units > 0,
+        52 => {
+            tile.kind == TileKind::Plant
+                && private.inventories[unit][8] > 0
+                && tile.fertilized_until_day < day as i16 + 2
+        }
+        53 => tile.kind != TileKind::Empty && !tile.has_animal,
+        54 | 55 => tile.kind == TileKind::Empty,
+        56 => tile.has_animal && !tile.watered_or_fed && private.inventories[unit][0] > 0,
+        57 => tile.has_animal && tile.fertilizer_available,
+        58 => tile.has_animal && !tile.cared_today,
+        _ => false,
+    }
+}
+
+/// Goods held in one shed, the quantity every capacity rule is written against.
+fn shed_total(private: &PrivateState) -> u16 {
+    private.shed.iter().sum()
+}
+
+impl UnitLedger {
     fn apply_action(&mut self, unit: usize, action: u8, day: u16) {
         if action >= UNIT_ACTIONS as u8 || unit >= usize::from(self.farm.units) {
             return;
@@ -539,7 +634,7 @@ impl UnitLedger {
     }
 
     fn shed_total(&self) -> u16 {
-        self.private.shed.iter().sum()
+        shed_total(&self.private)
     }
 
     fn add_inventory(&mut self, unit: usize, item: usize, amount: u16) {
@@ -1072,6 +1167,7 @@ impl Game {
         player: usize,
         agent: BuiltinAgent,
         rng: &mut PyRandom,
+        v27: &mut V27State,
     ) -> CompactAction {
         match agent {
             // Unit action 0 is PASS and market kind 0 is STOP, so the default
@@ -1079,7 +1175,159 @@ impl Game {
             BuiltinAgent::Pass => CompactAction::default(),
             BuiltinAgent::Random => self.random_agent_action(player, rng),
             BuiltinAgent::Starter => self.starter_agent_action(player),
+            BuiltinAgent::ScriptedV27 => self.scripted_v27_action(player, v27),
         }
+    }
+
+    /// The public v27 agent: replay this step's scripted action, repair weeds,
+    /// then reorder the sell slots the way it does.
+    ///
+    /// The script is indexed by the clamped step exactly as the reference
+    /// clamps it, so an episode running past the table's end repeats its last
+    /// entry rather than falling off.
+    fn scripted_v27_action(&self, player: usize, state: &mut V27State) -> CompactAction {
+        let step = usize::from(self.step).min(V27_STEPS - 1);
+        let now = step as i32;
+        if now == 0 || now < state.last_step {
+            *state = V27State::default();
+        }
+        state.last_step = now;
+
+        let farm = &self.farms[player];
+        let active = usize::from(farm.units).min(MAX_UNITS);
+        let scripted = &V27_SCRIPT[step];
+        let mut action = CompactAction::default();
+        // Slots past the live unit count stay PASS, which is what the
+        // reference's `_align_hands` leaves behind after truncating.
+        action.units[..active].copy_from_slice(&scripted.units[..active]);
+
+        // Repairs already in flight. A unit that no longer exists drops its
+        // repair, matching the reference's length check.
+        for unit in 0..MAX_UNITS {
+            if state.repair_start[unit] < 0 {
+                continue;
+            }
+            if unit >= active {
+                state.repair_start[unit] = -1;
+                continue;
+            }
+            let age = now - state.repair_start[unit];
+            if age == 1 {
+                action.units[unit] = state.repair_intended[unit];
+            } else if (2..=1 + V27_WEED_REPLAY_STEPS).contains(&age) {
+                // Age at least two means the previous step exists.
+                action.units[unit] = V27_SCRIPT[step - 1].units[unit];
+            } else {
+                state.repair_start[unit] = -1;
+            }
+        }
+
+        // New weeds, judged against the actions the repairs above just wrote.
+        for unit in 0..active {
+            if state.repair_start[unit] >= 0 {
+                continue;
+            }
+            let intended = action.units[unit];
+            if !V27_REPAIRED_ACTIONS.contains(&intended) {
+                continue;
+            }
+            let Position(x, y) = farm.positions[unit];
+            let tile = &farm.tiles[usize::from(y) * BOARD_SIZE + usize::from(x)];
+            if tile.kind != TileKind::Weed {
+                continue;
+            }
+            state.repair_start[unit] = now;
+            state.repair_intended[unit] = intended;
+            action.units[unit] = V27_DIG;
+        }
+
+        action.market_kinds = scripted.market_kinds;
+        action.market_quantities = scripted.market_quantities;
+        self.rank_v27_sell_slots(&mut action);
+        action
+    }
+
+    /// Reorder the scripted sell orders across the same slots, best first.
+    ///
+    /// The reference sorts by the dollars a sale would knock off its own quote
+    /// and rewrites only the sell slots, leaving every other order where the
+    /// script put it. Order matters because the engine executes the slots in
+    /// sequence and each sale moves the price the next one gets.
+    fn rank_v27_sell_slots(&self, action: &mut CompactAction) {
+        let mut slots = [0usize; MAX_MARKET_ORDERS];
+        let mut count = 0;
+        for slot in 0..MAX_MARKET_ORDERS {
+            let kind = action.market_kinds[slot];
+            if (V27_SELL_FIRST..V27_SELL_FIRST + PRODUCTS as u8).contains(&kind) {
+                slots[count] = slot;
+                count += 1;
+            }
+        }
+        if count < 2 {
+            return;
+        }
+        let mut scored = [(0.0f64, 0usize); MAX_MARKET_ORDERS];
+        for rank in 0..count {
+            let slot = slots[rank];
+            let item = usize::from(action.market_kinds[slot] - V27_SELL_FIRST);
+            let quantity = i32::from(action.market_quantities[slot]) + 1;
+            scored[rank] = (self.v27_order_score(item, quantity), slot);
+        }
+        let ranked = &mut scored[..count];
+        // Ties keep the script's own slot order, as the reference's `-index`
+        // secondary key does.
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .expect("order scores are finite")
+                .then(left.1.cmp(&right.1))
+        });
+        let kinds: [u8; MAX_MARKET_ORDERS] = action.market_kinds;
+        let quantities: [u8; MAX_MARKET_ORDERS] = action.market_quantities;
+        for (rank, &slot) in slots[..count].iter().enumerate() {
+            let source = ranked[rank].1;
+            action.market_kinds[slot] = kinds[source];
+            action.market_quantities[slot] = quantities[source];
+        }
+    }
+
+    /// Dollars this sale would give up, scaled by how overstocked the item is.
+    fn v27_order_score(&self, item: usize, quantity: i32) -> f64 {
+        let inventory = self.market_inventory[item];
+        let current = self.market_prices[item] as f64;
+        let later = market_price(item, inventory + quantity) as f64;
+        let impact = f64::from(quantity) * (current - later).max(0.0);
+        // Outside the rebalance regime the reference stops here, and the whole
+        // demand walk below is dead code in that configuration.
+        if self.config.town_center_sell_interval < V27_REBALANCE_INTERVAL || impact <= 0.0 {
+            return impact;
+        }
+        let demand = self.v27_demand_per_day(item).max(0.25);
+        let excess = f64::from((inventory + quantity - MARKET_I0).max(0));
+        let urgency = ((excess / demand) / 10.0).min(1.0);
+        impact * (1.0 + V27_DEMAND_ALPHA * urgency)
+    }
+
+    /// Units of `item` the town consumes per day at the current unlock state.
+    fn v27_demand_per_day(&self, item: usize) -> f64 {
+        let turns = f64::from(self.config.turns_per_day);
+        let shop_interval = f64::from(self.config.shop_sell_interval.max(1));
+        let mut demand = 0.0;
+        for &shop in &self.shops[..usize::from(self.shop_count)] {
+            let products = SHOP_PRODUCTS[usize::from(shop)];
+            if products.contains(&item) {
+                let multiplier = if products.len() == 1 { 2.0 } else { 1.0 };
+                demand += (turns / shop_interval) * multiplier;
+            }
+        }
+        if item != V27_FERTILIZER {
+            let center = f64::from(self.config.town_center_sell_interval.max(1));
+            // The rebalance regime's day multiplier is a flat one, so the
+            // reference never consults the day here.
+            demand += turns / center;
+        }
+        demand
     }
 
     /// A uniform operation per unit, sprinkled with seed buys and plants.
@@ -1428,82 +1676,42 @@ impl Game {
 
     fn apply_unit_actions(&mut self, player: usize, actions: &CompactAction, day: u16) {
         let units = usize::from(self.farms[player].units);
+        // The interpreter counts every PLANT request for a crop before applying
+        // any of them and drops all of them when the total exceeds the seeds held
+        // at the start of the turn (kaggriculture.py:907-920). Sequential
+        // reservation, which lets the first plant through, is what `compile_action`
+        // does to the policy's own factors -- and because masked sampling never
+        // requests more plants of a crop than it holds seeds, this rule is vacuous
+        // for the learner and decides only agents that submit a raw dict, such as
+        // the ported built-ins.
+        let mut demand = [0u16; CROPS];
         for unit in 0..units {
-            // `step_factors` receives the policy's pre-compile factors. The Python
-            // compiler reserves seeds sequentially, so later excess plants become
-            // PASS rather than triggering the raw interpreter's all-or-none rule.
+            if let Some(crop) = unit_plant_crop(actions.units[unit]) {
+                demand[crop] += 1;
+            }
+        }
+        let mut blocked = [false; CROPS];
+        for (crop, held) in self.privates[player].seeds.iter().enumerate() {
+            blocked[crop] = demand[crop] > *held;
+        }
+        for unit in 0..units {
             let selected = actions.units[unit];
-            let action = if self.unit_action_valid(player, unit, selected, day) {
-                selected
-            } else {
-                0
-            };
+            let refused = unit_plant_crop(selected).is_some_and(|crop| blocked[crop])
+                || !self.unit_action_valid(player, unit, selected, day);
+            let action = if refused { 0 } else { selected };
             self.apply_unit_action(player, unit, action, day);
         }
     }
 
     pub fn unit_action_valid(&self, player: usize, unit: usize, action: u8, day: u16) -> bool {
-        if action >= UNIT_ACTIONS as u8 || unit >= usize::from(self.farms[player].units) {
-            return false;
-        }
-        if action == 0 {
-            return true;
-        }
-        let position = self.farms[player].positions[unit];
-        let x = usize::from(position.0);
-        let y = usize::from(position.1);
-        if let Some((dx, dy)) = move_delta(action) {
-            let nx = x as i16 + dx;
-            let ny = y as i16 + dy;
-            return (0..BOARD_SIZE as i16).contains(&nx) && (0..BOARD_SIZE as i16).contains(&ny);
-        }
-        let at_shed = is_shed_access(x, y);
-        if action == 5 {
-            return at_shed
-                && self.shed_total(player) < self.config.shed_capacity
-                && self.privates[player].inventories[unit]
-                    .iter()
-                    .any(|&quantity| quantity > 0);
-        }
-        if let Some((item, quantity)) = pickup_spec(action) {
-            return at_shed && self.privates[player].shed[item] >= quantity;
-        }
-        let tile = self.farms[player].tiles[y * BOARD_SIZE + x];
-        if let Some(animal) = place_animal(action) {
-            let has_animal = self.privates[player].inventories[unit][9 + animal] > 0;
-            let installs_animal = tile.kind == animal_structure(animal) && !tile.has_animal;
-            let deposits_animal = at_shed && self.shed_total(player) < self.config.shed_capacity;
-            return has_animal && (installs_animal || deposits_animal);
-        }
-        if tile.kind == TileKind::Locked {
-            return false;
-        }
-        if let Some(crop) = unit_plant_crop(action) {
-            return tile.kind == TileKind::Empty && self.privates[player].seeds[crop] > 0;
-        }
-        match action {
-            50 => tile.kind == TileKind::Plant && !tile.watered_or_fed,
-            51 if tile.kind == TileKind::Plant => {
-                tile.yield_units > 0
-                    && day.saturating_sub(tile.origin_day) >= FIRST_YIELD[usize::from(tile.species)]
-            }
-            51 => tile.has_animal && tile.yield_units > 0,
-            52 => {
-                tile.kind == TileKind::Plant
-                    && self.privates[player].inventories[unit][8] > 0
-                    && tile.fertilized_until_day < day as i16 + 2
-            }
-            53 => tile.kind != TileKind::Empty && !tile.has_animal,
-            54 | 55 => tile.kind == TileKind::Empty,
-            56 => {
-                tile.has_animal
-                    && !tile.watered_or_fed
-                    && self.privates[player].inventories[unit][0] > 0
-            }
-            57 => tile.has_animal && tile.fertilizer_available,
-            58 => tile.has_animal && !tile.cared_today,
-            _ => false,
-        }
+        unit_action_is_valid(
+            &self.farms[player],
+            &self.privates[player],
+            &self.config,
+            unit,
+            action,
+            day,
+        )
     }
 
     fn apply_unit_action(&mut self, player: usize, unit: usize, action: u8, day: u16) {
@@ -1676,7 +1884,7 @@ impl Game {
     }
 
     fn shed_total(&self, player: usize) -> u16 {
-        self.privates[player].shed.iter().sum()
+        shed_total(&self.privates[player])
     }
 
     fn drop_inventory(&mut self, player: usize, unit: usize) {
@@ -3041,6 +3249,55 @@ mod tests {
     }
 
     #[test]
+    fn pickup_clamps_to_stock_so_a_later_unit_takes_the_remainder() {
+        let mut game = Game::new(0, GameConfig::default());
+        let mut hire = CompactAction::default();
+        hire.market_kinds[0] = 1;
+        game.step(&[hire, CompactAction::default()]);
+        assert_eq!(game.farms[0].units, 2);
+        // Hands spawn shed-adjacent; standing the farmer there too puts two units
+        // in one contest over a stock neither can drain alone.
+        game.farms[0].positions[0] = game.farms[0].positions[1];
+        game.privates[0].shed[0] = 5;
+        let mut pickup = CompactAction::default();
+        pickup.units[0] = 7; // wheat 2
+        pickup.units[1] = 9; // wheat 4
+        game.step(&[pickup, CompactAction::default()]);
+        assert_eq!(game.privates[0].inventories[0][0], 2);
+        // Three of the four asked for: the reference clamps a pickup to the stock
+        // instead of refusing it, so the shortfall costs only the missing unit.
+        assert_eq!(game.privates[0].inventories[1][0], 3);
+        assert_eq!(game.privates[0].shed[0], 0);
+    }
+
+    #[test]
+    fn plant_demand_over_seeds_blocks_every_plant_of_that_crop() {
+        let mut game = Game::new(0, GameConfig::default());
+        let mut hire = CompactAction::default();
+        hire.market_kinds[0] = 1;
+        game.step(&[hire, CompactAction::default()]);
+        assert_eq!(game.farms[0].units, 2);
+        game.farms[0].positions[1] = Position(3, 4);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Empty);
+        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Empty);
+        game.privates[0].seeds[0] = 1;
+        let mut plant = CompactAction::default();
+        plant.units[0] = 45;
+        plant.units[1] = 45;
+        game.step(&[plant, CompactAction::default()]);
+        // All-or-none, not first-come: one seed against two requests plants neither
+        // and spends nothing.
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Empty);
+        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Empty);
+        assert_eq!(game.privates[0].seeds[0], 1);
+        game.privates[0].seeds[0] = 2;
+        game.step(&[plant, CompactAction::default()]);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Plant);
+        assert_eq!(game.farms[0].tiles[43].kind, TileKind::Plant);
+        assert_eq!(game.privates[0].seeds[0], 0);
+    }
+
+    #[test]
     fn simultaneous_market_units_share_quote_then_commit_player_order() {
         let mut game = Game::new(0, GameConfig::default());
         game.privates[0].shed[0] = 2;
@@ -3263,7 +3520,11 @@ mod tests {
         assert_eq!(BuiltinAgent::from_code(1), Ok(Some(BuiltinAgent::Pass)));
         assert_eq!(BuiltinAgent::from_code(2), Ok(Some(BuiltinAgent::Random)));
         assert_eq!(BuiltinAgent::from_code(3), Ok(Some(BuiltinAgent::Starter)));
-        for code in [4, 42, u8::MAX] {
+        assert_eq!(
+            BuiltinAgent::from_code(4),
+            Ok(Some(BuiltinAgent::ScriptedV27))
+        );
+        for code in [5, 42, u8::MAX] {
             assert!(BuiltinAgent::from_code(code).is_err());
         }
     }
@@ -3274,7 +3535,7 @@ mod tests {
         game.farms[0].units = 4;
         game.privates[0].shed[1] = 10;
         let mut rng = PyRandom::seed_u64(0);
-        let action = game.builtin_action(0, BuiltinAgent::Pass, &mut rng);
+        let action = game.builtin_action(0, BuiltinAgent::Pass, &mut rng, &mut V27State::default());
         assert!(action.units.iter().all(|&unit| unit == 0));
         assert!(action.market_kinds.iter().all(|&kind| kind == 0));
     }
@@ -3283,7 +3544,8 @@ mod tests {
     fn starter_opens_by_buying_one_carrot_seed() {
         let game = Game::new(7, GameConfig::default());
         let mut rng = PyRandom::seed_u64(0);
-        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        let action =
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default());
         assert_eq!(action.market_kinds[0], 4);
         assert_eq!(action.market_quantities[0], 0);
         assert_eq!(action.market_kinds[1], 0);
@@ -3295,13 +3557,15 @@ mod tests {
         let mut game = Game::new(7, GameConfig::default());
         game.privates[0].seeds[1] = 1;
         let mut rng = PyRandom::seed_u64(0);
-        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        let action =
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default());
         assert_eq!(action.units[0], 46);
         // Holding a seed suppresses the restock order.
         assert_eq!(action.market_kinds[0], 0);
 
         game.farms[0].tiles[44] = Tile::structure(TileKind::Coop);
-        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        let action =
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default());
         assert_eq!(action.units[0], 0);
     }
 
@@ -3311,19 +3575,19 @@ mod tests {
         game.farms[0].tiles[44] = Tile::plant(1, 0, game.config.turns_per_day);
         let mut rng = PyRandom::seed_u64(0);
         assert_eq!(
-            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default())
                 .units[0],
             50
         );
         game.farms[0].tiles[44].watered_or_fed = true;
         assert_eq!(
-            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default())
                 .units[0],
             0
         );
         game.step = MAX_YIELD_DAY[1] * game.config.turns_per_day;
         assert_eq!(
-            game.builtin_action(0, BuiltinAgent::Starter, &mut rng)
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default())
                 .units[0],
             51
         );
@@ -3335,13 +3599,15 @@ mod tests {
         game.privates[0].seeds[1] = 1;
         game.privates[0].shed[1] = 37;
         let mut rng = PyRandom::seed_u64(0);
-        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        let action =
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default());
         assert_eq!(action.market_kinds[0], 14);
         assert_eq!(u16::from(action.market_quantities[0]) + 1, 37);
 
         // A shed filled to capacity still fits a single order.
         game.privates[0].shed[1] = game.config.shed_capacity;
-        let action = game.builtin_action(0, BuiltinAgent::Starter, &mut rng);
+        let action =
+            game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default());
         assert_eq!(
             u16::from(action.market_quantities[0]) + 1,
             game.config.shed_capacity
@@ -3357,7 +3623,8 @@ mod tests {
         game.privates[0].seeds[1] = 1;
         let mut rng = PyRandom::seed_u64(5);
         for _ in 0..256 {
-            let action = game.builtin_action(0, BuiltinAgent::Random, &mut rng);
+            let action =
+                game.builtin_action(0, BuiltinAgent::Random, &mut rng, &mut V27State::default());
             assert!(matches!(action.units[0], 0..=4 | 46 | 50 | 51));
             for unit in 1..3 {
                 assert!(matches!(action.units[unit], 0..=4 | 50 | 51));
@@ -3376,8 +3643,8 @@ mod tests {
         let mut rng = PyRandom::seed_u64(0);
         while !game.done {
             let actions = [
-                game.builtin_action(0, BuiltinAgent::Starter, &mut rng),
-                game.builtin_action(1, BuiltinAgent::Pass, &mut rng),
+                game.builtin_action(0, BuiltinAgent::Starter, &mut rng, &mut V27State::default()),
+                game.builtin_action(1, BuiltinAgent::Pass, &mut rng, &mut V27State::default()),
             ];
             game.step(&actions);
         }

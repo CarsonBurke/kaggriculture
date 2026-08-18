@@ -6,7 +6,12 @@ from pathlib import Path
 
 # Ordered because the batched Rust wave addresses these agents by code
 # (`BuiltinAgent::from_code`), and the code is this tuple's index plus one.
-BUILTIN_AGENT_ORDER = ("pass", "random", "starter")
+#
+# `scripted-v27` is the in-engine port of the public v27 agent, whose whole plan
+# is one hardcoded action per step. It is deliberately *not* named `v27`: the
+# aliases below must keep resolving to the reference Python file, so an
+# evaluation measures the real opponent and never the port that mirrors it.
+BUILTIN_AGENT_ORDER = ("pass", "random", "starter", "scripted-v27")
 BUILTIN_OPPONENTS = frozenset(BUILTIN_AGENT_ORDER)
 PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
 PUBLIC_V27_ALIASES = frozenset(("v27", "public-v27"))
