@@ -59,6 +59,16 @@ def parse_args() -> argparse.Namespace:
             "divides wall time almost exactly and changes nothing in the output"
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "reuse archives already in --output-dir instead of replaying their "
+            "seeds. Each episode costs about 3 CPU-seconds and the manifest is "
+            "only written at the end, so an interrupted run otherwise strands "
+            "every episode it completed"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -160,25 +170,48 @@ def _extract_seed(
 
     Seeds are wholly independent games, so this is the unit of parallelism.
     Each seat writes a uniquely named archive, so workers never contend.
+
+    Each record is read back out of the archive that was just written, so a
+    resumed seed and a freshly played one produce byte-identical provenance and
+    every written archive is proven to round-trip before the run can succeed.
     """
     steps = _play_episode(teacher, opponent, seed, episode_steps)
-    final = steps[-1]
     records = []
     for seat in seats:
         arrays = extract_episode(steps, seat, episode_steps=episode_steps)
-        name = f"episode-{seed:08d}-seat{seat}"
-        np.savez_compressed(output_dir / f"{name}.npz", **arrays)
-        records.append(
-            {
-                "file": f"{name}.npz",
-                "seed": seed,
-                "seat": seat,
-                "steps": episode_steps - 1,
-                "teacher_money": float(final[seat].reward),
-                "opponent_money": float(final[1 - seat].reward),
-            }
-        )
+        path = output_dir / f"episode-{seed:08d}-seat{seat}.npz"
+        np.savez_compressed(path, **arrays)
+        records.append(_archived_record(path, seed, seat, episode_steps))
     return records
+
+
+def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> dict[str, Any]:
+    """Derive one manifest record from an archive on disk.
+
+    Extraction is a long CPU job on a thermally shared machine, so it gets
+    interrupted, and an interrupted run used to strand its completed archives:
+    the manifest is written once at the end, and without it `train_bc` cannot read
+    the directory at all. One cancelled 512-episode run left 439 valid archives
+    with no way to be used, which is what `--resume` recovers.
+
+    Money is the bank in the last archived observation, which is a step short of
+    the episode's terminal reward: the terminal step carries no action, so it is
+    not archived, and its final day of income is not recoverable from the file. On
+    a measured seed the gap was 138,754 against a 138,973 reward. Deriving both
+    halves of a resumed directory the same way is worth more than 0.16% of a field
+    no consumer reads -- it is dataset diagnostics, not a training signal.
+    """
+    with np.load(path, allow_pickle=False) as archive:
+        raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()).decode("utf-8"))
+    farms = raw["observations"][-1]["observation"]["farms"]
+    return {
+        "file": path.name,
+        "seed": seed,
+        "seat": seat,
+        "steps": episode_steps - 1,
+        "teacher_money": float(farms[seat]["money"]),
+        "opponent_money": float(farms[1 - seat]["money"]),
+    }
 
 
 def collect_extractions(pending: dict[Future, int], started: float) -> list[dict[str, Any]]:
@@ -222,22 +255,53 @@ def main() -> None:
     seats = (0, 1) if mirrored else (0,)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    seeds = range(args.seed_start, args.seed_start + args.episodes)
+    seeds = list(range(args.seed_start, args.seed_start + args.episodes))
+    recovered: list[dict[str, Any]] = []
+    if args.resume:
+        # A seed counts as done only when every seat it owes exists, so a seed
+        # interrupted between its two mirrored seats is replayed rather than
+        # half-recorded.
+        outstanding = []
+        for seed in seeds:
+            paths = [args.output_dir / f"episode-{seed:08d}-seat{seat}.npz" for seat in seats]
+            if all(path.is_file() for path in paths):
+                recovered.extend(
+                    _archived_record(path, seed, seat, args.episode_steps)
+                    for path, seat in zip(paths, seats, strict=True)
+                )
+            else:
+                outstanding.append(seed)
+        print(
+            f"resuming: {len(recovered)} episode-seats already archived, "
+            f"{len(outstanding)} seeds to play",
+            flush=True,
+        )
+        seeds = outstanding
     started = time.perf_counter()
-    pool = ProcessPoolExecutor(max_workers=min(args.workers, args.episodes))
-    try:
-        pending = {
-            pool.submit(
-                _extract_seed, teacher, opponent, seed, args.episode_steps, seats, args.output_dir
-            ): seed
-            for seed in seeds
-        }
-        episodes = collect_extractions(pending, started)
-    finally:
-        # After a cancellation this waits only for the seeds already in
-        # flight, which is the shortest correct abort: their worker processes
-        # own open archive handles.
-        pool.shutdown(wait=True)
+    episodes = []
+    if seeds:
+        pool = ProcessPoolExecutor(max_workers=min(args.workers, len(seeds)))
+        try:
+            pending = {
+                pool.submit(
+                    _extract_seed,
+                    teacher,
+                    opponent,
+                    seed,
+                    args.episode_steps,
+                    seats,
+                    args.output_dir,
+                ): seed
+                for seed in seeds
+            }
+            episodes = collect_extractions(pending, started)
+        finally:
+            # After a cancellation this waits only for the seeds already in
+            # flight, which is the shortest correct abort: their worker processes
+            # own open archive handles.
+            pool.shutdown(wait=True)
+
+    episodes.extend(recovered)
     # Completion order is nondeterministic under parallelism; the manifest is
     # provenance and is hashed, so it is written in seed order regardless.
     episodes.sort(key=lambda record: (record["seed"], record["seat"]))
