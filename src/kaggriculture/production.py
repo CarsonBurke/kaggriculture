@@ -268,6 +268,8 @@ def build_training_command(
             str(ppo["actor_gae_lambda"]),
             "--target-kl",
             str(ppo["target_kl"]),
+            "--entropy-coefficient",
+            str(ppo["entropy_coefficient"]),
             "--max-gradient-norm",
             str(ppo["max_gradient_norm"]),
         )

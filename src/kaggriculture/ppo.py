@@ -396,6 +396,25 @@ class PpoConfig:
     # its absolute probability, so exploration dies faster than it should.
     clip_low: float = 0.80
     clip_high: float = 1.28
+    # The other half of the same fight, and until now the missing half: the
+    # clip band above only bounds how fast exploration can be *removed*, while
+    # nothing in the objective rewards keeping it. Measured on the run this
+    # replaces, mean entropy per active component was 0.1395 nats at the first
+    # actor-active iteration -- 3.4% of the unit head's ln(59) maximum, and the
+    # entropy of a two-way choice taken 96.9% one way. That policy cannot find
+    # a reward it has never sampled.
+    #
+    # Sampling temperature cannot supply the exploration instead: `rollout.py`
+    # rejects any learner temperature other than 1.0, because the replay-parity
+    # contract needs the update forward to reproduce the sampler's likelihoods.
+    # So the policy's own entropy is the only exploration that exists, which is
+    # what makes this a term in the objective rather than a sampling knob.
+    #
+    # Left at zero until measured. A nonzero default shipped from a reference
+    # value would be a guess: CleanRL's 0.01 is tuned against a single softmax
+    # over an Atari action set, not against 36 masked components per state whose
+    # legal counts vary by two orders of magnitude.
+    entropy_coefficient: float = 0.0
     # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
     # competition's fixed 719-action horizon. The critic shares it: VAPO's
     # decoupled lambda-one critic answers a sparse terminal-reward setting
@@ -525,6 +544,11 @@ def _validate_config(config: PpoConfig) -> None:
             raise ValueError(f"{name} must be finite and positive")
     if not math.isfinite(config.weight_decay) or config.weight_decay < 0.0:
         raise ValueError("weight decay must be finite and non-negative")
+    # Negative would actively drive the policy deterministic, which is the
+    # failure this term exists to oppose, so it is rejected rather than allowed
+    # as an exotic setting.
+    if not math.isfinite(config.entropy_coefficient) or config.entropy_coefficient < 0.0:
+        raise ValueError("entropy coefficient must be finite and non-negative")
     if config.epochs < 1 or config.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
     if config.critic_epochs is not None and config.critic_epochs < config.epochs:
@@ -1105,6 +1129,11 @@ def _actor_minibatch_terms(
     Returns device-side (policy objective sum, entropy sum, k3 KL sum, clipped
     count). Normalization by the per-minibatch component count stays outside
     so the varying host integer never enters the captured graph.
+
+    The entropy sum carries grad because it is an objective term, not only a
+    metric: sampling temperature is pinned to 1.0 by the replay-parity contract
+    (`rollout.py` rejects any other value), so the policy's own entropy is the
+    only exploration this pipeline has.
     """
     (
         new_unit,
@@ -1143,7 +1172,7 @@ def _actor_minibatch_terms(
             clip_high,
         )
         policy_sum = policy_sum + component_objective
-        entropy_sum = entropy_sum + (entropy.detach() * active).sum()
+        entropy_sum = entropy_sum + (entropy * active).sum()
         kl_sum = kl_sum + component_kl
         clipped_sum = clipped_sum + component_clipped
     return policy_sum, entropy_sum, kl_sum, clipped_sum
@@ -1908,10 +1937,16 @@ def update_ppo(
                 batch_kl = kl_sum.detach().double() / component_count
                 policy_loss = -policy_sum / component_count
                 entropy_mean = entropy_sum / component_count
+                # The surrogate stays the reported and finiteness-checked
+                # quantity, so `policy_loss` keeps meaning what its name says;
+                # the bonus is a separate term added only to what is optimized.
+                # Entropy's backward retains nothing new: it differentiates the
+                # same log_softmax output the gathered ratio already holds.
+                actor_loss = policy_loss - config.entropy_coefficient * entropy_mean
                 # Gradients are computed eagerly but the actor is mutated only
                 # after the deferred trust-region check below, so the guard
                 # semantics stay exact: a violating minibatch is never applied.
-                policy_loss.backward()
+                actor_loss.backward()
                 actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                     actor.parameters(), config.max_gradient_norm
                 ).detach()

@@ -41,8 +41,23 @@ from kaggriculture.rollout import collect_self_play
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 
 
-def test_ppo_config_has_no_entropy_bonus() -> None:
-    assert "entropy_coefficient" not in asdict(PpoConfig())
+def test_entropy_bonus_exists_and_ships_disabled_until_measured() -> None:
+    """DAPO drops the entropy bonus for Clip-Higher; this pipeline needs both.
+
+    Clip-Higher only permits a *sampled* low-probability action's probability to
+    grow, so it preserves exploration rather than restoring it. That presupposes
+    DAPO's setting -- RL from a pretrained model whose policy is still diffuse.
+    This actor is warm-started from behavior cloning and measured at 0.1395 nats
+    per active component on the first actor-active iteration, when 40 iterations
+    of critic warmup had left it byte-identical to the clone. The collapse is
+    therefore inherited, not caused by the update, and Clip-Higher cannot act on
+    actions that are never drawn.
+
+    The coefficient nonetheless ships at zero until a run measures it, so this
+    pins the mechanism's existence and its inert default separately.
+    """
+    assert "entropy_coefficient" in asdict(PpoConfig())
+    assert PpoConfig().entropy_coefficient == 0.0
 
 
 def test_rollout_action_masks_are_validated_once_before_replay() -> None:
@@ -992,7 +1007,15 @@ def test_extra_critic_epochs_refit_the_critic_without_touching_the_actor() -> No
         _validate_config(PpoConfig(epochs=4, critic_epochs=2))
 
 
-def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero(monkeypatch) -> None:
+def test_entropy_is_the_only_gradient_when_policy_advantage_is_zero(monkeypatch) -> None:
+    """Zero advantages silence the surrogate, isolating the entropy term.
+
+    With every advantage exactly zero the clipped surrogate has no gradient, so
+    whatever the actor does next is attributable to the entropy bonus alone.
+    That makes this the sharp test of the coefficient in both directions: at
+    zero it must leave the actor bit-identical, and above zero it must move the
+    policy toward higher entropy on the very states just measured.
+    """
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
@@ -1001,37 +1024,61 @@ def test_entropy_is_diagnostic_only_when_policy_advantage_is_zero(monkeypatch) -
     rollout = collect_self_play(actor, games=1, seed_start=94, episode_steps=3, sampling_seed=10)
     rollout.rewards.fill(0.0)
     # Zero rewards alone leave value-driven GAE deltas; zero replayed values
-    # too so every advantage is exactly zero and entropy carries no gradient.
+    # too so every advantage is exactly zero.
     monkeypatch.setattr(
         kaggriculture.ppo,
         "replay_behavior_values",
         lambda critic, architecture, staged, **kwargs: torch.zeros(staged["unit_actions"].shape[0]),
     )
-    config = PpoConfig(
-        epochs=1,
-        minibatch_size=rollout.state_count,
-        lr_warmup_steps=0,
-        weight_decay=0.0,
-        use_bfloat16=False,
-    )
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+
+    def run(coefficient: float, actor: FarmActor, critic: DistributionalCritic) -> dict:
+        config = PpoConfig(
+            epochs=1,
+            minibatch_size=rollout.state_count,
+            lr_warmup_steps=0,
+            weight_decay=0.0,
+            use_bfloat16=False,
+            entropy_coefficient=coefficient,
+            # Far above the shipped rate so one normalized step is unambiguous;
+            # `max_gradient_norm` makes the applied step `lr * g / ||g||`.
+            actor_learning_rate=1.0e-2,
+        )
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+        return update_ppo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(11),
+        )
+
     before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
-
-    metrics = update_ppo(
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
-        rollout,
-        config,
-        generator=np.random.default_rng(11),
-    )
-
-    assert metrics["actor_updates"] == 1
-    assert metrics["policy_loss"] == pytest.approx(0.0, abs=1e-12)
-    assert metrics["entropy"] > 0.0
+    disabled = run(0.0, actor, critic)
+    assert disabled["actor_updates"] == 1
+    assert disabled["policy_loss"] == pytest.approx(0.0, abs=1e-12)
+    assert disabled["entropy"] > 0.0
     for name, parameter in actor.named_parameters():
         torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+    # A fresh pair, so the enabled run starts from the same weights the disabled
+    # run left untouched rather than from its own first step.
+    enabled_actor = FarmActor(model_config)
+    enabled_actor.load_state_dict(actor.state_dict())
+    enabled_critic = DistributionalCritic(model_config)
+    enabled_critic.load_state_dict(critic.state_dict())
+    first = run(1.0, enabled_actor, enabled_critic)
+    second = run(1.0, enabled_actor, enabled_critic)
+
+    # The surrogate stays silent throughout, so the reported entropy rising over
+    # the identical states is the bonus doing the only work there is to do.
+    assert first["policy_loss"] == pytest.approx(0.0, abs=1e-12)
+    assert second["entropy"] > first["entropy"]
+    assert any(
+        not torch.equal(parameter, before[name])
+        for name, parameter in enabled_actor.named_parameters()
+    )
 
 
 def test_behavior_values_are_replayed_before_the_update_mutates_the_critic(monkeypatch) -> None:
