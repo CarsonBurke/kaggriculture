@@ -369,7 +369,10 @@ def load_checkpoint(
         cuda_rng = payload["cuda_rng"]
         if len(cuda_rng) != torch.cuda.device_count():
             raise ValueError("checkpoint CUDA RNG state count does not match visible CUDA devices")
-        torch.cuda.set_rng_state_all(cuda_rng)
+        # `map_location` above moved every tensor in the payload onto the training
+        # device, and a generator state is only accepted as a CPU ByteTensor -- the
+        # same reason the CPU generator above is restored through `.cpu()`.
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
     np.random.set_state(payload["numpy_rng"])
     random.setstate(payload["python_rng"])
     return payload
