@@ -993,7 +993,12 @@ def collect_mixed_play_rust(
     episode_steps: int = 720,
     deterministic: bool = False,
     temperature: float = 1.0,
-    opponent_temperature: float = 0.8,
+    # Matches `temperature` above, so a caller that omits it gets the symmetric
+    # wave production runs. It defaulted to 0.8 while training sharpened its
+    # league seats, and that default silently reached instruments which never
+    # passed it -- including the schedule sweep that chose the production
+    # learning rate, whose conclusions only transfer if its wave is production's.
+    opponent_temperature: float = 1.0,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
     deterministic_opponents: Sequence[bool] | np.ndarray | None = None,
