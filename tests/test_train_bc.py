@@ -391,9 +391,13 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
     assert [event.value for event in accumulator.Scalars("loss/train")] == pytest.approx(
         [record["train_loss"] for record in records], rel=1e-6
     )
-    # Per-head holdout statistics are runs, so the three share one chart.
-    heads = EventAccumulator(str(output / "tensorboard" / "heads" / "unit")).Reload()
-    assert "holdout/accuracy" in heads.Tags()["scalars"]
+    # Per-head holdout statistics share the run's single event file, with the
+    # head in the category so the three draw as adjacent sibling charts. They
+    # were separate runs once, which cost the mirror an event file per head.
+    assert {"holdout-unit/accuracy", "holdout-kind/accuracy", "holdout-unit/nll"} <= set(
+        accumulator.Tags()["scalars"]
+    )
+    assert not (output / "tensorboard" / "heads").exists()
 
     actor, payload = load_actor_artifact(output / "bc-actor.pt")
     assert payload["architecture"] == CONV_ENTITY
