@@ -258,6 +258,24 @@ _REPLAY_AUDIT_SHUFFLE_SEED = 20260815
 #: non-zero reading and still fires well before the collapse completes.
 MAX_VALUE_TARGET_SATURATED_FRACTION = 0.05
 
+#: Share of its intended minibatches an actor epoch must actually apply.
+#:
+#: `actor_updates < 1` was already refused, and that bound is too weak by
+#: exactly the amount that matters: a trust region mis-set against the policy's
+#: sharpness stops the epoch after the first minibatch, not before it, so the
+#: run reports one update and passes. That is what happened -- 66 iterations at
+#: 1 of 113 minibatches, 0.9% of each wave, with `approx_kl` reading 6e-4
+#: because it is a mean over the minibatches that stepped and almost none did.
+#: Nothing in the telemetry looked wrong.
+#:
+#: A healthy iteration applies all of them: 113 of 113 at every learning rate
+#: whose movement fits inside `target_kl`, and 113 of 113 in the 500-iteration
+#: run this replaces. So the honest reading of a partial epoch is that the trust
+#: region and the step size disagree, which no later iteration repairs. Half is
+#: far enough below one to leave an unlucky wave its early stop, and far enough
+#: above the 0.009 this is here to catch that it cannot be reached by accident.
+MINIMUM_ACTOR_EPOCH_FRACTION = 0.5
+
 #: Execution modes for the update path's forward+backward, as `torch.compile`
 #: `mode=` values plus `eager` for not compiling at all. A boolean cannot name
 #: this decision: the same mistake was already made on the collection side,
@@ -284,10 +302,38 @@ UPDATE_COMPILE_MODES = (
 
 @dataclass(frozen=True)
 class PpoConfig:
-    # Learning rates follow CleanRL's PPO reference (2.5e-4, Adam eps 1e-5)
-    # for both networks; CleanRL additionally anneals linearly to zero, which
-    # this pipeline deliberately does not adopt (warmup then constant).
-    actor_learning_rate: float = 2.5e-4
+    # The critic follows CleanRL's PPO reference (2.5e-4, Adam eps 1e-5), which
+    # this pipeline anneals to nothing -- warmup then constant -- rather than
+    # linearly to zero.
+    #
+    # The actor does not, and cannot: 2.5e-4 is incompatible with `target_kl`
+    # once the actor is warm-started from behavior cloning. A full epoch is 113
+    # sequential updates over one 230,080-state wave, and a BC-cloned policy is
+    # sharp, so it moves far more KL per unit of parameter movement than the
+    # from-scratch policy the reference rate was inherited for. Measured on the
+    # iteration-66 actor of the run this replaces, over that exact wave shape,
+    # worst minibatch KL against the stored behavior and the updates completed
+    # of 113:
+    #
+    #   lr        1e-12     1.5e-5    3.0e-5    5.0e-5    1.0e-4    2.5e-4
+    #   updates   113       113       113       28        5         1
+    #   max KL    1.44e-4   8.42e-3   2.02e-2   3.55e-2   1.73e-1   --
+    #
+    # The 1e-12 control matters as much as the rest: it completes all 113 with
+    # 1.44e-4, which is the replay-parity floor exactly, so the gate never fires
+    # on numerics and every reading above it is policy movement.
+    #
+    # 3.0e-5 is the largest rate whose whole epoch fits, at 1.49x margin. That is
+    # the same margin `runs/vapo-lv2-20260813` carried for 500 iterations without
+    # ever stopping early (0.03 against a worst minibatch of 2.179e-2), which is
+    # the only evidence available that a margin this size survives a full run.
+    #
+    # At 2.5e-4 the trust region stopped the actor after 1 of 113 minibatches on
+    # every post-warmup iteration, so the run trained on 0.9% of each wave while
+    # every logged statistic looked healthy: `approx_kl` is a mean over the
+    # minibatches that stepped, so it read 6e-4 precisely because almost none of
+    # them did.
+    actor_learning_rate: float = 3.0e-5
     critic_learning_rate: float = 2.5e-4
     lr_warmup_steps: int = 32
     # No weight decay: with decay the AdamW update is not scale-invariant and
@@ -1764,6 +1810,14 @@ def update_ppo(
     # separates those, and both are deltas of a running device total rather than
     # a second accumulator.
     epoch_marks: list[tuple[Tensor, int]] = []
+    # What a complete actor epoch would have applied, fixed before the loop so a
+    # trust-region stop cannot shrink the denominator it is measured against.
+    # The partition is recomputed per epoch from a fresh permutation, but its
+    # length depends only on the state count and the minibatch size, so one
+    # epoch's count times the actor's epochs is exact.
+    actor_minibatches_intended = actor_epochs * len(
+        _balanced_minibatch_slices(valid_indices.size, config.minibatch_size)
+    )
     for epoch_index in range(critic_epochs):
         shuffled = generator.permutation(valid_indices)
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
@@ -1954,7 +2008,6 @@ def update_ppo(
             total_states += states
             updates += 1
         epoch_marks.append((totals["value_loss"].clone(), total_states))
-        # One host read per epoch, covering every critic-only minibatch it ran.
         # Their steps were already gated on the device, so the critic reaching
         # this line has never absorbed a non-finite loss.
         if critic_nonfinite.item():
@@ -1964,6 +2017,7 @@ def update_ppo(
     first_epoch_value_loss, last_epoch_value_loss = _epoch_value_losses(epoch_marks)
     metrics: dict[str, float | int] = {
         "updates": updates,
+        "actor_minibatches_intended": actor_minibatches_intended,
         "actor_updates": actor_updates,
         "epochs": completed_epochs,
         "states": rollout.state_count,

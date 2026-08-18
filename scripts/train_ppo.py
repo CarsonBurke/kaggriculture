@@ -42,6 +42,7 @@ from kaggriculture.ppo import (
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     MAX_VALUE_TARGET_SATURATED_FRACTION,
+    MINIMUM_ACTOR_EPOCH_FRACTION,
     UPDATE_COMPILE_MODES,
     PpoConfig,
     make_optimizers,
@@ -1074,6 +1075,19 @@ def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: 
         )
     if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
         raise RuntimeError("PPO iteration completed without an actor update")
+    # A trust region set against the wrong policy sharpness stops the epoch after
+    # its first minibatch rather than before it, so the count above is 1 and
+    # passes while the iteration trains on under 1% of the wave. Nothing else
+    # reports it: `approx_kl` averages over the minibatches that stepped.
+    intended = int(update_metrics["actor_minibatches_intended"])
+    applied = int(update_metrics["actor_updates"])
+    if not warmup_active and intended > 0 and applied < MINIMUM_ACTOR_EPOCH_FRACTION * intended:
+        raise RuntimeError(
+            f"actor applied {applied} of {intended} minibatches, below "
+            f"{MINIMUM_ACTOR_EPOCH_FRACTION:.0%} of the epoch; the trust region "
+            f"{'stopped it early' if update_metrics.get('kl_early_stop') else 'is not the cause'} "
+            f"at max_approx_kl {float(update_metrics['max_approx_kl']):.4g}"
+        )
 
 
 def main() -> None:

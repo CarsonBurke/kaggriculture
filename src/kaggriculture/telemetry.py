@@ -499,6 +499,11 @@ _TRAINING_TAGS = {
     "gamma": "schedule/gamma",
     "epochs": "schedule/epochs",
     "updates": "schedule/updates",
+    # Beside `actor/updates` in meaning but a schedule quantity, not an outcome:
+    # it is what a complete epoch would have applied, so the pair reads as a
+    # fraction. Only the numerator was ever recorded, which is why 1 of 113
+    # looked no different from 113 of 113 on a chart.
+    "actor_minibatches_intended": "schedule/actor_minibatches_intended",
     # `timing` is how long a phase took and `throughput` is how much it got
     # done per unit of that time. Kept apart because the benchmark journal adds
     # four more of each to the same names, and one combined category would be

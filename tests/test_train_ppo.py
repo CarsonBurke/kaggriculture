@@ -539,6 +539,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
         "update_ppo",
         lambda *args, **kwargs: {
             "actor_updates": 1,
+            "actor_minibatches_intended": 1,
             "critic_updates": 1,
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
@@ -970,6 +971,7 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
         "update_ppo",
         lambda *args, **kwargs: {
             "actor_updates": 1,
+            "actor_minibatches_intended": 1,
             "critic_updates": 1,
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
@@ -1296,7 +1298,10 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     healthy = {
         "first_minibatch_approx_kl": MAX_FIRST_MINIBATCH_KL,
         "value_target_saturated_fraction": MAX_VALUE_TARGET_SATURATED_FRACTION,
-        "actor_updates": 1,
+        "actor_updates": 113,
+        "actor_minibatches_intended": 113,
+        "max_approx_kl": 0.02,
+        "kl_early_stop": 0,
     }
 
     module._gate_update_metrics(healthy, warmup_active=False)
@@ -1321,3 +1326,21 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
         )
     with pytest.raises(RuntimeError, match="without an actor update"):
         module._gate_update_metrics({**healthy, "actor_updates": 0}, warmup_active=False)
+    # The hole this closes: a trust region that latches after the first
+    # minibatch reports one update, not zero, so every gate above passes while
+    # the iteration trains on 0.9% of the wave. That is the exact shape of the
+    # run this gate was added for -- 1 of 113 with `kl_early_stop` set.
+    with pytest.raises(RuntimeError, match="below 50% of the epoch"):
+        module._gate_update_metrics(
+            {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
+            warmup_active=False,
+        )
+    # Warmup runs no actor at all, so the fraction cannot speak there.
+    module._gate_update_metrics(
+        {**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True
+    )
+    # An early stop that still applied most of the epoch is the safety valve
+    # working, and must not stop a run that is making progress.
+    module._gate_update_metrics(
+        {**healthy, "actor_updates": 96, "kl_early_stop": 1}, warmup_active=False
+    )
