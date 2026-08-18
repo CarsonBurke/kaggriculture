@@ -12,6 +12,12 @@ are kept, and the output is a standard architecture-tagged actor artifact
 that `CheckpointAgent`, `evaluate_checkpoint.py`, and RL warm-starting all
 consume directly.
 
+Several dataset directories are merged into one corpus, each holding out its
+own highest seeds. A clone trained on one opponent alone earned 92 money
+against `starter` while earning ~28.9k against a copy of itself, having
+learned to gate farming on "opponent is rich" — constant in that corpus, so
+the demonstrations have to vary it.
+
 GPU work: queue through mlq.
 """
 
@@ -24,6 +30,7 @@ import math
 import sys
 import time
 import zlib
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -84,7 +91,17 @@ _STRUCTURED_STATE_FIELDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True, help="extract_bc_dataset output dir")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        nargs="+",
+        required=True,
+        help=(
+            "one or more extract_bc_dataset output dirs, merged into one corpus; mixing "
+            "opponents is what keeps the clone from latching onto a spurious trigger, as a "
+            "single-opponent corpus made 'opponent is rich' a constant it could gate farming on"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True, help="run directory to create")
     parser.add_argument(
         "--architecture",
@@ -194,31 +211,72 @@ def _validate_targets_satisfy_masks(arrays: dict[str, np.ndarray], name: str) ->
 
 
 def load_dataset(
-    dataset_dir: Path,
+    dataset_dirs: Sequence[Path],
     *,
     architecture: str,
     holdout_seeds: int,
     encode_workers: int,
-) -> tuple[DemonstrationTensors, DemonstrationTensors, dict[str, Any]]:
-    """Load, encode, and stage the dataset; returns (train, holdout, manifest)."""
+) -> tuple[DemonstrationTensors, DemonstrationTensors, list[dict[str, Any]]]:
+    """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
+
+    Several directories are merged into one corpus because a single-opponent
+    corpus teaches the wrong precondition: the clone of `public-v27` trained
+    on v27-vs-v27 games alone earned 92 money against `starter` while earning
+    ~28.9k against a copy of itself, having latched onto "opponent is rich" —
+    a constant in that corpus — as a condition for farming at all.
+    """
     # Reject an unknown family before paying for the encode, not inside a
     # worker process after every episode has been tokenized.
     resolve_architecture(architecture)
-    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
-    version = manifest.get("format_version")
-    if version not in SUPPORTED_DATASET_FORMAT_VERSIONS:
-        raise ValueError(f"unsupported dataset format: {version}")
-    episodes = manifest["episodes"]
-    if not episodes:
-        raise ValueError("dataset manifest lists no episodes")
-    seeds = sorted({int(entry["seed"]) for entry in episodes})
-    if not 0 < holdout_seeds < len(seeds):
-        raise ValueError(
-            f"holdout of {holdout_seeds} seeds needs 1..{len(seeds) - 1} with {len(seeds)} seeds"
+    if not dataset_dirs:
+        raise ValueError("no dataset directories given")
+    manifests: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for directory in dataset_dirs:
+        raw = (directory / "manifest.json").read_bytes()
+        manifest = json.loads(raw)
+        version = manifest.get("format_version")
+        if version not in SUPPORTED_DATASET_FORMAT_VERSIONS:
+            raise ValueError(f"{directory}: unsupported dataset format: {version}")
+        if not manifest["episodes"]:
+            raise ValueError(f"{directory}: dataset manifest lists no episodes")
+        # A step means one environment decision at a fixed horizon; mixing
+        # horizons would silently change what a cloned step is.
+        if manifests and manifest["episode_steps"] != manifests[0]["episode_steps"]:
+            raise ValueError(
+                f"{directory}: episode_steps {manifest['episode_steps']} disagrees with "
+                f"{manifests[0]['episode_steps']} from {dataset_dirs[0]}"
+            )
+        manifests.append(manifest)
+        records.append(
+            {
+                "path": str(directory.resolve()),
+                "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+                "teacher": manifest["teacher"],
+                "opponent": manifest["opponent"],
+                "episodes": len(manifest["episodes"]),
+            }
         )
-    held_out = set(seeds[-holdout_seeds:])
 
-    paths = [str(dataset_dir / entry["file"]) for entry in episodes]
+    # Seeds are only unique within one extraction: each run has its own
+    # `--seed-start` but nothing forbids overlap, so the split key carries the
+    # dataset the episode came from. Each corpus also holds out its own
+    # highest seeds; a holdout taken from the globally highest keys would
+    # measure one opponent while training on the mixture.
+    held_out: set[tuple[int, int]] = set()
+    entries: list[tuple[int, Path, dict[str, Any]]] = []
+    for index, (directory, manifest) in enumerate(zip(dataset_dirs, manifests, strict=True)):
+        episodes = manifest["episodes"]
+        seeds = sorted({int(entry["seed"]) for entry in episodes})
+        if not 0 < holdout_seeds < len(seeds):
+            raise ValueError(
+                f"{directory}: holdout of {holdout_seeds} seeds needs "
+                f"1..{len(seeds) - 1} with {len(seeds)} seeds"
+            )
+        held_out.update((index, seed) for seed in seeds[-holdout_seeds:])
+        entries.extend((index, directory, entry) for entry in episodes)
+
+    paths = [str(directory / entry["file"]) for _, directory, entry in entries]
     encode = partial(_encode_episode_file, architecture_name=architecture)
     if encode_workers > 1:
         with ProcessPoolExecutor(max_workers=encode_workers) as pool:
@@ -227,9 +285,9 @@ def load_dataset(
         encoded = [encode(path) for path in paths]
 
     splits: dict[bool, list[dict[str, np.ndarray]]] = {False: [], True: []}
-    for entry, arrays in zip(episodes, encoded, strict=True):
-        _validate_targets_satisfy_masks(arrays, entry["file"])
-        splits[int(entry["seed"]) in held_out].append(arrays)
+    for (index, directory, entry), arrays in zip(entries, encoded, strict=True):
+        _validate_targets_satisfy_masks(arrays, str(directory / entry["file"]))
+        splits[(index, int(entry["seed"])) in held_out].append(arrays)
 
     def stage(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
         stacked = {
@@ -244,7 +302,7 @@ def load_dataset(
             row_components=components,
         )
 
-    return stage(splits[False]), stage(splits[True]), manifest
+    return stage(splits[False]), stage(splits[True]), records
 
 
 def _batch(
@@ -417,7 +475,7 @@ def _artifact_payload(
 
 def train(
     *,
-    dataset_dir: Path,
+    dataset_dirs: Sequence[Path],
     output_dir: Path,
     architecture: str,
     config: Any,
@@ -453,16 +511,15 @@ def train(
     torch.manual_seed(seed)
     generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    train_split, holdout_split, manifest = load_dataset(
-        dataset_dir,
+    train_split, holdout_split, datasets = load_dataset(
+        dataset_dirs,
         architecture=architecture,
         holdout_seeds=holdout_seeds,
         encode_workers=encode_workers,
     )
-    manifest_digest = hashlib.sha256((dataset_dir / "manifest.json").read_bytes()).hexdigest()
     print(
-        f"dataset: {train_split.rows} train rows, {holdout_split.rows} holdout rows "
-        f"({holdout_seeds} held-out seeds)",
+        f"dataset: {len(datasets)} corpora, {train_split.rows} train rows, "
+        f"{holdout_split.rows} holdout rows ({holdout_seeds} held-out seeds each)",
         flush=True,
     )
 
@@ -471,15 +528,18 @@ def train(
     steps_per_epoch = math.ceil(train_split.rows / batch_size)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * steps_per_epoch)
     autocast = device.type == "cuda"
-    bc_provenance = {
-        "dataset_dir": str(dataset_dir.resolve()),
-        "manifest_sha256": manifest_digest,
-        "teacher": manifest["teacher"],
-        "opponent": manifest["opponent"],
+    bc_provenance: dict[str, Any] = {
+        "datasets": datasets,
         "architecture": architecture,
         "holdout_seeds": holdout_seeds,
         "command": sys.argv,
     }
+    # A scalar teacher survives only when the mixture agrees on one, because a
+    # warm start is tagged with this label; the opponent deliberately has no
+    # scalar at all, since varying it across corpora is the point of mixing.
+    teachers = {json.dumps(record["teacher"], sort_keys=True) for record in datasets}
+    if len(teachers) == 1:
+        bc_provenance["teacher"] = datasets[0]["teacher"]
     identity = source_identity()
 
     best = math.inf
@@ -573,7 +633,7 @@ def train(
 def main() -> None:
     args = parse_args()
     train(
-        dataset_dir=args.dataset,
+        dataset_dirs=args.dataset,
         output_dir=args.output,
         architecture=args.architecture,
         config=model_config_from_args(resolve_architecture(args.architecture), args),

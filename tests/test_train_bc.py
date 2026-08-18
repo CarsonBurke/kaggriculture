@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
+import re
+import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +72,26 @@ def dataset_dir(tmp_path_factory) -> Path:
     return directory
 
 
+def _copy_dataset(
+    source: Path, destination: Path, seed_shift: int = 0, **manifest_changes: object
+) -> Path:
+    """A second corpus on disk: the same episode-seats, its own manifest.
+
+    Real mixtures pair one teacher against different opponents, which only the
+    manifest records; the episode payloads do not decide how directories merge
+    or split, so they are reused rather than replayed. `seed_shift` renumbers
+    this corpus's seeds, which is how independent extractions overlap.
+    """
+    destination.mkdir()
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    for entry in manifest["episodes"]:
+        shutil.copyfile(source / entry["file"], destination / entry["file"])
+        entry["seed"] += seed_shift
+    manifest.update(manifest_changes)
+    (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return destination
+
+
 def _tiny_config() -> ModelConfig:
     return ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
@@ -90,8 +114,8 @@ def _tiny_structured_config() -> StructuredConfig:
 def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
     trainer = _load_trainer()
 
-    train_split, holdout_split, manifest = trainer.load_dataset(
-        dataset_dir,
+    train_split, holdout_split, records = trainer.load_dataset(
+        [dataset_dir],
         architecture=CONV_ENTITY,
         holdout_seeds=1,
         encode_workers=1,
@@ -100,7 +124,7 @@ def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
     rows_per_seed = 2 * (EPISODE_STEPS - 1)
     assert train_split.rows == rows_per_seed
     assert holdout_split.rows == rows_per_seed
-    assert manifest["teacher"]["label"] == "starter"
+    assert [record["teacher"]["label"] for record in records] == ["starter"]
     assert train_split.staged["board"].dtype == torch.float16
     assert train_split.staged["unit_actions"].dtype == torch.int8
 
@@ -118,7 +142,7 @@ def test_only_the_minibatch_crosses_to_the_accelerator(
     """
     trainer = _load_trainer()
     train_split, _, _ = trainer.load_dataset(
-        dataset_dir,
+        [dataset_dir],
         architecture=architecture,
         holdout_seeds=1,
         encode_workers=1,
@@ -142,13 +166,13 @@ def test_structured_retokenization_yields_matched_rows(dataset_dir: Path) -> Non
     trainer = _load_trainer()
 
     conv_train, conv_holdout, _ = trainer.load_dataset(
-        dataset_dir,
+        [dataset_dir],
         architecture=CONV_ENTITY,
         holdout_seeds=1,
         encode_workers=1,
     )
     train_split, holdout_split, _ = trainer.load_dataset(
-        dataset_dir,
+        [dataset_dir],
         architecture=STRUCTURED,
         holdout_seeds=1,
         encode_workers=1,
@@ -180,11 +204,153 @@ def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path
 
     with pytest.raises(ValueError, match="violate their own masks"):
         trainer.load_dataset(
-            corrupt,
+            [corrupt],
             architecture=CONV_ENTITY,
             holdout_seeds=1,
             encode_workers=1,
         )
+
+
+def test_load_dataset_merges_directories_and_holds_out_within_each(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """Two corpora become one, and each contributes its own held-out seeds.
+
+    The corpora here carry seeds (3, 4) and (4, 5): extractions choose their
+    own `--seed-start` and nothing makes them disjoint. Keyed on the seed
+    alone, the second corpus's seed 4 would follow the first's into the
+    holdout; keyed globally on the highest pairs, only seed 5 of the second
+    corpus would be held out and the holdout would measure one opponent while
+    training on the mixture.
+    """
+    trainer = _load_trainer()
+    second = _copy_dataset(
+        dataset_dir,
+        tmp_path / "vs-pass",
+        seed_shift=1,
+        opponent={"label": "pass", "sha256": None},
+    )
+
+    train_split, holdout_split, records = trainer.load_dataset(
+        [dataset_dir, second],
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        encode_workers=1,
+    )
+
+    rows_per_seed = 2 * (EPISODE_STEPS - 1)
+    assert train_split.rows == 2 * rows_per_seed
+    assert holdout_split.rows == 2 * rows_per_seed
+    assert sum(record["episodes"] for record in records) == 8
+    assert [record["episodes"] for record in records] == [4, 4]
+    assert [record["opponent"]["label"] for record in records] == ["starter", "pass"]
+    assert [record["path"] for record in records] == [
+        str(dataset_dir.resolve()),
+        str(second.resolve()),
+    ]
+
+
+def test_load_dataset_rejects_an_empty_dataset_list(dataset_dir: Path) -> None:
+    trainer = _load_trainer()
+
+    with pytest.raises(ValueError, match="no dataset directories given"):
+        trainer.load_dataset(
+            [],
+            architecture=CONV_ENTITY,
+            holdout_seeds=1,
+            encode_workers=1,
+        )
+
+
+def test_load_dataset_rejects_a_directory_of_another_format_version(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    trainer = _load_trainer()
+    future = _copy_dataset(dataset_dir, tmp_path / "v2", format_version=2)
+
+    with pytest.raises(
+        ValueError, match=rf"{re.escape(str(future))}: unsupported dataset format: 2"
+    ):
+        trainer.load_dataset(
+            [dataset_dir, future],
+            architecture=CONV_ENTITY,
+            holdout_seeds=1,
+            encode_workers=1,
+        )
+
+
+def test_load_dataset_rejects_disagreeing_episode_steps(dataset_dir: Path, tmp_path: Path) -> None:
+    """Mixing horizons would silently change what one cloned step is."""
+    trainer = _load_trainer()
+    longer = _copy_dataset(dataset_dir, tmp_path / "longer", episode_steps=EPISODE_STEPS + 1)
+
+    with pytest.raises(
+        ValueError, match=rf"episode_steps {EPISODE_STEPS + 1} disagrees with {EPISODE_STEPS}"
+    ):
+        trainer.load_dataset(
+            [dataset_dir, longer],
+            architecture=CONV_ENTITY,
+            holdout_seeds=1,
+            encode_workers=1,
+        )
+
+
+def _tagging_encoder() -> Callable[[str, str], dict[str, np.ndarray]]:
+    """A stand-in tokenizer that makes the split assignment observable.
+
+    The fixture's 8-step starter episodes encode byte-identically for every
+    seed and seat, so the staged payload cannot say which episode landed on
+    which side of the split; one row per episode-seat tagged with load order
+    can. The arrays are the minimum `load_dataset` inspects: one active
+    component per factor, selected under an all-permitting mask.
+    """
+    order = itertools.count()
+
+    def encode(path_text: str, architecture_name: str) -> dict[str, np.ndarray]:
+        return {
+            "tag": np.array([[next(order)]], dtype=np.int64),
+            "unit_actions": np.zeros((1, 1), dtype=np.int8),
+            "unit_masks": np.ones((1, 1, 1), dtype=bool),
+            "market_kinds": np.zeros((1, 1), dtype=np.int8),
+            "market_kind_masks": np.ones((1, 1, 1), dtype=bool),
+            "market_quantities": np.zeros((1, 1), dtype=np.int8),
+            "market_quantity_masks": np.ones((1, 1, 1), dtype=bool),
+            "unit_active": np.ones((1, 1), dtype=bool),
+            "market_active": np.ones((1, 1), dtype=bool),
+            "market_quantity_active": np.ones((1, 1), dtype=bool),
+        }
+
+    return encode
+
+
+def _tags(split: object) -> list[int]:
+    return [int(value) for value in split.staged["tag"].flatten().tolist()]
+
+
+def test_one_directory_splits_exactly_as_it_did_before_mixing(
+    dataset_dir: Path, monkeypatch
+) -> None:
+    """A single dataset must split identically to the pre-mixture rule — the
+    highest `holdout_seeds` seeds held out whole, episodes in manifest order —
+    or the clones already measured stop being comparable to new ones."""
+    trainer = _load_trainer()
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    held_out = set(sorted({int(entry["seed"]) for entry in manifest["episodes"]})[-1:])
+    expected: dict[bool, list[int]] = {False: [], True: []}
+    for position, entry in enumerate(manifest["episodes"]):
+        expected[int(entry["seed"]) in held_out].append(position)
+    monkeypatch.setattr(trainer, "_encode_episode_file", _tagging_encoder())
+
+    train_split, holdout_split, _ = trainer.load_dataset(
+        [dataset_dir],
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        encode_workers=1,
+    )
+
+    assert expected[False] and expected[True]
+    assert _tags(train_split) == expected[False]
+    assert _tags(holdout_split) == expected[True]
 
 
 def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_path: Path) -> None:
@@ -192,7 +358,7 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
     output = tmp_path / "run"
 
     best = trainer.train(
-        dataset_dir=dataset_dir,
+        dataset_dirs=[dataset_dir],
         output_dir=output,
         architecture=CONV_ENTITY,
         config=_tiny_config(),
@@ -232,7 +398,9 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
     actor, payload = load_actor_artifact(output / "bc-actor.pt")
     assert payload["architecture"] == CONV_ENTITY
     assert payload["bc_provenance"]["teacher"]["label"] == "starter"
-    assert len(payload["bc_provenance"]["manifest_sha256"]) == 64
+    (only,) = payload["bc_provenance"]["datasets"]
+    assert len(only["manifest_sha256"]) == 64
+    assert (only["path"], only["episodes"]) == (str(dataset_dir.resolve()), 4)
     assert actor.training is False
 
 
@@ -243,7 +411,7 @@ def test_structured_training_saves_a_loadable_structured_artifact(
     output = tmp_path / "run-structured"
 
     best = trainer.train(
-        dataset_dir=dataset_dir,
+        dataset_dirs=[dataset_dir],
         output_dir=output,
         architecture=STRUCTURED,
         config=_tiny_structured_config(),
@@ -301,7 +469,7 @@ def test_clone_rejects_a_config_from_another_family(dataset_dir: Path, tmp_path:
 
     with pytest.raises(ValueError, match="does not configure the structured architecture"):
         trainer.train(
-            dataset_dir=dataset_dir,
+            dataset_dirs=[dataset_dir],
             output_dir=tmp_path / "mismatch",
             architecture=STRUCTURED,
             config=_tiny_config(),
@@ -322,7 +490,7 @@ def test_clone_refuses_to_overwrite_an_existing_run(dataset_dir: Path, tmp_path:
     trainer = _load_trainer()
     output = tmp_path / "run"
     arguments = dict(
-        dataset_dir=dataset_dir,
+        dataset_dirs=[dataset_dir],
         output_dir=output,
         architecture=CONV_ENTITY,
         config=_tiny_config(),
@@ -348,7 +516,7 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
     trainer = _load_trainer()
     output = tmp_path / "run"
     trainer.train(
-        dataset_dir=dataset_dir,
+        dataset_dirs=[dataset_dir],
         output_dir=output,
         architecture=CONV_ENTITY,
         config=_tiny_config(),
@@ -365,7 +533,7 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
     record = json.loads((output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
 
     train_split, _, _ = trainer.load_dataset(
-        dataset_dir,
+        [dataset_dir],
         architecture=CONV_ENTITY,
         holdout_seeds=1,
         encode_workers=1,
@@ -386,7 +554,7 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
 def test_clone_loss_is_the_masked_mean_component_nll(dataset_dir: Path, architecture: str) -> None:
     trainer = _load_trainer()
     train_split, _, _ = trainer.load_dataset(
-        dataset_dir,
+        [dataset_dir],
         architecture=architecture,
         holdout_seeds=1,
         encode_workers=1,
@@ -415,3 +583,54 @@ def test_clone_loss_is_the_masked_mean_component_nll(dataset_dir: Path, architec
         active_counts.values()
     )
     assert float(loss.detach()) == pytest.approx(expected, rel=1e-5)
+
+
+def test_run_record_carries_one_provenance_entry_per_dataset(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """Provenance has to name every corpus that shaped the weights, and must
+    not summarize a mixture with a scalar that describes one of them."""
+    trainer = _load_trainer()
+    second = _copy_dataset(
+        dataset_dir,
+        tmp_path / "v27-vs-pass",
+        teacher={"label": "public-v27", "sha256": "a" * 64},
+        opponent={"label": "pass", "sha256": None},
+    )
+    output = tmp_path / "run-mixed"
+
+    trainer.train(
+        dataset_dirs=[dataset_dir, second],
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=1,
+        patience=1,
+        batch_size=8,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    _, payload = load_actor_artifact(output / "bc-actor.pt")
+    provenance = payload["bc_provenance"]
+    records = provenance["datasets"]
+    assert [set(record) for record in records] == [
+        {"path", "manifest_sha256", "teacher", "opponent", "episodes"}
+    ] * 2
+    assert [
+        (record["path"], record["teacher"]["label"], record["opponent"]["label"])
+        for record in records
+    ] == [
+        (str(dataset_dir.resolve()), "starter", "starter"),
+        (str(second.resolve()), "public-v27", "pass"),
+    ]
+    assert len({record["manifest_sha256"] for record in records}) == 2
+    assert all(len(record["manifest_sha256"]) == 64 for record in records)
+    # Two teachers and two opponents: either scalar would name one corpus and
+    # misdescribe the run as having cloned it alone.
+    assert "teacher" not in provenance
+    assert "opponent" not in provenance
