@@ -25,7 +25,13 @@ PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
 # lanes back to the snapshot strata without anyone editing this constant.
 # Evaluation stays separate: `PRODUCTION_EXTERNAL_EVAL_OPPONENTS` below is a
 # diagnostic probe and shares nothing with these lanes.
-PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter"
+#
+# `scripted-v27` is the strength this leaderboard actually fields, replayed from
+# the public agent's own 719-step plan. It belongs here because the PFSP weight
+# is `(1 - score_rate)^2`: the three engine agents the learner already beats in
+# every game weigh nothing and hand their lanes to snapshots, so before v27 the
+# reserved lanes were spent on opponents that had stopped teaching anything.
+PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter,scripted-v27"
 PRODUCTION_LEAGUE_BUILTIN_LANES = 3
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_EVERY = 5
