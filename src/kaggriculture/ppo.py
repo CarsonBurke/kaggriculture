@@ -311,22 +311,28 @@ class PpoConfig:
     # sequential updates over one 230,080-state wave, and a BC-cloned policy is
     # sharp, so it moves far more KL per unit of parameter movement than the
     # from-scratch policy the reference rate was inherited for. Measured on the
-    # iteration-66 actor of the run this replaces, over that exact wave shape,
-    # worst minibatch KL against the stored behavior and the updates completed
-    # of 113:
+    # iteration-66 actor of the run this replaces, worst minibatch KL against the
+    # stored behavior and the updates completed of 113, on a self-play wave of
+    # production's shape and then on the shipped league mixture itself:
     #
-    #   lr        1e-12     1.5e-5    3.0e-5    5.0e-5    1.0e-4    2.5e-4
-    #   updates   113       113       113       28        5         1
-    #   max KL    1.44e-4   8.42e-3   2.02e-2   3.55e-2   1.73e-1   --
+    #   lr                1e-12     1.5e-5    3.0e-5    5.0e-5    1.0e-4   2.5e-4
+    #   self-play  upd    113       113       113       28        5        1
+    #              maxKL  1.44e-4   8.42e-3   2.02e-2   3.55e-2   1.73e-1  --
+    #   league-mix upd    113       --        113       102       --       2
+    #              maxKL  1.40e-4   --        1.59e-2   3.04e-2   --       --
     #
     # The 1e-12 control matters as much as the rest: it completes all 113 with
-    # 1.44e-4, which is the replay-parity floor exactly, so the gate never fires
-    # on numerics and every reading above it is policy movement.
+    # 1.4e-4 on both waves, which is the replay-parity floor exactly, so the gate
+    # never fires on numerics and every reading above it is policy movement.
     #
-    # 3.0e-5 is the largest rate whose whole epoch fits, at 1.49x margin. That is
-    # the same margin `runs/vapo-lv2-20260813` carried for 500 iterations without
-    # ever stopping early (0.03 against a worst minibatch of 2.179e-2), which is
-    # the only evidence available that a margin this size survives a full run.
+    # 3.0e-5 is the largest rate whose whole epoch fits, and the opponent mixture
+    # widens rather than narrows its margin -- 1.88x on the wave that ships,
+    # against 1.49x on self-play alone. 5.0e-5 is the reason the next rate up is
+    # not taken: it reads 0.99x on the shipped wave, which is the cliff itself,
+    # and its self-play margin of 0.85x would have understated how close. The
+    # margin taken is the one `runs/vapo-lv2-20260813` carried for 500 iterations
+    # without ever stopping early (0.03 against a worst minibatch of 2.179e-2),
+    # which is the only evidence available that a margin this size survives a run.
     #
     # At 2.5e-4 the trust region stopped the actor after 1 of 113 minibatches on
     # every post-warmup iteration, so the run trained on 0.9% of each wave while
