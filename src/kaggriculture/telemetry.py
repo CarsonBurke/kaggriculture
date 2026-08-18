@@ -607,6 +607,15 @@ _OPPONENT_RUN_ROOT = "opponents"
 _OPPONENT_CATEGORY = "opponents"
 _OPPONENT_AGGREGATE_FIELDS = ("score_rate", "mean_margin")
 _OPPONENT_UNCLASSIFIED = "unclassified"
+#: Every field an opponent record carries, longest first so a suffix match
+#: cannot stop early on a shorter field that is also a suffix of a longer one.
+#: Splitting on the first underscore instead would silently mis-parse any key
+#: containing one -- `builtin_starter` became opponent `builtin` with a field
+#: named `starter_score_rate`, which collapsed all three built-ins into one
+#: unclassified record carrying none of the fields the aggregation reads.
+_OPPONENT_FIELDS = tuple(
+    sorted(("category", "games", *_OPPONENT_AGGREGATE_FIELDS), key=len, reverse=True)
+)
 
 #: Run layout for a benchmark journal, which is keyed by batch size and repeat
 #: rather than by a monotonic step. Same reason as above: these decide where
@@ -713,9 +722,12 @@ def _opponent_scalars(record: dict[str, Any]) -> Iterator[tuple[str, str, float]
     for name, value in record.items():
         if not name.startswith(_OPPONENT_PREFIX):
             continue
-        identifier, _, field = name[len(_OPPONENT_PREFIX) :].partition("_")
-        if field:
-            opponents.setdefault(identifier, {})[field] = value
+        suffix = name[len(_OPPONENT_PREFIX) :]
+        for field in _OPPONENT_FIELDS:
+            identifier = suffix.removesuffix(f"_{field}")
+            if identifier != suffix and identifier:
+                opponents.setdefault(identifier, {})[field] = value
+                break
 
     categories: dict[str, list[dict[str, Any]]] = {}
     for opponent in opponents.values():

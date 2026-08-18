@@ -418,6 +418,48 @@ def test_league_opponents_aggregate_instead_of_minting_a_tag_each(tmp_path: Path
             assert not any(character.isdigit() for character in tag)
 
 
+def test_an_opponent_key_containing_an_underscore_still_resolves(tmp_path: Path) -> None:
+    """Built-in keys are names, not zero-padded indices, so they contain `_`.
+
+    Splitting the field off at the FIRST underscore read `builtin_starter` as an
+    opponent called `builtin` carrying a field called `starter_score_rate`. That
+    collapsed all three built-ins into a single record, classified it as
+    unclassified because no field named `category` survived, and dropped the
+    score-rate and margin curves entirely -- which are the only curves that say
+    whether the league is beating the reference agents it was admitted to beat.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    record: dict = {"iteration": 1, "league_score_rate": 0.5}
+    for key, fields in (
+        ("00000009", {"category": "active", "games": 14, "score_rate": 0.5, "mean_margin": 12.0}),
+        (
+            "builtin_starter",
+            {"category": "builtin", "games": 14, "score_rate": 0.0, "mean_margin": -3388.0},
+        ),
+        (
+            "builtin_pass",
+            {"category": "builtin", "games": 13, "score_rate": 0.25, "mean_margin": -2900.0},
+        ),
+    ):
+        for field, value in fields.items():
+            record[f"league_opponent_{key}_{field}"] = value
+    _write_jsonl(journal, [record])
+
+    migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    builtin = log_dir / "opponents/builtin"
+    assert _scalars(builtin, "opponents/count") == [(1, 2.0)]
+    assert _scalars(builtin, "opponents/games") == [(1, 27.0)]
+    # Both built-ins are present and weighted by games: (0.0*14 + 0.25*13)/27.
+    assert _scalars(builtin, "opponents/score_rate")[0][1] == pytest.approx(0.25 * 13 / 27)
+    assert _scalars(builtin, "opponents/score_rate_min") == [(1, 0.0)]
+    assert _scalars(builtin, "opponents/score_rate_max") == [(1, 0.25)]
+    # The snapshot key beside them, which has no underscore, is unaffected.
+    assert _scalars(log_dir / "opponents/active", "opponents/games") == [(1, 14.0)]
+    assert not (log_dir / "opponents/unclassified").exists()
+
+
 def test_a_cohort_is_a_run_so_its_statistics_share_one_chart(tmp_path: Path) -> None:
     """The wave, its self-play half and its league half report the same things.
 
