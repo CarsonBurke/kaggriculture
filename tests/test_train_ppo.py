@@ -615,6 +615,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "critic_updates": 1,
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
         },
     )
 
@@ -1047,6 +1048,7 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
             "critic_updates": 1,
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
         },
     )
     monkeypatch.setattr(module, "REPLAY_PARITY_AUDIT_INTERVAL", 3)
@@ -1364,7 +1366,11 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     onto the outermost atom saturates about 0.37 of the batch and never more.
     A bound set anywhere at or above that would never fire.
     """
-    from kaggriculture.ppo import MAX_FIRST_MINIBATCH_KL, MAX_VALUE_TARGET_SATURATED_FRACTION
+    from kaggriculture.ppo import (
+        MAX_FIRST_MINIBATCH_KL,
+        MAX_VALUE_TARGET_SATURATED_FRACTION,
+        MINIMUM_POLICY_ENTROPY,
+    )
 
     module = _training_script()
     healthy = {
@@ -1374,6 +1380,8 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
         "actor_minibatches_intended": 113,
         "max_approx_kl": 0.02,
         "kl_early_stop": 0,
+        # Inside the band every rate that learned measured, 0.14 to 0.37 nats.
+        "entropy": 0.2,
     }
 
     module._gate_update_metrics(healthy, warmup_active=False)
@@ -1437,3 +1445,18 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
             },
             warmup_active=False,
         )
+    # The second failure mode a learning-rate sweep found: at 1e-4 the actor
+    # converges onto passing every turn. Every number above reads healthy --
+    # the epoch completes 113 of 113 precisely because a deterministic policy
+    # has no KL movement to bound, and money rises to the untouched starting
+    # bank -- so entropy is the only place it can be caught.
+    with pytest.raises(RuntimeError, match=r"is below 0\.01"):
+        module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=False)
+    with pytest.raises(RuntimeError, match="no sampled alternative"):
+        module._gate_update_metrics(
+            {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
+        )
+    # The floor itself is admissible, and a warmup iteration cannot speak for a
+    # policy that has not been updated yet.
+    module._gate_update_metrics({**healthy, "entropy": MINIMUM_POLICY_ENTROPY}, warmup_active=False)
+    module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)

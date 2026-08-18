@@ -258,6 +258,31 @@ _REPLAY_AUDIT_SHUFFLE_SEED = 20260815
 #: non-zero reading and still fires well before the collapse completes.
 MAX_VALUE_TARGET_SATURATED_FRACTION = 0.05
 
+#: Mean policy entropy per active component, below which the policy is dead.
+#:
+#: Measured, not chosen from taste. A learning-rate sweep against the native
+#: built-ins (`artifacts/probes/trust-cliff.json`) found a second failure mode
+#: this pipeline could not see: at 1e-4 the actor converges within a dozen
+#: iterations onto passing every turn -- entropy 0.000 nats, final money exactly
+#: 3000, the starting bank untouched, and 0.000 score rate against every
+#: built-in. Nothing in the telemetry called it: the epoch completes 100% of its
+#: minibatches precisely because a deterministic policy has no KL movement to
+#: bound, `actor_updates` reads 113 of 113, and money *rose* to its maximum.
+#:
+#: It is also terminal rather than a phase. The gradient of a clipped surrogate
+#: comes from sampled alternatives, so a policy that samples nothing has no
+#: signal with which to leave, and the run burns GPU-hours converged on the
+#: reward's inaction basin -- passing scores -0.074 against `starter`, where
+#: trading badly scores -0.75, so the objective genuinely prefers doing nothing
+#: to farming incompetently and PPO is not misbehaving by finding that.
+#:
+#: The floor separates the two regimes by an order of magnitude on each side.
+#: Healthy runs measured 0.14 to 0.37 nats across every rate that learned;
+#: collapsed ones measured 0.000 to 0.001. At 0.01 nats a component's top action
+#: already holds about 99.8% of the mass, which is past the point where any
+#: remaining spread can be called exploration.
+MINIMUM_POLICY_ENTROPY = 0.01
+
 #: Share of its intended minibatches an actor epoch must actually apply.
 #:
 #: `actor_updates < 1` was already refused, and that bound is too weak by

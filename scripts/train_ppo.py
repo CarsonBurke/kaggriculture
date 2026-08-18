@@ -46,6 +46,7 @@ from kaggriculture.ppo import (
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     MAX_VALUE_TARGET_SATURATED_FRACTION,
     MINIMUM_ACTOR_EPOCH_FRACTION,
+    MINIMUM_POLICY_ENTROPY,
     UPDATE_COMPILE_MODES,
     PpoConfig,
     make_optimizers,
@@ -1149,6 +1150,18 @@ def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: 
             f"{MINIMUM_ACTOR_EPOCH_FRACTION:.0%} of the epoch; the trust region "
             f"{'stopped it early' if update_metrics.get('kl_early_stop') else 'is not the cause'} "
             f"at max_approx_kl {float(update_metrics['max_approx_kl']):.4g}"
+        )
+    # A policy that samples nothing cannot leave where it is: the clipped
+    # surrogate's gradient comes from sampled alternatives. Every other number in
+    # this iteration reads healthy when it happens -- the epoch completes because
+    # a deterministic policy has no KL to bound, and money rises because the
+    # inaction basin keeps the whole starting bank -- so this is the only signal.
+    entropy = float(update_metrics["entropy"])
+    if not warmup_active and entropy < MINIMUM_POLICY_ENTROPY:
+        raise RuntimeError(
+            f"policy entropy {entropy:.4g} nats per active component is below "
+            f"{MINIMUM_POLICY_ENTROPY}; the policy is deterministic and has no "
+            "sampled alternative left to learn from"
         )
 
 
