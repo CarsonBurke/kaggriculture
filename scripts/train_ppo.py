@@ -181,6 +181,19 @@ def parse_args() -> argparse.Namespace:
             "since replay parity pins the sampling temperature to 1.0"
         ),
     )
+    parser.add_argument(
+        "--optimizer",
+        choices=("normuon", "adamw"),
+        default=PpoConfig.optimizer,
+        help=(
+            "matrix optimizer: 'normuon' spectrally normalizes every hidden "
+            "matrix's update and leaves gains, biases and heads on Adam, "
+            "'adamw' is element-wise throughout. The learning rates above are "
+            "in the chosen optimizer's units -- a NorMuon rate is the fraction "
+            "of itself a matrix moves per step, an Adam rate is a per-element "
+            "step, and they differ by sqrt(fan_in)"
+        ),
+    )
     parser.add_argument("--max-gradient-norm", type=float, default=1.0)
     # Two phases, two knobs, decided separately by calibration: the collection
     # forward and the update compile different graphs, and their measured
@@ -1216,6 +1229,7 @@ def main() -> None:
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         entropy_coefficient=args.entropy_coefficient,
+        optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,
     )

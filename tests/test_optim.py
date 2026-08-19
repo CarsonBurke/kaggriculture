@@ -1,0 +1,384 @@
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+
+from kaggriculture.optim import (
+    ADAM_PARAMETER_ROLES,
+    POLAR_EXPRESS_COEFFICIENTS,
+    NorMuon,
+    polar_express,
+    route_parameters,
+)
+from kaggriculture.ppo import PpoConfig, make_optimizers
+from kaggriculture.production import production_model_config
+from kaggriculture.registry import resolve_architecture
+
+SHAPES = ((96, 96), (384, 96), (96, 384), (48, 432), (22, 100))
+
+
+def _decaying_spectrum(shape: tuple[int, int], seed: int = 0) -> torch.Tensor:
+    """A matrix with a steep spectrum, which is what a real gradient looks like."""
+
+    generator = torch.Generator().manual_seed(seed)
+    left, values, right = torch.linalg.svd(
+        torch.randn(*shape, generator=generator), full_matrices=False
+    )
+    return (left * torch.linspace(1.0, 0.01, values.numel()) ** 2) @ right
+
+
+def _exact_polar(matrix: torch.Tensor) -> torch.Tensor:
+    left, _, right = torch.linalg.svd(matrix.double(), full_matrices=False)
+    return left @ right
+
+
+def _model(seed: int = 0) -> torch.nn.Sequential:
+    torch.manual_seed(seed)
+    return torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.Linear(32, 8))
+
+
+def _optimizer(model: torch.nn.Module, **overrides: float) -> NorMuon:
+    settings: dict[str, float] = {"learning_rate": 1e-2, "adam_learning_rate": 1e-3}
+    settings.update(overrides)
+    return NorMuon(
+        [parameter for parameter in model.parameters() if parameter.ndim >= 2],
+        [parameter for parameter in model.parameters() if parameter.ndim < 2],
+        **settings,
+    )
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_polar_express_recovers_the_direction_of_an_exact_svd_polar_factor(
+    shape: tuple[int, int],
+) -> None:
+    matrix = _decaying_spectrum(shape)
+    approximation = polar_express(matrix).double()
+    reference = _exact_polar(matrix)
+    cosine = (approximation * reference).sum() / (approximation.norm() * reference.norm())
+    # Five iterations at this cushion do not reach an exact orthogonal factor,
+    # and are not meant to: the coefficients trade the smallest singular
+    # directions away rather than amplify what is noise there.
+    assert cosine > 0.94
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_polar_express_flattens_the_spectrum_without_exploding_it(
+    shape: tuple[int, int],
+) -> None:
+    values = torch.linalg.svdvals(polar_express(_decaying_spectrum(shape)).float())
+    # An exact polar factor has every singular value at one. The iteration's
+    # cushion overshoots slightly, and that bound is what keeps a step from
+    # being larger than the learning rate claims.
+    assert values.max() < 1.2
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_polar_express_is_invariant_to_the_scale_of_its_input(shape: tuple[int, int]) -> None:
+    """The property that removes gradient clipping's effective-rate variation.
+
+    `max_gradient_norm` rescales every gradient in this trainer, so a matrix
+    optimizer that responded to that scale would inherit a learning rate that
+    varied minibatch to minibatch. Measured in bfloat16 this same check fails
+    at 5-16%, which is why `polar_express` runs in fp32.
+    """
+
+    matrix = _decaying_spectrum(shape)
+    once = polar_express(matrix)
+    scaled = polar_express(matrix * 1000.0)
+    assert (once - scaled).norm() / once.norm() < 1e-4
+
+
+def test_polar_express_handles_both_orientations_consistently() -> None:
+    matrix = _decaying_spectrum((384, 96))
+    upright = polar_express(matrix)
+    transposed = polar_express(matrix.mT.contiguous())
+    assert torch.allclose(upright, transposed.mT, atol=1e-5)
+
+
+def test_polar_express_rejects_a_matrix_without_two_dimensions() -> None:
+    with pytest.raises(ValueError, match="two dimensions"):
+        polar_express(torch.zeros(8))
+
+
+def test_the_iteration_length_matches_the_coefficients_it_was_solved_for() -> None:
+    # The coefficients are a solved polynomial, not a tunable list; a different
+    # length is a different function and no longer approximates a polar factor.
+    assert len(POLAR_EXPRESS_COEFFICIENTS) == 5
+
+
+def test_a_normuon_step_is_invariant_to_the_gradient_scale() -> None:
+    steps = []
+    for scale in (1.0, 1000.0):
+        model = _model()
+        optimizer = _optimizer(model)
+        before = torch.cat(
+            [p.detach().reshape(-1) for p in model.parameters() if p.ndim >= 2]
+        ).clone()
+        inputs = torch.randn(64, 16, generator=torch.Generator().manual_seed(7))
+        ((model(inputs) ** 2).mean() * scale).backward()
+        optimizer.step()
+        after = torch.cat([p.detach().reshape(-1) for p in model.parameters() if p.ndim >= 2])
+        steps.append(after - before)
+    assert (steps[0] - steps[1]).norm() / steps[0].norm() < 1e-3
+
+
+def test_the_relative_step_size_of_a_square_matrix_is_the_learning_rate() -> None:
+    """What makes a NorMuon rate transferable, and what an Adam rate is not.
+
+    The orthogonalized update has Frobenius norm `lr * sqrt(min(rows, cols))`
+    against a weight norm near `sqrt(fan_out)`, so for a square matrix the
+    learning rate IS the fraction of itself the layer moves per step. The
+    schedule comments in `ppo.py` depend on this identity holding.
+    """
+
+    layer = torch.nn.Linear(96, 96, bias=False)
+    initial = layer.weight.detach().clone()
+    optimizer = NorMuon([layer.weight], [], learning_rate=1e-2, adam_learning_rate=1e-3)
+    layer.weight.grad = torch.randn_like(layer.weight)
+    optimizer.step()
+    relative = (layer.weight.detach() - initial).norm() / initial.norm()
+    assert 0.5e-2 < relative < 2e-2
+
+
+def test_the_shape_multiplier_keeps_a_tall_matrix_from_taking_a_smaller_step() -> None:
+    relatives = []
+    for rows, columns in ((96, 96), (384, 96)):
+        layer = torch.nn.Linear(columns, rows, bias=False)
+        initial = layer.weight.detach().clone()
+        optimizer = NorMuon([layer.weight], [], learning_rate=1e-2, adam_learning_rate=1e-3)
+        layer.weight.grad = torch.randn_like(layer.weight)
+        optimizer.step()
+        relatives.append(((layer.weight.detach() - initial).norm() / initial.norm()).item())
+    assert relatives[1] == pytest.approx(relatives[0], rel=0.35)
+
+
+def test_a_found_inf_step_leaves_parameters_moments_and_the_counter_untouched() -> None:
+    model = _model()
+    optimizer = _optimizer(model)
+    inputs = torch.randn(64, 16)
+    (model(inputs) ** 2).mean().backward()
+    optimizer.step()
+
+    parameters_before = [parameter.detach().clone() for parameter in model.parameters()]
+    state_before = copy.deepcopy(
+        {
+            index: {
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in optimizer.state[parameter].items()
+            }
+            for index, parameter in enumerate(model.parameters())
+        }
+    )
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, float("inf"))
+    optimizer.grad_scale = None
+    optimizer.found_inf = torch.ones(())
+    try:
+        optimizer.step()
+    finally:
+        del optimizer.grad_scale, optimizer.found_inf
+
+    for before, parameter in zip(parameters_before, model.parameters(), strict=True):
+        assert torch.equal(before, parameter.detach())
+        assert torch.isfinite(parameter).all()
+    for index, parameter in enumerate(model.parameters()):
+        for key, value in optimizer.state[parameter].items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(state_before[index][key], value)
+            else:
+                assert state_before[index][key] == value
+
+
+def test_a_zero_found_inf_step_applies_exactly_what_an_ungated_step_would() -> None:
+    outcomes = []
+    for gated in (False, True):
+        model = _model()
+        optimizer = _optimizer(model)
+        inputs = torch.randn(64, 16, generator=torch.Generator().manual_seed(3))
+        (model(inputs) ** 2).mean().backward()
+        if gated:
+            optimizer.grad_scale = None
+            optimizer.found_inf = torch.zeros(())
+        optimizer.step()
+        if gated:
+            del optimizer.grad_scale, optimizer.found_inf
+        outcomes.append(torch.cat([p.detach().reshape(-1) for p in model.parameters()]))
+    assert torch.allclose(outcomes[0], outcomes[1], atol=1e-7)
+
+
+def test_the_optimizer_state_survives_a_save_and_load(tmp_path) -> None:
+    """Resume must reproduce the next step exactly, which is how training resumes.
+
+    The state_dict is round-tripped through `torch.save`, deliberately: torch's
+    `load_state_dict` hands back the *same* state tensors when dtype and device
+    already match, so loading a live `state_dict()` aliases the donor's buffers
+    and any later step by either optimizer would corrupt the other. Every real
+    resume comes off disk, where the tensors are fresh.
+    """
+
+    inputs = torch.randn(64, 16, generator=torch.Generator().manual_seed(11))
+    original = _model()
+    original_optimizer = _optimizer(original)
+    (original(inputs) ** 2).mean().backward()
+    original_optimizer.step()
+
+    path = tmp_path / "optimizer.pt"
+    torch.save({"model": original.state_dict(), "optimizer": original_optimizer.state_dict()}, path)
+    payload = torch.load(path, weights_only=False)
+
+    resumed = _model()
+    resumed_optimizer = _optimizer(resumed)
+    resumed.load_state_dict(payload["model"])
+    resumed_optimizer.load_state_dict(payload["optimizer"])
+
+    for model, optimizer in ((original, original_optimizer), (resumed, resumed_optimizer)):
+        for parameter in model.parameters():
+            parameter.grad = None
+        (model(inputs) ** 2).mean().backward()
+        optimizer.step()
+
+    for left, right in zip(original.parameters(), resumed.parameters(), strict=True):
+        assert torch.equal(left.detach(), right.detach())
+
+
+def test_the_optimizer_descends_a_regression_it_can_solve() -> None:
+    model = _model()
+    optimizer = _optimizer(model)
+    inputs = torch.randn(64, 16, generator=torch.Generator().manual_seed(5))
+    targets = torch.randn(64, 8, generator=torch.Generator().manual_seed(6))
+    losses = []
+    for _ in range(100):
+        for parameter in model.parameters():
+            parameter.grad = None
+        loss = ((model(inputs) - targets) ** 2).mean()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0] * 0.8
+
+
+def test_a_parameter_without_a_gradient_is_skipped_rather_than_stepped() -> None:
+    layer = torch.nn.Linear(32, 16)
+    optimizer = NorMuon([layer.weight], [layer.bias], learning_rate=1e-2, adam_learning_rate=1e-3)
+    before = layer.weight.detach().clone()
+    layer.bias.grad = torch.randn_like(layer.bias)
+    optimizer.step()
+    assert torch.equal(before, layer.weight.detach())
+    assert optimizer.state[layer.weight] == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("learning_rate", 0.0),
+        ("adam_learning_rate", -1.0),
+        ("momentum", 1.0),
+        ("beta2", -0.1),
+    ),
+)
+def test_unusable_hyperparameters_are_rejected(field: str, value: float) -> None:
+    layer = torch.nn.Linear(8, 8)
+    settings: dict[str, float] = {"learning_rate": 1e-2, "adam_learning_rate": 1e-3}
+    settings[field] = value
+    with pytest.raises(ValueError):
+        NorMuon([layer.weight], [layer.bias], **settings)
+
+
+def test_a_vector_routed_to_the_matrix_set_is_rejected() -> None:
+    layer = torch.nn.Linear(8, 8)
+    with pytest.raises(ValueError, match="two dimensions"):
+        NorMuon([layer.bias], [], learning_rate=1e-2, adam_learning_rate=1e-3)
+
+
+def test_an_optimizer_needs_at_least_one_parameter() -> None:
+    with pytest.raises(ValueError, match="at least one parameter"):
+        NorMuon([], [], learning_rate=1e-2, adam_learning_rate=1e-3)
+
+
+def _production_modules() -> tuple[torch.nn.Module, torch.nn.Module]:
+    payload = production_model_config()
+    architecture = resolve_architecture(payload)
+    config = architecture.config_class(**payload)
+    return architecture.actor_class(config), architecture.critic_class(config)
+
+
+def test_every_production_parameter_is_routed_exactly_once() -> None:
+    for module in _production_modules():
+        matrices, vectors = route_parameters(module)
+        routed = {id(parameter) for parameter in matrices} | {
+            id(parameter) for parameter in vectors
+        }
+        assert len(matrices) + len(vectors) == len(routed)
+        assert routed == {id(parameter) for parameter in module.parameters()}
+
+
+def test_heads_and_embeddings_stay_on_adam_while_hidden_matrices_do_not() -> None:
+    """Muon's premise is about a matrix acting on a feature space.
+
+    A logit head's rows are per-action scores whose relative magnitudes are the
+    output, and an embedding's rows are independent lookups, so orthogonalizing
+    across either mixes quantities that are not comparable. This pins the
+    routing so a rename cannot silently move a layer between the two.
+    """
+
+    for module in _production_modules():
+        matrices, vectors = route_parameters(module)
+        matrix_ids = {id(parameter) for parameter in matrices}
+        vector_ids = {id(parameter) for parameter in vectors}
+        for name, parameter in module.named_parameters():
+            named_role = not ADAM_PARAMETER_ROLES.isdisjoint(name.split("."))
+            if named_role or parameter.ndim < 2:
+                assert id(parameter) in vector_ids, name
+            else:
+                assert id(parameter) in matrix_ids, name
+        # Convolution kernels are matrices under the standard Muon convention,
+        # flattened to (out_channels, -1) rather than excluded for being 4-D.
+        convolutions = [
+            name
+            for name, parameter in module.named_parameters()
+            if parameter.ndim == 4 and id(parameter) in matrix_ids
+        ]
+        assert convolutions
+
+
+def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
+    actor, critic = _production_modules()
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, PpoConfig())
+    for optimizer, learning_rate in (
+        (actor_optimizer, PpoConfig().actor_learning_rate),
+        (critic_optimizer, PpoConfig().critic_learning_rate),
+    ):
+        assert isinstance(optimizer, NorMuon)
+        kinds = {group["kind"]: group for group in optimizer.param_groups}
+        assert set(kinds) == {"normuon", "adam"}
+        assert kinds["normuon"]["lr"] == pytest.approx(learning_rate)
+        assert kinds["adam"]["lr"] == pytest.approx(
+            learning_rate * PpoConfig().adam_learning_rate_ratio
+        )
+        # `_optimizer_step` drives the warmup through this metadata.
+        for group in optimizer.param_groups:
+            assert group["base_lr"] == pytest.approx(group["lr"])
+            assert group["warmup_step"] == 0
+
+
+def test_the_critic_step_can_be_gated_on_the_device_under_normuon() -> None:
+    # `update_ppo` asks for this capability rather than inferring it from a
+    # fused AdamW, and a false answer would cost a host synchronization per
+    # minibatch or an ungated poisoned step.
+    actor, critic = _production_modules()
+    _, critic_optimizer = make_optimizers(actor, critic, PpoConfig())
+    assert getattr(critic_optimizer, "supports_found_inf", False)
+
+
+def test_the_adamw_optimizer_remains_available_for_comparison() -> None:
+    actor, critic = _production_modules()
+    actor_optimizer, _ = make_optimizers(actor, critic, PpoConfig(optimizer="adamw"))
+    assert isinstance(actor_optimizer, torch.optim.AdamW)
+
+
+def test_an_unknown_optimizer_name_is_rejected() -> None:
+    actor, critic = _production_modules()
+    with pytest.raises(ValueError, match="unsupported optimizer"):
+        make_optimizers(actor, critic, PpoConfig(optimizer="lion"))

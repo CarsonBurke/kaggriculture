@@ -16,6 +16,7 @@ from kaggriculture.model import (
     FarmActor,
     distributional_value_loss,
 )
+from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
 from kaggriculture.registry import CONV_ENTITY
@@ -30,6 +31,9 @@ Actor = FarmActor | StructuredActor
 LENGTH_ADAPTIVE_GAE_ALPHA = 0.05
 COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
 DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (LENGTH_ADAPTIVE_GAE_ALPHA * COMPETITION_ACTION_STEPS)
+
+#: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
+_OPTIMIZERS = ("normuon", "adamw")
 
 # Numerics gates shared by the calibration benchmark, the training launcher's
 # expected configuration, and the production training loop.
@@ -418,9 +422,53 @@ class PpoConfig:
     # the clip band it backs up (0.036 at a barely-engaging 0.80/1.28), and a
     # 12-iteration trajectory at 0.10 ends with the highest entropy of any run
     # measured, rising rather than falling.
-    actor_learning_rate: float = 3.0e-5
-    critic_learning_rate: float = 2.5e-4
+    #
+    # **Both rates were multiplied by ten when `optimizer` became `normuon`, and
+    # that factor is a unit conversion rather than a tuning decision.** Adam's
+    # step is per-element, so a matrix moves `lr * sqrt(numel)` against a weight
+    # norm of `sqrt(fan_out)` -- a relative step of `lr * sqrt(fan_in)`, which is
+    # 9.8x the rate at this model's width of 96. A NorMuon step's norm is
+    # `lr * shape_multiplier * sqrt(min(fan_in, fan_out))` against that same
+    # `sqrt(fan_out)`, and the shape multiplier is exactly what collapses both
+    # orientations to a relative step of `lr`. So 3.0e-5 under Adam and 3.0e-4
+    # under NorMuon move a layer by the same 3e-4 of itself per step, and the
+    # whole tabulation above -- which is a statement about how far the policy may
+    # travel per update before the trust region bites -- carries over unchanged.
+    # The A/B between the two therefore measures the update's DIRECTION, which is
+    # the only thing orthogonalization changes, instead of confounding it with a
+    # tenfold step-size difference. Sweeping around this anchor is still owed.
+    actor_learning_rate: float = 3.0e-4
+    critic_learning_rate: float = 2.5e-3
     lr_warmup_steps: int = 32
+    # Which optimizer `make_optimizers` builds. `normuon` gives every hidden
+    # matrix a spectrally normalized step (Polar Express + NorMuon's low-rank
+    # second moment, ported from `modded-nanogpt` in `optim.py`) and leaves the
+    # gains, biases, embeddings and logit heads on Adam; `adamw` is the prior
+    # element-wise optimizer, kept so the two can be measured against each
+    # other on play rather than argued about.
+    #
+    # The learning rates above mean DIFFERENT things under the two. Adam's step
+    # is per-element, so a matrix's relative movement scales with its size; a
+    # NorMuon step's Frobenius norm is `lr * sqrt(min(rows, cols))` against a
+    # weight norm near `sqrt(fan_out)`, so `lr` IS the relative movement per
+    # step. At Adam's 3.0e-5 a 96x96 layer moves about 3e-4 of its norm per
+    # step, which is the anchor a NorMuon rate has to be swept around.
+    optimizer: str = "normuon"
+    # Adam's rate for the parameters NorMuon does not take -- the gains, biases,
+    # embeddings and logit heads. Expressed as a multiple of the network's
+    # NorMuon rate because Adam's step is absolute and NorMuon's relative, so
+    # the ratio is the transferable quantity rather than a second absolute
+    # number. 0.35 is `modded-nanogpt`'s own ratio, 0.008 over 0.023, and it
+    # matters more than it looks: the heads are what most directly set the
+    # predictions, and an earlier guess of 0.1 measurably under-fitted the
+    # critic (explained variance 0.050 against AdamW's 0.33 on the same 64-state
+    # regression) purely by starving the value head.
+    adam_learning_rate_ratio: float = 0.35
+    # Muon's defaults, unchanged: momentum 0.95 is the Nesterov coefficient
+    # ahead of orthogonalization, and beta2 0.9 the low-rank second moment's
+    # decay. `modded-nanogpt` ships both.
+    normuon_momentum: float = 0.95
+    normuon_beta2: float = 0.9
     # No weight decay: with decay the AdamW update is not scale-invariant and
     # steadily shrinks norm gains and biases, and the CleanRL reference runs
     # plain Adam. Zero makes AdamW identical to Adam.
@@ -622,9 +670,18 @@ def _validate_config(config: PpoConfig) -> None:
         ("critic learning rate", config.critic_learning_rate),
         ("max gradient norm", config.max_gradient_norm),
         ("target KL", config.target_kl),
+        ("adam learning rate ratio", config.adam_learning_rate_ratio),
     ):
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
+    if config.optimizer not in _OPTIMIZERS:
+        raise ValueError(f"unsupported optimizer {config.optimizer!r}, want one of {_OPTIMIZERS}")
+    for name, value in (
+        ("normuon momentum", config.normuon_momentum),
+        ("normuon beta2", config.normuon_beta2),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be finite and in [0, 1)")
     if not math.isfinite(config.weight_decay) or config.weight_decay < 0.0:
         raise ValueError("weight decay must be finite and non-negative")
     # Negative would actively drive the policy deterministic, which is the
@@ -844,6 +901,27 @@ def make_optimizers(
     critic_device = next(critic.parameters()).device
     if actor_device != critic_device:
         raise ValueError("actor and critic must use the same device")
+    if config.optimizer == "normuon":
+        # One learning rate per network drives both halves: the matrices under
+        # NorMuon and the gains, biases and heads under Adam. They are not the
+        # same quantity -- a NorMuon rate is a RELATIVE step, since the
+        # orthogonalized update's Frobenius norm is `lr * sqrt(min(rows, cols))`
+        # against a weight norm of about `sqrt(fan_out)`, while an Adam rate is
+        # an ABSOLUTE per-element step. `adam_learning_rate_ratio` converts.
+        optimizers = tuple(
+            NorMuon(
+                *route_parameters(module),
+                learning_rate=rate,
+                adam_learning_rate=rate * config.adam_learning_rate_ratio,
+                momentum=config.normuon_momentum,
+                beta2=config.normuon_beta2,
+            )
+            for module, rate in (
+                (actor, config.actor_learning_rate),
+                (critic, config.critic_learning_rate),
+            )
+        )
+        return optimizers[0], optimizers[1]
     fused = actor_device.type == "cuda"
     actor_optimizer = torch.optim.AdamW(
         actor.parameters(),
@@ -1932,11 +2010,11 @@ def update_ppo(
     guard_host = torch.empty(3, dtype=torch.float64, pin_memory=device.type == "cuda")
     guard_event = torch.cuda.Event() if device.type == "cuda" else None
     critic_nonfinite = torch.zeros((), dtype=torch.float64, device=device)
-    # `found_inf` is a fused-implementation facility; the single-tensor and
-    # foreach paths assert it is unused. Ask the optimizer that will receive the
-    # skip whether it can honour one, rather than inferring it from the device
-    # that happened to imply `fused` back in `make_optimizers`.
-    critic_step_is_gateable = any(
+    # `found_inf` is a fused-implementation facility, which `NorMuon` implements
+    # directly and the single-tensor and foreach AdamW paths assert is unused.
+    # Ask the optimizer that will receive the skip whether it can honour one,
+    # rather than inferring it from the device that happened to imply `fused`.
+    critic_step_is_gateable = getattr(critic_optimizer, "supports_found_inf", False) or any(
         group.get("fused", False) for group in critic_optimizer.param_groups
     )
 

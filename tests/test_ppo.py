@@ -1454,13 +1454,19 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     # default 32-step warmup would not have finished ramping before the update
     # ends. `critic_epochs` above `epochs` is exactly the critic-only refit the
     # production warm-start phase runs.
+    #
+    # The rate is in NorMuon units, where it is the fraction of itself a matrix
+    # moves per step; the 3e-3 this read under AdamW was an absolute per-element
+    # step, worth `3e-3 * sqrt(fan_in)` relative at this model's width of 16.
+    # Keeping the same relative step is what keeps this a test of the metrics
+    # rather than of the optimizer.
     config = PpoConfig(
         epochs=1,
         critic_epochs=24,
         minibatch_size=32,
         use_bfloat16=False,
         lr_warmup_steps=0,
-        critic_learning_rate=3e-3,
+        critic_learning_rate=1.2e-2,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
 

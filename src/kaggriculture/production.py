@@ -280,6 +280,8 @@ def build_training_command(
             str(ppo["target_kl"]),
             "--entropy-coefficient",
             str(ppo["entropy_coefficient"]),
+            "--optimizer",
+            str(ppo["optimizer"]),
             "--max-gradient-norm",
             str(ppo["max_gradient_norm"]),
         )
