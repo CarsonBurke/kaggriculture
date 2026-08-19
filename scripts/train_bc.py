@@ -44,6 +44,7 @@ from kaggriculture.encoding import encode_observation
 from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
 from kaggriculture.model import FarmActor
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.ppo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
 from kaggriculture.provenance import source_identity
@@ -137,8 +138,44 @@ def parse_args() -> argparse.Namespace:
         "--patience", type=int, default=5, help="epochs without holdout improvement before stopping"
     )
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    # Both rate and decay changed UNITS when this moved off AdamW, so both are
+    # renamed: a stale invocation now fails at argparse instead of silently
+    # training a tenth as fast with a hundredth of the intended decay.
+    parser.add_argument(
+        "--matrix-learning-rate",
+        type=float,
+        default=3e-3,
+        help=(
+            "NorMuon rate: the fraction of itself a hidden matrix moves per step. "
+            "About ten times the Adam rate it replaced, because an Adam step is "
+            "per-element and moves a matrix roughly lr*sqrt(fan_in) of itself"
+        ),
+    )
+    parser.add_argument(
+        "--adam-learning-rate-ratio",
+        type=float,
+        default=0.35,
+        help=(
+            "rate for the gains, biases, embeddings and logit heads NorMuon does "
+            "not take, as a multiple of the matrix rate; the reference's own "
+            "0.008/0.023"
+        ),
+    )
+    parser.add_argument(
+        "--matrix-weight-decay",
+        type=float,
+        default=1.2,
+        help=(
+            "cautious decay on hidden matrices; quadratic in the rate, as in the "
+            "reference, which is why the coefficient is above one"
+        ),
+    )
+    parser.add_argument(
+        "--adam-weight-decay",
+        type=float,
+        default=0.005,
+        help="cautious decay on the parameters Adam takes",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -525,6 +562,57 @@ def _artifact_payload(
     }
 
 
+# `modded-nanogpt`'s pretraining schedule, transcribed from
+# `TrainingSchedule.get_lr` (train_gpt.py:1968-1976) and `get_muon_momentum`
+# (:1995-2005). Two departures from what this file used to do: the rate holds
+# flat and then decays LINEARLY to a floor rather than following a cosine to
+# zero, and the Nesterov coefficient is scheduled at all.
+COOLDOWN_FRACTION = 0.60
+FINAL_RATE_FRACTION = 0.15
+MOMENTUM_WARMUP_STEPS = 300
+MOMENTUM_COOLDOWN_STEPS = 50
+MOMENTUM_MINIMUM = 0.85
+MOMENTUM_MAXIMUM = 0.95
+
+
+def _rate_fraction(step: int, total_steps: int) -> float:
+    """The reference's trapezoid: flat, then linear to a floor, never to zero."""
+    cooldown_start = int(total_steps * (1.0 - COOLDOWN_FRACTION))
+    if step < cooldown_start:
+        return 1.0
+    progress = min(1.0, (step - cooldown_start) / max(total_steps - cooldown_start, 1))
+    return (1.0 - progress) + FINAL_RATE_FRACTION * progress
+
+
+def _momentum_at(step: int, total_steps: int) -> float:
+    """Nesterov coefficient warmed up, held, then cooled back down.
+
+    The reference's 300 and 50 steps are absolute counts on a run of tens of
+    thousands of steps. A clone is far shorter, so both are capped as fractions
+    of the run: an uncapped 300-step warmup could otherwise span the whole of
+    training and never reach the coefficient it is warming up to.
+    """
+    warmup = min(MOMENTUM_WARMUP_STEPS, max(total_steps // 4, 1))
+    cooldown = min(MOMENTUM_COOLDOWN_STEPS, max(total_steps // 20, 1))
+    span = MOMENTUM_MAXIMUM - MOMENTUM_MINIMUM
+    if step < warmup:
+        return MOMENTUM_MINIMUM + span * (step / warmup)
+    cooldown_start = total_steps - cooldown
+    if step >= cooldown_start:
+        return MOMENTUM_MAXIMUM - span * min(1.0, (step - cooldown_start) / cooldown)
+    return MOMENTUM_MAXIMUM
+
+
+def _apply_schedule(optimizer: NorMuon, step: int, total_steps: int) -> None:
+    """Set this step's rate and Nesterov coefficient on every group."""
+    fraction = _rate_fraction(step, total_steps)
+    momentum = _momentum_at(step, total_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = group["base_lr"] * fraction
+        if group["kind"] == "normuon":
+            group["momentum"] = momentum
+
+
 def train(
     *,
     dataset_dirs: Sequence[Path],
@@ -535,8 +623,10 @@ def train(
     epochs: int,
     patience: int,
     batch_size: int,
-    learning_rate: float,
-    weight_decay: float,
+    matrix_learning_rate: float,
+    matrix_weight_decay: float,
+    adam_learning_rate_ratio: float,
+    adam_weight_decay: float,
     seed: int,
     device: torch.device,
     encode_workers: int,
@@ -578,9 +668,22 @@ def train(
     )
 
     actor = resolve_architecture(architecture).actor_class(config).to(device)
-    optimizer = torch.optim.AdamW(actor.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # Pretraining, so the reference's full recipe applies: spectrally normalized
+    # matrix steps, Adam on the gains, biases and heads, and cautious decay on
+    # both halves. The PPO update deliberately runs the same optimizer with
+    # decay at zero; a clone has no trust region to keep.
+    matrices, vectors = route_parameters(actor)
+    optimizer = NorMuon(
+        matrices,
+        vectors,
+        learning_rate=matrix_learning_rate,
+        adam_learning_rate=matrix_learning_rate * adam_learning_rate_ratio,
+        weight_decay=matrix_weight_decay,
+        adam_weight_decay=adam_weight_decay,
+    )
     steps_per_epoch = math.ceil(train_split.rows / batch_size)
-    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * steps_per_epoch)
+    total_steps = max(epochs * steps_per_epoch, 1)
+    step_index = 0
     autocast = device.type == "cuda"
     bc_provenance: dict[str, Any] = {
         "datasets": datasets,
@@ -613,9 +716,11 @@ def train(
             # order.
             order = torch.randperm(train_split.rows, generator=generator)
             shuffled_components = train_split.row_components[order.numpy()]
-            # The applied learning rate, captured before the first step of this
-            # epoch advances the cosine schedule past it.
-            applied_learning_rate = optimizer.param_groups[0]["lr"]
+            # The rate and coefficient this epoch opens with, read from the
+            # schedule rather than from the optimizer, whose groups still hold
+            # the previous epoch's last step until the first step below sets it.
+            applied_learning_rate = matrix_learning_rate * _rate_fraction(step_index, total_steps)
+            applied_momentum = _momentum_at(step_index, total_steps)
             epoch_loss = 0.0
             epoch_components = 0.0
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
@@ -625,8 +730,9 @@ def train(
                     raise FloatingPointError(f"non-finite clone loss in epoch {epoch}")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                _apply_schedule(optimizer, step_index, total_steps)
                 optimizer.step()
-                schedule.step()
+                step_index += 1
                 # The loss is a mean over active components, so the epoch
                 # average must weight by that same count, exactly as the PPO
                 # update aggregates its per-minibatch losses.
@@ -645,6 +751,7 @@ def train(
                 "epoch": epoch,
                 "train_loss": epoch_loss / max(epoch_components, 1.0),
                 "learning_rate": applied_learning_rate,
+                "momentum": applied_momentum,
                 "seconds": time.perf_counter() - started,
                 **{f"holdout_{name}": value for name, value in holdout.items()},
             }
@@ -696,8 +803,10 @@ def main() -> None:
         epochs=args.epochs,
         patience=args.patience,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
+        matrix_learning_rate=args.matrix_learning_rate,
+        matrix_weight_decay=args.matrix_weight_decay,
+        adam_learning_rate_ratio=args.adam_learning_rate_ratio,
+        adam_weight_decay=args.adam_weight_decay,
         seed=args.seed,
         device=torch.device(args.device),
         encode_workers=args.encode_workers,

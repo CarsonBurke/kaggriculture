@@ -17,6 +17,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig
+from kaggriculture.optim import NorMuon
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.structured import StructuredActor, StructuredConfig
 
@@ -366,8 +367,12 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
         epochs=2,
         patience=2,
         batch_size=8,
-        learning_rate=1e-3,
-        weight_decay=0.0,
+        matrix_learning_rate=1e-3,
+        # The shipped decay values, so the end-to-end path that must still
+        # improve the loss is the cautious one a real clone runs.
+        matrix_weight_decay=1.2,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.005,
         seed=0,
         device=torch.device("cpu"),
         encode_workers=1,
@@ -423,8 +428,10 @@ def test_structured_training_saves_a_loadable_structured_artifact(
         epochs=2,
         patience=2,
         batch_size=8,
-        learning_rate=1e-3,
-        weight_decay=0.0,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
         seed=0,
         device=torch.device("cpu"),
         encode_workers=1,
@@ -481,8 +488,10 @@ def test_clone_rejects_a_config_from_another_family(dataset_dir: Path, tmp_path:
             epochs=1,
             patience=1,
             batch_size=8,
-            learning_rate=1e-3,
-            weight_decay=0.0,
+            matrix_learning_rate=1e-3,
+            matrix_weight_decay=0.0,
+            adam_learning_rate_ratio=0.35,
+            adam_weight_decay=0.0,
             seed=0,
             device=torch.device("cpu"),
             encode_workers=1,
@@ -502,8 +511,10 @@ def test_clone_refuses_to_overwrite_an_existing_run(dataset_dir: Path, tmp_path:
         epochs=1,
         patience=1,
         batch_size=8,
-        learning_rate=1e-3,
-        weight_decay=0.0,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
         seed=0,
         device=torch.device("cpu"),
         encode_workers=1,
@@ -528,8 +539,12 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
         epochs=1,
         patience=1,
         batch_size=1_000_000,  # one minibatch: the epoch mean is that loss exactly
-        learning_rate=0.0,  # frozen weights, so the recorded loss is reproducible
-        weight_decay=0.0,
+        # Any rate: with a single minibatch the recorded loss is the loss at the
+        # initial weights, taken before the only step of the epoch.
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
         seed=0,
         device=torch.device("cpu"),
         encode_workers=1,
@@ -612,8 +627,10 @@ def test_run_record_carries_one_provenance_entry_per_dataset(
         epochs=1,
         patience=1,
         batch_size=8,
-        learning_rate=1e-3,
-        weight_decay=0.0,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
         seed=0,
         device=torch.device("cpu"),
         encode_workers=1,
@@ -727,3 +744,61 @@ def test_a_seed_cap_takes_a_stable_prefix_of_each_corpus(dataset_dir: Path, tmp_
             encode_workers=1,
             seeds_per_dataset=2,
         )
+
+
+def test_the_clone_rate_holds_flat_then_decays_linearly_to_a_floor() -> None:
+    """The reference's trapezoid, which is neither a cosine nor a decay to zero."""
+
+    trainer = _load_trainer()
+    total = 1000
+    cooldown_start = int(total * (1.0 - trainer.COOLDOWN_FRACTION))
+    assert trainer._rate_fraction(0, total) == 1.0
+    assert trainer._rate_fraction(cooldown_start - 1, total) == 1.0
+    assert trainer._rate_fraction(cooldown_start, total) == 1.0
+    assert trainer._rate_fraction(total, total) == pytest.approx(trainer.FINAL_RATE_FRACTION)
+    tail = [trainer._rate_fraction(step, total) for step in range(cooldown_start, total + 1)]
+    assert all(later <= earlier for earlier, later in itertools.pairwise(tail))
+    # Linear: the middle of the cooldown is the middle of the range. A cosine
+    # would sit well above this.
+    middle = trainer._rate_fraction((cooldown_start + total) // 2, total)
+    assert middle == pytest.approx((1.0 + trainer.FINAL_RATE_FRACTION) / 2, abs=2e-3)
+
+
+def test_the_nesterov_coefficient_warms_up_holds_and_cools_back_down() -> None:
+    trainer = _load_trainer()
+    total = 4000
+    assert trainer._momentum_at(0, total) == pytest.approx(trainer.MOMENTUM_MINIMUM)
+    warmed = trainer._momentum_at(trainer.MOMENTUM_WARMUP_STEPS, total)
+    assert warmed == pytest.approx(trainer.MOMENTUM_MAXIMUM)
+    assert trainer._momentum_at(total // 2, total) == pytest.approx(trainer.MOMENTUM_MAXIMUM)
+    assert trainer._momentum_at(total - 1, total) < trainer.MOMENTUM_MAXIMUM
+    assert trainer._momentum_at(total, total) == pytest.approx(trainer.MOMENTUM_MINIMUM)
+
+
+def test_a_short_clone_still_reaches_the_held_coefficient() -> None:
+    """An uncapped 300-step warmup would span a short run and never arrive."""
+
+    trainer = _load_trainer()
+    total = 40
+    assert total < trainer.MOMENTUM_WARMUP_STEPS
+    assert trainer._momentum_at(total // 2, total) == pytest.approx(trainer.MOMENTUM_MAXIMUM)
+
+
+def test_the_schedule_sets_every_group_from_its_own_base_rate() -> None:
+    trainer = _load_trainer()
+    matrix = torch.nn.Parameter(torch.randn(16, 16))
+    vector = torch.nn.Parameter(torch.randn(16))
+    optimizer = NorMuon(
+        [matrix], [vector], learning_rate=3e-3, adam_learning_rate=1e-3, weight_decay=1.2
+    )
+    total = 100
+    trainer._apply_schedule(optimizer, total, total)
+    groups = {group["kind"]: group for group in optimizer.param_groups}
+    assert set(groups) == {"normuon", "adam"}
+    for group in optimizer.param_groups:
+        expected = group["base_lr"] * trainer.FINAL_RATE_FRACTION
+        assert group["lr"] == pytest.approx(expected)
+    assert groups["normuon"]["momentum"] == pytest.approx(trainer.MOMENTUM_MINIMUM)
+    # The Adam half has no Nesterov coefficient to schedule, and inventing one
+    # here would be read by nothing.
+    assert "momentum" not in groups["adam"]
