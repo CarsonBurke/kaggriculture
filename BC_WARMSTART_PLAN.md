@@ -1,6 +1,44 @@
-# Behavior-Cloning Warm-Start from the Public v27 Agent
+# Behavior-Cloning Warm-Start from a Public Agent
 
-Status: design (no implementation yet). Owner: training pipeline.
+Status: **done and measured.** The teacher moved from `public-v27` to
+`public-v16` on evidence; see "Measured outcome" below. Owner: training pipeline.
+
+## Measured outcome
+
+`runs/bc6-v16-mixed/bc-actor.pt`, four `public-v16` corpora at
+`--seeds-per-dataset 256` (mirror, vs-starter, vs-pass, vs-random), 20 epochs,
+NorMuon + Adam on the reference's trapezoid. Holdout NLL 0.000133 on wholly
+held-out seeds, all three heads at 0.9999+ top-1. Play, in the OFFICIAL
+`kaggle_environments` engine, deterministic decode, 2 seeds x both seat orders
+per opponent (`scripts/external_eval_worker.py`):
+
+| opponent | clone bank | opponent bank | score rate |
+|---|---|---|---|
+| `starter` | 144,417 | 3,507 | **1.000** |
+| `public-v27` | 83,803 | 76,016 | **0.750** |
+| `public-v16` (its own teacher) | 88,657 | 88,317 | **0.750** |
+
+Three things this settles.
+
+**The teacher choice was the whole game.** The v27-taught clone
+(`runs/bc5-mixed-conv`) scored 0.078 against v27; the v16-taught clone scores
+0.750 against that same opponent. `public-v16` itself beat `public-v27` 6/6 in
+the official engine, median bank 77,261 to 59,489, so the corpus ceiling moved
+and the clone moved with it.
+
+**Opponent breadth, not corpus depth, is what generalizes.** An uncapped
+single-opponent clone reached 99.996% holdout accuracy and still could not act
+when the opponent was poor: on those states it agreed with its teacher on 56.4%
+of unit decisions, and transplanting rich-opponent features back in restored
+99.99% agreement. It was gated on the opponent's wealth channels. A fifth of the
+seeds across four opponents fixed that, and 1.000 against `starter` is the
+measurement that says so -- `starter` is exactly the poor opponent the
+single-opponent clone could not handle.
+
+**Holdout NLL has stopped being the useful axis.** At 0.9999+ accuracy the
+residual is confidence on decisions that are already correct. Every further
+comparison here -- the NextLat A/B included -- is decided on bank and score rate
+in the official engine, with NLL reported only as a sanity check.
 
 ## Why
 
