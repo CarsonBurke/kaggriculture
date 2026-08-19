@@ -6,19 +6,27 @@ is 162 ms per step for a 1.42M-parameter model whose forward measures 4.9 ms of
 kernel time. Something other than arithmetic owns that step, and this probe
 measures which part, at production shapes, on the real corpus.
 
-Three candidates, separated rather than bundled:
+Three candidates were separated rather than bundled, and the first two are now
+MEASURED DEAD -- kept here so the next reader does not re-run them:
 
-* **Host gather.** The corpus lives in host memory and a minibatch is a fancy
-  index into it. At batch 2048 that copies ~25 MiB of scattered rows.
-* **The transfer.** `_batch` moves those rows with ``non_blocking=True``, which
-  is a NO-OP on unpageable memory: the staged corpus is not pinned, so every
-  step's copy is synchronous and serialises against compute. This probe measures
-  the same transfer out of a pinned staging buffer to price that.
-* **Launch overhead.** If the step is launch-bound rather than FLOP-bound, then
-  doubling the batch nearly halves the epoch, because the per-step costs are
-  paid once instead of twice. The sweep over batch size is what shows it, and
-  peak VRAM per batch is reported beside it so the ceiling is a measurement
-  rather than a guess.
+* **Host gather** (~1.2% of the step) and **the transfer** (~1.0%). `_batch`
+  moves rows with ``non_blocking=True``, which is a no-op on unpinned memory, so
+  every step's copy really is synchronous. It is also 1.6 ms of 157 ms, and
+  gathering into a pinned arena first measured 0.4 ms SLOWER. There is nothing
+  to win in the data path.
+* **Launch overhead.** Refuted by the sweep: rows per second is flat at
+  13,794 / 13,077 / 12,975 for batch 1024 / 2048 / 4096. A launch-bound step
+  gets cheaper per row as the batch grows; this one does not. Peak VRAM scales
+  linearly instead -- 6.16 / 12.20 / 24.27 GiB, then OOM at 8192 -- so the spare
+  VRAM is real and buys nothing.
+
+What is left is arithmetic and memory traffic: forward 27% and backward 61% of
+the step. A 96-dim, 127-token, 7-layer transformer is bandwidth-bound rather
+than FLOP-bound -- every kernel is small and reads more than it computes -- which
+is the regime where kernel fusion pays and where this repo already spends
+`update_compile_mode` on the PPO update and `forward_mode=inductor` on the
+rollout. The BC trainer compiles nothing. The `--compile-modes` axis prices that
+omission, which is the only lever the measurement above leaves standing.
 
 Reported per cell: seconds per step split into gather / transfer / forward /
 backward / optimizer, rows per second, and peak device memory. The interesting
@@ -56,6 +64,20 @@ def parse_args() -> argparse.Namespace:
         default=(1024, 2048, 4096, 8192),
         help="the shipped value is 2048; the sweep is what prices the spare VRAM",
     )
+    parser.add_argument(
+        "--compile-modes",
+        nargs="+",
+        default=("none", "default"),
+        help=(
+            "torch.compile modes for the clone step; 'none' is eager. Compiled cells "
+            "need a longer warmup because the first steps pay compilation"
+        ),
+    )
+    parser.add_argument(
+        "--pinned",
+        action="store_true",
+        help="also time a pinned staging arena; measured irrelevant, kept for reproduction",
+    )
     parser.add_argument("--steps", type=int, default=24, help="timed steps per cell after warmup")
     parser.add_argument("--warmup", type=int, default=6)
     parser.add_argument("--output", type=Path, required=True)
@@ -87,6 +109,8 @@ def _time_cell(
     warmup: int,
     device: torch.device,
     pinned: dict[str, torch.Tensor] | None,
+    clone_loss: Any,
+    compile_mode: str,
 ) -> dict[str, float]:
     generator = torch.Generator().manual_seed(0)
     totals = {"gather": 0.0, "transfer": 0.0, "forward": 0.0, "backward": 0.0, "optimizer": 0.0}
@@ -128,7 +152,7 @@ def _time_cell(
         # The shipped trainer enables bf16 autocast on CUDA unconditionally
         # (`train_bc.py:776`), so timing it disabled would price a configuration
         # nobody runs.
-        loss = trainer._clone_loss(actor, actor_args, factors, True)
+        loss = clone_loss(actor, actor_args, factors, True)
         torch.cuda.synchronize(device)
         forward = time.perf_counter()
 
@@ -154,6 +178,7 @@ def _time_cell(
     cell["peak_gib"] = torch.cuda.max_memory_allocated(device) / 1024**3
     cell["batch_size"] = batch_size
     cell["pinned"] = pinned is not None
+    cell["compile_mode"] = compile_mode
     return cell
 
 
@@ -190,25 +215,47 @@ def main() -> int:
     for batch_size in args.batch_sizes:
         if batch_size > train_split.rows:
             continue
-        for pinned_arena in (None, _stage_pinned(train_split.staged, batch_size)):
-            try:
-                cell = _time_cell(
-                    trainer,
-                    args.architecture,
-                    train_split,
-                    actor,
-                    optimizer,
-                    batch_size=batch_size,
-                    steps=args.steps,
-                    warmup=args.warmup,
-                    device=device,
-                    pinned=pinned_arena,
-                )
-            except torch.cuda.OutOfMemoryError:
-                cell = {"batch_size": batch_size, "pinned": pinned_arena is not None, "oom": True}
-                torch.cuda.empty_cache()
-            cells.append(cell)
-            print(json.dumps(cell, sort_keys=True), flush=True)
+        arenas = [None]
+        if args.pinned:
+            arenas.append(_stage_pinned(train_split.staged, batch_size))
+        for pinned_arena in arenas:
+            for compile_mode in args.compile_modes:
+                if compile_mode == "none":
+                    clone_loss = trainer._clone_loss
+                    warmup = args.warmup
+                else:
+                    # A fresh compile per cell: reusing one across batch sizes would
+                    # either recompile anyway or silently mark the shapes dynamic,
+                    # and dynamic shapes are not what the trainer runs.
+                    clone_loss = torch.compile(trainer._clone_loss, mode=compile_mode)
+                    # Compilation is paid inside the warmup, so it has to be long
+                    # enough to cover it or it lands in the timed steps.
+                    warmup = max(args.warmup, 12)
+                try:
+                    cell = _time_cell(
+                        trainer,
+                        args.architecture,
+                        train_split,
+                        actor,
+                        optimizer,
+                        batch_size=batch_size,
+                        steps=args.steps,
+                        warmup=warmup,
+                        device=device,
+                        pinned=pinned_arena,
+                        clone_loss=clone_loss,
+                        compile_mode=compile_mode,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    cell = {
+                        "batch_size": batch_size,
+                        "pinned": pinned_arena is not None,
+                        "compile_mode": compile_mode,
+                        "oom": True,
+                    }
+                    torch.cuda.empty_cache()
+                cells.append(cell)
+                print(json.dumps(cell, sort_keys=True), flush=True)
             del pinned_arena
 
     report = {
