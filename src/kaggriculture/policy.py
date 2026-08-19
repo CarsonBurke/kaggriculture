@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -145,6 +146,56 @@ def mask_logits(logits: Tensor, mask: Tensor, *, validate: bool = True) -> Tenso
     if validate and not bool(mask.any(dim=-1).all()):
         raise ValueError("every categorical decision needs at least one valid action")
     return logits.float().masked_fill(~mask, torch.finfo(torch.float32).min)
+
+
+def greedy_disagreement(first: Tensor, second: Tensor, mask: Tensor, active: Tensor) -> float:
+    """Share of active decisions where two policies' greedy actions differ.
+
+    The operational question behind a farming program: money is earned by taking
+    one particular action at each step, so the fraction of decisions that differ
+    reads "are these two the same program" more directly than any distance
+    between distributions, and unlike a KL it cannot be moved by the tails.
+
+    Masking before the argmax matters: an illegal action can hold the largest raw
+    logit, and two policies that would never take it must not be recorded as
+    disagreeing about it.
+    """
+    if not bool(active.any()):
+        return float("nan")
+    chosen = mask_logits(first, mask, validate=False).argmax(dim=-1)
+    other = mask_logits(second, mask, validate=False).argmax(dim=-1)
+    return float((chosen != other)[active.bool()].float().mean())
+
+
+def population_disagreement(unit_logits: Sequence[Tensor], mask: Tensor, active: Tensor) -> Tensor:
+    """The full N x N greedy-disagreement matrix over one fixed batch of states.
+
+    Symmetric with a zero diagonal, so the population's diversity is the mean of
+    the off-diagonal entries. A population that has converged into mirror play
+    under another name shows it here and nowhere else: every reward stays 0.5 and
+    every other metric reads healthy.
+
+    All members are scored on the SAME states, which is what makes the entries
+    comparable -- scoring each on its own visited states would confound flattened
+    weights with a moved state distribution.
+    """
+    count = len(unit_logits)
+    if count < 2:
+        raise ValueError("a disagreement matrix needs at least two policies")
+    matrix = torch.zeros((count, count), dtype=torch.float64)
+    for i in range(count):
+        for j in range(i + 1, count):
+            value = greedy_disagreement(unit_logits[i], unit_logits[j], mask, active)
+            matrix[i, j] = matrix[j, i] = value
+    return matrix
+
+
+def mean_off_diagonal(matrix: Tensor) -> float:
+    """Mean of a symmetric matrix's off-diagonal entries, its diagonal being zero."""
+    count = matrix.shape[0]
+    if count < 2:
+        raise ValueError("an off-diagonal mean needs at least two rows")
+    return float(matrix.sum() / (count * (count - 1)))
 
 
 def categorical_statistics(

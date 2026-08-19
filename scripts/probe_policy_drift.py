@@ -31,7 +31,11 @@ import torch
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import FarmActor
-from kaggriculture.policy import categorical_statistics, mask_logits
+from kaggriculture.policy import (
+    categorical_statistics,
+    mean_off_diagonal,
+    population_disagreement,
+)
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_self_play_rust
 
@@ -97,22 +101,9 @@ def _head_entropies(actor: FarmActor, states: dict[str, torch.Tensor]) -> dict[s
     return entropies
 
 
-def _agreement(reference: FarmActor, other: FarmActor, states: dict[str, torch.Tensor]) -> float:
-    """Share of active unit slots where the two policies' greedy action agrees.
-
-    This is the operational question behind a farming program: the clone earns its
-    money by taking one particular action at each step, so the fraction of
-    decisions that still match reads "is the program intact" more directly than
-    any distance between distributions.
-    """
-    masks = states["unit_masks"].bool()
-    first = mask_logits(_forward(reference, states).unit_logits, masks, validate=False)
-    second = mask_logits(_forward(other, states).unit_logits, masks, validate=False)
-    active = states["unit_active"].bool()
-    if not active.any():
-        return float("nan")
-    agree = first.argmax(dim=-1) == second.argmax(dim=-1)
-    return float(agree[active].float().mean())
+def _unit_logits(actor: FarmActor, states: dict[str, torch.Tensor]) -> torch.Tensor:
+    """The unit head's raw logits on a fixed batch, for the disagreement matrix."""
+    return _forward(actor, states).unit_logits
 
 
 def _rollout_states(
@@ -185,6 +176,12 @@ def main() -> None:
         rows=args.rows,
     )
 
+    # Every member is scored on the reference's states, which is what makes the
+    # matrix entries comparable: scoring each on its own visited states would
+    # confound flattened weights with a moved state distribution, and separating
+    # those two is the whole point of the per-checkpoint entropy pair below.
+    logits = [_unit_logits(reference, shared)]
+    names = [args.reference.name]
     records: list[dict[str, Any]] = []
     for path in args.checkpoints:
         actor, actor_architecture = _load(path, device)
@@ -201,15 +198,20 @@ def main() -> None:
             device=device,
             rows=args.rows,
         )
+        logits.append(_unit_logits(actor, shared))
+        names.append(path.name)
         record = {
             "checkpoint": path.name,
             "money": money,
-            "agreement_on_reference_states": _agreement(reference, actor, shared),
             "entropy_on_reference_states": _head_entropies(actor, shared),
             "entropy_on_own_states": _head_entropies(actor, own),
         }
         records.append(record)
         print(json.dumps(record, sort_keys=True), flush=True)
+
+    matrix = population_disagreement(logits, shared["unit_masks"], shared["unit_active"])
+    for record, row in zip(records, matrix[1:].tolist(), strict=True):
+        record["disagreement_on_reference_states"] = row[0]
 
     report = {
         "reference": args.reference.name,
@@ -218,6 +220,9 @@ def main() -> None:
         "games": args.games,
         "rows": args.rows,
         "seed": args.seed,
+        "members": names,
+        "disagreement_matrix": matrix.tolist(),
+        "disagreement_mean": mean_off_diagonal(matrix),
         "checkpoints": records,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

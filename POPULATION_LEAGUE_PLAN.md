@@ -191,9 +191,16 @@ wave sizes versus today's two forwards, using `scripts/sweep_rollout_execution.p
 shipped ceilings, (c) a table of ms/step for both candidate wave sizes.
 
 **Stage 1 - four diverse initializations.** Four BC runs, same corpora, different
-seeds, new pretraining recipe. Report per-agent holdout NLL and unit accuracy,
-per-agent built-in score rates, and the pairwise policy disagreement matrix on a
-fixed state batch (the `_agreement` measure in `scripts/probe_policy_drift.py`).
+seeds, new pretraining recipe. The corpora are the **`public-v16`** set, not the
+v27 set the earlier clones used: measured head-to-head in the official engine
+over three seeds and both seat orders, `public-v16` beat `public-v27` 6/6 with
+median bank 77,261 against 59,489, so it is the stronger teacher by 30%. All four
+runs take `--seeds-per-dataset 256` from each of the four v16 corpora, which the
+mirror corpus reaches only after its extraction completes -- so the seed-0 run
+carries the resuming extract and the other three are ordered behind it.
+Report per-agent holdout NLL and unit accuracy, per-agent built-in score rates,
+and the pairwise policy disagreement matrix on a fixed state batch (the
+`_agreement` measure in `scripts/probe_policy_drift.py`).
 *Acceptance:* all four within noise of each other on holdout NLL and on
 `starter` score rate, and initial pairwise disagreement recorded as the
 calibration point for the Stage 3 gate.
@@ -218,6 +225,25 @@ other metric reads healthy and every reward is 0.5. Its threshold is set from th
 Stage 1 measurement, not invented. *Acceptance:* one event file per run, no
 accordion past nine charts, `_LAYOUT_EPOCH` bumped; the disagreement gate fires
 on a synthetic population of four identical copies.
+
+How to read that threshold, measured rather than assumed. The disagreement
+measure now lives in `src/kaggriculture/policy.py` as `greedy_disagreement`,
+`population_disagreement` and `mean_off_diagonal` — the share of *active*
+decisions whose masked argmax differs, so an illegal action holding the largest
+raw logit never counts. On real artifacts it reads: `bc5` against
+`ppo-bc5mix/checkpoint-000040` exactly **0.000**, which is the correctness check
+(iteration 40 precedes the actor unfreezing, so the weights are identical), and
+`bc5` against `league-actor-00000049` **0.008** at a bank of 14,048 against
+85,051. Eight decisions in a thousand cost 83% of the money, and that
+checkpoint's unit entropy is 0.227 on the states it visits against 0.018 on the
+states BC demonstrated — a 13x gap, which is covariate shift measured directly
+rather than inferred.
+
+So the floor is a tripwire and not a target: four clones of one corpus differing
+in about a percent of decisions will diverge far past that within a few
+iterations of learning, and a gate at a quarter of the initial value should
+essentially never bind. If it does bind, the population has genuinely collapsed
+into one policy.
 
 **Stage 4 - retire the frozen-league scheduler.** Delete from the training path:
 `select_league_mix` and its call site, the PFSP lane contest and built-in lane
@@ -271,12 +297,27 @@ module to `vmap` over `functional_call`. If that shifts logprobs beyond the
 shipped ceilings, the ratio in the surrogate is measuring the wrong thing. Gated
 in Stage 0 with an existing instrument.
 
-## Open decisions
+## Decisions taken
 
-1. `N = 4` total (each agent faces three), or `N = 5` (each faces four)? The plan
-   is parameterized; the default is 4.
-2. Cost parity (78 trajectories per agent per iteration) or data parity (318, at
-   a measured batch cost)? Stage 0 produces the table; the choice is a compute
-   call.
-3. Does the reward get an absolute bank anchor? Independent of this plan, but it
-   decides whether Stage 5's tripwire is a safety net or the main event.
+1. **`N = 4` total**, each agent facing the other three.
+2. **Cost parity or data parity is still open** and is the one question left for a
+   measurement: Stage 0(c) produces the ms/step table and the choice is a compute
+   call, not a design call.
+3. **The reward gets no absolute anchor.** Only winning counts, so the objective
+   stays purely relative and antisymmetric: `_relative_score` and the shaping
+   potential built on it are unchanged, and `rust/kagg_env/src/core.rs` is not
+   touched. "My economy grew but by less than my opponent's" is the signal the
+   scheme is meant to carry, and a relative reward carries exactly that.
+
+   The consequence is explicit rather than hidden: mutual mediocrity remains a
+   fixed point, market denial remains positively rewarded whenever the opponent
+   is beatable, and no internal number can see either. Stage 5's tripwire --
+   absolute bank must not fall while a relative score rate rises -- is therefore
+   not a safety net but **the primary detector**, and the external evaluator is
+   the only absolute measurement in the system.
+
+   What the population does fix is the defect the measurements actually
+   condemned: 93% of the last run's experience came from the learner's own
+   current or frozen weaker weights, so beating them measured nothing. Every
+   opponent is now a live peer of equal competence that improves as the learner
+   improves, and no pairing is zero by construction.
