@@ -78,42 +78,86 @@ an accelerant for the post-BC RL fine-tune, not as the headline fix.
    the policy heads use: sum of unit-action embeddings + sum of market
    (kind embedding * quantity-bin embedding), projected to model_dim. All
    components already exist as vocabularies; no new action space design.
-3. **Dynamics model**: 2-layer MLP p_psi(concat(h_t, a_embed)) -> h_hat_{t+1},
-   hidden 2x model_dim. Loss SmoothL1(sg(h_{t+1}), h_hat_{t+1}), d = 1.
-   Skip terminal transitions (step 719 has no successor). The paper's KL
-   distillation term has no analog here (no token head over observations);
-   the principled substitute, if regression alone under-constrains, is
-   distilling the frozen critic's value distribution at h_hat — hold that
-   back unless d = 1 regression shows representational collapse, which the
-   stop-gradient is there to prevent.
-4. **Data plumbing**: rollout storage is contiguous [game, step], so the
-   transition pair (t, t+1) is index arithmetic on the existing arrays. The
-   actor already re-forwards every stored state during update epochs; cache
-   the state-token latent in that same forward (one extra tensor slice, no
-   extra pass) and gather successor latents by shifted index within the same
-   minibatch's episodes. Transitions whose successor falls outside the
-   minibatch are supervised in a second gather against latents computed under
-   no_grad — the stop-gradient target needs no fresh graph.
-5. **Objective**: add `latent_dynamics_coefficient` to `PpoConfig`
-   (0.0 = term absent). Add the term to the actor loss only; the critic
-   tower stays untouched. p_psi parameters join the actor optimizer.
-6. **Evidence gate** (per machine-learning skill, no smoke runs):
-   - `benchmark_ppo_iteration` before/after: accept <= 3% throughput cost.
-   - Full calibration A/B at production config: the auxiliary must not
-     degrade money_mean progression at matched wall-clock; success criterion
-     is a measurable improvement in early-phase sample efficiency
-     (iterations to 30k money_mean) or final strength.
-   - Journal the auxiliary loss so collapse (loss -> 0 with cosine
-     similarity of latents -> 1) is visible.
+3. **Dynamics model**: `h_hat_{t+1} = h_t + MLP(RMSNorm(concat(a_embed, h_t)))`,
+   two hidden layers at 4x model_dim. Two details are the reference's, not
+   ours, and both were missing from this plan's first draft
+   (`NextLat/models/model_nextlat.py:47-92`): the prediction is a **residual
+   delta** on the current latent, and the concat is **normalized** before the
+   MLP. A plain `MLP(concat) -> h_hat` has to relearn the identity map that the
+   residual gives for free.
+4. **Regression term** (`lambda_mse` in the reference, 1.0-3.0 in its shipped
+   configs): `smooth_l1_loss(h_hat_{t+1}, sg(h_{t+1}), reduction="none")`,
+   masked, divided by the masked ELEMENT count. Despite the name it is SmoothL1,
+   not MSE (`model_nextlat.py:303`). Skip terminal transitions: step 719 has no
+   successor.
+5. **Decode term** (`lambda_kl`, 0.1-1.0 in the reference's configs). This
+   plan's first draft claimed the paper's KL term "has no analog here (no token
+   head over observations)". That is wrong, and it matters. The reference's KL is
+   not over observations: it decodes the PREDICTED latent through the output
+   head's own weights, detached, and matches the model's own next-step output
+   distribution, also detached (`model_nextlat.py:313-328`). Our output head is
+   the policy, so the analog is exact and needs nothing invented: decode
+   `h_hat_{t+1}` through the frozen unit/kind/quantity heads and take
+   `KL(sg(pi_{t+1}) || pi(h_hat_{t+1}))` under the same legality masks the
+   policy uses at t+1. Without it the latent only has to be self-predictable;
+   with it, it has to be *decision-relevant*, which is the property we want. The
+   critic-distillation substitute this plan proposed instead is strictly worse:
+   it supervises a different head than the one the aux is trying to help.
+   `lambda_ce` (the reference's third term) is 0 in every shipped config and is
+   not implemented.
+6. **Horizon** (`mtp_horizon`, 1 by default and 4/8 swept in the reference's
+   sweeps, `model_nextlat.py:369-408`): recursively feed the prediction back in,
+   `h_hat_{t+k} = p_psi(h_hat_{t+k-1}, a_{t+k})`, accumulating both terms and
+   averaging over k. Each extra step tightens eligibility by one row.
+7. **Data plumbing, BC first.** The reference's setting is sequence modelling,
+   which our BC pretraining resembles far more closely than our RL update does,
+   and BC is where a 14-minute run can answer the question. But BC batches are a
+   flat shuffle over rows, so `(h_t, h_{t+1})` pairs do not co-occur. Staging
+   therefore carries `episode_index` and `step` per row and the sampler draws
+   **contiguous runs** (`--run-length`), so successors land adjacent in the same
+   minibatch and the aux costs one MLP rather than a second trunk pass.
+   Eligibility is `episode_index[j] == episode_index[j+1] and step[j+1] ==
+   step[j] + 1`, tightened by the horizon. RL plumbing is easier and comes
+   second: rollout storage is already contiguous `[game, step]`.
+8. **Objective**: `latent_dynamics_coefficient` (regression) and
+   `latent_decode_coefficient` (decode KL), both 0.0 = term absent, plus
+   `latent_horizon`. In BC they are trainer arguments; in RL they join
+   `PpoConfig` and the actor loss only, critic untouched. p_psi joins the actor
+   optimizer and NEVER the actor's state dict: league snapshots, inference
+   bundles and the frozen-ensemble stack all consume that dict whole.
+9. **Evidence gate** (no smoke runs; every number below is a measurement or the
+   claim is withdrawn):
+   - **BC A/B, the primary gate.** Same corpora (the four `public-v16` sets at
+     `--seeds-per-dataset 256`), same seed, same 12-epoch trapezoid, same
+     `--run-length`; the only difference is the two coefficients. Report holdout
+     NLL and per-head accuracy, and then the number that actually matters:
+     money and score rate in the OFFICIAL engine against `starter`, `pass`,
+     `random`, `public-v27` and `public-v16`. A clone that fits the corpus
+     better while playing no better has not earned the term.
+   - **Held-out-opponent generalization.** The paper's claim is compactness, so
+     the interesting cell is the opponent the corpus does NOT contain: train the
+     A/B on three corpora and evaluate against the fourth opponent. This is the
+     measurement that can distinguish a better world model from a better fit.
+   - **Collapse diagnostics in the journal**, not inferred afterwards: the
+     auxiliary loss per term, and belief dispersion. The failure mode is a loss
+     falling to zero because every latent became the same vector; the
+     stop-gradient makes that unlikely, not impossible.
+   - **Cost.** Wall clock per epoch before and after. The aux adds one MLP over
+     rows already in the batch, so the budget is 3%; the run-sampler change is
+     measured separately, since correlated batches are a real change to the
+     baseline's own gradient statistics.
+   - **RL, only after the BC A/B has an answer.** `benchmark_ppo_iteration`
+     before/after at <= 3% throughput cost, then the population A/B.
 
-## Sequencing recommendation
+## Sequencing
 
-1. First: BC warm-start (already scoped) — targets the actual measured gap.
-2. With it: this auxiliary in the RL fine-tune phase, where its
-   data-efficiency benefit is largest and the fresh-critic phase already
-   re-forwards everything.
-3. Attribution: the calibration A/B above isolates the auxiliary's effect;
-   do not bundle it untested into a relaunch whose gains BC will dominate.
-
-Effort estimate: ~1 day implementation + tests (action embedding reuse makes
-this small), plus one calibration cycle for the gate.
+1. BC warm-start: done (`runs/bc6-normuon-conv`, holdout NLL 0.00182).
+2. **This auxiliary in BC pretraining, measured, before any RL run.** That is a
+   change from this document's first draft, which put it in the RL fine-tune.
+   Two reasons: BC is the setting the paper's objective was designed for, and a
+   12-epoch clone answers in minutes what a 500-iteration league run answers in
+   days. If the term cannot improve a supervised clone whose targets are exactly
+   the demonstrated actions, its case for surviving a noisy policy-gradient is
+   weak.
+3. Then RL: the same two coefficients on the actor loss, attributed by the
+   population A/B rather than bundled into a relaunch.

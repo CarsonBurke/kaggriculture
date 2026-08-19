@@ -81,6 +81,23 @@ class ActorOutput(NamedTuple):
     market_quantity_context: Tensor
 
 
+class BeliefOutput(NamedTuple):
+    """Policy heads plus the belief latent the NextLat auxiliary supervises.
+
+    Deliberately not a fourth field on `ActorOutput`. The native rollout's packed
+    device-to-host transfer, the CUDA-graph capture of the collection forward and
+    the vmapped frozen ensemble all consume that tuple whole -- `torch.vmap`
+    outright rejects a `None` in its output pytree -- and none of them has any use
+    for a latent only the update path reads. Keeping `ActorOutput` at three
+    tensors leaves every collection path structurally untouched.
+    """
+
+    output: ActorOutput
+    #: [rows, MAX_UNITS + MAX_MARKET_ORDERS, model_dim], fp32. The unit tokens come
+    #: first, so the consumer splits at `MAX_UNITS` to recover the two halves.
+    belief: Tensor
+
+
 def _group_count(width: int) -> int:
     if width <= 0:
         raise ValueError("model width must be positive")
@@ -603,13 +620,24 @@ class FarmActor(nn.Module):
             self.config.quantity_rank,
         )
 
-    def forward(
+    def _head_inputs(
         self,
         board: Tensor,
         global_features: Tensor,
         units: Tensor,
         unit_positions: Tensor,
-    ) -> ActorOutput:
+    ) -> tuple[Tensor, Tensor]:
+        """Run the trunk and return the two tensors the policy heads are applied to.
+
+        Split out so `forward` and `forward_with_belief` share one trunk pass without
+        `forward` paying for the belief. Delegating `forward` to `forward_with_belief`
+        would have put the belief's concatenation and its two dtype widens on the
+        collection forward, which `_packed_outputs_to_host` records as running 719
+        times per training iteration. Nothing downstream could observe the result, but
+        `eager` is a live rollout mode and the one every CPU test takes, so the
+        allocation would be real rather than something Inductor deletes. Only the
+        update reads a belief; it should be the only caller that allocates one.
+        """
         batch = board.shape[0]
         board_tokens = self.spatial(board).flatten(2).transpose(1, 2)
         state_token = self.state_projection(global_features).unsqueeze(1)
@@ -657,12 +685,60 @@ class FarmActor(nn.Module):
 
         unit_start = 1 + BOARD_SIZE * BOARD_SIZE
         market_start = unit_start + MAX_UNITS
-        unit_hidden = hidden[:, unit_start:market_start]
-        market_hidden = self.market_norm(hidden[:, market_start:])
+        return hidden[:, unit_start:market_start], self.market_norm(hidden[:, market_start:])
+
+    def _policy_heads(self, unit_hidden: Tensor, market_hidden: Tensor) -> ActorOutput:
+        """Score every action factor from the trunk tensors `_head_inputs` returned."""
         return ActorOutput(
             unit_logits=self.unit_head(unit_hidden).contiguous(),
             market_kind_logits=self.market_kind(market_hidden).contiguous(),
             market_quantity_context=self.market_quantity_context(market_hidden).contiguous(),
+        )
+
+    def forward(
+        self,
+        board: Tensor,
+        global_features: Tensor,
+        units: Tensor,
+        unit_positions: Tensor,
+    ) -> ActorOutput:
+        return self._policy_heads(*self._head_inputs(board, global_features, units, unit_positions))
+
+    def forward_with_belief(
+        self,
+        board: Tensor,
+        global_features: Tensor,
+        units: Tensor,
+        unit_positions: Tensor,
+    ) -> BeliefOutput:
+        """Score every action factor and expose the latent the heads read to do it.
+
+        The belief is the heads' own input: `unit_hidden` followed by `market_hidden`,
+        exactly the two tensors `_policy_heads` applies the three heads to. That
+        coupling is the point. The reference regresses the same vector that produces
+        the output, so predicting the next latent is predicting the next decision;
+        supervising a token no head reads -- the trunk's state token being the obvious
+        candidate -- is cheaply satisfiable instead, because the trunk can park an
+        easily extrapolated function of the step in an unread channel and drive the
+        auxiliary loss to zero without the policy changing at all.
+
+        The two halves keep their own preprocessing: the unit slice is raw trunk
+        output and the market slice has already been through `market_norm`, because
+        that is what `unit_head` and `market_kind`/`market_quantity_context`
+        respectively receive. The consumer splits the result back at `MAX_UNITS`.
+
+        The cast to fp32 is load-bearing. `RMSNorm` deliberately returns the compute
+        dtype, so under the production bf16 autocast these tensors are bf16, while the
+        auxiliary's dynamics MLP holds fp32 parameters and must not silently take a
+        bf16 input. Each half is widened before the concatenation rather than after,
+        so the two slices cannot reach `cat` in different dtypes.
+        """
+        unit_hidden, market_hidden = self._head_inputs(
+            board, global_features, units, unit_positions
+        )
+        return BeliefOutput(
+            self._policy_heads(unit_hidden, market_hidden),
+            torch.cat((unit_hidden.float(), market_hidden.float()), dim=1),
         )
 
 

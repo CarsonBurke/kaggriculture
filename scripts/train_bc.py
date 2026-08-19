@@ -144,6 +144,18 @@ def parse_args() -> argparse.Namespace:
         "--patience", type=int, default=5, help="epochs without holdout improvement before stopping"
     )
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--run-length",
+        type=int,
+        default=1,
+        help=(
+            "rows per contiguous run: each minibatch is built from blocks of this "
+            "many consecutive steps of one episode-seat, so an auxiliary objective "
+            "over (step, step+1) pairs has pairs to work with. The default of 1 is "
+            "the independent-row shuffle exactly -- same generator draw, same order "
+            "-- so batches only change when an A/B raises it"
+        ),
+    )
     # Both rate and decay changed UNITS when this moved off AdamW, so both are
     # renamed: a stale invocation now fails at argparse instead of silently
     # training a tenth as fast with a hundredth of the intended decay.
@@ -206,6 +218,12 @@ class DemonstrationTensors:
     how much data it may learn from rather than on how wide a batch it may
     take. The gather and transfer cost a few percent of a step whose forward
     and backward dominate.
+
+    Two int32 row-metadata columns travel with the features: `episode_index`,
+    a dense index over staged episode-seats in staging order, and `step`, the
+    step number inside that episode-seat. They are what lets a consumer pair
+    row j with row j+1 -- eligible exactly when the episode index matches and
+    the step advances by one -- without trusting a batch's provenance.
     """
 
     staged: dict[str, torch.Tensor]
@@ -281,6 +299,13 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
         for name, value in template.items()
     }
     components = np.zeros(rows, dtype=np.float64)
+    # Pairing metadata, derived from row order rather than read from a field:
+    # `extract_episode` walks `range(episode_steps - 1)` and stacks in that
+    # order, so row j of an archive is step j of that seat, and the copy below
+    # preserves it. One member is one episode-seat, so its staging position is
+    # the dense episode index.
+    episode_index = np.empty(rows, dtype=np.int32)
+    step = np.empty(rows, dtype=np.int32)
     offset = 0
     for position, member in enumerate(members):
         span = member["unit_actions"].shape[0]
@@ -290,8 +315,12 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
             member[name].astype(np.float64).sum(axis=1)
             for name in ("unit_active", "market_active", "market_quantity_active")
         )
+        episode_index[offset : offset + span] = position
+        step[offset : offset + span] = np.arange(span, dtype=np.int32)
         offset += span
         members[position] = {}
+    stacked["episode_index"] = episode_index
+    stacked["step"] = step
     return DemonstrationTensors(
         staged={name: torch.from_numpy(value) for name, value in stacked.items()},
         row_components=components,
@@ -619,6 +648,57 @@ def _apply_schedule(optimizer: NorMuon, step: int, total_steps: int) -> None:
             group["momentum"] = momentum
 
 
+def _run_blocks(episode_index: torch.Tensor, run_length: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cut the corpus into contiguous same-episode row blocks, in staging order.
+
+    A block is up to `run_length` consecutive rows of one episode-seat, and rows
+    within it are consecutive steps, because staging preserves the archive's row
+    order and an archive is written step 0 first. A block never crosses into the
+    next episode-seat, so no pair a consumer forms from adjacent rows straddles
+    two games.
+
+    An episode's last block is kept short rather than dropped. A drop would
+    delete the same rows every epoch -- the tail of every episode, which is where
+    the late-game behaviour lives -- and it would cost real data: the shipped
+    720-step horizon stages 719 rows per seat, so a run length of 64 leaves a
+    15-row tail on every one of them, and an epoch would stop being a full pass
+    over the corpus.
+    """
+    if run_length < 1:
+        raise ValueError("run length must be positive")
+    rows = int(episode_index.shape[0])
+    if rows < 1:
+        raise ValueError("cannot build runs over an empty corpus")
+    positions = torch.arange(rows)
+    opens = torch.ones(rows, dtype=torch.bool)
+    opens[1:] = episode_index[1:] != episode_index[:-1]
+    episode_starts = positions[opens]
+    episode_lengths = torch.diff(torch.cat((episode_starts, positions.new_tensor([rows]))))
+    within = positions - torch.repeat_interleave(episode_starts, episode_lengths)
+    # Every episode's first row opens a block, so consecutive starts are never
+    # more than one episode apart and the gaps between them are the lengths.
+    starts = positions[within % run_length == 0]
+    return starts, torch.diff(torch.cat((starts, starts.new_tensor([rows]))))
+
+
+def _run_epoch_order(
+    starts: torch.Tensor, lengths: torch.Tensor, generator: torch.Generator
+) -> torch.Tensor:
+    """One epoch's row order: every block once, blocks shuffled, rows within in step order.
+
+    A permutation of the blocks is a permutation of the rows, so an epoch stays a
+    full pass with every row appearing exactly once. At a run length of one the
+    blocks are the rows and this reduces to `torch.randperm(rows, generator=...)`
+    -- the identical single generator draw, hence the identical order -- so the
+    default is the sampler it replaces rather than a lookalike of it.
+    """
+    order = torch.randperm(int(starts.shape[0]), generator=generator)
+    shuffled_starts, shuffled_lengths = starts[order], lengths[order]
+    offsets = torch.cumsum(shuffled_lengths, 0) - shuffled_lengths
+    rows = int(lengths.sum())
+    return torch.repeat_interleave(shuffled_starts - offsets, shuffled_lengths) + torch.arange(rows)
+
+
 def train(
     *,
     dataset_dirs: Sequence[Path],
@@ -629,6 +709,7 @@ def train(
     epochs: int,
     patience: int,
     batch_size: int,
+    run_length: int = 1,
     matrix_learning_rate: float,
     matrix_weight_decay: float,
     adam_learning_rate_ratio: float,
@@ -639,8 +720,8 @@ def train(
     seeds_per_dataset: int | None = None,
 ) -> dict[str, float]:
     """Run the full clone; returns the best holdout metrics."""
-    if epochs < 1 or patience < 1 or batch_size < 1:
-        raise ValueError("epochs, patience, and batch size must be positive")
+    if epochs < 1 or patience < 1 or batch_size < 1 or run_length < 1:
+        raise ValueError("epochs, patience, batch size, and run length must be positive")
     if architecture_of_config(config).name != architecture:
         raise ValueError(
             f"{type(config).__name__} does not configure the {architecture} architecture"
@@ -689,12 +770,19 @@ def train(
     )
     steps_per_epoch = math.ceil(train_split.rows / batch_size)
     total_steps = max(epochs * steps_per_epoch, 1)
+    # Fixed for the whole run: the blocks depend on the corpus and the run
+    # length, and only their order is redrawn per epoch.
+    run_starts, run_lengths = _run_blocks(train_split.staged["episode_index"], run_length)
     step_index = 0
     autocast = device.type == "cuda"
     bc_provenance: dict[str, Any] = {
         "datasets": datasets,
         "architecture": architecture,
         "holdout_seeds": holdout_seeds,
+        # How the batches were built, so an artifact is not silently comparable
+        # to one trained with a different sampler.
+        "batch_size": batch_size,
+        "run_length": run_length,
         "command": sys.argv,
     }
     # A scalar teacher survives only when the mixture agrees on one, because a
@@ -717,10 +805,9 @@ def train(
         for epoch in range(epochs):
             actor.train()
             started = time.perf_counter()
-            # The permutation indexes host storage and also selects the epoch
-            # weights from precomputed host-side counts, which needs the same
-            # order.
-            order = torch.randperm(train_split.rows, generator=generator)
+            # The order indexes host storage and also selects the epoch weights
+            # from precomputed host-side counts, which needs the same order.
+            order = _run_epoch_order(run_starts, run_lengths, generator)
             shuffled_components = train_split.row_components[order.numpy()]
             # The rate and coefficient this epoch opens with, read from the
             # schedule rather than from the optimizer, whose groups still hold
@@ -809,6 +896,7 @@ def main() -> None:
         epochs=args.epochs,
         patience=args.patience,
         batch_size=args.batch_size,
+        run_length=args.run_length,
         matrix_learning_rate=args.matrix_learning_rate,
         matrix_weight_decay=args.matrix_weight_decay,
         adam_learning_rate_ratio=args.adam_learning_rate_ratio,

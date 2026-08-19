@@ -123,6 +123,35 @@ New script `scripts/train_bc.py`, queued through `mlq`:
    the BC checkpoint digest go into `run_provenance` so any resulting
    submission can be traced to its imitation source.
 
+## Deferred: the rest of nanogpt's schedule
+
+What is ported today (`scripts/train_bc.py`, `src/kaggriculture/optim.py`) is
+the *trapezoid* and the *momentum warmup*: a rate flat for the first 40% of
+scheduled steps, then linear to a 0.15 floor rather than to zero, with NorMuon's
+momentum ramping 0.85 -> 0.95 over the first 300 steps. Measured against plain
+AdamW on a cosine at matched wall clock, that plus the spectral step took
+holdout NLL from 0.0028 in 20 epochs to 0.00182 in 10.
+
+What is NOT ported, and is the next thing to try here rather than in RL:
+
+- **Per-role rate and decay multipliers.** `modded-nanogpt`'s `param_table`
+  gives every parameter role its own `lr_mul` and `wd_mul`
+  (`train_gpt.py:2026-2050`): embeddings 75x, the output head 5x, scalars 5x,
+  the residual and value lambdas 1-5x, all on top of the base rate, and the
+  shape multiplier `sqrt(fan_in)` on top of that for matrices. We collapse all
+  of that into ONE number: `adam_learning_rate_ratio = 0.35`, the reference's
+  own 0.008/0.023 matrix-to-Adam ratio, applied uniformly to every gain, bias,
+  embedding and head. That is the crudest possible reading of the recipe, and
+  the embedding multiplier is the one most likely to be load-bearing: our
+  tokenizer embeddings are the first thing every observation passes through.
+- **The batch-size and window ramps.** nanogpt grows both across training
+  (`TRAINING_STAGES`, `train_gpt.py:1992-2010`). Our epoch is a full pass over a
+  fixed corpus with one window, so this needs a decision about what "stage"
+  means for a demonstration corpus before it can be ported at all.
+
+Deferred deliberately, by direction, so that the NextLat auxiliary is measured
+against one pretraining recipe rather than two moving at once.
+
 ## Risks
 
 - Mask-model divergence from the real engine surfaces as extraction

@@ -300,9 +300,32 @@ in Stage 0 with an existing instrument.
 ## Decisions taken
 
 1. **`N = 4` total**, each agent facing the other three.
-2. **Cost parity or data parity is still open** and is the one question left for a
-   measurement: Stage 0(c) produces the ms/step table and the choice is a compute
-   call, not a design call.
+2. **Cost parity, at 156 games.** Measured, not chosen on taste
+   (`artifacts/probes/population-cost.json`, `scripts/probe_population_cost.py`,
+   on `runs/bc5-mixed-conv/bc-actor.pt`, 3 repeats, median):
+
+   | wave | games | forwards/step | rollout s | trajectories per learner | host arena |
+   |---|---|---|---|---|---|
+   | today's mixed | 112 self-play + 96 league | 2 | 4.07 | 320 | 3.19 GiB |
+   | population G156 | 156 | 1 | **3.08** | 78 | 3.11 GiB |
+   | population G636 | 636 | 1 | — | 312 | **12.70 GiB, over budget** |
+
+   Two results decide it. Data parity is not a compute call at all: at 636 games
+   the host arena wants 12.7 GiB against a 12.0 GiB budget on a 32 GiB machine,
+   so it is infeasible before any throughput question arises. And cost parity is
+   not merely affordable, it is **24% cheaper per wave than what ships today**,
+   because every seat is a live learner and the second forward -- the frozen
+   ensemble's -- disappears entirely (`forwards_per_step` 2 -> 1).
+
+   The honest cost is stated rather than buried: each member sees 78 trajectories
+   per iteration where the single learner sees 320, so per-member sample
+   efficiency drops roughly fourfold and a population run needs proportionally
+   more iterations for the same per-member experience. What it buys is that all
+   78 come from live opponents of equal competence rather than from frozen
+   snapshots of its own past. Both waves pass every admissibility gate
+   (`worst_first_minibatch_kl` 2.5e-05, `worst_update_replay_max_kl` 4.4e-04,
+   11x under the shipped replay ceiling), so vmap replay parity is not the
+   constraint either.
 3. **The reward gets no absolute anchor.** Only winning counts, so the objective
    stays purely relative and antisymmetric: `_relative_score` and the shaping
    potential built on it are unchanged, and `rust/kagg_env/src/core.rs` is not

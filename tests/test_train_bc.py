@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import sys
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -744,6 +745,179 @@ def test_a_seed_cap_takes_a_stable_prefix_of_each_corpus(dataset_dir: Path, tmp_
             encode_workers=1,
             seeds_per_dataset=2,
         )
+
+
+# Uneven episode-seats, including one of a single row: a real corpus's seats are
+# equal-length, but the sampler must not depend on that, and the tail arithmetic
+# is where a run length that divides nothing goes wrong.
+_RUN_SPANS = (7, 5, 1, 12)
+
+
+def _synthetic_metadata(spans: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Staged `episode_index`/`step` for episode-seats of the given row counts."""
+    episode_index = torch.repeat_interleave(
+        torch.arange(len(spans), dtype=torch.int32), torch.tensor(spans)
+    )
+    return episode_index, torch.cat([torch.arange(span, dtype=torch.int32) for span in spans])
+
+
+@pytest.mark.parametrize("run_length", [1, 2, 3, 7, 64])
+def test_an_epoch_under_the_run_sampler_visits_every_row_exactly_once(run_length: int) -> None:
+    """An epoch is a pass over the corpus, so the order must be a permutation of
+    the rows -- a multiset equality, which a matching row count would not catch,
+    and which is why a short tail run is kept whole rather than dropped."""
+    trainer = _load_trainer()
+    episode_index, _ = _synthetic_metadata(_RUN_SPANS)
+    starts, lengths = trainer._run_blocks(episode_index, run_length)
+
+    order = trainer._run_epoch_order(starts, lengths, torch.Generator(device="cpu").manual_seed(0))
+
+    rows = sum(_RUN_SPANS)
+    assert sorted(order.tolist()) == list(range(rows))
+    assert int(lengths.sum()) == rows
+
+
+@pytest.mark.parametrize("run_length", [2, 3, 5, 64])
+def test_a_run_is_consecutive_steps_of_one_episode_seat(run_length: int) -> None:
+    """Pairing reads adjacent rows, so a run must stay inside one episode-seat and
+    advance the step by exactly one: a run spanning a boundary would pair the last
+    state of one game with the first state of another and call it a transition."""
+    trainer = _load_trainer()
+    episode_index, step = _synthetic_metadata(_RUN_SPANS)
+    starts, lengths = trainer._run_blocks(episode_index, run_length)
+
+    order = trainer._run_epoch_order(starts, lengths, torch.Generator(device="cpu").manual_seed(1))
+
+    for start, length in zip(starts.tolist(), lengths.tolist(), strict=True):
+        assert length <= run_length
+        rows = torch.arange(start, start + length)
+        assert episode_index[rows].unique().numel() == 1
+        assert torch.equal(torch.diff(step[rows]), torch.ones(length - 1, dtype=torch.int32))
+        # And the run reaches the batch as one ascending stretch: its rows land
+        # adjacent, in step order, wherever the shuffle placed it.
+        position = int((order == start).nonzero()[0])
+        assert order[position : position + length].tolist() == list(range(start, start + length))
+
+
+def test_a_run_length_of_one_is_the_independent_row_shuffle() -> None:
+    """The default must leave a queued run's batches alone. At a run length of one
+    the sampler is `torch.randperm` on the same generator -- one draw per epoch,
+    the same order -- rather than a lookalike that shifts gradient statistics."""
+    trainer = _load_trainer()
+    episode_index, _ = _synthetic_metadata(_RUN_SPANS)
+    rows = sum(_RUN_SPANS)
+    starts, lengths = trainer._run_blocks(episode_index, 1)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    reference = torch.Generator(device="cpu").manual_seed(7)
+
+    assert lengths.tolist() == [1] * rows
+    for _ in range(3):
+        assert torch.equal(
+            trainer._run_epoch_order(starts, lengths, generator),
+            torch.randperm(rows, generator=reference),
+        )
+
+
+def test_the_staged_step_is_the_step_the_archive_recorded(dataset_dir: Path) -> None:
+    """`step` is derived from row order, so it has to agree with the step every
+    stored observation carries; that agreement is what makes the derivation a fact
+    about the archive rather than an assumption about how it was written."""
+    trainer = _load_trainer()
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    held_out = max(int(entry["seed"]) for entry in manifest["episodes"])
+    kept = [entry for entry in manifest["episodes"] if int(entry["seed"]) != held_out]
+    recorded: list[int] = []
+    episodes: list[int] = []
+    for position, entry in enumerate(kept):
+        with np.load(dataset_dir / entry["file"]) as archive:
+            raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()))
+        recorded.extend(int(item["observation"]["step"]) for item in raw["observations"])
+        episodes.extend([position] * len(raw["observations"]))
+
+    train_split, _, _ = trainer.load_dataset(
+        [dataset_dir],
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        encode_workers=1,
+    )
+
+    assert recorded == list(range(EPISODE_STEPS - 1)) * len(kept)
+    assert train_split.staged["step"].tolist() == recorded
+    assert train_split.staged["episode_index"].tolist() == episodes
+
+
+def test_row_metadata_is_dense_per_split_after_a_cap_and_a_holdout(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """Pairing is keyed on `episode_index`, so it must index the split it is
+    staged in: the cap drops seeds and the holdout takes whole seeds off the top,
+    and an index left over from the uncapped corpus would leave gaps that make
+    two unrelated rows -- or none at all -- look like one episode's steps."""
+    trainer = _load_trainer()
+    directory = _copy_dataset(dataset_dir, tmp_path / "three-seeds")
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    lowest = min(int(entry["seed"]) for entry in manifest["episodes"])
+    highest = max(int(entry["seed"]) for entry in manifest["episodes"]) + 1
+    for seat in (0, 1):
+        shutil.copyfile(
+            directory / f"episode-{lowest:08d}-seat{seat}.npz",
+            directory / f"episode-{highest:08d}-seat{seat}.npz",
+        )
+        manifest["episodes"].append(
+            {"file": f"episode-{highest:08d}-seat{seat}.npz", "seed": highest, "seat": seat}
+        )
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    train_split, holdout_split, _ = trainer.load_dataset(
+        [directory],
+        architecture=CONV_ENTITY,
+        holdout_seeds=1,
+        encode_workers=1,
+        seeds_per_dataset=2,
+    )
+
+    per_episode = EPISODE_STEPS - 1
+    # The capped seed is gone from both sides and the held-out seed's two seats
+    # are the whole holdout, so each split holds exactly two episode-seats.
+    for split in (train_split, holdout_split):
+        assert split.rows == 2 * per_episode
+        assert split.staged["episode_index"].dtype == torch.int32
+        assert split.staged["step"].dtype == torch.int32
+        assert split.staged["episode_index"].tolist() == [0] * per_episode + [1] * per_episode
+        assert split.staged["step"].tolist() == list(range(per_episode)) * 2
+
+
+def test_the_artifact_records_how_its_batches_were_built(dataset_dir: Path, tmp_path: Path) -> None:
+    """Two clones trained with different samplers are different experiments, so
+    the sampler's configuration belongs in the provenance the artifact carries."""
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+    arguments = {
+        "dataset_dirs": [dataset_dir],
+        "output_dir": output,
+        "architecture": CONV_ENTITY,
+        "config": _tiny_config(),
+        "holdout_seeds": 1,
+        "epochs": 1,
+        "patience": 1,
+        "batch_size": 8,
+        "run_length": 3,
+        "matrix_learning_rate": 1e-3,
+        "matrix_weight_decay": 0.0,
+        "adam_learning_rate_ratio": 0.35,
+        "adam_weight_decay": 0.0,
+        "seed": 0,
+        "device": torch.device("cpu"),
+        "encode_workers": 1,
+    }
+
+    trainer.train(**arguments)
+
+    _, payload = load_actor_artifact(output / "bc-actor.pt")
+    provenance = payload["bc_provenance"]
+    assert (provenance["run_length"], provenance["batch_size"]) == (3, 8)
+    with pytest.raises(ValueError, match="must be positive"):
+        trainer.train(**{**arguments, "output_dir": tmp_path / "other", "run_length": 0})
 
 
 def test_the_clone_rate_holds_flat_then_decays_linearly_to_a_floor() -> None:

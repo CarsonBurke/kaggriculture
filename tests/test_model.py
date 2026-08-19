@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -22,6 +24,7 @@ from kaggriculture.encoding import (
 )
 from kaggriculture.model import (
     AxialRotaryEmbedding,
+    BeliefOutput,
     DistributionalCritic,
     EntityTransformer,
     FarmActor,
@@ -98,10 +101,16 @@ def test_inactive_unit_garbage_cannot_change_any_actor_output() -> None:
     corrupted_positions[:, 3:] = 1_000_000
 
     with torch.inference_mode():
-        expected = actor(board, global_features, units, positions)
-        actual = actor(board, global_features, corrupted_units, corrupted_positions)
+        expected = actor.forward_with_belief(board, global_features, units, positions)
+        actual = actor.forward_with_belief(
+            board, global_features, corrupted_units, corrupted_positions
+        )
 
-    for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
+    # The belief is included: it is the heads' own input, so if garbage reached it
+    # the logits could only be unchanged by luck.
+    for expected_tensor, actual_tensor in zip(
+        (*expected.output, expected.belief), (*actual.output, actual.belief), strict=True
+    ):
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0.0, atol=0.0)
 
 
@@ -112,12 +121,16 @@ def test_model_is_deterministic_across_train_and_eval_modes() -> None:
 
     actor.eval()
     with torch.inference_mode():
-        eval_output = actor(*inputs)
+        eval_output = actor.forward_with_belief(*inputs)
     actor.train()
     with torch.inference_mode():
-        train_output = actor(*inputs)
+        train_output = actor.forward_with_belief(*inputs)
 
-    for eval_tensor, train_tensor in zip(eval_output, train_output, strict=True):
+    for eval_tensor, train_tensor in zip(
+        (*eval_output.output, eval_output.belief),
+        (*train_output.output, train_output.belief),
+        strict=True,
+    ):
         torch.testing.assert_close(train_tensor, eval_tensor, rtol=0.0, atol=0.0)
     assert not any(isinstance(module, nn.SiLU) for module in actor.modules())
     assert not any("drop" in type(module).__name__.lower() for module in actor.modules())
@@ -372,6 +385,204 @@ def test_quantity_head_rejects_misaligned_selected_kinds() -> None:
 
     with pytest.raises(ValueError, match="must align"):
         actor.quantity_logits(context, torch.zeros(2, MAX_MARKET_ORDERS - 1, dtype=torch.long))
+
+
+def _captured_head_inputs(actor: FarmActor) -> tuple[dict[str, torch.Tensor], list[Any]]:
+    """Record the exact tensor each policy head is applied to, as it is applied."""
+    captured: dict[str, torch.Tensor] = {}
+
+    def record(name: str) -> Any:
+        def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+            captured[name] = inputs[0]
+
+        return hook
+
+    handles = [
+        head.register_forward_pre_hook(record(name))
+        for name, head in (
+            ("unit_head", actor.unit_head),
+            ("market_kind", actor.market_kind),
+            ("market_quantity_context", actor.market_quantity_context),
+        )
+    ]
+    return captured, handles
+
+
+def test_forward_with_belief_runs_one_trunk_pass_and_moves_no_logit() -> None:
+    """The belief must ride the forward the heads already ran, not a second one.
+
+    Bit-identity of every head is the first half: the A/B that switches the latent
+    auxiliary on must not simultaneously change the policy it is measuring.
+
+    On its own that is nearly tautological, because both paths call `_head_inputs`
+    and `_policy_heads` with the same arguments and CPU eager is deterministic -- an
+    implementation that simply ran the trunk twice, once for the logits and once for
+    the belief, would be bit-identical here and still wrong. Counting trunk calls is
+    what rejects it. The cost of that bug is a doubled trunk on the update path, and
+    on CUDA under bf16 autocast the two passes are not even guaranteed to agree:
+    `_sdpa_inputs` drops to bf16 and the attention backend's tiling is free to
+    differ, so the supervised belief would silently drift from what the heads saw.
+    """
+    torch.manual_seed(11)
+    actor = FarmActor(_small_config()).eval()
+    inputs = _actor_inputs(batch=3)
+    trunk_calls: list[int] = []
+    handle = actor.transformer.register_forward_hook(
+        lambda _module, _args, _output: trunk_calls.append(1)
+    )
+    try:
+        with torch.inference_mode():
+            plain = actor(*inputs)
+            assert len(trunk_calls) == 1
+            with_belief = actor.forward_with_belief(*inputs)
+            assert len(trunk_calls) == 2
+    finally:
+        handle.remove()
+
+    for field in ("unit_logits", "market_kind_logits", "market_quantity_context"):
+        assert torch.equal(getattr(plain, field), getattr(with_belief.output, field))
+
+
+def test_belief_is_exactly_the_tensors_the_policy_heads_were_applied_to() -> None:
+    """The belief must be the heads' own input, not a parallel read of the trunk.
+
+    The invariant pinned here is bit-equality against the tensors the three heads
+    actually received, recorded by pre-hooks during the same forward. Storage
+    identity is unavailable by construction -- the two halves carry different
+    preprocessing, `unit_hidden` raw and `market_hidden` post-`market_norm`, so no
+    single slice of the trunk output holds both and the concatenation must copy.
+    Bit-equality against the recorded head inputs is the strongest remaining
+    claim, and it is far stronger than gradient reachability, which any tensor
+    downstream of the trunk would satisfy: it fails the moment the belief is read
+    from a different token range, taken before `market_norm`, or recomputed.
+    """
+    torch.manual_seed(29)
+    config = _small_config()
+    actor = FarmActor(config).eval()
+    inputs = _actor_inputs(batch=2)
+
+    captured, handles = _captured_head_inputs(actor)
+    try:
+        with torch.inference_mode():
+            belief = actor.forward_with_belief(*inputs).belief
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # Both market heads must read one and the same tensor, or "the market half of
+    # the belief" would not be well defined.
+    assert captured["market_kind"] is captured["market_quantity_context"]
+    assert belief.shape == (2, MAX_UNITS + MAX_MARKET_ORDERS, config.model_dim)
+    assert torch.equal(belief[:, :MAX_UNITS], captured["unit_head"])
+    assert torch.equal(belief[:, MAX_UNITS:], captured["market_kind"])
+
+
+def test_belief_carries_the_head_inputs_gradient_and_no_head_parameter() -> None:
+    """The belief sits between the trunk and the heads, and the gradient proves it.
+
+    Three claims, none of which names a parameter, so none rots on a head rename.
+
+    The belief is a concatenation of the two head inputs, so the derivative of its
+    sum with respect to each half must be exactly ones. That is what catches a
+    detach on one half only, which no parameter-reachability set can see: both
+    halves descend from the same trunk output, so the surviving half already
+    reaches every trunk parameter and the sets stay equal.
+
+    Set equality against the gradient of the heads' own recorded inputs then says
+    the belief carries exactly their reachability -- nothing extra, and in
+    particular not a different token range: the trunk's state token, the obvious
+    wrong answer, never passes through `market_norm` and fails here. Strict
+    containment in the logits path says the belief is upstream of the heads, so no
+    head's own weights move with it.
+    """
+    torch.manual_seed(31)
+    actor = FarmActor(_small_config())
+    inputs = _actor_inputs(batch=2)
+
+    def run() -> tuple[BeliefOutput, dict[str, torch.Tensor]]:
+        captured, handles = _captured_head_inputs(actor)
+        try:
+            return actor.forward_with_belief(*inputs), captured
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def reached(loss: Callable[[BeliefOutput, dict[str, torch.Tensor]], torch.Tensor]) -> set[str]:
+        actor.zero_grad(set_to_none=True)
+        result, captured = run()
+        loss(result, captured).backward()
+        return {name for name, parameter in actor.named_parameters() if parameter.grad is not None}
+
+    result, captured = run()
+    half_grads = torch.autograd.grad(
+        result.belief.sum(),
+        (captured["unit_head"], captured["market_kind"]),
+        allow_unused=True,
+    )
+    for half_grad in half_grads:
+        assert half_grad is not None
+        assert torch.equal(half_grad, torch.ones_like(half_grad))
+
+    from_belief = reached(lambda result, _captured: result.belief.sum())
+    from_head_inputs = reached(
+        lambda _result, captured: captured["unit_head"].sum() + captured["market_kind"].sum()
+    )
+    from_logits = reached(
+        lambda result, _captured: (
+            result.output.unit_logits.sum()
+            + result.output.market_kind_logits.sum()
+            + result.output.market_quantity_context.sum()
+        )
+    )
+
+    assert from_belief == from_head_inputs
+    assert from_belief < from_logits
+
+
+def test_belief_is_fp32_one_token_per_unit_and_order_slot_under_bf16_autocast() -> None:
+    """The dynamics MLP holds fp32 weights, so the belief must be widened here.
+
+    Two ways the trunk can hand back bf16 are checked, because they are not the
+    same mechanism, and only the second one makes the widen load-bearing. On CPU
+    `RMSNorm`'s autocast-disabled `F.rms_norm` promotes an fp32 weight rather than
+    taking the fused path, so the trunk output under `torch.autocast('cpu')` is
+    already fp32 and that half only pins the shape and the dtype contract while
+    confirming the region was live. With bf16 parameters the trunk tensors are
+    unconditionally bf16, which is the state CUDA reaches under production
+    autocast, and there the widen is the only reason the belief is fp32 -- so that
+    half also checks the values survive it, since a widen that quietly substituted
+    a differently-shaped or zeroed tensor would satisfy dtype alone.
+    """
+    torch.manual_seed(37)
+    config = _small_config()
+    actor = FarmActor(config).eval()
+    board, global_features, units, positions = _actor_inputs(batch=4)
+    expected_shape = (4, MAX_UNITS + MAX_MARKET_ORDERS, config.model_dim)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16), torch.inference_mode():
+        under_autocast = actor.forward_with_belief(board, global_features, units, positions)
+    # Confirms the autocast region was live rather than silently ignored.
+    assert under_autocast.output.unit_logits.dtype == torch.bfloat16
+    assert under_autocast.belief.shape == expected_shape
+    assert under_autocast.belief.dtype == torch.float32
+
+    half = FarmActor(config).eval().to(torch.bfloat16)
+    captured, handles = _captured_head_inputs(half)
+    try:
+        with torch.inference_mode():
+            in_bf16 = half.forward_with_belief(
+                board.bfloat16(), global_features.bfloat16(), units.bfloat16(), positions
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert captured["unit_head"].dtype == torch.bfloat16
+    assert captured["market_kind"].dtype == torch.bfloat16
+    assert in_bf16.belief.shape == expected_shape
+    assert in_bf16.belief.dtype == torch.float32
+    assert torch.equal(in_bf16.belief[:, :MAX_UNITS], captured["unit_head"].float())
+    assert torch.equal(in_bf16.belief[:, MAX_UNITS:], captured["market_kind"].float())
 
 
 def _trunk_case() -> tuple[EntityTransformer, torch.Tensor, torch.Tensor]:
