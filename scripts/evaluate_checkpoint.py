@@ -566,11 +566,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_root = Path(name)
         artifact_snapshot = snapshot_root / "artifact.pt"
         shutil.copyfile(artifact, artifact_snapshot)
+        # `getattr`, matching `selection_report` below: `select_checkpoint` calls
+        # this with a hand-built namespace carrying only the fields it sets.
+        witness_path = getattr(args, "inference_equivalence", None)
         artifact_provenance = _artifact_provenance(
             artifact_snapshot,
-            json.loads(args.inference_equivalence.read_text(encoding="utf-8"))
-            if args.inference_equivalence is not None
-            else None,
+            None if witness_path is None else json.loads(witness_path.read_text(encoding="utf-8")),
         )
         artifact_provenance["path"] = str(artifact)
         selection = getattr(args, "selection_report", None)

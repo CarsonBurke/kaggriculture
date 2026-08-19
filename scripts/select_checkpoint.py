@@ -145,6 +145,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--inference-equivalence",
+        type=Path,
+        help=(
+            "measured witness from scripts/audit_inference_equivalence.py admitting "
+            "candidates whose bound tree has moved without changing inference"
+        ),
+    )
     parser.add_argument("--best-output", type=Path)
     return parser.parse_args()
 
@@ -175,6 +183,7 @@ def main() -> None:
                     workers=args.workers,
                     torch_threads=args.torch_threads,
                     device=args.device,
+                    inference_equivalence=args.inference_equivalence,
                 )
             )
             for opponent in opponents
