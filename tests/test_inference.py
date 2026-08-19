@@ -579,3 +579,49 @@ def test_the_bundle_smoke_test_refuses_an_agent_that_never_acts(tmp_path: Path) 
                 ")\n",
             )
         )
+
+
+def _load_build_plan_submission():
+    spec = importlib.util.spec_from_file_location(
+        "build_plan_submission_under_test",
+        Path(__file__).parents[1] / "scripts" / "build_plan_submission.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_plan_patch_cancels_exactly_the_named_steps(tmp_path: Path) -> None:
+    # The failure mode is silent and expensive: a patch that emits
+    # `frozenset(220, 224)` raises at import, and one that emits a truthy scalar
+    # would cancel the market on every step. Either ships an agent that is not the
+    # one the search measured, and the archive still looks well formed.
+    builder = _load_build_plan_submission()
+    source = tmp_path / "plan.py"
+    source.write_text(
+        "def _get(obs, key, default=None):\n"
+        "    return obs.get(key, default)\n"
+        "\n"
+        "\n"
+        "def agent(obs, configuration=None):\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': [['SELL', 'WHEAT', 1]]}\n",
+        encoding="utf-8",
+    )
+    patched = tmp_path / "main.py"
+    patched.write_text(builder.patched_source(source, (2, 5)), encoding="utf-8")
+
+    module = builder._load(patched, "patched_plan_under_test")
+    assert frozenset({2, 5}) == module._CANCELLED_MARKET_STEPS
+    cancelled = [step for step in range(8) if module.agent({"step": step})["market"] == []]
+    assert cancelled == [2, 5]
+    # The rest of the action is the plan's own, so the edit cannot be credited
+    # with a change it did not make.
+    assert module.agent({"step": 3})["market"] == [["SELL", "WHEAT", 1]]
+
+    with pytest.raises(SystemExit, match="already patched"):
+        builder.patched_source(patched, (2, 5))
+    bare = tmp_path / "bare.py"
+    bare.write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="no top-level agent"):
+        builder.patched_source(bare, (2,))
