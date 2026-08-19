@@ -534,25 +534,105 @@ def source_identity(root: Path | None = None) -> dict[str, Any]:
     )
 
 
-def require_source_identity(expected: object, root: Path | None = None) -> dict[str, Any]:
-    """Require the current checkout to exactly match a serialized identity."""
+#: The surfaces a frozen actor actually reads. A witness has to cover every one:
+#: a policy that sees the same observations under the same legality and answers
+#: with the same logits cannot behave differently, whatever else moved.
+INFERENCE_SURFACES = ("observations", "masks", "logits")
+
+
+def validate_inference_equivalence(value: object) -> dict[str, Any]:
+    """Validate a measured witness that two trees are interchangeable for inference.
+
+    Bound to one artifact and one ordered pair of tree identities, so it cannot be
+    replayed against another artifact or a tree that moved again since. It is a
+    measurement, not a waiver: every surface has to be equal, and a report holding
+    a failure list is refused rather than read for the parts that passed.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("inference equivalence witness is not a dictionary")
+    required = {
+        "artifact_sha256",
+        "expected_identity",
+        "candidate_identity",
+        "surfaces",
+        "games",
+        "steps",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise ValueError(f"inference equivalence witness is missing {missing}")
+    if value.get("failures"):
+        raise ValueError(f"inference equivalence witness records failures: {value['failures']}")
+    surfaces = value["surfaces"]
+    if not isinstance(surfaces, dict) or set(surfaces) != set(INFERENCE_SURFACES):
+        raise ValueError(
+            f"inference equivalence witness must cover exactly {list(INFERENCE_SURFACES)}"
+        )
+    for name, record in surfaces.items():
+        if not isinstance(record, dict) or not record.get("equal"):
+            raise ValueError(f"inference equivalence witness does not establish {name}")
+        if record.get("reference") != record.get("candidate"):
+            raise ValueError(f"inference equivalence witness reports unequal {name} digests")
+    _positive_number(value["games"], "inference equivalence games")
+    _positive_number(value["steps"], "inference equivalence steps")
+    return value
+
+
+def require_source_identity(
+    expected: object,
+    root: Path | None = None,
+    *,
+    equivalence: object = None,
+    artifact_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Require the current checkout to match a bound identity, or prove it need not.
+
+    Whole-tree identity is the right default and is too coarse to be true: a reward
+    change, a new league opponent, or a telemetry layout moves the hash without
+    touching how a frozen actor maps an observation to an action. Narrowing the hash
+    to a hand-picked file list would trade this false refusal for a silent
+    acceptance, since the list is a reachability claim nothing checks. An
+    `equivalence` witness instead carries the measurement that both trees present
+    identical observations, legality, and logits for this exact artifact.
+    """
     normalized = validate_source_identity(expected)
     current = source_identity(root)
-    if current != normalized:
-        expected_files = normalized["files"]
-        current_files = current["files"]
-        changed = sorted(
-            relative
-            for relative in set(expected_files) | set(current_files)
-            if expected_files.get(relative) != current_files.get(relative)
-        )
-        preview = ", ".join(changed[:8])
-        suffix = " ..." if len(changed) > 8 else ""
-        raise ValueError(
-            "source tree does not match the bound artifact identity "
-            f"({normalized['sha256']} != {current['sha256']}): {preview}{suffix}"
-        )
-    return current
+    if current == normalized:
+        return current
+    if equivalence is not None:
+        witness = validate_inference_equivalence(equivalence)
+        if witness["expected_identity"] != normalized["sha256"]:
+            raise ValueError(
+                "inference equivalence witness was measured against a different bound tree "
+                f"({witness['expected_identity']} != {normalized['sha256']})"
+            )
+        if witness["candidate_identity"] != current["sha256"]:
+            raise ValueError(
+                "inference equivalence witness is stale: the tree moved after it was measured "
+                f"({witness['candidate_identity']} != {current['sha256']})"
+            )
+        if artifact_sha256 is not None and witness["artifact_sha256"] != artifact_sha256:
+            raise ValueError(
+                "inference equivalence witness covers a different artifact "
+                f"({witness['artifact_sha256']} != {artifact_sha256})"
+            )
+        # Returned unannotated: consumers compare identities for exact equality
+        # across reports, and folding the witness in would make that comparison
+        # depend on which side happened to be handed the witness file.
+        return current
+    expected_files = normalized["files"]
+    current_files = current["files"]
+    changed = sorted(
+        relative
+        for relative in set(expected_files) | set(current_files)
+        if expected_files.get(relative) != current_files.get(relative)
+    )
+    preview = ", ".join(changed[:8])
+    suffix = " ..." if len(changed) > 8 else ""
+    raise ValueError(
+        "source tree does not match the bound artifact identity "
+        f"({normalized['sha256']} != {current['sha256']}): {preview}{suffix}"
+    )
 
 
 def freeze_source(destination: Path, root: Path | None = None) -> dict[str, Any]:

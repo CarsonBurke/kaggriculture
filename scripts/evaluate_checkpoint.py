@@ -100,13 +100,17 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
-def _artifact_provenance(path: Path) -> dict[str, Any]:
+def _artifact_provenance(path: Path, equivalence: dict[str, Any] | None = None) -> dict[str, Any]:
     """Validate the artifact before spawning workers and record stable identity."""
     actor, metadata = load_actor_artifact(path, device="cpu")
     del actor
-    identity = require_source_identity(metadata.get("source_identity"))
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    identity = require_source_identity(
+        metadata.get("source_identity"),
+        equivalence=equivalence,
+        artifact_sha256=digest,
+    )
     return {
         "path": str(path),
         "sha256": digest,
@@ -530,6 +534,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="optional checkpoint-selection evidence required by finalist packaging",
     )
+    parser.add_argument(
+        "--inference-equivalence",
+        type=Path,
+        help=(
+            "measured witness from scripts/audit_inference_equivalence.py admitting an "
+            "artifact whose bound tree has moved without changing its inference surface"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -554,7 +566,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_root = Path(name)
         artifact_snapshot = snapshot_root / "artifact.pt"
         shutil.copyfile(artifact, artifact_snapshot)
-        artifact_provenance = _artifact_provenance(artifact_snapshot)
+        artifact_provenance = _artifact_provenance(
+            artifact_snapshot,
+            json.loads(args.inference_equivalence.read_text(encoding="utf-8"))
+            if args.inference_equivalence is not None
+            else None,
+        )
         artifact_provenance["path"] = str(artifact)
         selection = getattr(args, "selection_report", None)
         selection_provenance = (

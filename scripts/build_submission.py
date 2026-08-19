@@ -110,6 +110,14 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="paired-seat seed clusters required per built-in report, so a pass is not a fluke",
     )
+    parser.add_argument(
+        "--inference-equivalence",
+        type=Path,
+        help=(
+            "measured witness from scripts/audit_inference_equivalence.py admitting a "
+            "checkpoint whose bound tree has moved without changing its inference surface"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -245,6 +253,7 @@ def build(
     minimum_score_rate: float = 0.0,
     minimum_builtin_score_rate: float = 0.0,
     minimum_builtin_seed_count: int = 1,
+    inference_equivalence: Path | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_path.expanduser().resolve()
     evaluation_report = evaluation_report.expanduser().resolve()
@@ -261,7 +270,16 @@ def build(
     checkpoint_digest = hashlib.sha256(checkpoint_contents).hexdigest()
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
     artifact = actor_artifact_from_checkpoint(checkpoint)
-    source = require_source_identity(artifact["source_identity"])
+    witness = (
+        json.loads(inference_equivalence.expanduser().resolve().read_text(encoding="utf-8"))
+        if inference_equivalence is not None
+        else None
+    )
+    source = require_source_identity(
+        artifact["source_identity"],
+        equivalence=witness,
+        artifact_sha256=file_sha256(checkpoint_path),
+    )
     run_provenance = validate_run_provenance(artifact.get("run_provenance"))
     builtin_score_rates: dict[str, float] = {}
     for path in builtin_paths:
@@ -321,6 +339,10 @@ def build(
         manifest = {
             "format_version": 1,
             "source_identity": source,
+            # Recorded beside the identity, never inside it: a reader who sees a
+            # shipped tree that differs from the checkpoint's own needs the
+            # measurement that admitted it, not a matching hash and no reason.
+            "inference_equivalence": witness,
             "run_provenance": run_provenance,
             "checkpoint": {
                 "sha256": checkpoint_digest,
@@ -385,6 +407,7 @@ def main() -> None:
         minimum_score_rate=args.minimum_score_rate,
         minimum_builtin_score_rate=args.minimum_builtin_score_rate,
         minimum_builtin_seed_count=args.minimum_builtin_seed_count,
+        inference_equivalence=args.inference_equivalence,
     )
     print(
         json.dumps(

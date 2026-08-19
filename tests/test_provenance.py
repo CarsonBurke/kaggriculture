@@ -7,13 +7,32 @@ from pathlib import Path
 import pytest
 
 from kaggriculture.provenance import (
+    INFERENCE_SURFACES,
     freeze_source,
     require_source_identity,
     run_provenance_from_decision,
     source_identity,
+    validate_inference_equivalence,
     validate_run_provenance,
     validate_source_identity,
 )
+
+
+def _witness(expected: str, candidate: str, artifact: str = "a" * 64) -> dict[str, object]:
+    """A passing equivalence witness, shaped exactly as the audit script emits one."""
+    return {
+        "artifact": "/runs/actor.pt",
+        "artifact_sha256": artifact,
+        "expected_identity": expected,
+        "candidate_identity": candidate,
+        "games": 8,
+        "steps": 719,
+        "surfaces": {
+            surface: {"reference": surface * 4, "candidate": surface * 4, "equal": True}
+            for surface in INFERENCE_SURFACES
+        },
+        "failures": [],
+    }
 
 
 def _minimal_source(root: Path) -> None:
@@ -480,3 +499,92 @@ def test_a_knob_that_is_not_a_mode_is_rejected_rather_than_read_as_eager(
 
     with pytest.raises(ValueError, match="must be an execution mode"):
         run_provenance_from_decision(decision)
+
+
+def test_a_measured_witness_admits_a_moved_tree_but_only_the_pair_it_measured(
+    tmp_path: Path,
+) -> None:
+    # The gate exists because a tree hash is the only cheap proof that an
+    # evaluation ran the stack its artifact was trained against. A witness is the
+    # expensive proof, so it has to be pinned to both endpoints: accepted for the
+    # pair it measured, refused for any other, or it is a blanket waiver wearing
+    # a measurement's name.
+    _minimal_source(tmp_path)
+    bound = source_identity(tmp_path)
+    (tmp_path / "scripts" / "train.py").write_text("print('moved')\n", encoding="utf-8")
+    moved = source_identity(tmp_path)
+    assert bound["sha256"] != moved["sha256"]
+
+    with pytest.raises(ValueError, match="does not match the bound artifact identity"):
+        require_source_identity(bound, tmp_path)
+
+    accepted = require_source_identity(
+        bound,
+        tmp_path,
+        equivalence=_witness(bound["sha256"], moved["sha256"]),
+    )
+    # The identity returned is the tree that will actually run, and carries no
+    # trace of the witness: every downstream report compares identities for exact
+    # equality, and only one side is handed the witness file.
+    assert accepted == moved
+
+    with pytest.raises(ValueError, match="measured against a different bound tree"):
+        require_source_identity(
+            bound,
+            tmp_path,
+            equivalence=_witness(moved["sha256"], moved["sha256"]),
+        )
+    with pytest.raises(ValueError, match="stale: the tree moved"):
+        require_source_identity(
+            bound,
+            tmp_path,
+            equivalence=_witness(bound["sha256"], bound["sha256"]),
+        )
+    with pytest.raises(ValueError, match="covers a different artifact"):
+        require_source_identity(
+            bound,
+            tmp_path,
+            equivalence=_witness(bound["sha256"], moved["sha256"], artifact="b" * 64),
+            artifact_sha256="c" * 64,
+        )
+
+
+def test_a_witness_missing_a_surface_or_carrying_a_failure_is_refused() -> None:
+    # Partial evidence is the dangerous shape: a report that measured
+    # observations, skipped logits, and still says "equal" would pass a model
+    # change as an environment change. So would one that lists its own failures
+    # and gets read for the surfaces that happened to match.
+    good = _witness("0" * 64, "1" * 64)
+    assert validate_inference_equivalence(good) is good
+
+    for surface in INFERENCE_SURFACES:
+        partial = _witness("0" * 64, "1" * 64)
+        del partial["surfaces"][surface]
+        with pytest.raises(ValueError, match="must cover exactly"):
+            validate_inference_equivalence(partial)
+
+        unequal = _witness("0" * 64, "1" * 64)
+        unequal["surfaces"][surface] = {"reference": "x", "candidate": "y", "equal": True}
+        with pytest.raises(ValueError, match=f"unequal {surface} digests"):
+            validate_inference_equivalence(unequal)
+
+        denied = _witness("0" * 64, "1" * 64)
+        denied["surfaces"][surface]["equal"] = False
+        with pytest.raises(ValueError, match=f"does not establish {surface}"):
+            validate_inference_equivalence(denied)
+
+    reported = _witness("0" * 64, "1" * 64)
+    reported["failures"] = ["logits differ at 3 of 719 steps, first 0"]
+    with pytest.raises(ValueError, match="records failures"):
+        validate_inference_equivalence(reported)
+
+    empty = _witness("0" * 64, "1" * 64)
+    empty["steps"] = 0
+    with pytest.raises(ValueError, match="steps must be finite and positive"):
+        validate_inference_equivalence(empty)
+
+    for field in ("artifact_sha256", "expected_identity", "candidate_identity", "games"):
+        incomplete = _witness("0" * 64, "1" * 64)
+        del incomplete[field]
+        with pytest.raises(ValueError, match=f"missing \\['{field}'\\]"):
+            validate_inference_equivalence(incomplete)
