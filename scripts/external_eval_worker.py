@@ -238,18 +238,58 @@ def _members(spec: str) -> list[int | None]:
 
 
 def _load_member(artifact: Path, member: int | None) -> Any:
-    """Load one actor: a league snapshot, or one member of a checkpoint.
+    """Load one actor from whichever of the three shapes the file holds.
 
-    Two explicit paths for two explicit inputs. A population checkpoint holds a
-    list of members and cannot answer "the actor" at all, which is why the
-    loader demands the index rather than defaulting to the first -- silently
-    evaluating member 0 and reporting it as the run's strength is the failure
-    this refuses.
+    A population checkpoint holds a list of members and cannot answer "the
+    actor" at all, which is why an index is demanded rather than defaulted --
+    silently evaluating member 0 and reporting it as the run's strength is the
+    failure that refuses. Without an index the file is either a league snapshot
+    or an exported actor artifact, and the two are told apart by the snapshot's
+    own closed key set rather than by a filename or a caller's promise: a
+    snapshot carries exactly `format_version`/`iteration`/`model_config`/`actor`
+    plus an optional `architecture`, while a BC or submission artifact adds
+    provenance and metrics. Both must load here, because the A/B this probe
+    measures compares a BC artifact against a trained snapshot.
     """
-    if member is None:
+    if member is not None:
+        actor, _ = load_actor_artifact(artifact, agent=member)
+        return actor
+    payload = torch.load(artifact, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"actor file is not a dictionary: {artifact}")
+    snapshot_keys = {"format_version", "iteration", "model_config", "actor"}
+    if snapshot_keys <= set(payload) and not set(payload) - snapshot_keys - {"architecture"}:
         return load_actor_snapshot(artifact)
-    actor, _ = load_actor_artifact(artifact, agent=member)
+    actor, _ = load_actor_artifact(artifact)
     return actor
+
+
+def _agent_for(actor: Any) -> Any:
+    """A single-argument agent callable bound to one actor.
+
+    The arity is load-bearing and is why this is a factory rather than a closure
+    written inline. `kaggle_environments` sizes the call with
+    `getfullargspec`, which counts EVERY parameter including one carrying a
+    default, and then invokes a two-parameter callable as
+    `agent(observation, configuration)`. A loop-local closure that bound its
+    actor as a default argument would therefore have the configuration dict
+    passed in as the actor; the resulting TypeError is swallowed under
+    `debug=False`, the seat submits nothing for all 720 steps, and the episode
+    still reports DONE with the bank at exactly its 3000 starting money. That is
+    indistinguishable from a policy that chose to do nothing, which is how the
+    fault survives a green-looking journal. Measured: the bug produced
+    `money_mean` 3000.0 and `score_rate` 0.0 against starter, public-v27 and
+    public-v16 alike.
+
+    A factory closes over its own scope, so the loop cannot rebind the actor
+    behind the callable's back either -- the late-binding hazard the default
+    argument was reaching for -- while the signature stays exactly one argument.
+    """
+
+    def agent(observation: dict[str, Any]) -> dict[str, Any]:
+        return act_batch(actor, [observation], deterministic=True).actions[0]
+
+    return agent
 
 
 def main() -> None:
@@ -266,11 +306,7 @@ def main() -> None:
     for member in members:
         actor = _load_member(args.artifact, member).eval()
 
-        def agent(observation: dict[str, Any], actor: Any = actor) -> dict[str, Any]:
-            # `actor` is bound as a default rather than closed over: the loop
-            # rebinds it, and a late-binding closure would evaluate the last
-            # member N times under N different labels.
-            return act_batch(actor, [observation], deterministic=True).actions[0]
+        agent = _agent_for(actor)
 
         for label, runnable in opponents:
             record = evaluate_opponent(
