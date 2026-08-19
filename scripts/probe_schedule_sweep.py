@@ -110,7 +110,15 @@ def _lane_statistics(
 
 def _label(overrides: dict[str, Any]) -> str:
     """Name a candidate by what it changes, so a report row is self-describing."""
-    return ",".join(f"{name}={value:g}" for name, value in sorted(overrides.items())) or "shipped"
+
+    def rendered(value: Any) -> str:
+        # `:g` is for the numeric knobs this began as; a knob whose value is a
+        # name -- `optimizer` -- is not formattable that way and crashed here.
+        return f"{value:g}" if isinstance(value, (int, float)) else str(value)
+
+    return ",".join(f"{name}={rendered(value)}" for name, value in sorted(overrides.items())) or (
+        "shipped"
+    )
 
 
 def main() -> None:
