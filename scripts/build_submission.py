@@ -19,6 +19,8 @@ import json
 import math
 import os
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 from collections.abc import Sequence
@@ -244,6 +246,95 @@ def _load_evaluation(
     return payload
 
 
+#: Long enough for the agent to be asked for several distinct decisions and short
+#: enough to stay a wiring check. Strength is the evaluation reports' job; this
+#: only answers whether the packaged bundle runs at all.
+_SMOKE_STEPS = 40
+
+#: Run inside the bundle, against the real engine, with the repository nowhere on
+#: the path. Every failure mode it catches is silent otherwise: an import error, a
+#: missing packaged module, a checkpoint the packaged loader refuses, or an agent
+#: that returns something the interpreter reads as "do nothing" -- all of which
+#: bank the untouched starting money and look like a merely weak submission.
+_SMOKE = """import json, sys
+from kaggle_environments import make
+
+import main
+
+environment = make(
+    "kaggriculture",
+    configuration={"episodeSteps": %(steps)d, "seed": 90_017},
+    debug=True,
+)
+environment.run([main.agent, "pass"])
+seat = environment.steps[-1][0]
+submitted = [
+    step[0].action
+    for step in environment.steps[1:]
+    if isinstance(step[0].action, dict)
+]
+
+
+def _acts(action):
+    commands = [action.get("farmer")] + list(action.get("hands") or [])
+    return bool(action.get("market")) or any(c != ["PASS"] for c in commands if c)
+
+
+acting = [action for action in submitted if _acts(action)]
+print(json.dumps({
+    "status": seat.status,
+    "reward": seat.reward,
+    "submitted": len(submitted),
+    "acting": len(acting),
+    "error": seat.info.get("error") if isinstance(seat.info, dict) else None,
+}))
+"""
+
+
+def _smoke_test(root: Path) -> dict[str, Any]:
+    """Play the packaged bundle against the engine before it can be shipped.
+
+    The bundle is the artifact that scores, not the checkpoint it was cut from,
+    and every way it can be broken is quiet: `kaggle_environments` swallows an
+    agent exception, seats a PASS for the rest of the episode, and still reports
+    DONE with the starting bank intact. A submission that fails this way is
+    indistinguishable from a weak one until a day of leaderboard budget is gone.
+    """
+    script = root / "_smoke.py"
+    script.write_text(_SMOKE % {"steps": _SMOKE_STEPS}, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, script.name],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        # The bundle has to satisfy its own imports from its own directory; an
+        # inherited path would let the repository stand in for a module the
+        # package forgot to ship.
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONPATH", "PYTHONHOME"}
+        },
+    )
+    script.unlink()
+    if completed.returncode != 0:
+        raise ValueError(
+            f"submission bundle failed to run:\n{completed.stdout}\n{completed.stderr}"
+        )
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    if result["error"]:
+        raise ValueError(f"submission bundle raised inside the engine: {result['error']}")
+    if result["status"] != "DONE":
+        raise ValueError(f"submission bundle did not finish its episode: {result['status']}")
+    if result["submitted"] != _SMOKE_STEPS - 1:
+        raise ValueError(
+            f"submission bundle answered {result['submitted']} of {_SMOKE_STEPS - 1} steps"
+        )
+    if not result["acting"]:
+        raise ValueError("submission bundle passed on every step: it would bank the start money")
+    return result
+
+
 def build(
     checkpoint_path: Path,
     evaluation_report: Path,
@@ -336,6 +427,9 @@ def build(
                 raise ValueError(
                     f"submission package source does not match source identity: {name}"
                 )
+        # After the hashes agree and before anything is archived: the bundle that
+        # scores is this directory, so it is the thing that has to be seen playing.
+        smoke = _smoke_test(root)
         manifest = {
             "format_version": 1,
             "source_identity": source,
@@ -343,6 +437,7 @@ def build(
             # shipped tree that differs from the checkpoint's own needs the
             # measurement that admitted it, not a matching hash and no reason.
             "inference_equivalence": witness,
+            "bundle_smoke": smoke,
             "run_provenance": run_provenance,
             "checkpoint": {
                 "sha256": checkpoint_digest,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -500,3 +501,81 @@ def test_actor_artifact_rejects_incompatible_format(tmp_path: Path, version) -> 
 
     with pytest.raises(ValueError, match="unsupported actor artifact format"):
         load_actor_artifact(path)
+
+
+def _bundle(root: Path, main_source: str) -> Path:
+    """Assemble a submission bundle by hand, so `main.py` can be made faulty."""
+    builder = _load_build_submission()
+    package = root / "kaggriculture"
+    package.mkdir(parents=True)
+    (root / "main.py").write_text(main_source, encoding="utf-8")
+    config = ModelConfig()
+    actor = FarmActor(config)
+    with torch.no_grad():
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-50.0)
+        actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 50.0
+        actor.market_quantity_context.weight.zero_()
+        actor.market_quantity_bias.fill_(-50.0)
+        actor.market_quantity_bias[:, -1] = 50.0
+    torch.save(
+        {
+            "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "iteration": 3,
+            "source_identity": source_identity(),
+            "run_provenance": None,
+        },
+        root / "model.pt",
+    )
+    for name in builder.PACKAGE_FILES:
+        shutil.copy2(Path(__file__).parents[1] / "src" / "kaggriculture" / name, package / name)
+    return root
+
+
+def _load_build_submission():
+    spec = importlib.util.spec_from_file_location(
+        "build_submission_under_test",
+        Path(__file__).parents[1] / "scripts" / "build_submission.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_bundle_smoke_test_refuses_an_agent_that_never_acts(tmp_path: Path) -> None:
+    # The expensive failure is quiet: `kaggle_environments` swallows an agent
+    # exception, seats PASS for the rest of the episode, and reports DONE with the
+    # starting bank intact. On the leaderboard that is indistinguishable from a
+    # merely weak submission, and it costs a day of submission budget to learn.
+    builder = _load_build_submission()
+
+    playing = _bundle(tmp_path / "playing", builder.MAIN)
+    result = builder._smoke_test(playing)
+    assert result["status"] == "DONE"
+    assert result["submitted"] == builder._SMOKE_STEPS - 1
+    assert result["acting"] > 0
+
+    with pytest.raises(ValueError, match="passed on every step"):
+        builder._smoke_test(_bundle(tmp_path / "silent", "def agent(obs):\n    return {}\n"))
+    with pytest.raises(ValueError, match="failed to run"):
+        builder._smoke_test(
+            _bundle(tmp_path / "raising", "def agent(obs):\n    raise ValueError('bad')\n")
+        )
+    # The trap the entrypoint template exists to avoid: `getfullargspec` counts
+    # `self`, so a callable object is invoked with two arguments, the TypeError is
+    # swallowed, and the seat submits nothing for the whole episode.
+    with pytest.raises(ValueError, match="failed to run"):
+        builder._smoke_test(
+            _bundle(
+                tmp_path / "callable",
+                "from pathlib import Path\n"
+                "import kaggriculture\n"
+                "from kaggriculture.inference import CheckpointAgent\n"
+                "agent = CheckpointAgent(\n"
+                "    Path(kaggriculture.__file__).resolve().parent.parent / 'model.pt'\n"
+                ")\n",
+            )
+        )
