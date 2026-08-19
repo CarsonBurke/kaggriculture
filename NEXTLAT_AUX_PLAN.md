@@ -69,10 +69,37 @@ an accelerant for the post-BC RL fine-tune, not as the headline fix.
 
 ## Concrete design
 
-1. **Latent**: the post-transformer state token of `FarmActor` (model_dim,
-   currently 96). It already aggregates board/unit/market context through
-   attention and is not consumed by any action head, making it a clean
-   belief-summary site.
+1. **Latent**: the 26 head-input tokens of `FarmActor` -- 16 unit tokens
+   concatenated with 10 market tokens, `(rows, 26, model_dim)`, exposed by
+   `forward_with_belief` and pinned by
+   `test_belief_is_fp32_one_token_per_unit_and_order_slot_under_bf16_autocast`.
+
+   This plan first specified the post-transformer **state token** on the grounds
+   that it "is not consumed by any action head, making it a clean belief-summary
+   site". Measured (`src/kaggriculture/model.py:676-695`): the claim is true and
+   it is a **disqualification**, not a qualification. The head slices begin at
+   index 101; nothing reads index 0. A latent no head reads cannot be regressed
+   against a decode of itself through those heads -- the norm and projection
+   would be applied to a vector their weights have never seen, and the decode
+   term (item 5), which is the term that makes the latent decision-relevant, is
+   then measuring a distribution the policy never computes. Collapsing 16 unit
+   slots to one row-level distribution also cannot express "unit 3 harvests
+   while unit 7 walks", which is what a step of this policy consists of.
+
+   In the reference the regressed latent IS the decode vector: `teacher_logits =
+   lm_head(hidden)` reads exactly the tensor the dynamics model predicts. Our
+   analog is therefore the tensor the policy heads read, and p_psi predicts
+   **per token with shared weights** -- action embedding broadcast across the 26
+   tokens, MLP applied to the last dimension, residual per token. Flattening the
+   26 into one 2496-wide regression would invent a per-position parameterization
+   the reference does not have and multiply the parameter count by 26.
+
+   One asymmetry is ours to carry, not the reference's: the unit half is raw
+   trunk output while `market_hidden = self.market_norm(...)` is post-RMSNorm.
+   Measured at production config, unit RMS 0.563 against market 1.000 -- a 1.78x
+   gap, not the 10x an earlier survey assumed. A SmoothL1 over the concatenation
+   is therefore mildly dominated by the market half. Reported per half rather
+   than silently rescaled, so a play difference can be attributed.
 2. **Action embedding**: the executed joint action is (per-unit action ids,
    market orders as kind/quantity pairs). Embed with the same factorization
    the policy heads use: sum of unit-action embeddings + sum of market
