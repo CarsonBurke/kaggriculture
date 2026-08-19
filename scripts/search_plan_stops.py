@@ -31,8 +31,16 @@ from kaggriculture.opponents import PUBLIC_V27_OPPONENT
 from kaggriculture.rust_env import load_native
 
 
-def spec_for(stops: frozenset[int]) -> str:
-    return "stop-step:" + ",".join(str(step) for step in sorted(stops)) if stops else "base"
+def spec_for(stops: frozenset[int], base_edit: str = "") -> str:
+    """Compose the accepted edit with the cancellations selected so far.
+
+    The base is any edit specification, so a search can resume on top of a set
+    that already carries reductions rather than restarting from the plan.
+    """
+
+    cancellations = "stop-step:" + ",".join(str(step) for step in sorted(stops)) if stops else ""
+    joined = "+".join(part for part in (base_edit, cancellations) if part)
+    return joined or "base"
 
 
 def score(
@@ -41,11 +49,12 @@ def score(
     stops: frozenset[int],
     seeds: np.ndarray,
     opponent: str,
+    base_edit: str = "",
 ) -> dict[str, Any]:
     money = play(
         module,
         seeds,
-        edit=make_edit(spec_for(stops), plan),
+        edit=make_edit(spec_for(stops, base_edit), plan),
         base="scripted-v27",
         opponent=opponent,
         steps=plan.steps,
@@ -81,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         help="training leaders re-measured on the holdout each round",
     )
     parser.add_argument("--initial-stops", default="", help="comma-separated steps to start from")
+    parser.add_argument(
+        "--base-edit",
+        default="",
+        help="accepted edit to build on, e.g. an already selected buy reduction",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -109,7 +123,7 @@ def main() -> int:
         raise SystemExit("holdout seeds must not overlap the training seeds")
 
     stops = frozenset(int(part) for part in args.initial_stops.split(",") if part)
-    accepted = score(module, plan, stops, holdout, args.opponent)
+    accepted = score(module, plan, stops, holdout, args.opponent, args.base_edit)
     history = [{"round": 0, "stops": sorted(stops), "holdout": accepted}]
     print(json.dumps(history[0]), flush=True)
 
@@ -119,7 +133,7 @@ def main() -> int:
         for step in range(plan.steps):
             if step in stops:
                 continue
-            summary = score(module, plan, stops | {step}, scan_seeds, args.opponent)
+            summary = score(module, plan, stops | {step}, scan_seeds, args.opponent, args.base_edit)
             scanned.append((rank(summary), step))
         scanned.sort(reverse=True)
 
@@ -128,13 +142,15 @@ def main() -> int:
         # cannot tell 0.92 from 0.95 and a 256-game scan of 719 steps is waste.
         reranked = []
         for _, step in scanned[: args.finalists]:
-            summary = score(module, plan, stops | {step}, rerank_seeds, args.opponent)
+            summary = score(
+                module, plan, stops | {step}, rerank_seeds, args.opponent, args.base_edit
+            )
             reranked.append((rank(summary), step, summary))
         reranked.sort(key=lambda item: item[0], reverse=True)
 
         chosen: dict[str, Any] | None = None
         for _, step, train_summary in reranked:
-            trial = score(module, plan, stops | {step}, holdout, args.opponent)
+            trial = score(module, plan, stops | {step}, holdout, args.opponent, args.base_edit)
             # The holdout decides, so a step that only wins on the scan seeds is
             # rejected rather than banked as progress.
             if rank(trial) > rank(accepted):
@@ -173,7 +189,7 @@ def main() -> int:
                 "holdout_seed_start": args.holdout_seed_start,
                 "holdout_games": args.holdout_games,
                 "stops": sorted(stops),
-                "edit": spec_for(stops),
+                "edit": spec_for(stops, args.base_edit),
                 "holdout": accepted,
                 "history": history,
             },

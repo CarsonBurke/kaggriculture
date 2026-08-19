@@ -212,11 +212,23 @@ def main() -> None:
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config
         )
-        # Both optimizers are restored so every candidate starts from the Adam
-        # moments the checkpoint reached, rather than from a cold second moment
-        # that would make each candidate's first steps incomparable.
-        actor_optimizer.load_state_dict(state["actor_optimizer"])
-        critic_optimizer.load_state_dict(state["critic_optimizer"])
+        # Both optimizers are restored so every candidate starts from the moments
+        # the checkpoint reached, rather than from a cold second moment that
+        # would make each candidate's first steps incomparable. A candidate that
+        # changes the OPTIMIZER cannot inherit them -- NorMuon keeps a momentum
+        # buffer and a low-rank second moment where AdamW keeps two full ones --
+        # so it starts cold, and the report says which candidates did.
+        # Read the saved state's own shape rather than the checkpoint's config:
+        # checkpoints written before `PpoConfig.optimizer` existed carry no such
+        # field, and defaulting it would claim AdamW moments are loadable into a
+        # NorMuon. Only NorMuon's groups carry a `kind`.
+        saved_is_normuon = any(
+            "kind" in group for group in state["actor_optimizer"]["param_groups"]
+        )
+        restored = saved_is_normuon == (config.optimizer == "normuon")
+        if restored:
+            actor_optimizer.load_state_dict(state["actor_optimizer"])
+            critic_optimizer.load_state_dict(state["critic_optimizer"])
         # `load_state_dict` restores `param_groups`, and `_optimizer_step` reads
         # the rate from `group["base_lr"]` in preference to its argument, so a
         # restore puts the checkpoint's rate back and a swept rate would never
@@ -224,9 +236,12 @@ def main() -> None:
         # its own variable; an earlier probe omitted it and reported five
         # identical configurations as though they were five learning rates.
         for group in actor_optimizer.param_groups:
-            group["base_lr"] = config.actor_learning_rate
+            rate = config.actor_learning_rate
+            if group.get("kind") == "adam":
+                rate *= config.adam_learning_rate_ratio
+            group["base_lr"] = rate
             group["warmup_step"] = 0
-            group["lr"] = config.actor_learning_rate
+            group["lr"] = rate
         history: list[dict[str, Any]] = []
         for iteration in range(args.iterations):
             candidate_actor.eval()
@@ -268,7 +283,14 @@ def main() -> None:
             row["lanes"] = _lane_statistics(league_part, assignments, lanes)
             history.append(row)
             print(json.dumps(row, sort_keys=True), flush=True)
-        sweep.append({"config": label, "overrides": overrides, "history": history})
+        sweep.append(
+            {
+                "config": label,
+                "overrides": overrides,
+                "inherited_optimizer_moments": restored,
+                "history": history,
+            }
+        )
 
     report["sweep"] = sweep
     args.output.parent.mkdir(parents=True, exist_ok=True)
