@@ -15,6 +15,7 @@ from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
+    RolloutBatch,
     _builtin_agent_rows,
     _cached_compiled_forward,
     _categorical_draws,
@@ -24,10 +25,12 @@ from kaggriculture.rollout import (
     collect_frozen_opponent_play_rust,
     collect_frozen_opponents_play_rust,
     collect_mixed_play_rust,
+    collect_population_play_rust,
     collect_self_play,
     collect_self_play_rust,
     concatenate_rollouts,
     merge_contiguous_rollouts,
+    population_pairings,
     slice_trajectories,
 )
 from kaggriculture.rust_env import load_native
@@ -630,6 +633,8 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
     # follow with the current seat chosen by seed parity.
     assert rollout.episode_seeds.tolist() == [130, 130, 131, 132]
     assert rollout.seats.tolist() == [0, 1, 131 % 2, 132 % 2]
+    # A single-learner wave labels every row with the one member it collected.
+    assert rollout.agents.tolist() == [0, 0, 0, 0]
     np.testing.assert_array_equal(rollout.final_money[0], rollout.opponent_money[1])
     np.testing.assert_array_equal(rollout.opponent_money[0], rollout.final_money[1])
 
@@ -1002,3 +1007,180 @@ def test_native_builtin_lane_needs_no_frozen_network() -> None:
 
     assert rollout.trajectories == 2
     assert rollout.opponent_money.tolist() == [3000.0, 3000.0]
+
+
+#: Three members rather than production's four: the only full-horizon fixture
+#: here pays 719 native steps, and three already scatters each member's rows
+#: across the wave on both seats, which two members cannot do.
+_POPULATION = 3
+_POPULATION_GAMES = 6
+_POPULATION_SEED_START = 310
+
+
+@pytest.fixture(scope="module")
+def population_wave() -> tuple[list[FarmActor], dict[str, np.ndarray], RolloutBatch]:
+    """One collected population wave, shared by the properties that read it."""
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    # Seeded for reproducible members inside a forked CPU stream: several tests
+    # in this file are sensitive to the global stream position, and a module
+    # fixture runs at whichever one its first user happens to leave. The
+    # collection call is inside the fork too, because the first stacked
+    # ensemble in a process builds its template model from the default
+    # generator. `devices=[]` keeps this off the accelerator's generators,
+    # which no test here draws from.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(20260818)
+        actors = [FarmActor(config) for _ in range(_POPULATION)]
+        arena = allocate_rollout_storage(CONV_ENTITY, 2 * _POPULATION_GAMES, 719)
+        rollout = collect_population_play_rust(
+            actors,
+            games=_POPULATION_GAMES,
+            seed_start=_POPULATION_SEED_START,
+            sampling_seed=4,
+            storage=arena,
+        )
+    return actors, arena, rollout
+
+
+def test_population_pairings_balance_every_ordered_pair_over_both_seats() -> None:
+    pairings = population_pairings(4, 156)
+
+    pairs, counts = np.unique(pairings, axis=0, return_counts=True)
+    assert pairs.shape == (12, 2)
+    assert (pairs[:, 0] != pairs[:, 1]).all()
+    assert counts.tolist() == [13] * 12
+    # Exactly, not in expectation: 13 games per ordered pair seats every member
+    # 39 times on each side, so seat bias cancels rather than averages out.
+    assert np.bincount(pairings[:, 0], minlength=4).tolist() == [39] * 4
+    assert np.bincount(pairings[:, 1], minlength=4).tolist() == [39] * 4
+
+
+@pytest.mark.parametrize("games", (150, 12 * 13 + 1, 0, -12))
+def test_population_pairings_refuse_a_wave_size_that_cannot_balance(games: int) -> None:
+    with pytest.raises(ValueError, match="positive multiple of 12"):
+        population_pairings(4, games)
+
+
+def test_population_pairings_refuse_a_population_with_nobody_to_play() -> None:
+    with pytest.raises(ValueError, match="at least two agents"):
+        population_pairings(1, 12)
+
+
+def test_population_wave_refuses_a_schedule_that_starves_a_member(monkeypatch) -> None:
+    """An unbalanced schedule has to fail loudly, because the fold cannot see it.
+
+    The lanes are folded with a `view` over the rows sorted by agent, which
+    succeeds for any row count divisible by the population and silently mixes
+    two members into one lane when their row counts differ. That would store
+    behavior log-probabilities from the wrong policy, which is indistinguishable
+    from ordinary data downstream -- so the wave refuses the schedule instead.
+    """
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    # Four rows for member 0, five for member 1 and three for member 2: still
+    # twelve rows over three members, so only the counts give it away.
+    starved = np.asarray([[0, 1], [0, 1], [0, 1], [0, 2], [1, 2], [2, 1]], dtype=np.int64)
+    monkeypatch.setattr("kaggriculture.rollout.population_pairings", lambda *_: starved)
+
+    with pytest.raises(ValueError, match="same row count for every member"):
+        collect_population_play_rust([FarmActor(config) for _ in range(3)], games=6, seed_start=170)
+
+
+def test_population_wave_stores_both_seats_in_pairing_order(population_wave) -> None:
+    actors, arena, rollout = population_wave
+    pairings = population_pairings(len(actors), _POPULATION_GAMES)
+
+    # Both seats are learners, so a game yields two trajectories, game-major
+    # and seat-minor against the schedule.
+    assert (rollout.trajectories, rollout.horizon) == (2 * _POPULATION_GAMES, 719)
+    assert rollout.state_count == 2 * _POPULATION_GAMES * 719
+    for game in range(_POPULATION_GAMES):
+        assert rollout.agents[2 * game] == pairings[game, 0]
+        assert rollout.agents[2 * game + 1] == pairings[game, 1]
+    assert rollout.agents.dtype == np.int64
+    assert rollout.seats.tolist() == [0, 1] * _POPULATION_GAMES
+    assert rollout.episode_seeds.tolist() == [
+        seed
+        for seed in range(_POPULATION_SEED_START, _POPULATION_SEED_START + _POPULATION_GAMES)
+        for _ in (0, 1)
+    ]
+    assert (
+        rollout.states["board"].__array_interface__["data"][0]
+        == arena["board"].__array_interface__["data"][0]
+    )
+
+
+def test_population_wave_rows_replay_through_the_member_that_sampled_them(
+    population_wave,
+) -> None:
+    """Every row's stored likelihoods must come from its own member's weights.
+
+    This is the whole ensemble contract: one vmapped forward whose lane index
+    is the agent index has to land each lane's logits back on that lane's rows,
+    and the native sampler has to read that row's quantity head. A gather or
+    scatter off by one lane leaves rows replaying under someone else's weights,
+    which the negative control at the end shows this assertion can see.
+    """
+    actors, _arena, rollout = population_wave
+
+    for row, agent in enumerate(rollout.agents.tolist()):
+        _assert_stored_rows_replay_from_current_actor(
+            actors[agent], slice_trajectories(rollout, row, row + 1)
+        )
+
+    other = (int(rollout.agents[0]) + 1) % len(actors)
+    with pytest.raises(AssertionError):
+        _assert_stored_rows_replay_from_current_actor(
+            actors[other], slice_trajectories(rollout, 0, 1)
+        )
+
+
+def test_population_wave_rewards_are_antisymmetric_within_every_game(population_wave) -> None:
+    """Both rows of a game must be able to move the objective, oppositely.
+
+    The shaped reward is built on a pair potential, so the two seats of a game
+    are exact negatives step by step and telescope to the terminal margin. This
+    is the property mirror self-play destroyed: identical weights make both
+    sides identically zero, and a wave of zeros carries no gradient at all.
+    """
+    _actors, _arena, rollout = population_wave
+
+    for game in range(_POPULATION_GAMES):
+        np.testing.assert_allclose(
+            rollout.rewards[2 * game], -rollout.rewards[2 * game + 1], atol=1e-7
+        )
+    assert (np.abs(rollout.rewards).sum(axis=1) > 0.0).all()
+    np.testing.assert_array_equal(rollout.final_money[::2], rollout.opponent_money[1::2])
+    np.testing.assert_array_equal(rollout.final_money[1::2], rollout.opponent_money[::2])
+    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
+    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+
+
+def test_slice_and_concatenation_carry_the_agent_assignment(population_wave) -> None:
+    _actors, _arena, rollout = population_wave
+
+    part = slice_trajectories(rollout, 2, 6)
+
+    assert np.shares_memory(part.agents, rollout.agents)
+    np.testing.assert_array_equal(part.agents, rollout.agents[2:6])
+    combined = concatenate_rollouts(
+        [slice_trajectories(rollout, 0, 4), slice_trajectories(rollout, 4, rollout.trajectories)]
+    )
+    np.testing.assert_array_equal(combined.agents, rollout.agents)
+
+
+def test_single_learner_waves_label_every_row_as_agent_zero() -> None:
+    """One learner is a population of one, so `agents` is never absent."""
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    rollout = collect_self_play(
+        FarmActor(config), games=2, seed_start=150, episode_steps=3, sampling_seed=7
+    )
+
+    assert rollout.agents.tolist() == [0, 0, 0, 0]
+    assert rollout.agents.dtype == np.int64

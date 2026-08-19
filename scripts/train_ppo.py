@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -39,6 +40,7 @@ from kaggriculture.league import (
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
+from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
     MAX_FIRST_MINIBATCH_KL,
@@ -49,6 +51,7 @@ from kaggriculture.ppo import (
     MINIMUM_POLICY_ENTROPY,
     UPDATE_COMPILE_MODES,
     PpoConfig,
+    actor_forward_args,
     make_optimizers,
     update_ppo,
     update_replay_parity,
@@ -67,12 +70,20 @@ from kaggriculture.rollout import (
     RolloutBatch,
     allocate_rollout_storage,
     collect_mixed_play_rust,
+    collect_population_play_rust,
     slice_trajectories,
 )
 from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.telemetry import TensorboardMirror
+from kaggriculture.telemetry import (
+    TensorboardMirror,
+    population_agent_field,
+    population_disagreement_field,
+    population_disagreement_pair_field,
+    population_head_to_head_field,
+)
 from kaggriculture.training import (
+    TrainingAgent,
     append_iteration_jsonl,
     checkpoint_payload,
     cpu_state_copy,
@@ -91,6 +102,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--games", type=int, default=112)
+    parser.add_argument(
+        "--population",
+        type=int,
+        default=1,
+        help=(
+            "concurrently learning agents; every game pairs two distinct members "
+            "so no trajectory's reward is zero by construction. 1 is the single "
+            "learner with mirror self-play and the frozen league, and N > 1 "
+            "replaces both: --games must then be a multiple of N * (N - 1) so "
+            "every ordered pairing appears equally often and seat bias cancels"
+        ),
+    )
     parser.add_argument("--league-games", type=int, default=96)
     parser.add_argument("--league-active-opponents", type=int, default=2)
     parser.add_argument("--league-historical-opponents", type=int, default=2)
@@ -253,7 +276,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--init-actor-from",
         type=Path,
-        help="actor artifact (e.g. a BC clone) whose weights initialize a fresh run's actor",
+        action="append",
+        help="actor artifact (e.g. a BC clone) whose weights initialize a fresh run's "
+        "actor; repeat it once per --population member, since four agents from one "
+        "checkpoint are numerically identical and their games are mirrors scoring 0",
     )
     parser.add_argument(
         "--critic-warmup-iterations",
@@ -266,11 +292,87 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _recorded_argument(value: object) -> object:
+    """One parsed CLI argument as `config.json` records it.
+
+    `--init-actor-from` is repeatable, so its value is a list of paths where every
+    other Path-valued flag is scalar, and both have to reach JSON as strings.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return [_recorded_argument(entry) for entry in value]
+    return value
+
+
+def _initial_actor_paths(args: argparse.Namespace) -> list[Path]:
+    """The pretrained artifacts a fresh run's members start from, in agent order."""
+    return list(args.init_actor_from or ())
+
+
+def _validate_population(args: argparse.Namespace) -> None:
+    """Refuse a population whose members cannot produce a usable gradient.
+
+    Two ways that happens, both silent. A wave whose game count is not a multiple
+    of N(N-1) cannot give every ordered pairing the same number of games, so seat
+    bias survives into the advantage instead of cancelling. And members starting
+    from one artifact are numerically identical, which makes their first games
+    mirrors: `_relative_score` is zero whenever both banks are equal, so the wave
+    carries no gradient at all -- exactly the defect this scheme replaces.
+    """
+    initial = _initial_actor_paths(args)
+    resolved = [path.expanduser().resolve() for path in initial]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            "--init-actor-from must name a different artifact per agent; members "
+            "sharing weights are identical and identical members score 0.5 by symmetry"
+        )
+    if args.population == 1:
+        if len(initial) > 1:
+            raise ValueError(
+                "a single learner has one actor to initialize; --population admits more"
+            )
+        return
+    pairings = args.population * (args.population - 1)
+    if args.games % pairings:
+        raise ValueError(
+            f"a population of {args.population} has {pairings} ordered pairings, so "
+            f"--games must be a multiple of {pairings}; {args.games} is not"
+        )
+    if initial and len(initial) != args.population:
+        raise ValueError(
+            f"--population {args.population} takes one --init-actor-from per agent or "
+            f"none at all; {len(initial)} were given"
+        )
+    # Every seat in a population wave is a learner, so nothing in it reads the
+    # frozen archive or plays an engine reference agent. Leaving either configured
+    # would accept a launch command claiming opponents the run never meets.
+    if args.league_games or args.league_builtin_lanes or _league_builtin_opponents(args):
+        raise ValueError(
+            "a population wave has no frozen or built-in lanes; pass --league-games 0 "
+            "and no built-in opponents"
+        )
+    # The probe evaluates every member from one immutable file. `latest.pt` is
+    # rewritten every iteration, so a worker reading it would race the trainer
+    # and could measure a half-written payload; the durable checkpoints are the
+    # only immutable population artifacts, which ties the probe's cadence to
+    # theirs. Left unchecked, an eval tick between two checkpoints would find no
+    # file and the run would carry no absolute measurement at all -- the one
+    # thing a purely relative objective cannot supply for itself.
+    if args.external_eval_every and args.external_eval_every % args.checkpoint_every:
+        raise ValueError(
+            "a population's external evaluation reads durable checkpoints, so "
+            f"--external-eval-every ({args.external_eval_every}) must be a multiple of "
+            f"--checkpoint-every ({args.checkpoint_every})"
+        )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     # Model-configuration flags are validated by the config dataclass itself,
     # so every entry point that builds one gets the same rules.
     positive = {
         "iterations": args.iterations,
+        "population": args.population,
         "games": args.games,
         "league_active_pool_size": args.league_active_pool_size,
         "episode_steps": args.episode_steps,
@@ -324,6 +426,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             "league games must cover the initial anchor and every configured "
             f"active/historical/built-in lane ({configured_opponents})"
         )
+    _validate_population(args)
     if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 0:
         raise ValueError("critic warmup iterations cannot be negative")
     if args.init_actor_from is not None and args.resume is not None:
@@ -341,7 +444,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--critic-warmup-iterations belongs to the run being resumed and is "
             "restored from its checkpoint"
         )
-    if args.critic_warmup_iterations is not None and args.init_actor_from is None:
+    if args.critic_warmup_iterations is not None and not _initial_actor_paths(args):
         raise ValueError("critic warmup applies only to a warm-started run")
     # A warmup at least as long as the run freezes the actor for its whole
     # life, and the stalled-actor guard that would otherwise catch zero actor
@@ -564,14 +667,14 @@ PARITY_STATISTICS: tuple[tuple[str, float, str], ...] = (
         "sampling-vs-update materially divergent component share exceeded",
     ),
 )
-PARITY_STAGING_KEYS = ("self-play", "league")
+PARITY_STAGING_KEYS = ("self-play", "league", "population")
 
 
 def _parity_metric_key(component: str, statistic: str) -> str:
     return f"update_replay_{component}_{statistic}"
 
 
-def _parity_staging_key(league_games: int) -> str:
+def _parity_staging_key(league_games: int, population: int = 1) -> str:
     """Name the staging configuration a wave exercises.
 
     League play and pure self-play stage the rollout arena differently -- the
@@ -580,7 +683,14 @@ def _parity_staging_key(league_games: int) -> str:
     whichever one the interval landed on while never examining the other,
     including the iteration where the league rows past the prefix are written
     for the first time.
+
+    A population wave is a third configuration rather than the self-play one at
+    a different width: its behaviour policy is one vmapped ensemble forward over
+    N lanes where self-play is a plain module forward, which is precisely the
+    staging difference the audit exists to measure.
     """
+    if population > 1:
+        return PARITY_STAGING_KEYS[2]
     return PARITY_STAGING_KEYS[1] if league_games else PARITY_STAGING_KEYS[0]
 
 
@@ -813,6 +923,38 @@ def _validate_parity_baseline(
     return validated
 
 
+def _parity_baseline_record(
+    baselines: Sequence[Mapping[str, float]], population: int
+) -> dict[str, float] | list[dict[str, float]]:
+    """The persisted form of the per-member baselines.
+
+    A single learner's record stays the flat dict every checkpoint has carried.
+    A population's is one entry per member, because each member's audit is judged
+    against its own previous audit: the members are separate policies sharpening
+    at their own rates, so pooling them would judge every member against whichever
+    one had sharpened furthest.
+    """
+    if population == 1:
+        return dict(baselines[0])
+    return [dict(baseline) for baseline in baselines]
+
+
+def _validate_parity_baselines(
+    record: object,
+    ceilings: Mapping[str, float],
+    *,
+    population: int,
+) -> list[dict[str, float]]:
+    """Validate one persisted baseline per population member."""
+    if population == 1:
+        return [_validate_parity_baseline(record, ceilings)]
+    if not isinstance(record, list) or len(record) != population:
+        raise ValueError(
+            "resume checkpoint replay-parity baseline does not cover every population member"
+        )
+    return [_validate_parity_baseline(entry, ceilings) for entry in record]
+
+
 def _validate_league_score_rates(rates: object) -> dict[str, float]:
     if not isinstance(rates, dict):
         raise ValueError("resume checkpoint has no valid league score-rate state")
@@ -894,17 +1036,39 @@ def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
     args.external_eval_opponents = ",".join(resolved)
 
 
+def _external_eval_source(
+    args: argparse.Namespace, committed_iteration: int, league_directory: Path
+) -> tuple[Path, str]:
+    """The immutable file the probe reads, and which members it names inside it.
+
+    A single-learner run has a league snapshot per iteration. A population run
+    writes no snapshot archive at all -- its members live in the durable
+    checkpoint, which is why the cadence is tied to `--checkpoint-every` and why
+    every member is named explicitly: the loader refuses to guess one.
+    """
+    if args.population < 2:
+        return league_directory / f"league-actor-{committed_iteration:08d}.pt", ""
+    checkpoint = args.run_dir / f"checkpoint-{committed_iteration:06d}.pt"
+    return checkpoint, ",".join(str(member) for member in range(args.population))
+
+
 def _maybe_launch_external_eval(
     args: argparse.Namespace,
     committed_iteration: int,
     league_directory: Path,
     process: subprocess.Popen | None,
 ) -> subprocess.Popen | None:
-    """Launch at most one CPU worker evaluating the latest durable snapshot.
+    """Launch at most one CPU worker evaluating the latest durable artifact.
 
     The worker is diagnostics only: it appends to metrics-external.jsonl and
     its absence never blocks training. A still-running worker simply skips
     the tick, so cadence degrades gracefully when episodes run long.
+
+    One worker covers every population member sequentially rather than N
+    workers in parallel: this probe runs on the CPU beside a GPU trainer, and N
+    concurrent copies would contend with each other and with the host work the
+    rollout depends on. A population is therefore N times slower to probe, which
+    the skip-if-running rule already absorbs.
     """
     if (
         not args.external_eval_every
@@ -920,7 +1084,7 @@ def _maybe_launch_external_eval(
             file=sys.stderr,
             flush=True,
         )
-    snapshot = league_directory / f"league-actor-{committed_iteration:08d}.pt"
+    artifact, members = _external_eval_source(args, committed_iteration, league_directory)
     log_path = args.run_dir / "external-eval.log"
     try:
         with log_path.open("ab") as log:
@@ -928,8 +1092,10 @@ def _maybe_launch_external_eval(
                 [
                     sys.executable,
                     str(Path(__file__).resolve().parent / "external_eval_worker.py"),
-                    "--snapshot",
-                    str(snapshot),
+                    "--artifact",
+                    str(artifact),
+                    "--agents",
+                    members,
                     "--iteration",
                     str(committed_iteration),
                     "--output",
@@ -1123,18 +1289,135 @@ def _restore_league_archive(
             raise ValueError(f"league snapshot digest mismatch: {target}")
 
 
-def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: bool) -> None:
+def _agent_fields(
+    measured: Mapping[str, float | int], agent: int, population: int
+) -> dict[str, float | int]:
+    """Journal field names for one member's readings.
+
+    A single learner writes the bare names every existing journal, mirror layout
+    and downstream reader already uses; a population prefixes each member so one
+    member's curve can be read without the other three drawn over it.
+    """
+    if population == 1:
+        return dict(measured)
+    return {population_agent_field(agent, name): value for name, value in measured.items()}
+
+
+def _audit_replay_parity(
+    actor: torch.nn.Module,
+    rollout: RolloutBatch,
+    *,
+    rows: np.ndarray | None,
+    ppo_config: PpoConfig,
+    device: torch.device,
+    baseline: Mapping[str, float],
+    ceilings: Mapping[str, float],
+    iteration: int,
+    agent: int | None,
+) -> tuple[dict[str, float | int], dict[str, float]]:
+    """Audit one policy's sampling-vs-update parity; return metrics and baseline.
+
+    The update pins its importance ratio to one by replaying behavior likelihoods
+    through its own forward, so a staging bug applied identically to both
+    update-path sides would never move the KL guard. Comparing that replay against
+    the rollout's stored sampling likelihoods catches exactly that class of bug.
+    The bound is a KL against the trust region the update already accepts, not a
+    worst component: see MAX_UPDATE_REPLAY_KL for why the extreme value is
+    reported but not gated.
+
+    A breach aborts only when it reads as a defect rather than as drift, and
+    REPLAY_PARITY_STEP_CHANGE_FACTOR is where that distinction is argued. The
+    asymmetry matters because aborting is unrecoverable: the audit precedes the
+    update, so no checkpoint covers the iteration, and a resume re-audits the same
+    actor through the same code and dies again. That is the correct outcome for a
+    defect, which a human has to go fix, and the wrong one for numerics drifting
+    past a calibrated bound in an otherwise healthy multi-day run -- which warns
+    instead, and leaves the trend in telemetry where it is the useful artifact.
+
+    `rows` restricts the audit to one member's trajectories, which is required
+    rather than an optimization: in a population wave every row was sampled by its
+    own member, so replaying the whole wave through one of them would measure a
+    difference between policies and report it as a staging defect.
+    """
+    where = "" if agent is None else f"agent {agent} "
+    metrics: dict[str, float | int] = update_replay_parity(
+        actor,
+        rollout,
+        minibatch_size=ppo_config.minibatch_size,
+        compile_mode=ppo_config.update_compile_mode,
+        autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
+        rows=rows,
+    )
+    # A head with no active components reports zero divergence, which would pass
+    # the bound without having audited anything. The calibration benchmark already
+    # refuses that; training must too, or an audit can pass while having examined
+    # nothing. This one is always fatal: it means the audit examined nothing, at
+    # any point in the run, which is never expected drift.
+    for component in PARITY_COMPONENTS:
+        if metrics[f"update_replay_{component}_active_count"] < 1:
+            raise RuntimeError(f"{where}update replay parity saw no active {component} components")
+    breaches = _parity_breaches(metrics, dict(baseline) or None, ceilings)
+    metrics["replay_parity_breached"] = len(breaches)
+    metrics.update(_parity_fatal_thresholds(dict(baseline) or None, ceilings))
+    for message, is_defect in breaches:
+        if is_defect:
+            continue
+        # The journalled metrics carry iteration + 1, since the counter advances
+        # before the record is written, so the warning names the row it will
+        # appear in rather than the loop variable.
+        print(
+            f"warning: iteration {iteration + 1} {where}{message} — this is "
+            f"within {REPLAY_PARITY_STEP_CHANGE_FACTOR}x of the previous "
+            "audit and under the absolute ceiling, so it reads as drift "
+            "rather than a defect and the run continues",
+            file=sys.stderr,
+            flush=True,
+        )
+    defects = [message for message, is_defect in breaches if is_defect]
+    if defects:
+        raise RuntimeError(
+            where
+            + "; ".join(defects)
+            + " — a step change away from the previous audit, or past the "
+            "absolute ceiling, rather than drift; resuming reproduces it. "
+            "A step change is a staging defect worth diagnosing directly; "
+            "a ceiling breach means the update forward's numerics no "
+            "longer support this bound, and the run continues as a fresh "
+            "one warm-started from the last actor under the repaired tree, "
+            "since repairing it changes the source identity these "
+            "checkpoints are bound to"
+        )
+    # The baseline advances after every audit, warned breaches included, so drift
+    # is always compared against recent drift and can never accumulate into a
+    # false step change. The ceiling is what stops that from ratcheting without
+    # limit. It advances even when this audit aborted for a different member: the
+    # process is ending either way, and nothing reads it after that.
+    return metrics, _parity_measurements(metrics)
+
+
+def _gate_update_metrics(
+    update_metrics: Mapping[str, float],
+    *,
+    warmup_active: bool,
+    agent: int | None = None,
+) -> None:
     """Stop the run on an update whose numbers say the next one is wasted.
 
     Ordered by cause, not by severity. An inflated first-minibatch KL at
     unchanged weights trips the trust region on minibatch zero, so checking the
     update count first would report the symptom; and a saturated value target
     explains a missing actor update rather than the other way round.
+
+    `agent` names the population member the numbers belong to, and is why these
+    gates are applied per member: one collapsed member has to stop the run as
+    itself rather than be averaged into three healthy ones. `None` is the single
+    learner, whose messages are unprefixed.
     """
+    where = "" if agent is None else f"agent {agent} "
     first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
     if first_minibatch_kl > MAX_FIRST_MINIBATCH_KL:
         raise RuntimeError(
-            "first-minibatch KL at unchanged weights exceeded "
+            f"{where}first-minibatch KL at unchanged weights exceeded "
             f"{MAX_FIRST_MINIBATCH_KL}: {first_minibatch_kl}"
         )
     # A target the support cannot hold is regressed onto a constant edge label,
@@ -1142,11 +1425,11 @@ def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: 
     saturated_fraction = float(update_metrics["value_target_saturated_fraction"])
     if saturated_fraction > MAX_VALUE_TARGET_SATURATED_FRACTION:
         raise RuntimeError(
-            "value targets saturated the critic support beyond "
+            f"{where}value targets saturated the critic support beyond "
             f"{MAX_VALUE_TARGET_SATURATED_FRACTION}: {saturated_fraction}"
         )
     if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
-        raise RuntimeError("PPO iteration completed without an actor update")
+        raise RuntimeError(f"{where}PPO iteration completed without an actor update")
     # A trust region set against the wrong policy sharpness stops the epoch after
     # its first minibatch rather than before it, so the count above is 1 and
     # passes while the iteration trains on under 1% of the wave. Nothing else
@@ -1155,7 +1438,7 @@ def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: 
     applied = int(update_metrics["actor_updates"])
     if not warmup_active and intended > 0 and applied < MINIMUM_ACTOR_EPOCH_FRACTION * intended:
         raise RuntimeError(
-            f"actor applied {applied} of {intended} minibatches, below "
+            f"{where}actor applied {applied} of {intended} minibatches, below "
             f"{MINIMUM_ACTOR_EPOCH_FRACTION:.0%} of the epoch; the trust region "
             f"{'stopped it early' if update_metrics.get('kl_early_stop') else 'is not the cause'} "
             f"at max_approx_kl {float(update_metrics['max_approx_kl']):.4g}"
@@ -1168,10 +1451,195 @@ def _gate_update_metrics(update_metrics: Mapping[str, float], *, warmup_active: 
     entropy = float(update_metrics["entropy"])
     if not warmup_active and entropy < MINIMUM_POLICY_ENTROPY:
         raise RuntimeError(
-            f"policy entropy {entropy:.4g} nats per active component is below "
+            f"{where}policy entropy {entropy:.4g} nats per active component is below "
             f"{MINIMUM_POLICY_ENTROPY}; the policy is deterministic and has no "
             "sampled alternative left to learn from"
         )
+
+
+# Fraction of this population's own iteration-0 pairwise disagreement below which
+# the members have converged into each other and the wave is mirror play under
+# another name. A share rather than an absolute level, because the level is a
+# property of the initializations and nothing inside the loop knows it: two
+# identical policies measure exactly 0.0, four independent ones about 0.894 --
+# the 1 - 1/9 that nine legal unit actions give -- and four BC clones of one
+# corpus land wherever their seeds put them. So the reference is recorded at
+# iteration 0 and this is the share of it a run may lose, which leaves a factor
+# of four of genuine convergence before the gate reads collapse.
+POPULATION_DISAGREEMENT_FLOOR_FRACTION = 0.25
+# States drawn from the iteration's own wave to score every member on. Sampled
+# from the wave rather than held fixed for the run's life: a genuinely fixed
+# batch would have to be checkpointed, and the reading is a mean over this many
+# active unit decisions, whose sampling noise sits orders of magnitude below the
+# factor of four the floor above allows.
+POPULATION_DISAGREEMENT_STATES = 2048
+
+
+def _population_row_partition(agents: np.ndarray, population: int) -> list[np.ndarray]:
+    """Each member's trajectory rows, in agent order, partitioning the whole wave.
+
+    Deliberately not contiguous. A game's two rows belong to two different
+    members, so no storage order makes one member's rows a block; the update
+    therefore takes row indices rather than a copied sub-batch, which would
+    duplicate the wave's state arrays -- the largest allocation in the process.
+    """
+    rows = [np.flatnonzero(agents == agent) for agent in range(population)]
+    covered = sum(index.size for index in rows)
+    if covered != agents.size:
+        raise ValueError(
+            f"population wave rows are not covered by agents 0..{population - 1}: "
+            f"{covered} of {agents.size} rows"
+        )
+    return rows
+
+
+def _population_state_sample(
+    rollout: RolloutBatch,
+    generator: np.random.Generator,
+    device: torch.device,
+) -> tuple[tuple[Any, ...], torch.Tensor, torch.Tensor]:
+    """One shared batch of states, as forward arguments plus unit mask and active.
+
+    Only slots the collector marked valid hold a decision -- an episode that ended
+    early leaves the rest of its lane untouched -- so sampling the raw block would
+    score every member on stale padding and pull the reading toward whatever that
+    padding happens to contain.
+    """
+    valid = np.flatnonzero(np.asarray(rollout.valid).reshape(-1))
+    index = generator.permutation(valid)[:POPULATION_DISAGREEMENT_STATES]
+
+    def sampled(array: np.ndarray) -> np.ndarray:
+        return array.reshape((-1, *array.shape[2:]))[index]
+
+    # `unit_active` is not in any architecture's state dict but the structured
+    # actor's forward reads it, so the update stages it alongside them and this
+    # has to as well; the convolutional family ignores the extra entry.
+    fields = {**rollout.states, "unit_active": rollout.unit_active}
+    states = {name: sampled(value) for name, value in fields.items()}
+    masks = torch.as_tensor(sampled(rollout.unit_masks)).to(device=device, dtype=torch.bool)
+    active = torch.as_tensor(sampled(rollout.unit_active)).to(device=device, dtype=torch.bool)
+    return actor_forward_args(rollout.architecture, states, device), masks, active
+
+
+def _population_disagreement(
+    actors: Sequence[torch.nn.Module],
+    forward_args: tuple[Any, ...],
+    masks: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    """The N x N greedy-disagreement matrix over one shared batch of states.
+
+    Scored in evaluation mode and restored afterwards: the measurement is about
+    which program each member runs, and a train-mode forward would fold whatever
+    stochastic layers the family has into a number the gate treats as structural.
+    """
+    training = [actor.training for actor in actors]
+    try:
+        for actor in actors:
+            actor.eval()
+        with torch.inference_mode():
+            logits = [actor(*forward_args).unit_logits for actor in actors]
+    finally:
+        for actor, mode in zip(actors, training, strict=True):
+            actor.train(mode)
+    return population_disagreement(logits, masks, active)
+
+
+def _validate_population_reference(value: object) -> float:
+    """Validate the checkpointed iteration-0 disagreement the floor is a share of.
+
+    Persisted rather than re-measured, because re-measuring after a resume would
+    recalibrate the floor against however far the members had already converged --
+    which is the state the gate exists to refuse. `--max-hours` makes chunked
+    restarts the designed operating mode, so a process-scoped reference would let
+    a converging population reset its own floor every few hours.
+    """
+    if (
+        not isinstance(value, float | int)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not 0.0 < float(value) <= 1.0
+    ):
+        raise ValueError("resume checkpoint has no valid population disagreement reference")
+    return float(value)
+
+
+def _gate_population_disagreement(measured: float, reference: float) -> None:
+    """Stop a population whose members have converged into a single policy.
+
+    The one failure this catches is invisible everywhere else. Identical members
+    score exactly 0.5 against each other because `_relative_score` is zero at
+    equal banks, so the wave carries no gradient at all -- while entropy, the
+    first-minibatch KL, the epoch fraction and the money curve every one stay
+    inside their bounds and the journal reads like a healthy run.
+    """
+    if not math.isfinite(measured):
+        raise RuntimeError(
+            "population pairwise disagreement is not finite: no active unit decision "
+            "was sampled to compare the members on"
+        )
+    # A floor that is a share of zero admits everything, so a population whose
+    # members already agree everywhere would run with this gate switched off. It
+    # is also the same defect the gate exists for, arriving before iteration 1:
+    # this architecture's unit logits carry a large fixed action prior that
+    # dominates a fresh head, so cold-started members are one program in practice
+    # and the members have to come from N differently trained artifacts.
+    if reference <= 0.0:
+        raise RuntimeError(
+            "this population's members agree on every sampled decision at iteration 0, "
+            "so they are one policy and every game is mirror play scoring 0.5 by "
+            "symmetry; warm-start the members from as many differently trained "
+            "artifacts as there are agents"
+        )
+    floor = POPULATION_DISAGREEMENT_FLOOR_FRACTION * reference
+    if measured < floor:
+        raise RuntimeError(
+            f"population pairwise disagreement {measured:.4g} is below {floor:.4g}, "
+            f"{POPULATION_DISAGREEMENT_FLOOR_FRACTION:.0%} of the {reference:.4g} this "
+            "population started at; the members have converged into each other and "
+            "every game is mirror play scoring 0.5 by symmetry"
+        )
+
+
+def _minimum_off_diagonal(matrix: torch.Tensor) -> float:
+    """Smallest pairwise entry of a symmetric matrix whose diagonal is zero.
+
+    Reported beside the mean because convergence starts as one pair, and a mean
+    over six pairs stays comfortably inside the floor while one of them has
+    already collapsed to zero.
+    """
+    off_diagonal = ~torch.eye(matrix.shape[0], dtype=torch.bool, device=matrix.device)
+    return float(matrix[off_diagonal].min())
+
+
+def _population_outcomes(rollout: RolloutBatch, population: int) -> dict[str, float]:
+    """Per-member score rate and the score rate of every ordered pairing.
+
+    Rows are game-major and seat-minor, so a row's opponent is its sibling row:
+    2g and 2g + 1 are the two seats of one game. A pairing with no games is
+    absent rather than zero, since zero is a score and not a missing measurement.
+    """
+    agents = np.asarray(rollout.agents)
+    if agents.size % 2:
+        raise ValueError("a population wave stores both seats of every game")
+    money = np.asarray(rollout.final_money, dtype=np.float64)
+    margins = money - np.asarray(rollout.opponent_money, dtype=np.float64)
+    outcomes = (margins > 0).astype(np.float64) - (margins < 0).astype(np.float64)
+    scores = (outcomes + 1.0) / 2.0
+    opponents = agents[np.arange(agents.size) ^ 1]
+    fields: dict[str, float] = {}
+    for agent in range(population):
+        own = agents == agent
+        if own.any():
+            fields[population_agent_field(agent, "score_rate")] = float(scores[own].mean())
+            fields[population_agent_field(agent, "money_mean")] = float(money[own].mean())
+        for opponent in range(population):
+            if agent == opponent:
+                continue
+            rows = own & (opponents == opponent)
+            if rows.any():
+                fields[population_head_to_head_field(agent, opponent)] = float(scores[rows].mean())
+    return fields
 
 
 def main() -> None:
@@ -1238,15 +1706,48 @@ def main() -> None:
     # is what the ceiling means: the level at which the uncorrected parity
     # divergence matches the divergence this run's update deliberately allows.
     parity_ceilings = _parity_ceilings()
-    actor = architecture.actor_class(model_config).to(device)
-    critic = architecture.critic_class(model_config).to(device)
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
+    # A single learner is a population of one, so members are built one way. The
+    # four names below alias member zero because everything a single-learner run
+    # does with them is unchanged; a population run addresses `members` instead.
+    # Cold-started members are genuinely different weights already: the global
+    # torch seed was set once above, so each construction advances it.
+    population = args.population
+    members: list[TrainingAgent] = []
+    for _ in range(population):
+        member_actor = architecture.actor_class(model_config).to(device)
+        member_critic = architecture.critic_class(model_config).to(device)
+        members.append(
+            TrainingAgent(
+                member_actor,
+                member_critic,
+                *make_optimizers(member_actor, member_critic, ppo_config),
+            )
+        )
+    # Member 0's networks are aliased for the single-learner code below; its
+    # optimizers are not, because every step site reaches them through the
+    # member itself, and a second name for one of N would read as though it
+    # were the run's optimizer.
+    actor = members[0].actor
+    critic = members[0].critic
     initial_actor_provenance = None
     critic_warmup_iterations = 0
-    if args.init_actor_from is not None:
-        initial_actor_provenance = _load_initial_actor(
-            args.init_actor_from, actor, architecture.name, model_config, device
-        )
+    initial_actors = _initial_actor_paths(args)
+    if initial_actors:
+        records = [
+            _load_initial_actor(path, member.actor, architecture.name, model_config, device)
+            for path, member in zip(initial_actors, members, strict=True)
+        ]
+        # Two copies of one artifact under different names are the same weights,
+        # which the path check in validation cannot see. Identical members make
+        # every one of their games a mirror scoring 0.5 by symmetry, so the run
+        # would train on a wave with no gradient in it.
+        digests = {record["sha256"] for record in records}
+        if len(digests) != len(records):
+            raise ValueError(
+                "initial actor artifacts must hold different weights per agent: "
+                f"{len(records)} paths carry {len(digests)} distinct digests"
+            )
+        initial_actor_provenance = records[0] if population == 1 else {"agents": records}
         critic_warmup_iterations = args.critic_warmup_iterations or 0
         # The count travels inside the warm-start record so it survives a
         # resume; validation already guarantees the two arrive together.
@@ -1258,14 +1759,7 @@ def main() -> None:
     if args.resume:
         # Architecture and model-config identity are validated inside
         # load_checkpoint before it mutates the freshly constructed models.
-        resume_payload = load_checkpoint(
-            args.resume,
-            actor,
-            critic,
-            actor_optimizer,
-            critic_optimizer,
-            device=device,
-        )
+        resume_payload = load_checkpoint(args.resume, members, device=device)
         if resume_payload["ppo_config"] != asdict(ppo_config):
             raise ValueError("resume checkpoint PPO configuration does not match arguments")
         if resume_payload.get("training_data_config") != training_data_config:
@@ -1345,25 +1839,40 @@ def main() -> None:
     # configurations that is large enough to trip the factor is not noise to be
     # tolerated anyway; it is one of them staging differently from the other,
     # which is the defect this whole audit exists to find.
-    parity_baseline: dict[str, float] = {}
+    parity_baselines: list[dict[str, float]] = [{} for _ in members]
+    # The population's iteration-0 pairwise disagreement, once measured. `None`
+    # until then, which is also what says "this iteration records it".
+    population_reference: float | None = None
     if resume_payload is not None:
-        league_snapshot_manifest = _validate_league_manifest(
-            resume_payload.get("league_snapshot_manifest"),
-            current_iteration=iteration,
-        )
         league_score_rates = _validate_league_score_rates(resume_payload.get("league_score_rates"))
-        parity_baseline = _validate_parity_baseline(
-            resume_payload.get("replay_parity_baseline"), parity_ceilings
+        parity_baselines = _validate_parity_baselines(
+            resume_payload.get("replay_parity_baseline"), parity_ceilings, population=population
         )
-        _restore_league_archive(
-            checkpoint=args.resume,
-            destination=league_directory,
-            manifest=league_snapshot_manifest,
-            model_config=model_config,
-        )
-    serialized_arguments = {
-        name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()
-    }
+        if population > 1:
+            population_reference = _validate_population_reference(
+                resume_payload.get("population_disagreement_reference")
+            )
+            # A population wave has no frozen lanes, so it writes no snapshot
+            # archive and there is none to restore. A non-empty manifest here is
+            # a checkpoint from the single-learner scheme being resumed as a
+            # population, which would silently change what the run plays.
+            if resume_payload.get("league_snapshot_manifest"):
+                raise ValueError(
+                    "resume checkpoint carries a league snapshot archive; a population "
+                    "run has no frozen lanes and cannot continue that run"
+                )
+        else:
+            league_snapshot_manifest = _validate_league_manifest(
+                resume_payload.get("league_snapshot_manifest"),
+                current_iteration=iteration,
+            )
+            _restore_league_archive(
+                checkpoint=args.resume,
+                destination=league_directory,
+                manifest=league_snapshot_manifest,
+                model_config=model_config,
+            )
+    serialized_arguments = {name: _recorded_argument(value) for name, value in vars(args).items()}
     serialized_arguments["resume"] = str(args.resume or "")
     configuration = {
         "arguments": serialized_arguments,
@@ -1399,10 +1908,7 @@ def main() -> None:
         else:
             save_checkpoint(
                 destination_latest,
-                actor=actor,
-                critic=critic,
-                actor_optimizer=actor_optimizer,
-                critic_optimizer=critic_optimizer,
+                agents=members,
                 model_config=model_config,
                 ppo_config=ppo_config,
                 iteration=iteration,
@@ -1412,7 +1918,8 @@ def main() -> None:
                 training_data_config=training_data_config,
                 league_snapshot_manifest=league_snapshot_manifest,
                 league_score_rates=league_score_rates,
-                replay_parity_baseline=dict(parity_baseline),
+                replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
+                population_disagreement_reference=population_reference,
                 source_identity=current_source_identity,
                 run_provenance=run_provenance,
                 initial_actor=initial_actor_provenance,
@@ -1433,10 +1940,7 @@ def main() -> None:
             else:
                 save_checkpoint(
                     numbered_checkpoint,
-                    actor=actor,
-                    critic=critic,
-                    actor_optimizer=actor_optimizer,
-                    critic_optimizer=critic_optimizer,
+                    agents=members,
                     model_config=model_config,
                     ppo_config=ppo_config,
                     iteration=iteration,
@@ -1446,7 +1950,8 @@ def main() -> None:
                     training_data_config=training_data_config,
                     league_snapshot_manifest=league_snapshot_manifest,
                     league_score_rates=league_score_rates,
-                    replay_parity_baseline=dict(parity_baseline),
+                    replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
+                    population_disagreement_reference=population_reference,
                     source_identity=current_source_identity,
                     run_provenance=run_provenance,
                     initial_actor=initial_actor_provenance,
@@ -1462,7 +1967,9 @@ def main() -> None:
     # wave (self-play rows first, league rows after) directly from the
     # collector, so the replay stages to the accelerator without any host
     # concatenation. The self-play prefix serves iterations without league
-    # play, which produce fewer trajectories.
+    # play, which produce fewer trajectories. A population wave has no league
+    # rows at all and both of its seats are stored, so it fills exactly the
+    # self-play prefix, which is the whole arena.
     self_play_rows = args.games * 2
     rollout_arena = allocate_rollout_storage(
         architecture.name,
@@ -1475,17 +1982,23 @@ def main() -> None:
     commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
     pending_commit: Future[None] | None = None
 
-    def commit_iteration(payload: dict, actor_state: dict) -> None:
+    def commit_iteration(payload: dict, actor_state: dict | None) -> None:
         """Durably commit one iteration's artifacts in canonical order.
 
         Runs on the single commit worker, so commits execute in submission
         order: league snapshot before the checkpoint that references it, and
         the checkpoint before its journal record, exactly as the recovery
         logic expects.
+
+        `actor_state` is None for a population wave, which has no frozen lanes
+        and therefore no archive to write; the checkpoint carries every member.
         """
         committed = int(payload["iteration"])
-        snapshot = save_actor_state_snapshot(league_directory, model_config, actor_state, committed)
-        league_snapshot_manifest[committed] = snapshot_sha256(snapshot.path)
+        if actor_state is not None:
+            snapshot = save_actor_state_snapshot(
+                league_directory, model_config, actor_state, committed
+            )
+            league_snapshot_manifest[committed] = snapshot_sha256(snapshot.path)
         write_checkpoint(args.run_dir / "latest.pt", payload)
         if committed % args.checkpoint_every == 0:
             write_checkpoint(args.run_dir / f"checkpoint-{committed:06d}.pt", payload)
@@ -1494,23 +2007,21 @@ def main() -> None:
 
     started = time.monotonic()
 
-    # The snapshot for the checkpoint's current actor is installed before the
-    # checkpoint is written, so every manifest is complete and portable with
-    # its immutable ``league/`` sidecar directory.
-    current_snapshot = save_actor_snapshot(league_directory, actor, iteration)
-    current_digest = snapshot_sha256(current_snapshot.path)
-    previous_digest = league_snapshot_manifest.get(iteration)
-    if previous_digest is not None and previous_digest != current_digest:
-        raise ValueError("resume checkpoint actor does not match its current league snapshot")
-    league_snapshot_manifest[iteration] = current_digest
+    if population == 1:
+        # The snapshot for the checkpoint's current actor is installed before the
+        # checkpoint is written, so every manifest is complete and portable with
+        # its immutable ``league/`` sidecar directory.
+        current_snapshot = save_actor_snapshot(league_directory, actor, iteration)
+        current_digest = snapshot_sha256(current_snapshot.path)
+        previous_digest = league_snapshot_manifest.get(iteration)
+        if previous_digest is not None and previous_digest != current_digest:
+            raise ValueError("resume checkpoint actor does not match its current league snapshot")
+        league_snapshot_manifest[iteration] = current_digest
 
     if iteration == 0 and not initial_checkpoint.exists():
         save_checkpoint(
             initial_checkpoint,
-            actor=actor,
-            critic=critic,
-            actor_optimizer=actor_optimizer,
-            critic_optimizer=critic_optimizer,
+            agents=members,
             model_config=model_config,
             ppo_config=ppo_config,
             iteration=0,
@@ -1520,7 +2031,8 @@ def main() -> None:
             training_data_config=training_data_config,
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=league_score_rates,
-            replay_parity_baseline=dict(parity_baseline),
+            replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
+            population_disagreement_reference=population_reference,
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
@@ -1538,183 +2050,190 @@ def main() -> None:
         iteration_started = time.monotonic()
         sampling_seed = int(generator.integers(0, np.iinfo(np.int64).max))
         opponent_checkpoint = ""
-        league_diagnostics = {}
-        selections = _select_league_opponents(
-            args,
-            list_actor_snapshots(league_directory),
-            iteration,
-            generator,
-            league_score_rates,
-            pretrained_start=initial_actor_provenance is not None,
-        )
-        league_games = args.league_games if selections else 0
-        if league_games:
-            # The selection's contract puts every snapshot lane before every
-            # built-in lane, which is exactly the lane index space the wave
-            # addresses: frozen modules first, built-ins after them.
-            snapshots = [row for row in selections if isinstance(row, SnapshotSelection)]
-            builtin_lanes = [
-                row.ref.name for row in selections if isinstance(row, BuiltinSelection)
-            ]
-            opponents = opponent_pool.acquire([row.ref.path for row in snapshots])
-            assignments = _balanced_assignments(
-                league_games,
-                len(selections),
-                generator,
-            )
-            opponent_checkpoint = ",".join(row.label for row in selections)
-        # Self-play and league games advance in one native wave, so the
-        # learner forward covers every current-policy row at once and the
-        # collector writes straight into the shared arena.
-        rollout = collect_mixed_play_rust(
-            actor,
-            opponents if league_games else (),
-            self_play_games=args.games,
-            league_games=league_games,
-            opponent_indices=assignments if league_games else None,
-            builtin_lanes=builtin_lanes if league_games else (),
-            seed_start=next_seed,
-            episode_steps=args.episode_steps,
-            temperature=args.temperature,
-            # Every league seat decodes exactly as the learner does. Sharpening
-            # them instead -- active lanes at 0.8, historical ones at argmax --
-            # handed the learner an opponent that was a strictly better executor
-            # of its own policy, so an identical snapshot beat it: iteration 40
-            # scored 0.302 in league lanes against copies of itself, and a
-            # temperature-1.0 seat loses to a temperature-0.8 one of the same
-            # weights at a 0.4375 win rate. The learner cannot answer that by
-            # playing better, only by playing something whose payoff survives
-            # its own sampling noise, and it found one: farming 143,000 needs
-            # roughly 8,000 correct decisions in a row while denying an opponent
-            # needs far fewer, so the gradient preferred the noise-robust
-            # strategy and the economy went with it.
-            opponent_temperature=args.temperature,
-            sampling_seed=sampling_seed,
-            # One decision, stated once. `forward_mode` drives the learner
-            # forward, and `compile_models` -- which now governs only the
-            # frozen-league ensemble -- follows it, because the pairing the
-            # 1.66x speedup and the 4-wave parity gate were measured under had
-            # both compiled together. A non-eager mode must not leave the
-            # ensemble eager.
-            forward_mode=args.rollout_forward_mode,
-            forward_autocast=args.rollout_bfloat16,
-            storage=rollout_arena if league_games else self_play_storage,
-        )
-        next_seed += args.games + league_games
+        league_diagnostics: dict[str, float | int | str] = {}
+        self_play_diagnostics: dict[str, float | int] = {}
+        population_metrics: dict[str, float] = {}
         # The wave's wall-clock is indivisible; per-part timing keys would
         # merely repeat it, so slice diagnostics keep only outcome metrics.
         indivisible_timings = ("rollout_seconds", "rollout_states_per_second")
-        self_play_diagnostics = {
-            f"self_play_{name}": value
-            for name, value in rollout_diagnostics(
-                slice_trajectories(rollout, 0, self_play_rows)
-            ).items()
-            if name not in indivisible_timings
-        }
-        if league_games:
-            league_part = slice_trajectories(rollout, self_play_rows, rollout.trajectories)
-            league_diagnostics = {
-                f"league_{name}": value
-                for name, value in rollout_diagnostics(league_part).items()
+        if population > 1:
+            # One ensemble forward over N lanes covering every row, lane index =
+            # agent index. Both seats belong to learners and both are stored, so
+            # the wave is 2G trajectories and there is no frozen or built-in lane
+            # for any schedule to reserve.
+            league_games = 0
+            rollout = collect_population_play_rust(
+                [member.actor for member in members],
+                games=args.games,
+                seed_start=next_seed,
+                episode_steps=args.episode_steps,
+                temperature=args.temperature,
+                sampling_seed=sampling_seed,
+                forward_mode=args.rollout_forward_mode,
+                forward_autocast=args.rollout_bfloat16,
+                storage=rollout_arena,
+            )
+            next_seed += args.games
+            agent_rows: list[np.ndarray | None] = list(
+                _population_row_partition(np.asarray(rollout.agents), population)
+            )
+            # Measured before the update, so iteration 0 records what these
+            # initializations were rather than what one update already left.
+            forward_args, unit_masks, unit_active = _population_state_sample(
+                rollout, generator, device
+            )
+            disagreement = _population_disagreement(
+                [member.actor for member in members], forward_args, unit_masks, unit_active
+            )
+            mean_disagreement = mean_off_diagonal(disagreement)
+            if population_reference is None:
+                population_reference = mean_disagreement
+            _gate_population_disagreement(mean_disagreement, population_reference)
+            population_metrics = {
+                population_disagreement_field("mean"): mean_disagreement,
+                population_disagreement_field("min"): _minimum_off_diagonal(disagreement),
+                population_disagreement_field("floor"): population_reference,
+                **{
+                    population_disagreement_pair_field(first, second): float(
+                        disagreement[first, second]
+                    )
+                    for first in range(population)
+                    for second in range(first + 1, population)
+                },
+                **_population_outcomes(rollout, population),
+            }
+        else:
+            agent_rows = [None]
+            selections = _select_league_opponents(
+                args,
+                list_actor_snapshots(league_directory),
+                iteration,
+                generator,
+                league_score_rates,
+                pretrained_start=initial_actor_provenance is not None,
+            )
+            league_games = args.league_games if selections else 0
+            if league_games:
+                # The selection's contract puts every snapshot lane before every
+                # built-in lane, which is exactly the lane index space the wave
+                # addresses: frozen modules first, built-ins after them.
+                snapshots = [row for row in selections if isinstance(row, SnapshotSelection)]
+                builtin_lanes = [
+                    row.ref.name for row in selections if isinstance(row, BuiltinSelection)
+                ]
+                opponents = opponent_pool.acquire([row.ref.path for row in snapshots])
+                assignments = _balanced_assignments(
+                    league_games,
+                    len(selections),
+                    generator,
+                )
+                opponent_checkpoint = ",".join(row.label for row in selections)
+            # Self-play and league games advance in one native wave, so the
+            # learner forward covers every current-policy row at once and the
+            # collector writes straight into the shared arena.
+            rollout = collect_mixed_play_rust(
+                actor,
+                opponents if league_games else (),
+                self_play_games=args.games,
+                league_games=league_games,
+                opponent_indices=assignments if league_games else None,
+                builtin_lanes=builtin_lanes if league_games else (),
+                seed_start=next_seed,
+                episode_steps=args.episode_steps,
+                temperature=args.temperature,
+                # Every league seat decodes exactly as the learner does.
+                # Sharpening them instead -- active lanes at 0.8, historical ones
+                # at argmax -- handed the learner an opponent that was a strictly
+                # better executor of its own policy, so an identical snapshot beat
+                # it: iteration 40 scored 0.302 in league lanes against copies of
+                # itself, and a temperature-1.0 seat loses to a temperature-0.8
+                # one of the same weights at a 0.4375 win rate. The learner cannot
+                # answer that by playing better, only by playing something whose
+                # payoff survives its own sampling noise, and it found one: farming
+                # 143,000 needs roughly 8,000 correct decisions in a row while
+                # denying an opponent needs far fewer, so the gradient preferred
+                # the noise-robust strategy and the economy went with it.
+                opponent_temperature=args.temperature,
+                sampling_seed=sampling_seed,
+                # One decision, stated once. `forward_mode` drives the learner
+                # forward, and `compile_models` -- which now governs only the
+                # frozen-league ensemble -- follows it, because the pairing the
+                # 1.66x speedup and the 4-wave parity gate were measured under had
+                # both compiled together. A non-eager mode must not leave the
+                # ensemble eager.
+                forward_mode=args.rollout_forward_mode,
+                forward_autocast=args.rollout_bfloat16,
+                storage=rollout_arena if league_games else self_play_storage,
+            )
+            next_seed += args.games + league_games
+            self_play_diagnostics = {
+                f"self_play_{name}": value
+                for name, value in rollout_diagnostics(
+                    slice_trajectories(rollout, 0, self_play_rows)
+                ).items()
                 if name not in indivisible_timings
             }
-            opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
-                league_part, assignments, selections
-            )
-            league_diagnostics.update(opponent_diagnostics)
-            _blend_league_score_rates(league_score_rates, measured_rates)
-        # The update pins its importance ratio to one by replaying behavior
-        # likelihoods through its own forward, so a staging bug applied
-        # identically to both update-path sides would never move the KL guard.
-        # Comparing that replay against the rollout's stored sampling
-        # likelihoods catches exactly that class of bug. The bound is a KL
-        # against the trust region the update already accepts, not a worst
-        # component: see MAX_UPDATE_REPLAY_KL for why the extreme value is
-        # reported but not gated.
-        #
-        # A breach aborts only when it reads as a defect rather than as drift,
-        # and REPLAY_PARITY_STEP_CHANGE_FACTOR is where that distinction is
-        # argued. The asymmetry matters because aborting is unrecoverable: the
-        # audit precedes the update, so no checkpoint covers the iteration, and
-        # a resume re-audits the same actor through the same code and dies
-        # again. That is the correct outcome for a defect, which a human has to
-        # go fix, and the wrong one for numerics drifting past a calibrated
-        # bound in an otherwise healthy multi-day run -- which warns instead,
-        # and leaves the trend in telemetry where it is the useful artifact.
+            if league_games:
+                league_part = slice_trajectories(rollout, self_play_rows, rollout.trajectories)
+                league_diagnostics = {
+                    f"league_{name}": value
+                    for name, value in rollout_diagnostics(league_part).items()
+                    if name not in indivisible_timings
+                }
+                opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
+                    league_part, assignments, selections
+                )
+                league_diagnostics.update(opponent_diagnostics)
+                _blend_league_score_rates(league_score_rates, measured_rates)
+        # The audit is per member, on that member's own rows: in a population wave
+        # every row was sampled by its own policy, so a whole-wave replay through
+        # one of them measures a policy difference and calls it a staging defect.
+        # `_audit_replay_parity` carries the rest of the reasoning.
         replay_parity_metrics: dict[str, float | int] = {}
-        audited_staging = _parity_staging_key(league_games)
+        audited_staging = _parity_staging_key(league_games, population)
         if _parity_audit_due(last_parity_audit, iteration, audited_staging):
-            replay_parity_metrics = update_replay_parity(
-                actor,
-                rollout,
-                minibatch_size=ppo_config.minibatch_size,
-                compile_mode=ppo_config.update_compile_mode,
-                autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
-            )
-            # A head with no active components reports zero divergence, which
-            # would pass the bound without having audited anything. The
-            # calibration benchmark already refuses that; training must too,
-            # or an audit can pass while having examined nothing. This one is
-            # always fatal: it means the audit examined nothing, at any point
-            # in the run, which is never expected drift.
-            for component in PARITY_COMPONENTS:
-                if replay_parity_metrics[f"update_replay_{component}_active_count"] < 1:
-                    raise RuntimeError(f"update replay parity saw no active {component} components")
-            breaches = _parity_breaches(
-                replay_parity_metrics, parity_baseline or None, parity_ceilings
-            )
-            replay_parity_metrics["replay_parity_breached"] = len(breaches)
-            replay_parity_metrics.update(
-                _parity_fatal_thresholds(parity_baseline or None, parity_ceilings)
-            )
-            for message, is_defect in breaches:
-                if is_defect:
-                    continue
-                # The journalled metrics carry iteration + 1, since the counter
-                # advances before the record is written, so the warning names
-                # the row it will appear in rather than the loop variable.
-                print(
-                    f"warning: iteration {iteration + 1} {message} — this is "
-                    f"within {REPLAY_PARITY_STEP_CHANGE_FACTOR}x of the previous "
-                    "audit and under the absolute ceiling, so it reads as drift "
-                    "rather than a defect and the run continues",
-                    file=sys.stderr,
-                    flush=True,
+            for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):
+                measured, parity_baselines[agent] = _audit_replay_parity(
+                    member.actor,
+                    rollout,
+                    rows=rows,
+                    ppo_config=ppo_config,
+                    device=device,
+                    baseline=parity_baselines[agent],
+                    ceilings=parity_ceilings,
+                    iteration=iteration,
+                    agent=None if population == 1 else agent,
                 )
-            # The baseline advances after every audit, warned breaches
-            # included, so drift is always compared against recent drift and
-            # can never accumulate into a false step change. The ceiling is
-            # what stops that from ratcheting without limit.
-            parity_baseline = _parity_measurements(replay_parity_metrics)
+                replay_parity_metrics.update(_agent_fields(measured, agent, population))
             last_parity_audit[audited_staging] = iteration
-            defects = [message for message, is_defect in breaches if is_defect]
-            if defects:
-                raise RuntimeError(
-                    "; ".join(defects)
-                    + " — a step change away from the previous audit, or past the "
-                    "absolute ceiling, rather than drift; resuming reproduces it. "
-                    "A step change is a staging defect worth diagnosing directly; "
-                    "a ceiling breach means the update forward's numerics no "
-                    "longer support this bound, and the run continues as a fresh "
-                    "one warm-started from the last actor under the repaired tree, "
-                    "since repairing it changes the source identity these "
-                    "checkpoints are bound to"
-                )
         update_started = time.monotonic()
         # Critic-first warm start: a freshly initialized critic must fit
         # before its advantages may push a pretrained actor.
         warmup_active = iteration < critic_warmup_iterations
-        update_metrics = update_ppo(
-            actor,
-            critic,
-            actor_optimizer,
-            critic_optimizer,
-            rollout,
-            ppo_config,
-            generator=generator,
-            actor_epochs=0 if warmup_active else None,
-        )
-        _gate_update_metrics(update_metrics, warmup_active=warmup_active)
+        # Once per member, over that member's rows. Partitioning first is not
+        # cosmetic: `prepare_advantages` normalizes by the batch's own advantage
+        # standard deviation, so a pooled update would divide each member's
+        # advantages by the population's spread and leak one member's return scale
+        # into another's step size.
+        update_metrics: dict[str, float | int] = {}
+        for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):
+            measured = update_ppo(
+                member.actor,
+                member.critic,
+                member.actor_optimizer,
+                member.critic_optimizer,
+                rollout,
+                ppo_config,
+                generator=generator,
+                actor_epochs=0 if warmup_active else None,
+                rows=rows,
+            )
+            # Per member, so one collapsed member stops the run as itself rather
+            # than being averaged into three healthy ones.
+            _gate_update_metrics(
+                measured, warmup_active=warmup_active, agent=None if population == 1 else agent
+            )
+            update_metrics.update(_agent_fields(measured, agent, population))
         update_seconds = time.monotonic() - update_started
         iteration += 1
         metrics = {
@@ -1736,6 +2255,7 @@ def main() -> None:
             **rollout_diagnostics(rollout),
             **self_play_diagnostics,
             **league_diagnostics,
+            **population_metrics,
             **replay_parity_metrics,
             **update_metrics,
         }
@@ -1746,12 +2266,21 @@ def main() -> None:
         # background so serialization and fsync overlap the next rollout. The
         # snapshot digest lands in the shared manifest inside the worker,
         # before the payload referencing that manifest is serialized.
-        actor_state = cpu_state_copy(actor.state_dict())
+        agent_states = [
+            {
+                "actor": cpu_state_copy(member.actor.state_dict()),
+                "critic": cpu_state_copy(member.critic.state_dict()),
+                "actor_optimizer": cpu_state_copy(member.actor_optimizer.state_dict()),
+                "critic_optimizer": cpu_state_copy(member.critic_optimizer.state_dict()),
+            }
+            for member in members
+        ]
+        # A population wave has no frozen lanes, so it writes no snapshot archive:
+        # an archive nothing reads would claim the run has a frozen-opponent
+        # history it does not have.
+        actor_state = agent_states[0]["actor"] if population == 1 else None
         payload = checkpoint_payload(
-            actor_state=actor_state,
-            critic_state=cpu_state_copy(critic.state_dict()),
-            actor_optimizer_state=cpu_state_copy(actor_optimizer.state_dict()),
-            critic_optimizer_state=cpu_state_copy(critic_optimizer.state_dict()),
+            agents=agent_states,
             model_config=model_config,
             ppo_config=ppo_config,
             iteration=iteration,
@@ -1768,7 +2297,8 @@ def main() -> None:
             league_score_rates=dict(league_score_rates),
             # Snapshot for the same reason: the audit at the next interval
             # replaces this configuration's entry while the commit serializes.
-            replay_parity_baseline=dict(parity_baseline),
+            replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
+            population_disagreement_reference=population_reference,
             initial_actor=initial_actor_provenance,
         )
         if pending_commit is not None:

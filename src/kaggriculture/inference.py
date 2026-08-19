@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,13 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 11 gave a population run's payload a list of members under `agents`
+# in place of the four top-level state dicts a single learner keeps. The bump is
+# what stops a version-10 resume from being read as a population of one: the
+# resume path reconstructs N actors, critics and optimizer pairs from that list,
+# and a payload without it would restore nothing for members 1..N-1 and train
+# them from their fresh initialization while reporting a resumed run.
+#
 # Version 10 renamed the resume payload's `vapo_config` key to `ppo_config`.
 # The bump is the whole point of the number: the key has exactly one reader and
 # it subscripts, so without it a version-9 checkpoint passes the format check,
@@ -39,24 +47,76 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 10
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9))
+CHECKPOINT_FORMAT_VERSION = 11
+# A version-10 payload's actor tensors are exactly a version-11 single learner's,
+# so the actor-only read path stays compatible while resume above refuses it.
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
 }
 SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS = SUPPORTED_CHECKPOINT_FORMAT_VERSIONS
 
+#: Where a population checkpoint keeps its members. Its presence is what tells
+#: the two payload shapes apart, and the distinction is deliberately not papered
+#: over: a single learner's payload keeps the four top-level state dicts it has
+#: always had, and a population payload has NO top-level actor at all. Aliasing
+#: member zero there would let every reader of "the actor" -- submission
+#: selection, external evaluation, replay viewing, export -- quietly score one
+#: arbitrary member and report it as the run's strength.
+POPULATION_CHECKPOINT_KEY = "agents"
 
-def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+
+def checkpoint_agent_count(checkpoint: Mapping[str, Any]) -> int:
+    """How many members a checkpoint carries; one for a single learner."""
+    members = checkpoint.get(POPULATION_CHECKPOINT_KEY)
+    return len(members) if isinstance(members, list) else 1
+
+
+def checkpoint_actor_state(checkpoint: Mapping[str, Any], agent: int | None) -> dict[str, Any]:
+    """The actor weights `agent` names, refusing a read that would be arbitrary.
+
+    A population payload has no single answer to "the actor", so `agent is None`
+    against one is an error rather than member zero. The two directions are both
+    checked because either mistake is silent: reading a population as a single
+    learner reports one member as the run, and naming an agent against a single
+    learner is a caller that believes it selected something.
+    """
+    members = checkpoint.get(POPULATION_CHECKPOINT_KEY)
+    if isinstance(members, list):
+        available = f"0..{len(members) - 1}"
+        if agent is None:
+            raise ValueError(
+                f"checkpoint holds a population of {len(members)} agents and has no "
+                f"single actor; select one with agent={available}"
+            )
+        if not 0 <= agent < len(members):
+            raise ValueError(
+                f"checkpoint population has no agent {agent}; available agents are {available}"
+            )
+        return members[agent]["actor"]
+    if agent is not None:
+        raise ValueError(
+            f"checkpoint holds a single learner, not a population, so agent {agent} "
+            "does not name anything in it"
+        )
+    if "actor" not in checkpoint:
+        raise ValueError("checkpoint is missing actor weights")
+    return checkpoint["actor"]
+
+
+def actor_artifact_from_checkpoint(
+    checkpoint: dict[str, Any], *, agent: int | None = None
+) -> dict[str, Any]:
     checkpoint_version = checkpoint.get("format_version")
     if checkpoint_version not in SUPPORTED_CHECKPOINT_FORMAT_VERSIONS:
         expected = ", ".join(map(str, sorted(SUPPORTED_CHECKPOINT_FORMAT_VERSIONS)))
         raise ValueError(
             f"unsupported checkpoint format: {checkpoint_version}; expected one of {expected}"
         )
-    if "actor" not in checkpoint or "model_config" not in checkpoint:
+    if "model_config" not in checkpoint:
         raise ValueError("checkpoint is missing actor weights or model configuration")
+    actor_state = checkpoint_actor_state(checkpoint, agent)
     identity = validate_source_identity(checkpoint.get("source_identity"))
     try:
         run_provenance = validate_run_provenance(checkpoint.get("run_provenance"))
@@ -76,7 +136,7 @@ def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]
         "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
         "architecture": resolve_architecture(checkpoint).name,
         "model_config": checkpoint["model_config"],
-        "actor": checkpoint["actor"],
+        "actor": actor_state,
         "iteration": int(checkpoint.get("iteration", 0)),
         "metrics": checkpoint.get("metrics", {}),
         "source_identity": identity,
@@ -85,7 +145,7 @@ def actor_artifact_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]
 
 
 def load_actor_artifact(
-    path: Path, device: torch.device | str = "cpu"
+    path: Path, device: torch.device | str = "cpu", *, agent: int | None = None
 ) -> tuple[nn.Module, dict[str, Any]]:
     payload = torch.load(path, map_location=device, weights_only=False)
     version = payload.get("format_version")
@@ -118,7 +178,7 @@ def load_actor_artifact(
     if run_provenance is not None and run_provenance["source_identity"] != identity:
         raise ValueError("actor artifact run provenance source does not match source identity")
     actor = resolve_architecture(payload).build_actor(payload["model_config"]).to(device)
-    actor.load_state_dict(payload["actor"])
+    actor.load_state_dict(checkpoint_actor_state(payload, agent))
     actor.eval()
     return actor, payload
 

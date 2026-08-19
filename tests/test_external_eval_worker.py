@@ -34,6 +34,20 @@ def test_builtin_opponents_pass_through_and_missing_files_fail(tmp_path: Path) -
         normalize_opponent(str(tmp_path / "missing.py"))
 
 
+def test_public_v16_alias_resolves_to_fixed_file(monkeypatch, tmp_path: Path) -> None:
+    import kaggriculture.opponents as opponents
+
+    teacher = tmp_path / "v16.py"
+    teacher.write_text("def agent(obs): return {}\n", encoding="utf-8")
+    monkeypatch.setattr(opponents, "PUBLIC_V16_TEACHER", teacher)
+
+    label, resolved = normalize_opponent("v16")
+
+    assert label == "public-v16"
+    assert resolved == str(teacher.resolve())
+    assert normalize_opponent("public-v16") == (label, resolved)
+
+
 def test_game_outcome_scores_wins_ties_and_losses() -> None:
     module = _script()
     win = module.GameOutcome(0, 0, 100.0, 50.0, None)
@@ -62,8 +76,9 @@ def test_evaluate_opponent_summarizes_only_completed_games(monkeypatch, tmp_path
         "starter",
         "starter",
         iteration=40,
-        snapshot_name="league-actor-00000040.pt",
-        snapshot_digest="ab" * 32,
+        artifact_name="league-actor-00000040.pt",
+        artifact_digest="ab" * 32,
+        member=None,
         seeds=range(7, 9),
         episode_steps=720,
     )
@@ -78,6 +93,26 @@ def test_evaluate_opponent_summarizes_only_completed_games(monkeypatch, tmp_path
     assert record["opponent_money_mean"] == pytest.approx(50.0)
     assert record["score_rate"] == pytest.approx((1.0 + 0.5 + 0.0) / 3)
     assert record["errors"] == ["environment did not reach DONE"]
+    # A single-learner row carries the key with a null, so a reader never has to
+    # decide whether an absent key means one learner or an older worker.
+    assert record["agent"] is None
+    assert record["artifact"] == "league-actor-00000040.pt"
+
+
+def test_members_refuses_a_spec_a_reader_could_not_deduplicate() -> None:
+    module = _script()
+
+    assert module._members("") == [None]
+    assert module._members(" ") == [None]
+    assert module._members("0,2,1") == [0, 2, 1]
+    # Two rows for one member would collide on (iteration, agent, opponent),
+    # which is the key a reader deduplicates last-wins on.
+    with pytest.raises(ValueError, match="names a member twice"):
+        module._members("1,1")
+    with pytest.raises(ValueError, match="names a negative member"):
+        module._members("-1")
+    with pytest.raises(ValueError, match="named no member"):
+        module._members(",")
 
 
 def test_opponent_digest_follows_the_runnable_not_the_label(monkeypatch, tmp_path: Path) -> None:
@@ -99,8 +134,9 @@ def test_opponent_digest_follows_the_runnable_not_the_label(monkeypatch, tmp_pat
         label,
         runnable,
         iteration=1,
-        snapshot_name="league-actor-00000001.pt",
-        snapshot_digest="ab" * 32,
+        artifact_name="league-actor-00000001.pt",
+        artifact_digest="ab" * 32,
+        member=2,
         seeds=range(1),
         episode_steps=720,
     )

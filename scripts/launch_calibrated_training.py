@@ -967,7 +967,7 @@ def main() -> None:
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
         resume_checkpoint=resume_checkpoint,
-        initial_actor=initial_actor,
+        initial_actors=() if initial_actor is None else (initial_actor,),
         critic_warmup_iterations=critic_warmup_iterations,
     )
     decision.update(

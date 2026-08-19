@@ -44,7 +44,14 @@ from typing import Any, Protocol
 #: did not change -- only the placement logic reading them did. Without the bump
 #: an epoch 6 mirror would be judged current and appended to under the new
 #: scheme, serving both layouts from one directory.
-_LAYOUT_EPOCH = 7
+#: 8: a population run reports every training category once per agent, plus
+#: `population-` categories for the head-to-head score-rate matrix and the
+#: pairwise policy disagreement. The per-agent facet is placement logic that no
+#: table value expresses: under epoch 7 an `agent0_value_loss` field fell through
+#: every rule into `misc/agent0_value_loss`, a tag the new scheme never writes, so
+#: an epoch 7 mirror appended to under this one would serve one agent's critic
+#: loss from two categories at once.
+_LAYOUT_EPOCH = 8
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -629,6 +636,112 @@ _OPPONENT_FIELDS = tuple(
     sorted(("category", "games", *_OPPONENT_AGGREGATE_FIELDS), key=len, reverse=True)
 )
 
+#: A population run reports every category once per agent as well as once for
+#: the whole wave, so one learner's curves can be read without the other three
+#: drawn over them. The agent is the tag's category suffix, for the reason
+#: `_placement` states below: as a chart-name segment every agent of a category
+#: would land in one accordion and multiply its size by the population.
+#:
+#: The facet joins the cohort rather than taking its place. `outcome-wave-agent0`
+#: stutters against `outcome-wave`, and the shorter alternative -- letting the
+#: agent occupy the cohort's slot, since a population wave has no self-play or
+#: league half to name -- stops being injective the moment a cohort does come
+#: back: `agent0_league_score_rate` would then land on the tag
+#: `agent0_score_rate` already owns, and two measurements at one tag render as a
+#: single plausible noisy line.
+_AGENT_TOKEN = "agent"
+
+
+def _agent_facet_name(index: int) -> str:
+    """The category suffix one agent's statistics are filed under."""
+    return f"{_AGENT_TOKEN}{index}"
+
+
+def population_agent_field(index: int, name: str) -> str:
+    """The journal field one agent's reading of `name` is recorded at.
+
+    The training loop writes these and the mirror parses them, so the two have
+    to agree exactly; they share this function because a disagreement is silent
+    -- an unrecognized field is filed in `misc`, not rejected.
+    """
+    return f"{_agent_facet_name(index)}_{name}"
+
+
+#: The population's two matrices, and the only place a reader can see it cycling
+#: or converging into a single policy under another name. Each is faceted by the
+#: agent whose row a reading is, and each is its own first path segment, because
+#: they neither fit in one accordion nor mean the same thing. The head-to-head
+#: score rate is asymmetric and needs all N(N-1) ordered readings, since seat and
+#: opponent order both move it; `policy.population_disagreement` returns a
+#: symmetric matrix with a zero diagonal, so its distinct pairs are half of that
+#: and publishing the mirror image would double an accordion for no information.
+#: At the default population that is 12 readings plus 6 plus the mean and the
+#: minimum -- twice the readable budget for one category before any facet.
+#:
+#: The pair is parsed out of the field name rather than tabulated because the
+#: matrices are sized by `--population`, which no table written here can know.
+#: Whatever precedes the pair is the matrix, so it carries its own underscores
+#: into the category the way every other multi-word category spells them:
+#: `population-score-rate-agent0/vs_agent1`.
+#:
+#: A row is N-1 charts, so the facet holds to a population of ten and no further:
+#: at eleven a single row is itself over budget. That is far past anything this
+#: plan contemplates -- the default is four and the alternative five -- and a
+#: population that large wants a heatmap rather than 110 curves anyway.
+_POPULATION_PREFIX = "population_"
+_POPULATION_CATEGORY = "population"
+_POPULATION_HEAD_TO_HEAD = "score_rate"
+_POPULATION_DISAGREEMENT = "disagreement"
+_POPULATION_VERSUS = "vs_"
+#: Matched as prefixes when a field is placed, longest first so a matrix added
+#: later whose name extends another's cannot be swallowed by it. Prefixes rather
+#: than a shape, so a matrix name may hold underscores and so may a reading:
+#: reading the matrix off the *end* of the name instead, as `<matrix>_<reading>`,
+#: files `disagreement_mean` correctly and a two-word reading into a category one
+#: sort position from the right one -- `population-disagreement-mean/first`, which
+#: looks deliberate and is not the visible fallback a misfiled field belongs in.
+#: The sizes stay parsed; those are the part `--population` decides.
+_POPULATION_MATRICES = tuple(
+    sorted((_POPULATION_HEAD_TO_HEAD, _POPULATION_DISAGREEMENT), key=len, reverse=True)
+)
+
+
+def _population_pair_field(matrix: str, agent: int, opponent: int) -> str:
+    return f"{_POPULATION_PREFIX}{matrix}_{agent}_{_POPULATION_VERSUS}{opponent}"
+
+
+def population_head_to_head_field(agent: int, opponent: int) -> str:
+    """The journal field `agent`'s score rate against `opponent` is recorded at.
+
+    Ordered: `(0, 1)` and `(1, 0)` are different games and different readings.
+    Never equal, because `rollout.population_pairings` seats no member against
+    itself, and a `vs_agent2` chart in agent 2's own row would read as a genuine
+    mirror-play measurement.
+    """
+    if agent == opponent:
+        raise ValueError("no population pairing seats a member against itself")
+    return _population_pair_field(_POPULATION_HEAD_TO_HEAD, agent, opponent)
+
+
+def population_disagreement_pair_field(agent: int, opponent: int) -> str:
+    """The journal field the disagreement between two agents is recorded at.
+
+    Lowest index first whichever way it is asked for. The matrix is symmetric, so
+    one field per distinct pair is the whole of the information, and a caller
+    walking every ordered pair cannot publish the mirror image by accident.
+    """
+    if agent == opponent:
+        raise ValueError("the disagreement matrix has a zero diagonal by construction")
+    return _population_pair_field(
+        _POPULATION_DISAGREEMENT, min(agent, opponent), max(agent, opponent)
+    )
+
+
+def population_disagreement_field(statistic: str) -> str:
+    """The journal field a whole-population disagreement reading is recorded at."""
+    return f"{_POPULATION_PREFIX}{_POPULATION_DISAGREEMENT}_{statistic}"
+
+
 #: Run layout for a benchmark journal, which is keyed by batch size and repeat
 #: rather than by a monotonic step. Same reason as above: these decide where
 #: every benchmark scalar lands, so the identity has to include them.
@@ -665,6 +778,13 @@ def _layout_fingerprint() -> str:
                 "aggregates": _OPPONENT_AGGREGATE_FIELDS,
                 "unclassified": _OPPONENT_UNCLASSIFIED,
             },
+            "population": {
+                "agent": _AGENT_TOKEN,
+                "prefix": _POPULATION_PREFIX,
+                "category": _POPULATION_CATEGORY,
+                "matrices": _POPULATION_MATRICES,
+                "versus": _POPULATION_VERSUS,
+            },
             "benchmark": {
                 "batch_run": _BENCHMARK_BATCH_RUN,
                 "summary_run": _BENCHMARK_SUMMARY_RUN,
@@ -683,8 +803,50 @@ def _layout_fingerprint() -> str:
 TENSORBOARD_MIRROR_FORMAT_VERSION = f"{_LAYOUT_EPOCH}-{_layout_fingerprint()}"
 
 
-def _placement(name: str) -> tuple[str, str] | None:
-    """Return the (run, tag) a training-journal field is mirrored at, or None.
+def _agent_facet(name: str) -> tuple[str, str]:
+    """Split a journal field into its agent facet and the statistic it names.
+
+    The index must be digits, so a field that merely begins with the token --
+    `agent_active_count`, were one ever recorded -- keeps its whole name and is
+    placed as a statistic of the wave instead of as agent `""`'s.
+    """
+    facet, _, statistic = name.partition("_")
+    index = facet.removeprefix(_AGENT_TOKEN)
+    if statistic and index != facet and index.isdigit():
+        return facet, statistic
+    return "", name
+
+
+def _population_category(matrix: str) -> str:
+    """The category one of the population's matrices is charted under."""
+    return f"{_POPULATION_CATEGORY}-{matrix.replace('_', '-')}"
+
+
+def _population_placement(statistic: str) -> tuple[str, str]:
+    """Place a population reading, faceting each matrix by the agent whose row it is.
+
+    The matrix is one of a known two; only its indices are sized by
+    `--population`, so only the pair is parsed. A reading that is not a pair
+    keeps its whole name as the chart, and a field naming neither matrix keeps the
+    bare category -- visible, the way an unrecognized field is visible in `misc`,
+    rather than filed under a plausible category nobody meant.
+    """
+    for matrix in _POPULATION_MATRICES:
+        if not statistic.startswith(f"{matrix}_"):
+            continue
+        reading = statistic[len(matrix) + 1 :]
+        agent, versus, opponent = reading.rpartition(f"_{_POPULATION_VERSUS}")
+        if versus and agent.isdigit() and opponent.isdigit():
+            return "", (
+                f"{_population_category(matrix)}-{_agent_facet_name(int(agent))}"
+                f"/{_POPULATION_VERSUS}{_agent_facet_name(int(opponent))}"
+            )
+        return "", f"{_population_category(matrix)}/{reading}"
+    return "", f"{_POPULATION_CATEGORY}/{statistic}"
+
+
+def _agentless_placement(name: str) -> tuple[str, str] | None:
+    """Return the (run, tag) a field is mirrored at, before its agent joins it.
 
     A training mirror is one event file, so the run is always empty here and every
     distinction the layout draws lives in the tag. Only the benchmark mirror still
@@ -704,6 +866,10 @@ def _placement(name: str) -> tuple[str, str] | None:
     tag = _TRAINING_TAGS.get(name)
     if tag is not None:
         return "", tag
+    if name.startswith(_POPULATION_PREFIX):
+        # Ahead of the cohort loop below, whose empty prefix matches everything:
+        # it would file the whole matrix in `misc`, one chart per ordered pair.
+        return _population_placement(name[len(_POPULATION_PREFIX) :])
     for prefix, category in _PER_HEAD_PREFIXES:
         if not name.startswith(prefix):
             continue
@@ -726,6 +892,23 @@ def _placement(name: str) -> tuple[str, str] | None:
                 chart = statistic[len(family) :] if absorbs else statistic
                 return "", f"{category}-{cohort}/{chart or statistic}"
     return "", f"{_UNCATEGORIZED}/{name}"
+
+
+def _placement(name: str) -> tuple[str, str] | None:
+    """Return the (run, tag) a training-journal field is mirrored at, or None.
+
+    The agent facet is joined here, onto whichever category the rules above
+    chose, rather than inside each of them: a branch that forgot to carry it
+    would file one agent's reading at the tag the whole wave's reading owns, and
+    two series at one tag render as a single plausible noisy curve.
+    """
+    agent, statistic = _agent_facet(name)
+    placement = _agentless_placement(statistic)
+    if placement is None or not agent:
+        return placement
+    run, tag = placement
+    category, _, chart = tag.partition("/")
+    return run, f"{category}-{agent}/{chart}"
 
 
 def _opponent_scalars(record: dict[str, Any]) -> Iterator[tuple[str, str, float]]:

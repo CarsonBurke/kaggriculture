@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Extract projected demonstration episodes from official public-v27 games.
+"""Extract projected demonstration episodes from official public-v16 games.
 
-Runs complete kaggle_environments episodes with the public v27 agent in the
+Runs complete kaggle_environments episodes with the public v16 teacher in the
 recorded seat(s), projects every recorded engine action through the exact
 sequential legality ledger (`kaggriculture.demonstrations`), verifies the
 factored round trip against the recorded dict, and stores one compressed
@@ -42,11 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=128, help="environment seeds to play")
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument(
-        "--teacher", default="public-v27", help="demonstrating agent (spec for opponents registry)"
+        "--teacher", default="public-v16", help="demonstrating agent (spec for opponents registry)"
     )
     parser.add_argument(
         "--opponent",
-        default="public-v27",
+        default="public-v16",
         help="other seat; when it equals the teacher, both seats are recorded",
     )
     parser.add_argument("--episode-steps", type=int, default=720)

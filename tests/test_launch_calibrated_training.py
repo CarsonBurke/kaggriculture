@@ -13,6 +13,8 @@ import pytest
 
 from kaggriculture.ppo import PpoConfig, _validate_config
 from kaggriculture.production import (
+    PRODUCTION_EXTERNAL_EVAL_EVERY,
+    PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
@@ -77,7 +79,10 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
     # External probes are part of the production record: cadence and opponents
     # must both be emitted so the launch command is complete.
     assert command[command.index("--external-eval-every") + 1] == "10"
-    assert command[command.index("--external-eval-opponents") + 1] == "starter,public-v27"
+    assert (
+        command[command.index("--external-eval-opponents") + 1]
+        == PRODUCTION_EXTERNAL_EVAL_OPPONENTS
+    )
 
 
 def test_training_command_round_trips_through_the_training_parser(monkeypatch, tmp_path) -> None:
@@ -118,6 +123,75 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     assert "--compile-update" not in command
 
 
+def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
+    monkeypatch, tmp_path
+) -> None:
+    """A population wave has no frozen lanes, no built-in lanes and no single
+    snapshot to probe, so a command left at the single-learner league values would
+    record opponents the run never plays -- and train_ppo would refuse to start.
+    One `--init-actor-from` per member, in agent order, is what distinguishes them.
+    """
+    training = _script("train_ppo.py")
+    population = 4
+    artifacts = [tmp_path / f"member-{agent}.pt" for agent in range(population)]
+    for artifact in artifacts:
+        artifact.write_bytes(b"")
+    command = build_training_command(
+        tmp_path / "run",
+        iterations=500,
+        max_hours=0.0,
+        seed=7,
+        rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
+        update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+        population=population,
+        games=156,
+        initial_actors=artifacts,
+        critic_warmup_iterations=10,
+    )
+    monkeypatch.setattr(sys, "argv", ["train_ppo.py", *command[2:]])
+
+    args = training.parse_args()
+    training._validate_args(args)
+
+    assert args.population == population
+    assert args.init_actor_from == artifacts
+    assert args.league_games == 0
+    assert args.league_builtin_lanes == 0
+    # A population has no built-in lane and every in-wave number is relative, so
+    # the external probe is its only absolute measurement and stays on. One
+    # worker reads the durable checkpoint, so the cadence must land on one.
+    assert args.external_eval_every == PRODUCTION_EXTERNAL_EVAL_EVERY
+    assert args.external_eval_every % args.checkpoint_every == 0
+    # Cost parity at N = 4: 156 games is a multiple of the 12 ordered pairings, so
+    # every pairing gets 13 games and seat bias cancels exactly.
+    assert args.games % (population * (population - 1)) == 0
+
+    # The wave size is the one thing a launch has to state, since nothing in the
+    # tree yet decides between the plan's cost-parity and data-parity candidates.
+    with pytest.raises(ValueError, match="multiple of 12"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=500,
+            max_hours=0.0,
+            seed=7,
+            rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
+            update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+            population=population,
+        )
+    with pytest.raises(ValueError, match="one initial actor per member"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=500,
+            max_hours=0.0,
+            seed=7,
+            rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
+            update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+            population=population,
+            games=156,
+            initial_actors=artifacts[:2],
+        )
+
+
 def test_warm_started_command_round_trips_through_the_training_parser(monkeypatch, tmp_path):
     """A BC-warm-started baseline has to reach train_ppo through the same
     launcher every family uses, or the families are not being compared on one
@@ -132,7 +206,7 @@ def test_warm_started_command_round_trips_through_the_training_parser(monkeypatc
         seed=7,
         rollout_forward_mode="eager",
         update_compile_mode="eager",
-        initial_actor=artifact,
+        initial_actors=(artifact,),
         critic_warmup_iterations=15,
     )
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", *command[2:]])
@@ -140,7 +214,7 @@ def test_warm_started_command_round_trips_through_the_training_parser(monkeypatc
     args = training.parse_args()
     training._validate_args(args)
 
-    assert args.init_actor_from == artifact
+    assert args.init_actor_from == [artifact]
     assert args.critic_warmup_iterations == 15
     assert args.resume is None
 
@@ -156,7 +230,7 @@ def test_warm_start_and_resume_are_rejected_together(tmp_path: Path) -> None:
             seed=7,
             rollout_forward_mode="eager",
             update_compile_mode="eager",
-            initial_actor=tmp_path / "bc-actor.pt",
+            initial_actors=(tmp_path / "bc-actor.pt",),
             resume_checkpoint=tmp_path / "checkpoint-000010.pt",
         )
 
@@ -1302,7 +1376,7 @@ def test_a_warmup_that_outlasts_the_run_is_rejected(tmp_path: Path) -> None:
             seed=7,
             rollout_forward_mode="eager",
             update_compile_mode="eager",
-            initial_actor=tmp_path / "bc-actor.pt",
+            initial_actors=(tmp_path / "bc-actor.pt",),
             critic_warmup_iterations=15,
         )
 

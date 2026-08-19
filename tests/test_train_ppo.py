@@ -23,6 +23,7 @@ from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import model_config_from_args
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, resolve_architecture
+from kaggriculture.rollout import population_pairings
 from kaggriculture.structured import StructuredConfig
 
 
@@ -313,6 +314,7 @@ def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch,
         external_eval_seeds=2,
         episode_steps=720,
         run_dir=tmp_path,
+        population=1,
     )
     league_directory = tmp_path / "league"
     launched: list[list[str]] = []
@@ -334,7 +336,9 @@ def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch,
     process = module._maybe_launch_external_eval(args, 10, league_directory, None)
     assert isinstance(process, FakeProcess)
     command = launched[0]
-    assert command[command.index("--snapshot") + 1].endswith("league-actor-00000010.pt")
+    assert command[command.index("--artifact") + 1].endswith("league-actor-00000010.pt")
+    # A single learner names no member: the artifact holds exactly one actor.
+    assert command[command.index("--agents") + 1] == ""
     assert command[command.index("--iteration") + 1] == "10"
     assert command[command.index("--opponents") + 1] == "starter"
     assert command[command.index("--output") + 1] == str(tmp_path / "metrics-external.jsonl")
@@ -355,6 +359,35 @@ def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch,
     assert len(launched) == 2
 
 
+def test_a_population_is_probed_from_its_durable_checkpoint(monkeypatch, tmp_path) -> None:
+    # `latest.pt` is rewritten every iteration, so a worker reading it races the
+    # trainer. The numbered checkpoint is immutable once written, which is what
+    # ties the probe cadence to `--checkpoint-every`.
+    module = _training_script()
+    args = SimpleNamespace(
+        external_eval_every=10,
+        external_eval_opponents="starter",
+        external_eval_seeds=2,
+        episode_steps=720,
+        run_dir=tmp_path,
+        population=4,
+    )
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launched.append(command) or SimpleNamespace(poll=lambda: 0),
+    )
+
+    module._maybe_launch_external_eval(args, 10, tmp_path / "league", None)
+
+    command = launched[0]
+    assert command[command.index("--artifact") + 1] == str(tmp_path / "checkpoint-000010.pt")
+    # Every member is named, in agent order: one worker covers the population,
+    # and the journal rows are told apart by their `agent` field.
+    assert command[command.index("--agents") + 1] == "0,1,2,3"
+
+
 def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path) -> None:
     module = _training_script()
     args = SimpleNamespace(
@@ -363,6 +396,7 @@ def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path
         external_eval_seeds=2,
         episode_steps=720,
         run_dir=tmp_path,
+        population=1,
     )
 
     def refuse(*_args, **_kwargs):
@@ -733,7 +767,12 @@ def test_parity_audit_is_due_per_staging_configuration_and_on_a_cadence() -> Non
     interval = module.REPLAY_PARITY_AUDIT_INTERVAL
     league = module._parity_staging_key(96)
     self_play = module._parity_staging_key(0)
-    assert {league, self_play} == set(module.PARITY_STAGING_KEYS)
+    population = module._parity_staging_key(0, 4)
+    assert {league, self_play, population} == set(module.PARITY_STAGING_KEYS)
+    # A population wave stages its behaviour policy as one vmapped ensemble
+    # forward, a third staging width, so it audits on its own cadence even
+    # though it plays no league rows.
+    assert module._parity_staging_key(96, 4) == population
 
     # Nothing audited yet: due whichever configuration this iteration uses.
     assert module._parity_audit_due({}, 0, league)
@@ -1290,10 +1329,14 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
     record["critic_warmup_iterations"] = 15
 
     payload = checkpoint_payload(
-        actor_state={},
-        critic_state={},
-        actor_optimizer_state={},
-        critic_optimizer_state={},
+        agents=[
+            {
+                "actor": {},
+                "critic": {},
+                "actor_optimizer": {},
+                "critic_optimizer": {},
+            }
+        ],
         model_config=config,
         ppo_config=PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False),
         iteration=3,
@@ -1467,3 +1510,390 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     # policy that has not been updated yet.
     module._gate_update_metrics({**healthy, "entropy": MINIMUM_POLICY_ENTROPY}, warmup_active=False)
     module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)
+
+
+def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
+    """A synthetic population wave with the row layout the collector's contract fixes.
+
+    Row order is game-major and seat-minor, so `agents` is the pairing table read
+    flat; the loop's partition, its head-to-head table and its sibling-row opponent
+    lookup all depend on exactly that.
+    """
+    from kaggriculture.rollout import _SHARED_ROLLOUT_FIELDS, allocate_rollout_storage
+
+    rows = games * 2
+    storage = allocate_rollout_storage(CONV_ENTITY, rows, steps)
+    generator = np.random.default_rng(seed)
+    for name in ("board", "global_features", "critic_features", "units"):
+        storage[name][:] = generator.standard_normal(storage[name].shape)
+    for name in ("unit_masks", "unit_active", "market_active", "market_quantity_active", "valid"):
+        storage[name][:] = True
+    storage["market_kind_masks"][:] = True
+    storage["market_quantity_masks"][:] = True
+    money = generator.uniform(0.0, 100.0, rows)
+    return SimpleNamespace(
+        architecture=CONV_ENTITY,
+        states={
+            name: storage[name]
+            for name in ("board", "global_features", "critic_features", "units", "unit_positions")
+        },
+        **{name: storage[name] for name in _SHARED_ROLLOUT_FIELDS},
+        agents=population_pairings(population, games).reshape(-1),
+        seats=np.arange(rows, dtype=np.int64) % 2,
+        episode_seeds=np.arange(rows, dtype=np.int64) // 2,
+        final_money=money,
+        opponent_money=money[np.arange(rows) ^ 1],
+        entropy_sums=np.full(rows, 1.0, dtype=np.float64),
+        elapsed_seconds=1.0,
+        state_count=rows * steps,
+        trajectories=rows,
+        horizon=steps,
+        mean_entropy=1.0,
+    )
+
+
+def _distinct_actors(config: ModelConfig, count: int, *, seed: int = 5) -> list[FarmActor]:
+    """`count` actors that genuinely run different programs.
+
+    Fresh initializations do not: this architecture's unit logits carry a large
+    fixed action prior that dominates an untrained head, so cold-started actors
+    pick the same greedy action everywhere and are one policy for the purpose the
+    gate measures. Displacing each head's bias is what four differently trained
+    members differ by, expressed in one line.
+    """
+    torch.manual_seed(seed)
+    actors = [FarmActor(config) for _ in range(count)]
+    with torch.no_grad():
+        for actor in actors:
+            actor.unit_head[1].bias.add_(torch.randn(actor.unit_head[1].bias.shape) * 3.0)
+    return actors
+
+
+def _actor_artifact(path: Path, actor: FarmActor, config: ModelConfig) -> Path:
+    """One exported actor artifact of the shape a BC clone writes."""
+    from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
+    from kaggriculture.provenance import source_identity
+
+    torch.save(
+        {
+            "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+            "architecture": CONV_ENTITY,
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "iteration": 0,
+            "source_identity": source_identity(),
+        },
+        path,
+    )
+    return path
+
+
+_TINY_CONFIG = ModelConfig(
+    cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+)
+
+
+def _population_arguments(run_dir: Path, *, population: int, games: int, iterations: int = 1):
+    return [
+        "train_ppo.py",
+        "--run-dir",
+        str(run_dir),
+        "--iterations",
+        str(iterations),
+        "--population",
+        str(population),
+        "--games",
+        str(games),
+        "--league-games",
+        "0",
+        "--league-builtin-opponents",
+        "",
+        "--league-builtin-lanes",
+        "0",
+        "--external-eval-every",
+        "0",
+        "--device",
+        "cpu",
+        "--cnn-width",
+        "8",
+        "--cnn-blocks",
+        "1",
+        "--model-dim",
+        "16",
+        "--transformer-layers",
+        "3",
+        "--attention-heads",
+        "2",
+        "--checkpoint-every",
+        "1",
+        "--no-bfloat16",
+    ]
+
+
+def _run_population_main(
+    module,
+    monkeypatch,
+    run_dir: Path,
+    *,
+    population: int,
+    games: int,
+    iterations: int = 1,
+    initial_actors: tuple[Path, ...] = (),
+    resume: Path | None = None,
+):
+    """Run one iteration of the loop with only the wave and the update mocked out.
+
+    The partition, the disagreement measurement, its gate, the per-member update
+    gates and the checkpoint payload all run for real; substituting the collector
+    is what makes that possible on a CPU in a test.
+    """
+
+    class Writer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_scalar(self, *args, **kwargs) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    seen: list[np.ndarray | None] = []
+
+    def update(*args, rows=None, **kwargs):
+        seen.append(rows)
+        return {
+            "actor_updates": 1,
+            "actor_minibatches_intended": 1,
+            "critic_updates": 1,
+            "first_minibatch_approx_kl": 0.0,
+            "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
+        }
+
+    wave = _population_wave(module, games=games, population=max(population, 2))
+    if population == 1:
+        wave.agents = np.zeros(wave.agents.size, dtype=np.int64)
+    monkeypatch.setattr(module, "SummaryWriter", Writer)
+    monkeypatch.setattr(module, "collect_population_play_rust", lambda *a, **k: wave)
+    monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *a, **k: wave)
+    monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
+    monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
+    monkeypatch.setattr(module, "update_replay_parity", lambda *a, **k: _parity_metrics(module))
+    monkeypatch.setattr(module, "update_ppo", update)
+    arguments = _population_arguments(
+        run_dir, population=population, games=games, iterations=iterations
+    )
+    for artifact in initial_actors:
+        arguments.extend(("--init-actor-from", str(artifact)))
+    if resume is not None:
+        arguments.extend(("--resume", str(resume)))
+    monkeypatch.setattr(sys, "argv", arguments)
+    module.main()
+    record = json.loads((run_dir / "metrics.jsonl").read_text().splitlines()[-1])
+    return record, seen
+
+
+def test_a_single_learner_run_keeps_todays_metric_layout(monkeypatch, tmp_path) -> None:
+    """`--population 1` is the path every shipped run and every downstream reader
+    already uses, so it must reshape nothing: the bare metric names stay, no
+    per-agent or population name appears, and the update sees the whole wave."""
+    module = _training_script()
+
+    record, seen = _run_population_main(
+        module, monkeypatch, tmp_path / "single", population=1, games=2
+    )
+
+    assert seen == [None]
+    assert record["entropy"] == 0.2
+    assert not [name for name in record if name.startswith("population")]
+    assert not [name for name in record if name.startswith("agent")]
+
+
+def test_a_population_partitions_its_wave_across_the_members_exactly_once() -> None:
+    """Every row belongs to exactly one member, and the union is the whole wave --
+    otherwise a member trains on another's trajectories or the wave loses rows to
+    no update at all, and both read as an ordinary run."""
+    module = _training_script()
+    population = 4
+    games = population * (population - 1)
+    agents = population_pairings(population, games).reshape(-1)
+
+    rows = module._population_row_partition(agents, population)
+
+    assert len(rows) == population
+    union = np.concatenate(rows)
+    assert sorted(union.tolist()) == list(range(agents.size))
+    assert len(set(union.tolist())) == union.size
+    # Each member holds one seat of every game it plays and no member's rows are
+    # contiguous, which is why the update takes indices rather than a sub-batch.
+    assert {index.size for index in rows} == {2 * (population - 1)}
+    assert any(np.diff(index).max() > 1 for index in rows)
+
+    with pytest.raises(ValueError, match="not covered by agents"):
+        module._population_row_partition(np.array([0, 1, 2, 2], dtype=np.int64), 2)
+
+
+def test_the_disagreement_gate_separates_converged_members_from_distinct_ones() -> None:
+    """The failure this exists for reads healthy everywhere else: converged members
+    score 0.5 against each other by symmetry, so entropy, KL, epoch fraction and
+    the money curve all stay in bounds while the wave carries no gradient."""
+    module = _training_script()
+    wave = _population_wave(module, games=12, population=4, seed=3)
+    forward_args, masks, active = module._population_state_sample(
+        wave, np.random.default_rng(0), torch.device("cpu")
+    )
+
+    distinct = _distinct_actors(_TINY_CONFIG, 4)
+    identical = _distinct_actors(_TINY_CONFIG, 4)
+    for member in identical[1:]:
+        member.load_state_dict(identical[0].state_dict())
+
+    reference = module.mean_off_diagonal(
+        module._population_disagreement(distinct, forward_args, masks, active)
+    )
+    collapsed = module.mean_off_diagonal(
+        module._population_disagreement(identical, forward_args, masks, active)
+    )
+
+    # Members running different programs disagree on most decisions; copies of one
+    # set of weights run the same program and disagree on none.
+    assert reference > 0.5
+    assert collapsed == 0.0
+    module._gate_population_disagreement(reference, reference)
+    with pytest.raises(RuntimeError, match="converged into each other"):
+        module._gate_population_disagreement(collapsed, reference)
+    # The floor is a share of the recorded start, so a run may lose most of its
+    # diversity before the gate calls it collapse.
+    floor = module.POPULATION_DISAGREEMENT_FLOOR_FRACTION * reference
+    module._gate_population_disagreement(floor, reference)
+    with pytest.raises(RuntimeError, match="converged into each other"):
+        module._gate_population_disagreement(floor * 0.99, reference)
+    # A population that agreed everywhere at iteration 0 would make the floor a
+    # share of zero, which admits everything: the gate refuses to be switched off.
+    with pytest.raises(RuntimeError, match="agree on every sampled decision"):
+        module._gate_population_disagreement(0.0, 0.0)
+
+
+def test_members_starting_from_the_same_weights_are_rejected(monkeypatch, tmp_path) -> None:
+    """Four agents built from one checkpoint are numerically identical, which makes
+    every one of their first games a mirror scoring 0.5, so the run would train on
+    a wave with no gradient in it. Both spellings of that mistake must fail: the
+    same path twice, and two paths holding the same weights."""
+    module = _training_script()
+    artifact = _actor_artifact(
+        tmp_path / "bc-actor.pt", _distinct_actors(_TINY_CONFIG, 1)[0], _TINY_CONFIG
+    )
+    twin = tmp_path / "bc-actor-copy.pt"
+    twin.write_bytes(artifact.read_bytes())
+
+    repeated = _population_arguments(tmp_path / "repeated", population=2, games=2)
+    repeated.extend(("--init-actor-from", str(artifact), "--init-actor-from", str(artifact)))
+    monkeypatch.setattr(sys, "argv", repeated)
+    with pytest.raises(ValueError, match="different artifact per agent"):
+        module.main()
+
+    # Distinct paths, so validation cannot see it: only the artifacts' digests can.
+    copied = _population_arguments(tmp_path / "copied", population=2, games=2)
+    copied.extend(("--init-actor-from", str(artifact), "--init-actor-from", str(twin)))
+    monkeypatch.setattr(sys, "argv", copied)
+    with pytest.raises(ValueError, match="different weights per agent"):
+        module.main()
+
+
+def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
+    monkeypatch, tmp_path
+) -> None:
+    """The payload has to carry every member: restoring one and training the rest
+    from their fresh initialization would report a resumed run. A version-10
+    payload holds four top-level state dicts and no members at all, which is why
+    reading it as a population is refused rather than half-interpreted."""
+    from kaggriculture.inference import POPULATION_CHECKPOINT_KEY
+    from kaggriculture.training import CHECKPOINT_FORMAT_VERSION, TrainingAgent, load_checkpoint
+
+    module = _training_script()
+    population = 3
+    games = population * (population - 1)
+    run_dir = tmp_path / "population"
+
+    artifacts = tuple(
+        _actor_artifact(tmp_path / f"member-{agent}.pt", actor, _TINY_CONFIG)
+        for agent, actor in enumerate(_distinct_actors(_TINY_CONFIG, population))
+    )
+    record, seen = _run_population_main(
+        module,
+        monkeypatch,
+        run_dir,
+        population=population,
+        games=games,
+        initial_actors=artifacts,
+    )
+
+    assert len(seen) == population
+    assert sorted(np.concatenate(seen).tolist()) == list(range(2 * games))
+    # Per member, so one collapsed member is visible as itself rather than as a
+    # third of an average that still reads healthy.
+    assert {record[f"agent{agent}_entropy"] for agent in range(population)} == {0.2}
+    assert record["population_disagreement_mean"] > 0.0
+    assert record["population_disagreement_floor"] == record["population_disagreement_mean"]
+
+    payload = torch.load(run_dir / "latest.pt", weights_only=False)
+    assert payload["format_version"] == CHECKPOINT_FORMAT_VERSION
+    members = payload[POPULATION_CHECKPOINT_KEY]
+    assert len(members) == population
+    assert all(
+        set(member) == {"actor", "critic", "actor_optimizer", "critic_optimizer"}
+        for member in members
+    )
+    assert not any(name in payload for name in ("actor", "critic", "actor_optimizer"))
+
+    config = _TINY_CONFIG
+    architecture = resolve_architecture({"architecture": CONV_ENTITY})
+    restored = [
+        TrainingAgent(architecture.actor_class(config), architecture.critic_class(config))
+        for _ in range(population)
+    ]
+    reloaded = load_checkpoint(run_dir / "latest.pt", restored, device=torch.device("cpu"))
+    assert reloaded["iteration"] == 1
+    assert reloaded["population_disagreement_reference"] == record["population_disagreement_floor"]
+    for member, stored in zip(restored, members, strict=True):
+        assert all(
+            torch.equal(value, stored["actor"][name])
+            for name, value in member.actor.state_dict().items()
+        )
+    # Distinct members, which is the whole point of the population: one restored
+    # set of weights standing in for all three would pass every other assertion.
+    signatures = {
+        tuple(round(float(value.sum()), 6) for value in member.actor.state_dict().values())
+        for member in restored
+    }
+    assert len(signatures) == population
+
+    # The strongest statement of the round trip: the loop itself continues from the
+    # payload. Every population-shaped resume field is read on this path -- one
+    # parity baseline per member and the iteration-0 disagreement reference, which
+    # must be restored rather than re-measured after the members have moved.
+    resumed_dir = tmp_path / "resumed"
+    resumed_record, resumed_rows = _run_population_main(
+        module,
+        monkeypatch,
+        resumed_dir,
+        population=population,
+        games=games,
+        iterations=2,
+        resume=run_dir / "latest.pt",
+    )
+    assert len(resumed_rows) == population
+    assert resumed_record["iteration"] == 2
+    assert (
+        resumed_record["population_disagreement_floor"] == record["population_disagreement_floor"]
+    )
+    assert (resumed_dir / "checkpoint-000002.pt").is_file()
+
+    stale = tmp_path / "stale.pt"
+    torch.save({**payload, "format_version": CHECKPOINT_FORMAT_VERSION - 1}, stale)
+    with pytest.raises(ValueError, match="unsupported checkpoint format"):
+        load_checkpoint(stale, restored, device=torch.device("cpu"))

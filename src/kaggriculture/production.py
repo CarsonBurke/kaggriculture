@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -73,12 +74,22 @@ PRODUCTION_ROLLOUT_BFLOAT16 = True
 # point of the direct launch being uncalibrated: the chain is what earns a
 # change here.
 PRODUCTION_UPDATE_COMPILE_MODE = "default"
-# Deterministic starter/public-v27 probes every N committed iterations give the
-# journal an absolute progress axis that self-play score rates cannot provide.
-# The opponents are emitted explicitly so the launch command is the complete
-# record; unavailable ones are dropped at launch with a warning, never fatal.
+# Deterministic probes every N committed iterations give the journal an absolute
+# progress axis that self-play score rates cannot provide. The opponents are
+# emitted explicitly so the launch command is the complete record; unavailable
+# ones are dropped at launch with a warning, never fatal.
+#
+# `public-v16` is here because it is the strongest reference on hand: measured in
+# the official engine over three seeds and both seat orders it beat `public-v27`
+# 6/6, median bank 77,261 against 59,489. An absolute axis anchored only on
+# agents we already beat would saturate exactly where the interesting failure
+# lives. `starter` stays as the cheap floor that catches total collapse.
+#
+# A population run must keep this a multiple of `PRODUCTION_CHECKPOINT_EVERY`:
+# its members are probed out of the durable checkpoint, since `latest.pt` is
+# rewritten under the worker's feet.
 PRODUCTION_EXTERNAL_EVAL_EVERY = 10
-PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27"
+PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
 
 
 def production_model_config() -> dict[str, int | float]:
@@ -170,11 +181,13 @@ def build_training_command(
     seed: int,
     rollout_forward_mode: str,
     update_compile_mode: str,
+    population: int = 1,
+    games: int = PRODUCTION_SELF_PLAY_GAMES,
     rollout_bfloat16: bool = PRODUCTION_ROLLOUT_BFLOAT16,
     expected_source_digest: str | None = None,
     calibration_decision: Path | None = None,
     resume_checkpoint: Path | None = None,
-    initial_actor: Path | None = None,
+    initial_actors: Sequence[Path] = (),
     critic_warmup_iterations: int | None = None,
 ) -> list[str]:
     """Build the exact production train_ppo.py invocation."""
@@ -183,12 +196,32 @@ def build_training_command(
     # A warm start initializes iteration zero; a resume continues a run that
     # already has an actor. train_ppo rejects the pair, and it must fail here
     # rather than after the launcher has already rewritten the run's evidence.
-    if initial_actor is not None and resume_checkpoint is not None:
+    if initial_actors and resume_checkpoint is not None:
         raise ValueError("a resumed run already has an actor; --init-actor-from initializes one")
-    if critic_warmup_iterations is not None and initial_actor is None:
+    if critic_warmup_iterations is not None and not initial_actors:
         raise ValueError("critic warmup applies only to a warm-started run")
     if critic_warmup_iterations is not None and not 0 < critic_warmup_iterations < iterations:
         raise ValueError("critic warmup must be positive and leave iterations for the actor")
+    if population < 1:
+        raise ValueError("a population needs at least one member")
+    # Every ordered pairing must get the same number of games or seat bias
+    # survives into the advantage, so the wave size is a multiple of N(N-1). No
+    # production constant states it because the plan's Stage 0 measures the two
+    # candidate sizes -- 156 at cost parity, 636 at data parity -- and the choice
+    # is a compute call, so the caller states which one it launched.
+    pairings = population * (population - 1)
+    if population > 1 and games % pairings:
+        raise ValueError(
+            f"a population of {population} has {pairings} ordered pairings, so its wave "
+            f"size must be a multiple of {pairings}; {games} is not"
+        )
+    if population > 1 and initial_actors and len(initial_actors) != population:
+        raise ValueError(
+            f"a population of {population} takes one initial actor per member or none "
+            f"at all; {len(initial_actors)} were given"
+        )
+    if len({artifact.expanduser().resolve() for artifact in initial_actors}) != len(initial_actors):
+        raise ValueError("each member needs its own initial actor; identical members score 0.5")
     model = production_model_config()
     ppo = production_ppo_config(update_compile_mode=update_compile_mode)
     command = [
@@ -212,24 +245,37 @@ def build_training_command(
                 str(calibration_decision),
             )
         )
+    # A population wave has no frozen or built-in lanes, so those flags are
+    # emitted as the absence they are rather than left at the single-learner
+    # values -- a command that named lanes the run never plays would be a false
+    # record of what ran. External evaluation is the opposite case and stays on:
+    # with no built-in lane and every in-wave number relative, it is the run's
+    # ONLY absolute measurement, and the one instrument that can see the
+    # pathology this scheme was built against -- a member's bank falling while
+    # its relative score rate rises. One worker probes every member from the
+    # durable checkpoint, which is why the cadence must stay a multiple of
+    # `PRODUCTION_CHECKPOINT_EVERY`.
+    league = population == 1
     command.extend(
         (
             "--device",
             "cuda",
+            "--population",
+            str(population),
             "--games",
-            str(PRODUCTION_SELF_PLAY_GAMES),
+            str(games),
             "--league-games",
-            str(PRODUCTION_LEAGUE_GAMES),
+            str(PRODUCTION_LEAGUE_GAMES if league else 0),
             "--league-active-opponents",
-            str(PRODUCTION_LEAGUE_ACTIVE_OPPONENTS),
+            str(PRODUCTION_LEAGUE_ACTIVE_OPPONENTS if league else 0),
             "--league-historical-opponents",
-            str(PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS),
+            str(PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS if league else 0),
             "--league-active-pool-size",
             str(PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE),
             "--league-builtin-opponents",
-            PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
+            PRODUCTION_LEAGUE_BUILTIN_OPPONENTS if league else "",
             "--league-builtin-lanes",
-            str(PRODUCTION_LEAGUE_BUILTIN_LANES),
+            str(PRODUCTION_LEAGUE_BUILTIN_LANES if league else 0),
             "--episode-steps",
             str(PRODUCTION_EPISODE_STEPS),
             "--temperature",
@@ -296,10 +342,12 @@ def build_training_command(
     command.extend(("--rollout-forward-mode", rollout_forward_mode))
     command.append("--rollout-bfloat16" if rollout_bfloat16 else "--no-rollout-bfloat16")
     command.extend(("--update-compile-mode", update_compile_mode))
-    if initial_actor is not None:
-        command.extend(("--init-actor-from", str(initial_actor)))
-        if critic_warmup_iterations is not None:
-            command.extend(("--critic-warmup-iterations", str(critic_warmup_iterations)))
+    # One flag per member, in agent order, since a population's members are
+    # distinguished only by which artifact each starts from.
+    for artifact in initial_actors:
+        command.extend(("--init-actor-from", str(artifact)))
+    if initial_actors and critic_warmup_iterations is not None:
+        command.extend(("--critic-warmup-iterations", str(critic_warmup_iterations)))
     if resume_checkpoint is not None:
         command.extend(("--resume", str(resume_checkpoint)))
     return command

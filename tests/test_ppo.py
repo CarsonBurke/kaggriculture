@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import copy
 import math
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,6 +21,7 @@ from kaggriculture.ppo import (
     UNCOMPILED_UPDATE_COMPILE_MODE,
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
+    _actor_batch_args,
     _balanced_minibatch_slices,
     _clipped_surrogate_sums,
     _epoch_value_losses,
@@ -29,6 +31,7 @@ from kaggriculture.ppo import (
     _target_correlation,
     _validate_config,
     _validate_staged_action_masks,
+    actor_forward_args,
     generalized_advantage_and_targets,
     make_optimizers,
     prepare_advantages,
@@ -37,7 +40,11 @@ from kaggriculture.ppo import (
     update_replay_parity,
 )
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
-from kaggriculture.rollout import collect_self_play
+from kaggriculture.rollout import (
+    _SHARED_ROLLOUT_FIELDS,
+    _TRAJECTORY_METADATA_FIELDS,
+    collect_self_play,
+)
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 
 
@@ -1156,6 +1163,37 @@ def test_behavior_value_replay_is_chunk_invariant_and_restores_mode() -> None:
         replay_behavior_values(critic, CONV_ENTITY, staged, chunk_size=0)
 
 
+def test_behavior_value_replay_can_be_restricted_to_named_states() -> None:
+    """A population member's critic is replayed on that member's rows alone.
+
+    The restriction is the saving that keeps N per-member updates at one
+    whole-wave critic pass between them instead of N. It must return exactly the
+    values a whole-wave pass produces, in the order asked for, and it has to
+    hold across chunk boundaries because the chunk is a memory bound rather than
+    a semantic one.
+    """
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        FarmActor(model_config), games=1, seed_start=95, episode_steps=4, sampling_seed=12
+    )
+    device = torch.device("cpu")
+    staged = {
+        "board": _stage_tensor(rollout.states["board"], device),
+        "critic_features": _stage_tensor(rollout.states["critic_features"], device),
+        "unit_actions": _stage_tensor(rollout.unit_actions, device),
+    }
+    whole_wave = replay_behavior_values(critic, CONV_ENTITY, staged)
+    selected = torch.tensor([4, 1, 0], dtype=torch.long)
+
+    restricted = replay_behavior_values(critic, CONV_ENTITY, staged, states=selected, chunk_size=2)
+
+    assert restricted.shape == (selected.numel(),)
+    torch.testing.assert_close(restricted, whole_wave[selected])
+
+
 def test_zero_actor_epochs_runs_a_critic_only_warmup_update(monkeypatch) -> None:
     """The warm-start phase fits the critic without touching a pretrained actor.
 
@@ -1621,3 +1659,232 @@ def test_the_audited_first_minibatch_kl_is_the_replay_to_update_residual() -> No
     # the whole point: these are not interchangeable measurements.
     assert replay < 1e-9
     assert sampling > replay
+
+
+def _population_wave() -> tuple[FarmActor, DistributionalCritic, object]:
+    """Two games' four trajectories, laid out the way a population wave stores them.
+
+    Game-major and seat-minor, so a member holding one seat of each game owns
+    rows 0 and 3: never a contiguous block, which is why the update partitions
+    on row indices instead of slicing the batch. Eight steps of a fresh game
+    leave every shaped reward near 1e-9, where an advantage normalizer divides
+    noise by noise, so the two members are given return scales a hundredfold
+    apart -- a pooled normalization then cannot be mistaken for a partitioned
+    one.
+    """
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    generator = np.random.default_rng(11)
+    for rows, scale in ((_QUIET_ROWS, 0.05), (_LOUD_ROWS, 5.0)):
+        rollout.rewards[rows] = generator.normal(
+            0.0, scale, size=(rows.size, rollout.horizon)
+        ).astype(np.float32)
+    return actor, critic, rollout
+
+
+#: One member's rows and the other's, in the layout `_population_wave` builds.
+_QUIET_ROWS = np.array([0, 3], dtype=np.int64)
+_LOUD_ROWS = np.array([1, 2], dtype=np.int64)
+
+
+def _trajectory_subset(rollout, rows: np.ndarray):
+    """A batch physically containing only `rows`, in that order."""
+    fields = {*_SHARED_ROLLOUT_FIELDS, *_TRAJECTORY_METADATA_FIELDS, "agents"}
+    return replace(
+        rollout,
+        states={name: array[rows] for name, array in rollout.states.items()},
+        **{field: getattr(rollout, field)[rows] for field in fields},
+    )
+
+
+def _partitioned_update(actor, critic, rollout, config: PpoConfig, rows: np.ndarray | None):
+    """One update on fresh copies of the pair, so the runs stay independent."""
+    run_actor = copy.deepcopy(actor)
+    run_critic = copy.deepcopy(critic)
+    actor_optimizer, critic_optimizer = make_optimizers(run_actor, run_critic, config)
+    metrics = update_ppo(
+        run_actor,
+        run_critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(4),
+        rows=rows,
+    )
+    return metrics, run_actor, run_critic
+
+
+def _same_weights(left: torch.nn.Module, right: torch.nn.Module) -> bool:
+    right_state = right.state_dict()
+    return all(torch.equal(value, right_state[name]) for name, value in left.state_dict().items())
+
+
+def test_a_partition_naming_every_row_is_the_unpartitioned_update_bit_for_bit() -> None:
+    """`rows=None` stays production's single-learner path and must not move.
+
+    A partition naming every row is the same states in the same order with the
+    same RNG draws, so it has to reproduce the unpartitioned update exactly --
+    every metric and every weight, not merely closely.
+    """
+    actor, critic, rollout = _population_wave()
+    config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
+
+    unpartitioned, pooled_actor, pooled_critic = _partitioned_update(
+        actor, critic, rollout, config, None
+    )
+    every_row, row_actor, row_critic = _partitioned_update(
+        actor, critic, rollout, config, np.arange(rollout.trajectories, dtype=np.int64)
+    )
+
+    assert every_row == unpartitioned
+    assert every_row["states"] == rollout.state_count
+    assert _same_weights(row_actor, pooled_actor)
+    assert _same_weights(row_critic, pooled_critic)
+
+
+def test_a_row_restricted_update_is_the_update_on_a_batch_of_only_those_rows() -> None:
+    """The partition must be a partition, not a reweighting.
+
+    Restricting two rows of a four-row wave in place must reproduce the update a
+    batch physically holding only those rows produces. Anything the other rows
+    still reach -- the advantage normalizer, the minibatch partition, the KL,
+    the critic's targets, any reported statistic -- differs here if it leaks.
+    """
+    actor, critic, rollout = _population_wave()
+    config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
+
+    restricted, restricted_actor, restricted_critic = _partitioned_update(
+        actor, critic, rollout, config, _QUIET_ROWS
+    )
+    physical, physical_actor, physical_critic = _partitioned_update(
+        actor, critic, _trajectory_subset(rollout, _QUIET_ROWS), config, None
+    )
+
+    assert restricted == physical
+    # Half the wave's states, so the restriction reached the sample index rather
+    # than merely the metrics computed off it.
+    assert restricted["states"] == rollout.state_count // 2
+    assert _same_weights(restricted_actor, physical_actor)
+    assert _same_weights(restricted_critic, physical_critic)
+
+
+def test_each_row_partition_normalizes_its_advantages_by_its_own_scale() -> None:
+    """Per-subset normalization is why a population partitions before it updates.
+
+    Two disjoint halves of one wave whose returns differ a hundredfold each come
+    out zero-mean and unit-variance. Pooled, the quiet half is divided by the
+    loud half's spread and reaches the surrogate at a fraction of the step size
+    its own returns call for.
+    """
+    _actor, _critic, rollout = _population_wave()
+    config = PpoConfig()
+    values = np.zeros(rollout.rewards.shape, dtype=np.float32)
+
+    quiet = prepare_advantages(rollout, values, config, rows=_QUIET_ROWS)
+    loud = prepare_advantages(rollout, values, config, rows=_LOUD_ROWS)
+    pooled = prepare_advantages(rollout, values, config)
+
+    for rows, prepared in ((_QUIET_ROWS, quiet), (_LOUD_ROWS, loud)):
+        owned = np.zeros(rollout.valid.shape, dtype=bool)
+        owned[rows] = rollout.valid[rows]
+        normalized = prepared.advantages[owned]
+        assert normalized.mean() == pytest.approx(0.0, abs=1e-5)
+        assert normalized.std() == pytest.approx(1.0, abs=1e-5)
+        # Rows the partition does not own carry no advantage at all, so nothing
+        # downstream can pick one up by indexing past its own share.
+        assert not prepared.advantages[~owned].any()
+
+    # The scales the partition keeps apart, and what pooling does to the quiet
+    # member: its advantages arrive at a fiftieth of unit variance.
+    assert loud.raw_advantage_std > 50.0 * quiet.raw_advantage_std
+    assert pooled.advantages[_QUIET_ROWS][rollout.valid[_QUIET_ROWS]].std() < 0.1
+
+
+def test_a_row_restricted_parity_audit_is_the_audit_of_only_those_rows() -> None:
+    """Every wave row was sampled by its own member's weights.
+
+    Auditing the whole wave through one member's actor measures the distance
+    between two policies and reports it as a staging defect, so the audit takes
+    the same row partition the update does -- and restricting in place must
+    equal auditing a batch that physically holds only those rows.
+    """
+    actor, _critic, rollout = _population_wave()
+    audit = {
+        "minibatch_size": 8,
+        "compile_mode": UNCOMPILED_UPDATE_COMPILE_MODE,
+        "autocast_enabled": False,
+    }
+
+    restricted = update_replay_parity(actor, rollout, **audit, rows=_QUIET_ROWS)
+    physical = update_replay_parity(actor, _trajectory_subset(rollout, _QUIET_ROWS), **audit)
+    whole_wave = update_replay_parity(actor, rollout, **audit)
+
+    assert restricted == physical
+    # The whole-wave audit is a different measurement over strictly more
+    # components, which is what makes the restriction load-bearing rather than
+    # cosmetic once those components belong to other members' policies.
+    assert (
+        whole_wave["update_replay_unit_active_count"]
+        > restricted["update_replay_unit_active_count"]
+    )
+
+
+def test_actor_forward_args_reproduce_the_staged_minibatch_arguments() -> None:
+    """Both actor-argument builders read one field and dtype table.
+
+    A second copy of that table is silent when it drifts: a swapped argument or
+    a narrowed dtype changes the logits without raising anything, so the
+    host-side builder is pinned against the staged one the update itself uses,
+    on both architectures.
+    """
+    device = torch.device("cpu")
+    conv_rollout = collect_self_play(
+        _small_update_models()[0], games=1, seed_start=98, episode_steps=4, sampling_seed=16
+    )
+    _structured_actor, structured_rollout = _structured_rollout_with_quantity_orders(
+        seed_start=205, sampling_seed=27
+    )
+    selected = np.array([0, 3], dtype=np.int64)
+
+    def flattened(args) -> list[torch.Tensor]:
+        """The argument tuple's tensors, entering the structured named tuple."""
+        return [
+            tensor for value in args for tensor in (value if isinstance(value, tuple) else (value,))
+        ]
+
+    for architecture, rollout in ((CONV_ENTITY, conv_rollout), (STRUCTURED, structured_rollout)):
+        # The structured actor's unit mask is a shared rollout field rather than
+        # a state field, and the update stages it beside the states.
+        source = {**rollout.states, "unit_active": rollout.unit_active}
+        staged = {name: _stage_tensor(array, device) for name, array in source.items()}
+        host_states = {
+            name: array.reshape(-1, *array.shape[2:])[selected] for name, array in source.items()
+        }
+
+        host = flattened(actor_forward_args(architecture, host_states, device))
+        minibatch = flattened(_actor_batch_args(architecture, staged, torch.from_numpy(selected)))
+
+        assert len(host) == len(minibatch) > 0
+        for left, right in zip(host, minibatch, strict=True):
+            assert left.dtype == right.dtype
+            assert torch.equal(left, right)
+
+
+def test_an_unknown_architecture_is_refused_with_the_known_names() -> None:
+    """A `KeyError` naming a dict key is not something a caller can act on.
+
+    Both actor-argument builders fail on an unregistered architecture rather
+    than guessing at one, and they name the alternatives the way
+    `resolve_architecture` does.
+    """
+    builders = (
+        lambda: actor_forward_args("entity-mlp", {}, torch.device("cpu")),
+        lambda: _actor_batch_args("entity-mlp", {}, slice(None)),
+    )
+
+    for builder in builders:
+        with pytest.raises(ValueError, match="unknown actor architecture 'entity-mlp'") as raised:
+            builder()
+        assert CONV_ENTITY in str(raised.value)
+        assert STRUCTURED in str(raised.value)

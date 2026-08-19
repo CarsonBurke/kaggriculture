@@ -46,6 +46,19 @@ def _training_script():
     return module
 
 
+# The population every population check is exercised at: the plan's default, and
+# the number that decides whether the per-agent facets fit. Every category is
+# reported once per agent, so a facet joining the chart name instead of the
+# category would multiply each accordion by this.
+_POPULATION = 4
+
+# The largest population the matrix layout claims to hold for. A row of the
+# head-to-head matrix is N-1 charts, so ten is the last size whose rows fit the
+# nine-chart budget; the layout says so in a comment, and the budget check below
+# is where that claim is actually measured.
+_LARGEST_BUDGETED_POPULATION = 10
+
+
 def test_training_jsonl_migration_is_idempotent_and_rebuilds_after_append(tmp_path: Path) -> None:
     journal = tmp_path / "metrics.jsonl"
     log_dir = tmp_path / "tensorboard"
@@ -504,6 +517,156 @@ def test_a_cohort_is_a_category_so_one_mirror_stays_one_event_file(tmp_path: Pat
     assert _scalars(log_dir, "economy-league/money_median") == [(1, 0.0)]
 
 
+def _pair_value(agent: int, opponent: int) -> float:
+    """A distinct reading per pair, exact in binary so the event file returns it."""
+    return agent / 8.0 + opponent / 64.0
+
+
+def _population_record(iteration: int) -> dict:
+    """One iteration of a population run, as the training loop journals it.
+
+    The disagreement matrix is written for every ordered pair, which is how a
+    caller holding a symmetric matrix would walk it; the builder folds each pair
+    onto one field, so the record carries six entries rather than twelve.
+    """
+    record: dict = {"iteration": iteration, "score_rate": 0.5}
+    for index in range(_POPULATION):
+        record[telemetry.population_agent_field(index, "value_loss")] = 0.5 * index
+        record[telemetry.population_agent_field(index, "score_rate")] = 0.25 * index
+    for agent in range(_POPULATION):
+        for opponent in range(_POPULATION):
+            if agent == opponent:
+                continue
+            record[telemetry.population_head_to_head_field(agent, opponent)] = _pair_value(
+                agent, opponent
+            )
+            record[telemetry.population_disagreement_pair_field(agent, opponent)] = _pair_value(
+                min(agent, opponent), max(agent, opponent)
+            )
+    record[telemetry.population_disagreement_field("mean")] = 0.75
+    record[telemetry.population_disagreement_field("min")] = 0.5
+    return record
+
+
+def test_a_symmetric_matrix_is_named_once_and_neither_matrix_has_a_diagonal() -> None:
+    """The two builders differ exactly where the two matrices differ.
+
+    Disagreement is symmetric, so both orderings of a pair name one field and the
+    reading is published once; a score rate is asymmetric, so they name two. And
+    neither matrix has a diagonal to publish -- `rollout.population_pairings`
+    seats no member against itself and a policy's disagreement with itself is zero
+    by construction -- so a `vs_agent2` chart in agent 2's own row could only be a
+    caller's bug, arriving as a measurement.
+    """
+    assert telemetry.population_disagreement_pair_field(
+        3, 1
+    ) == telemetry.population_disagreement_pair_field(1, 3)
+    assert telemetry.population_head_to_head_field(3, 1) != telemetry.population_head_to_head_field(
+        1, 3
+    )
+    for builder in (
+        telemetry.population_head_to_head_field,
+        telemetry.population_disagreement_pair_field,
+    ):
+        with pytest.raises(ValueError):
+            builder(2, 2)
+
+
+def test_a_population_reading_nobody_filed_stays_visible() -> None:
+    """A reading added later must land where a person will notice it.
+
+    The matrices are recognized by name and only their indices are parsed, so a
+    two-word reading keeps its whole name as the chart and a field naming neither
+    matrix keeps the bare category. Recovering the matrix from the end of the name
+    instead would file `disagreement_mean_first_iteration` under
+    `population-disagreement-mean`, one sort position from the real category and
+    indistinguishable from a category somebody meant.
+    """
+    reading = telemetry.population_disagreement_field("mean_first_iteration")
+    assert telemetry._placement(reading) == ("", "population-disagreement/mean_first_iteration")
+    assert telemetry._placement("population_cycle_length") == ("", "population/cycle_length")
+
+
+def test_a_population_run_facets_every_agent_and_stays_one_event_file(tmp_path: Path) -> None:
+    """Four concurrent learners report the same categories four times over.
+
+    The agent joins the category, so `critic-agent0` is an accordion of the size
+    `critic` has for a single learner, and the wave's own reading keeps the tag it
+    always had. A facet dropped in any one branch of the placement rules would put
+    one agent's curve on top of that shared tag, where two series at one step
+    render as a single plausible noisy line.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    records = [_population_record(iteration) for iteration in (1, 2)]
+
+    # Through the live mirror rather than a rebuild, because that is the writer a
+    # run actually uses and the one that would open a directory per agent. The
+    # journal is appended to before each record, as the loop appends before it
+    # mirrors.
+    mirror = TensorboardMirror(journal, log_dir)
+    for index, record in enumerate(records, start=1):
+        _write_jsonl(journal, records[:index])
+        mirror.record(record)
+    mirror.close()
+
+    # Four learners, still one event file: no run is opened per agent, so a parent
+    # `--logdir` shows one selector row for the run however large N is.
+    assert [path.parent for path in log_dir.rglob("events.out.tfevents.*")] == [log_dir]
+    steps = (1, 2)
+    assert _scalars(log_dir, "outcome-wave/score_rate") == [(step, 0.5) for step in steps]
+    for index in range(_POPULATION):
+        assert _scalars(log_dir, f"critic-agent{index}/value_loss") == [
+            (step, 0.5 * index) for step in steps
+        ]
+        assert _scalars(log_dir, f"outcome-wave-agent{index}/score_rate") == [
+            (step, 0.25 * index) for step in steps
+        ]
+    # Nothing per-agent fell through to the category of last resort.
+    assert not any(tag.startswith("misc") for tag in _tags(log_dir))
+
+
+def test_the_population_category_carries_the_matrix_and_both_disagreement_readings(
+    tmp_path: Path,
+) -> None:
+    """Cycling and convergence are visible here and nowhere else.
+
+    Every reward in a population wave is relative, so a three-cycle among four
+    learners and a population that has collapsed into one policy both read 0.5 on
+    every other chart. The score rate is asymmetric -- seat and opponent order
+    both move it -- so all twelve ordered pairs are charted; the disagreement
+    matrix is symmetric with a zero diagonal, so its six distinct pairs are the
+    whole of it and the mirror image is not written at all.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    _write_jsonl(journal, [_population_record(1)])
+
+    migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    for agent in range(_POPULATION):
+        for opponent in range(_POPULATION):
+            if agent == opponent:
+                continue
+            assert _scalars(log_dir, f"population-score-rate-agent{agent}/vs_agent{opponent}") == [
+                (1, _pair_value(agent, opponent))
+            ]
+    assert {tag for tag in _tags(log_dir) if tag.startswith("population-disagreement-")} == {
+        f"population-disagreement-agent{low}/vs_agent{high}"
+        for low in range(_POPULATION)
+        for high in range(low + 1, _POPULATION)
+    }
+    for low in range(_POPULATION):
+        for high in range(low + 1, _POPULATION):
+            assert _scalars(log_dir, f"population-disagreement-agent{low}/vs_agent{high}") == [
+                (1, _pair_value(low, high))
+            ]
+    # The two readings the convergence gate is set from, in the matrix's own
+    # category rather than one agent's facet: neither belongs to a member.
+    assert _scalars(log_dir, "population-disagreement/mean") == [(1, 0.75)]
+    assert _scalars(log_dir, "population-disagreement/min") == [(1, 0.5)]
+
+
 def test_every_field_is_placed_and_an_unrecognized_one_stays_visible(tmp_path: Path) -> None:
     """A field nobody filed must land somewhere a person will notice it.
 
@@ -597,6 +760,7 @@ def _mirrored_field_names() -> list[str]:
             final_money=np.zeros(trajectories, dtype=np.float32),
             opponent_money=np.zeros(trajectories, dtype=np.float32),
             seats=np.asarray([0, 1], dtype=np.int8),
+            agents=np.zeros(trajectories, dtype=np.int64),
             entropy_sums=np.zeros((trajectories, horizon), dtype=np.float32),
             elapsed_seconds=1.0,
         )
@@ -639,6 +803,49 @@ def _mirrored_field_names() -> list[str]:
     )
 
 
+def _population_field_names(population: int = _POPULATION) -> list[str]:
+    """Field names a population run adds to the ones above.
+
+    A per-agent twin of every field, both matrices in full, and the whole-
+    population disagreement readings. Every one is built with the helper the
+    training loop builds it with, so a change to a prefix moves both sides or
+    fails here, rather than filing one agent's curves in `misc` while every other
+    check stays green.
+
+    `dict.fromkeys` because the disagreement matrix is symmetric: walking every
+    ordered pair asks for each distinct pair twice and is answered with one field
+    name, which is the property that keeps the mirror image off the charts.
+    """
+    shared = _mirrored_field_names()
+    return list(
+        dict.fromkeys(
+            (
+                *(
+                    telemetry.population_agent_field(index, name)
+                    for index in range(population)
+                    for name in shared
+                ),
+                *(
+                    builder(agent, opponent)
+                    for builder in (
+                        telemetry.population_head_to_head_field,
+                        telemetry.population_disagreement_pair_field,
+                    )
+                    for agent in range(population)
+                    for opponent in range(population)
+                    if agent != opponent
+                ),
+                *(
+                    telemetry.population_disagreement_field(reading)
+                    # `floor` is the iteration-0 reference the convergence gate is
+                    # set from, charted beside the readings it bounds.
+                    for reading in ("mean", "min", "floor")
+                ),
+            )
+        )
+    )
+
+
 def test_no_two_fields_share_one_run_and_tag() -> None:
     """A collision is silent: two series at the same step render as one line.
 
@@ -646,7 +853,7 @@ def test_no_two_fields_share_one_run_and_tag() -> None:
     curve that is actually two different measurements interleaved.
     """
     seen: dict[tuple[str, str], str] = {}
-    for name in _mirrored_field_names():
+    for name in (*_mirrored_field_names(), *_population_field_names()):
         placement = telemetry._placement(name)
         if placement is None:
             continue
@@ -668,10 +875,27 @@ def test_no_category_grows_past_the_readable_budget() -> None:
     thing this mirror writes, and it is where the worst of this was: its
     scalars used to be tagged `{kind}/{mode}/games_{n}/{name}`, which is one
     category holding all 63 of them.
+
+    A population of four is counted alongside the single learner, because that
+    is where a misplaced facet is fatal rather than merely untidy: the agent
+    joins the category, so each of its accordions keeps the size it has for one
+    learner. Joining the chart name instead would collect every agent's copy
+    under one first path segment -- `parity-unit` from seven charts to
+    thirty-five, and `population-score-rate` over budget on the ordered pairs
+    alone, twelve of them at four agents. Ten is counted as well, being the size
+    the matrix layout claims to hold to: a row is N-1 charts, so that claim is a
+    measurement here and not a hope.
     """
     benchmark_run = telemetry._BENCHMARK_BATCH_RUN.format(kind="ppo", mode="eager", games=112)
+    populations = (_POPULATION, _LARGEST_BUDGETED_POPULATION)
+    names = dict.fromkeys(
+        (
+            *_mirrored_field_names(),
+            *(name for size in populations for name in _population_field_names(size)),
+        )
+    )
     counts: dict[tuple[str, str], int] = {}
-    for name in _mirrored_field_names():
+    for name in names:
         placement = telemetry._placement(name)
         if placement is None:
             continue

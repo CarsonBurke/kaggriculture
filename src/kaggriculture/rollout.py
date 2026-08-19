@@ -12,7 +12,14 @@ import torch
 from kaggle_environments import make
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
-from kaggriculture.constants import BOARD_SIZE, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.constants import (
+    BOARD_SIZE,
+    CROPS,
+    EPISODE_STEPS,
+    MAX_MARKET_ORDERS,
+    MAX_UNITS,
+    PRODUCTS,
+)
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
@@ -75,6 +82,11 @@ class RolloutBatch:
     final_money: np.ndarray
     opponent_money: np.ndarray
     seats: np.ndarray
+    # Which population member sampled the row. A single-learner wave stores
+    # zeros; a population wave stores the pairing schedule's agent index, and
+    # the update partitions on it so one member's advantage scale never
+    # normalizes another's.
+    agents: np.ndarray
     entropy_sums: np.ndarray
     elapsed_seconds: float
 
@@ -223,6 +235,7 @@ def _finish_rollout(
     final_money: np.ndarray,
     opponent_money: np.ndarray,
     seats: np.ndarray,
+    agents: np.ndarray,
     entropy_sums: np.ndarray,
     started: float,
 ) -> RolloutBatch:
@@ -237,6 +250,7 @@ def _finish_rollout(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
+        agents=agents,
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -712,25 +726,30 @@ def _rollout_model_forward(
     `inductor` while that boolean was false silently got an eager forward, and a
     run's provenance would record a configuration it did not execute. One knob
     cannot contradict itself, so `eager` is spelled as a mode rather than as the
-    absence of a flag. The frozen league ensemble takes the same mode, so a
-    league wave cannot end up compiling one of its two forwards and not the
-    other.
+    absence of a flag. The stacked ensemble takes the same mode, so a wave
+    cannot end up compiling one of its two forwards and not the other.
     """
     if mode == "eager" or _leading_tensor(inputs).device.type != "cuda":
         return model(*inputs)
     return _cached_compiled_forward(model, mode)(*inputs)
 
 
-class _StackedFrozenEnsemble:
-    """One batched forward over every frozen league seat via stacked weights.
+class _StackedActorEnsemble:
+    """One batched forward over several same-architecture actors via stacked weights.
 
-    League opponents share an architecture but not weights. Stacking their
-    parameters lane-wise and running a single vmapped functional call replaces
-    the per-opponent forward loop, so the whole frozen side of a mixed wave is
-    one large kernel sequence instead of several small ones. Instances persist
-    for the process and are refilled in place each collection call: a captured
-    CUDA graph keeps reading current weights at stable addresses without any
+    The lanes share an architecture but not weights. Stacking their parameters
+    lane-wise and running a single vmapped functional call replaces the
+    per-model forward loop, so a whole multi-model side of a wave is one large
+    kernel sequence instead of several small ones. Instances persist for the
+    process and are refilled in place each collection call: a captured CUDA
+    graph keeps reading current weights at stable addresses without any
     per-step parameter copies.
+
+    Nothing here requires the lanes be frozen, which is what lets a population
+    wave run every concurrently learning member through it: rollout takes no
+    gradient, and the update replays the stored actions through the plain
+    module. The in-place refill reads live weights exactly as it reads a
+    snapshot's.
     """
 
     def __init__(self, models: Sequence[FarmActor | StructuredActor]) -> None:
@@ -776,15 +795,17 @@ class _StackedFrozenEnsemble:
         return torch.vmap(run)(self.params, self.buffers, *inputs)
 
     def __call__(self, *inputs: Any, mode: str) -> ActorOutput:
-        """Run every frozen league seat under the same mode as the learner.
+        """Run every stacked lane under the same mode as the learner forward.
 
         A league wave runs this forward once per step in addition to the
-        learner's, so leaving it on a backend the learner abandoned would cap the
-        collection speedup at whatever fraction of steps are pure self-play. It
-        takes the same mode for the same measured reason: `cudagraphs` is slower
-        here than not compiling, because this forward is limited by per-kernel
-        overhead rather than launch cost, and only fusion reduces the kernel
-        count.
+        learner's, and a population wave runs it as the only forward, so leaving
+        it on a backend the learner abandoned would cap the collection speedup
+        at whatever fraction of steps are pure self-play -- and in a population
+        wave it would set every stored row's behavior policy from a path the
+        update does not replay. It takes the same mode for the same measured
+        reason: `cudagraphs` is slower here than not compiling, because this
+        forward is limited by per-kernel overhead rather than launch cost, and
+        only fusion reduces the kernel count.
         """
         leading = _leading_tensor(inputs)
         if mode == "eager" or leading.device.type != "cuda":
@@ -808,18 +829,18 @@ class _StackedFrozenEnsemble:
         return compiled(*inputs)
 
 
-_FROZEN_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedFrozenEnsemble] = {}
+_STACKED_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedActorEnsemble] = {}
 
 
-def _stacked_frozen_ensemble(
+def _stacked_actor_ensemble(
     models: Sequence[FarmActor | StructuredActor],
-) -> _StackedFrozenEnsemble:
-    """Fetch or build the persistent stacked ensemble for these league lanes."""
+) -> _StackedActorEnsemble:
+    """Fetch or build the persistent stacked ensemble for these lanes."""
     key = (type(models[0]), models[0].config, len(models), next(models[0].parameters()).device)
-    ensemble = _FROZEN_ENSEMBLE_CACHE.get(key)
+    ensemble = _STACKED_ENSEMBLE_CACHE.get(key)
     if ensemble is None:
-        ensemble = _StackedFrozenEnsemble(models)
-        _FROZEN_ENSEMBLE_CACHE[key] = ensemble
+        ensemble = _StackedActorEnsemble(models)
+        _STACKED_ENSEMBLE_CACHE[key] = ensemble
     else:
         ensemble.load(models)
     return ensemble
@@ -963,6 +984,7 @@ def _native_batch(
     final_money: np.ndarray,
     opponent_money: np.ndarray,
     seats: np.ndarray,
+    agents: np.ndarray,
     entropy_sums: np.ndarray,
     started: float,
 ) -> RolloutBatch:
@@ -975,6 +997,7 @@ def _native_batch(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
+        agents=agents,
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -1173,7 +1196,7 @@ def collect_mixed_play_rust(
         # captured CUDA graph survives the next draw. Their logits are never
         # read. A wave with no frozen network at all runs no ensemble.
         ensemble = (
-            _stacked_frozen_ensemble(
+            _stacked_actor_ensemble(
                 [opponents[min(index, len(opponents) - 1)] for index in active_indices]
             )
             if opponents
@@ -1331,6 +1354,217 @@ def collect_mixed_play_rust(
                 league_seats.astype(np.int8),
             ]
         ),
+        agents=np.zeros(trajectories, dtype=np.int64),
+        entropy_sums=entropy_sums,
+        started=started,
+    )
+
+
+def population_pairings(population: int, games: int) -> np.ndarray:
+    """Enumerate the balanced round-robin seating of a concurrent population.
+
+    Row ``g`` is ``(seat 0 agent, seat 1 agent)`` for game ``g``. Every ordered
+    pair of distinct members appears the same number of times, so each member
+    meets every opponent equally often on both seats and the seat *counts*
+    cancel exactly rather than in expectation -- which is why the schedule is
+    enumerated instead of sampled, and why `games` must be a positive multiple
+    of `population * (population - 1)`. No row ever seats a member against
+    itself: `_relative_score` is identically zero for equal banks, so a mirror
+    game cannot move the objective at all.
+
+    The map behind a pairing does not cancel with the counts. Game ``g`` takes
+    seed ``seed_start + g`` and `games` is a multiple of the pair count, so a
+    caller advancing `seed_start` by a wave keeps every ordered pair on one
+    fixed residue class of seeds forever, and (i, j) is compared with (j, i)
+    across disjoint seed streams. Both seats of a game start from identical
+    farms and banks, so this is a difference in maps drawn, not in advantage.
+
+    This is the only place the schedule is decided. The wave, the per-agent
+    update partition and the head-to-head telemetry all read the same rows.
+    """
+    if population < 2:
+        raise ValueError("a population wave needs at least two agents")
+    orderings = population * (population - 1)
+    if games < 1 or games % orderings:
+        raise ValueError(
+            f"a population of {population} needs games to be a positive multiple of {orderings}"
+        )
+    ordered = np.asarray(
+        [
+            (first, second)
+            for first in range(population)
+            for second in range(population)
+            if first != second
+        ],
+        dtype=np.int64,
+    )
+    return np.tile(ordered, (games // orderings, 1))
+
+
+@torch.inference_mode()
+def collect_population_play_rust(
+    actors: Sequence[FarmActor | StructuredActor],
+    *,
+    games: int,
+    seed_start: int,
+    episode_steps: int = EPISODE_STEPS,
+    temperature: float = 1.0,
+    sampling_seed: int = 0,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
+    storage: dict[str, np.ndarray] | None = None,
+) -> RolloutBatch:
+    """Collect one wave in which every seat is a concurrently learning member.
+
+    Both seats belong to learners and both are stored, so a wave of `games`
+    returns `2 * games` trajectories in the native batch's own game-major,
+    seat-minor order: `agents[2 * g]` is the seat 0 member of game `g` and
+    `agents[2 * g + 1]` its seat 1 member, matching
+    `population_pairings(len(actors), games)` row for row. There is no frozen
+    lane, no built-in lane and no mirror pairing anywhere in the wave.
+
+    One stacked-ensemble forward covers every row, with lane index equal to
+    agent index. That is strictly less work than the mixed league wave it
+    replaces, which runs the learner's rows and the frozen ensemble's rows as
+    two forwards per step: this is one launch sequence at the same total width.
+    The balanced schedule gives every member exactly the same number of rows,
+    so the lanes need none of the padding an uneven league mix needs.
+
+    Rollouts capture only behavior policy state. Value predictions for GAE are
+    replayed from the stored features at update time, where the critic weights
+    are still exactly the behavior weights.
+    """
+    actors = tuple(actors)
+    population = len(actors)
+    if games < 1:
+        raise ValueError("games must be positive")
+    if episode_steps != EPISODE_STEPS:
+        raise ValueError("the native simulator currently supports the competition horizon 720")
+    _validate_learner_temperature(temperature)
+    pairings = population_pairings(population, games)
+    started = time.perf_counter()
+    for member in actors:
+        member.eval()
+    device = next(actors[0].parameters()).device
+    if any(next(member.parameters()).device != device for member in actors):
+        raise ValueError("every population member must use the same device")
+    if any(
+        type(member) is not type(actors[0]) or member.config != actors[0].config
+        for member in actors
+    ):
+        raise ValueError("every population member must use the same model configuration")
+    architecture = architecture_of(actors[0]).name
+
+    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
+    environment = load_native().BatchEnv(seeds)
+    rows = games * 2
+    horizon = episode_steps - 1
+    fields = _native_rollout_storage(storage, architecture, rows, horizon)
+    encoded_wave = _native_wave(architecture, environment, device)
+    encoded = encoded_wave.arrays
+    sampled = environment.sample_buffers()
+
+    # The native wave is already game-major and seat-minor, so the schedule
+    # flattens straight into the per-row agent index the sampler wants as its
+    # quantity-head selector and the update wants as its partition.
+    agents = pairings.reshape(-1)
+    kind_gate, quantity_values, quantity_bias = _quantity_heads(actors)
+    head_ids = agents.astype(np.uint16)
+    deterministic_rows = np.zeros(rows, dtype=np.bool_)
+    temperatures = np.full(rows, temperature, dtype=np.float32)
+    builtin_agents = np.zeros(rows, dtype=np.uint8)
+    generator = np.random.default_rng(sampling_seed)
+    entropy_sums = np.zeros(rows, dtype=np.float64)
+    pair_rows = np.arange(rows, dtype=np.int64) ^ 1
+    final = None
+    packed_transfer: _PackedTransfer | None = None
+
+    ensemble = _stacked_actor_ensemble(actors)
+    # Equal row counts per member mean a stable sort by agent folds the wave
+    # into full lanes, so the ensemble's shape is fixed by the population size
+    # alone and a captured CUDA graph survives every later wave. The scatter
+    # back is the inverse of that gather; every row is written each step, which
+    # is why the staging buffers below need no initialization.
+    lane_width = rows // population
+    lane_rows = np.argsort(agents, kind="stable")
+    # `_lane_view_inputs` folds with a `view`, so an unbalanced schedule would
+    # mis-group the lanes silently rather than fail: a member's rows would
+    # replay under another's weights, and stored behavior log-probabilities
+    # that belong to the wrong policy look exactly like ordinary data.
+    if not (np.bincount(agents, minlength=population) == lane_width).all():
+        raise ValueError("a population wave needs the same row count for every member")
+    lane_tensor = torch.as_tensor(lane_rows, device=device)
+    unit_logits = np.empty((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
+    kind_logits = np.empty((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
+    quantity_context = np.empty(
+        (rows, MAX_MARKET_ORDERS, actors[0].config.quantity_rank), dtype=np.float32
+    )
+    autocast_forward = forward_autocast and device.type == "cuda"
+    compiled_forward = forward_mode != "eager"
+
+    for step in range(horizon):
+        encoded_wave.refresh(environment)
+        encoded_wave.copy_to_device()
+        _mark_cuda_graph_step(device, compiled_forward)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+            lane_output = ensemble(
+                *_lane_view_inputs(encoded_wave.inputs(), lane_tensor, population, lane_width),
+                mode=forward_mode,
+            )
+        output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+        host_outputs, packed_transfer = _packed_outputs_to_host((output,), packed_transfer)
+        (host,) = host_outputs
+        for destination, values in zip(
+            (unit_logits, kind_logits, quantity_context),
+            (host.unit_logits, host.market_kind_logits, host.market_quantity_context),
+            strict=True,
+        ):
+            destination[lane_rows] = values
+        unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+        environment.sample_and_step_into(
+            unit_logits,
+            kind_logits,
+            quantity_context,
+            kind_gate,
+            quantity_values,
+            quantity_bias,
+            head_ids,
+            unit_draws,
+            kind_draws,
+            quantity_draws,
+            deterministic_rows,
+            temperatures,
+            builtin_agents,
+            sampled,
+        )
+        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        _store_native_wave(
+            architecture, fields, step, encoded, sampled, rewards, slice(None), pair_rows
+        )
+        counts = (
+            np.asarray(sampled["unit_active"]).sum(axis=1)
+            + np.asarray(sampled["market_active"]).sum(axis=1)
+            + np.asarray(sampled["market_quantity_active"]).sum(axis=1)
+        )
+        entropy_sums += np.asarray(sampled["entropy"]) * counts
+        dones = np.asarray(sampled["dones"], dtype=np.bool_)
+        if step + 1 < horizon and dones.any():
+            raise RuntimeError("native rollout terminated before the competition horizon")
+        if step + 1 == horizon and not dones.all():
+            raise RuntimeError("native rollout did not terminate at the competition horizon")
+        final = np.asarray(sampled["final_money"], dtype=np.float32)
+
+    assert final is not None
+    # Copied off the native buffer rather than viewed: the batch outlives this
+    # environment, and a view would keep the whole simulator batch alive.
+    return _native_batch(
+        architecture,
+        fields,
+        episode_seeds=np.repeat(seeds.astype(np.int64), 2),
+        final_money=np.array(final.reshape(-1)),
+        opponent_money=np.array(final[:, ::-1].reshape(-1)),
+        seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
+        agents=agents,
         entropy_sums=entropy_sums,
         started=started,
     )
@@ -1533,6 +1767,7 @@ def collect_self_play(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
+        agents=np.zeros(trajectories, dtype=np.int64),
         entropy_sums=entropy_sums,
         started=started,
     )
@@ -1650,6 +1885,7 @@ def collect_frozen_opponent_play(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=seats,
+        agents=np.zeros(games, dtype=np.int64),
         entropy_sums=entropy_sums,
         started=started,
     )
@@ -1660,6 +1896,7 @@ _TRAJECTORY_METADATA_FIELDS = (
     "final_money",
     "opponent_money",
     "seats",
+    "agents",
     "entropy_sums",
 )
 

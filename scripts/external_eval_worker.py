@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 
+from kaggriculture.inference import load_actor_artifact
 from kaggriculture.league import load_actor_snapshot, snapshot_sha256
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.policy import act_batch
@@ -55,9 +56,27 @@ class GameOutcome:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", type=Path, required=True, help="immutable league snapshot")
+    parser.add_argument(
+        "--artifact",
+        type=Path,
+        required=True,
+        help=(
+            "immutable actor source to evaluate: a league snapshot for a single-learner "
+            "run, or a durable training checkpoint when --agents names members"
+        ),
+    )
     parser.add_argument("--iteration", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True, help="JSONL journal to append to")
+    parser.add_argument(
+        "--agents",
+        default="",
+        help=(
+            "comma-separated member indices to evaluate from a population checkpoint; "
+            "empty evaluates the artifact's single actor. Members run sequentially in "
+            "one process, because N concurrent CPU workers would contend with each "
+            "other and with training for cores this probe is not entitled to"
+        ),
+    )
     parser.add_argument(
         "--opponents",
         default="starter,public-v27",
@@ -133,8 +152,9 @@ def evaluate_opponent(
     runnable: str,
     *,
     iteration: int,
-    snapshot_name: str,
-    snapshot_digest: str,
+    artifact_name: str,
+    artifact_digest: str,
+    member: int | None,
     seeds: range,
     episode_steps: int,
 ) -> dict[str, Any]:
@@ -146,8 +166,12 @@ def evaluate_opponent(
     record: dict[str, Any] = {
         "event": "external_eval",
         "iteration": iteration,
-        "snapshot": snapshot_name,
-        "snapshot_sha256": snapshot_digest,
+        "artifact": artifact_name,
+        "artifact_sha256": artifact_digest,
+        # Which population member this row measures. Present and null for a
+        # single-learner run, so a reader never has to guess whether a missing
+        # key means "one learner" or "an older worker that did not record it".
+        "agent": member,
         "opponent": label,
         # The runnable, not the label, decides identity: a file opponent named
         # like a built-in still gets its digest recorded.
@@ -193,6 +217,41 @@ def append_record(output: Path, record: dict[str, Any]) -> str:
     return rendered
 
 
+def _members(spec: str) -> list[int | None]:
+    """Member indices to evaluate, or a single unnamed actor.
+
+    An empty spec is a single-learner run reading a league snapshot; anything
+    else names members inside one population checkpoint. Duplicates would write
+    two rows a reader must then deduplicate on a key it cannot distinguish, so
+    they are refused rather than tolerated.
+    """
+    if not spec.strip():
+        return [None]
+    members = [int(part) for part in spec.split(",") if part.strip()]
+    if not members:
+        raise ValueError("--agents was given but named no member")
+    if len(set(members)) != len(members):
+        raise ValueError(f"--agents names a member twice: {spec}")
+    if any(member < 0 for member in members):
+        raise ValueError(f"--agents names a negative member: {spec}")
+    return list(members)
+
+
+def _load_member(artifact: Path, member: int | None) -> Any:
+    """Load one actor: a league snapshot, or one member of a checkpoint.
+
+    Two explicit paths for two explicit inputs. A population checkpoint holds a
+    list of members and cannot answer "the actor" at all, which is why the
+    loader demands the index rather than defaulting to the first -- silently
+    evaluating member 0 and reporting it as the run's strength is the failure
+    this refuses.
+    """
+    if member is None:
+        return load_actor_snapshot(artifact)
+    actor, _ = load_actor_artifact(artifact, agent=member)
+    return actor
+
+
 def main() -> None:
     args = parse_args()
     if args.seeds < 1 or args.episode_steps < 2:
@@ -201,25 +260,31 @@ def main() -> None:
     opponents = [normalize_opponent(spec) for spec in args.opponents.split(",") if spec]
     if not opponents:
         raise ValueError("at least one opponent is required")
-    actor = load_actor_snapshot(args.snapshot)
-    actor.eval()
-    digest = snapshot_sha256(args.snapshot)
+    members = _members(args.agents)
+    digest = snapshot_sha256(args.artifact)
 
-    def agent(observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(actor, [observation], deterministic=True).actions[0]
+    for member in members:
+        actor = _load_member(args.artifact, member).eval()
 
-    for label, runnable in opponents:
-        record = evaluate_opponent(
-            agent,
-            label,
-            runnable,
-            iteration=args.iteration,
-            snapshot_name=args.snapshot.name,
-            snapshot_digest=digest,
-            seeds=range(args.seed_start, args.seed_start + args.seeds),
-            episode_steps=args.episode_steps,
-        )
-        print(append_record(args.output, record), flush=True)
+        def agent(observation: dict[str, Any], actor: Any = actor) -> dict[str, Any]:
+            # `actor` is bound as a default rather than closed over: the loop
+            # rebinds it, and a late-binding closure would evaluate the last
+            # member N times under N different labels.
+            return act_batch(actor, [observation], deterministic=True).actions[0]
+
+        for label, runnable in opponents:
+            record = evaluate_opponent(
+                agent,
+                label,
+                runnable,
+                iteration=args.iteration,
+                artifact_name=args.artifact.name,
+                artifact_digest=digest,
+                member=member,
+                seeds=range(args.seed_start, args.seed_start + args.seeds),
+                episode_steps=args.episode_steps,
+            )
+            print(append_record(args.output, record), flush=True)
 
 
 if __name__ == "__main__":

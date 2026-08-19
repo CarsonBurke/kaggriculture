@@ -6,7 +6,8 @@ import json
 import os
 import random
 import tempfile
-from dataclasses import asdict
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ import torch
 
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
-from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
+from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import (
@@ -32,6 +33,47 @@ AnyActor = FarmActor | StructuredActor
 AnyCritic = DistributionalCritic | StructuredCritic
 AnyModelConfig = ModelConfig | StructuredConfig
 
+#: The four states one member of the population owns. Kept together because they
+#: are only ever saved and restored as a set: a critic restored without its
+#: optimizer refits from a cold moment estimate, which is the same silent
+#: half-resume the format version exists to prevent.
+AGENT_STATE_KEYS = ("actor", "critic", "actor_optimizer", "critic_optimizer")
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingAgent:
+    """One population member's live modules and optimizer pair.
+
+    A single learner is a population of one, so the checkpoint API takes a
+    sequence of these rather than a bare actor/critic pair and there is exactly
+    one code path to keep correct. The optimizers are optional only because
+    evaluation-side readers restore weights without ever stepping them.
+    """
+
+    actor: AnyActor
+    critic: AnyCritic
+    actor_optimizer: torch.optim.Optimizer | None = None
+    critic_optimizer: torch.optim.Optimizer | None = None
+
+    def state(self) -> dict[str, Any]:
+        """This member's four states in the layout the payload stores them in."""
+        if self.actor_optimizer is None or self.critic_optimizer is None:
+            raise ValueError("a checkpointed agent needs both of its optimizers")
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+        }
+
+
+def checkpoint_agent_states(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every member's states, in agent order, from either payload shape."""
+    members = payload.get(POPULATION_CHECKPOINT_KEY)
+    if isinstance(members, list):
+        return list(members)
+    return [{name: payload[name] for name in AGENT_STATE_KEYS}]
+
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
     """Reject checkpoints from incompatible model and action schemas.
@@ -45,6 +87,17 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
         raise ValueError(
             f"unsupported checkpoint format: {version}; expected {CHECKPOINT_FORMAT_VERSION}"
         )
+    members = payload.get(POPULATION_CHECKPOINT_KEY)
+    if members is not None and (
+        not isinstance(members, list)
+        or len(members) < 2
+        or any(not isinstance(entry, dict) or tuple(entry) != AGENT_STATE_KEYS for entry in members)
+    ):
+        raise ValueError("checkpoint population is not a list of complete agent states")
+    # A single learner keeps the four states at the top level, so a payload with
+    # neither shape is a half-written checkpoint rather than something to resume.
+    if members is None and any(name not in payload for name in AGENT_STATE_KEYS):
+        raise ValueError("checkpoint is missing single-learner training state")
     identity = validate_source_identity(payload.get("source_identity"))
     run_provenance = validate_run_provenance(payload.get("run_provenance"))
     if run_provenance is not None and run_provenance["source_identity"] != identity:
@@ -192,10 +245,7 @@ def training_rng_states() -> dict[str, Any]:
 
 def checkpoint_payload(
     *,
-    actor_state: dict[str, Any],
-    critic_state: dict[str, Any],
-    actor_optimizer_state: dict[str, Any],
-    critic_optimizer_state: dict[str, Any],
+    agents: Sequence[Mapping[str, Any]],
     model_config: AnyModelConfig,
     ppo_config: PpoConfig,
     iteration: int,
@@ -208,7 +258,8 @@ def checkpoint_payload(
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[int, float] | None = None,
-    replay_parity_baseline: dict[str, float] | None = None,
+    replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
+    population_disagreement_reference: float | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
@@ -246,6 +297,18 @@ def checkpoint_payload(
         )
     if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
         raise ValueError("checkpoint RNG capture is incomplete")
+    if not agents or any(tuple(agent) != AGENT_STATE_KEYS for agent in agents):
+        raise ValueError(f"every checkpointed agent needs exactly {AGENT_STATE_KEYS}")
+    if len(agents) == 1:
+        # A single learner's payload is byte-for-byte what it has always been:
+        # the four states at the top level and no population list, so every
+        # reader of "the actor" keeps working without being told which member.
+        members: dict[str, Any] = dict(agents[0])
+    else:
+        # A population payload deliberately carries no top-level actor. See
+        # POPULATION_CHECKPOINT_KEY: a member-zero alias there is how a reader
+        # ends up reporting one arbitrary member as the whole run's strength.
+        members = {POPULATION_CHECKPOINT_KEY: [dict(agent) for agent in agents]}
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
@@ -253,10 +316,7 @@ def checkpoint_payload(
         "architecture": architecture_of_config(model_config).name,
         "model_config": model_config.to_dict(),
         "ppo_config": asdict(ppo_config),
-        "actor": actor_state,
-        "critic": critic_state,
-        "actor_optimizer": actor_optimizer_state,
-        "critic_optimizer": critic_optimizer_state,
+        **members,
         "metrics": metrics,
         **rng_states,
         "training_rng": training_rng_state,
@@ -272,6 +332,12 @@ def checkpoint_payload(
         # restarted under --max-hours would otherwise judge its first audit
         # with no history and abort a merely drifted run.
         "replay_parity_baseline": replay_parity_baseline,
+        # The population's pairwise disagreement at iteration 0, which the
+        # convergence gate takes a fixed share of. Persisted for the same reason
+        # as the baseline above and one more: re-measuring it after a resume
+        # would recalibrate the floor against however far the members had
+        # already converged, which is the state the gate exists to refuse.
+        "population_disagreement_reference": population_disagreement_reference,
         # Warm-start provenance travels with the run: opponent selection
         # keeps the iteration-0 league snapshot eligible only when it is a
         # pretrained baseline, and a resume must preserve that decision.
@@ -299,10 +365,7 @@ def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
 def save_checkpoint(
     path: Path,
     *,
-    actor: AnyActor,
-    critic: AnyCritic,
-    actor_optimizer: torch.optim.Optimizer,
-    critic_optimizer: torch.optim.Optimizer,
+    agents: Sequence[TrainingAgent],
     model_config: AnyModelConfig,
     ppo_config: PpoConfig,
     iteration: int,
@@ -314,14 +377,12 @@ def save_checkpoint(
     training_data_config: dict[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[int, float] | None = None,
-    replay_parity_baseline: dict[str, float] | None = None,
+    replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
+    population_disagreement_reference: float | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> None:
     payload = checkpoint_payload(
-        actor_state=actor.state_dict(),
-        critic_state=critic.state_dict(),
-        actor_optimizer_state=actor_optimizer.state_dict(),
-        critic_optimizer_state=critic_optimizer.state_dict(),
+        agents=[agent.state() for agent in agents],
         model_config=model_config,
         ppo_config=ppo_config,
         iteration=iteration,
@@ -335,6 +396,7 @@ def save_checkpoint(
         league_snapshot_manifest=league_snapshot_manifest,
         league_score_rates=league_score_rates,
         replay_parity_baseline=replay_parity_baseline,
+        population_disagreement_reference=population_disagreement_reference,
         initial_actor=initial_actor,
     )
     write_checkpoint(path, payload)
@@ -342,10 +404,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path,
-    actor: AnyActor,
-    critic: AnyCritic,
-    actor_optimizer: torch.optim.Optimizer | None = None,
-    critic_optimizer: torch.optim.Optimizer | None = None,
+    agents: Sequence[TrainingAgent],
     *,
     device: torch.device,
 ) -> dict[str, Any]:
@@ -354,16 +413,25 @@ def load_checkpoint(
     # Validate the model identity before mutating anything: a mismatched
     # checkpoint must fail with these messages, not with a strict-loading
     # key dump halfway through restoring the actor.
-    if resolve_architecture(payload).name != architecture_of(actor).name:
+    if resolve_architecture(payload).name != architecture_of(agents[0].actor).name:
         raise ValueError("checkpoint architecture does not match the constructed models")
-    if payload["model_config"] != actor.config.to_dict():
+    if payload["model_config"] != agents[0].actor.config.to_dict():
         raise ValueError("checkpoint model configuration does not match the constructed models")
-    actor.load_state_dict(payload["actor"])
-    critic.load_state_dict(payload["critic"])
-    if actor_optimizer is not None:
-        actor_optimizer.load_state_dict(payload["actor_optimizer"])
-    if critic_optimizer is not None:
-        critic_optimizer.load_state_dict(payload["critic_optimizer"])
+    states = checkpoint_agent_states(payload)
+    # The population size is part of the run's identity, not something to pad or
+    # truncate: restoring three members into four would leave the fourth training
+    # from its fresh initialization while the run reported itself as resumed.
+    if len(states) != len(agents):
+        raise ValueError(
+            f"checkpoint carries {len(states)} agents; this run configures {len(agents)}"
+        )
+    for agent, state in zip(agents, states, strict=True):
+        agent.actor.load_state_dict(state["actor"])
+        agent.critic.load_state_dict(state["critic"])
+        if agent.actor_optimizer is not None:
+            agent.actor_optimizer.load_state_dict(state["actor_optimizer"])
+        if agent.critic_optimizer is not None:
+            agent.critic_optimizer.load_state_dict(state["critic_optimizer"])
     torch.set_rng_state(payload["torch_rng"].cpu())
     if torch.cuda.is_available() and payload.get("cuda_rng") is not None:
         cuda_rng = payload["cuda_rng"]

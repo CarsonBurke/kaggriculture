@@ -11,6 +11,7 @@ from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.provenance import source_identity
 from kaggriculture.training import (
     CHECKPOINT_FORMAT_VERSION,
+    TrainingAgent,
     append_iteration_jsonl,
     load_checkpoint,
     metrics_journal_iteration,
@@ -32,10 +33,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
 
     save_checkpoint(
         path,
-        actor=actor,
-        critic=critic,
-        actor_optimizer=actor_optimizer,
-        critic_optimizer=critic_optimizer,
+        agents=[TrainingAgent(actor, critic, actor_optimizer, critic_optimizer)],
         model_config=model_config,
         ppo_config=ppo_config,
         iteration=3,
@@ -51,10 +49,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
 
     payload = load_checkpoint(
         path,
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
+        [TrainingAgent(actor, critic, actor_optimizer, critic_optimizer)],
         device=torch.device("cpu"),
     )
     restored = np.random.default_rng()
@@ -70,7 +65,7 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert restored.random(8).tolist() == expected.tolist()
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)
@@ -81,8 +76,7 @@ def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     with pytest.raises(ValueError, match="unsupported checkpoint format"):
         load_checkpoint(
             path,
-            FarmActor(model_config),
-            DistributionalCritic(model_config),
+            [TrainingAgent(FarmActor(model_config), DistributionalCritic(model_config))],
             device=torch.device("cpu"),
         )
 
@@ -111,10 +105,14 @@ def test_a_checkpoints_update_mode_record_must_match_its_ppo_config() -> None:
 
     def build(recorded: str):
         return checkpoint_payload(
-            actor_state=actor.state_dict(),
-            critic_state=critic.state_dict(),
-            actor_optimizer_state=actor_optimizer.state_dict(),
-            critic_optimizer_state=critic_optimizer.state_dict(),
+            agents=[
+                {
+                    "actor": actor.state_dict(),
+                    "critic": critic.state_dict(),
+                    "actor_optimizer": actor_optimizer.state_dict(),
+                    "critic_optimizer": critic_optimizer.state_dict(),
+                }
+            ],
             model_config=model_config,
             ppo_config=ppo_config,
             iteration=1,
@@ -154,10 +152,7 @@ def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_p
         actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
         save_checkpoint(
             path,
-            actor=actor,
-            critic=critic,
-            actor_optimizer=actor_optimizer,
-            critic_optimizer=critic_optimizer,
+            agents=[TrainingAgent(actor, critic, actor_optimizer, critic_optimizer)],
             model_config=model_config,
             ppo_config=ppo_config,
             iteration=1,
@@ -193,9 +188,11 @@ def test_checkpoint_load_rejects_a_foreign_model_before_touching_the_actor(tmp_p
     before = {name: value.clone() for name, value in actor.state_dict().items()}
 
     with pytest.raises(ValueError, match="checkpoint architecture does not match"):
-        load_checkpoint(foreign_family, actor, critic, device=torch.device("cpu"))
+        load_checkpoint(foreign_family, [TrainingAgent(actor, critic)], device=torch.device("cpu"))
     with pytest.raises(ValueError, match="checkpoint model configuration does not match"):
-        load_checkpoint(foreign_capacity, actor, critic, device=torch.device("cpu"))
+        load_checkpoint(
+            foreign_capacity, [TrainingAgent(actor, critic)], device=torch.device("cpu")
+        )
 
     assert all(torch.equal(value, before[name]) for name, value in actor.state_dict().items())
 

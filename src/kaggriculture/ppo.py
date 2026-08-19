@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +20,7 @@ from kaggriculture.model import (
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
-from kaggriculture.registry import CONV_ENTITY
+from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredCritic, StructuredInputs
 
@@ -710,38 +711,86 @@ def _leading_tensor(args: tuple[Any, ...]) -> Tensor:
     return head
 
 
-def _actor_batch_args(
-    architecture: str, staged: dict[str, Tensor], indices: Tensor | slice
-) -> tuple[Any, ...]:
-    """Build one minibatch of actor forward arguments from staged storage.
+#: Every actor forward argument, in order, as the state field it is taken from
+#: and the dtype the forward requires. One table, because a second copy of it is
+#: a staging bug waiting for the next architecture change: a wrong order or a
+#: wrong dtype stays silent until the logits are wrong.
+_ACTOR_FORWARD_FIELDS: dict[str, tuple[tuple[str, torch.dtype], ...]] = {
+    CONV_ENTITY: (
+        ("board", torch.float32),
+        ("global_features", torch.float32),
+        ("units", torch.float32),
+        ("unit_positions", torch.long),
+    ),
+    STRUCTURED: (
+        ("tile_categorical", torch.long),
+        ("tile_continuous", torch.float32),
+        ("unit_categorical", torch.long),
+        ("unit_continuous", torch.float32),
+        ("unit_active", torch.bool),
+        ("unit_tile_gather", torch.long),
+        ("unit_tile_gather_valid", torch.bool),
+        ("products", torch.float32),
+        ("crops", torch.float32),
+        ("farms", torch.float32),
+        ("town", torch.float32),
+    ),
+}
+
+
+def _actor_forward_fields(architecture: str) -> tuple[tuple[str, torch.dtype], ...]:
+    """The named architecture's forward fields, or a caller-actionable refusal."""
+    try:
+        return _ACTOR_FORWARD_FIELDS[architecture]
+    except KeyError:
+        known = ", ".join(sorted(_ACTOR_FORWARD_FIELDS))
+        raise ValueError(f"unknown actor architecture {architecture!r}; known: {known}") from None
+
+
+def _actor_forward_tuple(architecture: str, batched: dict[str, Tensor]) -> tuple[Any, ...]:
+    """Assemble the actor's forward arguments from one batch of its fields.
 
     The returned tuple is splatted directly into the actor's forward, so its
     arity is a property of the architecture; the compiled update callables
     therefore take these arguments last, after every fixed factor tensor.
     """
     if architecture == CONV_ENTITY:
-        return (
-            _batch_tensor(staged["board"], indices, torch.float32),
-            _batch_tensor(staged["global_features"], indices, torch.float32),
-            _batch_tensor(staged["units"], indices, torch.float32),
-            _batch_tensor(staged["unit_positions"], indices, torch.long),
-        )
-    return (
-        StructuredInputs(
-            tile_categorical=_batch_tensor(staged["tile_categorical"], indices, torch.long),
-            tile_continuous=_batch_tensor(staged["tile_continuous"], indices, torch.float32),
-            unit_categorical=_batch_tensor(staged["unit_categorical"], indices, torch.long),
-            unit_continuous=_batch_tensor(staged["unit_continuous"], indices, torch.float32),
-            unit_active=_batch_tensor(staged["unit_active"], indices, torch.bool),
-            unit_tile_gather=_batch_tensor(staged["unit_tile_gather"], indices, torch.long),
-            unit_tile_gather_valid=_batch_tensor(
-                staged["unit_tile_gather_valid"], indices, torch.bool
-            ),
-            products=_batch_tensor(staged["products"], indices, torch.float32),
-            crops=_batch_tensor(staged["crops"], indices, torch.float32),
-            farms=_batch_tensor(staged["farms"], indices, torch.float32),
-            town=_batch_tensor(staged["town"], indices, torch.float32),
-        ),
+        return tuple(batched[name] for name, _dtype in _ACTOR_FORWARD_FIELDS[CONV_ENTITY])
+    return (StructuredInputs(**batched),)
+
+
+def _actor_batch_args(
+    architecture: str, staged: dict[str, Tensor], indices: Tensor | slice
+) -> tuple[Any, ...]:
+    """Build one minibatch of actor forward arguments from staged storage."""
+    return _actor_forward_tuple(
+        architecture,
+        {
+            name: _batch_tensor(staged[name], indices, dtype)
+            for name, dtype in _actor_forward_fields(architecture)
+        },
+    )
+
+
+def actor_forward_args(
+    architecture: str, states: Mapping[str, np.ndarray], device: torch.device
+) -> tuple[Any, ...]:
+    """Actor forward arguments for a batch of already-selected states.
+
+    The field order and dtypes the update's own minibatches use, for callers
+    holding host arrays already reduced to the rows they want -- scoring several
+    actors on one shared sample of states, say -- rather than a staged
+    whole-wave dict to be indexed per minibatch. `states` is keyed the way the
+    update stages its fields: every architecture's `RolloutBatch.states`, plus
+    the shared `unit_active` mask, which the structured actor reads and no
+    architecture's state dict carries.
+    """
+    return _actor_forward_tuple(
+        architecture,
+        {
+            name: torch.from_numpy(states[name]).to(device=device, dtype=dtype)
+            for name, dtype in _actor_forward_fields(architecture)
+        },
     )
 
 
@@ -808,6 +857,9 @@ def replay_behavior_values(
     architecture: str,
     staged: dict[str, Tensor],
     *,
+    # Staged rows to replay, in the order given, or every staged row. One
+    # population member's critic is asked about that member's rows only.
+    states: Tensor | None = None,
     # Transient fp32 activations scale with the chunk. At production model
     # size 16384 rows would add several GiB right when the staged rollout
     # already occupies the device; 4096 keeps the pass large enough to stay
@@ -825,10 +877,16 @@ def replay_behavior_values(
     the update mutates the critic. This full-batch pass is half the update's
     wall clock when run eagerly, so on CUDA it routes through the same
     Inductor compilation and autocast state as the rest of the update path.
+
+    `states` narrows the pass to those staged rows and returns one value per
+    requested row rather than one per staged row. A population update owns a
+    subset of the wave's trajectories, and every other row's prediction would
+    be this member's critic reading a state its own policy never visited --
+    which the advantage mask discards anyway, so the pass never computes it.
     """
     if chunk_size < 1:
         raise ValueError("chunk size must be positive")
-    rows = staged["unit_actions"].shape[0]
+    row_count = staged["unit_actions"].shape[0] if states is None else int(states.numel())
     device = staged["unit_actions"].device
     forward = _cached_update_callable(
         critic,
@@ -836,31 +894,105 @@ def replay_behavior_values(
         _replayed_value_chunk,
         _device_compile_mode(compile_mode, device),
     )
+    chunks = [
+        slice(start, start + chunk_size) if states is None else states[start : start + chunk_size]
+        for start in range(0, row_count, chunk_size)
+    ]
     was_training = critic.training
     critic.eval()
     try:
         values = [
-            forward(
-                critic,
-                autocast_enabled,
-                *_critic_batch_args(architecture, staged, slice(start, start + chunk_size)),
-            )
-            for start in range(0, rows, chunk_size)
+            forward(critic, autocast_enabled, *_critic_batch_args(architecture, staged, chunk))
+            for chunk in chunks
         ]
     finally:
         critic.train(was_training)
     return torch.cat(values).float()
 
 
+def _owned_valid(rollout: RolloutBatch, rows: np.ndarray | None) -> np.ndarray:
+    """The valid-state mask one update owns, restricted to `rows` when given.
+
+    A population wave stores each game's two rows adjacently and they belong to
+    two different members, so no storage order makes one member's rows a
+    contiguous block. The partition is therefore a mask over the whole
+    `(trajectories, steps)` grid instead of a sliced copy of the rollout, whose
+    state arrays are the largest allocation in the process. Being a mask, it is
+    indifferent to the order of `rows` and to repeats in it.
+    """
+    if rows is None:
+        return rollout.valid
+    owned = np.zeros(rollout.valid.shape, dtype=bool)
+    owned[rows] = rollout.valid[rows]
+    return owned
+
+
+def _owned_behavior_values(
+    critic: Critic,
+    architecture: str,
+    staged: dict[str, Tensor],
+    rollout: RolloutBatch,
+    rows: np.ndarray | None,
+    *,
+    compile_mode: str,
+    autocast_enabled: bool,
+) -> np.ndarray:
+    """Behavior-time value predictions on the rollout grid, replayed for `rows`.
+
+    Rows this update does not own stay exactly zero, which is what the owned
+    mask makes of them in every consumer: GAE selects them away, and no metric
+    reads them. Restricting the pass rather than the readings is what keeps a
+    population's N per-member updates costing one whole-wave critic replay
+    between them instead of N.
+    """
+    device = staged["unit_actions"].device
+    horizon = rollout.horizon
+    states = None
+    if rows is not None:
+        owned_rows = np.asarray(rows, dtype=np.int64).reshape(-1, 1)
+        flat = (owned_rows * horizon + np.arange(horizon, dtype=np.int64)).reshape(-1)
+        states = torch.from_numpy(flat).to(device=device)
+    replayed = (
+        replay_behavior_values(
+            critic,
+            architecture,
+            staged,
+            states=states,
+            compile_mode=compile_mode,
+            autocast_enabled=autocast_enabled,
+        )
+        .cpu()
+        .numpy()
+    )
+    if rows is None:
+        return replayed.reshape(rollout.rewards.shape)
+    grid = np.zeros(rollout.rewards.shape, dtype=replayed.dtype)
+    grid[rows] = replayed.reshape(-1, horizon)
+    return grid
+
+
 def prepare_advantages(
-    rollout: RolloutBatch, values: np.ndarray, config: PpoConfig
+    rollout: RolloutBatch,
+    values: np.ndarray,
+    config: PpoConfig,
+    *,
+    rows: np.ndarray | None = None,
 ) -> AdvantageBatch:
+    """Lambda-GAE advantages and targets, normalized over the states one update owns.
+
+    `rows` restricts every statistic to those trajectory rows: the location and
+    scale the advantages are normalized by are that subset's own, and rows
+    outside it come back exactly zero. That restriction is the reason a
+    population wave partitions before it updates rather than after -- the
+    normalizer is the batch's own advantage standard deviation, so a pooled
+    batch would let one member's return scale set another member's step size.
+    """
     _validate_config(config)
     if values.shape != rollout.rewards.shape:
         raise ValueError("behavior values must match the rollout reward shape")
     rewards = torch.from_numpy(rollout.rewards).float()
     values = torch.from_numpy(values).float()
-    valid = torch.from_numpy(rollout.valid).float()
+    valid = torch.from_numpy(_owned_valid(rollout, rows)).float()
     advantages, targets = generalized_advantage_and_targets(
         rewards,
         values,
@@ -1386,6 +1518,7 @@ def update_replay_parity(
     minibatch_size: int,
     compile_mode: str,
     autocast_enabled: bool,
+    rows: np.ndarray | None = None,
 ) -> dict[str, float | int]:
     """Measure rollout-sampling versus update-replay likelihood divergence.
 
@@ -1409,11 +1542,16 @@ def update_replay_parity(
     locate the worst component when something does go wrong — but they are
     extreme values over hundreds of thousands of samples, so they grow with the
     component count and are not thresholds.
+
+    `rows` restricts the audit to those trajectory rows. In a population wave
+    every row was sampled by its own member, so replaying the whole wave
+    through one member's actor would measure the distance between two policies
+    and report it as a staging defect.
     """
     if minibatch_size < 1:
         raise ValueError("minibatch size must be positive")
     device = next(actor.parameters()).device
-    flat_valid = rollout.valid.reshape(-1)
+    flat_valid = _owned_valid(rollout, rows).reshape(-1)
     valid_indices = np.flatnonzero(flat_valid)
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
@@ -1855,6 +1993,7 @@ def update_ppo(
     *,
     generator: np.random.Generator,
     actor_epochs: int | None = None,
+    rows: np.ndarray | None = None,
 ) -> dict[str, float | int]:
     """Replay one rollout with asymmetric, per-component clipped policy updates.
 
@@ -1863,6 +2002,14 @@ def update_ppo(
     critic must fit before its advantages are allowed to push a pretrained
     actor. Zero runs a critic-only refit; the behavior-likelihood replay is
     skipped entirely because nothing consumes it.
+
+    `rows` restricts the update to those trajectory rows -- a population's
+    per-member partition. Every statistic below is then that subset's own, the
+    advantage normalizer above all: pooled, one member's return scale would set
+    another member's step size. The partition is a row index rather than a
+    sliced rollout because a game's two rows belong to two different members,
+    so no storage order makes one member's rows a contiguous block and slicing
+    would copy the wave's state arrays.
     """
     _validate_config(config)
     if actor_epochs is None:
@@ -1872,8 +2019,11 @@ def update_ppo(
     device = next(actor.parameters()).device
     if next(critic.parameters()).device != device:
         raise ValueError("actor and critic must use the same device")
-    flat_valid = rollout.valid.reshape(-1)
+    owned_valid = _owned_valid(rollout, rows)
+    flat_valid = owned_valid.reshape(-1)
     valid_indices = np.flatnonzero(flat_valid)
+    if valid_indices.size == 0:
+        raise ValueError("rollout contains no valid states")
     flat_component_counts = (
         rollout.unit_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
         + rollout.market_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
@@ -1904,17 +2054,14 @@ def update_ppo(
     # step. The critic still holds exactly the behavior weights at this point.
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
-    behavior_values = (
-        replay_behavior_values(
-            critic,
-            architecture,
-            staged,
-            compile_mode=compile_mode,
-            autocast_enabled=autocast_enabled,
-        )
-        .cpu()
-        .numpy()
-        .reshape(rollout.rewards.shape)
+    behavior_values = _owned_behavior_values(
+        critic,
+        architecture,
+        staged,
+        rollout,
+        rows,
+        compile_mode=compile_mode,
+        autocast_enabled=autocast_enabled,
     )
     # Behavior likelihoods are recomputed through the update path itself (same
     # callable, precision, and minibatch partitioning as the loop below), not
@@ -1935,8 +2082,8 @@ def update_ppo(
         )
     actor.train()
     critic.train()
-    prepared = prepare_advantages(rollout, behavior_values, config)
-    valid_value_targets = prepared.value_targets[rollout.valid]
+    prepared = prepare_advantages(rollout, behavior_values, config, rows=rows)
+    valid_value_targets = prepared.value_targets[owned_valid]
     value_support = critic.support.detach().float().cpu().numpy()
     support_widths = np.diff(value_support)
     if (
@@ -2243,7 +2390,9 @@ def update_ppo(
         "actor_minibatches_intended": actor_minibatches_intended,
         "actor_updates": actor_updates,
         "epochs": completed_epochs,
-        "states": rollout.state_count,
+        # The valid states this update trained on, which `rows` restricts to
+        # one member's share of the wave.
+        "states": valid_indices.size,
         "policy_loss": float(totals["policy_loss"] / max(1, total_components)),
         "value_loss": float(totals["value_loss"] / max(1, total_states)),
         "value_loss_first_epoch": first_epoch_value_loss,
@@ -2258,10 +2407,10 @@ def update_ppo(
         "critic_gradient_norm": float(totals["critic_gradient_norm"] / max(1, total_states)),
         "advantage_mean": prepared.raw_advantage_mean,
         "advantage_std": prepared.raw_advantage_std,
-        "value_target_mean": float(prepared.value_targets[rollout.valid].mean()),
-        "value_target_std": float(prepared.value_targets[rollout.valid].std()),
-        "value_target_min": float(prepared.value_targets[rollout.valid].min()),
-        "value_target_max": float(prepared.value_targets[rollout.valid].max()),
+        "value_target_mean": float(prepared.value_targets[owned_valid].mean()),
+        "value_target_std": float(prepared.value_targets[owned_valid].std()),
+        "value_target_min": float(prepared.value_targets[owned_valid].min()),
+        "value_target_max": float(prepared.value_targets[owned_valid].max()),
         # Every target statistic here, and the suffix-return and lambda-return
         # explained variances and the correlation below, are taken from the
         # unclipped return, so they all describe one quantity -- what the
@@ -2291,7 +2440,7 @@ def update_ppo(
         # about how the game ends: this conflates that correlation with the
         # scale the critic was fitted at, which belongs to a different target.
         "monte_carlo_explained_variance": _explained_variance(
-            prepared.monte_carlo_returns, behavior_values, rollout.valid
+            prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
         # Against the target actually regressed on, from the pre-update
         # predictions -- which are inside that target, since it is
@@ -2300,7 +2449,7 @@ def update_ppo(
         # conventional PPO reading, and one the critic can raise by merely
         # gaining prediction variance.
         "lambda_return_explained_variance": _explained_variance(
-            prepared.value_targets, behavior_values, rollout.valid
+            prepared.value_targets, behavior_values, owned_valid
         ),
         # Against the same target with predictions taken during the update, so
         # the residual is a fit error rather than an algebraic identity. These
@@ -2329,10 +2478,10 @@ def update_ppo(
         # the correlation is taken against the suffix return because it is the
         # scale-free half of that reading: it is what the critic knows about how
         # the game ends, with the fitted scale divided out.
-        "value_prediction_mean": float(behavior_values[rollout.valid].mean()),
-        "value_prediction_std": float(behavior_values[rollout.valid].std()),
+        "value_prediction_mean": float(behavior_values[owned_valid].mean()),
+        "value_prediction_std": float(behavior_values[owned_valid].std()),
         "value_target_correlation": _target_correlation(
-            prepared.monte_carlo_returns, behavior_values, rollout.valid
+            prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
     }
     return metrics

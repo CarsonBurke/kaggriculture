@@ -128,7 +128,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20,
+        default=12,
+        # 12 rather than 20 on measurement: under NorMuon the holdout curve is
+        # already at 0.00182 nats by epoch 10 (AdamW needed all 20 to reach
+        # 0.0028), and the trapezoid's decay tail is where the last gains are, so
+        # a shorter budget does not truncate learning -- it compresses the same
+        # shape. The rate schedule is a fraction of `epochs`, so this is the
+        # number that sets it: 20 epochs is not "12 plus 8 free ones".
         help=(
             "passes over the corpus; an epoch is a pass, not a fixed step count, "
             "so a larger corpus needs fewer of them, not more"
