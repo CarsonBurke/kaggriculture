@@ -94,6 +94,60 @@ def make_edit(spec: str, plan: Plan) -> Edit:
                 units[:, 0, :] = np.uint8(0)
 
         return pass_step
+    if name == "buy-delta":
+        # Cancelling a step's whole row is the coarsest possible edit; several of
+        # the winning steps only bought one to three of an item, so shrinking a
+        # purchase asks the same question at the resolution of one unit.
+        where, _, amount = raw_value.partition("@")
+        at = frozenset(int(part) for part in where.split(",") if part)
+        delta = int(amount)
+        stop = np.uint8(int(MarketKind.STOP))
+
+        def buy_delta(
+            step: int, units: np.ndarray, kinds: np.ndarray, quantities: np.ndarray
+        ) -> None:
+            if step not in at:
+                return
+            row_kinds = kinds[:, 0, :]
+            row_quantities = quantities[:, 0, :]
+            active = np.cumprod(row_kinds != stop, axis=1).astype(bool)
+            buying = active & ~np.isin(row_kinds, SELL_KINDS)
+            shifted = row_quantities.astype(np.int16) + delta
+            # Bin zero is a quantity of one, the smallest order the engine can
+            # encode; going lower is a cancellation, which `stop-step` already is.
+            np.clip(shifted, 0, MAX_QUANTITY_BIN, out=shifted)
+            np.copyto(row_quantities, shifted.astype(np.uint8), where=buying)
+
+        return buy_delta
+    if name == "reverse-sells":
+        # `_rank_sell_slots` in the reference only permutes a step's sell orders,
+        # by a score, and that permutation is worth ~1,400 dollars. Reversing it
+        # asks the counterfactual directly, and needs no observation: the ranked
+        # row is already in hand.
+        at = frozenset(int(part) for part in raw_value.split(",") if part)
+        stop = np.uint8(int(MarketKind.STOP))
+
+        def reverse_sells(
+            step: int, units: np.ndarray, kinds: np.ndarray, quantities: np.ndarray
+        ) -> None:
+            if step not in at:
+                return
+            row_kinds = kinds[:, 0, :]
+            row_quantities = quantities[:, 0, :]
+            active = np.cumprod(row_kinds != stop, axis=1).astype(bool)
+            selling = active & np.isin(row_kinds, SELL_KINDS)
+            # Reverse only the occupied sell positions, leaving every buy and the
+            # row's length exactly where the reference put them.
+            flipped_kinds = row_kinds.copy()
+            flipped_quantities = row_quantities.copy()
+            for row in np.flatnonzero(selling.any(axis=1)):
+                slots = np.flatnonzero(selling[row])
+                flipped_kinds[row, slots] = row_kinds[row, slots[::-1]]
+                flipped_quantities[row, slots] = row_quantities[row, slots[::-1]]
+            kinds[:, 0, :] = flipped_kinds
+            quantities[:, 0, :] = flipped_quantities
+
+        return reverse_sells
     if name in {"stop-kind", "cap-kind"}:
         # The engine decodes market orders up to the first STOP, so removing one
         # mid-row would silently drop every order behind it. Both edits therefore
@@ -214,6 +268,7 @@ def play(
     seeds: np.ndarray,
     *,
     edit: Edit,
+    opponent_edit: Edit | None = None,
     base: str,
     opponent: str,
     steps: int,
@@ -241,6 +296,11 @@ def play(
             np.asarray(emitted["market_quantities"]).reshape(games, PLAYERS, -1)
         )
         edit(step, units, kinds, quantities)
+        if opponent_edit is not None:
+            # PLAYERS is two, so reversing the seat axis presents seat one where a
+            # seat-zero edit writes. Views over the same buffer, so the arrays
+            # handed to the engine below carry both rewrites.
+            opponent_edit(step, units[:, ::-1, :], kinds[:, ::-1, :], quantities[:, ::-1, :])
         result = environment.step_factors(
             units,
             kinds,
@@ -278,6 +338,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent", type=Path, default=Path(PUBLIC_V27_OPPONENT))
     parser.add_argument("--base", default="scripted-v27", choices=sorted(CODES))
     parser.add_argument("--opponent", default="scripted-v27", choices=sorted(CODES))
+    parser.add_argument(
+        "--opponent-edit",
+        help="edit applied to the opposing seat, to score a candidate against an improved rival",
+    )
     parser.add_argument("--edit", nargs="+", default=["base"])
     parser.add_argument("--games", type=int, default=16)
     parser.add_argument("--seed-start", type=int, default=90_001)
@@ -304,6 +368,9 @@ def main() -> int:
                 module,
                 seeds,
                 edit=make_edit(spec, plan),
+                opponent_edit=(
+                    None if args.opponent_edit is None else make_edit(args.opponent_edit, plan)
+                ),
                 base=args.base,
                 opponent=args.opponent,
                 steps=plan.steps,

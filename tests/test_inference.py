@@ -625,3 +625,52 @@ def test_the_plan_patch_cancels_exactly_the_named_steps(tmp_path: Path) -> None:
     bare.write_text("x = 1\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="no top-level agent"):
         builder.patched_source(bare, (2,))
+
+
+def test_the_plan_patch_shrinks_only_priced_purchases(tmp_path: Path) -> None:
+    # Reducing a sell would stop the plan banking its harvest, and reducing a bare
+    # `HIRE` would corrupt an order the engine reads positionally. Both are silent:
+    # the agent still returns a well formed action and still plays 720 steps.
+    builder = _load_build_plan_submission()
+    source = tmp_path / "plan.py"
+    source.write_text(
+        "def _get(obs, key, default=None):\n"
+        "    return obs.get(key, default)\n"
+        "\n"
+        "\n"
+        "def agent(obs, configuration=None):\n"
+        "    return {\n"
+        "        'farmer': ['PASS'],\n"
+        "        'hands': [],\n"
+        "        'market': [\n"
+        "            ['HIRE'],\n"
+        "            ['BUY_SEED', 'MELON', 7],\n"
+        "            ['SELL', 'WHEAT', 9],\n"
+        "            ['BUY_PRODUCT', 'WHEAT', 1],\n"
+        "        ],\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    patched = tmp_path / "main.py"
+    patched.write_text(builder.patched_source(source, (5,), ((3, 2),)), encoding="utf-8")
+
+    module = builder._load(patched, "reduced_plan_under_test")
+    assert module._REDUCED_BUY_STEPS == {3: 2}
+    assert module.agent({"step": 3})["market"] == [
+        ["HIRE"],
+        ["BUY_SEED", "MELON", 5],
+        ["SELL", "WHEAT", 9],
+        # Floored at one: the engine has no smaller order, so the alternative to a
+        # shrink this deep is a cancellation, which is a different edit.
+        ["BUY_PRODUCT", "WHEAT", 1],
+    ]
+    assert module.agent({"step": 4})["market"] == [
+        ["HIRE"],
+        ["BUY_SEED", "MELON", 7],
+        ["SELL", "WHEAT", 9],
+        ["BUY_PRODUCT", "WHEAT", 1],
+    ]
+    assert module.agent({"step": 5})["market"] == []
+
+    with pytest.raises(SystemExit, match="both cancelled and reduced"):
+        builder.patched_source(source, (3,), ((3, 2),))
