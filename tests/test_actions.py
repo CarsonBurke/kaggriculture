@@ -542,6 +542,20 @@ def _python_sequential_factor_masks(
     )
 
 
+#: Pickup action codes grouped by item, ascending in requested quantity. Used to
+#: prove the randomized sweep below actually visits the one state where the two
+#: legality scopes disagree: a shed holding at least one of an item but fewer
+#: than a variant asks for. There the quantity-1 variant is legal under both and
+#: the larger one only under `LegalityScope::SubmittedDict`.
+_PICKUP_FAMILIES: dict[str, list[tuple[int, int]]] = {}
+for _pickup in UnitAction:
+    if _pickup.name.startswith("PICKUP_"):
+        _item, _quantity = _pickup.name[len("PICKUP_") :].rsplit("_", 1)
+        _PICKUP_FAMILIES.setdefault(_item, []).append((int(_quantity), int(_pickup)))
+for _variants in _PICKUP_FAMILIES.values():
+    _variants.sort()
+
+
 def test_rust_factor_masks_match_python_ledgers_across_evolving_states() -> None:
     game_count = 8
     transitions = 300
@@ -558,6 +572,7 @@ def test_rust_factor_masks_match_python_ledgers_across_evolving_states() -> None
         environment.reset(2)
     rust = load_native().BatchEnv(seeds)
     generator = np.random.default_rng(23_887)
+    partial_stock_states = 0
 
     for _ in range(transitions):
         unit_actions = generator.integers(
@@ -604,6 +619,14 @@ def test_rust_factor_masks_match_python_ledgers_across_evolving_states() -> None
                 native[name],
             )
 
+        for unit_masks in native["unit_masks"]:
+            for unit_mask in unit_masks:
+                for variants in _PICKUP_FAMILIES.values():
+                    if not unit_mask[variants[0][1]]:
+                        continue
+                    if any(not unit_mask[code] for _, code in variants[1:]):
+                        partial_stock_states += 1
+
         for game, environment in enumerate(environments):
             environment.step(
                 [
@@ -617,3 +640,9 @@ def test_rust_factor_masks_match_python_ledgers_across_evolving_states() -> None
                 ]
             )
         rust.step_factors(unit_actions, market_kinds, market_quantities)
+
+    # Both engines agreeing means nothing if the sweep never stood a unit at a
+    # shed holding less than a pickup variant asks for: everywhere else the two
+    # legality scopes are the same function, so drift in the clause that
+    # separates them would pass unnoticed.
+    assert partial_stock_states, "sweep never reached a partially fillable pickup"
