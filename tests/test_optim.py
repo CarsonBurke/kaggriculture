@@ -382,3 +382,124 @@ def test_an_unknown_optimizer_name_is_rejected() -> None:
     actor, critic = _production_modules()
     with pytest.raises(ValueError, match="unsupported optimizer"):
         make_optimizers(actor, critic, PpoConfig(optimizer="lion"))
+
+
+def _matrix_step(weight_decay: float, learning_rate: float = 1e-2) -> tuple[torch.Tensor, ...]:
+    """One NorMuon step on a square matrix; returns the weight before and after.
+
+    Square on purpose: the shape multiplier is then exactly 1, so the step is
+    the bare rate and the expected decay factor is `lr * lr * wd` with nothing
+    from `_shape_learning_rate_multiplier` folded in.
+    """
+
+    torch.manual_seed(0)
+    parameter = torch.nn.Parameter(torch.randn(96, 96) * 0.1)
+    parameter.grad = _decaying_spectrum((96, 96), seed=1)
+    optimizer = NorMuon(
+        [parameter],
+        [],
+        learning_rate=learning_rate,
+        adam_learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
+    start = parameter.detach().clone()
+    optimizer.step()
+    return start, parameter.detach().clone()
+
+
+def test_cautious_decay_only_shrinks_weights_the_step_was_already_shrinking() -> None:
+    learning_rate, decay = 1e-2, 1.2
+    start, plain = _matrix_step(0.0, learning_rate)
+    start_again, decayed = _matrix_step(decay, learning_rate)
+    assert torch.equal(start, start_again)
+    # The applied step is observed rather than recomputed: `start - plain` is
+    # `step * direction`, so its sign against the weight is the predicate the
+    # update uses, without this test restating the algebra it checks.
+    applied = start - plain
+    difference = plain - decayed
+    term = decay * learning_rate * learning_rate * start
+    # The term is proportional to the weight and is recovered by subtracting two
+    # fp32 results of order 1e-3, so on the smallest weights it sinks under that
+    # subtraction's rounding. Pin the exact value where it stands clear of it,
+    # and pin the gate itself everywhere.
+    resolved = start.abs() > start.abs().median()
+    ratio = difference[resolved] / term[resolved]
+    untouched = ratio.abs() < 1e-3
+    decayed_fully = (ratio - 1.0).abs() < 1e-3
+    assert (untouched | decayed_fully).all()
+    assert untouched.any() and decayed_fully.any()
+    # Exactly untouched wherever the step was already growing the weight, which
+    # is the whole content of "cautious".
+    grew = applied * start < -1e-8 * start.abs()
+    assert grew.any()
+    assert (difference[grew] == 0.0).all()
+    # The decay's own contribution always points toward zero. Stated on the
+    # contribution rather than on the resulting weight, because a step that
+    # overshoots zero can leave `decayed` further from it than `plain` while
+    # the decay term itself still pointed inward.
+    assert (difference * start >= 0).all()
+
+
+def test_cautious_decay_on_the_adam_half_is_quadratic_in_the_rate() -> None:
+    learning_rate, decay = 1e-2, 0.005
+
+    def step(weight_decay: float) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(3)
+        parameter = torch.nn.Parameter(torch.randn(128) * 0.1)
+        parameter.grad = torch.randn(128) * 0.05
+        optimizer = NorMuon(
+            [],
+            [parameter],
+            learning_rate=learning_rate,
+            adam_learning_rate=learning_rate,
+            adam_weight_decay=weight_decay,
+        )
+        start = parameter.detach().clone()
+        optimizer.step()
+        return start, parameter.detach().clone()
+
+    start, plain = step(0.0)
+    _, decayed = step(decay)
+    shrinking = ((start - plain) * start) > 0
+    assert shrinking.any() and not shrinking.all()
+    torch.testing.assert_close(decayed[~shrinking], plain[~shrinking], rtol=0.0, atol=0.0)
+    expected = plain[shrinking] - decay * learning_rate * learning_rate * start[shrinking]
+    torch.testing.assert_close(decayed[shrinking], expected)
+
+
+def test_a_skipped_minibatch_decays_nothing() -> None:
+    # Decay is written against the gated step rather than the bare rate, so a
+    # non-finite gradient must leave the weights untouched -- not merely
+    # un-stepped, which decay applied separately would quietly violate.
+    torch.manual_seed(0)
+    matrix = torch.nn.Parameter(torch.randn(96, 96) * 0.1)
+    vector = torch.nn.Parameter(torch.randn(128) * 0.1)
+    matrix.grad = torch.randn(96, 96)
+    vector.grad = torch.randn(128)
+    optimizer = NorMuon(
+        [matrix],
+        [vector],
+        learning_rate=1e-2,
+        adam_learning_rate=1e-2,
+        weight_decay=1.2,
+        adam_weight_decay=0.005,
+    )
+    before = (matrix.detach().clone(), vector.detach().clone())
+    optimizer.found_inf = torch.ones((), dtype=torch.float64)
+    optimizer.step()
+    del optimizer.found_inf
+    assert torch.equal(matrix.detach(), before[0])
+    assert torch.equal(vector.detach(), before[1])
+
+
+@pytest.mark.parametrize("value", [-1e-9, float("nan"), float("inf")])
+def test_an_unusable_weight_decay_is_rejected(value: float) -> None:
+    parameter = torch.nn.Parameter(torch.randn(8, 8))
+    with pytest.raises(ValueError, match="weight decay must be finite and non-negative"):
+        NorMuon(
+            [parameter],
+            [],
+            learning_rate=1e-3,
+            adam_learning_rate=1e-3,
+            weight_decay=value,
+        )

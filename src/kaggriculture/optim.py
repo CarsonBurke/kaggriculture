@@ -30,16 +30,21 @@ What is kept, and why each piece is here:
     makes a step's effect on the layer's output independent of its aspect
     ratio.
 
+  * **Cautious weight decay.**  The decay term joins the update only where the
+    update and the parameter already share a sign -- where the gradient step is
+    itself shrinking that weight -- so decay never opposes the gradient.  The
+    reference scales it quadratically in the rate, `lr^2 * wd` for Adam and
+    `lr^2 * lr_mul * wd` for matrices, which is why it can carry `wd = 1.2` on
+    matrices: at its 0.023 rate the per-step factor is 6.3e-4.  Off by default
+    here, because a PPO trust region is a statement about the policy the update
+    replays and decay moves weights the surrogate never asked to move.
+    Pretraining is the case it was written for, and `train_bc.py` turns it on.
+
 What is deliberately NOT ported:
 
   * **All communication.**  Replicated, sharded, and sparse gradient reduction,
     parameter banks, and the reduce/work orders exist to overlap eight ranks.
     We train on one GPU, so every one of those paths is dead weight here.
-
-  * **Cautious weight decay.**  We do not pretrain, and `weight_decay` has been
-    zero here since the config was written: with decay the update stops being
-    scale-invariant and steadily shrinks norm gains and biases.  A gated
-    variant of a term whose coefficient is zero is still zero.
 
   * **bfloat16 parameters with mantissa tracking.**  That trick stores a bf16
     parameter beside a uint16 low half, so the forward reads half the bytes
@@ -230,6 +235,8 @@ class NorMuon(torch.optim.Optimizer):
         beta2: float = 0.9,
         adam_betas: tuple[float, float] = (0.9, 0.99),
         adam_epsilon: float = 1e-10,
+        weight_decay: float = 0.0,
+        adam_weight_decay: float = 0.0,
     ) -> None:
         matrices = [parameter for parameter in matrix_parameters]
         vectors = [parameter for parameter in vector_parameters]
@@ -245,6 +252,14 @@ class NorMuon(torch.optim.Optimizer):
         ):
             if not value > 0.0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        for name, value in (
+            ("weight decay", weight_decay),
+            ("adam weight decay", adam_weight_decay),
+        ):
+            # Written as a bounded interval so NaN is rejected by the same
+            # comparison that rejects an infinity.
+            if not 0.0 <= value < float("inf"):
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
         for name, value in (
             ("momentum", momentum),
             ("beta2", beta2),
@@ -265,6 +280,7 @@ class NorMuon(torch.optim.Optimizer):
                     "warmup_step": 0,
                     "momentum": momentum,
                     "beta2": beta2,
+                    "weight_decay": weight_decay,
                 }
             )
         if vectors:
@@ -277,6 +293,7 @@ class NorMuon(torch.optim.Optimizer):
                     "warmup_step": 0,
                     "betas": tuple(adam_betas),
                     "eps": adam_epsilon,
+                    "weight_decay": adam_weight_decay,
                 }
             )
         if not groups:
@@ -303,6 +320,7 @@ class NorMuon(torch.optim.Optimizer):
         momentum = float(group["momentum"])
         beta2 = float(group["beta2"])
         learning_rate = float(group["lr"])
+        weight_decay = float(group["weight_decay"])
         for parameter in group["params"]:
             gradient = parameter.grad
             if gradient is None:
@@ -340,7 +358,17 @@ class NorMuon(torch.optim.Optimizer):
             step = learning_rate * _shape_learning_rate_multiplier(rows, columns)
             if found_inf is not None:
                 step = torch.where(found_inf == 0, step, 0.0)
-            flat_parameter.add_(direction.to(flat_parameter.dtype) * -step)
+            if not weight_decay:
+                flat_parameter.add_(direction.to(flat_parameter.dtype) * -step)
+            else:
+                # `step` carries both the shape multiplier and the skip gate, so
+                # the reference's `lr^2 * lr_mul * wd` and its "a skipped
+                # minibatch changes nothing" both follow from writing the decay
+                # against it rather than against the bare rate.
+                decay = weight_decay * learning_rate * step
+                shrinking = (direction * flat_parameter) >= 0
+                update = direction * step + flat_parameter * shrinking * decay
+                flat_parameter.sub_(update.to(flat_parameter.dtype))
 
     @staticmethod
     def _reduce_variance(
@@ -377,6 +405,7 @@ class NorMuon(torch.optim.Optimizer):
         beta1, beta2 = group["betas"]
         epsilon = float(group["eps"])
         learning_rate = float(group["lr"])
+        weight_decay = float(group["weight_decay"])
         for parameter in group["params"]:
             gradient = parameter.grad
             if gradient is None:
@@ -410,4 +439,12 @@ class NorMuon(torch.optim.Optimizer):
                 (second / bias2.clamp_min(1e-12)).sqrt() + epsilon
             )
             step = learning_rate if found_inf is None else learning_rate * applied_scalar
-            parameter.add_((update * -step).to(parameter.dtype))
+            if not weight_decay:
+                parameter.add_((update * -step).to(parameter.dtype))
+            else:
+                # Quadratic in the rate here too, which is why the reference's
+                # 0.005 bites only on the tables it gives a large `lr_mul`.
+                decay = weight_decay * learning_rate * step
+                shrinking = (update * parameter) > 0
+                decayed = update * step + parameter * shrinking * decay
+                parameter.sub_(decayed.to(parameter.dtype))
