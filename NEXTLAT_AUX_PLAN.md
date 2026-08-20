@@ -4,6 +4,34 @@ Source: "Next-Latent Prediction Transformers Learn Compact World Models"
 (Teoh et al., Microsoft Research, arXiv 2511.05963v4). Verified against the
 full PDF, not just an abstract summary.
 
+## Status
+
+**Module implemented and gated; not yet wired into a training run.** On main:
+`src/kaggriculture/latent_dynamics.py` carries `LatentDynamics`,
+`latent_dynamics_loss`, `latent_dynamics_halves`, `latent_decode_kl`,
+`consecutive_rows`, `latent_horizon_loss` and `belief_spread`, with
+`FarmActor.forward_with_belief` exposing the belief and
+`tests/test_latent_dynamics.py` holding 15 pins (full suite 717 python, 33
+rust).
+
+The load-bearing pin is `test_the_decode_reproduces_the_actors_own_heads_exactly`:
+decoding the belief with detached head weights reproduces the actor's own logits
+at rtol=0, atol=0. It fails on a wrong split index, on a second `market_norm`,
+and on any per-row broadcast, which is what the first implementation did.
+
+Still open, in order: wire the two terms into the BC step behind
+`latent_dynamics_coefficient`, run the A/B on the `public-v16` corpora, and only
+then consider the RL fine-tune. The A/B cannot be decided on holdout NLL --
+`runs/bc6-v16-mixed` reached 0.000133 with all three heads above 0.9999, so the
+metric is saturated. It is decided on bank and score rate in the official
+engine, where the same clone scores 1.000 against `starter` and 0.750 against
+both `public-v27` and its own teacher.
+
+Contributing measurement, since it changes what a run costs: compiling the clone
+step is 2.03x per epoch at `--compile-mode default`, now the shipped value. It
+is deliberately NOT `max-autotune-no-cudagraphs`, which reaches the same steady
+state for 473s of compilation against 39s and only breaks even past 16 epochs.
+
 ## What the paper shows
 
 NextLat augments next-token prediction with a self-supervised latent loss: a
