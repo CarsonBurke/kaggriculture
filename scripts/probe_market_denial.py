@@ -41,21 +41,25 @@ from kaggriculture.training import AnyActor
 _STEPS = PRODUCTION_EPISODE_STEPS
 
 
-def _load(path: Path, device: torch.device) -> AnyActor:
-    """Load a league snapshot or an exported actor artifact.
+def _load(path: Path, device: torch.device, *, agent: int | None = None) -> AnyActor:
+    """Load a league snapshot, an exported actor artifact, or one population member.
 
     Both file shapes are in play here: the league writes snapshots under
     `league/`, while a BC run exports the artifact shape inference reads. The
     two overlap on `model_config` and `actor`, so the snapshot loader's own
     strict key set is what distinguishes them -- a BC artifact additionally
-    carries provenance and metrics, which that loader rejects outright.
+    carries provenance and metrics, which that loader rejects outright. A
+    population checkpoint is the third shape: `agent` selects one member, and
+    the artifact reader refuses it when N > 1 and no member was named.
     """
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if {"format_version", "iteration", "model_config", "actor"} <= set(payload) and not (
         set(payload) - {"format_version", "iteration", "model_config", "actor", "architecture"}
     ):
+        if agent is not None:
+            raise SystemExit(f"{path} is a league snapshot and holds no population member")
         return load_actor_snapshot(path, device=device)
-    actor, _ = load_actor_artifact(path, device=device)
+    actor, _ = load_actor_artifact(path, device=device, agent=agent)
     return actor.eval().requires_grad_(False)
 
 
@@ -117,7 +121,12 @@ def _match(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--actor", action="append", required=True, help="name=path")
+    parser.add_argument(
+        "--actor",
+        action="append",
+        required=True,
+        help="name=path, or name=path@agent to select one member of a population checkpoint",
+    )
     parser.add_argument("--games", type=int, default=16)
     parser.add_argument("--seed", type=int, default=90_001)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -139,7 +148,13 @@ def main() -> int:
         name, _, path = spec.partition("=")
         if not path:
             raise SystemExit(f"expected name=path, got {spec!r}")
-        actor = _load(Path(path), device)
+        # A population checkpoint holds N actors and no single one, so a member
+        # has to be named. `@` rather than `:` because a path may carry a colon
+        # and a member index may not.
+        path, _, member = path.partition("@")
+        if member and not member.isdigit():
+            raise SystemExit(f"expected name=path@agent with a member index, got {spec!r}")
+        actor = _load(Path(path), device, agent=int(member) if member else None)
         actors[name] = actor
         architectures.add(architecture_of(actor).name)
     if len(architectures) > 1:

@@ -386,16 +386,44 @@ trained artifact, so it is a real change -- but no scheduler, population size or
 pairing rule can substitute for it, and Stages 5 and 6 have now spent their
 budget establishing exactly that.
 
-**Market denial is still positively rewarded.** Measured twice: destroying the
-shared market beats out-farming when the opponent is beatable, and a population
-trains straight into it. Four co-learners do not change the incentive, and the
-first member to discover denial wins its pairings. Only an absolute anchor
-removes it; the Stage 5 tripwire only reports it after the fact.
+**Market denial is still positively rewarded. Measured on this run's own
+members.** `artifacts/probes/pop4-denial.json`, 16 games per ordered cell, two
+seat orders per edge, warm start member 0 (`warm0`, iteration 40) against final
+members 0 and 1 (`fin0`, `fin1`, iteration 130):
 
-**Cycling.** With no past players, non-transitive rock-paper-scissors drift among
-four learners is unchecked, and the aggregate score rate cannot see it — a
-three-cycle keeps every member near 0.5 forever. Instrumented in Stage 5 by
-scoring each agent against its own earlier weights in evaluation only.
+| policy | bank in mirror play |
+|---|---|
+| `warm0` | 61,772 / 66,360 |
+| `fin0` | 48,416 / 52,439 |
+| `fin1` | 50,087 / 48,816 |
+
+Ninety actor-active iterations made every member **poorer against an equal**.
+`fin1` then beats `warm0` 0.844 without ever out-earning it: facing `warm0` it
+holds 47,933 -- below its own mirror bank -- while cutting `warm0` from 61,772
+to 28,767, and from the other seat `warm0` collapses to a 8,633 median. The
+winner of that edge is the poorer policy, which is the pathology stated exactly:
+a scale-invariant reward pays for the opponent's loss at any price in your own
+bank, and the market is one shared `market_inventory` whose price is a function
+of it (`rust/kagg_env/src/core.rs:269,2869`), so dumping product is a permanent
+transfer away from both players and toward whoever needs it less.
+
+**Cycling. Measured, and it is what pins the aggregate at 0.5.** The risk was
+that non-transitive drift among four learners is unchecked and the aggregate
+score rate cannot see it. The same matrix shows a clean three-cycle, every edge
+at 32 games:
+
+`warm0` beats `fin0` 0.719, `fin0` beats `fin1` 0.812, `fin1` beats `warm0`
+0.844.
+
+That is the explanation for mean self-play score sitting at exactly 0.5000 for
+131 iterations: it is not a population balanced at equal skill, it is a cycle.
+Aggregate score rate is structurally blind to it, and per-agent score rate is
+too -- both read 0.5 in a cycle and in a converged tie. The distinguishing
+measurement is the ordered pairwise matrix, which the run already journals as
+`population_score_rate_i_vs_j`; nothing consumed it. Reading it is cheap and
+should gate any future population run, but it diagnoses rather than fixes: a
+cycle among three denial policies is a symptom of the reward, not of the
+pairing rule.
 
 **Convergence of the population.** Four agents on the same architecture, corpus
 and objective can drift together until the league is mirror play under another
