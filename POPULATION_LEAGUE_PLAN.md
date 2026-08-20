@@ -337,13 +337,21 @@ members stop competing for the shared economy and let a fixed opponent take it.
 Agent 2 at iteration 120 finished with 7 money against `starter`, having beaten
 it 1.000 at the warm start.
 
-**The decisive number is that the mean self-play score is exactly 0.5000 at
-every iteration.** It is zero-sum by construction, so the wave's only gradient
-is the *spread* around 0.5, and that spread is what widened -- 0.43-0.58 at
-iteration 20 to 0.18-0.78 at 120. Maximizing spread means beating your siblings,
-which in this game means denying the shared market at a cost to yourself that a
-scale-invariant reward divides out. This is `probe_market_denial`'s finding
-arriving as a training trajectory rather than a pairwise measurement.
+**Withdrawn: "the decisive number is that the mean self-play score is exactly
+0.5000".** It is an accounting identity, not a measurement. `_relative_score` is
+antisymmetric and the schedule plays every ordered pairing equally often, so
+`score(i,j) + score(j,i) = 1.000000` for every pair and the mean over all twelve
+is 0.5 whatever the members are -- verified on iteration 135's journal. One god
+and three rocks also average 0.5. The column is in the table above for shape
+only; it carries no information and nothing should be concluded from it.
+
+What the *ordered* matrix shows, which the mean cannot, is that the population
+was not balanced at all. At iteration 135: `0>1` 0.654, `0>2` 0.692, `0>3`
+0.808, `1>2` 0.769, `1>3` 0.846, `3>2` 0.692 -- a strict order 0 > 1 > 3 > 2
+with strong edges, so there was a real internal gradient and it was being
+followed. Cycling appeared transiently at iteration 81 (0 > 1 > 2 > 0, all three
+dominated by 3) and resolved by 135. So the run does not support a
+cycling explanation either.
 
 Every internal instrument read healthy or improving while it happened: entropy
 alive and rising 0.000 to 0.185, pairwise disagreement up 6.6x, critic explained
@@ -357,34 +365,62 @@ adopted separately, the reward anchor.
 
 ## Risks
 
-**The population does not fix reward saturation, and cannot. Now measured, not
-predicted.** Every reward term is scale-invariant: `_relative_score` and the
-dense shaping potential built on it (`terminal_pair_potential`). This paragraph
-used to argue that a population of four equals scores 0.5 each, exactly as mirror
-self-play did, and that the scheme removes only the *guarantee* of a zero signal
-from identical weights rather than the fixed point at mutual mediocrity. Stage 5
-ran and that is what happened, faster and harder than in the frozen-league run:
-mean self-play score exactly 0.5000 throughout, the shared bank down 68%, and
-every member from 0.875 to 0.000 against `public-v27`.
+**Reward saturation is real, but it is NOT established as the cause of either
+collapse. Both runs share one confound: no non-saturating opponent was ever in
+the training wave.** Every reward term is scale-invariant --  `_relative_score`
+and the dense shaping potential built on it (`terminal_pair_potential`) -- and
+absolute competence is therefore a null direction of the objective. That much is
+a property of the code and is not in question. What was claimed here, and is now
+withdrawn, is that two collapses had established it as the operative cause.
 
-The absolute bank anchor is therefore no longer a separate decision that may
-wait. It is the blocking one, and it now has three independent reproductions of
-the same root cause behind it:
+The confound, found by asking why a standard league does not behave this way:
 
-1. `runs/ppo-bc5mix` — N=1 league, built-ins 12.5% of the wave: money 48,006 to
-   7,032 while `league_score_rate` *rose* 0.302 to 0.578.
-2. `artifacts/probes/market-denial.json` — pairwise and direct: iteration-49
-   weights pay 57k to 14k of their own bank to drive `bc5`'s median bank to 0,
-   and score **better** for it (0.876 against 0.840 at four times the money).
-3. `runs/pop4-klwin` — N=4, zero fixed opponents: the table above.
+| run | built-in opponents in the training wave |
+|---|---|
+| `runs/ppo-bc5mix` | `pass,random,starter` |
+| `runs/pop4-klwin` | none (`_validate_population` refuses lanes at N>1) |
+| `production.py:35` default | `pass,random,starter,scripted-v27` |
 
-The three differ in scheduler, opponent mix and population size, and agree on
-mechanism. What varies is only how fast: the fewer fixed opponents in the wave,
-the faster the collapse, which is the dose-response curve the anchor argument
-needs. Anchoring touches `rust/kagg_env/src/core.rs` and the meaning of every
-trained artifact, so it is a real change -- but no scheduler, population size or
-pairing rule can substitute for it, and Stages 5 and 6 have now spent their
-budget establishing exactly that.
+`scripted-v27` -- the in-engine port of the strongest known opponent, native in
+the batched wave (`core.rs:1226`), already the production default -- was omitted
+from the one run that could have used it and structurally forbidden in the
+other. And the three that were used all *saturate*, measured in
+`artifacts/probes/pop4-anchor.json`:
+
+| policy | vs `starter` | vs `scripted-v27` |
+|---|---|---|
+| `warm0` (it 40) | 1.000, bank 140,592 | **0.4375**, 66,821 / 72,778 |
+| `fin0` (it 130) | 1.000, bank 54,471 | 0.000, 40,279 / 111,832 |
+| `fin1` (it 130) | 1.000, bank 54,842 | 0.000, 43,235 / 113,859 |
+
+`starter` reads 1.000 across a 2.6x spread in absolute bank. A constant score
+contributes a zero advantage and therefore no gradient, so the "12.5% built-in
+rows" in `ppo-bc5mix` were not an anchor -- they were wasted rows. Effectively
+both runs were unanchored self-play. `scripted-v27` is the opposite: 0.4375
+against the warm start and 0.000 against both collapsed finals, which is a large
+corrective gradient that was available and never sampled.
+
+This also repairs the mechanism story. Against a strong opponent the collapsed
+policy does not deny -- `scripted-v27`'s own bank *rises* 72,778 to 113,859, the
+same direction `public-v27`'s did in external evaluation. Denial only pays
+against a market-dependent opponent (`bc5`, itself weaker than `public-v27`); a
+strong opponent is denial's beneficiary. So denial is an exploit of a specific
+opponent class, not a dominant strategy, and an exploit is exactly what a league
+with a permanent non-saturating anchor is supposed to punish.
+
+That is the AlphaStar recipe this plan claimed to be following and was not: a
+supervised anchor kept in the league permanently, main agents spending a large
+share of games against the whole past league, and PFSP up-weighting opponents
+you are losing to. Beating a fixed strong opponent requires absolute capability,
+which pins the null direction without touching the reward at all.
+
+**Therefore the reward change is no longer the next step.** Anchoring touches
+`rust/kagg_env/src/core.rs` and the meaning of every trained artifact; it must
+not be spent on a hypothesis confounded by a missing flag. The decisive and far
+cheaper experiment is `ppo-bc5mix`'s own configuration with `scripted-v27` added
+to the built-in lanes -- one variable, against a known collapse. Only if a
+policy still walks off its bank with a non-saturating anchor in the wave does the
+reward become the suspect.
 
 **Market denial is still positively rewarded. Measured on this run's own
 members.** `artifacts/probes/pop4-denial.json`, 16 games per ordered cell, two
@@ -407,23 +443,23 @@ bank, and the market is one shared `market_inventory` whose price is a function
 of it (`rust/kagg_env/src/core.rs:269,2869`), so dumping product is a permanent
 transfer away from both players and toward whoever needs it less.
 
-**Cycling. Measured, and it is what pins the aggregate at 0.5.** The risk was
-that non-transitive drift among four learners is unchecked and the aggregate
-score rate cannot see it. The same matrix shows a clean three-cycle, every edge
-at 32 games:
+**Cycling. Present but transient, and it explains nothing.** The risk was that
+non-transitive drift among four learners is unchecked and the aggregate score
+rate cannot see it. Both halves need correcting.
 
-`warm0` beats `fin0` 0.719, `fin0` beats `fin1` 0.812, `fin1` beats `warm0`
-0.844.
+The cross-generation matrix is a three-cycle at 32 games per edge -- `warm0`
+beats `fin0` 0.719, `fin0` beats `fin1` 0.812, `fin1` beats `warm0` 0.844 -- so
+non-transitivity is real between generations. But the *live* population's own
+ordered matrix was cyclic only at iteration 81 and strictly ordered by 135
+(0 > 1 > 3 > 2, above), so the run ended with a clean internal ranking.
 
-That is the explanation for mean self-play score sitting at exactly 0.5000 for
-131 iterations: it is not a population balanced at equal skill, it is a cycle.
-Aggregate score rate is structurally blind to it, and per-agent score rate is
-too -- both read 0.5 in a cycle and in a converged tie. The distinguishing
-measurement is the ordered pairwise matrix, which the run already journals as
-`population_score_rate_i_vs_j`; nothing consumed it. Reading it is cheap and
-should gate any future population run, but it diagnoses rather than fixes: a
-cycle among three denial policies is a symptom of the reward, not of the
-pairing rule.
+And this was claimed to explain the 0.5000 aggregate. It does not: that number
+is an antisymmetry identity and needs no explanation. What survives is narrow
+and still useful -- aggregate and per-agent score rate both read 0.5 in a cycle
+and in a converged tie, so neither can detect non-transitivity, while the
+ordered pairwise matrix can. The run already journals it as
+`population_score_rate_i_vs_j` and nothing consumed it. Read it; do not treat
+the mean as data.
 
 **Convergence of the population.** Four agents on the same architecture, corpus
 and objective can drift together until the league is mirror play under another
