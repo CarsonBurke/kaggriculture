@@ -6,26 +6,69 @@ full PDF, not just an abstract summary.
 
 ## Status
 
-**Module implemented and gated; not yet wired into a training run.** On main:
+**Wired, measured, and the verdict splits the paper's two terms.** On main the
+auxiliary is live in `scripts/train_bc.py` behind `--latent-dynamics-coefficient`
+(the reference's `lambda_mse`), `--latent-decode-coefficient` (`lambda_kl`) and
+`--latent-horizon` (`mtp_horizon`), all defaulting to zero, so the shipped clone
+is the path it was. One trunk pass serves both objectives;
 `src/kaggriculture/latent_dynamics.py` carries `LatentDynamics`,
 `latent_dynamics_loss`, `latent_dynamics_halves`, `latent_decode_kl`,
-`consecutive_rows`, `latent_horizon_loss` and `belief_spread`, with
-`FarmActor.forward_with_belief` exposing the belief and
-`tests/test_latent_dynamics.py` holding 15 pins (full suite 717 python, 33
-rust).
+`consecutive_rows`, `latent_horizon_loss` and `belief_spread` with 16 pins.
 
 The load-bearing pin is `test_the_decode_reproduces_the_actors_own_heads_exactly`:
 decoding the belief with detached head weights reproduces the actor's own logits
 at rtol=0, atol=0. It fails on a wrong split index, on a second `market_norm`,
 and on any per-row broadcast, which is what the first implementation did.
 
-Still open, in order: wire the two terms into the BC step behind
-`latent_dynamics_coefficient`, run the A/B on the `public-v16` corpora, and only
-then consider the RL fine-tune. The A/B cannot be decided on holdout NLL --
-`runs/bc6-v16-mixed` reached 0.000133 with all three heads above 0.9999, so the
-metric is saturated. It is decided on bank and score rate in the official
-engine, where the same clone scores 1.000 against `starter` and 0.750 against
-both `public-v27` and its own teacher.
+### Measured outcome
+
+Four arms, three training seeds each, identical corpora (the four `public-v16`
+sets at `--seeds-per-dataset 64`), identical 12-epoch trapezoid, identical
+`--run-length 4` sampler so only the objective differs. Play measured in the
+official `kaggle_environments` engine, 16 games per opponent per seed:
+
+| arm | lambda_mse | lambda_kl | learning-phase NLL | vs `starter` | vs `public-v16` | vs `public-v27` |
+|---|---|---|---|---|---|---|
+| baseline | 0 | 0 | 0.00664 +- 0.00102 | 1.000 | 0.875 | 0.125 / 0.000 / 0.000 |
+| dyn | 1.0 | 0 | 0.00666 +- 0.00083 | 1.000 | 0.854 | 0.000 / 0.000 / 0.000 |
+| dyn-kl | 1.0 | 0.5 | 0.00629 +- 0.00083 | 1.000 | 0.875 | 0.000 / 0.000 / 0.000 |
+| **kl** | 0 | 0.5 | **0.00485 +- 0.00040** | 1.000 | 0.875 | 0.000 / **0.938** / **1.000** |
+
+**The KL distillation term pays and the SmoothL1 latent regression does not.**
+That inverts the paper's emphasis, where `lambda_mse` is the headline term at
+1.0-3.0 and the KL is the optional extra.
+
+Three readings, none of them from a single number:
+
+1. *Sample efficiency, the stated gate.* `runs/bc6-v16-mixed` -- 4x the corpus
+   (256 seeds per dataset) and 20 epochs -- scores 0.9375 against `public-v27`
+   with money 80,904 to 71,427. The KL arm at 64 seeds and 12 epochs reaches
+   0.938 (84,183 to 71,459) and 1.000 (79,051 to 71,943): the same score, the
+   same money, the same opponent money. The auxiliary buys what 4x the
+   demonstration data buys, on the opponent that is out of distribution.
+2. *All the signal is off-distribution.* Against `starter` every arm saturates at
+   1.000 and against its own teacher every arm sits at 0.875. Only `public-v27`
+   -- stronger, and not the teacher of these corpora -- separates them, which is
+   what a world-model auxiliary is supposed to buy and is exactly the failure
+   this project already diagnosed: a clone gated on opponent wealth channels
+   that collapses against opponents it never saw.
+3. *The two terms are not proxies for each other.* In the KL-only arm the
+   unsupervised SmoothL1 climbs 0.059 -> 0.85 while its decode KL falls
+   0.077 -> 0.068. The belief becomes less latently predictable and more
+   decision-preserving at the same time. Latent coordinates are not the quantity
+   that matters; the action distribution they induce is.
+
+Against the failure direction: `dyn` seeds finish 16 games against `public-v27`
+holding 311 and 390 money, having burned a 3,000 bank. Regressing raw latent
+coordinates does not merely fail to help, it competes with the clone for trunk
+capacity and makes the policy catastrophically fragile off-distribution.
+
+Honest limits. The KL arm is bimodal -- one seed of three collapsed like the
+baseline -- so the claim is 2 successes in 3 against 0 in the 9 runs of the other
+three arms (Fisher exact p ~= 0.045), not a reliable gain. Five more seeds per
+arm are queued to pin the success rate. Cost is +10.6% per epoch for either term.
+Neither `lambda_kl` nor the horizon was swept; both sit at first-choice values
+(0.5 and 2).
 
 Contributing measurement, since it changes what a run costs: compiling the clone
 step is 2.03x per epoch at `--compile-mode default`, now the shipped value. It
