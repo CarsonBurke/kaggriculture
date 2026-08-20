@@ -63,12 +63,22 @@ holding 311 and 390 money, having burned a 3,000 bank. Regressing raw latent
 coordinates does not merely fail to help, it competes with the clone for trunk
 capacity and makes the policy catastrophically fragile off-distribution.
 
-Honest limits. The KL arm is bimodal -- one seed of three collapsed like the
-baseline -- so the claim is 2 successes in 3 against 0 in the 9 runs of the other
-three arms (Fisher exact p ~= 0.045), not a reliable gain. Five more seeds per
-arm are queued to pin the success rate. Cost is +10.6% per epoch for either term.
-Neither `lambda_kl` nor the horizon was swept; both sit at first-choice values
-(0.5 and 2).
+The bimodality is a property of the training seed, not of the evaluation. Every
+one of the six baseline and KL artifacts was replayed against `public-v27` on a
+disjoint game-seed block (6000-6007 against 5000-5007) and each reproduced its
+own verdict: both dead baselines stayed at 0.000, the dead KL seed stayed at
+0.000, and the two live KL seeds went 0.938 -> 1.000 and 1.000 -> 1.000, winning
+16 of 16 on states they had never seen. Which basin training lands in is what
+varies; where a trained artifact ends up is stable across 32 games.
+
+Honest limits. One KL seed of three collapsed like the baseline, so the claim is
+2 successes in 3 against 0 in the 9 runs of the other three arms (Fisher exact
+p ~= 0.045), not a reliable gain. Five more seeds per arm are queued behind
+another user's GPU job to pin the success rate. Cost is +10.6% per epoch for
+either term. Neither `lambda_kl` nor the horizon was swept; both sit at
+first-choice values (0.5 and 2). The whole A/B ran at `--seeds-per-dataset 64`,
+a deliberately data-starved regime; whether the term still pays at 256, where
+the plain baseline already reaches 0.9375, is untested.
 
 Contributing measurement, since it changes what a run costs: compiling the clone
 step is 2.03x per epoch at `--compile-mode default`, now the shipped value. It
