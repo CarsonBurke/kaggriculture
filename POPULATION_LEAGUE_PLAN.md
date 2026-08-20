@@ -293,6 +293,21 @@ stacked-ensemble machinery. *Acceptance:* no training-path caller of the retired
 functions remains, the suite passes without them, and no second scheduler is left
 behind.
 
+**Deferred until after Stage 5, deliberately.** This stage was sequenced before
+the launch to stop a second scheduler running silently beside the first. That
+hazard does not exist: `_validate_population` (`scripts/train_ppo.py:350`) already
+*refuses* `--league-games`, `--league-builtin-lanes` and `--league-builtin-opponents`
+whenever `N > 1`, so a population wave cannot reach the frozen-league scheduler at
+all. The paths are mutually exclusive by construction, and the acceptance
+criterion "no second scheduler is left behind" is already met by refusal.
+
+What deleting it now would cost is real. Zero population runs have completed, so
+the design is unvalidated, while the frozen-league path produced every artifact in
+this repository -- the v27 clone, BC5, the v16 clones, all of them. `population ==
+1` returns early from the same validator, so the league scheduler *is* the N=1
+path: retiring it removes the project's only demonstrated RL recipe and any
+fallback, before the replacement has trained once. Validate first, then delete.
+
 **Stage 5 - measured launch.** Cost check against Stage 0's table, then the run,
 with external evaluation of all N agents. Instrument cycling without adding a
 frozen lane: in evaluation only, score each agent against its own weights from K
