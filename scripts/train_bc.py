@@ -161,6 +161,16 @@ def parse_args() -> argparse.Namespace:
             "-- so batches only change when an A/B raises it"
         ),
     )
+    parser.add_argument(
+        "--compile-mode",
+        default="max-autotune-no-cudagraphs",
+        help=(
+            "torch.compile mode for the clone step, or 'none' for eager. The "
+            "default is measured: 2.07x per step and 35% less peak VRAM at the "
+            "shipped batch. NOT a cudagraphs mode -- the last minibatch of an "
+            "epoch is a short tail, so the shape varies"
+        ),
+    )
     # Both rate and decay changed UNITS when this moved off AdamW, so both are
     # renamed: a stale invocation now fails at argparse instead of silently
     # training a tenth as fast with a hundredth of the intended decay.
@@ -602,6 +612,12 @@ def _artifact_payload(
     }
 
 
+# Inductor's own list, read rather than restated, so a torch upgrade that adds or
+# drops a mode cannot leave a stale allowlist behind. `none` is ours and means
+# eager.
+COMPILE_MODES = tuple(sorted(torch._inductor.list_mode_options()))
+
+
 # `modded-nanogpt`'s pretraining schedule, transcribed from
 # `TrainingSchedule.get_lr` (train_gpt.py:1968-1976) and `get_muon_momentum`
 # (:1995-2005). Two departures from what this file used to do: the rate holds
@@ -715,6 +731,7 @@ def train(
     patience: int,
     batch_size: int,
     run_length: int = 1,
+    compile_mode: str = "none",
     matrix_learning_rate: float,
     matrix_weight_decay: float,
     adam_learning_rate_ratio: float,
@@ -727,6 +744,13 @@ def train(
     """Run the full clone; returns the best holdout metrics."""
     if epochs < 1 or patience < 1 or batch_size < 1 or run_length < 1:
         raise ValueError("epochs, patience, batch size, and run length must be positive")
+    # Checked before the corpus is staged, which takes minutes: a typo'd mode
+    # otherwise surfaces at the first minibatch, after the wait. Inductor owns
+    # the list, so this cannot drift from what torch actually accepts.
+    if compile_mode != "none" and compile_mode not in COMPILE_MODES:
+        raise ValueError(
+            f"unknown compile mode {compile_mode!r}; expected 'none' or one of {COMPILE_MODES}"
+        )
     if architecture_of_config(config).name != architecture:
         raise ValueError(
             f"{type(config).__name__} does not configure the {architecture} architecture"
@@ -780,6 +804,18 @@ def train(
     run_starts, run_lengths = _run_blocks(train_split.staged["episode_index"], run_length)
     step_index = 0
     autocast = device.type == "cuda"
+    # Measured, not assumed: fusing the clone step is 2.07x at batch 2048 and
+    # cuts peak VRAM 12.21 -> 7.99 GiB, because the intermediates stop being
+    # materialized (`artifacts/probes/bc-compile.json`). A 96-dim, 127-token
+    # transformer is bandwidth-bound, which is the regime where fusion pays.
+    # Compiled and eager are not bit-identical -- inductor reorders reductions,
+    # which moves a bf16 accumulation by 0.097% in global gradient L2 at
+    # unchanged direction, while fp32 agrees to 2e-05
+    # (`artifacts/probes/compile-parity.json`). Recorded in provenance below so
+    # an artifact is never silently compared against one trained the other way.
+    clone_loss = (
+        _clone_loss if compile_mode == "none" else torch.compile(_clone_loss, mode=compile_mode)
+    )
     bc_provenance: dict[str, Any] = {
         "datasets": datasets,
         "architecture": architecture,
@@ -788,6 +824,7 @@ def train(
         # to one trained with a different sampler.
         "batch_size": batch_size,
         "run_length": run_length,
+        "compile_mode": compile_mode,
         "command": sys.argv,
     }
     # A scalar teacher survives only when the mixture agrees on one, because a
@@ -823,7 +860,7 @@ def train(
             epoch_components = 0.0
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
                 actor_args, factors = _batch(architecture, train_split, order[indices], device)
-                loss = _clone_loss(actor, actor_args, factors, autocast)
+                loss = clone_loss(actor, actor_args, factors, autocast)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite clone loss in epoch {epoch}")
                 optimizer.zero_grad(set_to_none=True)
@@ -902,6 +939,7 @@ def main() -> None:
         patience=args.patience,
         batch_size=args.batch_size,
         run_length=args.run_length,
+        compile_mode=args.compile_mode,
         matrix_learning_rate=args.matrix_learning_rate,
         matrix_weight_decay=args.matrix_weight_decay,
         adam_learning_rate_ratio=args.adam_learning_rate_ratio,

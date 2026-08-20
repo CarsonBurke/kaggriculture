@@ -44,6 +44,7 @@ from kaggriculture.actions import (
     N_UNIT_ACTIONS,
     QUANTIFIED_MARKET_KINDS,
 )
+from kaggriculture.constants import MAX_UNITS
 from kaggriculture.model import ReluSquared, RMSNorm, factored_quantity_logits
 from kaggriculture.policy import mask_logits
 
@@ -131,41 +132,84 @@ class LatentDynamics(nn.Module):
         market_kinds: Tensor,
         market_quantities: Tensor,
     ) -> Tensor:
-        """Predict ``h_hat_{t+1}`` for every row, shaped ``(rows, model_dim)``.
+        """Predict ``h_hat_{t+1}``, shaped ``(rows, tokens, model_dim)``.
+
+        The belief is the tensor the policy heads read -- 16 unit tokens then 10
+        market tokens -- so the prediction is per token, with the MLP shared
+        across tokens and the row's action embedding broadcast to all of them.
+        That is the reference's shape: NextLat predicts one token's latent at a
+        time and tokens are the sequence dimension. Flattening the tokens into
+        one wide regression would invent a per-position parameterization the
+        reference does not have and multiply the parameters by the token count.
 
         Runs in fp32 regardless of the caller's autocast state. The regression
         target is fp32 by construction and the loss reduces in fp32 anyway, so
         pinning the precision here costs one cast on a tiny module and removes a
         silent dependency on the caller's autocast state.
         """
-        if belief.ndim != 2:
-            raise ValueError("belief must be one vector per row")
+        if belief.ndim != 3:
+            raise ValueError("belief must be one vector per belief token per row")
         if belief.shape[-1] != self.model_dim:
             raise ValueError("belief width does not match the dynamics model width")
         with torch.autocast(device_type=belief.device.type, enabled=False):
             belief = belief.float()
             action = self.embed_action(unit_actions, market_kinds, market_quantities)
-            transition = self.transition_norm(torch.cat((action.float(), belief), dim=-1))
+            # One action per row, one prediction per token: the action is the same
+            # for every token of a row, and it is the belief that differs.
+            broadcast = action.float().unsqueeze(-2).expand(-1, belief.shape[-2], -1)
+            transition = self.transition_norm(torch.cat((broadcast, belief), dim=-1))
             return belief + self.predictor(transition)
+
+
+def _masked_element_mean(predicted: Tensor, target: Tensor, eligible: Tensor) -> Tensor:
+    """SmoothL1 over eligible rows, divided by the masked ELEMENT count.
+
+    Matching the reference's division by masked ``B * T * n_embd``: the result is
+    a mean per coordinate, so masking rows out does not shrink it. Every trailing
+    dimension counts, which is what makes this correct for a per-token belief as
+    well as for a single vector.
+    """
+    weights = eligible.to(torch.float32).reshape(-1, *([1] * (predicted.ndim - 1)))
+    errors = F.smooth_l1_loss(predicted.float(), target.detach().float(), reduction="none")
+    coordinates = 1
+    for size in predicted.shape[1:]:
+        coordinates *= size
+    elements = weights.sum() * coordinates
+    return (errors * weights).sum() / elements.clamp_min(1.0)
 
 
 def latent_dynamics_loss(predicted: Tensor, target: Tensor, eligible: Tensor) -> Tensor:
     """SmoothL1 regression onto the stop-gradient successor belief.
 
-    The denominator is the masked *element* count, matching the reference's
-    division by masked ``B * T * n_embd``: the loss is the mean per-coordinate
-    error over eligible rows, so masking rows out does not shrink it. ``eligible``
-    zeroes rows whose successor is not the next row -- the last step of an
-    episode, and any row whose successor fell outside the minibatch.
+    ``eligible`` zeroes rows whose successor is not the next row -- the last step
+    of an episode, and any row whose successor fell outside the minibatch.
     """
     if predicted.shape != target.shape:
         raise ValueError("predicted and target beliefs must have the same shape")
     if eligible.shape != predicted.shape[:1]:
         raise ValueError("eligibility mask must have one entry per row")
-    weights = eligible.to(torch.float32).unsqueeze(-1)
-    errors = F.smooth_l1_loss(predicted.float(), target.detach().float(), reduction="none")
-    elements = weights.sum() * predicted.shape[-1]
-    return (errors * weights).sum() / elements.clamp_min(1.0)
+    return _masked_element_mean(predicted, target, eligible)
+
+
+def latent_dynamics_halves(
+    predicted: Tensor, target: Tensor, eligible: Tensor, unit_tokens: int
+) -> tuple[Tensor, Tensor]:
+    """The same loss split into its unit and market halves, for journaling.
+
+    The two halves are not on one scale and the asymmetry is ours, not the
+    reference's: the unit tokens are raw trunk output while the market tokens are
+    already `market_norm`ed by the actor. Measured at production config the unit
+    half sits at RMS 0.563 against the market half's 1.000, so a pooled SmoothL1
+    is mildly dominated by the market half. Reported rather than rescaled --
+    rescaling would be a modelling choice the reference does not make, while an
+    unreported imbalance is one nobody can see.
+    """
+    if not 0 < unit_tokens < predicted.shape[-2]:
+        raise ValueError("unit token count must split the belief")
+    return (
+        _masked_element_mean(predicted[:, :unit_tokens], target[:, :unit_tokens], eligible),
+        _masked_element_mean(predicted[:, unit_tokens:], target[:, unit_tokens:], eligible),
+    )
 
 
 class BeliefDecode(NamedTuple):
@@ -208,7 +252,6 @@ class DecodeHeads(NamedTuple):
 
     unit_norm: RMSNorm
     unit_projection: nn.Linear
-    market_norm: RMSNorm
     market_kind: nn.Linear
     market_quantity_context: nn.Linear
     market_quantity_kind_gate: nn.Embedding
@@ -221,7 +264,6 @@ class DecodeHeads(NamedTuple):
         return cls(
             unit_norm=actor.unit_head[0],
             unit_projection=actor.unit_head[-1],
-            market_norm=actor.market_norm,
             market_kind=actor.market_kind,
             market_quantity_context=actor.market_quantity_context,
             market_quantity_kind_gate=actor.market_quantity_kind_gate,
@@ -231,19 +273,28 @@ class DecodeHeads(NamedTuple):
         )
 
     def decode(self, belief: Tensor) -> BeliefDecode:
-        """Score one belief per row through the heads, with the weights detached.
+        """Score the belief tokens through the heads that read them, detached.
 
         The reference's `F.linear(pred, lm_head.weight.detach())`, generalized to
-        three factored heads. Detached in both roles it is used for: as the
-        student the gradient must reach the predicted latent but never the heads,
-        and as the teacher nothing should be reached at all.
+        three factored heads over a split belief: the first `MAX_UNITS` tokens are
+        the unit head's input and the rest are the market heads'. Detached in both
+        roles it is used for -- as the student the gradient must reach the
+        predicted latent but never the heads, and as the teacher nothing should be
+        reached at all.
+
+        `market_norm` is deliberately absent. The actor applies it inside
+        `_head_inputs` before the market heads see anything, so the belief's
+        market half arrives already normalized; re-applying it here would norm
+        twice and decode a tensor the heads never see.
         """
+        if belief.ndim != 3 or belief.shape[-2] <= MAX_UNITS:
+            raise ValueError("belief must carry one token per unit slot and per market slot")
         with torch.autocast(device_type=belief.device.type, enabled=False):
             belief = belief.float()
-            market = _frozen_norm(self.market_norm, belief)
+            units, market = belief[:, :MAX_UNITS], belief[:, MAX_UNITS:]
             return BeliefDecode(
                 unit_logits=_frozen_linear(
-                    self.unit_projection, _frozen_norm(self.unit_norm, belief)
+                    self.unit_projection, _frozen_norm(self.unit_norm, units)
                 ),
                 market_kind_logits=_frozen_linear(self.market_kind, market),
                 market_quantity_context=_frozen_linear(self.market_quantity_context, market),
@@ -325,38 +376,31 @@ def latent_decode_kl(
     the same way the clone loss pools its log-likelihoods: one mean over the
     concatenated active components, so a factor's weight is its decision count.
     """
-    if predicted.ndim != 2:
-        raise ValueError("predicted belief must be one vector per row")
+    if predicted.ndim != 3:
+        raise ValueError("predicted belief must be one vector per belief token per row")
     if eligible.shape != predicted.shape[:1]:
         raise ValueError("eligibility mask must have one entry per row")
     student = heads.decode(predicted)
     row = eligible.bool().unsqueeze(-1)
-    # The heads score one distribution per row; the policy asks the same question
-    # once per slot under a per-slot mask, so the row's decode is broadcast and it
-    # is the masks that make the slots differ.
-    unit_slots = masks.unit_masks.shape[-2]
-    order_slots = masks.market_kind_masks.shape[-2]
+    # Every slot has its own token, so every slot has its own distribution on
+    # both sides. Nothing is broadcast: a row-level distribution shared by all
+    # 16 unit slots could not express "unit 3 harvests while unit 7 walks", and
+    # it is not what the policy computes.
     unit_kl, unit_weight = _decision_kl(
-        student.unit_logits.unsqueeze(-2).expand(-1, unit_slots, -1),
-        teacher_unit_logits.unsqueeze(-2).expand(-1, unit_slots, -1),
+        student.unit_logits,
+        teacher_unit_logits,
         masks.unit_masks,
         (row & masks.unit_active).float(),
     )
     kind_kl, kind_weight = _decision_kl(
-        student.market_kind_logits.unsqueeze(-2).expand(-1, order_slots, -1),
-        teacher_kind_logits.unsqueeze(-2).expand(-1, order_slots, -1),
+        student.market_kind_logits,
+        teacher_kind_logits,
         masks.market_kind_masks,
         (row & masks.market_active).float(),
     )
     quantity_kl, quantity_weight = _decision_kl(
-        heads.quantity_logits(
-            student.market_quantity_context.unsqueeze(-2).expand(-1, order_slots, -1),
-            masks.market_kinds,
-        ),
-        heads.quantity_logits(
-            teacher_quantity_context.unsqueeze(-2).expand(-1, order_slots, -1),
-            masks.market_kinds,
-        ),
+        heads.quantity_logits(student.market_quantity_context, masks.market_kinds),
+        heads.quantity_logits(teacher_quantity_context, masks.market_kinds),
         masks.market_quantity_masks,
         (row & masks.market_quantity_active).float(),
     )

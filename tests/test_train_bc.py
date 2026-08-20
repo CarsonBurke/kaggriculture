@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import itertools
 import json
 import re
@@ -976,3 +977,48 @@ def test_the_schedule_sets_every_group_from_its_own_base_rate() -> None:
     # The Adam half has no Nesterov coefficient to schedule, and inventing one
     # here would be read by nothing.
     assert "momentum" not in groups["adam"]
+
+
+def test_a_typo_in_the_compile_mode_fails_before_the_corpus_is_staged(tmp_path: Path) -> None:
+    """Staging takes minutes, so a bad mode must not surface at the first minibatch."""
+    trainer = _load_trainer()
+    with pytest.raises(ValueError, match="unknown compile mode"):
+        trainer.train(
+            dataset_dirs=[tmp_path],
+            output_dir=tmp_path / "run",
+            architecture=CONV_ENTITY,
+            config=_tiny_config(),
+            holdout_seeds=1,
+            epochs=1,
+            patience=1,
+            batch_size=8,
+            compile_mode="max-autotune-no-cudagrahps",
+            matrix_learning_rate=1e-3,
+            matrix_weight_decay=1.2,
+            adam_learning_rate_ratio=0.35,
+            adam_weight_decay=0.005,
+            seed=0,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )
+
+
+def test_the_shipped_compile_default_is_a_real_inductor_mode(monkeypatch, tmp_path: Path) -> None:
+    """The CLI default and the function default deliberately differ; pin both.
+
+    `train`'s default is `none` so the CPU suite never pays a compilation, while
+    the CLI default is the measured mode so a production run gets the 2.07x
+    without being asked. That split is a trap unless it is pinned: the shipped
+    value has to be a mode inductor actually accepts, and it must not be a
+    cudagraphs mode -- an epoch's last minibatch is a short tail, so the shape
+    varies and a captured graph would not fit it.
+    """
+    trainer = _load_trainer()
+    monkeypatch.setattr(
+        sys, "argv", ["train_bc.py", "--dataset", str(tmp_path), "--output", str(tmp_path / "run")]
+    )
+    shipped = trainer.parse_args().compile_mode
+    assert shipped == "max-autotune-no-cudagraphs"
+    assert shipped in trainer.COMPILE_MODES
+    assert shipped.endswith("no-cudagraphs")
+    assert inspect.signature(trainer.train).parameters["compile_mode"].default == "none"
