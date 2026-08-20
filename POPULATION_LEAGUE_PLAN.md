@@ -293,20 +293,28 @@ stacked-ensemble machinery. *Acceptance:* no training-path caller of the retired
 functions remains, the suite passes without them, and no second scheduler is left
 behind.
 
-**Deferred until after Stage 5, deliberately.** This stage was sequenced before
-the launch to stop a second scheduler running silently beside the first. That
-hazard does not exist: `_validate_population` (`scripts/train_ppo.py:350`) already
-*refuses* `--league-games`, `--league-builtin-lanes` and `--league-builtin-opponents`
-whenever `N > 1`, so a population wave cannot reach the frozen-league scheduler at
-all. The paths are mutually exclusive by construction, and the acceptance
-criterion "no second scheduler is left behind" is already met by refusal.
+**Refused, not deferred. Validation ran and the replacement lost.** This stage
+was sequenced before the launch to stop a second scheduler running silently
+beside the first. That hazard never existed: `_validate_population`
+(`scripts/train_ppo.py:350`) already *refuses* `--league-games`,
+`--league-builtin-lanes` and `--league-builtin-opponents` whenever `N > 1`, so a
+population wave cannot reach the frozen-league scheduler at all. The paths are
+mutually exclusive by construction and the acceptance criterion "no second
+scheduler is left behind" was met by refusal before any code was written.
 
-What deleting it now would cost is real. Zero population runs have completed, so
-the design is unvalidated, while the frozen-league path produced every artifact in
-this repository -- the v27 clone, BC5, the v16 clones, all of them. `population ==
-1` returns early from the same validator, so the league scheduler *is* the N=1
-path: retiring it removes the project's only demonstrated RL recipe and any
-fallback, before the replacement has trained once. Validate first, then delete.
+The deletion was then held for Stage 5 on the grounds that the replacement had
+never trained. It has now trained, once, and it is the worse recipe: the
+frozen-league path produced every artifact in this repository -- the v27 clone,
+BC5, the v16 clones -- while the population path took four artifacts that each
+beat `public-v27` and returned four that lose to it 0-of-16, one of them holding
+7 money against `starter`. `population == 1` returns early from the same
+validator, so the league scheduler *is* the N=1 path.
+
+Deleting the only demonstrated recipe in favour of a measured-worse one is not a
+cleanup, so this stage is withdrawn rather than rescheduled. It becomes live
+again only if some later change makes a population wave beat the N=1 league on
+external score rate, and the fact that both collapse for the same
+scale-invariance reason says the reward anchor comes first either way.
 
 **Stage 5 - measured launch. Ran, and the tripwire fired.** `runs/pop4-klwin`,
 N=4 at 156 games (13 x 12 ordered pairings), no league and no built-in lanes,
