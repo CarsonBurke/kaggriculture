@@ -22,41 +22,64 @@ and on any per-row broadcast, which is what the first implementation did.
 
 ### Measured outcome
 
-Four arms, three training seeds each, identical corpora (the four `public-v16`
-sets at `--seeds-per-dataset 64`), identical 12-epoch trapezoid, identical
+Four arms, identical corpora (the four `public-v16` sets at
+`--seeds-per-dataset 64`), identical 12-epoch trapezoid, identical
 `--run-length 4` sampler so only the objective differs. Play measured in the
-official `kaggle_environments` engine, 16 games per opponent per seed:
+official `kaggle_environments` engine, 16 games per opponent per seed. The two
+decision arms were extended to eight training seeds each; `dyn` and `dyn-kl`
+stopped at three, having already failed.
 
-| arm | lambda_mse | lambda_kl | learning-phase NLL | vs `starter` | vs `public-v16` | vs `public-v27` |
-|---|---|---|---|---|---|---|
-| baseline | 0 | 0 | 0.00664 +- 0.00102 | 1.000 | 0.875 | 0.125 / 0.000 / 0.000 |
-| dyn | 1.0 | 0 | 0.00666 +- 0.00083 | 1.000 | 0.854 | 0.000 / 0.000 / 0.000 |
-| dyn-kl | 1.0 | 0.5 | 0.00629 +- 0.00083 | 1.000 | 0.875 | 0.000 / 0.000 / 0.000 |
-| **kl** | 0 | 0.5 | **0.00485 +- 0.00040** | 1.000 | 0.875 | 0.000 / **0.938** / **1.000** |
+| arm | lambda_mse | lambda_kl | learning-phase NLL | final NLL | vs `starter` | vs `public-v16` | beats `public-v27` |
+|---|---|---|---|---|---|---|---|
+| baseline | 0 | 0 | 0.00669 (n=8) | 0.00135 | 1.000 | 0.875 | 0/8 |
+| dyn | 1.0 | 0 | 0.00666 (n=3) | 0.00153 | 1.000 | 0.854 | 0/3 |
+| dyn-kl | 1.0 | 0.5 | 0.00629 (n=3) | 0.00151 | 1.000 | 0.875 | 0/3 |
+| **kl** | 0 | 0.5 | **0.00502 (n=8)** | **0.00107** | 1.000 | 0.875 | **3/8** |
 
-**The KL distillation term pays and the SmoothL1 latent regression does not.**
-That inverts the paper's emphasis, where `lambda_mse` is the headline term at
-1.0-3.0 and the KL is the optional extra.
+**The KL distillation term improves imitation decisively and off-distribution play
+only sometimes. The SmoothL1 latent regression does neither.** The first half
+inverts the paper's emphasis, where `lambda_mse` is the headline term at 1.0-3.0
+and the KL is the optional extra.
 
-Three readings, none of them from a single number:
+Three readings, and the first is much better supported than the second:
 
-1. *Sample efficiency, the stated gate.* `runs/bc6-v16-mixed` -- 4x the corpus
-   (256 seeds per dataset) and 20 epochs -- scores 0.9375 against `public-v27`
-   with money 80,904 to 71,427. The KL arm at 64 seeds and 12 epochs reaches
-   0.938 (84,183 to 71,459) and 1.000 (79,051 to 71,943): the same score, the
-   same money, the same opponent money. The auxiliary buys what 4x the
-   demonstration data buys, on the opponent that is out of distribution.
-2. *All the signal is off-distribution.* Against `starter` every arm saturates at
+1. *Imitation sample efficiency: decisive.* Learning-phase holdout NLL (epochs
+   2-7) is **completely separated across sixteen runs** -- every KL seed is below
+   every baseline seed, KL's worst 0.00552 against baseline's best 0.00559. For
+   8-versus-8 that is the extreme of the rank statistic, p = 1/C(16,8) ~= 7.8e-5.
+   25% lower in the learning phase and 21% lower at the end.
+2. *Off-distribution play: a bimodal effect, not a mean improvement.* Three of
+   eight KL seeds beat `public-v27` (0.875, 0.938, 1.000) where none of eight
+   baseline seeds and none of the six `dyn`/`dyn-kl` runs exceeded 0.125. Those
+   three match the anchor exactly: `runs/bc6-v16-mixed`, 4x the corpus and 20
+   epochs, scores 0.9375 with money 80,904 to 71,427, and the winners hold
+   79,051-84,183 against 71,459-72,424. So a KL seed that lands well buys what 4x
+   the demonstration data buys. But 3-of-8 against 0-of-8 is Fisher p = 0.10, and
+   on the continuous objective -- `_relative_score`, the bank margin the engine
+   actually scores -- a rank test over the sixteen runs is a wash (U = 30 against
+   an expected 32), because the KL arm holds the best three *and* the worst three.
+   Sixteen more runs are training to settle it. An earlier revision of this
+   section claimed p ~= 0.045 from 2-of-3 against 0-of-9; that was small-sample
+   luck and is withdrawn.
+3. *All the signal is off-distribution.* Against `starter` every arm saturates at
    1.000 and against its own teacher every arm sits at 0.875. Only `public-v27`
    -- stronger, and not the teacher of these corpora -- separates them, which is
    what a world-model auxiliary is supposed to buy and is exactly the failure
    this project already diagnosed: a clone gated on opponent wealth channels
    that collapses against opponents it never saw.
-3. *The two terms are not proxies for each other.* In the KL-only arm the
+4. *The two terms are not proxies for each other.* In the KL-only arm the
    unsupervised SmoothL1 climbs 0.059 -> 0.85 while its decode KL falls
    0.077 -> 0.068. The belief becomes less latently predictable and more
    decision-preserving at the same time. Latent coordinates are not the quantity
    that matters; the action distribution they induce is.
+5. *No training-time metric knows which seed won.* The three winning KL seeds and
+   the five losing ones are indistinguishable on every number the run records:
+   final holdout NLL 0.00105 against 0.00108, learning-phase 0.00521 against
+   0.00490 (the losers slightly better), the auxiliary's own KL identical to four
+   decimals, belief dispersion 0.511 against 0.524. Holdout likelihood is not
+   merely saturated here, it is uninformative about off-distribution play. So
+   selection has to be by play, which is exactly what `build_submission.py`'s
+   strength gate already refuses to ship without.
 
 Against the failure direction: `dyn` seeds finish 16 games against `public-v27`
 holding 311 and 390 money, having burned a 3,000 bank. Regressing raw latent
@@ -71,14 +94,12 @@ own verdict: both dead baselines stayed at 0.000, the dead KL seed stayed at
 16 of 16 on states they had never seen. Which basin training lands in is what
 varies; where a trained artifact ends up is stable across 32 games.
 
-Honest limits. One KL seed of three collapsed like the baseline, so the claim is
-2 successes in 3 against 0 in the 9 runs of the other three arms (Fisher exact
-p ~= 0.045), not a reliable gain. Five more seeds per arm are queued behind
-another user's GPU job to pin the success rate. Cost is +10.6% per epoch for
-either term. Neither `lambda_kl` nor the horizon was swept; both sit at
-first-choice values (0.5 and 2). The whole A/B ran at `--seeds-per-dataset 64`,
-a deliberately data-starved regime; whether the term still pays at 256, where
-the plain baseline already reaches 0.9375, is untested.
+Honest limits. Cost is +10.6% per epoch for either term. Neither `lambda_kl` nor
+the horizon was swept; both sit at first-choice values (0.5 and 2). The whole A/B
+ran at `--seeds-per-dataset 64`, a deliberately data-starved regime; whether the
+term still pays at 256, where the plain baseline already reaches 0.9375, is
+untested. And the play half of the result rests on a 3-in-8 basin rate, which is
+a recipe only if paired with per-seed play selection.
 
 Contributing measurement, since it changes what a run costs: compiling the clone
 step is 2.03x per epoch at `--compile-mode default`, now the shipped value. It

@@ -151,6 +151,18 @@ def _rollout_states(
     return states, float(np.asarray(rollout.final_money, dtype=np.float64).mean())
 
 
+def _label(path: Path) -> str:
+    """A member's name in the report, unique across the paths actually given.
+
+    A bare file name collides the moment the members are per-run artifacts:
+    `runs/ab-kl-s1/bc-actor.pt` and `runs/ab-baseline/bc-actor.pt` are both
+    `bc-actor.pt`, which silently labels every row of the matrix identically.
+    League snapshots are the opposite case -- one directory, distinct file names
+    -- so neither half of the path is sufficient alone.
+    """
+    return path.name if path.parent == Path() else f"{path.parent.name}/{path.name}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
@@ -175,13 +187,12 @@ def main() -> None:
         device=device,
         rows=args.rows,
     )
-
     # Every member is scored on the reference's states, which is what makes the
     # matrix entries comparable: scoring each on its own visited states would
     # confound flattened weights with a moved state distribution, and separating
     # those two is the whole point of the per-checkpoint entropy pair below.
     logits = [_unit_logits(reference, shared)]
-    names = [args.reference.name]
+    names = [_label(args.reference)]
     records: list[dict[str, Any]] = []
     for path in args.checkpoints:
         actor, actor_architecture = _load(path, device)
@@ -199,9 +210,9 @@ def main() -> None:
             rows=args.rows,
         )
         logits.append(_unit_logits(actor, shared))
-        names.append(path.name)
+        names.append(_label(path))
         record = {
-            "checkpoint": path.name,
+            "checkpoint": _label(path),
             "money": money,
             "entropy_on_reference_states": _head_entropies(actor, shared),
             "entropy_on_own_states": _head_entropies(actor, own),
@@ -214,7 +225,7 @@ def main() -> None:
         record["disagreement_on_reference_states"] = row[0]
 
     report = {
-        "reference": args.reference.name,
+        "reference": _label(args.reference),
         "reference_money": reference_money,
         "reference_entropy": _head_entropies(reference, shared),
         "games": args.games,
