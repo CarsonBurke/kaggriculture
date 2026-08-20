@@ -308,34 +308,81 @@ this repository -- the v27 clone, BC5, the v16 clones, all of them. `population 
 path: retiring it removes the project's only demonstrated RL recipe and any
 fallback, before the replacement has trained once. Validate first, then delete.
 
-**Stage 5 - measured launch.** Cost check against Stage 0's table, then the run,
-with external evaluation of all N agents. Instrument cycling without adding a
-frozen lane: in evaluation only, score each agent against its own weights from K
-iterations earlier, which detects non-transitive drift without giving history any
-gradient. *Acceptance:* per-agent external score rate against `public-v27` and
-the built-ins rising over iterations; per-agent absolute bank not falling while a
-relative score rate rises — the exact pathology of the last run.
+**Stage 5 - measured launch. Ran, and the tripwire fired.** `runs/pop4-klwin`,
+N=4 at 156 games (13 x 12 ordered pairings), no league and no built-in lanes,
+members the four v16-KL clones each individually beating `public-v27`, critic
+warmup 40, external evaluation of all four every 10 iterations. Cancelled at
+iteration 131 after 90 actor-active iterations decided it.
+
+| it | self-play money | mean self-play score | per-agent range | disagreement | entropy | vs `public-v27` | vs `public-v16` | vs `starter` |
+|---|---|---|---|---|---|---|---|---|
+| 40 (frozen) | 82,946 | 0.5000 | 0.378-0.603 | 0.063 | 0.000 | **0.875** | 0.750 | 1.000 |
+| 60 | 26,218 | 0.5000 | 0.308-0.718 | 0.387 | 0.150 | 0.062 | 0.000 | 1.000 |
+| 80 | 29,760 | 0.5000 | 0.308-0.910 | 0.402 | 0.170 | 0.000 | 0.000 | 1.000 |
+| 100 | 31,551 | 0.5000 | 0.231-0.821 | 0.421 | 0.183 | 0.000 | 0.000 | 0.750 |
+| 120 | 41,333 | 0.5000 | 0.179-0.782 | 0.398 | 0.185 | 0.000 | 0.000 | 0.750 |
+
+The acceptance criterion was inverted on every line. Against `public-v27` the
+population went 0.875 to 0.000 in twenty actor-active iterations, and its own
+bank fell 83,432 to 15,094 while the *opponent's rose* 79,356 to 132,468: the
+members stop competing for the shared economy and let a fixed opponent take it.
+Agent 2 at iteration 120 finished with 7 money against `starter`, having beaten
+it 1.000 at the warm start.
+
+**The decisive number is that the mean self-play score is exactly 0.5000 at
+every iteration.** It is zero-sum by construction, so the wave's only gradient
+is the *spread* around 0.5, and that spread is what widened -- 0.43-0.58 at
+iteration 20 to 0.18-0.78 at 120. Maximizing spread means beating your siblings,
+which in this game means denying the shared market at a cost to yourself that a
+scale-invariant reward divides out. This is `probe_market_denial`'s finding
+arriving as a training trajectory rather than a pairwise measurement.
+
+Every internal instrument read healthy or improving while it happened: entropy
+alive and rising 0.000 to 0.185, pairwise disagreement up 6.6x, critic explained
+variance 0.87, 28 of 28 minibatches applied, `max_approx_kl` 0.005-0.029 against
+a 0.10 bound. `MINIMUM_POPULATION_DISAGREEMENT` reads *healthiest* exactly when
+the policies are worst, because diverging to exploit each other is diversity.
+Only the external anchor detected anything, which is the argument for it.
 
 **Stage 6 - ablations.** PFSP versus uniform pairing; population size; and, if
 adopted separately, the reward anchor.
 
 ## Risks
 
-**The population does not fix reward saturation, and cannot.** Every reward term
-is scale-invariant: `_relative_score` and the dense shaping potential built on it
-(`terminal_pair_potential`). A population of four equals that all collapse to the
-3,000 starting bank scores 0.5 each, exactly as mirror self-play did. What the
-scheme removes is the *guarantee* of a zero signal from identical weights; what
-it does not remove is the fixed point at mutual mediocrity. Mitigation is an
-absolute bank anchor in the reward, which touches `rust/kagg_env/src/core.rs`
-and the meaning of every trained artifact, and is therefore a separate decision.
-Until then, Stage 5's acceptance criterion — absolute bank must not fall while
-relative score rises — is the tripwire.
+**The population does not fix reward saturation, and cannot. Now measured, not
+predicted.** Every reward term is scale-invariant: `_relative_score` and the
+dense shaping potential built on it (`terminal_pair_potential`). This paragraph
+used to argue that a population of four equals scores 0.5 each, exactly as mirror
+self-play did, and that the scheme removes only the *guarantee* of a zero signal
+from identical weights rather than the fixed point at mutual mediocrity. Stage 5
+ran and that is what happened, faster and harder than in the frozen-league run:
+mean self-play score exactly 0.5000 throughout, the shared bank down 68%, and
+every member from 0.875 to 0.000 against `public-v27`.
 
-**Market denial is still positively rewarded.** Measured above: destroying the
-shared market beats out-farming when the opponent is beatable. Four co-learners
-do not change the incentive, and the first member to discover denial wins its
-pairings. The Stage 5 tripwire catches it; only an absolute anchor removes it.
+The absolute bank anchor is therefore no longer a separate decision that may
+wait. It is the blocking one, and it now has three independent reproductions of
+the same root cause behind it:
+
+1. `runs/ppo-bc5mix` — N=1 league, built-ins 12.5% of the wave: money 48,006 to
+   7,032 while `league_score_rate` *rose* 0.302 to 0.578.
+2. `artifacts/probes/market-denial.json` — pairwise and direct: iteration-49
+   weights pay 57k to 14k of their own bank to drive `bc5`'s median bank to 0,
+   and score **better** for it (0.876 against 0.840 at four times the money).
+3. `runs/pop4-klwin` — N=4, zero fixed opponents: the table above.
+
+The three differ in scheduler, opponent mix and population size, and agree on
+mechanism. What varies is only how fast: the fewer fixed opponents in the wave,
+the faster the collapse, which is the dose-response curve the anchor argument
+needs. Anchoring touches `rust/kagg_env/src/core.rs` and the meaning of every
+trained artifact, so it is a real change -- but no scheduler, population size or
+pairing rule can substitute for it, and Stages 5 and 6 have now spent their
+budget establishing exactly that.
+
+**Market denial is still positively rewarded.** Measured twice: destroying the
+shared market beats out-farming when the opponent is beatable, and a population
+trains straight into it. Four co-learners do not change the incentive, and the
+first member to discover denial wins its pairings. Only an absolute anchor
+removes it; the Stage 5 tripwire only reports it after the fact.
 
 **Cycling.** With no past players, non-transitive rock-paper-scissors drift among
 four learners is unchecked, and the aggregate score rate cannot see it — a
@@ -351,6 +398,13 @@ policy, and nothing finer. Members differing on 1.1% of decisions were measured
 winning 3-of-8 against `public-v27` versus 0-of-8, so this gate passing is not
 evidence that a population is still exploring different strategies. That claim
 needs play.
+
+Stage 5 settled the direction of that gap, and it is worse than uninformative.
+Disagreement rose 6.6x, 0.063 to 0.42, over exactly the iterations in which
+every member fell from 0.875 to 0.000 against `public-v27`. The gate reads
+*healthiest* when the policies are worst, because diverging in order to exploit
+each other is diversity by this measure. It is a mirror-play detector and must
+never be read as an exploration signal or a run-health signal.
 
 **Replay parity under vmap.** The behaviour policy moves from a plain compiled
 module to `vmap` over `functional_call`. If that shifts logprobs beyond the
