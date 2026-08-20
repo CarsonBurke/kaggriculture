@@ -35,14 +35,22 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 
 from kaggriculture.encoding import encode_observation
 from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
-from kaggriculture.model import FarmActor
+from kaggriculture.latent_dynamics import (
+    DecodeContext,
+    DecodeHeads,
+    DecodeMasks,
+    LatentDynamics,
+    belief_spread,
+    latent_horizon_loss,
+)
+from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
@@ -172,6 +180,36 @@ def parse_args() -> argparse.Namespace:
             "buys 0.6% of throughput for 12x its own benefit and only breaks even "
             "past 16 epochs. Cudagraphs modes are refused separately: an epoch's "
             "last minibatch is a short tail, so the shape varies"
+        ),
+    )
+    parser.add_argument(
+        "--latent-dynamics-coefficient",
+        type=float,
+        default=0.0,
+        help=(
+            "weight on NextLat's SmoothL1 next-latent regression (the reference's "
+            "lambda_mse, 1.0-3.0 in its shipped configs). Zero runs the plain "
+            "clone and never builds the dynamics model"
+        ),
+    )
+    parser.add_argument(
+        "--latent-decode-coefficient",
+        type=float,
+        default=0.0,
+        help=(
+            "weight on the decode KL (the reference's lambda_kl, 0.1-1.0). This is "
+            "the term that makes the latent decision-relevant rather than merely "
+            "self-predictable; zero skips it rather than multiplying it by zero"
+        ),
+    )
+    parser.add_argument(
+        "--latent-horizon",
+        type=int,
+        default=1,
+        help=(
+            "steps to unroll the dynamics model (the reference's mtp_horizon, 1-8). "
+            "Each extra step needs one more consecutive row, so it needs "
+            "--run-length above it to have pairs to consume"
         ),
     )
     # Both rate and decay changed UNITS when this moved off AdamW, so both are
@@ -477,11 +515,47 @@ def _batch(
         "market_active": rows["market_active"],
         "market_quantity_active": rows["market_quantity_active"],
     }
+    # The auxiliary needs to know which rows are consecutive steps of one
+    # episode-seat. Carried as int64 on the device rather than recomputed from
+    # the host order, so the pairing a step trains on is the pairing that step's
+    # rows actually have.
+    factors["episode_index"] = _batch_tensor(rows["episode_index"], whole, torch.long)
+    factors["step"] = _batch_tensor(rows["step"], whole, torch.long)
     return actor_args, factors
 
 
 def _masked_mean(values: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
     return (values * active).sum() / active.sum().clamp(min=1)
+
+
+def _clone_loss_from_output(
+    actor: FarmActor | StructuredActor,
+    output: ActorOutput,
+    factors: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """The clone objective given a forward that already ran.
+
+    Split out so the auxiliary path can reuse ONE trunk pass: computing the
+    belief and the logits separately would double the most expensive part of the
+    step to save nothing.
+    """
+    unit_logprob, kind_logprob, quantity_logprob = component_selected_logprobs(
+        output,
+        actor.quantity_logits(output.market_quantity_context, factors["market_kinds"]),
+        factors["unit_actions"],
+        factors["market_kinds"],
+        factors["market_quantities"],
+        factors["unit_masks"],
+        factors["market_kind_masks"],
+        factors["market_quantity_masks"],
+        validate_masks=False,
+    )
+    active = torch.cat(
+        (factors["unit_active"], factors["market_active"], factors["market_quantity_active"]),
+        dim=1,
+    )
+    logprobs = torch.cat((unit_logprob, kind_logprob, quantity_logprob), dim=1)
+    return -_masked_mean(logprobs, active)
 
 
 def _clone_loss(
@@ -495,23 +569,92 @@ def _clone_loss(
         device_type=factors["unit_actions"].device.type, dtype=torch.bfloat16, enabled=autocast
     ):
         output = actor(*actor_args)
-        unit_logprob, kind_logprob, quantity_logprob = component_selected_logprobs(
-            output,
-            actor.quantity_logits(output.market_quantity_context, factors["market_kinds"]),
-            factors["unit_actions"],
-            factors["market_kinds"],
-            factors["market_quantities"],
-            factors["unit_masks"],
-            factors["market_kind_masks"],
-            factors["market_quantity_masks"],
-            validate_masks=False,
+        return _clone_loss_from_output(actor, output, factors)
+
+
+class LatentTerms(NamedTuple):
+    """The clone loss and the auxiliary terms from one trunk pass."""
+
+    clone: torch.Tensor
+    dynamics: torch.Tensor
+    decode: torch.Tensor
+    unit_half: torch.Tensor
+    market_half: torch.Tensor
+    eligible: torch.Tensor
+    cosine: torch.Tensor
+    dispersion: torch.Tensor
+
+
+def _clone_and_latent_loss(
+    actor: FarmActor,
+    dynamics: LatentDynamics,
+    actor_args: tuple[Any, ...],
+    factors: dict[str, torch.Tensor],
+    autocast: bool,
+    horizon: int,
+    decode_coefficient: float,
+) -> LatentTerms:
+    """The clone objective and NextLat's two terms, sharing one forward.
+
+    The belief is the tensor the policy heads read, so the decode term scores it
+    through those same heads with their weights detached -- the gradient reaches
+    the prediction and stops, which is what stops the degenerate solution of
+    flattening the policy until every decode agrees.
+
+    `decode_coefficient` at zero skips the decode entirely rather than
+    multiplying it by zero. It is the more expensive of the two terms and the
+    reference ships `lambda_kl = 0` configurations, so paying for it unweighted
+    would be a pure waste.
+    """
+    with torch.autocast(
+        device_type=factors["unit_actions"].device.type, dtype=torch.bfloat16, enabled=autocast
+    ):
+        belief_output = actor.forward_with_belief(*actor_args)
+        clone = _clone_loss_from_output(actor, belief_output.output, factors)
+    belief = belief_output.belief
+    decode = (
+        DecodeContext(
+            heads=DecodeHeads.from_actor(actor),
+            masks=DecodeMasks(
+                unit_masks=factors["unit_masks"],
+                market_kind_masks=factors["market_kind_masks"],
+                market_quantity_masks=factors["market_quantity_masks"],
+                unit_active=factors["unit_active"],
+                market_active=factors["market_active"],
+                market_quantity_active=factors["market_quantity_active"],
+                market_kinds=factors["market_kinds"],
+            ),
         )
-    active = torch.cat(
-        (factors["unit_active"], factors["market_active"], factors["market_quantity_active"]),
-        dim=1,
+        if decode_coefficient
+        else None
     )
-    logprobs = torch.cat((unit_logprob, kind_logprob, quantity_logprob), dim=1)
-    return -_masked_mean(logprobs, active)
+    horizon_loss = latent_horizon_loss(
+        dynamics,
+        belief,
+        factors["unit_actions"],
+        factors["market_kinds"],
+        factors["market_quantities"],
+        factors["episode_index"],
+        factors["step"],
+        horizon=horizon,
+        decode=decode,
+    )
+    # The halves come back from the unroll rather than from a second prediction:
+    # they are reported for attribution, not optimized separately, and the two
+    # are on different scales because the actor norms the market half and not the
+    # unit half, so a pooled SmoothL1 leans market and a play difference would
+    # otherwise be unattributable.
+    spread = belief_spread(belief)
+    return LatentTerms(
+        clone=clone,
+        dynamics=horizon_loss.dynamics,
+        decode=horizon_loss.decode,
+        unit_half=horizon_loss.unit_half,
+        market_half=horizon_loss.market_half,
+        eligible=horizon_loss.eligible,
+        cosine=spread.cosine_similarity,
+        dispersion=spread.dispersion,
+    )
 
 
 @torch.no_grad()
@@ -619,6 +762,20 @@ def _artifact_payload(
 # drops a mode cannot leave a stale allowlist behind. `none` is ours and means
 # eager.
 COMPILE_MODES = tuple(sorted(torch._inductor.list_mode_options()))
+
+# Journalled per-step means when the auxiliary is on. `latent_steps` is the
+# divisor and is popped before the record is written rather than shipped as a
+# field nobody reads.
+_LATENT_FIELDS = (
+    "latent_dynamics",
+    "latent_decode",
+    "latent_unit_half",
+    "latent_market_half",
+    "latent_eligible",
+    "belief_cosine",
+    "belief_dispersion",
+    "latent_steps",
+)
 
 
 # `modded-nanogpt`'s pretraining schedule, transcribed from
@@ -735,6 +892,9 @@ def train(
     batch_size: int,
     run_length: int = 1,
     compile_mode: str = "none",
+    latent_dynamics_coefficient: float = 0.0,
+    latent_decode_coefficient: float = 0.0,
+    latent_horizon: int = 1,
     matrix_learning_rate: float,
     matrix_weight_decay: float,
     adam_learning_rate_ratio: float,
@@ -769,6 +929,20 @@ def train(
         raise ValueError(
             f"{type(config).__name__} does not configure the {architecture} architecture"
         )
+    # The auxiliary regresses row j onto row j+1, so it needs blocks longer than
+    # one row to have any pair at all, and one more row per extra horizon step.
+    # Refused rather than silently trained on an all-false eligibility mask,
+    # which would report a loss of exactly zero and look converged.
+    if latent_horizon < 1:
+        raise ValueError("latent horizon must be at least one step")
+    if latent_dynamics_coefficient < 0 or latent_decode_coefficient < 0:
+        raise ValueError("latent coefficients must not be negative")
+    latent_active = bool(latent_dynamics_coefficient or latent_decode_coefficient)
+    if latent_active and run_length <= latent_horizon:
+        raise ValueError(
+            f"a latent horizon of {latent_horizon} needs --run-length above it; "
+            f"got {run_length}, which yields no eligible pair"
+        )
     artifact_path = output_dir / "bc-actor.pt"
     metrics_path = output_dir / "metrics.jsonl"
     # A second clone into a populated directory would overwrite an artifact
@@ -802,7 +976,14 @@ def train(
     # matrix steps, Adam on the gains, biases and heads, and cautious decay on
     # both halves. The PPO update deliberately runs the same optimizer with
     # decay at zero; a clone has no trust region to keep.
+    # p_psi trains alongside the policy and under the same recipe: it is a
+    # matrix-and-vector module like any other, and giving it a second optimizer
+    # would mean a second schedule nobody chose.
+    dynamics = LatentDynamics(config.model_dim).to(device) if latent_active else None
     matrices, vectors = route_parameters(actor)
+    if dynamics is not None:
+        extra_matrices, extra_vectors = route_parameters(dynamics)
+        matrices, vectors = matrices + extra_matrices, vectors + extra_vectors
     optimizer = NorMuon(
         matrices,
         vectors,
@@ -836,8 +1017,9 @@ def train(
     # accuracy 0.99982 against 0.99986 -- so the residual is confidence on
     # decisions that were already right. Recorded in provenance below so an
     # artifact is never silently compared against one trained the other way.
+    step_loss = _clone_loss if dynamics is None else _clone_and_latent_loss
     clone_loss = (
-        _clone_loss if compile_mode == "none" else torch.compile(_clone_loss, mode=compile_mode)
+        step_loss if compile_mode == "none" else torch.compile(step_loss, mode=compile_mode)
     )
     bc_provenance: dict[str, Any] = {
         "datasets": datasets,
@@ -848,6 +1030,9 @@ def train(
         "batch_size": batch_size,
         "run_length": run_length,
         "compile_mode": compile_mode,
+        "latent_dynamics_coefficient": latent_dynamics_coefficient,
+        "latent_decode_coefficient": latent_decode_coefficient,
+        "latent_horizon": latent_horizon,
         "command": sys.argv,
     }
     # A scalar teacher survives only when the mixture agrees on one, because a
@@ -881,9 +1066,26 @@ def train(
             applied_momentum = _momentum_at(step_index, total_steps)
             epoch_loss = 0.0
             epoch_components = 0.0
+            latent_sums = dict.fromkeys(_LATENT_FIELDS, 0.0)
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
                 actor_args, factors = _batch(architecture, train_split, order[indices], device)
-                loss = clone_loss(actor, actor_args, factors, autocast)
+                if dynamics is None:
+                    loss = clone_loss(actor, actor_args, factors, autocast)
+                else:
+                    terms = clone_loss(
+                        actor,
+                        dynamics,
+                        actor_args,
+                        factors,
+                        autocast,
+                        latent_horizon,
+                        latent_decode_coefficient,
+                    )
+                    loss = (
+                        terms.clone
+                        + latent_dynamics_coefficient * terms.dynamics
+                        + latent_decode_coefficient * terms.decode
+                    )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite clone loss in epoch {epoch}")
                 optimizer.zero_grad(set_to_none=True)
@@ -895,8 +1097,23 @@ def train(
                 # average must weight by that same count, exactly as the PPO
                 # update aggregates its per-minibatch losses.
                 components = float(shuffled_components[indices].sum())
-                epoch_loss += float(loss.detach()) * components
+                # The CLONE term is what the journal's `train_loss` has always
+                # meant, and it stays comparable across arms only if the
+                # auxiliary is excluded from it. The combined objective is not a
+                # likelihood and averaging it under that name would make an A/B
+                # unreadable.
+                clone_term = terms.clone if dynamics is not None else loss
+                epoch_loss += float(clone_term.detach()) * components
                 epoch_components += components
+                if dynamics is not None:
+                    latent_sums["latent_dynamics"] += float(terms.dynamics.detach())
+                    latent_sums["latent_decode"] += float(terms.decode.detach())
+                    latent_sums["latent_unit_half"] += float(terms.unit_half.detach())
+                    latent_sums["latent_market_half"] += float(terms.market_half.detach())
+                    latent_sums["latent_eligible"] += float(terms.eligible.sum())
+                    latent_sums["belief_cosine"] += float(terms.cosine)
+                    latent_sums["belief_dispersion"] += float(terms.dispersion)
+                    latent_sums["latent_steps"] += 1.0
             holdout = evaluate(
                 architecture,
                 actor,
@@ -913,6 +1130,12 @@ def train(
                 "seconds": time.perf_counter() - started,
                 **{f"holdout_{name}": value for name, value in holdout.items()},
             }
+            # Per-step means, so an arm's numbers are comparable across corpora
+            # and batch sizes. Absent entirely on a plain clone rather than
+            # written as zeros, which would read as a measured collapse.
+            steps = latent_sums.pop("latent_steps")
+            if steps:
+                record.update({name: value / steps for name, value in latent_sums.items()})
             # A diverged epoch must fail here rather than be written as the
             # bare `NaN` token, which is not JSON and which every downstream
             # reader would either reject or silently accept as a real loss.
@@ -963,6 +1186,9 @@ def main() -> None:
         batch_size=args.batch_size,
         run_length=args.run_length,
         compile_mode=args.compile_mode,
+        latent_dynamics_coefficient=args.latent_dynamics_coefficient,
+        latent_decode_coefficient=args.latent_decode_coefficient,
+        latent_horizon=args.latent_horizon,
         matrix_learning_rate=args.matrix_learning_rate,
         matrix_weight_decay=args.matrix_weight_decay,
         adam_learning_rate_ratio=args.adam_learning_rate_ratio,

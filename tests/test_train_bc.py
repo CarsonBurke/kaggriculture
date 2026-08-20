@@ -1053,3 +1053,80 @@ def test_a_cudagraphs_mode_is_refused(tmp_path: Path) -> None:
             device=torch.device("cpu"),
             encode_workers=1,
         )
+
+
+def test_the_latent_auxiliary_trains_and_is_journalled(dataset_dir: Path, tmp_path: Path) -> None:
+    """The auxiliary has to move p_psi and appear in the journal.
+
+    A term that is computed and thrown away looks identical to one that works,
+    so this pins the observable: the aux scalars exist, the eligible-pair count
+    is positive, and the belief has not collapsed.
+    """
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+    trainer.train(
+        dataset_dirs=[dataset_dir],
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=1,
+        patience=1,
+        batch_size=64,
+        run_length=4,
+        latent_dynamics_coefficient=1.0,
+        latent_decode_coefficient=0.5,
+        latent_horizon=2,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=1.2,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.005,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+    record = json.loads((output / "metrics.jsonl").read_text().splitlines()[0])
+    for name in ("latent_dynamics", "latent_decode", "latent_unit_half", "latent_market_half"):
+        assert record[name] > 0.0, name
+    assert record["latent_eligible"] > 0.0
+    # A collapsed belief drives the dynamics term to zero for free; the
+    # stop-gradient exists to prevent it, and this is the reading that shows it.
+    assert record["belief_dispersion"] > 0.0
+    payload = torch.load(output / "bc-actor.pt", map_location="cpu", weights_only=False)
+    assert payload["bc_provenance"]["latent_dynamics_coefficient"] == 1.0
+    assert payload["bc_provenance"]["latent_horizon"] == 2
+    # p_psi is training-only: it must never reach an actor artifact, which
+    # inference, league snapshots and the frozen-ensemble stack all load whole.
+    assert not any(name.startswith("predictor") for name in payload["actor"])
+
+
+def test_the_auxiliary_is_refused_when_the_sampler_gives_it_no_pairs(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """An all-false eligibility mask reports a loss of exactly zero.
+
+    That reads as a converged auxiliary rather than an absent one, so the
+    combination is refused instead of trained.
+    """
+    trainer = _load_trainer()
+    with pytest.raises(ValueError, match="needs --run-length above it"):
+        trainer.train(
+            dataset_dirs=[dataset_dir],
+            output_dir=tmp_path / "run",
+            architecture=CONV_ENTITY,
+            config=_tiny_config(),
+            holdout_seeds=1,
+            epochs=1,
+            patience=1,
+            batch_size=64,
+            run_length=1,
+            latent_dynamics_coefficient=1.0,
+            latent_horizon=1,
+            matrix_learning_rate=1e-3,
+            matrix_weight_decay=1.2,
+            adam_learning_rate_ratio=0.35,
+            adam_weight_decay=0.005,
+            seed=0,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )

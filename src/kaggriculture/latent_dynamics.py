@@ -441,6 +441,11 @@ class LatentHorizonLoss(NamedTuple):
     # each step of the horizon actually supervises. A tensor rather than a tuple
     # of ints so reading it never synchronizes the device.
     eligible: Tensor
+    # The first unrolled step's loss split into its unit and market halves. Taken
+    # from the prediction the loss already made rather than recomputed, and from
+    # step 0 because that is the one every configuration has.
+    unit_half: Tensor
+    market_half: Tensor
 
 
 def latent_horizon_loss(
@@ -496,6 +501,8 @@ def latent_horizon_loss(
         chain = chain[:keep] & paired[offset:stop]
         target = belief[offset + 1 : stop + 1]
         dynamics_total = dynamics_total + latent_dynamics_loss(predicted, target, chain)
+        if offset == 0:
+            halves = latent_dynamics_halves(predicted, target, chain, MAX_UNITS)
         if decode is not None:
             teacher = decode.heads.decode(target.detach())
             decode_total = decode_total + latent_decode_kl(
@@ -512,6 +519,8 @@ def latent_horizon_loss(
         dynamics=dynamics_total / horizon,
         decode=decode_total / horizon,
         eligible=torch.stack(eligible_counts),
+        unit_half=halves[0],
+        market_half=halves[1],
     )
 
 
