@@ -129,12 +129,17 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=12,
-        # 12 rather than 20 on measurement: under NorMuon the holdout curve is
-        # already at 0.00182 nats by epoch 10 (AdamW needed all 20 to reach
-        # 0.0028), and the trapezoid's decay tail is where the last gains are, so
-        # a shorter budget does not truncate learning -- it compresses the same
-        # shape. The rate schedule is a fraction of `epochs`, so this is the
-        # number that sets it: 20 epochs is not "12 plus 8 free ones".
+        # 12 is a budget, not a plateau. The plateau reading was measured on the
+        # v27 corpora (holdout 0.00188 at epoch 9, 0.00182 at 10) and the v16
+        # corpora refute it: there holdout fell 0.000516 -> 0.000133 over epochs
+        # 10-19, a 4x gain, while unit accuracy sat at 0.99996 the whole way. What
+        # justifies the cap is that those gains arrive WITH THE DECAY, and the
+        # rate schedule is a fraction of this number rather than a fixed step
+        # count: at `--epochs 12` the final epoch runs at 1.13e-3, where a
+        # 20-epoch schedule is still at 3.31e-3 on the same epoch. A 12-epoch run
+        # is therefore not the first 12 epochs of a 20-epoch run -- it is the same
+        # trapezoid compressed, tail included. The residual NLL it gives up is
+        # confidence on decisions that were already correct.
         help=(
             "passes over the corpus; an epoch is a pass, not a fixed step count, "
             "so a larger corpus needs fewer of them, not more"
