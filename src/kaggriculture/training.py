@@ -260,6 +260,7 @@ def checkpoint_payload(
     league_score_rates: dict[int, float] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
+    policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
@@ -338,6 +339,13 @@ def checkpoint_payload(
         # would recalibrate the floor against however far the members had
         # already converged, which is the state the gate exists to refuse.
         "population_disagreement_reference": population_disagreement_reference,
+        # Each member's entropy at the first iteration its actor stepped, which
+        # the entropy floor takes a share of when that is lower than the absolute
+        # level. Persisted rather than re-measured for the same reason: a resume
+        # would recalibrate the floor against however far the policy had already
+        # sharpened, and a chunked run under --max-hours would ratchet its own
+        # floor down every restart until the gate admitted a collapsed policy.
+        "policy_entropy_reference": policy_entropy_reference,
         # Warm-start provenance travels with the run: opponent selection
         # keeps the iteration-0 league snapshot eligible only when it is a
         # pretrained baseline, and a resume must preserve that decision.
@@ -379,6 +387,7 @@ def save_checkpoint(
     league_score_rates: dict[int, float] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
+    policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
 ) -> None:
     payload = checkpoint_payload(
@@ -397,6 +406,7 @@ def save_checkpoint(
         league_score_rates=league_score_rates,
         replay_parity_baseline=replay_parity_baseline,
         population_disagreement_reference=population_disagreement_reference,
+        policy_entropy_reference=policy_entropy_reference,
         initial_actor=initial_actor,
     )
     write_checkpoint(path, payload)

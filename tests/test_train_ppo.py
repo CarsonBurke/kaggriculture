@@ -1512,6 +1512,85 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)
 
 
+def test_the_entropy_floor_admits_a_clone_that_starts_sharper_than_the_absolute_level() -> None:
+    """A faithful clone begins below the from-scratch floor and still plays well.
+
+    Measured, not hypothetical: the v16-KL clones read 0.00896 nats at their
+    first actor-active iteration while holding 0.001 holdout NLL and beating
+    `public-v27` in the official engine. An absolute floor calibrated on
+    from-scratch entropy (0.14-0.37 healthy, 0.000-0.001 collapsed) refused them
+    on their first update, so the floor is the lower of that level and a share of
+    the run's own start.
+    """
+    from kaggriculture.ppo import (
+        MINIMUM_POLICY_ENTROPY,
+        MINIMUM_POLICY_ENTROPY_REFERENCE,
+        POLICY_ENTROPY_FLOOR_FRACTION,
+    )
+
+    module = _training_script()
+    clone = 0.00896
+    # The reference only ever relaxes the floor: a from-scratch run whose quarter
+    # is looser than the absolute level is judged against the level, exactly as
+    # before this existed. `min` and not `max`, because a policy sharpening as it
+    # converges is the expected trajectory rather than a failure.
+    assert module._policy_entropy_floor(None) == MINIMUM_POLICY_ENTROPY
+    assert module._policy_entropy_floor(0.29) == MINIMUM_POLICY_ENTROPY
+    assert module._policy_entropy_floor(clone) == POLICY_ENTROPY_FLOOR_FRACTION * clone
+
+    healthy = {
+        "first_minibatch_approx_kl": 0.0,
+        "value_target_saturated_fraction": 0.0,
+        "actor_updates": 113,
+        "actor_minibatches_intended": 113,
+        "max_approx_kl": 0.0,
+        "entropy": clone,
+    }
+    # The clone's own first update is admissible; four times sharper is not.
+    module._gate_update_metrics(healthy, warmup_active=False, entropy_reference=clone)
+    with pytest.raises(RuntimeError, match="no sampled alternative"):
+        module._gate_update_metrics(
+            {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
+            warmup_active=False,
+            entropy_reference=clone,
+        )
+    # A run cannot start collapsed. Admitting such a reference would set a floor
+    # below the collapse and switch the gate off for every later iteration.
+    with pytest.raises(ValueError, match="collapsed range"):
+        module._validate_policy_entropy_reference(MINIMUM_POLICY_ENTROPY_REFERENCE * 0.99)
+    assert (
+        module._validate_policy_entropy_reference(MINIMUM_POLICY_ENTROPY_REFERENCE)
+        == MINIMUM_POLICY_ENTROPY_REFERENCE
+    )
+
+
+def test_the_entropy_reference_is_persisted_per_population_member() -> None:
+    """A chunked run must not recalibrate its floor against its own sharpening.
+
+    `--max-hours` makes restarts the designed operating mode, so a reference
+    re-measured on resume would ratchet the floor down every few hours until it
+    admitted a collapsed policy. Per member because members warm-started from
+    differently trained artifacts arrive at different sharpnesses.
+    """
+    module = _training_script()
+    # A single learner's record stays the bare scalar every checkpoint carried.
+    assert module._entropy_reference_record([0.29], 1) == 0.29
+    assert module._validate_entropy_references(0.29, population=1) == [0.29]
+    # Written before the warmup ends, no member has stepped and there is nothing
+    # to preserve: a resume measures its own.
+    assert module._entropy_reference_record([None], 1) is None
+    assert module._validate_entropy_references(None, population=1) == [None]
+
+    references = [0.00896, None, 0.29]
+    record = module._entropy_reference_record(references, 3)
+    assert record == references
+    assert module._validate_entropy_references(record, population=3) == references
+    with pytest.raises(ValueError, match="every population member"):
+        module._validate_entropy_references(record, population=4)
+    with pytest.raises(ValueError, match="collapsed range"):
+        module._validate_entropy_references([0.0, None, 0.29], population=3)
+
+
 def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
     """A synthetic population wave with the row layout the collector's contract fixes.
 
@@ -1859,6 +1938,10 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     reloaded = load_checkpoint(run_dir / "latest.pt", restored, device=torch.device("cpu"))
     assert reloaded["iteration"] == 1
     assert reloaded["population_disagreement_reference"] == record["population_disagreement_floor"]
+    # Measured at the first actor-active iteration and carried, so a resume
+    # judges the members against where they started rather than against however
+    # far they have already sharpened.
+    assert reloaded["policy_entropy_reference"] == [0.2] * population
     for member, stored in zip(restored, members, strict=True):
         assert all(
             torch.equal(value, stored["actor"][name])

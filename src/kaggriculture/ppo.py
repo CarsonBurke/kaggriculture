@@ -281,12 +281,46 @@ MAX_VALUE_TARGET_SATURATED_FRACTION = 0.05
 #: trading badly scores -0.75, so the objective genuinely prefers doing nothing
 #: to farming incompetently and PPO is not misbehaving by finding that.
 #:
-#: The floor separates the two regimes by an order of magnitude on each side.
-#: Healthy runs measured 0.14 to 0.37 nats across every rate that learned;
-#: collapsed ones measured 0.000 to 0.001. At 0.01 nats a component's top action
-#: already holds about 99.8% of the mass, which is past the point where any
-#: remaining spread can be called exploration.
+#: The level is a ceiling on the floor, not the floor itself, because it does not
+#: survive a warm start from a faithful clone. From-scratch runs that learned
+#: measured 0.14 to 0.37 nats and collapsed ones 0.000 to 0.001, so 0.01 sat an
+#: order of magnitude clear of both. The v16-KL clones then measured 0.00896 nats
+#: at their first actor-active iteration -- below this level while holding NLL
+#: 0.001 and 0.99996 unit accuracy, and beating `public-v27` in play. A faithful
+#: clone of a sharp teacher legitimately starts sharper than any from-scratch run
+#: ever gets, so an absolute floor calibrated on from-scratch entropy refuses the
+#: strongest artifacts this project has. At 0.01 nats a component's top action
+#: holds about 99.8% of the mass, which is past exploration for a policy that
+#: arrived there by converging -- and unremarkable for one that was trained to
+#: imitate.
 MINIMUM_POLICY_ENTROPY = 0.01
+
+#: Share of its own first actor-active entropy a policy must keep.
+#:
+#: Paired with the level above as `min(level, fraction * reference)`: whichever
+#: is *lower* gates the run. A from-scratch run starting at 0.29 nats is judged
+#: against 0.01 exactly as before, since a quarter of its start is looser; a
+#: clone starting at 0.00896 is judged against 0.00224 rather than being refused
+#: on its first update. `min` rather than `max` because a policy sharpening as it
+#: converges is the expected trajectory, not a failure, and no measurement here
+#: bounds how much of its starting spread a healthy run may spend -- so the
+#: reference may only relax a level that has evidence behind it, never tighten
+#: one that does not.
+#:
+#: The reference is measured at the first iteration the actor actually updates,
+#: which is why the warmup exemption is load-bearing rather than cosmetic: a
+#: frozen actor reports the entropy it was initialized with, and a critic-warmup
+#: window would otherwise calibrate the floor against a policy that has not yet
+#: taken a step.
+POLICY_ENTROPY_FLOOR_FRACTION = 0.25
+
+#: Entropy at or below which a policy is already collapsed, whatever it started
+#: at. Collapsed runs measured 0.000 to 0.001 nats; 0.002 is twice the worst of
+#: those. Its one job is to refuse a *reference* inside that range: a floor that
+#: is a share of a collapsed start sits below the collapse and switches the gate
+#: off for the remaining iterations, which is the failure the gate exists for
+#: arriving before it can be measured.
+MINIMUM_POLICY_ENTROPY_REFERENCE = 0.002
 
 #: Share of its intended minibatches an actor epoch must actually apply.
 #:

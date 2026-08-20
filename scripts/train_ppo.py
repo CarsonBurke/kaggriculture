@@ -49,6 +49,8 @@ from kaggriculture.ppo import (
     MAX_VALUE_TARGET_SATURATED_FRACTION,
     MINIMUM_ACTOR_EPOCH_FRACTION,
     MINIMUM_POLICY_ENTROPY,
+    MINIMUM_POLICY_ENTROPY_REFERENCE,
+    POLICY_ENTROPY_FLOOR_FRACTION,
     UPDATE_COMPILE_MODES,
     PpoConfig,
     actor_forward_args,
@@ -1395,11 +1397,90 @@ def _audit_replay_parity(
     return metrics, _parity_measurements(metrics)
 
 
+def _policy_entropy_floor(reference: float | None) -> float:
+    """The entropy this policy must keep, given where its own updates started.
+
+    Whichever of the absolute level and a share of the reference is *lower*. A
+    warm start from a faithful clone begins below the absolute level while
+    playing well, so an absolute floor alone refuses the strongest artifacts
+    this project has; a share alone would refuse a policy for sharpening as it
+    converges, which is the expected trajectory.
+
+    `None` before the first actor-active iteration, where no reference exists
+    yet: the absolute level applies, which is what a run with no measured start
+    of its own can be held to.
+    """
+    if reference is None:
+        return MINIMUM_POLICY_ENTROPY
+    return min(MINIMUM_POLICY_ENTROPY, POLICY_ENTROPY_FLOOR_FRACTION * reference)
+
+
+def _validate_policy_entropy_reference(value: object) -> float:
+    """Validate one member's first actor-active entropy, persisted or measured.
+
+    The same function guards the live measurement and the resumed one, because
+    the bound is a property of the number rather than of where it came from.
+
+    Bounded below by the collapsed range this gate exists to catch. A run cannot
+    start collapsed: a reference inside the measured 0.000-0.001 would set a
+    floor below itself and switch the gate off for the rest of the run -- the
+    same defect `_gate_population_disagreement` refuses at a zero reference. No
+    upper bound, because `_policy_entropy_floor` takes the minimum with the
+    absolute level, so an implausibly large reference can only leave the floor
+    exactly where it was before any of this existed.
+    """
+    if (
+        not isinstance(value, float | int)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < MINIMUM_POLICY_ENTROPY_REFERENCE
+    ):
+        raise ValueError(
+            f"policy entropy reference must be at least {MINIMUM_POLICY_ENTROPY_REFERENCE}: "
+            "a policy that starts inside the collapsed range has no sampled "
+            "alternative to learn from and cannot calibrate its own floor"
+        )
+    return float(value)
+
+
+def _entropy_reference_record(
+    references: Sequence[float | None], population: int
+) -> float | list[float | None] | None:
+    """The persisted form of the per-member entropy references.
+
+    `None` until the warmup ends and the first real actor update measures it, so
+    a checkpoint written inside the warmup window carries no reference and a
+    resume from it measures its own -- which is correct, because nothing has
+    stepped yet and there is nothing to preserve.
+    """
+    if population == 1:
+        return references[0]
+    return list(references)
+
+
+def _validate_entropy_references(
+    record: object,
+    *,
+    population: int,
+) -> list[float | None]:
+    """Validate one persisted entropy reference per population member."""
+    if population == 1:
+        record = [record]
+    if not isinstance(record, list) or len(record) != population:
+        raise ValueError(
+            "resume checkpoint policy entropy reference does not cover every population member"
+        )
+    return [
+        None if entry is None else _validate_policy_entropy_reference(entry) for entry in record
+    ]
+
+
 def _gate_update_metrics(
     update_metrics: Mapping[str, float],
     *,
     warmup_active: bool,
     agent: int | None = None,
+    entropy_reference: float | None = None,
 ) -> None:
     """Stop the run on an update whose numbers say the next one is wasted.
 
@@ -1412,6 +1493,12 @@ def _gate_update_metrics(
     gates are applied per member: one collapsed member has to stop the run as
     itself rather than be averaged into three healthy ones. `None` is the single
     learner, whose messages are unprefixed.
+
+    `entropy_reference` is this member's own first actor-active entropy, which
+    only relaxes the entropy floor -- see `_policy_entropy_floor`. It is per
+    member for the same reason the gates are: members warm-started from
+    differently trained artifacts arrive at different sharpnesses, so a pooled
+    reference would judge every member against whichever one started widest.
     """
     where = "" if agent is None else f"agent {agent} "
     first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
@@ -1449,11 +1536,12 @@ def _gate_update_metrics(
     # a deterministic policy has no KL to bound, and money rises because the
     # inaction basin keeps the whole starting bank -- so this is the only signal.
     entropy = float(update_metrics["entropy"])
-    if not warmup_active and entropy < MINIMUM_POLICY_ENTROPY:
+    floor = _policy_entropy_floor(entropy_reference)
+    if not warmup_active and entropy < floor:
         raise RuntimeError(
             f"{where}policy entropy {entropy:.4g} nats per active component is below "
-            f"{MINIMUM_POLICY_ENTROPY}; the policy is deterministic and has no "
-            "sampled alternative left to learn from"
+            f"{floor:.4g}; the policy is deterministic and has no sampled "
+            "alternative left to learn from"
         )
 
 
@@ -1843,10 +1931,16 @@ def main() -> None:
     # The population's iteration-0 pairwise disagreement, once measured. `None`
     # until then, which is also what says "this iteration records it".
     population_reference: float | None = None
+    # Each member's own first actor-active entropy, once its actor has stepped.
+    # `None` until then, which is also what says "this update records it".
+    entropy_references: list[float | None] = [None for _ in members]
     if resume_payload is not None:
         league_score_rates = _validate_league_score_rates(resume_payload.get("league_score_rates"))
         parity_baselines = _validate_parity_baselines(
             resume_payload.get("replay_parity_baseline"), parity_ceilings, population=population
+        )
+        entropy_references = _validate_entropy_references(
+            resume_payload.get("policy_entropy_reference"), population=population
         )
         if population > 1:
             population_reference = _validate_population_reference(
@@ -1920,6 +2014,7 @@ def main() -> None:
                 league_score_rates=league_score_rates,
                 replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
                 population_disagreement_reference=population_reference,
+                policy_entropy_reference=_entropy_reference_record(entropy_references, population),
                 source_identity=current_source_identity,
                 run_provenance=run_provenance,
                 initial_actor=initial_actor_provenance,
@@ -1952,6 +2047,9 @@ def main() -> None:
                     league_score_rates=league_score_rates,
                     replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
                     population_disagreement_reference=population_reference,
+                    policy_entropy_reference=_entropy_reference_record(
+                        entropy_references, population
+                    ),
                     source_identity=current_source_identity,
                     run_provenance=run_provenance,
                     initial_actor=initial_actor_provenance,
@@ -2033,6 +2131,7 @@ def main() -> None:
             league_score_rates=league_score_rates,
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
             population_disagreement_reference=population_reference,
+            policy_entropy_reference=_entropy_reference_record(entropy_references, population),
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
@@ -2230,8 +2329,18 @@ def main() -> None:
             )
             # Per member, so one collapsed member stops the run as itself rather
             # than being averaged into three healthy ones.
+            if not warmup_active and entropy_references[agent] is None:
+                # The first update this member's actor actually applied, which is
+                # the only iteration whose entropy describes where it started
+                # rather than where the objective has moved it.
+                entropy_references[agent] = _validate_policy_entropy_reference(
+                    float(measured["entropy"])
+                )
             _gate_update_metrics(
-                measured, warmup_active=warmup_active, agent=None if population == 1 else agent
+                measured,
+                warmup_active=warmup_active,
+                agent=None if population == 1 else agent,
+                entropy_reference=entropy_references[agent],
             )
             update_metrics.update(_agent_fields(measured, agent, population))
         update_seconds = time.monotonic() - update_started
@@ -2299,6 +2408,7 @@ def main() -> None:
             # replaces this configuration's entry while the commit serializes.
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
             population_disagreement_reference=population_reference,
+            policy_entropy_reference=_entropy_reference_record(entropy_references, population),
             initial_actor=initial_actor_provenance,
         )
         if pending_commit is not None:
