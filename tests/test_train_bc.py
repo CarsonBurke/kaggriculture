@@ -1007,7 +1007,7 @@ def test_the_shipped_compile_default_is_a_real_inductor_mode(monkeypatch, tmp_pa
     """The CLI default and the function default deliberately differ; pin both.
 
     `train`'s default is `none` so the CPU suite never pays a compilation, while
-    the CLI default is the measured mode so a production run gets the 2.07x
+    the CLI default is the measured mode so a production run gets the 2.03x
     without being asked. That split is a trap unless it is pinned: the shipped
     value has to be a mode inductor actually accepts, and it must not be a
     cudagraphs mode -- an epoch's last minibatch is a short tail, so the shape
@@ -1018,7 +1018,38 @@ def test_the_shipped_compile_default_is_a_real_inductor_mode(monkeypatch, tmp_pa
         sys, "argv", ["train_bc.py", "--dataset", str(tmp_path), "--output", str(tmp_path / "run")]
     )
     shipped = trainer.parse_args().compile_mode
-    assert shipped == "max-autotune-no-cudagraphs"
+    assert shipped == "default"
     assert shipped in trainer.COMPILE_MODES
-    assert shipped.endswith("no-cudagraphs")
+    # Read from inductor's config rather than the mode's name: `reduce-overhead`
+    # does not say "cudagraphs" and enables them anyway.
+    assert not torch._inductor.list_mode_options(shipped).get("triton.cudagraphs")
     assert inspect.signature(trainer.train).parameters["compile_mode"].default == "none"
+
+
+def test_a_cudagraphs_mode_is_refused(tmp_path: Path) -> None:
+    """`reduce-overhead` enables cudagraphs without saying so in its name.
+
+    An epoch's last minibatch is a short tail, so a captured graph would either
+    recapture per shape or fail. The refusal reads inductor's config for the
+    mode, which is why a name-based check would have let this one through.
+    """
+    trainer = _load_trainer()
+    with pytest.raises(ValueError, match="enables cudagraphs"):
+        trainer.train(
+            dataset_dirs=[tmp_path],
+            output_dir=tmp_path / "run",
+            architecture=CONV_ENTITY,
+            config=_tiny_config(),
+            holdout_seeds=1,
+            epochs=1,
+            patience=1,
+            batch_size=8,
+            compile_mode="reduce-overhead",
+            matrix_learning_rate=1e-3,
+            matrix_weight_decay=1.2,
+            adam_learning_rate_ratio=0.35,
+            adam_weight_decay=0.005,
+            seed=0,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )

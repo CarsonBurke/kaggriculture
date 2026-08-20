@@ -163,12 +163,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--compile-mode",
-        default="max-autotune-no-cudagraphs",
+        default="default",
         help=(
-            "torch.compile mode for the clone step, or 'none' for eager. The "
-            "default is measured: 2.07x per step and 35% less peak VRAM at the "
-            "shipped batch. NOT a cudagraphs mode -- the last minibatch of an "
-            "epoch is a short tail, so the shape varies"
+            "torch.compile mode for the clone step, or 'none' for eager. Measured "
+            "on three full 12-epoch arms: 'default' and "
+            "'max-autotune-no-cudagraphs' reach the SAME steady state (2.03x and "
+            "2.01x per epoch) but cost 39s and 473s to compile, so autotuning "
+            "buys 0.6% of throughput for 12x its own benefit and only breaks even "
+            "past 16 epochs. Cudagraphs modes are refused separately: an epoch's "
+            "last minibatch is a short tail, so the shape varies"
         ),
     )
     # Both rate and decay changed UNITS when this moved off AdamW, so both are
@@ -751,6 +754,17 @@ def train(
         raise ValueError(
             f"unknown compile mode {compile_mode!r}; expected 'none' or one of {COMPILE_MODES}"
         )
+    # A captured graph is bound to one set of shapes, and an epoch's last
+    # minibatch is a short tail, so a cudagraphs mode would recapture per shape
+    # or fail outright. Read from inductor's config for the mode rather than
+    # matched on the mode's name, which only happens to say so today.
+    if compile_mode != "none" and torch._inductor.list_mode_options(compile_mode).get(
+        "triton.cudagraphs"
+    ):
+        raise ValueError(
+            f"compile mode {compile_mode!r} enables cudagraphs, which cannot capture "
+            "the short last minibatch of an epoch"
+        )
     if architecture_of_config(config).name != architecture:
         raise ValueError(
             f"{type(config).__name__} does not configure the {architecture} architecture"
@@ -804,15 +818,24 @@ def train(
     run_starts, run_lengths = _run_blocks(train_split.staged["episode_index"], run_length)
     step_index = 0
     autocast = device.type == "cuda"
-    # Measured, not assumed: fusing the clone step is 2.07x at batch 2048 and
-    # cuts peak VRAM 12.21 -> 7.99 GiB, because the intermediates stop being
-    # materialized (`artifacts/probes/bc-compile.json`). A 96-dim, 127-token
-    # transformer is bandwidth-bound, which is the regime where fusion pays.
-    # Compiled and eager are not bit-identical -- inductor reorders reductions,
+    # Measured on three full 12-epoch arms, not on a step benchmark. Fusing the
+    # clone step is 2.03x per epoch (15.96s -> 7.88s) and cuts peak VRAM
+    # 12.21 -> 7.99 GiB, because the intermediates stop being materialized: a
+    # 96-dim, 127-token transformer is bandwidth-bound, which is where fusion
+    # pays. `max-autotune-no-cudagraphs` reaches the SAME steady state (2.01x)
+    # and is nonetheless the wrong choice -- it spends 473s compiling against
+    # `default`'s 39s, so it breaks even only past 16 production epochs and made
+    # the 12-epoch run measured here 3x SLOWER end to end. A per-step probe
+    # cannot see that, because warmup hides exactly the cost that decides it.
+    #
+    # Compiled and eager are not bit-identical: inductor reorders reductions,
     # which moves a bf16 accumulation by 0.097% in global gradient L2 at
     # unchanged direction, while fp32 agrees to 2e-05
-    # (`artifacts/probes/compile-parity.json`). Recorded in provenance below so
-    # an artifact is never silently compared against one trained the other way.
+    # (`artifacts/probes/compile-parity.json`). Behaviourally they agree --
+    # final holdout NLL 0.001574 eager against 0.001158 compiled, with unit
+    # accuracy 0.99982 against 0.99986 -- so the residual is confidence on
+    # decisions that were already right. Recorded in provenance below so an
+    # artifact is never silently compared against one trained the other way.
     clone_loss = (
         _clone_loss if compile_mode == "none" else torch.compile(_clone_loss, mode=compile_mode)
     )
