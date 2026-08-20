@@ -205,6 +205,46 @@ and the pairwise policy disagreement matrix on a fixed state batch (the
 `starter` score rate, and initial pairwise disagreement recorded as the
 calibration point for the Stage 3 gate.
 
+*Measured.* Sixteen BC members -- eight seeds of the plain clone and eight of the
+NextLat-KL clone (`NEXTLAT_AUX_PLAN.md`), same corpora, same schedule -- scored on
+one shared batch of 2,048 active unit decisions from a 4-game rollout
+(`artifacts/probes/population-floor.json`):
+
+| block | mean off-diagonal | range |
+|---|---|---|
+| within the plain arm (n=8) | 0.01133 | 0.01056 - 0.01209 |
+| within the KL arm (n=8) | 0.01078 | 0.00972 - 0.01161 |
+| across the two arms | 0.01097 | 0.00930 - 0.01230 |
+| first four plain members, an actual N=4 population | 0.01128 | -- |
+
+**The floor is 0.011.** So a BC-seeded population starts at about 1.1% pairwise
+decision disagreement, 81x below the ~0.894 that four independent random
+initializations would give, and the Stage 3 gate's absolute floor is
+`0.25 * 0.011 = 0.0028`. That is a safe setting: identical policies read exactly
+0.0, and the spread of the measure itself (+-10% within an arm) sits far above
+the margin, so the gate cannot misfire on sampling noise.
+
+**But the measure is blind to what decides games, and the gate must not be read
+as a diversity check.** Cross-arm disagreement (0.01097) is indistinguishable
+from within-arm (0.01133, 0.01078), while the two arms play completely
+differently: 3 of 8 KL members beat `public-v27` and 0 of 8 plain members do,
+and the winners hold a positive bank margin where every plain member is deeply
+negative. Two policies differing on 1.1% of decisions can be a total-loss agent
+and a v27-beating agent, because a 719-step compounding economy integrates a 1%
+decision difference into an entirely different trajectory.
+
+Two consequences the later stages have to carry:
+
+1. `MINIMUM_POPULATION_DISAGREEMENT` is a *mirror-play detector only*. It catches
+   members that have literally become one policy. It cannot certify that a
+   population above the floor is behaviorally diverse, and no reading of it should
+   be used to argue that.
+2. Cloning one teacher does not produce diverse members in any sense this measure
+   can see, so diversity has to be engineered and then verified by play, not by
+   disagreement. The cheapest lever available is already measured: seeding half
+   the population with the KL auxiliary and half without yields members that are
+   behaviorally distinct at identical disagreement, at +10.6% per BC epoch.
+
 **Stage 2 - population wave.** `collect_mixed_play_rust` gains a population mode:
 per-row agent assignment from the balanced pairing schedule, every row stored,
 `RolloutBatch.agents` populated, one ensemble forward over N lanes, no frozen or
@@ -290,7 +330,12 @@ scoring each agent against its own earlier weights in evaluation only.
 **Convergence of the population.** Four agents on the same architecture, corpus
 and objective can drift together until the league is mirror play under another
 name. This is why `MINIMUM_POPULATION_DISAGREEMENT` exists and why Stage 1
-measures the initial value rather than guessing a floor.
+measures the initial value rather than guessing a floor. Now measured at 0.011,
+which also bounds what the gate is for: it detects members that have become one
+policy, and nothing finer. Members differing on 1.1% of decisions were measured
+winning 3-of-8 against `public-v27` versus 0-of-8, so this gate passing is not
+evidence that a population is still exploring different strategies. That claim
+needs play.
 
 **Replay parity under vmap.** The behaviour policy moves from a plain compiled
 module to `vmap` over `functional_call`. If that shifts logprobs beyond the
