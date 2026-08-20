@@ -329,8 +329,13 @@ class DecodeMasks(NamedTuple):
     market_quantity_active: Tensor
     market_kinds: Tensor
 
-    def rows(self, start: int, stop: int) -> DecodeMasks:
-        return DecodeMasks(*(field[start:stop] for field in self))
+    def at(self, index: Tensor) -> DecodeMasks:
+        """The masks of the rows named by ``index``, one gather per field.
+
+        An index rather than a slice because the horizon unroll addresses its
+        target rows by a clamped offset, keeping every shape static.
+        """
+        return DecodeMasks(*(field[index] for field in self))
 
 
 def _decision_kl(
@@ -465,8 +470,8 @@ def latent_horizon_loss(
     The reference's ``mtp_horizon`` loop: the prediction is fed back in as the
     next step's input, conditioned on the action executed at that step, and
     regressed onto the true belief that many rows later. Each step's terms are
-    accumulated and divided by ``horizon``, so ``horizon=1`` is bit-for-bit the
-    single-step call (a division by one is exact).
+    accumulated and divided by ``horizon``, so ``horizon=1`` is the single-step
+    call up to the reduction order of one extra zero-weight row.
 
     Eligibility tightens by one row per extra step: predicting k steps ahead
     needs k consecutive pairs, so an episode-seat run shorter than k+1 rows
@@ -489,17 +494,29 @@ def latent_horizon_loss(
     eligible_counts = []
     predicted = belief
     chain = torch.ones(rows, dtype=torch.bool, device=belief.device)
+    # Every step keeps the full row count and carries eligibility in the mask
+    # rather than in a shorter slice. Shrinking the slice per step is what a
+    # reading of the reference's loop suggests, but it makes every shape in the
+    # unroll symbolic (`rows - k - 1`), and inductor then cannot generate the
+    # unit KL kernel at all: it splits (rows, 16, 59) logits against (rows, 16)
+    # masks and fails with `CantSplit: 944*s1 - 944 not divisible by 16*s1 - 16`.
+    # The numbers are unchanged because both losses are mask-weighted means, so a
+    # row at weight zero contributes to neither numerator nor denominator.
+    positions = torch.arange(rows, device=belief.device)
     for offset in range(horizon):
-        keep = max(rows - offset - 1, 0)
-        stop = offset + keep
+        # Rows past the end read the last row's data and are then masked out for
+        # free: `consecutive_rows` scores the final row False for want of a
+        # successor, and clamping sends exactly the out-of-range rows there.
+        source = (positions + offset).clamp_max(rows - 1)
         predicted = dynamics(
-            predicted[:keep],
-            unit_actions[offset:stop],
-            market_kinds[offset:stop],
-            market_quantities[offset:stop],
+            predicted,
+            unit_actions[source],
+            market_kinds[source],
+            market_quantities[source],
         )
-        chain = chain[:keep] & paired[offset:stop]
-        target = belief[offset + 1 : stop + 1]
+        chain = chain & paired[source]
+        target_index = (positions + offset + 1).clamp_max(rows - 1)
+        target = belief[target_index]
         dynamics_total = dynamics_total + latent_dynamics_loss(predicted, target, chain)
         if offset == 0:
             halves = latent_dynamics_halves(predicted, target, chain, MAX_UNITS)
@@ -511,7 +528,7 @@ def latent_horizon_loss(
                 teacher.market_kind_logits,
                 teacher.market_quantity_context,
                 decode.heads,
-                decode.masks.rows(offset + 1, stop + 1),
+                decode.masks.at(target_index),
                 chain,
             )
         eligible_counts.append(chain.sum())

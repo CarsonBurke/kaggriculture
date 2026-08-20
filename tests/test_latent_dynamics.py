@@ -310,6 +310,71 @@ def test_a_run_shorter_than_the_horizon_contributes_nothing() -> None:
         _horizon(dynamics, belief, actions, episode, step, horizon=0)
 
 
+def test_the_static_unroll_matches_an_explicitly_sliced_one() -> None:
+    """The unroll keeps full-width rows and masks; it used to shrink its slice.
+
+    Shrinking made every shape in the loop symbolic and inductor could not
+    generate the unit KL kernel at all. The replacement is only legitimate if the
+    padded rows are exactly inert, so this recomputes a multi-step unroll the
+    sliced way and demands the same numbers.
+    """
+    torch.manual_seed(0)
+    actor = _actor()
+    dynamics = LatentDynamics(16)
+    rows, horizon = 7, 3
+    actions = _actions(rows)
+    belief = torch.randn(rows, BELIEF_TOKENS, 16)
+    # A seat boundary inside the batch, so eligibility does real work rather than
+    # being uniformly true and hiding a mask bug.
+    episode = torch.tensor([0, 0, 0, 0, 1, 1, 1])
+    step = torch.tensor([0, 1, 2, 3, 0, 1, 2])
+    heads = DecodeHeads.from_actor(actor)
+    masks = _masks(rows, actions)
+    got = _horizon(
+        dynamics,
+        belief,
+        actions,
+        episode,
+        step,
+        horizon=horizon,
+        decode=DecodeContext(heads=heads, masks=masks),
+    )
+
+    paired = consecutive_rows(episode, step)
+    predicted = belief
+    chain = torch.ones(rows, dtype=torch.bool)
+    dynamics_total = torch.zeros(())
+    decode_total = torch.zeros(())
+    counts = []
+    for offset in range(horizon):
+        keep = max(rows - offset - 1, 0)
+        stop = offset + keep
+        predicted = dynamics(
+            predicted[:keep],
+            actions["unit_actions"][offset:stop],
+            actions["market_kinds"][offset:stop],
+            actions["market_quantities"][offset:stop],
+        )
+        chain = chain[:keep] & paired[offset:stop]
+        target = belief[offset + 1 : stop + 1]
+        dynamics_total = dynamics_total + latent_dynamics_loss(predicted, target, chain)
+        teacher = heads.decode(target.detach())
+        decode_total = decode_total + latent_decode_kl(
+            predicted,
+            teacher.unit_logits,
+            teacher.market_kind_logits,
+            teacher.market_quantity_context,
+            heads,
+            DecodeMasks(*(field[offset + 1 : stop + 1] for field in masks)),
+            chain,
+        )
+        counts.append(int(chain.sum()))
+
+    assert got.eligible.tolist() == counts
+    torch.testing.assert_close(got.dynamics, dynamics_total / horizon, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(got.decode, decode_total / horizon, rtol=1e-6, atol=1e-7)
+
+
 def test_the_horizon_runs_the_decode_only_when_asked() -> None:
     actor = _actor()
     dynamics = LatentDynamics(16)
