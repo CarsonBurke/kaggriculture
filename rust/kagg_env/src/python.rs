@@ -8,7 +8,7 @@ use crate::core::{
 };
 use crate::v27_script::{V27_SOURCE_NAME, V27_SOURCE_SHA256, V27_STEPS};
 use half::f16;
-use numpy::ndarray::{Array1, Array2, Array3};
+use numpy::ndarray::{Array2, Array3};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
     PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
@@ -24,10 +24,6 @@ pub(crate) struct BatchEnv {
     games: Vec<Game>,
     sampled_scratch: Vec<SampledFactors>,
     results_scratch: Vec<StepResult>,
-    /// Shaping potential of each game's current state, written by every step
-    /// path so the next step's previous potential is a carry-forward instead
-    /// of a recomputed liquidation walk.
-    potential_cache: Vec<f32>,
     /// Per-seat memory for the scripted v27 opponent, one row per game seat in
     /// the same order as `sampled_scratch`. It needs no reset hook: the agent
     /// clears its own row when the step index restarts, exactly as the
@@ -54,7 +50,6 @@ impl BatchEnv {
                 .map(|_| SampledFactors::default())
                 .collect(),
             results_scratch: vec![StepResult::default(); games.len()],
-            potential_cache: games.iter().map(Game::pair_potential).collect(),
             v27_states: vec![V27State::default(); games.len() * PLAYERS],
             games,
         })
@@ -76,9 +71,6 @@ impl BatchEnv {
         validate_seeds(seeds)?;
         for (game, &seed) in self.games.iter_mut().zip(seeds) {
             *game = Game::new(seed, GameConfig::default());
-        }
-        for (cached, game) in self.potential_cache.iter_mut().zip(&self.games) {
-            *cached = game.pair_potential();
         }
         Ok(())
     }
@@ -576,7 +568,6 @@ impl BatchEnv {
             &self.games,
             &self.sampled_scratch,
             &self.results_scratch,
-            &mut self.potential_cache,
             &mut output_slices,
         );
         Ok(())
@@ -604,7 +595,6 @@ impl BatchEnv {
             market_quantities,
             external,
         )?;
-        let previous_potentials = self.potential_cache.clone();
         let results = py.detach(|| {
             self.games
                 .par_iter_mut()
@@ -634,28 +624,19 @@ impl BatchEnv {
                 .into_pyarray(py),
         )?;
         output.set_item("dones", dones.into_pyarray(py))?;
-        let post_potentials: Vec<f32> = self.games.iter().map(Game::post_step_potential).collect();
-        self.potential_cache.copy_from_slice(&post_potentials);
-        let shaped: Vec<f32> = previous_potentials
-            .iter()
-            .zip(post_potentials.iter())
-            .flat_map(|(&previous, &post)| {
-                let reward_zero = post - previous;
-                [reward_zero, -reward_zero]
-            })
-            .collect();
+        let economic_scores: Vec<f32> = self.games.iter().flat_map(Game::economic_scores).collect();
+        let training_rewards: Vec<f32> =
+            self.games.iter().flat_map(Game::training_rewards).collect();
         output.set_item(
-            "previous_potentials",
-            Array1::from_vec(previous_potentials).into_pyarray(py),
+            "economic_scores",
+            Array2::from_shape_vec((self.games.len(), PLAYERS), economic_scores)
+                .expect("economic score shape is internal")
+                .into_pyarray(py),
         )?;
         output.set_item(
-            "potentials",
-            Array1::from_vec(post_potentials).into_pyarray(py),
-        )?;
-        output.set_item(
-            "shaped_rewards",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), shaped)
-                .expect("shaped reward shape is internal")
+            "training_rewards",
+            Array2::from_shape_vec((self.games.len(), PLAYERS), training_rewards)
+                .expect("training reward shape is internal")
                 .into_pyarray(py),
         )?;
         Ok(output)
@@ -689,7 +670,6 @@ fn allocate_encoded_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Boun
         "unit_active",
         PyArray2::<bool>::zeros(py, [rows, MAX_UNITS], false),
     )?;
-    output.set_item("potentials", PyArray1::<f32>::zeros(py, batch, false))?;
     Ok(output)
 }
 
@@ -740,7 +720,6 @@ fn allocate_structured_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<B
         "town",
         PyArray2::<f16>::zeros(py, [rows, TOWN_TOKEN_FIELDS], false),
     )?;
-    output.set_item("potentials", PyArray1::<f32>::zeros(py, batch, false))?;
     Ok(output)
 }
 
@@ -799,7 +778,6 @@ fn fill_structured_output(
     let mut crops = output_array!("crops", PyArray3<f16>, [rows, CROPS, CROP_TOKEN_FIELDS]);
     let mut farms = output_array!("farms", PyArray3<f16>, [rows, PLAYERS, FARM_TOKEN_FIELDS]);
     let mut town = output_array!("town", PyArray2<f16>, [rows, TOWN_TOKEN_FIELDS]);
-    let mut potentials = output_array!("potentials", PyArray1<f32>, [games.len()]);
 
     let tile_categorical = tile_categorical
         .as_slice_mut()
@@ -828,9 +806,6 @@ fn fill_structured_output(
     let crops = crops.as_slice_mut().map_err(|_| non_contiguous("crops"))?;
     let farms = farms.as_slice_mut().map_err(|_| non_contiguous("farms"))?;
     let town = town.as_slice_mut().map_err(|_| non_contiguous("town"))?;
-    let potentials = potentials
-        .as_slice_mut()
-        .map_err(|_| non_contiguous("potentials"))?;
 
     const TILE_CATEGORICAL_VALUES: usize = TILE_TOKENS * TILE_CATEGORICAL;
     const TILE_CONTINUOUS_VALUES: usize = TILE_TOKENS * TILE_CONTINUOUS;
@@ -926,10 +901,6 @@ fn fill_structured_output(
                     }
                 },
             );
-        potentials
-            .par_iter_mut()
-            .zip(games.par_iter())
-            .for_each(|(output, game)| *output = game.pair_potential());
     });
     Ok(())
 }
@@ -980,13 +951,15 @@ fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound
         )?;
     }
     output.set_item("entropy", PyArray1::<f32>::zeros(py, rows, false))?;
-    for name in ["rewards", "final_money", "shaped_rewards"] {
+    for name in [
+        "rewards",
+        "final_money",
+        "economic_scores",
+        "training_rewards",
+    ] {
         output.set_item(name, PyArray2::<f32>::zeros(py, [batch, PLAYERS], false))?;
     }
     output.set_item("dones", PyArray1::<bool>::zeros(py, batch, false))?;
-    for name in ["previous_potentials", "potentials"] {
-        output.set_item(name, PyArray1::<f32>::zeros(py, batch, false))?;
-    }
     Ok(output)
 }
 
@@ -1007,9 +980,8 @@ struct SampleOutputArrays<'py> {
     rewards: PyReadwriteArray2<'py, f32>,
     money: PyReadwriteArray2<'py, f32>,
     dones: PyReadwriteArray1<'py, bool>,
-    previous: PyReadwriteArray1<'py, f32>,
-    potentials: PyReadwriteArray1<'py, f32>,
-    shaped: PyReadwriteArray2<'py, f32>,
+    economic_scores: PyReadwriteArray2<'py, f32>,
+    training_rewards: PyReadwriteArray2<'py, f32>,
 }
 
 impl<'py> SampleOutputArrays<'py> {
@@ -1073,9 +1045,8 @@ impl<'py> SampleOutputArrays<'py> {
             rewards: output_array!("rewards", PyArray2<f32>, [batch, PLAYERS]),
             money: output_array!("final_money", PyArray2<f32>, [batch, PLAYERS]),
             dones: output_array!("dones", PyArray1<bool>, [batch]),
-            previous: output_array!("previous_potentials", PyArray1<f32>, [batch]),
-            potentials: output_array!("potentials", PyArray1<f32>, [batch]),
-            shaped: output_array!("shaped_rewards", PyArray2<f32>, [batch, PLAYERS]),
+            economic_scores: output_array!("economic_scores", PyArray2<f32>, [batch, PLAYERS]),
+            training_rewards: output_array!("training_rewards", PyArray2<f32>, [batch, PLAYERS]),
         })
     }
 
@@ -1097,9 +1068,8 @@ impl<'py> SampleOutputArrays<'py> {
             rewards,
             money,
             dones,
-            previous,
-            potentials,
-            shaped,
+            economic_scores,
+            training_rewards,
         } = self;
         Ok(SampleOutputSlices {
             unit_actions: unit_actions
@@ -1148,15 +1118,12 @@ impl<'py> SampleOutputArrays<'py> {
                 .as_slice_mut()
                 .map_err(|_| non_contiguous("final_money"))?,
             dones: dones.as_slice_mut().map_err(|_| non_contiguous("dones"))?,
-            previous: previous
+            economic_scores: economic_scores
                 .as_slice_mut()
-                .map_err(|_| non_contiguous("previous_potentials"))?,
-            potentials: potentials
+                .map_err(|_| non_contiguous("economic_scores"))?,
+            training_rewards: training_rewards
                 .as_slice_mut()
-                .map_err(|_| non_contiguous("potentials"))?,
-            shaped: shaped
-                .as_slice_mut()
-                .map_err(|_| non_contiguous("shaped_rewards"))?,
+                .map_err(|_| non_contiguous("training_rewards"))?,
         })
     }
 }
@@ -1178,9 +1145,8 @@ struct SampleOutputSlices<'a> {
     rewards: &'a mut [f32],
     money: &'a mut [f32],
     dones: &'a mut [bool],
-    previous: &'a mut [f32],
-    potentials: &'a mut [f32],
-    shaped: &'a mut [f32],
+    economic_scores: &'a mut [f32],
+    training_rewards: &'a mut [f32],
 }
 
 fn required_output<'py>(output: &Bound<'py, PyDict>, name: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -1217,7 +1183,6 @@ fn fill_encoded_output(py: Python<'_>, games: &[Game], output: &Bound<'_, PyDict
     let mut units = output_array!("units", PyArray3<f16>, [rows, MAX_UNITS, UNIT_FEATURES]);
     let mut positions = output_array!("unit_positions", PyArray3<i64>, [rows, MAX_UNITS, 2]);
     let mut active = output_array!("unit_active", PyArray2<bool>, [rows, MAX_UNITS]);
-    let mut potentials = output_array!("potentials", PyArray1<f32>, [games.len()]);
 
     let board = board.as_slice_mut().map_err(|_| non_contiguous("board"))?;
     let globals = globals
@@ -1233,9 +1198,6 @@ fn fill_encoded_output(py: Python<'_>, games: &[Game], output: &Bound<'_, PyDict
     let active = active
         .as_slice_mut()
         .map_err(|_| non_contiguous("unit_active"))?;
-    let potentials = potentials
-        .as_slice_mut()
-        .map_err(|_| non_contiguous("potentials"))?;
 
     const BOARD_VALUES: usize = BOARD_CHANNELS * BOARD_SIZE * BOARD_SIZE;
     const UNIT_VALUES: usize = MAX_UNITS * UNIT_FEATURES;
@@ -1277,10 +1239,6 @@ fn fill_encoded_output(py: Python<'_>, games: &[Game], output: &Bound<'_, PyDict
                     }
                 },
             );
-        potentials
-            .par_iter_mut()
-            .zip(games.par_iter())
-            .for_each(|(output, game)| *output = game.pair_potential());
     });
     Ok(())
 }
@@ -1370,7 +1328,6 @@ fn fill_sample_step_output(
     games: &[Game],
     sampled: &[SampledFactors],
     results: &[StepResult],
-    potential_cache: &mut [f32],
     output: &mut SampleOutputSlices<'_>,
 ) {
     let SampleOutputSlices {
@@ -1390,9 +1347,8 @@ fn fill_sample_step_output(
         rewards,
         money,
         dones,
-        previous,
-        potentials,
-        shaped,
+        economic_scores,
+        training_rewards,
     } = output;
 
     for (row_index, row) in sampled.iter().enumerate() {
@@ -1425,21 +1381,13 @@ fn fill_sample_step_output(
             .copy_from_slice(&row.market_quantity_logprobs);
         entropy[row_index] = row.mean_entropy;
     }
-    for (game_index, ((game, result), cached)) in
-        games.iter().zip(results).zip(potential_cache).enumerate()
-    {
+    for (game_index, (game, result)) in games.iter().zip(results).enumerate() {
         let offset = game_index * PLAYERS;
         rewards[offset..offset + PLAYERS].copy_from_slice(&result.rewards);
         money[offset..offset + PLAYERS].copy_from_slice(&result.money);
         dones[game_index] = result.done;
-        let pre = *cached;
-        previous[game_index] = pre;
-        let post = game.post_step_potential();
-        potentials[game_index] = post;
-        *cached = post;
-        let reward_zero = post - pre;
-        shaped[offset] = reward_zero;
-        shaped[offset + 1] = -reward_zero;
+        economic_scores[offset..offset + PLAYERS].copy_from_slice(&game.economic_scores());
+        training_rewards[offset..offset + PLAYERS].copy_from_slice(&game.training_rewards());
     }
 }
 

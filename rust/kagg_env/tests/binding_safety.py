@@ -132,16 +132,20 @@ def main() -> None:
             f"stdout:\n{child.stdout}\nstderr:\n{child.stderr}"
         )
 
-    assert_output_rejected_without_step(lambda output: output.pop("potentials"))
+    assert_output_rejected_without_step(lambda output: output.pop("training_rewards"))
     assert_output_rejected_without_step(
-        lambda output: output.__setitem__("potentials", np.zeros(BATCH + 1, dtype=np.float32))
+        lambda output: output.__setitem__(
+            "training_rewards", np.zeros((BATCH + 1, 2), dtype=np.float32)
+        )
     )
     assert_output_rejected_without_step(
-        lambda output: output.__setitem__("potentials", np.zeros(BATCH, dtype=np.float64))
+        lambda output: output.__setitem__(
+            "training_rewards", np.zeros((BATCH, 2), dtype=np.float64)
+        )
     )
 
     def make_readonly(output: dict[str, np.ndarray]) -> None:
-        output["potentials"].flags.writeable = False
+        output["training_rewards"].flags.writeable = False
 
     assert_output_rejected_without_step(make_readonly)
     assert_output_rejected_without_step(

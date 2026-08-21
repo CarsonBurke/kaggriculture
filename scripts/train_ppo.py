@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "concurrently learning agents; every game pairs two distinct members "
-            "so no trajectory's reward is zero by construction. 1 is the single "
+            "and every seat optimizes its own absolute economy. 1 is the single "
             "learner with mirror self-play and the frozen league, and N > 1 "
             "replaces both: --games must then be a multiple of N * (N - 1) so "
             "every ordered pairing appears equally often and seat bias cancels"
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
         "--gamma",
         type=float,
         default=1.0,
-        help="reward discount; 1.0 preserves the exact final relative-bank objective",
+        help="reward discount; 1.0 preserves the time-average economy plus final-bank objective",
     )
     parser.add_argument(
         "--actor-gae-lambda",
@@ -315,19 +315,18 @@ def _initial_actor_paths(args: argparse.Namespace) -> list[Path]:
 def _validate_population(args: argparse.Namespace) -> None:
     """Refuse a population whose members cannot produce a usable gradient.
 
-    Two ways that happens, both silent. A wave whose game count is not a multiple
+    Three silent defects are refused. A wave whose game count is not a multiple
     of N(N-1) cannot give every ordered pairing the same number of games, so seat
-    bias survives into the advantage instead of cancelling. And members starting
-    from one artifact are numerically identical, which makes their first games
-    mirrors: `_relative_score` is zero whenever both banks are equal, so the wave
-    carries no gradient at all -- exactly the defect this scheme replaces.
+    bias survives into the advantage. Members initialized from the same artifact
+    are one policy rather than four learners. And a configured frozen or built-in
+    lane would violate the population collector's all-learners contract.
     """
     initial = _initial_actor_paths(args)
     resolved = [path.expanduser().resolve() for path in initial]
     if len(set(resolved)) != len(resolved):
         raise ValueError(
-            "--init-actor-from must name a different artifact per agent; members "
-            "sharing weights are identical and identical members score 0.5 by symmetry"
+            "--init-actor-from must name a different artifact per agent; "
+            "four learners require four independently trained initial policies"
         )
     if args.population == 1:
         if len(initial) > 1:
@@ -462,7 +461,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.lr_warmup_steps < 0:
         raise ValueError("LR warmup steps cannot be negative")
     if args.gamma != 1.0:
-        raise ValueError("Kaggriculture bank-delta rewards require --gamma 1.0")
+        raise ValueError("Kaggriculture economic rewards require --gamma 1.0 (undiscounted)")
     if not math.isfinite(args.actor_gae_lambda) or not 0.0 <= args.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
     if not math.isfinite(args.max_hours) or args.max_hours < 0.0:
@@ -1825,10 +1824,9 @@ def main() -> None:
             _load_initial_actor(path, member.actor, architecture.name, model_config, device)
             for path, member in zip(initial_actors, members, strict=True)
         ]
-        # Two copies of one artifact under different names are the same weights,
-        # which the path check in validation cannot see. Identical members make
-        # every one of their games a mirror scoring 0.5 by symmetry, so the run
-        # would train on a wave with no gradient in it.
+        # Two copies of one artifact under different names are the same policy.
+        # Four learners require four independently trained initial programs;
+        # otherwise the nominal population begins as mirror play under aliases.
         digests = {record["sha256"] for record in records}
         if len(digests) != len(records):
             raise ValueError(

@@ -9,16 +9,42 @@ agent inside the training wave. All members share one architecture and one
 configuration; each owns its own actor weights, its own critic, and its own
 optimizer state.
 
-`N = 4` by default: each agent faces the other three. (Read literally, "one of 4
-opponents" could mean four opponents *besides* the learner; that is `N = 5` and
-the only change is the constant. `--population` carries it, so the plan does not
-depend on which was meant.)
+This run uses `N = 4`: each learner faces the other three. `--population`
+remains configurable; no player identity or policy is hardcoded. The population
+validator rejects frozen snapshots, built-ins, and fixed opponents whenever
+`N > 1`.
 
-This is AlphaStar-like in the one sense that matters here — a population of
-concurrent learners rather than a single learner against its own past — and
-deliberately unlike AlphaStar in another: AlphaStar kept past players precisely
-to suppress cycling. That risk is retained knowingly and instrumented in
-Stage 5 rather than answered with frozen lanes.
+Each seat optimizes its own non-telescoping economy:
+`mean_t tanh((farm_value_t - 3000) / 75000)` plus the same transform of final
+bank. Reducing the opponent's wealth never raises your reward. Equal rich play
+is therefore better than equal collapse, and sustaining capital matters even
+when two trajectories share an endpoint. Entropy remains telemetry only; there
+is no entropy coefficient in either `PpoConfig` or the CLI.
+
+## Measured four-learner result
+
+`runs/pop4-economic-lr3e5/checkpoint-000050.pt` is the selected population
+checkpoint. It contains four independently initialized live learners after ten
+actor-active round-robin self-play iterations. The training wave contained no
+fixed, frozen, scripted, or built-in player.
+
+Evaluation used eight held-out seeds, both seat orders, and the full 720-step
+horizon: 16 games per member and opponent.
+
+| external opponent | aggregate score | member score rates |
+|---|---:|---|
+| `starter` | 64 / 64 | 1.000, 1.000, 1.000, 1.000 |
+| `public-v16` | 64 / 64 | 1.000, 1.000, 1.000, 1.000 |
+| `public-v27` | 52 / 64 | 1.000, 1.000, 0.875, 0.375 |
+
+The 3e-4 NorMuon schedule collapsed external play within the same ten actor
+updates: aggregate score fell to 1 / 32 against `public-v27` and 5 / 32 against
+`public-v16`, while mean self-play bank fell from 82,969 to 54,088. The selected
+3e-5 schedule kept mean bank at 80,923. A 1e-5 control remained stable through
+30 actor updates (82,587 mean bank) but scored 49 / 64 against `public-v27`.
+The measured default is therefore 3e-5. The entropy guard rejected the next
+unsafe update before it could be committed; entropy is still telemetry and a
+stop condition, never a reward bonus.
 
 ## What this replaces, and the measurement that condemns it
 
@@ -69,10 +95,10 @@ The end state was a deterministic replay at iteration 236 banking **0** against
   training path. That machinery is retired, not kept in parallel.
 - No scripted or built-in opponent in the training wave. The native built-ins
   stay, used by evaluation and parity audits only.
-- No architecture change. `entity-cnn` and its production `ModelConfig` are held
-  fixed so the measured difference is the play scheme.
-- No reward change bundled into this work. The saturation risk is documented
-  below and decided separately; bundling it would confound the ablation.
+- No architecture change. `entity-cnn` and its production `ModelConfig` stay fixed.
+- The original population ablation kept the reward fixed to isolate the play
+  scheme. Stage 5 then measured collapse under that reward; the current decision
+  above replaces it before the next run.
 
 ## Design
 
@@ -250,8 +276,8 @@ per-row agent assignment from the balanced pairing schedule, every row stored,
 `RolloutBatch.agents` populated, one ensemble forward over N lanes, no frozen or
 built-in lanes. *Acceptance:* a wave of G = 156 returns 312 trajectories with an
 exactly balanced 12-pairing histogram and exactly balanced seat counts per agent;
-reward antisymmetry holds pairwise (`reward[i] == -reward[j]` up to the shaping
-term for every game); CPU test coverage for the schedule and the partition.
+each seat receives its own bounded economic reward, with no opponent-bank term;
+CPU test coverage for the schedule, partition, and reward independence.
 
 **Stage 3 - N-agent training loop.** N actors, critics, and optimizer pairs;
 per-agent updates and per-agent gates (`_gate_update_metrics`, including
@@ -360,67 +386,29 @@ a 0.10 bound. `MINIMUM_POPULATION_DISAGREEMENT` reads *healthiest* exactly when
 the policies are worst, because diverging to exploit each other is diversity.
 Only the external anchor detected anything, which is the argument for it.
 
-**Stage 6 - ablations.** PFSP versus uniform pairing; population size; and, if
-adopted separately, the reward anchor.
+**Stage 6 - ablations.** PFSP versus uniform pairing and population size, after
+the absolute non-telescoping reward has established a stable baseline.
 
 ## Risks
 
-**Reward saturation is real, but it is NOT established as the cause of either
-collapse. Both runs share one confound: no non-saturating opponent was ever in
-the training wave.** Every reward term is scale-invariant --  `_relative_score`
-and the dense shaping potential built on it (`terminal_pair_potential`) -- and
-absolute competence is therefore a null direction of the objective. That much is
-a property of the code and is not in question. What was claimed here, and is now
-withdrawn, is that two collapses had established it as the operative cause.
+**Resolved: the league must not depend on a fixed opponent.** The inherited
+proposal added `scripted-v27` as a permanent lane, but that violates the
+four-live-learner requirement and makes training quality depend on one hardcoded
+policy. External opponents remain useful evaluation diagnostics only.
 
-The confound, found by asking why a standard league does not behave this way:
+The replacement addresses the mechanism directly. Under the old antisymmetric
+reward, opponent loss could outweigh learner loss and equal farms scored zero at
+any absolute wealth. Under the economic reward, each seat is monotone only in
+its own farm value; lowering the opponent changes nothing. The time-average term
+also distinguishes early sustained growth from a last-step endpoint, so it
+cannot telescope into the same return.
 
-| run | built-in opponents in the training wave |
-|---|---|
-| `runs/ppo-bc5mix` | `pass,random,starter` |
-| `runs/pop4-klwin` | none (`_validate_population` refuses lanes at N>1) |
-| `production.py:35` default | `pass,random,starter,scripted-v27` |
-
-`scripted-v27` -- the in-engine port of the strongest known opponent, native in
-the batched wave (`core.rs:1226`), already the production default -- was omitted
-from the one run that could have used it and structurally forbidden in the
-other. And the three that were used all *saturate*, measured in
-`artifacts/probes/pop4-anchor.json`:
-
-| policy | vs `starter` | vs `scripted-v27` |
-|---|---|---|
-| `warm0` (it 40) | 1.000, bank 140,592 | **0.4375**, 66,821 / 72,778 |
-| `fin0` (it 130) | 1.000, bank 54,471 | 0.000, 40,279 / 111,832 |
-| `fin1` (it 130) | 1.000, bank 54,842 | 0.000, 43,235 / 113,859 |
-
-`starter` reads 1.000 across a 2.6x spread in absolute bank. A constant score
-contributes a zero advantage and therefore no gradient, so the "12.5% built-in
-rows" in `ppo-bc5mix` were not an anchor -- they were wasted rows. Effectively
-both runs were unanchored self-play. `scripted-v27` is the opposite: 0.4375
-against the warm start and 0.000 against both collapsed finals, which is a large
-corrective gradient that was available and never sampled.
-
-This also repairs the mechanism story. Against a strong opponent the collapsed
-policy does not deny -- `scripted-v27`'s own bank *rises* 72,778 to 113,859, the
-same direction `public-v27`'s did in external evaluation. Denial only pays
-against a market-dependent opponent (`bc5`, itself weaker than `public-v27`); a
-strong opponent is denial's beneficiary. So denial is an exploit of a specific
-opponent class, not a dominant strategy, and an exploit is exactly what a league
-with a permanent non-saturating anchor is supposed to punish.
-
-That is the AlphaStar recipe this plan claimed to be following and was not: a
-supervised anchor kept in the league permanently, main agents spending a large
-share of games against the whole past league, and PFSP up-weighting opponents
-you are losing to. Beating a fixed strong opponent requires absolute capability,
-which pins the null direction without touching the reward at all.
-
-**Therefore the reward change is no longer the next step.** Anchoring touches
-`rust/kagg_env/src/core.rs` and the meaning of every trained artifact; it must
-not be spent on a hypothesis confounded by a missing flag. The decisive and far
-cheaper experiment is `ppo-bc5mix`'s own configuration with `scripted-v27` added
-to the built-in lanes -- one variable, against a known collapse. Only if a
-policy still walks off its bank with a non-saturating anchor in the wave does the
-reward become the suspect.
+The remaining risk is reward-model error in the illiquid credits. Exact
+liquidation value covers bank and market products, while seeds, animals, pending
+yields, and land use conservative cost-basis fractions. A policy could overhold
+those assets mid-episode, but the final bank bonus ignores every unsold asset and
+has equal total weight to the whole occupancy average. Native/Python reward
+parity and the external bank curves are the gates for that failure.
 
 **Market denial is still positively rewarded. Measured on this run's own
 members.** `artifacts/probes/pop4-denial.json`, 16 games per ordered cell, two
@@ -512,18 +500,18 @@ in Stage 0 with an existing instrument.
    (`worst_first_minibatch_kl` 2.5e-05, `worst_update_replay_max_kl` 4.4e-04,
    11x under the shipped replay ceiling), so vmap replay parity is not the
    constraint either.
-3. **The reward gets no absolute anchor.** Only winning counts, so the objective
-   stays purely relative and antisymmetric: `_relative_score` and the shaping
-   potential built on it are unchanged, and `rust/kagg_env/src/core.rs` is not
-   touched. "My economy grew but by less than my opponent's" is the signal the
-   scheme is meant to carry, and a relative reward carries exactly that.
+3. **The reward has an absolute, non-telescoping anchor.** The measured Stage 5
+   run made every learner poorer while relative margins improved, so a purely
+   antisymmetric objective is retired. Each transition now pays one horizon
+   share of the learner's own bounded farm value and the terminal transition
+   adds its bounded final bank. The complete return is a time average plus an
+   endpoint, not a potential difference.
 
-   The consequence is explicit rather than hidden: mutual mediocrity remains a
-   fixed point, market denial remains positively rewarded whenever the opponent
-   is beatable, and no internal number can see either. Stage 5's tripwire --
-   absolute bank must not fall while a relative score rate rises -- is therefore
-   not a safety net but **the primary detector**, and the external evaluator is
-   the only absolute measurement in the system.
+   This removes both null directions that mattered: equal rich and equal poor
+   play no longer score identically, and sacrificing your bank to reduce the
+   opponent's cannot improve your reward. The return remains inside `(-2, 2)`,
+   market-product trades remain value-neutral, and terminal scoring still ignores
+   unsold inventory.
 
    What the population does fix is the defect the measurements actually
    condemned: 93% of the last run's experience came from the learner's own

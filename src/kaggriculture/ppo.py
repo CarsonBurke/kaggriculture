@@ -654,9 +654,9 @@ def generalized_advantage_and_targets(
     wherever the value function is exact and trades the remaining bias for a
     variance reduction that grows with the horizon: over 719 transitions the
     lambda-one Monte Carlo suffix return accumulates the noise of every later
-    action into every earlier state's target, and the dense potential-difference
-    reward makes that trade lopsided -- almost all of the return is already
-    observable within the lambda's ~36-step effective window.
+    action into every earlier state's target. The dense economic occupancy
+    reward exposes progress throughout the episode, so the shorter window keeps
+    useful local signal while the critic supplies the continuation estimate.
     """
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")
@@ -733,7 +733,7 @@ def _validate_config(config: PpoConfig) -> None:
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
         raise ValueError("clip interval must straddle one")
     if config.gamma != 1.0:
-        raise ValueError("Kaggriculture bank-delta rewards require undiscounted gamma=1")
+        raise ValueError("Kaggriculture economic rewards require undiscounted gamma=1")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
 
@@ -1948,13 +1948,10 @@ def _fit_explained_variance(sums: dict[str, Tensor], states: int) -> float:
 
     The two explained variances taken from the pre-update replay cannot answer
     whether the regression worked. Against the suffix return the critic is
-    scored on a quantity it never fits, and under potential-shaped rewards with
-    gamma one that return is the terminal outcome minus the current potential,
-    so most of its variance is the game's coin flip and no critic can explain
-    it. Against the lambda-return the residual is identically the advantage --
-    the target is `advantages + values` and the prediction is those same
-    `values` -- so the number rises whenever the critic's predictions merely
-    gain variance, agreeing with themselves.
+    scored on a quantity it never fits directly. Against the lambda-return the
+    residual is identically the advantage -- the target is `advantages + values`
+    and the prediction is those same `values` -- so the number rises whenever
+    the critic's predictions merely gain variance, agreeing with themselves.
 
     This one is neither: the targets are fixed before the update and the
     predictions are the critic's own, so a critic that is fitting what it was
@@ -2466,13 +2463,10 @@ def update_ppo(
         # separating.
         #
         # Against the undiscounted suffix return. The critic does not regress
-        # on it, and under this environment's potential-shaped reward with
-        # gamma one the suffix return telescopes to the terminal outcome minus
-        # the current potential -- so its variance is mostly the game's coin
-        # flip, and a healthy critic still scores near zero here. Read the
-        # correlation below, not this, for whether the critic knows anything
-        # about how the game ends: this conflates that correlation with the
-        # scale the critic was fitted at, which belongs to a different target.
+        # on it directly. Under the non-telescoping economic objective this
+        # measures whether its pre-update prediction explains the remaining
+        # time-average farm value plus final bank value; unlike the old
+        # potential difference, the target retains path information.
         "monte_carlo_explained_variance": _explained_variance(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),

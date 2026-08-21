@@ -156,7 +156,7 @@ def main() -> None:
             timed("rust_sample_step", stage, sample_step)
 
             def bookkeeping() -> None:
-                np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+                np.asarray(sampled["training_rewards"], dtype=np.float32).reshape(-1)
                 counts = (
                     np.asarray(sampled["unit_active"]).sum(axis=1)
                     + np.asarray(sampled["market_active"]).sum(axis=1)

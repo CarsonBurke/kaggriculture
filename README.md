@@ -190,106 +190,59 @@ the chain.
 Sweep with `--games 64,112,128,256` when the question is scaling or memory
 headroom, which is a separate study from this one.
 
-Training is direct from-scratch self-play. Rewards are the change in a dense
-shaping potential: player zero receives it, player one receives the negative.
-Both the mid-episode potential and the terminal one are the same squashed
-dollar margin, `tanh((a - b) / 75000)`, and only the argument changes at the
-terminal transition, so the reward stays the difference of a single function
-and the shaped return still telescopes exactly. Mid-episode `a` and `b` are
-farm value: each side is an exact liquidation core -- bank money plus the exact
+Training rewards each learner for its own economy; they are not zero-sum and do
+not read the opponent's bank. For player `i` after transition `t`,
+
+```
+s[i,t] = tanh((value[i,t] - 3000) / 75000)
+r[i,t] = s[i,t] / 719 + terminal(t) * s[i,t]
+```
+
+so the full episode return is the time-average post-action economic score plus
+the final bank score. It is deliberately non-telescoping: two trajectories with
+the same endpoint receive different returns when one sustained useful capital
+for longer. Equal rich learners both receive positive reward; equal bankrupt
+learners both receive negative reward. Reducing the opponent's bank never raises
+your reward, which removes the self-play failure where all four policies became
+poorer while improving their relative margin against one another.
+
+Mid-episode `value` is an exact liquidation core -- bank money plus the exact
 proceeds of selling every held product, unit by unit at the quotes the engine
-would actually pay, so market product trades stay exactly potential-neutral
-and harvested-but-unsold output is credited at true sale proceeds -- plus a
-heuristic cost-basis credit for the assets the market cannot buy back: seeds at
-0.85 of engine cost in the shed and 0.8 once planted, animals at 0.82 in the
-shed and 0.85 once placed, pending yields at 0.72 of their posted price, and
-each extra unlocked tile at 0.9 of its land price. Those credits exist only to
-smooth credit assignment across the invest-produce-sell loop; without them
-self-play collapses into a never-spend tie equilibrium before harvests can pay
-back, and kept near engine cost they make a purchase a small potential dip
-rather than a shaped-reward cliff the policy never crosses. At the terminal
-transition the argument becomes banked money alone -- the only quantity the
-engine itself scores -- so the heuristic weights cannot move the objective, and
-because tanh is strictly increasing the squash reorders nothing: equal sides
-still give exactly 0.0, two empty farms included, and a market product trade is
-still exactly potential-neutral.
+would actually pay -- plus conservative cost-basis credit for assets the market
+cannot buy back: seeds at 0.85 of engine cost in the shed and 0.8 once planted,
+animals at 0.82 in the shed and 0.85 once placed, pending yields at 0.72 of
+their posted price, and extra land at 0.9 of purchase price. Market-product
+trades are exactly value-neutral, so cycling inventory cannot manufacture
+reward. These credits bridge the invest-produce-sell delay without making an
+investment look like pure loss. On the terminal transition `value` becomes
+banked money alone, so unsold inventory and heuristic credits do not enter the
+final bonus.
 
-The margin is squashed rather than normalized by the pot because normalizing
-makes a dollar's reward inversely proportional to the pot: under
-`(a - b) / (a + b)` a dollar of margin is worth `2b / (a + b)^2`, which is
-1.67e-4 at a 6,000 pot against 3.3e-6 at a 300,000 one, and that 50x premium
-on keeping the economy small is live at every step rather than only at the end.
-A run took it. Money fell 48,006 to 7,032 while `score_rate` rose 0.441 to
-0.520; the self-play score sat at exactly 0.500 by symmetry while self-play
-money fell 43,167 to 8,713; and against `starter`, 166,862 scored 0.959 where
-56,033 scored 0.883, so destroying 66% of the economy read as an improvement.
-Against `public-v27` it was a real regression that only the absolute banks
-show: `public-v27` earned more facing the collapsed policy (106,502) than
-facing the pre-collapse clone (85,203). `MARGIN_SCALE` is 75,000 dollars, read
-off the measured margin distribution rather than picked. Neural-versus-neural
-games sit at a median absolute margin of 9,440 and a p90 of 27,136, which stays
-inside tanh's near-linear region at this scale, while a healthy policy's roughly
-104,000 margin against a built-in lands at 0.88 to 0.98 instead of saturating.
-That widens the gap between a rich and a poor built-in result from 0.076 to
-0.370 and the gap between beating and losing to `public-v27` from 0.450 to
-0.629, while leaving the typical mirror-lane signal marginally stronger than it
-was, 0.077 against 0.068. The constant is duplicated in
-`src/kaggriculture/encoding.py` and `rust/kagg_env/src/core.rs`, and has to stay
-identical between them.
+The 3,000-dollar baseline makes doing nothing exactly zero. The 75,000-dollar
+scale keeps measured neural final banks -- roughly 40,000 to 140,000 -- in the
+informative part of tanh while bounding each score inside `(-1, 1)`. The
+time-average contributes less than one and the final bonus contributes less than
+one, so every complete return remains strictly inside `(-2, 2)`, matching the
+critic's HL-Gauss support. The constant is duplicated as `ECONOMIC_SCALE` in
+`src/kaggriculture/encoding.py` and `rust/kagg_env/src/core.rs`; native/Python
+parity covers both the score and reward.
 
-Because the reward is a potential difference and gamma is fixed at 1.0, the
-shaped suffix return from any state telescopes exactly to the terminal
-potential minus that state's potential. The start is symmetric, so its
-potential is exactly 0.0 and the undiscounted episode return is exactly the
-terminal squashed bank margin, whose sign still exactly matches the game's
-winner/tie relation. Both potentials are bounded in `(-1, 1)`, so that return
-stays inside the proven `[-2, 2]` range the critic's HL-Gauss support is built
-around. Gamma is not free to tune here: discounting potential differences
-would introduce a separate preference for holding cash early. The telescoping
-also means that return's variance is mostly the game's own coin flip rather
-than anything the critic can read at a single state, so explained variance
-against it sits at or near zero even for a healthy critic. That is why it is
-reported as `monte_carlo_explained_variance` rather than as the critic's
-accuracy, and why the critic's own regression is scored beside it twice, as
-`critic_fit_explained_variance_first_epoch` and
-`critic_fit_explained_variance_last_epoch`. Both read the clipped target the
-critic actually regresses on, against predictions taken from inside the
-update, where `monte_carlo_explained_variance` and
-`lambda_return_explained_variance` both read the unclipped return. There are
-two because a single in-sample reading cannot separate a critic that is
-fitting from one that is memorizing the batch. The last-epoch reading is the
-in-sample one deliberately: it scores every state on its final pass, already
-fitted three times over at the four critic epochs production configures, while
-the first scores those same states before this update has touched them. A
-critic that generalizes keeps the two together and one that memorizes the
-batch pulls them apart. The epochs between are never mixed in, and with a
-single configured critic epoch the two coincide, that epoch being both.
-
-Advantages use VAPO's length-adaptive
+Gamma is fixed at 1.0 so all 719 occupancy samples have equal weight. Advantages
+use VAPO's length-adaptive
 `lambda_policy = 1 - 1 / (0.05 * 719) = 0.9721835883`, and critic targets are
-the matching lambda-return `advantage + value`. VAPO decouples the critic onto
-lambda one because its setting pays a single terminal reward, so nothing short
-of the whole trajectory is unbiased; here the reward is a dense potential
-difference at every transition, and the lambda-one suffix return would instead
-fold the noise of all 719 actions into every earlier state's target. Targets
-are saturated at the outermost value atom, as any categorical critic must be
-once it bootstraps, and the saturated fraction is reported. Valid games
-always contain 719 actions, so the paper's length-adaptive formula is constant
-for this environment. Epoch permutations are split into balanced minibatches
-so a short tail cannot receive a disproportionate optimizer step. No entropy
-bonus is involved. The production defaults collect 112 live self-play games
-plus 96 frozen-league games and replay them once. Frozen actor-only snapshots
-are written every update, with opponents drawn from a 16-policy recent window
-and log-age historical strata, and every league seat decodes at the learner's
-own temperature. Sharpening them instead -- active lanes at 0.8, historical
-ones at argmax -- hands the learner an opponent that is a strictly better
-executor of its own policy, so an identical snapshot beats it: iteration 40
-scored 0.302 in league lanes against copies of itself, and a temperature-1.0
-seat loses to a temperature-0.8 seat of the same weights at a 0.4375 win rate.
-The learner cannot answer that by playing better, only by playing something
-whose payoff survives its own sampling noise, and it found one: farming 143,000
-needs roughly 8,000 correct decisions in a row where denying an opponent needs
-far fewer. Full resumable checkpoints are kept every five updates.
+the matching lambda-return `advantage + value`. A lambda-one suffix return would
+fold all later action noise into every earlier target; the shorter window keeps
+the local dense signal while the critic supplies continuation value. Targets
+that bootstrap beyond the categorical support saturate at the outer atom and
+the saturated fraction is reported.
+
+Entropy is measured for collapse detection but never optimized: `PpoConfig` and
+the training CLI expose no entropy coefficient, and the actor loss is exactly
+the clipped PPO surrogate. Population training uses four independently
+initialized live learners, uniform ordered round-robin pairings, and both seats'
+trajectories. `--population 4` requires `--league-games 0`; validation rejects
+frozen snapshots and built-in opponents in the wave. External opponents are
+evaluation-only diagnostics and never affect training gradients.
 
 The actor and critic have separate spatial U-Nets and fixed-token entity
 transformers. The actor attends over one state token, 100 board cells, 16 unit

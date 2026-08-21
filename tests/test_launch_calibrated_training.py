@@ -157,9 +157,9 @@ def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
     assert args.init_actor_from == artifacts
     assert args.league_games == 0
     assert args.league_builtin_lanes == 0
-    # A population has no built-in lane and every in-wave number is relative, so
-    # the external probe is its only absolute measurement and stays on. One
-    # worker reads the durable checkpoint, so the cadence must land on one.
+    # A population has no built-in lane. External evaluation stays diagnostic
+    # and never enters the training wave; one worker reads each durable
+    # checkpoint, so the cadence must land on one.
     assert args.external_eval_every == PRODUCTION_EXTERNAL_EVAL_EVERY
     assert args.external_eval_every % args.checkpoint_every == 0
     # Cost parity at N = 4: 156 games is a multiple of the 12 ordered pairings, so

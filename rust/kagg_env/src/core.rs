@@ -127,13 +127,11 @@ const ILLIQUID_PLANTED_SEED_CREDIT: f64 = 0.8;
 const ILLIQUID_PENDING_YIELD_CREDIT: f64 = 0.72;
 const ILLIQUID_LAND_CREDIT: f64 = 0.9;
 
-// Dollars of margin at which the scored potential reaches tanh's knee. The
-// potential squashes a margin rather than normalizing one by the pot: under
-// `(a - b) / (a + b)` a dollar of margin is worth `2b / (a + b)^2`, a 50x
-// premium on keeping the economy small, which a run took by destroying 85% of
-// its own bank while its score rose. Must stay identical to MARGIN_SCALE in
-// src/kaggriculture/encoding.py.
-const MARGIN_SCALE: f64 = 75_000.0;
+// Economic value above the starting bank at which the bounded score reaches
+// tanh's knee. Neural-versus-neural final banks span roughly 40k-140k, so this
+// separates collapsed from healthy play without letting one episode's return
+// leave (-2, 2). Must match ECONOMIC_SCALE in encoding.py.
+const ECONOMIC_SCALE: f64 = 75_000.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -1159,33 +1157,38 @@ impl Game {
         value
     }
 
-    /// Bounded farm-value margin from player zero's perspective.
+    /// Per-player absolute economic competence in the current state.
     ///
-    /// The dense shaping potential: an exact liquidation core (market product
-    /// trades stay exactly potential-neutral and harvested-but-unsold output
-    /// is credited at true sale proceeds) plus the heuristic cost-basis
-    /// credit for illiquid assets.
-    pub fn pair_potential(&self) -> f32 {
-        margin_score(
-            self.liquidation_value(0) + self.illiquid_value(0),
-            self.liquidation_value(1) + self.illiquid_value(1),
-        )
+    /// Mid-episode value combines exact liquidation proceeds with conservative
+    /// cost-basis credit for illiquid investments. The terminal state uses bank
+    /// only. One player's score never reads the other's value, so destroying an
+    /// opponent's economy cannot compensate for destroying your own.
+    pub fn economic_scores(&self) -> [f32; PLAYERS] {
+        std::array::from_fn(|player| {
+            let value = if self.done {
+                self.farms[player].money as f64
+            } else {
+                self.liquidation_value(player) + self.illiquid_value(player)
+            };
+            economic_score(value, self.config.starting_money as f64)
+        })
     }
 
-    /// Bounded banked-money margin, scoring the quantity the engine banks.
-    pub fn terminal_potential(&self) -> f32 {
-        margin_score(self.farms[0].money as f64, self.farms[1].money as f64)
-    }
-
-    /// Post-step shaping potential: the farm-value margin mid-episode and the
-    /// banked-money margin at termination, so the telescoped shaped return
-    /// equals the exact final scored margin.
-    pub fn post_step_potential(&self) -> f32 {
-        if self.done {
-            self.terminal_potential()
-        } else {
-            self.pair_potential()
-        }
+    /// Non-telescoping economic reward for the current post-action state.
+    ///
+    /// Every transition contributes one horizon-normalized economic score and
+    /// the terminal transition adds the final bank score once more. The episode
+    /// return is therefore mean post-action farm value plus final bank value,
+    /// strictly inside (-2, 2).
+    pub fn training_rewards(&self) -> [f32; PLAYERS] {
+        let scores = self.economic_scores();
+        let transitions = f32::from(
+            self.config
+                .episode_steps
+                .checked_sub(1)
+                .expect("episode must contain a transition"),
+        );
+        scores.map(|score| score / transitions + if self.done { score } else { 0.0 })
     }
 
     /// The action the named built-in reference agent takes for `player`.
@@ -2854,16 +2857,12 @@ fn shape(kind: Shape, x: f64) -> f64 {
     }
 }
 
-/// Bounded dollar margin from player zero's perspective.
+/// Bounded absolute economic competence above the initial endowment.
 ///
-/// Both potentials squash through this identically, so the shaped reward stays
-/// the difference of one function and its telescoped return is exact. Only the
-/// argument changes at the terminal transition: farm value during the episode,
-/// banked money at the end. Computed in f64 and narrowed once, matching
-/// `encoding._margin_score` so replay parity holds to the same tolerance the
-/// division did.
-fn margin_score(zero: f64, one: f64) -> f32 {
-    ((zero - one) / MARGIN_SCALE).tanh() as f32
+/// Computed in f64 and narrowed once, matching `encoding._economic_score` so
+/// native/Python reward parity holds to the same tolerance as state encoding.
+fn economic_score(value: f64, starting_money: f64) -> f32 {
+    ((value - starting_money) / ECONOMIC_SCALE).tanh() as f32
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
@@ -3118,48 +3117,49 @@ mod tests {
     }
 
     #[test]
-    fn pair_potential_squashes_the_dollar_margin_over_an_exact_liquid_core() {
+    fn economic_scores_are_absolute_and_independent() {
         let mut game = Game::new(0, GameConfig::default());
-        game.farms[0].money = 3000;
-        game.farms[1].money = 1000;
-        let lead = game.pair_potential();
-        assert_eq!(
-            lead,
-            ((game.farms[0].money - game.farms[1].money) as f64 / MARGIN_SCALE).tanh() as f32
-        );
-        assert!(lead > 0.0);
+        game.farms[0].money = 9_000;
+        game.farms[1].money = 3_000;
+        let scores = game.economic_scores();
+        assert_eq!(scores[0], (6_000.0 / ECONOMIC_SCALE).tanh() as f32);
+        assert_eq!(scores[1], 0.0);
 
-        // Antisymmetric in the two players, so the zero-sum pair is scored by
-        // one number and the trailing seat sees the exact negation.
-        game.farms[0].money = 1000;
-        game.farms[1].money = 3000;
-        assert_eq!(game.pair_potential(), -lead);
-
-        // Equal farms are exactly zero at any wealth. That is what makes the
-        // symmetric start's potential 0.0, so the telescoped shaped return is
-        // the terminal potential alone and stays inside [-2, 2].
-        game.farms[0].money = 0;
+        // Destroying the opponent's bank cannot raise the learner's score.
         game.farms[1].money = 0;
-        assert_eq!(game.pair_potential(), 0.0);
+        let opponent_destroyed = game.economic_scores();
+        assert_eq!(opponent_destroyed[0], scores[0]);
+        assert!(opponent_destroyed[1] < scores[1]);
+
+        // Equal rich play is positively reinforced instead of collapsing onto
+        // the same zero reward as an equal bankrupt pair.
         game.farms[0].money = 250_000;
         game.farms[1].money = 250_000;
-        assert_eq!(game.pair_potential(), 0.0);
+        let rich_tie = game.economic_scores();
+        assert_eq!(rich_tie[0], rich_tie[1]);
+        assert!(rich_tie[0] > 0.0);
+        game.farms[0].money = 0;
+        game.farms[1].money = 0;
+        let poor_tie = game.economic_scores();
+        assert_eq!(poor_tie[0], poor_tie[1]);
+        assert!(poor_tie[0] < 0.0);
 
-        // Held products count at their exact sale proceeds, whether they sit
-        // in the shed or in a hired unit's hands.
-        game.farms[0].money = 1000;
-        game.farms[1].money = 1000;
+        // Held products count at their own exact sale proceeds, whether they
+        // sit in the shed or in a hired unit's hands.
+        game.farms[0].money = 1_000;
+        game.farms[1].money = 1_000;
         game.farms[0].units = 2;
         game.privates[0].shed[0] = 30;
         game.privates[0].inventories[1][0] = 10;
         game.privates[1].shed[4] = 5;
         let zero = game.liquidation_value(0);
         let one = game.liquidation_value(1);
-        assert!(zero > 1000.0);
-        assert!(one > 1000.0);
         assert_eq!(
-            game.pair_potential(),
-            ((zero - one) / MARGIN_SCALE).tanh() as f32
+            game.economic_scores(),
+            [
+                economic_score(zero, game.config.starting_money as f64),
+                economic_score(one, game.config.starting_money as f64),
+            ]
         );
 
         // Unhired unit slots are outside the observation and must not count.
@@ -3168,24 +3168,27 @@ mod tests {
     }
 
     #[test]
-    fn pair_potential_grows_with_dollars_rather_than_with_the_margin_ratio() {
-        // This is the property the squashed margin exists to create. Under the
-        // old `(a - b) / (a + b)` a 3:1 lead scored 0.5 whether the pot was
-        // 4,000 or 400,000, so a dollar of margin was worth 1.67e-4 at a 6,000
-        // pot and 3.3e-6 at a 300,000 one: a 50x reward premium on keeping the
-        // economy small, which a measured run took by destroying 85% of its own
-        // bank while its score rose.
-        let mut game = Game::new(0, GameConfig::default());
-        game.farms[0].money = 3_000;
-        game.farms[1].money = 1_000;
-        let small = game.pair_potential();
-        game.farms[0].money = 300_000;
-        game.farms[1].money = 100_000;
-        let large = game.pair_potential();
-        assert!(large > small);
-        // Still bounded in (-1, 1) at any wealth, so the critic's HL-Gauss
-        // support over the [-2, 2] return range is untouched.
-        assert!(large < 1.0);
+    fn training_reward_is_non_telescoping_and_bounded() {
+        let mut game = Game::new(
+            0,
+            GameConfig {
+                episode_steps: 3,
+                ..GameConfig::default()
+            },
+        );
+        game.farms[0].money = 78_000;
+        game.farms[1].money = 78_000;
+        let score = game.economic_scores()[0];
+        let occupancy = game.training_rewards()[0];
+        assert_eq!(occupancy, score / 2.0);
+
+        game.done = true;
+        let terminal = game.training_rewards()[0];
+        assert_eq!(terminal, score * 1.5);
+        // Same endpoint, different path: carrying value through the preceding
+        // state adds occupancy reward instead of telescoping away.
+        assert!(occupancy + terminal > terminal);
+        assert!(occupancy + terminal < 2.0);
     }
 
     #[test]
@@ -3200,9 +3203,8 @@ mod tests {
         game.market_inventory[4] = 10_320;
         let predicted = game.liquidation_value(0);
         // Selling at the quoted price only moves proceeds from the shed into
-        // the bank, so a market product trade is exactly potential-neutral and
-        // the shaped reward never pays or charges for trading itself.
-        let potential_before = game.pair_potential();
+        // the bank, so the economic score is exactly trade-neutral.
+        let score_before = game.economic_scores()[0];
 
         for item in [0, 4, 8] {
             while game.privates[0].shed[item] > 0 {
@@ -3217,7 +3219,7 @@ mod tests {
         }
 
         assert_eq!(predicted, game.farms[0].money as f64);
-        assert_eq!(game.pair_potential(), potential_before);
+        assert_eq!(game.economic_scores()[0], score_before);
     }
 
     #[test]
@@ -3256,27 +3258,27 @@ mod tests {
             + ILLIQUID_PENDING_YIELD_CREDIT * 2.0 * game.market_prices[7] as f64 // sheep -> WOOL
             + ILLIQUID_LAND_CREDIT * (LAND_PRICES[0] + LAND_PRICES[1]) as f64;
         assert!((game.illiquid_value(0) - expected).abs() < 1e-9);
-        // Investment now moves the shaping potential instead of reading as
-        // pure loss, so self-play cannot settle into the never-spend tie.
-        assert!(game.pair_potential() > 0.0);
+        // Investment contributes economic value instead of reading as pure
+        // loss, so self-play does not prefer the never-spend basin.
+        assert!(game.economic_scores()[0] > 0.0);
     }
 
     #[test]
-    fn terminal_potential_scores_bank_only() {
+    fn terminal_economic_score_uses_bank_only() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
         game.privates[1].shed.fill(100);
-        let banked =
-            ((game.farms[0].money - game.farms[1].money) as f64 / MARGIN_SCALE).tanh() as f32;
-        assert_eq!(game.terminal_potential(), banked);
-        // The loser's unsold shed counts mid-episode but is worth nothing once
-        // the episode scores the bank.
-        assert!(game.pair_potential() < banked);
+        let mid_episode = game.economic_scores();
+        assert!(mid_episode[1] > 0.0);
 
-        assert_eq!(game.post_step_potential(), game.pair_potential());
         game.done = true;
-        assert_eq!(game.post_step_potential(), banked);
+        let banked = [0.0, ((1_000.0 - 3_000.0) / ECONOMIC_SCALE).tanh() as f32];
+        assert_eq!(game.economic_scores(), banked);
+        let terminal_rewards = game.training_rewards();
+        let terminal_weight = 1.0 + 1.0 / 719.0;
+        assert_eq!(terminal_rewards[0], 0.0);
+        assert_eq!(terminal_rewards[1], banked[1] * terminal_weight);
     }
 
     #[test]

@@ -370,72 +370,78 @@ def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
     return value
 
 
-#: Dollars of margin at which the scored potential reaches tanh's knee. The
-#: potential squashes a *margin* rather than normalizing one by the pot, because
-#: normalizing by the pot makes a dollar's reward inversely proportional to the
-#: pot: under `(a - b) / (a + b)` a dollar of margin is worth `2b / (a + b)^2`,
-#: which is 1.67e-4 at a 6,000 pot and 3.3e-6 at a 300,000 one. That 50x premium
-#: on keeping the economy small is live at every step, and a run took it --
-#: destroying 85% of its own bank while its score rose, because 166,862 and
-#: 56,033 against `starter` score 0.959 and 0.883 under the old form, and mirror
-#: lanes score 0.000 at any wealth at all.
-#:
-#: Chosen from the measured margin distribution: neural-versus-neural games sit
-#: at a median absolute margin of 9,440 and a p90 of 27,136, inside tanh's
-#: near-linear region here, while a healthy policy's ~104,000 margin against a
-#: built-in lands at 0.88 to 0.98 rather than saturating. That widens the gap
-#: between a rich and a poor built-in result from 0.076 to 0.370 and the gap
-#: between beating and losing to `public-v27` from 0.450 to 0.629, and still
-#: leaves the typical mirror-lane signal slightly stronger than it was, 0.077
-#: against 0.068, so nothing was traded away to buy the anchor.
-MARGIN_SCALE = 75_000.0
+#: Economic value above the starting bank at which the bounded score reaches
+#: tanh's knee. Neural-versus-neural final banks span roughly 40k-140k, so this
+#: keeps the region that separates collapsed from healthy play informative while
+#: bounding one episode's return below 2. Must match ECONOMIC_SCALE in core.rs.
+ECONOMIC_SCALE = 75_000.0
+STARTING_MONEY = 3_000.0
 
 
-def _margin_score(zero: float, one: float) -> float:
-    """Bounded dollar margin from player zero's perspective.
-
-    Both potentials squash through this identically, so the reward remains the
-    difference of a single function and the shaped return still telescopes
-    exactly. Only the argument changes at the terminal transition: farm value
-    during the episode, banked money at the end.
-    """
-    return math.tanh((zero - one) / MARGIN_SCALE)
-
-
-def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
-    """Bounded farm-value margin from player zero's perspective.
-
-    The dense shaping potential: an exact liquidation core (market product
-    trades stay exactly potential-neutral and harvested-but-unsold output is
-    credited at true sale proceeds) plus the heuristic cost-basis credit for
-    illiquid assets.
-    """
-    return _margin_score(
-        liquidation_value(observation_zero, 0) + illiquid_value(observation_zero, 0),
-        liquidation_value(observation_one, 1) + illiquid_value(observation_one, 1),
-    )
+def _economic_score(value: float, starting_money: float = STARTING_MONEY) -> float:
+    """Bounded absolute economic competence above the initial endowment."""
+    if (
+        not math.isfinite(value)
+        or value < 0.0
+        or not math.isfinite(starting_money)
+        or starting_money < 0.0
+    ):
+        raise ValueError("economic value and starting money must be finite and non-negative")
+    return math.tanh((value - starting_money) / ECONOMIC_SCALE)
 
 
-def terminal_pair_potential(
-    observation_zero: dict[str, Any], observation_one: dict[str, Any]
-) -> float:
-    """Bounded banked-money margin, scoring the quantity the engine banks.
-
-    Used as the potential of terminal states so the telescoped shaped return
-    equals the exact final scored margin.
-    """
-    return _margin_score(
-        _scored_money(observation_zero, 0),
-        _scored_money(observation_one, 1),
-    )
-
-
-def shaped_pair_reward(
-    previous_potential: float,
-    next_potential: float,
+def pair_economic_scores(
+    observation_zero: dict[str, Any],
+    observation_one: dict[str, Any],
+    *,
+    terminal: bool = False,
+    starting_money: float = STARTING_MONEY,
 ) -> tuple[float, float]:
-    """Dense zero-sum change in the exact scored-bank margin."""
-    if not math.isfinite(previous_potential) or not math.isfinite(next_potential):
-        raise ValueError("pair potentials must be finite")
-    reward_zero = next_potential - previous_potential
-    return reward_zero, -reward_zero
+    """Absolute per-player economic scores for one post-action state.
+
+    Mid-episode value combines exact liquidation proceeds with conservative
+    cost-basis credit for illiquid investments. The terminal score uses banked
+    money only, matching the competition's actual result. Neither player's score
+    reads the other's value: shrinking an opponent's economy cannot compensate
+    for shrinking your own.
+    """
+    if terminal:
+        values = (
+            _scored_money(observation_zero, 0),
+            _scored_money(observation_one, 1),
+        )
+    else:
+        values = (
+            liquidation_value(observation_zero, 0) + illiquid_value(observation_zero, 0),
+            liquidation_value(observation_one, 1) + illiquid_value(observation_one, 1),
+        )
+    return (
+        _economic_score(values[0], starting_money),
+        _economic_score(values[1], starting_money),
+    )
+
+
+def economic_pair_reward(
+    scores: tuple[float, float],
+    *,
+    terminal: bool,
+    transitions: int = EPISODE_STEPS - 1,
+) -> tuple[float, float]:
+    """Non-telescoping economic return for one post-action state.
+
+    Every transition contributes its share of the episode's time-average farm
+    value. The terminal transition adds the final bank score once more, so the
+    total return is ``mean(post_action_farm_scores) + final_bank_score`` and is
+    strictly bounded inside ``(-2, 2)``. Sustaining useful capital therefore
+    matters even when all four learners finish with the same bank; equal rich
+    play is rewarded and equal collapse is not.
+    """
+    if transitions < 1:
+        raise ValueError("transitions must be positive")
+    if len(scores) != 2 or any(not math.isfinite(score) for score in scores):
+        raise ValueError("economic scores must contain two finite values")
+    terminal_bonus = 1.0 if terminal else 0.0
+    return (
+        scores[0] / transitions + terminal_bonus * scores[0],
+        scores[1] / transitions + terminal_bonus * scores[1],
+    )

@@ -25,9 +25,8 @@ from kaggriculture.encoding import (
     CRITIC_FEATURES,
     GLOBAL_FEATURES,
     UNIT_FEATURES,
-    pair_potential,
-    shaped_pair_reward,
-    terminal_pair_potential,
+    economic_pair_reward,
+    pair_economic_scores,
 )
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
@@ -1305,7 +1304,7 @@ def collect_mixed_play_rust(
             builtin_agents,
             sampled,
         )
-        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        rewards = np.asarray(sampled["training_rewards"], dtype=np.float32).reshape(-1)
         _store_native_wave(
             architecture,
             fields,
@@ -1537,7 +1536,7 @@ def collect_population_play_rust(
             builtin_agents,
             sampled,
         )
-        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        rewards = np.asarray(sampled["training_rewards"], dtype=np.float32).reshape(-1)
         _store_native_wave(
             architecture, fields, step, encoded, sampled, rewards, slice(None), pair_rows
         )
@@ -1703,7 +1702,6 @@ def collect_self_play(
         for index in range(games)
     ]
     states = [environment.reset(2) for environment in environments]
-    potentials = [pair_potential(state[0].observation, state[1].observation) for state in states]
     fields = _new_fields(architecture)
     trajectories = games * 2
     final_money = np.zeros(trajectories, dtype=np.float32)
@@ -1733,23 +1731,24 @@ def collect_self_play(
             next_states.append(next_state)
             if any(agent.status == "ERROR" for agent in next_state):
                 raise RuntimeError(f"agent error in self-play seed {seed_start + game}")
-            if environment.done:
+            terminal = environment.done
+            if terminal:
                 farms = next_state[0].observation["farms"]
                 money = np.asarray(
                     [float(farms[0]["money"]), float(farms[1]["money"])], dtype=np.float32
                 )
                 final_money[offset : offset + 2] = money
                 opponent_money[offset : offset + 2] = money[::-1]
-                next_potential = terminal_pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-            else:
-                next_potential = pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
-            potentials[game] = next_potential
-            step_rewards[offset : offset + 2] = pair_rewards
+            scores = pair_economic_scores(
+                next_state[0].observation,
+                next_state[1].observation,
+                terminal=terminal,
+            )
+            step_rewards[offset : offset + 2] = economic_pair_reward(
+                scores,
+                terminal=terminal,
+                transitions=episode_steps - 1,
+            )
         fields["rewards"].append(step_rewards)
         fields["valid"].append(np.ones(trajectories, dtype=np.bool_))
         states = next_states
@@ -1811,7 +1810,6 @@ def collect_frozen_opponent_play(
     ]
     states = [environment.reset(2) for environment in environments]
     seats = np.asarray([(seed_start + index) % 2 for index in range(games)], dtype=np.int8)
-    potentials = [pair_potential(state[0].observation, state[1].observation) for state in states]
     fields = _new_fields(architecture)
     final_money = np.zeros(games, dtype=np.float32)
     opponent_money = np.zeros(games, dtype=np.float32)
@@ -1855,20 +1853,22 @@ def collect_frozen_opponent_play(
             next_states.append(next_state)
             if any(agent.status == "ERROR" for agent in next_state):
                 raise RuntimeError(f"agent error in league seed {seed_start + game}")
-            if environment.done:
+            terminal = environment.done
+            if terminal:
                 farms = next_state[0].observation["farms"]
                 player_money = (float(farms[0]["money"]), float(farms[1]["money"]))
                 final_money[game] = player_money[int(seat)]
                 opponent_money[game] = player_money[1 - int(seat)]
-                next_potential = terminal_pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-            else:
-                next_potential = pair_potential(
-                    next_state[0].observation, next_state[1].observation
-                )
-            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
-            potentials[game] = next_potential
+            scores = pair_economic_scores(
+                next_state[0].observation,
+                next_state[1].observation,
+                terminal=terminal,
+            )
+            pair_rewards = economic_pair_reward(
+                scores,
+                terminal=terminal,
+                transitions=episode_steps - 1,
+            )
             step_rewards[game] = pair_rewards[int(seat)]
         fields["rewards"].append(step_rewards)
         fields["valid"].append(np.ones(games, dtype=np.bool_))

@@ -142,14 +142,13 @@ def test_the_critic_target_is_the_lambda_return_the_actor_advantage_came_from() 
     assert not torch.allclose(targets, torch.ones_like(targets))
 
 
-def test_an_exact_critic_makes_the_target_the_dense_bank_delta_at_any_lambda() -> None:
+def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
     """Bootstrapping costs nothing where the value function is already right.
 
-    The reward is a potential difference, so the exact value of a state is the
-    remaining potential delta. Feed that in and every temporal-difference
-    residual vanishes: the advantage is exactly zero and the target is exactly
-    the Monte Carlo return, for any lambda. The bias the lambda introduces is
-    therefore entirely the critic's own error, not a property of the target.
+    A synthetic potential-difference sequence gives an analytic exact value for
+    every state. Feed that in and every temporal-difference residual vanishes:
+    the advantage is zero and the target is the Monte Carlo return at any lambda.
+    This tests the GAE recurrence, not the environment's reward construction.
     """
     potentials = torch.tensor([[0.2, -0.1, 0.4, 0.3, 0.6]])
     rewards = potentials[:, 1:] - potentials[:, :-1]
@@ -219,9 +218,8 @@ def test_discounted_advantages_and_targets_match_the_reference_recurrence() -> N
     expected_advantages = torch.tensor([[expected_0, expected_1, expected_2]])
     torch.testing.assert_close(advantages, expected_advantages)
     torch.testing.assert_close(targets, expected_advantages + values)
-    # Discounting a potential difference would price holding cash early, which
-    # is why production fixes gamma at one; the recurrence still has to be right
-    # for the general case it is written for.
+    # Production fixes gamma at one to weight every economic occupancy sample
+    # equally; the general recurrence still supports discounting correctly.
     monte_carlo = torch.tensor([[0.2 + 0.9 * (-0.1 + 0.9 * 0.3), -0.1 + 0.9 * 0.3, 0.3]])
     assert not torch.allclose(targets, monte_carlo)
 
@@ -948,10 +946,10 @@ def test_a_critic_only_refit_aborts_on_a_non_finite_loss(monkeypatch: pytest.Mon
 def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     """A bootstrapped target has no bound the support can be sized against.
 
-    The Monte Carlo target was a potential difference and could not leave
-    [-2, 2], so a target outside the support meant a bug and was raised on. The
-    lambda-return adds the critic's own prediction to that, and the critic is
-    only bounded by the same support, so no width contains it by construction.
+    The environment's complete economic return is bounded inside (-2, 2), but a
+    lambda-return adds the critic's own prediction to a truncated advantage. The
+    critic is only bounded by the same support, so no width contains that target
+    by construction.
     Saturating at the outermost atom is what a categorical projection does; the
     fraction it had to saturate is what tells you the critic is off, and killing
     a five-hundred-iteration run to say so would be strictly less informative.
@@ -962,8 +960,8 @@ def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
-    # A reward far outside the potential difference the environment can pay, so
-    # the return leaves the support no matter what the critic predicts.
+    # A reward far outside the environment's bounded economic score, so the
+    # return leaves the support no matter what the critic predicts.
     rollout.rewards[:, -1] = np.float32(9.0)
     config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
@@ -1367,14 +1365,15 @@ def test_a_mis_scaled_critic_still_explains_its_own_bootstrapped_target() -> Non
     the bootstrapped reading would have retired the measurement that diagnosed
     this critic in the first place.
     """
-    # A relative bank drifting a little each step over a horizon long against
-    # the lambda window, which is the shape of the real 719-step episode: one
-    # transition moves the potential far less than the rest of the game does.
+    # Small dense economic rewards over a horizon long against the lambda
+    # window, matching the occupancy-reward scale of the 719-step episode.
     generator = np.random.default_rng(5)
-    potentials = np.cumsum(generator.normal(0.0, 0.05, size=(4, 65)), axis=1).astype(np.float32)
-    rewards = np.diff(potentials, axis=1)
+    rewards = generator.normal(0.002, 0.001, size=(4, 64)).astype(np.float32)
     valid = np.ones_like(rewards, dtype=np.bool_)
-    monte_carlo = potentials[:, -1:] - potentials[:, :-1]
+    monte_carlo = np.flip(
+        np.cumsum(np.flip(rewards, axis=1), axis=1),
+        axis=1,
+    ).copy()
     mis_scaled = (3.0 * monte_carlo).astype(np.float32)
 
     prepared = prepare_advantages(

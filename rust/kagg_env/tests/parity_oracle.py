@@ -20,7 +20,7 @@ from kaggriculture.actions import (
     compile_action,
 )
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
-from kaggriculture.encoding import encode_observation, pair_potential
+from kaggriculture.encoding import economic_pair_reward, encode_observation, pair_economic_scores
 from kaggriculture.rust_env import load_native
 
 
@@ -44,7 +44,6 @@ def main() -> None:
         native.encoded_into(encoded_buffers)
         encoded = encoded_buffers
         oracle = []
-        potentials = []
         for environment in official:
             oracle.extend(
                 (
@@ -56,12 +55,6 @@ def main() -> None:
                         environment.state[1].observation,
                         environment.state[0].observation.private,
                     ),
-                )
-            )
-            potentials.append(
-                pair_potential(
-                    environment.state[0].observation,
-                    environment.state[1].observation,
                 )
             )
         for name in (
@@ -80,7 +73,6 @@ def main() -> None:
                     f"encoding divergence t={transition} {name}{index}: "
                     f"python={expected[index]} rust={encoded[name][index]}"
                 )
-        np.testing.assert_allclose(encoded["potentials"], potentials, atol=1e-7, rtol=0)
         if transition == args.steps:
             break
         unit = rng.integers(
@@ -98,6 +90,8 @@ def main() -> None:
             size=(args.games, 2, MAX_MARKET_ORDERS),
             dtype=np.uint8,
         )
+        expected_scores = []
+        expected_rewards = []
         for game, environment in enumerate(official):
             environment.step(
                 [
@@ -110,7 +104,21 @@ def main() -> None:
                     for player in range(2)
                 ]
             )
-        native.step_factors(unit, kinds, quantities)
+            terminal = environment.done
+            scores = pair_economic_scores(
+                environment.state[0].observation,
+                environment.state[1].observation,
+                terminal=terminal,
+            )
+            expected_scores.append(scores)
+            expected_rewards.append(economic_pair_reward(scores, terminal=terminal))
+        native_step = native.step_factors(unit, kinds, quantities)
+        np.testing.assert_allclose(
+            native_step["economic_scores"], expected_scores, atol=1e-7, rtol=0
+        )
+        np.testing.assert_allclose(
+            native_step["training_rewards"], expected_rewards, atol=1e-7, rtol=0
+        )
         for game, environment in enumerate(official):
             python_state = json.loads(
                 json.dumps(
@@ -128,7 +136,7 @@ def main() -> None:
                     raise AssertionError(
                         f"state divergence t={transition + 1} game={game} key={key}"
                     )
-    print(f"exact state/encoding/potential parity: {args.games} games x {args.steps} transitions")
+    print(f"exact state/encoding/reward parity: {args.games} games x {args.steps} transitions")
 
 
 if __name__ == "__main__":

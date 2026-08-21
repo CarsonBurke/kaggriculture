@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 
 import numpy as np
@@ -8,7 +7,7 @@ import pytest
 import torch
 
 from kaggriculture.actions import MarketKind, UnitAction
-from kaggriculture.encoding import MARGIN_SCALE, pair_potential, terminal_pair_potential
+from kaggriculture.encoding import ECONOMIC_SCALE, STARTING_MONEY, pair_economic_scores
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
@@ -42,13 +41,19 @@ class _NearOneGenerator:
         return np.full(size, np.nextafter(1.0, 0.0), dtype=np.float64)
 
 
-def _terminal_bank_potential(own: np.ndarray, opponent: np.ndarray) -> np.ndarray:
-    """Vectorized mirror of `terminal_pair_potential` over final banks.
+def _terminal_economic_score(own: np.ndarray) -> np.ndarray:
+    """Vectorized terminal bank score used by the training reward."""
+    return np.tanh((own - STARTING_MONEY) / ECONOMIC_SCALE)
 
-    Squashing a dollar margin needs no empty-pot guard the way dividing by the
-    pot did: a bankrupt pair is `tanh(0)`, which is exactly 0.0.
-    """
-    return np.tanh((own - opponent) / MARGIN_SCALE)
+
+def _assert_absolute_reward_contract(rollout: RolloutBatch, *, atol: float = 2e-6) -> None:
+    terminal_scores = _terminal_economic_score(rollout.final_money)
+    np.testing.assert_allclose(
+        rollout.rewards[:, -1],
+        terminal_scores * (1.0 + 1.0 / rollout.horizon),
+        atol=atol,
+    )
+    assert (np.abs(rollout.rewards.sum(axis=1)) < 2.0).all()
 
 
 def test_native_categorical_draw_transport_stays_strictly_below_one() -> None:
@@ -76,7 +81,7 @@ def test_on_policy_collectors_reject_nonunit_temperature(collector, temperature:
         )
 
 
-def test_short_self_play_rollout_shapes_and_telescoping() -> None:
+def test_short_self_play_rollout_uses_absolute_non_telescoping_rewards() -> None:
     config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
@@ -96,12 +101,15 @@ def test_short_self_play_rollout_shapes_and_telescoping() -> None:
     assert rollout.state_count == 28
     assert rollout.states["board"].shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    assert rollout.rewards.sum(axis=1).tolist() == pytest.approx(final_scores.tolist(), abs=1e-6)
+    terminal_scores = _terminal_economic_score(rollout.final_money)
+    np.testing.assert_allclose(
+        rollout.rewards[:, -1],
+        terminal_scores * (1.0 + 1.0 / rollout.horizon),
+        atol=1e-6,
+    )
+    assert (np.abs(rollout.rewards.sum(axis=1)) < 2.0).all()
     assert rollout.seats.tolist() == [0, 1, 0, 1]
     assert rollout.episode_seeds.tolist() == [50, 50, 51, 51]
-    np.testing.assert_allclose(rollout.rewards[0], -rollout.rewards[1], atol=1e-7)
-    np.testing.assert_allclose(rollout.rewards[2], -rollout.rewards[3], atol=1e-7)
 
 
 def test_frozen_opponent_rollout_and_concatenation() -> None:
@@ -303,8 +311,7 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
     assert rollout.trajectories == 2
     assert rollout.horizon == 719
     assert rollout.state_count == 1438
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    _assert_absolute_reward_contract(rollout)
     assert rollout.seats.tolist() == [0, 1]
     assert np.isfinite(rollout.old_unit_logprobs).all()
     assert np.isfinite(rollout.old_market_kind_logprobs).all()
@@ -422,8 +429,7 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
     assert rollout.state_count == 1438
     assert rollout.seats.tolist() == [0, 1]
     assert rollout.episode_seeds.tolist() == [130, 131]
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    _assert_absolute_reward_contract(rollout)
 
     # A fresh native batch exposes the same game-major/player-minor opening
     # rows. Verify that league storage selects the current seat's centralized
@@ -638,8 +644,7 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
     np.testing.assert_array_equal(rollout.final_money[0], rollout.opponent_money[1])
     np.testing.assert_array_equal(rollout.opponent_money[0], rollout.final_money[1])
 
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    _assert_absolute_reward_contract(rollout)
 
     # The stored league rows must be the current seat's centralized critic rows
     # of the shared game-major/player-minor native batch.
@@ -766,9 +771,7 @@ def test_structured_self_play_rollout_replays_from_stored_states() -> None:
     for name, (shape, dtype) in _state_field_specs(STRUCTURED).items():
         assert rollout.states[name].shape == (2, 7, *shape)
         assert rollout.states[name].dtype == dtype
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
-    np.testing.assert_allclose(rollout.rewards[0], -rollout.rewards[1], atol=1e-7)
+    _assert_absolute_reward_contract(rollout)
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=2e-6)
 
 
@@ -836,8 +839,7 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     )
     assert rollout.episode_seeds.tolist() == [230, 230, 231, 232]
     assert rollout.seats.tolist() == [0, 1, 231 % 2, 232 % 2]
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    _assert_absolute_reward_contract(rollout)
     assert np.isfinite(rollout.old_unit_logprobs).all()
     assert np.isfinite(rollout.old_market_kind_logprobs).all()
     assert np.isfinite(rollout.old_market_quantity_logprobs).all()
@@ -874,24 +876,15 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
 
 
-def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None:
-    """The done-step potential must switch from liquidation value to bank.
-
-    Forces player zero to end the episode holding a large unsold shed, so the
-    terminal branch is observable: those 80 held WHEAT liquidate for 3,788
-    against the opponent's 3,000 while the bank holds only 520, so the two
-    potentials disagree on who is even ahead, and the telescoped shaped return
-    must equal the exact banked margin rather than the liquidation score.
-    Random-policy episodes cannot guard this — they end bankrupt and empty,
-    making the terminal reward zero either way.
-    """
+def test_native_terminal_reward_scores_bank_without_discarding_the_economic_path() -> None:
+    """The final bonus uses bank while the return retains time-average value."""
     import json
 
     from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 
     native = load_native()
     environment = native.BatchEnv(np.asarray([911], dtype=np.uint64))
-    telescoped = 0.0
+    returns = np.zeros(2, dtype=np.float64)
     step = 0
     while True:
         unit = np.zeros((1, 2, MAX_UNITS), dtype=np.uint8)
@@ -901,7 +894,7 @@ def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None
             kinds[0, 0, 0] = MarketKind.BUY_PRODUCT_WHEAT
             quantities[0, 0, 0] = 79  # quantity bin 79 orders 80 units
         out = environment.step_factors(unit, kinds, quantities)
-        telescoped += float(np.asarray(out["shaped_rewards"])[0, 0])
+        returns += np.asarray(out["training_rewards"], dtype=np.float64)[0]
         step += 1
         if np.asarray(out["dones"]).all():
             break
@@ -917,26 +910,23 @@ def test_native_terminal_reward_scores_bank_while_holdings_stay_liquid() -> None
         for player in range(2)
     ]
     assert observations[0]["private"]["shed"]["WHEAT"] == 80
-    terminal = terminal_pair_potential(observations[0], observations[1])
-    mid_episode = pair_potential(observations[0], observations[1])
-    # The unsold shed does not merely shift the score, it flips its sign, so a
-    # terminal step that forgot to switch potentials could not pass by accident.
-    assert mid_episode > 0.0 > terminal
+    mid_episode = pair_economic_scores(observations[0], observations[1])
+    terminal = pair_economic_scores(observations[0], observations[1], terminal=True)
+    assert mid_episode[0] > terminal[0]
 
     money = np.asarray(out["final_money"], dtype=np.float64)[0]
     assert money[0] > 0.0 and money[1] > 0.0
-    # 520 against 3,000: the old pot-normalized form called that 2,480 dollar
-    # gap a crushing -0.705 purely because the whole economy was 3,520 dollars,
-    # where the squashed margin scores it -0.033. Handing out most of the
-    # available score for a rounding error of an economy is the incentive this
-    # objective exists to remove.
-    bank_margin = math.tanh((money[0] - money[1]) / MARGIN_SCALE)
-    assert terminal == pytest.approx(bank_margin, abs=1e-9)
-    # Native terminal potential matches the python mirror bank-only score.
-    assert float(np.asarray(out["potentials"])[0]) == pytest.approx(terminal, abs=1e-7)
-    # The shaped return telescopes to the exact banked margin, not to the
-    # liquidation score of the unsold shed.
-    assert telescoped == pytest.approx(bank_margin, abs=1e-5)
+    expected_terminal = _terminal_economic_score(money)
+    np.testing.assert_allclose(terminal, expected_terminal, atol=1e-9)
+    np.testing.assert_allclose(out["economic_scores"][0], terminal, atol=1e-7)
+    np.testing.assert_allclose(
+        out["training_rewards"][0],
+        expected_terminal * (1.0 + 1.0 / 719.0),
+        atol=1e-7,
+    )
+    # The same endpoint would have fixed a potential-difference return. Here the
+    # valuable held inventory on the preceding 718 states remains in the result.
+    assert not np.allclose(returns, terminal, atol=1e-5)
 
 
 def test_builtin_agent_rows_codes_only_the_assigned_frozen_seats() -> None:
@@ -1138,25 +1128,25 @@ def test_population_wave_rows_replay_through_the_member_that_sampled_them(
         )
 
 
-def test_population_wave_rewards_are_antisymmetric_within_every_game(population_wave) -> None:
-    """Both rows of a game must be able to move the objective, oppositely.
-
-    The shaped reward is built on a pair potential, so the two seats of a game
-    are exact negatives step by step and telescope to the terminal margin. This
-    is the property mirror self-play destroyed: identical weights make both
-    sides identically zero, and a wave of zeros carries no gradient at all.
-    """
+def test_population_wave_rewards_each_learner_absolute_economy(population_wave) -> None:
+    """Every learner owns its reward; pair rows are not forced to sum to zero."""
     _actors, _arena, rollout = population_wave
 
-    for game in range(_POPULATION_GAMES):
-        np.testing.assert_allclose(
-            rollout.rewards[2 * game], -rollout.rewards[2 * game + 1], atol=1e-7
-        )
-    assert (np.abs(rollout.rewards).sum(axis=1) > 0.0).all()
     np.testing.assert_array_equal(rollout.final_money[::2], rollout.opponent_money[1::2])
     np.testing.assert_array_equal(rollout.final_money[1::2], rollout.opponent_money[::2])
-    final_scores = _terminal_bank_potential(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), final_scores, atol=2e-6)
+    expected_terminal = _terminal_economic_score(rollout.final_money) * (
+        1.0 + 1.0 / rollout.horizon
+    )
+    np.testing.assert_allclose(rollout.rewards[:, -1], expected_terminal, atol=2e-6)
+    assert (np.abs(rollout.rewards.sum(axis=1)) < 2.0).all()
+    assert any(
+        not np.allclose(
+            rollout.rewards[2 * game],
+            -rollout.rewards[2 * game + 1],
+            atol=1e-7,
+        )
+        for game in range(_POPULATION_GAMES)
+    )
 
 
 def test_slice_and_concatenation_carry_the_agent_assignment(population_wave) -> None:
