@@ -1182,14 +1182,8 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert "--compile-update" not in decision["training_command"]
     update_mode = decision["training_command"].index("--update-compile-mode") + 1
     assert decision["training_command"][update_mode] == "default"
-    # Emitted rather than defaulted, and emitted even at zero. A load-bearing
-    # learning knob left off the command would be settled by whatever the CLI
-    # default happened to be on the day, which is the one thing this command is
-    # supposed to make impossible.
-    entropy_index = decision["training_command"].index("--entropy-coefficient")
-    assert decision["training_command"][entropy_index + 1] == str(
-        module.production_ppo_config(update_compile_mode="eager")["entropy_coefficient"]
-    )
+    # Entropy remains measured but never enters the optimized objective.
+    assert "--entropy-coefficient" not in decision["training_command"]
     assert decision["source_identity"] == module.source_identity()
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]

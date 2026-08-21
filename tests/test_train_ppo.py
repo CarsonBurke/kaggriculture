@@ -51,9 +51,8 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     # An unflagged run is exactly the family's dataclass configuration, which
     # is what a warm-start artifact and the calibration benchmark both carry.
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
-    # Reads the dataclass rather than restating it, so the field cannot ship one
-    # default through the CLI and a different one through PpoConfig.
-    assert args.entropy_coefficient == PpoConfig.entropy_coefficient
+    # Entropy is telemetry only; the training CLI has no bonus coefficient.
+    assert not hasattr(args, "entropy_coefficient")
     assert args.gamma == 1.0
     assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
     assert not hasattr(args, "gae_lambda")

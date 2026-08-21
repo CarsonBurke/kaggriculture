@@ -198,15 +198,6 @@ def parse_args() -> argparse.Namespace:
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
     parser.add_argument(
-        "--entropy-coefficient",
-        type=float,
-        default=PpoConfig.entropy_coefficient,
-        help=(
-            "weight on the policy entropy bonus; the only exploration available, "
-            "since replay parity pins the sampling temperature to 1.0"
-        ),
-    )
-    parser.add_argument(
         "--optimizer",
         choices=("normuon", "adamw"),
         default=PpoConfig.optimizer,
@@ -1783,7 +1774,6 @@ def main() -> None:
         actor_gae_lambda=args.actor_gae_lambda,
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
-        entropy_coefficient=args.entropy_coefficient,
         optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,

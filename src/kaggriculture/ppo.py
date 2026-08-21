@@ -562,20 +562,11 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # The premise the term was added to oppose turned out to be false once the
-    # built-ins entered the league: entropy climbed from 0.185 to 0.294 nats with
-    # NO bonus at all, because a policy with real gradient spreads on its own. The
-    # collapse was caused by training only against itself, and the league is its
-    # fix -- not the objective. The term stays because it is the only exploration
-    # knob that exists and is provably inert at zero, but a nonzero value now has
-    # a measurement to beat rather than a reference default to copy.
-    entropy_coefficient: float = 0.0
     # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
-    # competition's fixed 719-action horizon. The critic shares it: VAPO's
-    # decoupled lambda-one critic answers a sparse terminal-reward setting
-    # where the only unbiased signal is the whole trajectory, and this
-    # environment's reward is a dense potential difference at every one of the
-    # 719 transitions instead.
+    # competition's fixed 719-action horizon. The critic shares it. The economic
+    # objective supplies a bounded signal on every transition plus a final-bank
+    # bonus, so the shorter lambda window reduces long-horizon sampling variance
+    # without adding an exploration objective.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     gamma: float = 1.0
     # Measured to bind on EVERY minibatch, which makes this the step-size
@@ -719,11 +710,6 @@ def _validate_config(config: PpoConfig) -> None:
             raise ValueError(f"{name} must be finite and in [0, 1)")
     if not math.isfinite(config.weight_decay) or config.weight_decay < 0.0:
         raise ValueError("weight decay must be finite and non-negative")
-    # Negative would actively drive the policy deterministic, which is the
-    # failure this term exists to oppose, so it is rejected rather than allowed
-    # as an exotic setting.
-    if not math.isfinite(config.entropy_coefficient) or config.entropy_coefficient < 0.0:
-        raise ValueError("entropy coefficient must be finite and non-negative")
     if config.epochs < 1 or config.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
     if config.critic_epochs is not None and config.critic_epochs < config.epochs:
@@ -2276,16 +2262,12 @@ def update_ppo(
                 batch_kl = kl_sum.detach().double() / component_count
                 policy_loss = -policy_sum / component_count
                 entropy_mean = entropy_sum / component_count
-                # The surrogate stays the reported and finiteness-checked
-                # quantity, so `policy_loss` keeps meaning what its name says;
-                # the bonus is a separate term added only to what is optimized.
-                # Entropy's backward retains nothing new: it differentiates the
-                # same log_softmax output the gathered ratio already holds.
-                actor_loss = policy_loss - config.entropy_coefficient * entropy_mean
+                # Entropy remains telemetry only. The optimizer follows the PPO
+                # surrogate exactly; there is no configurable entropy bonus.
                 # Gradients are computed eagerly but the actor is mutated only
                 # after the deferred trust-region check below, so the guard
                 # semantics stay exact: a violating minibatch is never applied.
-                actor_loss.backward()
+                policy_loss.backward()
                 actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                     actor.parameters(), config.max_gradient_norm
                 ).detach()

@@ -128,7 +128,7 @@ def main() -> None:
         "--configs",
         type=json.loads,
         required=True,
-        help="JSON list of PpoConfig overrides, e.g. '[{}, {\"entropy_coefficient\": 0.01}]'",
+        help="JSON list of PpoConfig overrides, e.g. '[{}, {\"target_kl\": 0.05}]'",
     )
     parser.add_argument("--iterations", type=int, default=12)
     parser.add_argument("--games", type=int, default=PRODUCTION_SELF_PLAY_GAMES)
@@ -207,7 +207,6 @@ def main() -> None:
         "shipped": {
             "actor_learning_rate": float(schedule["actor_learning_rate"]),
             "target_kl": float(schedule["target_kl"]),
-            "entropy_coefficient": float(schedule["entropy_coefficient"]),
         },
     }
 
