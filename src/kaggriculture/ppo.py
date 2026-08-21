@@ -458,21 +458,24 @@ class PpoConfig:
     # 12-iteration trajectory at 0.10 ends with the highest entropy of any run
     # measured, rising rather than falling.
     #
-    # **Both rates were multiplied by ten when `optimizer` became `normuon`, and
-    # that factor is a unit conversion rather than a tuning decision.** Adam's
-    # step is per-element, so a matrix moves `lr * sqrt(numel)` against a weight
-    # norm of `sqrt(fan_out)` -- a relative step of `lr * sqrt(fan_in)`, which is
-    # 9.8x the rate at this model's width of 96. A NorMuon step's norm is
-    # `lr * shape_multiplier * sqrt(min(fan_in, fan_out))` against that same
-    # `sqrt(fan_out)`, and the shape multiplier is exactly what collapses both
-    # orientations to a relative step of `lr`. So 3.0e-5 under Adam and 3.0e-4
-    # under NorMuon move a layer by the same 3e-4 of itself per step, and the
-    # whole tabulation above -- which is a statement about how far the policy may
-    # travel per update before the trust region bites -- carries over unchanged.
-    # The A/B between the two therefore measures the update's DIRECTION, which is
-    # the only thing orthogonalization changes, instead of confounding it with a
-    # tenfold step-size difference. Sweeping around this anchor is still owed.
-    actor_learning_rate: float = 3.0e-4
+    # The tenfold NorMuon conversion below was a hypothesis, not a measurement,
+    # and the four-learner economic-reward run falsified it. Starting from the
+    # same four clones after the same 40 critic-only iterations:
+    #
+    #   NorMuon lr  iteration  internal money  public-v27  public-v16
+    #   3.0e-4     50         54,088          1/32        5/32
+    #   3.0e-5     50         80,923          52/64       64/64
+    #   1.0e-5     70         82,587          49/64       64/64
+    #
+    # External counts use both seats; the two lower-rate rows use 16 held-out
+    # games per member and opponent. At 3.0e-4 the first ten actor updates erase
+    # a strong clone. 3.0e-5 preserves the economy and wins the strongest
+    # measured external row; 1.0e-5 survives longer but gives back three v27
+    # games. The entropy floor stopped both conservative runs before a
+    # deterministic update could be committed, with no entropy term in the
+    # objective. This measurement supersedes the optimizer unit-conversion
+    # projection while leaving the older Adam evidence above as history.
+    actor_learning_rate: float = 3.0e-5
     critic_learning_rate: float = 2.5e-3
     lr_warmup_steps: int = 32
     # Which optimizer `make_optimizers` builds. `normuon` gives every hidden
