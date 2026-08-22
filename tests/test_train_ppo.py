@@ -80,6 +80,25 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
             module._validate_args(args)
 
 
+def test_population_defaults_drop_the_frozen_lane(monkeypatch, tmp_path) -> None:
+    """`--population 4` must not inherit the single-learner's 112+96 mix.
+
+    That mix is not a valid population wave (112 is not a multiple of 12, and
+    96 frozen games are a league the collector refuses), so leaving those
+    defaults implicit would make every unflagged population launch fail.
+    """
+    module = _training_script()
+    monkeypatch.setattr(
+        sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path), "--population", "4"]
+    )
+
+    args = module.parse_args()
+
+    assert args.population == 4
+    assert args.games == 4 * 3 * 13
+    assert args.league_games == 0
+
+
 def test_built_in_league_flags_reach_selection_and_the_data_provenance(
     monkeypatch, tmp_path
 ) -> None:

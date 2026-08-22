@@ -109,7 +109,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--iterations", type=int, default=500)
-    parser.add_argument("--games", type=int, default=112)
+    parser.add_argument(
+        "--games",
+        type=int,
+        default=None,
+        help="games per wave; defaults to 112 for a single learner and "
+        "13 copies of every ordered pairing for a population",
+    )
     parser.add_argument(
         "--population",
         type=int,
@@ -122,7 +128,13 @@ def parse_args() -> argparse.Namespace:
             "every ordered pairing appears equally often and seat bias cancels"
         ),
     )
-    parser.add_argument("--league-games", type=int, default=96)
+    parser.add_argument(
+        "--league-games",
+        type=int,
+        default=None,
+        help="frozen-league games per wave; defaults to 96 for a single learner "
+        "and 0 for a population (which has no frozen lane)",
+    )
     parser.add_argument("--league-active-opponents", type=int, default=2)
     parser.add_argument("--league-historical-opponents", type=int, default=2)
     parser.add_argument("--league-active-pool-size", type=int, default=16)
@@ -287,7 +299,17 @@ def parse_args() -> argparse.Namespace:
             "belongs to the warm start, and a resumed run restores it from its checkpoint"
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # A population wave is all learners; the single-learner defaults (112 live
+    # games plus 96 frozen) are not a valid population configuration, so they
+    # must not be the implicit ones. An explicit flag still wins either way.
+    if args.games is None:
+        args.games = (
+            args.population * (args.population - 1) * 13 if args.population > 1 else 112
+        )
+    if args.league_games is None:
+        args.league_games = 0 if args.population > 1 else 96
+    return args
 
 
 def _recorded_argument(value: object) -> object:
