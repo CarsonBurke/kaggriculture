@@ -1,4 +1,4 @@
-"""PPO masked-token update with length-adaptive GAE and lambda-return targets."""
+"""PPO masked-token update with CleanRL's standard GAE schedule and lambda-return targets."""
 
 from __future__ import annotations
 
@@ -27,11 +27,9 @@ from kaggriculture.structured import StructuredActor, StructuredCritic, Structur
 Critic = DistributionalCritic | StructuredCritic
 Actor = FarmActor | StructuredActor
 
-#: VAPO's length-adaptive GAE constant, the one piece of that paper this update
-#: still takes: it sets lambda from the horizon rather than from a tuned guess.
-LENGTH_ADAPTIVE_GAE_ALPHA = 0.05
-COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
-DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (LENGTH_ADAPTIVE_GAE_ALPHA * COMPETITION_ACTION_STEPS)
+#: CleanRL's standard PPO GAE lambda (cleanrl/ppo.py `gae_lambda = 0.95`), shared
+#: by the actor advantages and the critic's lambda-return targets.
+DEFAULT_ACTOR_GAE_LAMBDA = 0.95
 
 #: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
 _OPTIMIZERS = ("normuon", "adamw")
@@ -565,13 +563,13 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # VAPO's lambda_policy = 1 - 1 / (alpha * length), with alpha=0.05 and the
-    # competition's fixed 719-action horizon. The critic shares it. The economic
-    # objective supplies a bounded signal on every transition plus a final-bank
-    # bonus, so the shorter lambda window reduces long-horizon sampling variance
-    # without adding an exploration objective.
+    # CleanRL's standard PPO schedule (cleanrl/ppo.py): `gae_lambda = 0.95`
+    # shared by the actor advantages and the critic's lambda-return targets, and
+    # `gamma = 0.99`. The economic objective still supplies a bounded signal on
+    # every transition plus a final-bank bonus; discounting weights near-term
+    # transitions more heavily instead of the undiscounted equal weighting.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
-    gamma: float = 1.0
+    gamma: float = 0.99
     # Measured to bind on EVERY minibatch, which makes this the step-size
     # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
     # 1264 production-shaped minibatches in four configurations -- BC actor with
@@ -589,18 +587,15 @@ class PpoConfig:
     # is recorded here is that the constant is load-bearing: raising it changes
     # the step size on 100% of updates, not on the tail it reads as bounding.
     max_gradient_norm: float = 1.0
-    # Raised from 0.03 on the measured surface tabulated at `actor_learning_rate`,
-    # which is where the pair is decided together: 0.03 and 0.10 score the same
-    # against `starter` at 3.0e-5, and 0.03 gets there while discarding 78% of
-    # every wave it collects against 11% at 0.10. 0.30 is past the far edge -- it
-    # completes every epoch and walks the policy into the inaction basin.
-    #
-    # The 0.03 it replaces was inherited from a from-scratch run that never
-    # stopped early against a worst minibatch of 2.179e-2. That run's evidence
-    # remains valid and does not transfer: a BC-cloned policy's replay-parity
-    # floor alone is 3.73e-3 against its 1.4e-4, so 26x of the same budget is
-    # spent on numerics before any policy movement is counted.
-    target_kl: float = 0.10
+    # Restored to 0.03, the CleanRL-adjacent trust region this pipeline shipped
+    # from scratch, on the population runs' own telemetry: four members at
+    # actor_lr 3.0e-5 held approx_kl at 1e-4 to 2e-4 per iteration with the
+    # epoch never stopping early (`runs/pop4-economic-*`), so at the rate the
+    # launcher ships the region 0.03 does not bind and the wider 0.10 only
+    # buys headroom for an excursion the measured surface does not produce.
+    # The earlier tabulated raise to 0.10 was decided on a lane whose actor
+    # started from a different BC artifact; it is history, not a constraint.
+    target_kl: float = 0.03
     # BF16 autocast for both update-path forwards. The actor's importance
     # ratio starts at one because `replay_behavior_logprobs` recomputes the
     # behavior side through the update path's forward at the same precision;
@@ -619,11 +614,12 @@ class PpoConfig:
 class AdvantageBatch:
     advantages: np.ndarray
     value_targets: np.ndarray
-    # The undiscounted suffix return. Nothing trains on it: it is the target the
-    # critic used to fit, kept as the one measurement of critic quality the
-    # critic cannot move. Explained variance against `value_targets` is scored
-    # against a target that contains the prediction, so it improves when the
-    # critic merely agrees with itself; against this it does not.
+    # The gamma-discounted suffix return (lambda one). Nothing trains on it: it
+    # is the target the critic used to fit, kept as the one measurement of
+    # critic quality the critic cannot move. Explained variance against
+    # `value_targets` is scored against a target that contains the prediction,
+    # so it improves when the critic merely agrees with itself; against this
+    # it does not.
     monte_carlo_returns: np.ndarray
     # Location and scale of the advantages before normalization. The normalized
     # array is zero-mean and unit-variance by construction, so measuring it
@@ -639,7 +635,7 @@ def generalized_advantage_and_targets(
     values: Tensor,
     valid: Tensor,
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
-    gamma: float = 1.0,
+    gamma: float = 0.99,
 ) -> tuple[Tensor, Tensor]:
     """Compute lambda-GAE advantages and the matching lambda-return targets.
 
@@ -721,8 +717,8 @@ def _validate_config(config: PpoConfig) -> None:
         raise ValueError("LR warmup steps cannot be negative")
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
         raise ValueError("clip interval must straddle one")
-    if config.gamma != 1.0:
-        raise ValueError("Kaggriculture economic rewards require undiscounted gamma=1")
+    if not math.isfinite(config.gamma) or not 0.0 < config.gamma <= 1.0:
+        raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
 
@@ -2447,11 +2443,7 @@ def update_ppo(
         # cannot carry the questions the run has been misread for want of
         # separating.
         #
-        # Against the undiscounted suffix return. The critic does not regress
-        # on it directly. Under the non-telescoping economic objective this
-        # measures whether its pre-update prediction explains the remaining
-        # time-average farm value plus final bank value; unlike the old
-        # potential difference, the target retains path information.
+        # Against the discounted suffix return. The critic does not regress
         "monte_carlo_explained_variance": _explained_variance(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),

@@ -181,17 +181,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gamma",
         type=float,
-        default=1.0,
-        help="reward discount; 1.0 preserves the time-average economy plus final-bank objective",
+        default=PpoConfig.gamma,
+        help="reward discount; defaults to CleanRL's standard 0.99",
     )
     parser.add_argument(
         "--actor-gae-lambda",
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            "GAE lambda; defaults to VAPO's alpha=0.05 value for the fixed "
-            "719-action competition horizon. It sets the critic too: the target "
-            "is the lambda-return the advantage came from"
+            "GAE lambda; defaults to CleanRL's standard 0.95. It sets the "
+            "critic too: the target is the lambda-return the advantage came from"
         ),
     )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
@@ -451,8 +450,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("clip interval must straddle one")
     if args.lr_warmup_steps < 0:
         raise ValueError("LR warmup steps cannot be negative")
-    if args.gamma != 1.0:
-        raise ValueError("Kaggriculture economic rewards require --gamma 1.0 (undiscounted)")
+    if not math.isfinite(args.gamma) or not 0.0 < args.gamma <= 1.0:
+        raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(args.actor_gae_lambda) or not 0.0 <= args.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
     if not math.isfinite(args.max_hours) or args.max_hours < 0.0:

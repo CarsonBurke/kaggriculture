@@ -53,17 +53,20 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
     # Entropy is telemetry only; the training CLI has no bonus coefficient.
     assert not hasattr(args, "entropy_coefficient")
-    assert args.gamma == 1.0
-    assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
+    assert args.gamma == pytest.approx(0.99)
+    assert args.actor_gae_lambda == pytest.approx(0.95)
     assert not hasattr(args, "gae_lambda")
     assert args.target_kl == PpoConfig.target_kl
     assert args.checkpoint_every == 5
     module._validate_args(args)
 
-    args.gamma = 0.99
-    with pytest.raises(ValueError, match=r"require --gamma 1\.0"):
+    args.gamma = 1.5
+    with pytest.raises(ValueError, match="gamma must be finite"):
         module._validate_args(args)
-    args.gamma = 1.0
+    args.gamma = 0.0
+    with pytest.raises(ValueError, match="gamma must be finite"):
+        module._validate_args(args)
+    args.gamma = PpoConfig.gamma
 
     # The k3 estimator is non-negative and the trust region stops on
     # `batch_kl > target_kl`, so a non-positive value admits at most the

@@ -78,19 +78,19 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         _validate_staged_action_masks(staged, valid)
 
 
-def test_default_gae_matches_the_length_adaptive_value_for_the_fixed_horizon() -> None:
+def test_default_gae_matches_the_cleanrl_standard() -> None:
     config = PpoConfig()
 
-    assert config.gamma == 1.0
-    assert config.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
-    assert config.actor_gae_lambda == pytest.approx(699.0 / 719.0)
+    assert config.gamma == 0.99
+    assert config.actor_gae_lambda == pytest.approx(0.95)
     assert config.actor_gae_lambda == DEFAULT_ACTOR_GAE_LAMBDA
-    assert 1.0 / (1.0 - config.actor_gae_lambda) == pytest.approx(0.05 * 719.0)
 
 
-def test_discounted_bank_delta_objective_is_rejected() -> None:
-    with pytest.raises(ValueError, match="undiscounted gamma=1"):
-        _validate_config(PpoConfig(gamma=0.99))
+def test_out_of_range_gamma_is_rejected() -> None:
+    with pytest.raises(ValueError, match="gamma must be finite"):
+        _validate_config(PpoConfig(gamma=1.5))
+    with pytest.raises(ValueError, match="gamma must be finite"):
+        _validate_config(PpoConfig(gamma=0.0))
 
 
 def test_minibatches_are_balanced_without_dropping_the_tail() -> None:
@@ -119,7 +119,7 @@ def test_the_critic_target_is_the_lambda_return_the_actor_advantage_came_from() 
     valid = torch.ones_like(rewards)
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=0.5
+        rewards, values, valid, actor_gae_lambda=0.5, gamma=1.0
     )
 
     torch.testing.assert_close(advantages, torch.tensor([[0.125, 0.85, 0.5]]))
@@ -143,7 +143,7 @@ def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
 
     for actor_gae_lambda in (0.0, 0.5, 1.0):
         advantages, targets = generalized_advantage_and_targets(
-            rewards, exact, valid, actor_gae_lambda=actor_gae_lambda
+            rewards, exact, valid, actor_gae_lambda=actor_gae_lambda, gamma=1.0
         )
 
         torch.testing.assert_close(advantages, torch.zeros_like(advantages))
@@ -153,7 +153,7 @@ def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
     # target ignoring it: displace the critic and the target moves with it,
     # which the Monte Carlo suffix return it replaced would not have done.
     displaced = generalized_advantage_and_targets(
-        rewards, exact + 0.5, valid, actor_gae_lambda=0.5
+        rewards, exact + 0.5, valid, actor_gae_lambda=0.5, gamma=1.0
     )[1]
     assert not torch.allclose(displaced, exact)
 
@@ -204,8 +204,8 @@ def test_discounted_advantages_and_targets_match_the_reference_recurrence() -> N
     expected_advantages = torch.tensor([[expected_0, expected_1, expected_2]])
     torch.testing.assert_close(advantages, expected_advantages)
     torch.testing.assert_close(targets, expected_advantages + values)
-    # Production fixes gamma at one to weight every economic occupancy sample
-    # equally; the general recurrence still supports discounting correctly.
+    # Production discounts at CleanRL's standard gamma=0.99; the general
+    # recurrence still supports any gamma in (0, 1] correctly.
     monte_carlo = torch.tensor([[0.2 + 0.9 * (-0.1 + 0.9 * 0.3), -0.1 + 0.9 * 0.3, 0.3]])
     assert not torch.allclose(targets, monte_carlo)
 
@@ -227,7 +227,9 @@ def test_lambda_one_recovers_the_monte_carlo_return_whatever_the_critic_says() -
         torch.tensor([[10.0, -7.0, 3.0], [4.0, 1.0, -8.0]]),
         torch.tensor([[-2.0, 6.0, 9.0], [-5.0, 11.0, 0.5]]),
     ):
-        targets = generalized_advantage_and_targets(rewards, values, valid, actor_gae_lambda=1.0)[1]
+        targets = generalized_advantage_and_targets(
+            rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
+        )[1]
 
         torch.testing.assert_close(targets, monte_carlo)
 
@@ -236,6 +238,7 @@ def test_lambda_one_recovers_the_monte_carlo_return_whatever_the_critic_says() -
         torch.tensor([[10.0, -7.0, 3.0], [4.0, 1.0, -8.0]]),
         valid,
         actor_gae_lambda=0.99,
+        gamma=1.0,
     )[1]
     assert not torch.allclose(shortened, monte_carlo)
 
@@ -246,9 +249,8 @@ def test_masked_gae_does_not_bootstrap_through_padding() -> None:
     valid = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=1.0
+        rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
     )
-
     torch.testing.assert_close(targets[0], torch.tensor([1.0, 1.0, 0.0]))
     torch.testing.assert_close(advantages[0], torch.tensor([0.75, 0.5, 0.0]))
     torch.testing.assert_close(targets[1], torch.tensor([-1.0, -1.0, -1.0]))
@@ -269,9 +271,8 @@ def test_a_truncated_trajectory_anchors_its_last_target_on_the_reward_alone() ->
     valid = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=0.5
+        rewards, values, valid, actor_gae_lambda=0.5, gamma=1.0
     )
-
     torch.testing.assert_close(
         advantages, torch.tensor([[0.225, -0.55, 0.7, 0.0], [-0.35, 1.1, 0.0, 0.0]])
     )
@@ -289,9 +290,8 @@ def test_masked_gae_ignores_nonfinite_padding_but_rejects_nonfinite_valid_data()
     valid = torch.tensor([[True, True, False]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=1.0
+        rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
     )
-
     torch.testing.assert_close(advantages, torch.tensor([[0.75, 0.5, 0.0]]))
     torch.testing.assert_close(targets, torch.tensor([[1.0, 1.0, 0.0]]))
     with pytest.raises(ValueError, match="valid rewards must be finite"):
@@ -1335,7 +1335,7 @@ def test_a_mis_scaled_critic_still_explains_its_own_bootstrapped_target() -> Non
     prepared = prepare_advantages(
         SimpleNamespace(rewards=rewards, valid=valid),
         mis_scaled,
-        PpoConfig(actor_gae_lambda=0.5),
+        PpoConfig(actor_gae_lambda=0.5, gamma=1.0),
     )
 
     np.testing.assert_allclose(prepared.monte_carlo_returns, monte_carlo, atol=1e-6)

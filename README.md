@@ -3,7 +3,7 @@
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
 The learner is direct, from-scratch self-play PPO with DAPO's asymmetric clip
-band and VAPO's length-adaptive GAE. Training does not currently depend on
+band and CleanRL's standard gamma/GAE-lambda schedule. Training does not currently depend on
 expert demonstrations, distillation, behavior cloning, or value pretraining. An exact
 batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
 environment remains the parity oracle and final evaluator.
@@ -198,8 +198,9 @@ s[i,t] = tanh((value[i,t] - 3000) / 75000)
 r[i,t] = s[i,t] / 719 + terminal(t) * s[i,t]
 ```
 
-so the full episode return is the time-average post-action economic score plus
-the final bank score. It is deliberately non-telescoping: two trajectories with
+so the episode return is the geometrically weighted sum of post-action
+economic scores plus the discounted final bank score. It is deliberately
+non-telescoping: two trajectories with
 the same endpoint receive different returns when one sustained useful capital
 for longer. Equal rich learners both receive positive reward; equal bankrupt
 learners both receive negative reward. Reducing the opponent's bank never raises
@@ -227,14 +228,17 @@ critic's HL-Gauss support. The constant is duplicated as `ECONOMIC_SCALE` in
 `src/kaggriculture/encoding.py` and `rust/kagg_env/src/core.rs`; native/Python
 parity covers both the score and reward.
 
-Gamma is fixed at 1.0 so all 719 occupancy samples have equal weight. Advantages
-use VAPO's length-adaptive
-`lambda_policy = 1 - 1 / (0.05 * 719) = 0.9721835883`, and critic targets are
-the matching lambda-return `advantage + value`. A lambda-one suffix return would
-fold all later action noise into every earlier target; the shorter window keeps
-the local dense signal while the critic supplies continuation value. Targets
-that bootstrap beyond the categorical support saturate at the outer atom and
-the saturated fraction is reported.
+Gamma and GAE lambda follow CleanRL's standard PPO schedule (`gamma = 0.99`,
+`gae_lambda = 0.95`) and the actor advantages and critic targets share them:
+critic targets are the matching lambda-return `advantage + value`. A lambda-one
+suffix return would fold all later action noise into every earlier target; the
+shorter window keeps the local dense signal while the critic supplies
+continuation value. Targets that bootstrap beyond the categorical support
+saturate at the outer atom and the saturated fraction is reported.
+
+The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
+population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
+rarely binds.
 
 Entropy is measured for collapse detection but never optimized: `PpoConfig` and
 the training CLI expose no entropy coefficient, and the actor loss is exactly

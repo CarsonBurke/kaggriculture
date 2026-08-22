@@ -1194,7 +1194,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--league-historical-opponents", "2"),
         ("--epochs", "1"),
         ("--minibatch-size", "2048"),
-        ("--gamma", "1.0"),
+        ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
         (
             "--actor-gae-lambda",
             str(module.production_ppo_config(update_compile_mode="eager")["actor_gae_lambda"]),
