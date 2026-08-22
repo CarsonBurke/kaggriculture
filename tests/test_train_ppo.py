@@ -48,6 +48,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.league_active_pool_size == 16
     assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
     assert args.epochs == 1
+    assert args.critic_lr == pytest.approx(2.5e-4)
     assert args.minibatch_size == 2048
     # An unflagged run is exactly the family's dataclass configuration, which
     # is what a warm-start artifact and the calibration benchmark both carry.

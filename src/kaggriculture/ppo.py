@@ -374,7 +374,11 @@ UPDATE_COMPILE_MODES = (
 class PpoConfig:
     # The critic follows CleanRL's PPO reference (2.5e-4, Adam eps 1e-5), which
     # this pipeline anneals to nothing -- warmup then constant -- rather than
-    # linearly to zero.
+    # linearly to zero. The tenfold NorMuon conversion that briefly sat here
+    # (2.5e-3) was the same unmeasured unit change the actor tabulation
+    # falsified; the critic never got its own sweep, and the 2.5e-3 step
+    # clipped ~9x every minibatch on the economic population runs. The
+    # reference rate is the one that has a citation.
     #
     # The actor does not, and cannot: 2.5e-4 is incompatible with `target_kl`
     # once the actor is warm-started from behavior cloning. A full epoch is 113
@@ -474,7 +478,7 @@ class PpoConfig:
     # objective. This measurement supersedes the optimizer unit-conversion
     # projection while leaving the older Adam evidence above as history.
     actor_learning_rate: float = 3.0e-5
-    critic_learning_rate: float = 2.5e-3
+    critic_learning_rate: float = 2.5e-4
     lr_warmup_steps: int = 32
     # Which optimizer `make_optimizers` builds. `normuon` gives every hidden
     # matrix a spectrally normalized step (Polar Express + NorMuon's low-rank
