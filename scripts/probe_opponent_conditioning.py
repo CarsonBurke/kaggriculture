@@ -62,7 +62,8 @@ from kaggriculture.encoding import (
     GLOBAL_FEATURES,
     encode_observation,
 )
-from kaggriculture.inference import load_actor_artifact
+from kaggriculture.inference import checkpoint_orientation, load_actor_artifact
+from kaggriculture.orientation import Orientation
 from kaggriculture.provenance import file_sha256
 from kaggriculture.registry import CONV_ENTITY, architecture_of
 
@@ -625,6 +626,12 @@ def main() -> None:
     torch.set_num_threads(max(1, args.threads))
     started = time.perf_counter()
     actor, payload = load_actor_artifact(args.actor, "cpu")
+    orientation = checkpoint_orientation(payload)
+    if orientation is not Orientation.IDENTITY:
+        raise ValueError(
+            f"{args.actor}: the artifact plays under {orientation.name}; this probe "
+            "edits and re-encodes upright boards, so it only measures identity members"
+        )
     architecture = architecture_of(actor)
     if architecture.name != CONV_ENTITY:
         raise ValueError(

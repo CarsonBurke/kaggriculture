@@ -28,7 +28,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from kaggriculture.inference import load_actor_artifact
+from kaggriculture.inference import checkpoint_orientation, load_actor_artifact
+from kaggriculture.orientation import Orientation
 from kaggriculture.league import load_actor_snapshot
 from kaggriculture.production import PRODUCTION_EPISODE_STEPS
 from kaggriculture.registry import architecture_of
@@ -59,7 +60,16 @@ def _load(path: Path, device: torch.device, *, agent: int | None = None) -> AnyA
         if agent is not None:
             raise SystemExit(f"{path} is a league snapshot and holds no population member")
         return load_actor_snapshot(path, device=device)
-    actor, _ = load_actor_artifact(path, device=device, agent=agent)
+    actor, payload = load_actor_artifact(path, device=device, agent=agent)
+    # This probe renders every board upright; a member recorded under a
+    # non-identity orientation would be measured against a rendering it never
+    # trained on. Refuse rather than mis-measure.
+    orientation = checkpoint_orientation(payload, agent)
+    if orientation is not Orientation.IDENTITY:
+        raise SystemExit(
+            f"{path}: member {agent} plays under {orientation.name}; this probe "
+            "has no oriented rendering and only measures identity members"
+        )
     return actor.eval().requires_grad_(False)
 
 

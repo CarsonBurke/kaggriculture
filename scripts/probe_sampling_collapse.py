@@ -263,18 +263,26 @@ def _initialize_worker(device: str, torch_threads: int) -> None:
     _WORKER["device"] = device
 
 
-def _load_actor(path: str):
-    """One actor per worker process per artifact, reused across that path's cells.
+def _load_actor(path: str) -> tuple[Any, Any]:
+    """One actor and its orientation, per worker process per artifact.
 
     Resume checkpoints and exported actor artifacts share `load_actor_artifact`;
     per-iteration league snapshots are a separate, narrower format (version 2)
     with its own strict reader, and including them is what turns a two-point
-    before/after into the per-iteration trace of the collapse.
+    before/after into the per-iteration trace of the collapse. The recorded
+    orientation travels with the weights: a population member trained under a
+    mirror renders every board flipped, and playing it upright would measure
+    the rendering change rather than the policy. Payloads that predate the
+    field read as identity, which is what those runs played under.
     """
     import torch
 
-    from kaggriculture.inference import load_actor_artifact
+    from kaggriculture.inference import (
+        checkpoint_orientation,
+        load_actor_artifact,
+    )
     from kaggriculture.league import LEAGUE_SNAPSHOT_FORMAT_VERSION, load_actor_snapshot
+    from kaggriculture.orientation import Orientation
 
     cached = _WORKER.get("actor")
     if cached is not None and _WORKER.get("actor_path") == path:
@@ -283,11 +291,13 @@ def _load_actor(path: str):
     if version == LEAGUE_SNAPSHOT_FORMAT_VERSION:
         actor = load_actor_snapshot(Path(path)).to(_WORKER["device"])
         actor.eval()
+        orientation = Orientation.IDENTITY
     else:
-        actor, _ = load_actor_artifact(Path(path), device=_WORKER["device"])
-    _WORKER["actor"] = actor
+        actor, payload = load_actor_artifact(Path(path), device=_WORKER["device"])
+        orientation = checkpoint_orientation(payload)
+    _WORKER["actor"] = (actor, orientation)
     _WORKER["actor_path"] = path
-    return actor
+    return actor, orientation
 
 
 def _flat(array: np.ndarray) -> np.ndarray:
@@ -407,7 +417,16 @@ def measure_cell(cell: Cell, args: dict[str, Any]) -> dict[str, Any]:
     """One wave under one decode rule, plus the sharpness of the states it saw."""
     from kaggriculture.rollout import collect_mixed_play_rust
 
-    actor = _load_actor(cell.path)
+    actor, orientation = _load_actor(cell.path)
+    # The native mixed collector encodes every row upright; only the population
+    # collector carries per-row orientations. A mirrored member probed here
+    # would read a rendering it never trained on, so refuse rather than
+    # mis-measure -- identity artifacts and league snapshots are unaffected.
+    if orientation is not Orientation.IDENTITY:
+        raise ValueError(
+            f"{cell.path}: orientation {orientation.name} requires a surface that "
+            "replays it; the native mixed collector renders upright"
+        )
     games = int(args["games"])
     started = time.perf_counter()
     batch = collect_mixed_play_rust(
@@ -506,10 +525,12 @@ def measure_official(cell: Cell, args: dict[str, Any]) -> dict[str, Any]:
         sys.path.insert(0, str(_SCRIPTS))
     from external_eval_worker import _play_game
 
-    actor = _load_actor(cell.path)
+    actor, orientation = _load_actor(cell.path)
 
     def agent(observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(actor, [observation], deterministic=True).actions[0]
+        return act_batch(
+            actor, [observation], deterministic=True, orientation=orientation
+        ).actions[0]
 
     started = time.perf_counter()
     outcomes = [
