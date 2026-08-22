@@ -248,6 +248,19 @@ trajectories. `--population 4` requires `--league-games 0`; validation rejects
 frozen snapshots and built-in opponents in the wave. External opponents are
 evaluation-only diagnostics and never affect training gradients.
 
+Members are kept far from duplicates in the states they receive. Every game in
+a wave has its own seed (`seed_start + g`), so a member's 78 games per wave are
+distinct maps, and two members share only their direct head-to-heads. On top of
+that each member trains under its own fixed board orientation
+(`MEMBER_ORIENTATIONS[member % 4]`): identity, horizontal mirror, vertical
+mirror, or a 180-degree rotation. The orientation transforms the encoded board,
+the unit positions, and the movement actions consistently -- what the oriented
+view calls EAST executes as the real direction the map sends it -- so every
+member acts legally in the shared environment while receiving genuinely
+different state streams. Checkpoints record each member's orientation and
+evaluation and submission replay it; the structured (non-conv) encoding does
+not yet carry an orientation mapping and rejects non-identity populations.
+
 The actor and critic have separate spatial U-Nets and fixed-token entity
 transformers. The actor attends over one state token, 100 board cells, 16 unit
 slots, and 10 autoregressive market slots using pre-normalization, ReLU-squared

@@ -229,6 +229,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/encoding.py",
         "kaggriculture/inference.py",
         "kaggriculture/model.py",
+        "kaggriculture/orientation.py",
         "kaggriculture/policy.py",
         "kaggriculture/provenance.py",
         "kaggriculture/registry.py",

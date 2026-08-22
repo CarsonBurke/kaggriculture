@@ -30,6 +30,15 @@ from kaggriculture.encoding import (
 )
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
+from kaggriculture.orientation import (
+    Orientation,
+    orient_boards,
+    orient_unit_actions,
+    orient_unit_features,
+    orient_unit_logits,
+    orient_unit_masks,
+    row_orientations,
+)
 from kaggriculture.policy import PolicyStep, act_batch
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
@@ -1429,6 +1438,15 @@ def collect_population_play_rust(
     The balanced schedule gives every member exactly the same number of rows,
     so the lanes need none of the padding an uneven league mix needs.
 
+    Each member plays under its fixed `member_orientation`: every step the
+    encoder output is flipped into that member's frame before the forward, and
+    the oriented movement logits are restriped back to real-action columns for
+    the native sampler. Storage keeps the unit factors in the oriented label
+    space, so a row's stored features, masks and actions replay consistently
+    through its own member. Only the convolutional entity encoding has an
+    orientation mapping; a structured population with non-identity members is
+    refused up front.
+
     Rollouts capture only behavior policy state. Value predictions for GAE are
     replayed from the stored features at update time, where the critic weights
     are still exactly the behavior weights.
@@ -1454,6 +1472,22 @@ def collect_population_play_rust(
         raise ValueError("every population member must use the same model configuration")
     architecture = architecture_of(actors[0]).name
 
+    # The native wave is already game-major and seat-minor, so the schedule
+    # flattens straight into the per-row agent index the sampler wants as its
+    # quantity-head selector and the update wants as its partition.
+    agents = pairings.reshape(-1)
+    # Each member plays under its fixed orientation, so every row carries one.
+    # Only the convolutional entity encoding has an orientation mapping: the
+    # structured token encoding has no defined flip yet, so refuse the mix
+    # before any simulator state exists rather than misread it per row later.
+    codes = row_orientations(agents)
+    if architecture != CONV_ENTITY and (codes != int(Orientation.IDENTITY)).any():
+        raise ValueError(
+            "member orientations have no mapping in the structured encoding yet; "
+            "a population with non-identity members needs the convolutional "
+            "entity architecture"
+        )
+
     seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
     rows = games * 2
@@ -1462,11 +1496,6 @@ def collect_population_play_rust(
     encoded_wave = _native_wave(architecture, environment, device)
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
-
-    # The native wave is already game-major and seat-minor, so the schedule
-    # flattens straight into the per-row agent index the sampler wants as its
-    # quantity-head selector and the update wants as its partition.
-    agents = pairings.reshape(-1)
     kind_gate, quantity_values, quantity_bias = _quantity_heads(actors)
     head_ids = agents.astype(np.uint16)
     deterministic_rows = np.zeros(rows, dtype=np.bool_)
@@ -1503,6 +1532,13 @@ def collect_population_play_rust(
 
     for step in range(horizon):
         encoded_wave.refresh(environment)
+        # refresh() re-encodes every array straight from the simulator, so the
+        # members' orientations have to be re-applied every step before
+        # anything reads them: this one pass feeds the device upload, hence the
+        # forward, and _store_native_wave below copies these same oriented rows
+        # into storage.
+        orient_boards(encoded["board"], codes)
+        orient_unit_features(encoded["units"], encoded["unit_positions"], codes)
         encoded_wave.copy_to_device()
         _mark_cuda_graph_step(device, compiled_forward)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
@@ -1520,6 +1556,10 @@ def collect_population_play_rust(
         ):
             destination[lane_rows] = values
         unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+        # The forward consumed oriented features and therefore emitted oriented
+        # movement logits, while Rust masks and samples real-action columns;
+        # restriping here hands it logits whose column j describes real action j.
+        orient_unit_logits(unit_logits, codes)
         environment.sample_and_step_into(
             unit_logits,
             kind_logits,
@@ -1537,8 +1577,23 @@ def collect_population_play_rust(
             sampled,
         )
         rewards = np.asarray(sampled["training_rewards"], dtype=np.float32).reshape(-1)
+        # Storage keeps the unit factors in oriented space so the replay path
+        # reads features, masks and actions out of one label space. The stored
+        # log-probabilities need no remap: P(oriented index i) and P(the real
+        # action it executes) are the same categorical event, and neither the
+        # market fields nor entropy touch movement columns.
+        oriented_sampled = dict(sampled)
+        oriented_sampled["unit_actions"] = orient_unit_actions(sampled["unit_actions"], codes)
+        oriented_sampled["unit_masks"] = orient_unit_masks(sampled["unit_masks"], codes)
         _store_native_wave(
-            architecture, fields, step, encoded, sampled, rewards, slice(None), pair_rows
+            architecture,
+            fields,
+            step,
+            encoded,
+            oriented_sampled,
+            rewards,
+            slice(None),
+            pair_rows,
         )
         counts = (
             np.asarray(sampled["unit_active"]).sum(axis=1)

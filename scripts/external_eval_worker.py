@@ -23,9 +23,10 @@ from typing import Any
 
 import torch
 
-from kaggriculture.inference import load_actor_artifact
+from kaggriculture.inference import checkpoint_orientation, load_actor_artifact
 from kaggriculture.league import load_actor_snapshot, snapshot_sha256
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
+from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch
 from kaggriculture.provenance import file_sha256
 
@@ -237,8 +238,8 @@ def _members(spec: str) -> list[int | None]:
     return list(members)
 
 
-def _load_member(artifact: Path, member: int | None) -> Any:
-    """Load one actor from whichever of the three shapes the file holds.
+def _load_member(artifact: Path, member: int | None) -> tuple[Any, Orientation]:
+    """Load one actor and the orientation it must play under.
 
     A population checkpoint holds a list of members and cannot answer "the
     actor" at all, which is why an index is demanded rather than defaulted --
@@ -249,23 +250,26 @@ def _load_member(artifact: Path, member: int | None) -> Any:
     snapshot carries exactly `format_version`/`iteration`/`model_config`/`actor`
     plus an optional `architecture`, while a BC or submission artifact adds
     provenance and metrics. Both must load here, because the A/B this probe
-    measures compares a BC artifact against a trained snapshot.
+    measures compares a BC artifact against a trained snapshot. Every shape
+    reads its member's recorded orientation -- a member trained under a mirror
+    scores differently when probed upright, and the difference would look like
+    drift in the weights rather than a rendering mismatch.
     """
     if member is not None:
-        actor, _ = load_actor_artifact(artifact, agent=member)
-        return actor
+        actor, payload = load_actor_artifact(artifact, agent=member)
+        return actor, checkpoint_orientation(payload, agent=member)
     payload = torch.load(artifact, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"actor file is not a dictionary: {artifact}")
     snapshot_keys = {"format_version", "iteration", "model_config", "actor"}
     if snapshot_keys <= set(payload) and not set(payload) - snapshot_keys - {"architecture"}:
-        return load_actor_snapshot(artifact)
+        return load_actor_snapshot(artifact), Orientation.IDENTITY
     actor, _ = load_actor_artifact(artifact)
-    return actor
+    return actor, checkpoint_orientation(payload)
 
 
-def _agent_for(actor: Any) -> Any:
-    """A single-argument agent callable bound to one actor.
+def _agent_for(actor: Any, orientation: Orientation) -> Any:
+    """A single-argument agent callable bound to one actor and its orientation.
 
     The arity is load-bearing and is why this is a factory rather than a closure
     written inline. `kaggle_environments` sizes the call with
@@ -287,7 +291,9 @@ def _agent_for(actor: Any) -> Any:
     """
 
     def agent(observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(actor, [observation], deterministic=True).actions[0]
+        return act_batch(
+            actor, [observation], deterministic=True, orientation=orientation
+        ).actions[0]
 
     return agent
 
@@ -304,9 +310,10 @@ def main() -> None:
     digest = snapshot_sha256(args.artifact)
 
     for member in members:
-        actor = _load_member(args.artifact, member).eval()
+        actor, orientation = _load_member(args.artifact, member)
+        actor = actor.eval()
 
-        agent = _agent_for(actor)
+        agent = _agent_for(actor, orientation)
 
         for label, runnable in opponents:
             record = evaluate_opponent(

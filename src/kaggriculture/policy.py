@@ -42,6 +42,13 @@ from kaggriculture.constants import (
 )
 from kaggriculture.encoding import EncodedObservation, encode_observation
 from kaggriculture.model import ActorOutput, FarmActor
+from kaggriculture.orientation import (
+    Orientation,
+    flip_board,
+    movement_permutation,
+    orient_unit_features,
+    orient_unit_masks,
+)
 from kaggriculture.structured import StructuredActor, stack_structured
 from kaggriculture.tokens import StructuredObservation, encode_structured_observation
 
@@ -77,6 +84,10 @@ class TensorObservationBatch:
 
 @dataclass(frozen=True)
 class ActionFactors:
+    # Unit movement indices and mask columns live in the orientation space the
+    # actor stepped in -- identity unless `act_batch` was given another one --
+    # so a replay that re-forwards the stored features gathers likelihoods at
+    # these indices directly. Market factors are always real-space.
     unit_actions: np.ndarray
     market_kinds: np.ndarray
     market_quantities: np.ndarray
@@ -444,8 +455,20 @@ def act_batch(
     deterministic: bool = False,
     temperature: float = 1.0,
     generator: np.random.Generator | None = None,
+    orientation: Orientation = Orientation.IDENTITY,
 ) -> PolicyStep:
-    """Encode, sample, mask, and compile a batch of decentralized actions."""
+    """Encode, sample, mask, and compile a batch of decentralized actions.
+
+    Under a non-identity ``orientation`` every row's encoded board and unit
+    geometry is flipped before the forward pass, so the actor sees the world
+    rendered through that grid symmetry and its movement head scores oriented
+    actions. Movement masks are restriped into those oriented columns and the
+    sampled indices stay in oriented space -- the factor arrays then match the
+    stored features a PPO replay re-forwards -- while each chosen movement is
+    mapped back to the real action it executes before engine-facing actions,
+    ledger evolution, and per-unit effects are compiled. Market heads carry no
+    spatial semantics and are never permuted.
+    """
     if not observations:
         raise ValueError("act_batch requires at least one observation")
     if opponent_privates is None:
@@ -454,6 +477,11 @@ def act_batch(
         raise ValueError("opponent private-state count must match observations")
     device = next(actor.parameters()).device
     if isinstance(actor, StructuredActor):
+        if orientation is not Orientation.IDENTITY:
+            raise NotImplementedError(
+                "orientations flip board surfaces, so only the convolutional "
+                "actor plays under a non-identity orientation"
+            )
         encoded = [
             encode_structured_observation(observation, opponent_private)
             for observation, opponent_private in zip(observations, opponent_privates, strict=True)
@@ -465,6 +493,16 @@ def act_batch(
             encode_observation(observation, opponent_private)
             for observation, opponent_private in zip(observations, opponent_privates, strict=True)
         ]
+        if orientation is not Orientation.IDENTITY:
+            # Orienting the rows themselves keeps PolicyStep.encoded holding
+            # exactly the features this forward consumed, which is what makes
+            # a replay of the stored factors on-policy.
+            row_codes = np.full(1, int(orientation), dtype=np.int8)
+            for row in encoded:
+                flip_board(row.board, orientation)
+                orient_unit_features(
+                    row.units[np.newaxis], row.unit_positions[np.newaxis], row_codes
+                )
         tensors = stack_encoded(encoded, device)
         output = actor(
             tensors.board, tensors.global_features, tensors.units, tensors.unit_positions
@@ -477,9 +515,11 @@ def act_batch(
     quantity_bias = actor.market_quantity_bias.float().cpu().numpy()
     batch_size = len(observations)
     generator = generator or np.random.default_rng()
+    movement_map = movement_permutation(orientation)
 
     unit_actions = np.zeros((batch_size, MAX_UNITS), dtype=np.int64)
     unit_masks = np.zeros((batch_size, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.bool_)
+    real_unit_actions = np.zeros((batch_size, MAX_UNITS), dtype=np.int64)
     unit_active = np.stack([row.unit_active for row in encoded])
     remaining_seeds = [
         dict((observation.get("private") or {}).get("seeds") or {}) for observation in observations
@@ -508,17 +548,26 @@ def act_batch(
                 )
             else:
                 unit_masks[row, unit_index, UnitAction.PASS] = True
+        if orientation is Orientation.IDENTITY:
+            oriented_masks = unit_masks[:, unit_index]
+        else:
+            # The restripe orient_unit_masks performs on a batched array, done
+            # on one unit slice: oriented column j holds real column perm[j].
+            oriented_masks = unit_masks[:, unit_index][:, movement_map]
         sampled_cpu, logprob, entropy = _sample_numpy_categorical(
             unit_logits[:, unit_index],
-            unit_masks[:, unit_index],
+            oriented_masks,
             deterministic,
             temperature,
             generator,
         )
+        # `sampled_cpu` is the oriented index the flipped forward scored; the
+        # engine and every mask-evolving side effect consume its real image.
         unit_actions[:, unit_index] = sampled_cpu
+        real_unit_actions[:, unit_index] = movement_map[sampled_cpu]
         unit_logprobs[:, unit_index] = logprob
         unit_entropies[:, unit_index] = entropy
-        for row, raw_action in enumerate(sampled_cpu):
+        for row, raw_action in enumerate(real_unit_actions[:, unit_index]):
             if UnitAction.PLANT_WHEAT <= raw_action <= UnitAction.PLANT_MELON:
                 crop = CROPS[int(raw_action) - int(UnitAction.PLANT_WHEAT)]
                 remaining_seeds[row][crop] = remaining_seeds[row].get(crop, 0) - 1
@@ -631,7 +680,7 @@ def act_batch(
         compile_action(observation, units, kinds, quantities)
         for observation, units, kinds, quantities in zip(
             observations,
-            unit_actions,
+            real_unit_actions,
             market_kinds,
             market_quantities,
             strict=True,
@@ -646,7 +695,15 @@ def act_batch(
         unit_actions=unit_actions,
         market_kinds=market_kinds,
         market_quantities=market_quantities,
-        unit_masks=unit_masks,
+        # The stored mask columns must describe the stored action indices:
+        # under a non-identity orientation both live in the oriented space the
+        # actor stepped in, so a replay re-forward of the stored features
+        # scores the same categorical event the sampler drew.
+        unit_masks=unit_masks
+        if orientation is Orientation.IDENTITY
+        else orient_unit_masks(
+            unit_masks, np.full(batch_size, int(orientation), dtype=np.int8)
+        ),
         market_kind_masks=kind_masks,
         market_quantity_masks=quantity_masks,
         unit_active=unit_active,

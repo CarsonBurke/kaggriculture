@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from kaggriculture.policy import act_batch
+from kaggriculture.orientation import Orientation
 from kaggriculture.provenance import (
     is_legacy_run_provenance,
     validate_run_provenance,
@@ -19,6 +20,12 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 12 records each member's `orientation`: the grid symmetry its
+# observations were rendered through during training. Acting under anything
+# else shows the weights a world they never saw, so evaluation and submission
+# replay the recorded code, and resume demands this version rather than
+# guessing a rendering the run never used.
+#
 # Version 11 gave a population run's payload a list of members under `agents`
 # in place of the four top-level state dicts a single learner keeps. The bump is
 # what stops a version-10 resume from being read as a population of one: the
@@ -47,10 +54,12 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 11
-# A version-10 payload's actor tensors are exactly a version-11 single learner's,
-# so the actor-only read path stays compatible while resume above refuses it.
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10))
+CHECKPOINT_FORMAT_VERSION = 12
+# Versions before 12 carry no orientation code. On the actor-only read path
+# their payloads are otherwise unchanged, so the legacy versions stay readable
+# with orientation defaulting to IDENTITY -- which is what those runs played
+# under -- while resume above refuses them.
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
@@ -105,6 +114,38 @@ def checkpoint_actor_state(checkpoint: Mapping[str, Any], agent: int | None) -> 
     return checkpoint["actor"]
 
 
+def _orientation_code(value: Any) -> Orientation:
+    try:
+        return Orientation(int(value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid orientation code: {value!r}") from error
+
+
+def checkpoint_orientation(checkpoint: Mapping[str, Any], agent: int | None = None) -> Orientation:
+    """The grid symmetry the checkpoint's member trains and plays under.
+
+    A population member carries its code beside its weights; a single learner
+    keeps one at the top level. Payloads that predate the field read as
+    IDENTITY, which is exactly what those runs played under -- the code is
+    recorded so a reader can replay the rendering, not to distinguish old
+    weights from new ones.
+    """
+    members = checkpoint.get(POPULATION_CHECKPOINT_KEY)
+    if isinstance(members, list):
+        if agent is None or not 0 <= agent < len(members):
+            available = f"0..{len(members) - 1}" if members else "none"
+            raise ValueError(
+                f"checkpoint population holds no member {agent}; select one with agent={available}"
+            )
+        return _orientation_code(members[agent].get("orientation", 0))
+    if agent is not None:
+        raise ValueError(
+            f"checkpoint holds a single learner, not a population, so agent {agent} "
+            "does not name anything in it"
+        )
+    return _orientation_code(checkpoint.get("orientation", 0))
+
+
 def actor_artifact_from_checkpoint(
     checkpoint: dict[str, Any], *, agent: int | None = None
 ) -> dict[str, Any]:
@@ -141,6 +182,10 @@ def actor_artifact_from_checkpoint(
         "metrics": checkpoint.get("metrics", {}),
         "source_identity": identity,
         "run_provenance": run_provenance,
+        # The symmetry the weights were rendered under. Exporting without it
+        # would ship an actor that plays a different game than the one that
+        # trained it, so the code travels with the weights it describes.
+        "orientation": int(checkpoint_orientation(checkpoint, agent)),
     }
 
 
@@ -199,10 +244,15 @@ class CheckpointAgent:
                 # PyTorch only permits changing this before the first parallel op.
                 torch.set_num_interop_threads(1)
         self.actor, self.metadata = load_actor_artifact(artifact, device)
+        # An artifact exported from a v12 checkpoint records the symmetry its
+        # member trained under; anything older predates the field and reads as
+        # identity. Playing without it would silently re-render the world.
+        self.orientation = _orientation_code(self.metadata.get("orientation", 0))
 
     def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
         return act_batch(
             self.actor,
             [observation],
             deterministic=True,
+            orientation=self.orientation,
         ).actions[0]

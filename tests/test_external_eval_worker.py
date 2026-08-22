@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from kaggriculture.opponents import normalize_opponent
+from kaggriculture.orientation import Orientation
 
 
 def _script():
@@ -170,7 +171,7 @@ def test_the_agent_callable_takes_exactly_the_one_argument_the_engine_passes() -
     import inspect
 
     module = _script()
-    agent = module._agent_for(object())
+    agent = module._agent_for(object(), Orientation.IDENTITY)
     spec = inspect.getfullargspec(agent)
 
     assert spec.args == ["observation"]
@@ -185,12 +186,14 @@ def test_each_member_gets_its_own_actor_rather_than_the_loops_last() -> None:
     module = _script()
     calls: list[str] = []
 
-    def fake_act_batch(actor, observations, *, deterministic):
+    def fake_act_batch(actor, observations, *, deterministic, orientation):
         calls.append(actor)
         return type("Out", (), {"actions": [{"actor": actor}]})()
 
     module.act_batch = fake_act_batch
-    agents = [module._agent_for(name) for name in ("first", "second", "third")]
+    agents = [
+        module._agent_for(name, Orientation.IDENTITY) for name in ("first", "second", "third")
+    ]
     results = [agent({}) for agent in agents]
 
     assert [result["actor"] for result in results] == ["first", "second", "third"]
@@ -214,7 +217,9 @@ def test_an_exported_artifact_and_a_league_snapshot_both_load_without_a_hint(tmp
     actor = FarmActor(config)
 
     snapshot = save_actor_snapshot(tmp_path / "league", actor, 3)
-    assert isinstance(module._load_member(snapshot.path, None), FarmActor)
+    loaded, snapshot_orientation = module._load_member(snapshot.path, None)
+    assert isinstance(loaded, FarmActor)
+    assert snapshot_orientation == Orientation.IDENTITY
 
     artifact = tmp_path / "bc-actor.pt"
     # Built by the trainer's own writer rather than a hand-rolled dict, so this
@@ -231,4 +236,6 @@ def test_an_exported_artifact_and_a_league_snapshot_both_load_without_a_hint(tmp
         ),
         artifact,
     )
-    assert isinstance(module._load_member(artifact, None), FarmActor)
+    actor, orientation = module._load_member(artifact, None)
+    assert isinstance(actor, FarmActor)
+    assert orientation == Orientation.IDENTITY

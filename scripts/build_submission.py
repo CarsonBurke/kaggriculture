@@ -44,6 +44,7 @@ PACKAGE_FILES = (
     "encoding.py",
     "inference.py",
     "model.py",
+    "orientation.py",
     "policy.py",
     "provenance.py",
     "registry.py",

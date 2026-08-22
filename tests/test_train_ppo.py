@@ -21,6 +21,7 @@ from kaggriculture.league import (
 )
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import model_config_from_args
+from kaggriculture.orientation import row_orientations
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, resolve_architecture
 from kaggriculture.rollout import population_pairings
@@ -1824,7 +1825,7 @@ def test_the_disagreement_gate_separates_converged_members_from_distinct_ones() 
     the money curve all stay in bounds while the wave carries no gradient."""
     module = _training_script()
     wave = _population_wave(module, games=12, population=4, seed=3)
-    forward_args, masks, active = module._population_state_sample(
+    forward_args, masks, active, codes = module._population_state_sample(
         wave, np.random.default_rng(0), torch.device("cpu")
     )
 
@@ -1834,10 +1835,10 @@ def test_the_disagreement_gate_separates_converged_members_from_distinct_ones() 
         member.load_state_dict(identical[0].state_dict())
 
     reference = module.mean_off_diagonal(
-        module._population_disagreement(distinct, forward_args, masks, active)
+        module._population_disagreement(distinct, forward_args, masks, active, codes)
     )
     collapsed = module.mean_off_diagonal(
-        module._population_disagreement(identical, forward_args, masks, active)
+        module._population_disagreement(identical, forward_args, masks, active, codes)
     )
 
     # Members running different programs disagree on most decisions; copies of one
@@ -1926,9 +1927,15 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     members = payload[POPULATION_CHECKPOINT_KEY]
     assert len(members) == population
     assert all(
-        set(member) == {"actor", "critic", "actor_optimizer", "critic_optimizer"}
+        set(member)
+        == {"actor", "critic", "actor_optimizer", "critic_optimizer", "orientation"}
         for member in members
     )
+    # Each member carries the orientation its index assigns, so a resume reads
+    # the same label space the wave was collected under without re-deriving it.
+    assert [member["orientation"] for member in members] == [
+        int(code) for code in row_orientations(np.arange(population))
+    ]
     assert not any(name in payload for name in ("actor", "critic", "actor_optimizer"))
 
     config = _TINY_CONFIG

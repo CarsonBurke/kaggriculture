@@ -18,6 +18,7 @@ from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.orientation import Orientation, member_orientation
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
@@ -72,7 +73,24 @@ def checkpoint_agent_states(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     members = payload.get(POPULATION_CHECKPOINT_KEY)
     if isinstance(members, list):
         return list(members)
-    return [{name: payload[name] for name in AGENT_STATE_KEYS}]
+    # A single learner's orientation lives at the top level beside its states;
+    # flattening it in here keeps every orientation reader shape-agnostic.
+    single = {name: payload[name] for name in AGENT_STATE_KEYS}
+    if "orientation" in payload:
+        single["orientation"] = payload["orientation"]
+    return [single]
+
+
+def checkpoint_member_orientations(payload: Mapping[str, Any]) -> list[Orientation]:
+    """Each member's recorded orientation, in agent order.
+
+    Absent reads as identity: payloads that predate the field were rendered
+    without one, so resuming them under identity is the truth, not a fallback.
+    """
+    return [
+        Orientation(int(state.get("orientation", int(Orientation.IDENTITY))))
+        for state in checkpoint_agent_states(payload)
+    ]
 
 
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
@@ -91,7 +109,13 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
     if members is not None and (
         not isinstance(members, list)
         or len(members) < 2
-        or any(not isinstance(entry, dict) or tuple(entry) != AGENT_STATE_KEYS for entry in members)
+        or any(
+            not isinstance(entry, dict)
+            # Version 12 members carry an `orientation` code beside their four
+            # states; older-shaped entries stay valid and read as identity.
+            or tuple(entry) not in (AGENT_STATE_KEYS, (*AGENT_STATE_KEYS, "orientation"))
+            for entry in members
+        )
     ):
         raise ValueError("checkpoint population is not a list of complete agent states")
     # A single learner keeps the four states at the top level, so a payload with
@@ -298,18 +322,30 @@ def checkpoint_payload(
         )
     if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
         raise ValueError("checkpoint RNG capture is incomplete")
-    if not agents or any(tuple(agent) != AGENT_STATE_KEYS for agent in agents):
+    if not agents or any(
+        tuple(agent) not in (AGENT_STATE_KEYS, (*AGENT_STATE_KEYS, "orientation"))
+        for agent in agents
+    ):
         raise ValueError(f"every checkpointed agent needs exactly {AGENT_STATE_KEYS}")
-    if len(agents) == 1:
+    # Member i trains under MEMBER_ORIENTATIONS[i % 4], so the payload records
+    # the code beside each member's weights: evaluation and submission replay
+    # the rendering the member actually saw. A writer that stamped its own is
+    # left alone; everything else gets the index-derived truth.
+    oriented = []
+    for index, agent in enumerate(agents):
+        entry = dict(agent)
+        entry.setdefault("orientation", int(member_orientation(index)))
+        oriented.append(entry)
+    if len(oriented) == 1:
         # A single learner's payload is byte-for-byte what it has always been:
         # the four states at the top level and no population list, so every
         # reader of "the actor" keeps working without being told which member.
-        members: dict[str, Any] = dict(agents[0])
+        members: dict[str, Any] = dict(oriented[0])
     else:
         # A population payload deliberately carries no top-level actor. See
         # POPULATION_CHECKPOINT_KEY: a member-zero alias there is how a reader
         # ends up reporting one arbitrary member as the whole run's strength.
-        members = {POPULATION_CHECKPOINT_KEY: [dict(agent) for agent in agents]}
+        members = {POPULATION_CHECKPOINT_KEY: oriented}
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
