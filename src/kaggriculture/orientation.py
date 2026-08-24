@@ -1,13 +1,12 @@
-"""Per-member state orientations for population league play.
+"""Per-game board symmetries for training invariance.
 
-Every population member sees the farm through its own fixed spatial orientation
-of the board. The transforms are exactly the symmetries of the square grid that
-map grid tiles to grid tiles: identity, horizontal mirror, vertical mirror, and
-the 180-degree rotation. A member's observation is the true world rendered
-through its orientation, and its movement actions are interpreted back through
-the same map, so every member keeps acting legally in the real environment while
-receiving genuinely different state streams -- four members at four orientations
-cannot collapse into duplicate receivers of one shared encoding.
+The farm is a square. Four grid-preserving symmetries — identity, horizontal
+mirror, vertical mirror, and 180-degree rotation — produce four views of the
+same game. Training assigns one symmetry per *game*, not per population
+member: both seats of a game share the frame, and games cycle through all
+four so every learner sees every rendering. A member-locked assignment
+left three of four warm-started clones playing a board their BC weights
+had never seen, and they went broke on the first wave.
 
 The mapping is closed over three surfaces:
 
@@ -19,7 +18,8 @@ The mapping is closed over three surfaces:
 
 Masks and sampled actions cross between the two spaces through the same
 permutation, so a mask column always describes the action whose logit occupies
-that column, whichever space storage uses.
+that column, whichever space storage uses. Evaluation and inference stay on
+the identity frame — the real competition board.
 """
 
 from __future__ import annotations
@@ -47,29 +47,61 @@ class Orientation(enum.IntEnum):
     ROTATE_180 = 3
 
 
-#: Member i of a population trains and plays under MEMBER_ORIENTATIONS[i % 4].
-MEMBER_ORIENTATIONS = (
+#: The four grid symmetries, in cycle order. Game *g* trains under
+#: ``ORIENTATION_CYCLE[g % 4]``. Both seats of that game share the code.
+ORIENTATION_CYCLE = (
     Orientation.IDENTITY,
     Orientation.MIRROR_X,
     Orientation.MIRROR_Y,
     Orientation.ROTATE_180,
 )
 
+#: Historical alias: the cycle used to be locked to member index.
+MEMBER_ORIENTATIONS = ORIENTATION_CYCLE
+
 
 def member_orientation(member_index: int) -> Orientation:
-    """The fixed orientation assigned to one population member index."""
+    """The *i*-th frame in the four-symmetry cycle.
+
+    Kept because older checkpoints stamped this code next to member *i*'s
+    weights. New collection ignores member index: use ``game_orientation``.
+    """
     if member_index < 0:
         raise ValueError("member index cannot be negative")
-    return MEMBER_ORIENTATIONS[member_index % len(MEMBER_ORIENTATIONS)]
+    return ORIENTATION_CYCLE[member_index % len(ORIENTATION_CYCLE)]
 
 
-def row_orientations(member_indices: np.ndarray) -> np.ndarray:
-    """Per-row orientation codes for a wave's agent column."""
-    members = np.asarray(member_indices, dtype=np.int64)
-    if members.size and int(members.min()) < 0:
-        raise ValueError("member indices cannot be negative")
-    table = np.asarray([int(value) for value in MEMBER_ORIENTATIONS], dtype=np.int8)
-    return table[members % len(MEMBER_ORIENTATIONS)]
+def game_orientation(game_index: int) -> Orientation:
+    """The board symmetry assigned to one game, cycling all four frames."""
+    if game_index < 0:
+        raise ValueError("game index cannot be negative")
+    return ORIENTATION_CYCLE[game_index % len(ORIENTATION_CYCLE)]
+
+
+def row_orientations(indices: np.ndarray) -> np.ndarray:
+    """Map non-negative indices onto the four-symmetry cycle.
+
+    Used as a compact source of all four codes in tests. Collection uses
+    ``seat_orientations``, which is this cycle over games, repeated per seat.
+    """
+    values = np.asarray(indices, dtype=np.int64)
+    if values.size and int(values.min()) < 0:
+        raise ValueError("orientation indices cannot be negative")
+    table = np.asarray([int(value) for value in ORIENTATION_CYCLE], dtype=np.int8)
+    return table[values % len(ORIENTATION_CYCLE)]
+
+
+def game_orientations(game_count: int) -> np.ndarray:
+    """Per-game orientation codes, cycling identity, mirror-x, mirror-y, rotate-180."""
+    if game_count < 0:
+        raise ValueError("game count cannot be negative")
+    return row_orientations(np.arange(game_count, dtype=np.int64))
+
+
+def seat_orientations(game_count: int) -> np.ndarray:
+    """Per-row codes for a native wave: both seats of a game share one frame."""
+    return np.repeat(game_orientations(game_count), 2)
+
 
 
 def movement_permutation(orientation: Orientation) -> np.ndarray:
@@ -184,3 +216,25 @@ def orient_unit_masks(unit_masks: np.ndarray, orientations: np.ndarray) -> np.nd
         rows = np.flatnonzero(orientations == code)
         oriented[rows] = oriented[rows][:, :, movement_permutation(orientation)]
     return oriented
+
+
+def apply_state_orientations(arrays: dict[str, np.ndarray], codes: np.ndarray) -> None:
+    """Flip encoded board and unit features in place to match ``codes``."""
+    orient_boards(arrays["board"], codes)
+    orient_unit_features(arrays["units"], arrays["unit_positions"], codes)
+
+
+def augment_demonstration_rows(arrays: dict[str, np.ndarray], codes: np.ndarray) -> None:
+    """Flip encoded demonstration rows and remapped unit targets in place.
+
+    Structured encodings have no flip. A non-identity code against a batch
+    that lacks a board is a silent no-op for market-only fields and a bug
+    for unit targets, so it is refused.
+    """
+    if "board" not in arrays:
+        if (np.asarray(codes) != int(Orientation.IDENTITY)).any():
+            raise ValueError("structured demonstrations have no orientation mapping")
+        return
+    apply_state_orientations(arrays, codes)
+    arrays["unit_actions"] = orient_unit_actions(arrays["unit_actions"], codes)
+    arrays["unit_masks"] = orient_unit_masks(arrays["unit_masks"], codes)

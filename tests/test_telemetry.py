@@ -761,6 +761,7 @@ def _mirrored_field_names() -> list[str]:
             opponent_money=np.zeros(trajectories, dtype=np.float32),
             seats=np.asarray([0, 1], dtype=np.int8),
             agents=np.zeros(trajectories, dtype=np.int64),
+            orientations=np.zeros(trajectories, dtype=np.int8),
             entropy_sums=np.zeros((trajectories, horizon), dtype=np.float32),
             elapsed_seconds=1.0,
         )

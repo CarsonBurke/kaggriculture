@@ -26,10 +26,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
+
 
 import numpy as np
 import torch
@@ -75,7 +78,12 @@ def _dump(args: argparse.Namespace) -> dict[str, Any]:
     module = load_native()
     seeds = np.arange(args.seed_start, args.seed_start + args.games, dtype=np.uint64)
     environment = module.BatchEnv(seeds)
-    actor, _ = load_actor_artifact(Path(args.artifact).resolve(), device=torch.device("cpu"))
+    actor, _ = load_actor_artifact(
+        Path(args.artifact).resolve(),
+        device=torch.device("cpu"),
+        agent=getattr(args, "agent", None),
+    )
+
     actor = actor.eval().requires_grad_(False)
     generator = np.random.default_rng(args.driver_seed)
 
@@ -159,6 +167,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument(
+        "--agent",
+        type=int,
+        default=None,
+        help="population member to drive; required for a multi-member checkpoint",
+    )
+
+    parser.add_argument(
         "--reference-tree",
         type=Path,
         help="checkout to compare against; this script is copied in and run there",
@@ -192,45 +207,45 @@ def main() -> int:
     )
 
     tree = args.reference_tree.resolve()
-    # The harness has to be this file so both sides drive the identical sequence,
-    # and everything it imports resolves inside the tree it runs in -- that is the
-    # whole point, the reference tree answers with its own inference stack.
-    #
-    # It lands in `artifacts/`, which `source_identity` never walks, because
-    # `scripts/` is a hashed root: staging there would change the very identity
-    # this witness has to name, and the witness would then bind a tree that only
-    # ever existed while it was being measured.
-    staged = tree / "artifacts" / f"_{Path(__file__).name}"
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
-    reference_dump = tree / "artifacts" / "inference-equivalence-reference.json"
-    shared = [
-        "--artifact",
-        str(Path(args.artifact).resolve()),
-        "--games",
-        str(args.games),
-        "--steps",
-        str(args.steps),
-        "--seed-start",
-        str(args.seed_start),
-        "--driver-seed",
-        str(args.driver_seed),
-    ]
-    completed = subprocess.run(
-        # Same interpreter, different `sys.path`: the tree supplies the package and
-        # its native extension, never the Python runtime, which the identity does
-        # not bind.
-        [sys.executable, str(staged), *shared, "--dump", str(reference_dump)],
-        cwd=tree,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        raise SystemExit(f"reference tree dump failed:\n{completed.stdout}\n{completed.stderr}")
-
-    reference = json.loads(reference_dump.read_text(encoding="utf-8"))
+    # The harness has to be this file so both sides drive the identical sequence.
+    # Frozen snapshots are read-only, so the copy lives in a temp dir and the
+    # reference package is injected via PYTHONPATH rather than by nesting the
+    # script under the tree (which is what `source_identity` hashes).
+    with tempfile.TemporaryDirectory(prefix="kaggriculture-inference-eq-") as name:
+        staged = Path(name) / Path(__file__).name
+        staged.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
+        reference_dump = Path(name) / "inference-equivalence-reference.json"
+        shared = [
+            "--artifact",
+            str(Path(args.artifact).resolve()),
+            "--games",
+            str(args.games),
+            "--steps",
+            str(args.steps),
+            "--seed-start",
+            str(args.seed_start),
+            "--driver-seed",
+            str(args.driver_seed),
+        ]
+        if args.agent is not None:
+            shared.extend(["--agent", str(args.agent)])
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(tree / "src")
+        completed = subprocess.run(
+            [sys.executable, str(staged), *shared, "--dump", str(reference_dump)],
+            cwd=tree,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise SystemExit(
+                f"reference tree dump failed:\n{completed.stdout}\n{completed.stderr}"
+            )
+        reference = json.loads(reference_dump.read_text(encoding="utf-8"))
     candidate = _dump(args)
     failures = _compare(reference, candidate, INFERENCE_SURFACES)
+
     artifact = Path(args.artifact).resolve()
     # The witness is only usable if it names which pair of trees it measured and
     # which artifact it drove, so a reader -- and `require_source_identity` -- can

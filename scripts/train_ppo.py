@@ -6,15 +6,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import torch
@@ -40,12 +47,6 @@ from kaggriculture.league import (
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
-from kaggriculture.orientation import (
-    Orientation,
-    member_orientation,
-    movement_permutation,
-    row_orientations,
-)
 from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
@@ -1602,7 +1603,7 @@ def _population_state_sample(
     rollout: RolloutBatch,
     generator: np.random.Generator,
     device: torch.device,
-) -> tuple[tuple[Any, ...], torch.Tensor, torch.Tensor, np.ndarray]:
+) -> tuple[tuple[Any, ...], torch.Tensor, torch.Tensor]:
     """One shared batch of states, as forward arguments plus unit mask and active.
 
     Only slots the collector marked valid hold a decision -- an episode that ended
@@ -1610,9 +1611,9 @@ def _population_state_sample(
     score every member on stale padding and pull the reading toward whatever that
     padding happens to contain.
 
-    The sampled rows' orientation codes come back too: stored masks are striped
-    by each row's collecting member's orientation, and the comparison needs the
-    real-action columns underneath.
+    Stored features and masks already live in the game's oriented frame. Every
+    member is forwarded on that same frame, so the disagreement comparison
+    stays in that shared label space.
     """
     valid = np.flatnonzero(np.asarray(rollout.valid).reshape(-1))
     index = generator.permutation(valid)[:POPULATION_DISAGREEMENT_STATES]
@@ -1627,41 +1628,7 @@ def _population_state_sample(
     states = {name: sampled(value) for name, value in fields.items()}
     masks = torch.as_tensor(sampled(rollout.unit_masks)).to(device=device, dtype=torch.bool)
     active = torch.as_tensor(sampled(rollout.unit_active)).to(device=device, dtype=torch.bool)
-    # `index` addresses the flattened decision space, row-major over
-    # trajectories then horizon, so a slot's member is its trajectory's agent
-    # repeated once per horizon step.
-    per_slot_agents = np.repeat(np.asarray(rollout.agents).reshape(-1), rollout.horizon)
-    codes = row_orientations(per_slot_agents[index])
-    return actor_forward_args(rollout.architecture, states, device), masks, active, codes
-
-
-def _population_real_space(
-    logits: Sequence[torch.Tensor], masks: torch.Tensor, codes: np.ndarray
-) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Restripe oriented movement columns onto the real actions they execute.
-
-    Member i's logits live in member i's orientation label space and each
-    sampled row's mask is striped by its collecting member's orientation, so a
-    raw argmax comparison would count two members picking the same physical
-    move under opposite names as disagreeing. Every movement permutation here
-    is its own inverse, so one gather per code maps oriented column c onto the
-    real action it executes on both sides; identity codes index unchanged and
-    an all-identity population passes through untouched.
-    """
-    real_logits = []
-    for member, member_logits in enumerate(logits):
-        permutation = torch.as_tensor(
-            movement_permutation(member_orientation(member)), device=member_logits.device
-        )
-        real_logits.append(member_logits[..., permutation])
-    real_masks = masks.clone()
-    for code in np.unique(codes):
-        permutation = torch.as_tensor(
-            movement_permutation(Orientation(int(code))), device=masks.device
-        )
-        rows = torch.as_tensor(np.flatnonzero(codes == code), device=masks.device)
-        real_masks[rows] = masks[rows][..., permutation]
-    return real_logits, real_masks
+    return actor_forward_args(rollout.architecture, states, device), masks, active
 
 
 def _population_disagreement(
@@ -1669,14 +1636,14 @@ def _population_disagreement(
     forward_args: tuple[Any, ...],
     masks: torch.Tensor,
     active: torch.Tensor,
-    codes: np.ndarray,
 ) -> torch.Tensor:
     """The N x N greedy-disagreement matrix over one shared batch of states.
 
     Scored in evaluation mode and restored afterwards: the measurement is about
     which program each member runs, and a train-mode forward would fold whatever
     stochastic layers the family has into a number the gate treats as structural.
-    Members emit oriented logits, so the comparison runs in real-action space.
+    Every member sees the same oriented features, so their logits already share
+    a label space and need no per-member remapping.
     """
     training = [actor.training for actor in actors]
     try:
@@ -1687,8 +1654,9 @@ def _population_disagreement(
     finally:
         for actor, mode in zip(actors, training, strict=True):
             actor.train(mode)
-    real_logits, real_masks = _population_real_space(logits, masks, codes)
-    return population_disagreement(real_logits, real_masks, active)
+    return population_disagreement(logits, masks, active)
+
+
 
 
 def _validate_population_reference(value: object) -> float:
@@ -1789,6 +1757,9 @@ def _population_outcomes(rollout: RolloutBatch, population: int) -> dict[str, fl
 
 
 def main() -> None:
+    torch.set_num_threads(1)
+    with suppress(RuntimeError):
+        torch.set_num_interop_threads(1)
     args = parse_args()
     _validate_args(args)
     _resolve_external_eval_opponents(args)
@@ -2234,16 +2205,16 @@ def main() -> None:
             )
             # Measured before the update, so iteration 0 records what these
             # initializations were rather than what one update already left.
-            forward_args, unit_masks, unit_active, orientation_codes = (
-                _population_state_sample(rollout, generator, device)
+            forward_args, unit_masks, unit_active = _population_state_sample(
+                rollout, generator, device
             )
             disagreement = _population_disagreement(
                 [member.actor for member in members],
                 forward_args,
                 unit_masks,
                 unit_active,
-                orientation_codes,
             )
+
             mean_disagreement = mean_off_diagonal(disagreement)
             if population_reference is None:
                 population_reference = mean_disagreement

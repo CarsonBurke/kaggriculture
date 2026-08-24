@@ -37,8 +37,9 @@ from kaggriculture.orientation import (
     orient_unit_features,
     orient_unit_logits,
     orient_unit_masks,
-    row_orientations,
+    seat_orientations,
 )
+
 from kaggriculture.policy import PolicyStep, act_batch
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
@@ -95,6 +96,10 @@ class RolloutBatch:
     # the update partitions on it so one member's advantage scale never
     # normalizes another's.
     agents: np.ndarray
+    # Per-trajectory board symmetry. Both seats of a game share one code;
+    # games cycle identity / mirror-x / mirror-y / rotate-180. Mixed and
+    # Python collectors store zeros (identity).
+    orientations: np.ndarray
     entropy_sums: np.ndarray
     elapsed_seconds: float
 
@@ -259,6 +264,7 @@ def _finish_rollout(
         opponent_money=opponent_money,
         seats=seats,
         agents=agents,
+        orientations=np.zeros(agents.shape[0], dtype=np.int8),
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -995,8 +1001,12 @@ def _native_batch(
     agents: np.ndarray,
     entropy_sums: np.ndarray,
     started: float,
+    orientations: np.ndarray | None = None,
 ) -> RolloutBatch:
+
     state_names = set(_state_field_specs(architecture))
+    if orientations is None:
+        orientations = np.zeros(agents.shape[0], dtype=np.int8)
     return RolloutBatch(
         architecture=architecture,
         states={name: array for name, array in fields.items() if name in state_names},
@@ -1006,6 +1016,7 @@ def _native_batch(
         opponent_money=opponent_money,
         seats=seats,
         agents=agents,
+        orientations=orientations,
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -1438,14 +1449,17 @@ def collect_population_play_rust(
     The balanced schedule gives every member exactly the same number of rows,
     so the lanes need none of the padding an uneven league mix needs.
 
-    Each member plays under its fixed `member_orientation`: every step the
-    encoder output is flipped into that member's frame before the forward, and
-    the oriented movement logits are restriped back to real-action columns for
-    the native sampler. Storage keeps the unit factors in the oriented label
-    space, so a row's stored features, masks and actions replay consistently
-    through its own member. Only the convolutional entity encoding has an
-    orientation mapping; a structured population with non-identity members is
-    refused up front.
+    Each game plays under one board symmetry, cycling identity / mirror-x /
+    mirror-y / rotate-180, and both seats share that game's frame. Every
+    step the encoder output is flipped into the game's frame before the
+    forward, and the oriented movement logits are restriped back to
+    real-action columns for the native sampler. Storage keeps the unit
+    factors in the oriented label space, so a row's stored features, masks
+    and actions replay consistently through whichever member collected
+    them. Only the convolutional entity encoding has an orientation
+    mapping; a structured population that would cycle non-identity frames
+    is refused up front.
+
 
     Rollouts capture only behavior policy state. Value predictions for GAE are
     replayed from the stored features at update time, where the critic weights
@@ -1474,19 +1488,17 @@ def collect_population_play_rust(
 
     # The native wave is already game-major and seat-minor, so the schedule
     # flattens straight into the per-row agent index the sampler wants as its
-    # quantity-head selector and the update wants as its partition.
+    # lane. One symmetry per game, both seats sharing it, cycling all four
+    # frames so every member sees every rendering.
     agents = pairings.reshape(-1)
-    # Each member plays under its fixed orientation, so every row carries one.
-    # Only the convolutional entity encoding has an orientation mapping: the
-    # structured token encoding has no defined flip yet, so refuse the mix
-    # before any simulator state exists rather than misread it per row later.
-    codes = row_orientations(agents)
+    codes = seat_orientations(games)
     if architecture != CONV_ENTITY and (codes != int(Orientation.IDENTITY)).any():
         raise ValueError(
-            "member orientations have no mapping in the structured encoding yet; "
-            "a population with non-identity members needs the convolutional "
+            "game orientations have no mapping in the structured encoding yet; "
+            "a population that cycles non-identity frames needs the convolutional "
             "entity architecture"
         )
+
 
     seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
@@ -1533,10 +1545,10 @@ def collect_population_play_rust(
     for step in range(horizon):
         encoded_wave.refresh(environment)
         # refresh() re-encodes every array straight from the simulator, so the
-        # members' orientations have to be re-applied every step before
-        # anything reads them: this one pass feeds the device upload, hence the
-        # forward, and _store_native_wave below copies these same oriented rows
-        # into storage.
+        # game's orientation has to be re-applied every step before anything
+        # reads it: this one pass feeds the device upload, hence the forward,
+        # and _store_native_wave below copies these same oriented rows into
+        # storage.
         orient_boards(encoded["board"], codes)
         orient_unit_features(encoded["units"], encoded["unit_positions"], codes)
         encoded_wave.copy_to_device()
@@ -1619,6 +1631,7 @@ def collect_population_play_rust(
         opponent_money=np.array(final[:, ::-1].reshape(-1)),
         seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
         agents=agents,
+        orientations=codes,
         entropy_sums=entropy_sums,
         started=started,
     )
@@ -1952,8 +1965,10 @@ _TRAJECTORY_METADATA_FIELDS = (
     "opponent_money",
     "seats",
     "agents",
+    "orientations",
     "entropy_sums",
 )
+
 
 
 def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:

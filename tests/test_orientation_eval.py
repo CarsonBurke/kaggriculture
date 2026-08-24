@@ -18,14 +18,13 @@ from kaggriculture.inference import (
 )
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.orientation import (
-    MEMBER_ORIENTATIONS,
     Orientation,
     flip_board,
-    member_orientation,
     movement_permutation,
     orient_unit_features,
     orient_unit_masks,
 )
+
 from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.policy import _sample_numpy_categorical, act_batch, stack_encoded
 from kaggriculture.provenance import source_identity
@@ -203,7 +202,11 @@ def test_act_batch_rejects_orientation_for_structured_actors() -> None:
 
 
 def test_checkpoint_round_trip_preserves_member_orientations(tmp_path) -> None:
-    """Every member's code survives a save/load cycle, stamped from its index."""
+    """Every member's code survives a save/load cycle as identity.
+
+    Training cycles frames per game; evaluation plays the real board, so
+    the payload records identity beside each member's weights.
+    """
     model_config = _small_config()
     ppo_config = PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
     agents = []
@@ -226,12 +229,10 @@ def test_checkpoint_round_trip_preserves_member_orientations(tmp_path) -> None:
     )
 
     payload = load_checkpoint(path, agents, device=torch.device("cpu"))
-    assert checkpoint_member_orientations(payload) == [
-        member_orientation(index) for index in range(len(agents))
-    ]
-    assert [member["orientation"] for member in payload["agents"]] == [
-        int(value) for value in MEMBER_ORIENTATIONS[:2]
-    ]
+    assert checkpoint_member_orientations(payload) == [Orientation.IDENTITY] * len(agents)
+    assert [member["orientation"] for member in payload["agents"]] == [0, 0]
+
+
 
     # A single learner keeps its code at the top level, beside its states.
     single = checkpoint_payload(
@@ -294,8 +295,8 @@ def test_resume_treats_an_absent_orientation_as_identity(tmp_path) -> None:
     load_checkpoint(path, readers, device=torch.device("cpu"))
 
 
-def test_exported_artifact_carries_the_source_members_orientation() -> None:
-    """The artifact records whose rendering it ships; legacy reads as identity."""
+def test_exported_artifact_plays_the_real_board() -> None:
+    """Export stamps identity even when the source member recorded a flip."""
     model_config = _small_config()
     actor = FarmActor(model_config)
     population = {
@@ -308,10 +309,10 @@ def test_exported_artifact_carries_the_source_members_orientation() -> None:
         ],
     }
     assert actor_artifact_from_checkpoint(population, agent=0)["orientation"] == int(
-        Orientation.MIRROR_Y
+        Orientation.IDENTITY
     )
     assert actor_artifact_from_checkpoint(population, agent=1)["orientation"] == int(
-        Orientation.ROTATE_180
+        Orientation.IDENTITY
     )
 
     legacy = {
@@ -324,7 +325,7 @@ def test_exported_artifact_carries_the_source_members_orientation() -> None:
     assert artifact["orientation"] == int(Orientation.IDENTITY)
 
 
-def test_checkpoint_agent_plays_under_the_recorded_orientation(tmp_path) -> None:
+def test_checkpoint_agent_plays_the_real_board(tmp_path) -> None:
     model_config = _small_config()
     actor = FarmActor(model_config)
     path = tmp_path / "model.pt"
@@ -341,4 +342,4 @@ def test_checkpoint_agent_plays_under_the_recorded_orientation(tmp_path) -> None
         path,
     )
 
-    assert CheckpointAgent(path).orientation == Orientation.MIRROR_X
+    assert CheckpointAgent(path).orientation == Orientation.IDENTITY

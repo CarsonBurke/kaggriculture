@@ -1,12 +1,14 @@
-"""Per-member orientation behavior of the population rollout collector.
+"""Per-game orientation behavior of the population rollout collector.
 
-The collector flips every row's encoder output into its member's frame before
-the forward, restripes the oriented movement logits back to real-action columns
-for the Rust sampler, and stores the unit factors in oriented space. These
-tests pin the three contracts that make the PPO replay path work unchanged:
-identity is bit-for-bit the pre-orientation collector, stored factors are the
-oriented images of the real sample, and non-convolutional populations are
-refused rather than misread.
+The collector flips every row's encoder output into its *game's* frame
+before the forward, restripes the oriented movement logits back to real-action
+columns for the Rust sampler, and stores the unit factors in oriented space.
+Both seats of a game share the frame; games cycle all four symmetries so
+every member sees every rendering. These tests pin the contracts that make
+the PPO replay path work unchanged: identity is bit-for-bit the
+pre-orientation collector, stored factors are the oriented images of the
+real sample, and non-convolutional populations are refused rather than
+misread.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from kaggriculture.orientation import (
     orient_unit_logits,
     orient_unit_masks,
     row_orientations,
+    seat_orientations,
 )
 from kaggriculture.rollout import (
     RolloutBatch,
@@ -47,7 +50,7 @@ _WEIGHT_SEED = 20260821
 
 
 def _collect_population_wave() -> tuple[list[FarmActor], RolloutBatch]:
-    """One tiny deterministic two-member wave: member 1 plays mirrored in x."""
+    """One tiny deterministic two-member wave: game 1 plays mirrored in x."""
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(_WEIGHT_SEED)
         actors = [FarmActor(_CONFIG) for _ in range(2)]
@@ -60,10 +63,17 @@ def _collect_population_wave() -> tuple[list[FarmActor], RolloutBatch]:
     return actors, rollout
 
 
+
+
 def _assert_batches_identical(first: RolloutBatch, second: RolloutBatch) -> None:
-    """Every stored buffer of two waves agrees exactly; timing is not a buffer."""
+    """Every stored buffer of two waves agrees exactly; timing is not a buffer.
+
+    ``orientations`` is the assignment, not a collected buffer: an
+    all-identity force and a pass-through of the real cycle write different
+    codes for the same features.
+    """
     for field in fields(RolloutBatch):
-        if field.name in ("architecture", "elapsed_seconds"):
+        if field.name in ("architecture", "elapsed_seconds", "orientations"):
             continue
         if field.name == "states":
             for name, array in first.states.items():
@@ -72,8 +82,17 @@ def _assert_batches_identical(first: RolloutBatch, second: RolloutBatch) -> None
             np.testing.assert_array_equal(getattr(first, field.name), getattr(second, field.name))
 
 
+
+
+def test_seat_orientations_repeat_each_game_code() -> None:
+    codes = seat_orientations(5)
+    np.testing.assert_array_equal(codes, [0, 0, 1, 1, 2, 2, 3, 3, 0, 0])
+
+
 def test_identity_orientation_reproduces_the_pre_orientation_path(monkeypatch) -> None:
     """All-identity codes leave every collection buffer byte-identical.
+
+
 
     Two readings of the same fixed wave. One forces the per-row codes to
     identity, which makes every orientation helper skip its rows entirely --
@@ -86,12 +105,13 @@ def test_identity_orientation_reproduces_the_pre_orientation_path(monkeypatch) -
 
     monkeypatch.setattr(
         rollout_module,
-        "row_orientations",
-        lambda agents: np.zeros(np.asarray(agents).size, dtype=np.int8),
+        "seat_orientations",
+        lambda games: np.zeros(games * 2, dtype=np.int8),
     )
     _actors, identity_run = _collect_population_wave()
 
-    monkeypatch.setattr(rollout_module, "row_orientations", row_orientations)
+    monkeypatch.setattr(rollout_module, "seat_orientations", seat_orientations)
+
     monkeypatch.setattr(rollout_module, "orient_boards", lambda board, codes: board)
     monkeypatch.setattr(
         rollout_module, "orient_unit_features", lambda units, positions, codes: None
@@ -154,18 +174,20 @@ def test_stored_factors_are_the_oriented_images_of_the_real_sample() -> None:
         np.testing.assert_allclose(behavior, replayed, rtol=1e-6, atol=1e-7)
 
 
-def test_mirror_member_rows_replay_from_their_stored_factors() -> None:
-    """The mirrored member's stored likelihoods reproduce from its own storage.
+def test_mirror_game_rows_replay_from_their_stored_factors() -> None:
+    """Mirrored-game stored likelihoods reproduce from their own storage.
 
     End-to-end version of the synthetic consistency above: a real wave where
-    member 1 collects every row mirrored in x. Its stored features, masks and
+    game 1 collects both seats mirrored in x. Stored features, masks and
     actions must form one consistent oriented label space -- replaying them
-    through its own weights reproduces the stored log-probabilities, while any
-    real/oriented mix-up in storage would show up as a mismatch.
+    through the collecting member's weights reproduces the stored
+    log-probabilities, while any real/oriented mix-up in storage would show
+    up as a mismatch.
     """
     actors, rollout = _collect_population_wave()
 
-    codes = row_orientations(rollout.agents)
+    codes = np.asarray(rollout.orientations)
+    np.testing.assert_array_equal(codes, seat_orientations(_GAMES))
     mirror_rows = np.flatnonzero(codes == int(Orientation.MIRROR_X))
     assert mirror_rows.tolist() != [] and set(codes[mirror_rows]) == {int(Orientation.MIRROR_X)}
     for row in mirror_rows:
@@ -174,13 +196,28 @@ def test_mirror_member_rows_replay_from_their_stored_factors() -> None:
         )
 
 
-def test_structured_wave_refuses_non_identity_members() -> None:
+def test_both_seats_of_a_game_share_one_orientation() -> None:
+    """A game's two seats see the same frame; adjacent games cycle."""
+    _actors, rollout = _collect_population_wave()
+    codes = np.asarray(rollout.orientations)
+    assert codes.shape == (2 * _GAMES,)
+    for game in range(_GAMES):
+        assert codes[2 * game] == codes[2 * game + 1]
+    assert set(int(code) for code in codes) == {0, 1}
+    assert set(int(agent) for agent in rollout.agents[:2]) == {0, 1}
+    assert set(int(agent) for agent in rollout.agents[2:4]) == {0, 1}
+
+
+
+
+def test_structured_wave_refuses_non_identity_frames() -> None:
     """The structured token encoding has no flip, so the collector refuses it.
 
-    Fires before any simulator state exists: a structured population with
-    non-identity members would otherwise silently feed unflipped boards to a
-    policy trained on flipped ones.
+    Fires before any simulator state exists: a structured population that
+    would cycle non-identity games would otherwise silently feed unflipped
+    boards to a policy trained on flipped ones.
     """
+
     config = StructuredConfig(
         model_dim=16,
         attention_heads=2,

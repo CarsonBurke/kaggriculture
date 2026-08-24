@@ -27,20 +27,29 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 import zlib
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import torch
 
 from kaggriculture.encoding import encode_observation
+from kaggriculture.orientation import ORIENTATION_CYCLE, augment_demonstration_rows
+
 from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
 from kaggriculture.latent_dynamics import (
     DecodeContext,
@@ -253,9 +262,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
-        "--encode-workers", type=int, default=8, help="processes for observation encoding"
+        "--encode-workers",
+        type=int,
+        default=2,
+        help=(
+            "processes for observation encoding; each worker is pinned to one "
+            "host thread so this is the actual core count, not cores times BLAS"
+        ),
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help="intra-op threads for the parent and each encode worker",
     )
     return parser.parse_args()
+
+
+def _pin_host_threads(threads: int = 1) -> None:
+    """Stop BLAS/PyTorch from multiplying across encode workers.
+
+    A worker that inherits the default intra-op pool (one thread per core)
+    turns `--encode-workers N` into N times cores runnable threads.
+    """
+    threads = max(1, int(threads))
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+    with suppress(RuntimeError):
+        torch.set_num_interop_threads(1)
 
 
 @dataclass
@@ -366,7 +403,14 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
     for position, member in enumerate(members):
         span = member["unit_actions"].shape[0]
         for name, value in member.items():
+            expected = (span, *stacked[name].shape[1:])
+            if value.shape != expected:
+                raise ValueError(
+                    f"{name} has shape {value.shape}, expected {expected}; "
+                    "re-extract every dataset after an action-space change"
+                )
             stacked[name][offset : offset + span] = value
+
         components[offset : offset + span] = sum(
             member[name].astype(np.float64).sum(axis=1)
             for name in ("unit_active", "market_active", "market_quantity_active")
@@ -389,6 +433,7 @@ def load_dataset(
     architecture: str,
     holdout_seeds: int,
     encode_workers: int,
+    torch_threads: int = 1,
     seeds_per_dataset: int | None = None,
 ) -> tuple[DemonstrationTensors, DemonstrationTensors, list[dict[str, Any]]]:
     """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
@@ -467,8 +512,15 @@ def load_dataset(
 
     paths = [str(directory / entry["file"]) for _, directory, entry in entries]
     encode = partial(_encode_episode_file, architecture_name=architecture)
-    if encode_workers > 1:
-        with ProcessPoolExecutor(max_workers=encode_workers) as pool:
+    if encode_workers < 1:
+        raise ValueError("encode workers must be positive")
+    workers = min(encode_workers, len(paths))
+    if workers > 1:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_pin_host_threads,
+            initargs=(torch_threads,),
+        ) as pool:
             encoded = list(pool.map(encode, paths, chunksize=1))
     else:
         encoded = [encode(path) for path in paths]
@@ -481,8 +533,32 @@ def load_dataset(
     # list itself -- but it is what lets `stage` below release each episode as it
     # copies it, instead of the corpus being reachable from two places at once.
     encoded.clear()
-
     return _stage_split(splits[False]), _stage_split(splits[True]), records
+
+
+def _orient_host_batch(rows: dict[str, torch.Tensor], rng: np.random.Generator) -> None:
+
+    """Apply one sampled symmetry per episode-seat, in place on the host gather.
+
+    Holdout stays identity so the reported clone score is the real board.
+    Training cycles all four frames so a warm-started member is not seeing
+    a flipped farm for the first time in self-play.
+    """
+    if "board" not in rows:
+        return
+    episode = rows["episode_index"].detach().cpu().numpy()
+    codes = np.zeros(episode.shape[0], dtype=np.int8)
+    for ep in np.unique(episode):
+        codes[episode == ep] = int(rng.integers(0, len(ORIENTATION_CYCLE)))
+    if not np.any(codes):
+        return
+    arrays = {
+        name: rows[name].detach().cpu().numpy().copy()
+        for name in ("board", "units", "unit_positions", "unit_actions", "unit_masks")
+    }
+    augment_demonstration_rows(arrays, codes)
+    for name, array in arrays.items():
+        rows[name] = torch.from_numpy(np.ascontiguousarray(array))
 
 
 def _batch(
@@ -490,6 +566,7 @@ def _batch(
     tensors: DemonstrationTensors,
     indices: torch.Tensor | slice,
     device: torch.device,
+    orientation_rng: np.random.Generator | None = None,
 ) -> tuple[tuple[Any, ...], dict[str, torch.Tensor]]:
     """One minibatch of actor forward arguments plus teacher-forced factors.
 
@@ -498,10 +575,10 @@ def _batch(
     accelerator through the same helpers the PPO update uses, so the bus
     carries fp16 and int8 rather than the fp32 and int64 they become.
     """
-    rows = {
-        name: _batch_tensor(value, indices).to(device, non_blocking=True)
-        for name, value in tensors.staged.items()
-    }
+    rows = {name: _batch_tensor(value, indices) for name, value in tensors.staged.items()}
+    if orientation_rng is not None:
+        _orient_host_batch(rows, orientation_rng)
+    rows = {name: value.to(device, non_blocking=True) for name, value in rows.items()}
     whole = slice(None)
     actor_args = _actor_batch_args(architecture, rows, whole)
     factors = {
@@ -902,9 +979,13 @@ def train(
     seed: int,
     device: torch.device,
     encode_workers: int,
+    torch_threads: int = 1,
     seeds_per_dataset: int | None = None,
 ) -> dict[str, float]:
     """Run the full clone; returns the best holdout metrics."""
+    if torch_threads < 1:
+        raise ValueError("torch threads must be positive")
+    _pin_host_threads(torch_threads)
     if epochs < 1 or patience < 1 or batch_size < 1 or run_length < 1:
         raise ValueError("epochs, patience, batch size, and run length must be positive")
     # Checked before the corpus is staged, which takes minutes: a typo'd mode
@@ -957,12 +1038,15 @@ def train(
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     generator = torch.Generator(device="cpu").manual_seed(seed)
+    orientation_rng = np.random.default_rng(seed)
+
 
     train_split, holdout_split, datasets = load_dataset(
         dataset_dirs,
         architecture=architecture,
         holdout_seeds=holdout_seeds,
         encode_workers=encode_workers,
+        torch_threads=torch_threads,
         seeds_per_dataset=seeds_per_dataset,
     )
     print(
@@ -1044,6 +1128,7 @@ def train(
     identity = source_identity()
 
     best = math.inf
+
     best_metrics: dict[str, float] = {}
     stale = 0
     # The journal stays the durable append-only record the mirror rebuilds
@@ -1068,7 +1153,15 @@ def train(
             epoch_components = 0.0
             latent_sums = dict.fromkeys(_LATENT_FIELDS, 0.0)
             for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
-                actor_args, factors = _batch(architecture, train_split, order[indices], device)
+                actor_args, factors = _batch(
+                    architecture,
+                    train_split,
+                    order[indices],
+                    device,
+                    orientation_rng=orientation_rng,
+                )
+
+
                 if dynamics is None:
                     loss = clone_loss(actor, actor_args, factors, autocast)
                 else:
@@ -1196,6 +1289,7 @@ def main() -> None:
         seed=args.seed,
         device=torch.device(args.device),
         encode_workers=args.encode_workers,
+        torch_threads=args.torch_threads,
     )
 
 

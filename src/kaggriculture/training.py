@@ -18,7 +18,8 @@ from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
-from kaggriculture.orientation import Orientation, member_orientation
+from kaggriculture.orientation import Orientation
+
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
@@ -327,15 +328,15 @@ def checkpoint_payload(
         for agent in agents
     ):
         raise ValueError(f"every checkpointed agent needs exactly {AGENT_STATE_KEYS}")
-    # Member i trains under MEMBER_ORIENTATIONS[i % 4], so the payload records
-    # the code beside each member's weights: evaluation and submission replay
-    # the rendering the member actually saw. A writer that stamped its own is
-    # left alone; everything else gets the index-derived truth.
+    # Evaluation and submission play the real board. Training cycles
+    # symmetries per game, so a member has no private frame to record.
+    # Identity is the code inference applies when it is asked to play.
     oriented = []
-    for index, agent in enumerate(agents):
+    for agent in agents:
         entry = dict(agent)
-        entry.setdefault("orientation", int(member_orientation(index)))
+        entry.setdefault("orientation", int(Orientation.IDENTITY))
         oriented.append(entry)
+
     if len(oriented) == 1:
         # A single learner's payload is byte-for-byte what it has always been:
         # the four states at the top level and no population list, so every

@@ -10,14 +10,15 @@ from typing import Any
 import torch
 from torch import nn
 
-from kaggriculture.policy import act_batch
 from kaggriculture.orientation import Orientation
+from kaggriculture.policy import act_batch
 from kaggriculture.provenance import (
     is_legacy_run_provenance,
     validate_run_provenance,
     validate_source_identity,
 )
 from kaggriculture.registry import resolve_architecture
+
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # Version 12 records each member's `orientation`: the grid symmetry its
@@ -122,13 +123,12 @@ def _orientation_code(value: Any) -> Orientation:
 
 
 def checkpoint_orientation(checkpoint: Mapping[str, Any], agent: int | None = None) -> Orientation:
-    """The grid symmetry the checkpoint's member trains and plays under.
+    """Historical per-member code, ignored at play time.
 
-    A population member carries its code beside its weights; a single learner
-    keeps one at the top level. Payloads that predate the field read as
-    IDENTITY, which is exactly what those runs played under -- the code is
-    recorded so a reader can replay the rendering, not to distinguish old
-    weights from new ones.
+    Older population checkpoints stamped member *i*'s cycle index beside its
+    weights. Training now cycles frames per game and evaluation always plays
+    the real board, so this reader exists only to keep old files loadable.
+    Callers that act must use ``Orientation.IDENTITY``.
     """
     members = checkpoint.get(POPULATION_CHECKPOINT_KEY)
     if isinstance(members, list):
@@ -144,6 +144,8 @@ def checkpoint_orientation(checkpoint: Mapping[str, Any], agent: int | None = No
             "does not name anything in it"
         )
     return _orientation_code(checkpoint.get("orientation", 0))
+
+
 
 
 def actor_artifact_from_checkpoint(
@@ -182,10 +184,9 @@ def actor_artifact_from_checkpoint(
         "metrics": checkpoint.get("metrics", {}),
         "source_identity": identity,
         "run_provenance": run_provenance,
-        # The symmetry the weights were rendered under. Exporting without it
-        # would ship an actor that plays a different game than the one that
-        # trained it, so the code travels with the weights it describes.
-        "orientation": int(checkpoint_orientation(checkpoint, agent)),
+        # Evaluation is the real board. A stored member code is history.
+        "orientation": int(Orientation.IDENTITY),
+
     }
 
 
@@ -237,22 +238,74 @@ class CheckpointAgent:
         *,
         device: torch.device | str = "cpu",
         torch_threads: int = 1,
+        agent: int | None = None,
     ) -> None:
         if torch_threads > 0:
             torch.set_num_threads(torch_threads)
             with suppress(RuntimeError):
                 # PyTorch only permits changing this before the first parallel op.
                 torch.set_num_interop_threads(1)
-        self.actor, self.metadata = load_actor_artifact(artifact, device)
-        # An artifact exported from a v12 checkpoint records the symmetry its
-        # member trained under; anything older predates the field and reads as
-        # identity. Playing without it would silently re-render the world.
-        self.orientation = _orientation_code(self.metadata.get("orientation", 0))
+        self.actor, self.metadata = load_actor_artifact(artifact, device, agent=agent)
+        self.member = agent
+
+        # Training may have cycled frames; the competition board is identity.
+        # A stored member code on a legacy artifact is ignored.
+        self.orientation = Orientation.IDENTITY
 
     def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(
+        action = act_batch(
             self.actor,
             [observation],
             deterministic=True,
             orientation=self.orientation,
         ).actions[0]
+        # The v16/v27 teachers DIG a weed only when an open-loop script wanted
+        # to plant or build there. A masked policy can never emit that intent:
+        # PLANT/BUILD are illegal on WEED, so the sampler never scores them,
+        # and BC cannot recover the hidden script bit. For a reactive agent
+        # the script-sync reason not to dig is gone — a weed underfoot is
+        # sterile land. Replace the standing command before the engine sees it.
+        return clear_standing_weeds(observation, action)
+
+
+
+def _tile_at(farm: dict[str, Any], position: Any) -> Any:
+    if not isinstance(position, (list, tuple)) or len(position) < 2:
+        return None
+    tiles = farm.get("tiles") or []
+    y = int(position[1])
+    x = int(position[0])
+    if y < 0 or y >= len(tiles) or x < 0 or x >= len(tiles[y]):
+        return None
+    return tiles[y][x]
+
+
+def _is_weed(tile: Any) -> bool:
+    return isinstance(tile, dict) and tile.get("kind") == "WEED"
+
+
+def clear_standing_weeds(
+    observation: dict[str, Any], action: dict[str, Any]
+) -> dict[str, Any]:
+    """Force DIG for every live unit standing on a weed.
+
+    Mutates and returns ``action``. Units the engine will not execute this
+    turn are left alone: a leftover hand command on a missing unit is not
+    a standing tile.
+    """
+    player = int(observation.get("player", 0) or 0)
+    farms = observation.get("farms") or []
+    if player >= len(farms) or not isinstance(action, dict):
+        return action
+    farm = farms[player]
+    if _is_weed(_tile_at(farm, farm.get("farmer"))):
+        action["farmer"] = ["DIG"]
+    hands = list(action.get("hands") or [])
+    positions = list(farm.get("hands") or [])
+    for index, position in enumerate(positions):
+        if index >= len(hands):
+            break
+        if _is_weed(_tile_at(farm, position)):
+            hands[index] = ["DIG"]
+    action["hands"] = hands
+    return action
