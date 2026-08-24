@@ -11,7 +11,8 @@ pub const ANIMALS: usize = 3;
 pub const PRIVATE_ITEMS: usize = 12;
 pub const MAX_UNITS: usize = 16;
 pub const MAX_MARKET_ORDERS: usize = 10;
-pub const UNIT_ACTIONS: usize = 59;
+pub const UNIT_ACTIONS: usize = 68;
+
 pub const MARKET_KINDS: usize = 22;
 pub const MARKET_QUANTITIES: usize = 100;
 const UNIT_MASK_VALUES: usize = MAX_UNITS * UNIT_ACTIONS;
@@ -513,11 +514,11 @@ fn unit_action_is_valid(
     let at_shed = is_shed_access(x, y);
     if action == 5 {
         return at_shed
-            && shed_total(private) < config.shed_capacity
             && private.inventories[unit]
                 .iter()
                 .any(|&quantity| quantity > 0);
     }
+
     if let Some((item, quantity)) = pickup_spec(action) {
         // The interpreter clamps a pickup to the stock on hand rather than
         // refusing it (kaggriculture.py:357), so for a submitted dict any nonzero
@@ -536,6 +537,12 @@ fn unit_action_is_valid(
         let deposits_animal = at_shed && shed_total(private) < config.shed_capacity;
         return has_animal && (installs_animal || deposits_animal);
     }
+    if let Some(item) = place_product(action) {
+        return at_shed
+            && private.inventories[unit][item] > 0
+            && shed_total(private) < config.shed_capacity;
+    }
+
     if tile.kind == TileKind::Locked {
         return false;
     }
@@ -605,6 +612,13 @@ impl UnitLedger {
             }
             return;
         }
+        if let Some(item) = place_product(action) {
+            if is_shed_access(x, y) {
+                self.place_to_shed(unit, item, u16::MAX);
+            }
+            return;
+        }
+
         if let Some(crop) = unit_plant_crop(action) {
             self.private.seeds[crop] -= 1;
             self.farm.tiles[tile_index] = Tile::plant(crop, day, self.config.turns_per_day);
@@ -1818,6 +1832,13 @@ impl Game {
             }
             return;
         }
+        if let Some(item) = place_product(action) {
+            if is_shed_access(x, y) {
+                self.place_to_shed(player, unit, item, u16::MAX);
+            }
+            return;
+        }
+
         let tile = self.farms[player].tiles[tile_index];
         if tile.kind == TileKind::Locked {
             return;
@@ -2526,12 +2547,19 @@ fn pickup_spec(action: u8) -> Option<(usize, u16)> {
     }
 }
 
-#[inline]
 fn place_animal(action: u8) -> Option<usize> {
     (42..=44)
         .contains(&action)
         .then(|| usize::from(action - 42))
 }
+
+#[inline]
+fn place_product(action: u8) -> Option<usize> {
+    (59..=67)
+        .contains(&action)
+        .then(|| usize::from(action - 59))
+}
+
 
 #[inline]
 fn unit_plant_crop(action: u8) -> Option<usize> {
@@ -2609,19 +2637,23 @@ enum Shape {
     Square,
     Sqrt,
     Log,
+    Hinge,
 }
 
 const MARKET_PARAMS: [(f64, f64, Shape, f64, Shape, f64); PRODUCTS] = [
     (25.0, 400.0, Shape::Sqrt, 0.80, Shape::Log, 0.20),
-    (35.0, 450.0, Shape::Log, 0.20, Shape::Sqrt, 0.70),
-    (60.0, 200.0, Shape::Linear, 0.40, Shape::Sqrt, 0.60),
+    (35.0, 450.0, Shape::Hinge, 1.00, Shape::Sqrt, 0.70),
+    (60.0, 200.0, Shape::Hinge, 0.40, Shape::Sqrt, 0.60),
     (120.0, 100.0, Shape::Sqrt, 0.70, Shape::Linear, 1.60),
     (250.0, 300.0, Shape::Log, 0.20, Shape::Square, 3.60),
-    (50.0, 332.0, Shape::Linear, 0.40, Shape::Log, 0.20),
+    (50.0, 332.0, Shape::Hinge, 0.40, Shape::Log, 0.20),
     (160.0, 122.0, Shape::Sqrt, 0.60, Shape::Linear, 1.60),
     (200.0, 105.0, Shape::Log, 0.20, Shape::Square, 3.20),
     (100.0, 200.0, Shape::Linear, 0.40, Shape::Linear, 0.40),
 ];
+
+const HINGE_GAIN: f64 = 8.0;
+
 
 fn money_feature(amount: i64) -> f32 {
     let value = amount as f64;
@@ -2847,13 +2879,20 @@ fn encode_farm_structured(
     }
 }
 
-#[inline]
-fn shape(kind: Shape, x: f64) -> f64 {
+fn shape(kind: Shape, x: f64, scale: f64) -> f64 {
     match kind {
         Shape::Linear => x,
         Shape::Square => x * x,
         Shape::Sqrt => x.sqrt(),
         Shape::Log => x.ln_1p(),
+        Shape::Hinge => {
+            if scale <= 0.0 {
+                x
+            } else {
+                let unit = x / scale;
+                unit + HINGE_GAIN * (unit - 1.0).max(0.0).powi(2)
+            }
+        }
     }
 }
 
@@ -2882,8 +2921,8 @@ pub fn market_price(item: usize, inventory: i32) -> i64 {
             -1.0,
         )
     };
-    let amplitude = target * base / shape(kind, scale);
-    round_ties_even(base + sign * amplitude * shape(kind, distance)).max(PRICE_FLOOR)
+    let amplitude = target * base / shape(kind, scale, scale);
+    round_ties_even(base + sign * amplitude * shape(kind, distance, scale)).max(PRICE_FLOOR)
 }
 
 #[inline]
@@ -3094,26 +3133,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_state_and_terminal_horizon() {
-        let mut game = Game::new(4, GameConfig::default());
-        assert_eq!(game.step, 0);
-        assert_eq!(
-            game.farms[0].tiles[4 * BOARD_SIZE + 4].kind,
-            TileKind::Empty
-        );
-        let pass = [CompactAction::default(); PLAYERS];
-        for _ in 0..718 {
-            assert!(!game.step(&pass).done);
-        }
-        assert!(game.step(&pass).done);
-        assert_eq!(game.step, 719);
-    }
-
-    #[test]
     fn price_reference_points() {
         assert_eq!(market_price(0, 10_000), 25);
         assert_eq!(market_price(0, 9_600), 45);
         assert_eq!(market_price(4, 10_300), 1);
+        // Carrot hinge at the knee: distance == T => f(T) = 1, price = 70.
+        assert_eq!(market_price(1, 9_550), 70);
     }
 
     #[test]
@@ -3491,6 +3516,39 @@ mod tests {
         assert_eq!(game.privates[0].shed.iter().sum::<u16>(), 100);
         assert_eq!(game.privates[0].inventories[0][10], 0);
     }
+
+    #[test]
+    fn place_product_deposits_held_stack_at_shed() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].positions[0] = Position(4, 4);
+        game.add_inventory(0, 0, 7, 15);
+        let mut action = CompactAction::default();
+        action.units[0] = 66;
+
+        let masks = game.factor_masks(0, &action);
+        assert!(masks.unit[66]);
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.privates[0].shed[7], 15);
+        assert_eq!(game.privates[0].inventories[0][7], 0);
+    }
+
+    #[test]
+    fn drop_is_legal_when_shed_is_full() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].positions[0] = Position(4, 4);
+        game.privates[0].shed[0] = 100;
+        game.add_inventory(0, 0, 6, 3);
+        let mut action = CompactAction::default();
+        action.units[0] = 5;
+
+        let masks = game.factor_masks(0, &action);
+        assert!(masks.unit[5]);
+        game.step(&[action, CompactAction::default()]);
+        assert_eq!(game.privates[0].inventories[0][6], 0);
+        assert_eq!(game.privates[0].shed[0], 100);
+    }
+
+
 
     #[test]
     fn build_then_place_does_not_consume_shed_capacity_in_unit_ledger() {

@@ -61,6 +61,43 @@ def test_place_shed_deposit_quantity_is_a_representability_gap() -> None:
         _canonical_unit_command(["PLACE", "GOOSE", 2])
 
 
+def test_place_product_deposit_projects_held_quantity() -> None:
+    observation = _observation()
+    observation["private"]["inventories"][0]["WOOL"] = 15
+    action = {"farmer": ["PLACE", "WOOL", 15], "hands": [], "market": []}
+
+    projected = _project(observation, action)
+
+    assert projected.unit_actions[0] == UnitAction.PLACE_WOOL
+    assert projected.canonical_action["farmer"] == ["PLACE", "WOOL", 15]
+
+
+def test_place_product_over_ask_clamps_to_held_like_the_engine() -> None:
+    observation = _observation()
+    observation["private"]["inventories"][0]["MILK"] = 3
+    action = {"farmer": ["PLACE", "MILK", 6], "hands": [], "market": []}
+
+    projected = _project(observation, action)
+
+    assert projected.unit_actions[0] == UnitAction.PLACE_MILK
+    assert projected.canonical_action["farmer"] == ["PLACE", "MILK", 3]
+
+
+def test_zero_quantity_market_order_is_discarded() -> None:
+    observation = _observation()
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [["BUY_SEED", "CARROT", 0], ["HIRE"]],
+    }
+
+    projected = _project(observation, action)
+
+    assert projected.canonical_action["market"] == [["HIRE"]]
+
+
+
+
 def test_pickup_without_quantity_defaults_to_one() -> None:
     observation = _observation()
     observation["private"]["shed"]["WHEAT"] = 5

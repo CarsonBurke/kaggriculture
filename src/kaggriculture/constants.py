@@ -90,20 +90,22 @@ MARKET_PARAMS = {
         "base": 35,
         "I0": MARKET_I0,
         "T": 450,
-        "below_func": "log",
-        "below_target": 0.20,
+        "below_func": "hinge",
+        "below_target": 1.00,
         "above_func": "sqrt",
         "above_target": 0.70,
     },
+
     "TOMATO": {
         "base": 60,
         "I0": MARKET_I0,
         "T": 200,
-        "below_func": "linear",
+        "below_func": "hinge",
         "below_target": 0.40,
         "above_func": "sqrt",
         "above_target": 0.60,
     },
+
     "STRAWBERRY": {
         "base": 120,
         "I0": MARKET_I0,
@@ -126,11 +128,12 @@ MARKET_PARAMS = {
         "base": 50,
         "I0": MARKET_I0,
         "T": 332,
-        "below_func": "linear",
+        "below_func": "hinge",
         "below_target": 0.40,
         "above_func": "log",
         "above_target": 0.20,
     },
+
     "MILK": {
         "base": 160,
         "I0": MARKET_I0,
@@ -178,7 +181,10 @@ FARMER_MOVES = {
 }
 
 
-def _market_shape(function: str, value: float) -> float:
+HINGE_GAIN = 8.0
+
+
+def _market_shape(function: str, value: float, scale: float | None = None) -> float:
     value = max(0.0, value)
     if function == "linear":
         return value
@@ -190,6 +196,11 @@ def _market_shape(function: str, value: float) -> float:
         return math.log1p(value)
     if function == "log10":
         return math.log10(1.0 + value)
+    if function == "hinge":
+        if scale is None or scale <= 0.0:
+            return value
+        unit = value / scale
+        return unit + HINGE_GAIN * max(0.0, unit - 1.0) ** 2
     return value
 
 
@@ -208,14 +219,20 @@ def market_price(
     if inventory < initial_inventory:
         function = str(pricing["below_func"])
         target = float(pricing["below_target"])
-        amplitude = target * base / _market_shape(function, scale)
-        price = base + amplitude * _market_shape(function, initial_inventory - inventory)
+        amplitude = target * base / _market_shape(function, scale, scale)
+        price = base + amplitude * _market_shape(
+            function, initial_inventory - inventory, scale
+        )
     else:
         function = str(pricing["above_func"])
         target = float(pricing["above_target"])
-        amplitude = target * base / _market_shape(function, scale)
-        price = base - amplitude * _market_shape(function, inventory - initial_inventory)
+        amplitude = target * base / _market_shape(function, scale, scale)
+        price = base - amplitude * _market_shape(
+            function, inventory - initial_inventory, scale
+        )
     return max(PRICE_FLOOR, round(price))
+
+
 
 
 def fibonacci_hire_cost(hires_today: int) -> int:

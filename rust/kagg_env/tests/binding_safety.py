@@ -14,6 +14,7 @@ from collections.abc import Callable
 
 import numpy as np
 
+from kaggriculture.actions import N_UNIT_ACTIONS
 from kaggriculture.rust_env import load_native
 
 BATCH = 2
@@ -23,7 +24,8 @@ RANK = 3
 
 def sampler_inputs() -> list[np.ndarray]:
     return [
-        np.zeros((ROWS, 16, 59), dtype=np.float32),
+        np.zeros((ROWS, 16, N_UNIT_ACTIONS), dtype=np.float32),
+
         np.zeros((ROWS, 10, 22), dtype=np.float32),
         np.zeros((ROWS, 10, RANK), dtype=np.float32),
         np.zeros((1, 22, RANK), dtype=np.float32),

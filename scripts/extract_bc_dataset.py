@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """Extract projected demonstration episodes from official public-v16 games.
 
-Runs complete kaggle_environments episodes with the public v16 teacher in the
-recorded seat(s), projects every recorded engine action through the exact
-sequential legality ledger (`kaggriculture.demonstrations`), verifies the
-factored round trip against the recorded dict, and stores one compressed
-archive per episode-seat: raw observations (retokenizable for any future
+Runs complete kaggle_environments episodes with the teacher in both seats.
+Against a distinct opponent that means two games per seed (teacher first,
+then seats swapped). Against a copy of itself one game already has the
+teacher on both sides. Every recorded engine action is projected through
+the exact sequential legality ledger (`kaggriculture.demonstrations`),
+verified against the recorded dict, and stored as one compressed archive
+per episode-seat: raw observations (retokenizable for any future
 architecture), factored targets, teacher-forced masks, and active flags.
 
 Any representability gap or mask divergence aborts extraction with the
 offending step — silent clamping would corrupt the dataset. CPU-only.
 """
 
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import zlib
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 
@@ -53,10 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
+        default=4,
         help=(
             "parallel episode extractors; seeds are independent games, so this "
-            "divides wall time almost exactly and changes nothing in the output"
+            "divides wall time almost exactly and changes nothing in the output. "
+            "Each worker is one host thread; 8 used to saturate a shared box"
         ),
     )
     parser.add_argument(
@@ -158,15 +168,34 @@ def _agent_digest(runnable: str) -> str | None:
     return None if runnable in BUILTIN_OPPONENTS else file_sha256(Path(runnable))
 
 
+def _pin_extract_worker() -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
+def teacher_jobs(teacher: str, opponent: str) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
+    """Games that put the teacher in a recorded seat.
+
+    A self-play seed is one game with both seats. Against anyone else the
+    teacher has to sit twice: once on the left, once on the right, same
+    map seed. Recording only seat 0 is how a clone never saw the other
+    farm's private state as its own.
+    """
+    if teacher == opponent:
+        return ((teacher, opponent, (0, 1)),)
+    return ((teacher, opponent, (0,)), (opponent, teacher, (1,)))
+
+
 def _extract_seed(
     teacher: str,
     opponent: str,
     seed: int,
     episode_steps: int,
-    seats: tuple[int, ...],
     output_dir: Path,
 ) -> list[dict[str, Any]]:
-    """Play one seed and archive every recorded seat of it.
+    """Play one seed and archive every teacher seat of it.
 
     Seeds are wholly independent games, so this is the unit of parallelism.
     Each seat writes a uniquely named archive, so workers never contend.
@@ -175,14 +204,17 @@ def _extract_seed(
     resumed seed and a freshly played one produce byte-identical provenance and
     every written archive is proven to round-trip before the run can succeed.
     """
-    steps = _play_episode(teacher, opponent, seed, episode_steps)
     records = []
-    for seat in seats:
-        arrays = extract_episode(steps, seat, episode_steps=episode_steps)
-        path = output_dir / f"episode-{seed:08d}-seat{seat}.npz"
-        np.savez_compressed(path, **arrays)
-        records.append(_archived_record(path, seed, seat, episode_steps))
+    for left, right, seats in teacher_jobs(teacher, opponent):
+        steps = _play_episode(left, right, seed, episode_steps)
+        for seat in seats:
+            arrays = extract_episode(steps, seat, episode_steps=episode_steps)
+            path = output_dir / f"episode-{seed:08d}-seat{seat}.npz"
+            np.savez_compressed(path, **arrays)
+            records.append(_archived_record(path, seed, seat, episode_steps))
     return records
+
+
 
 
 def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> dict[str, Any]:
@@ -251,15 +283,14 @@ def main() -> None:
         raise ValueError("--workers must be positive")
     teacher_label, teacher = normalize_opponent(args.teacher)
     opponent_label, opponent = normalize_opponent(args.opponent)
-    mirrored = teacher == opponent
-    seats = (0, 1) if mirrored else (0,)
+    seats = (0, 1)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = list(range(args.seed_start, args.seed_start + args.episodes))
     recovered: list[dict[str, Any]] = []
     if args.resume:
-        # A seed counts as done only when every seat it owes exists, so a seed
-        # interrupted between its two mirrored seats is replayed rather than
+        # A seed counts as done only when every teacher seat it owes exists,
+        # so a seed interrupted between the two sides is replayed rather than
         # half-recorded.
         outstanding = []
         for seed in seeds:
@@ -280,7 +311,10 @@ def main() -> None:
     started = time.perf_counter()
     episodes = []
     if seeds:
-        pool = ProcessPoolExecutor(max_workers=min(args.workers, len(seeds)))
+        pool = ProcessPoolExecutor(
+            max_workers=min(args.workers, len(seeds)),
+            initializer=_pin_extract_worker,
+        )
         try:
             pending = {
                 pool.submit(
@@ -289,7 +323,6 @@ def main() -> None:
                     opponent,
                     seed,
                     args.episode_steps,
-                    seats,
                     args.output_dir,
                 ): seed
                 for seed in seeds

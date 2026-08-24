@@ -61,3 +61,13 @@ def test_successful_extraction_returns_every_submitted_seat() -> None:
     assert sorted((record["seed"], record["seat"]) for record in episodes) == [
         (seed, seat) for seed in range(4) for seat in (0, 1)
     ]
+
+
+def test_teacher_sits_both_seats_against_a_distinct_opponent() -> None:
+    """A clone has to see the farm from both sides, not just seat 0."""
+    extractor = _load_extractor()
+    assert extractor.teacher_jobs("v16", "starter") == (
+        ("v16", "starter", (0,)),
+        ("starter", "v16", (1,)),
+    )
+    assert extractor.teacher_jobs("starter", "starter") == (("starter", "starter", (0, 1)),)

@@ -88,6 +88,16 @@ class UnitAction(IntEnum):
     FEED = 56
     COLLECT_FERTILIZER = 57
     CARE = 58
+    PLACE_WHEAT = 59
+    PLACE_CARROT = 60
+    PLACE_TOMATO = 61
+    PLACE_STRAWBERRY = 62
+    PLACE_MELON = 63
+    PLACE_EGG = 64
+    PLACE_MILK = 65
+    PLACE_WOOL = 66
+    PLACE_FERTILIZER = 67
+
 
     # The original unsuffixed names remain readable aliases for the largest
     # transfer, while masks expose every smaller coordination-friendly choice.
@@ -144,6 +154,8 @@ _PLACE_ANIMAL = {
     UnitAction.PLACE_COW: "COW",
     UnitAction.PLACE_SHEEP: "SHEEP",
 }
+_PLACE_PRODUCT = {UnitAction[f"PLACE_{item}"]: item for item in PRODUCTS}
+
 _PLANT_CROP = {
     UnitAction.PLANT_WHEAT: "WHEAT",
     UnitAction.PLANT_CARROT: "CARROT",
@@ -236,9 +248,8 @@ def unit_action_mask(
     if at_shed:
         shed = remaining_shed if remaining_shed is not None else private.get("shed") or {}
         shed_room = SHED_CAPACITY - sum(int(value or 0) for value in shed.values())
-        mask[UnitAction.DROP] = shed_room > 0 and any(
-            int(value or 0) > 0 for value in inventory.values()
-        )
+        mask[UnitAction.DROP] = any(int(value or 0) > 0 for value in inventory.values())
+
         # Our policy only asks for pickups it can fill completely. The engine
         # would clamp a short one instead of refusing it (kaggriculture.py:357),
         # so this is a deliberate narrowing of our own action space and not a
@@ -251,6 +262,9 @@ def unit_action_mask(
             mask[action] = int(shed.get(item, 0) or 0) >= quantity
         for action, animal in _PLACE_ANIMAL.items():
             mask[action] = shed_room > 0 and int(inventory.get(animal, 0) or 0) > 0
+        for action, item in _PLACE_PRODUCT.items():
+            mask[action] = shed_room > 0 and int(inventory.get(item, 0) or 0) > 0
+
 
     tile = tiles[y][x]
     if tile == "LOCKED":
@@ -404,6 +418,19 @@ def unit_action_command(
         return ["PICKUP", item, min(quantity, int(shed.get(item, 0) or 0))]
     if action in _PLACE_ANIMAL:
         return ["PLACE", _PLACE_ANIMAL[action]]
+    if action in _PLACE_PRODUCT:
+        item = _PLACE_PRODUCT[action]
+        inventory = _unit_inventory(observation.get("private") or {}, unit_index)
+        held = max(0, int(inventory.get(item, 0) or 0))
+        shed = (
+            remaining_shed
+            if remaining_shed is not None
+            else (observation.get("private") or {}).get("shed") or {}
+        )
+        room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed.values()))
+        return ["PLACE", item, min(held, room)]
+
+
     if action in _PLANT_CROP:
         return ["PLANT", _PLANT_CROP[action]]
     return [action.name]
@@ -445,6 +472,22 @@ def apply_unit_shed_effect(
         if room > 0 and int(inventory.get(animal, 0) or 0) > 0:
             shed[animal] = int(shed.get(animal, 0) or 0) + 1
         return
+    if action in _PLACE_PRODUCT:
+        player = int(observation.get("player", 0) or 0)
+        farm = (observation.get("farms") or [])[player]
+        position = _unit_position(farm, unit_index)
+        if position is None or position not in shed_access_tiles(
+            len(tiles_override if tiles_override is not None else farm.get("tiles") or [])
+            or BOARD_SIZE
+        ):
+            return
+        item = _PLACE_PRODUCT[action]
+        inventory = _unit_inventory(observation.get("private") or {}, unit_index)
+        room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed.values()))
+        quantity = min(room, max(0, int(inventory.get(item, 0) or 0)))
+        if quantity > 0:
+            shed[item] = int(shed.get(item, 0) or 0) + quantity
+        return
     if action != UnitAction.DROP:
         return
     inventory = _unit_inventory(observation.get("private") or {}, unit_index)
@@ -453,6 +496,7 @@ def apply_unit_shed_effect(
         quantity = min(room, max(0, int(raw_quantity or 0)))
         if quantity > 0:
             shed[item] = shed.get(item, 0) + quantity
+
 
 
 def apply_unit_tile_effect(

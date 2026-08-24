@@ -43,6 +43,7 @@ from kaggriculture.actions import (
 )
 from kaggriculture.constants import (
     ANIMAL_STRUCTURE,
+    ANIMALS,
     BOARD_SIZE,
     CROP_FIRST_YIELD_DAY,
     MARKET_I0,
@@ -155,12 +156,17 @@ def _canonical_unit_command(command: Any) -> list[Any]:
     if opcode in ("PLANT", "PLACE"):
         if len(command) < 2:
             raise DemonstrationError(f"{opcode} without an argument: {command!r}")
-        if opcode == "PLACE" and len(command) >= 3 and int(command[2]) != 1:
-            # The engine's PLACE doubles as a shed deposit of N items; the
-            # factored space only represents the animal-placement/deposit-1
-            # form, so a larger deposit is a representability gap.
-            raise DemonstrationError(f"unrepresentable PLACE deposit quantity: {command!r}")
+        if opcode == "PLACE":
+            item = str(command[1])
+            quantity = int(command[2]) if len(command) >= 3 else 1
+            if item in PRODUCTS:
+                return ["PLACE", item, quantity]
+            if item not in ANIMALS:
+                raise DemonstrationError(f"unknown PLACE target in {command!r}")
+            if quantity != 1:
+                raise DemonstrationError(f"unrepresentable PLACE animal quantity: {command!r}")
         return [opcode, str(command[1])]
+
     if opcode == "PICKUP":
         if len(command) < 2:
             raise DemonstrationError(f"PICKUP without an item: {command!r}")
@@ -170,15 +176,17 @@ def _canonical_unit_command(command: Any) -> list[Any]:
 
 
 def _parse_unit_command(
-    command: Any, shed_available: dict[str, int]
+    command: Any,
+    shed_available: dict[str, int],
+    inventory: dict[str, int],
 ) -> tuple[UnitAction, list[Any]]:
     """Map a demonstrated command to its factored variant and executed form.
 
     Returns the selected :class:`UnitAction` plus the command the engine
     actually executes at this ledger state, which is what ``compile_action``
-    must reproduce. The only stateful reduction is PICKUP's shed clamp
-    (``n = min(n, available)``, no-op when nothing is available) — every other
-    reduction is pure argument arity.
+    must reproduce. Stateful reductions are PICKUP's shed clamp and PLACE
+    product deposits, which the engine fills with ``min(requested, held,
+    shed room)``.
     """
     canonical = _canonical_unit_command(command)
     opcode = str(canonical[0])
@@ -188,32 +196,43 @@ def _parse_unit_command(
         return UnitAction[opcode], canonical
     if opcode == "DROP":
         return UnitAction.DROP, canonical
-    if opcode in ("PLANT", "PLACE"):
+    if opcode == "PLANT":
         try:
-            return UnitAction[f"{opcode}_{canonical[1]}"], canonical
+            return UnitAction[f"PLANT_{canonical[1]}"], canonical
         except KeyError:
-            raise DemonstrationError(f"unknown {opcode} target in {command!r}") from None
+            raise DemonstrationError(f"unknown PLANT target in {command!r}") from None
+    if opcode == "PLACE":
+        item = str(canonical[1])
+        if item in ANIMALS:
+            try:
+                return UnitAction[f"PLACE_{item}"], canonical
+            except KeyError:
+                raise DemonstrationError(f"unknown PLACE target in {command!r}") from None
+        held = max(0, int(inventory.get(item, 0) or 0))
+        room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed_available.values()))
+        executed = min(int(canonical[2]), held, room)
+        if executed <= 0:
+            return UnitAction.PASS, ["PASS"]
+        try:
+            return UnitAction[f"PLACE_{item}"], ["PLACE", item, executed]
+        except KeyError:
+            raise DemonstrationError(f"unknown PLACE target in {command!r}") from None
     item, quantity = str(canonical[1]), int(canonical[2])
     if quantity <= 0:
-        # Engine: `if n <= 0: return` — a demonstrated non-positive pickup
-        # executes as nothing at all.
         return UnitAction.PASS, ["PASS"]
     maximum = _PICKUP_MAX.get(item)
     if maximum is None:
         raise DemonstrationError(f"unknown pickup item in {command!r}")
     executed = min(quantity, int(shed_available.get(item, 0) or 0))
     if executed <= 0:
-        # Engine clamps to shed stock and no-ops on an empty shed; the
-        # executed behavior is exactly PASS.
         return UnitAction.PASS, ["PASS"]
     if executed > maximum:
         raise DemonstrationError(
             f"executed pickup of {executed} {item} is outside the factored "
             f"action space (1..{maximum})"
         )
-    # compile_action emits min(variant, shed); with variant == executed <= shed
-    # the emitted command matches the engine-executed one exactly.
     return UnitAction[f"PICKUP_{item}_{executed}"], ["PICKUP", item, executed]
+
 
 
 def _canonical_market_order(order: Any) -> list[Any]:
@@ -230,7 +249,8 @@ def _canonical_market_order(order: Any) -> list[Any]:
     raise DemonstrationError(f"unknown market order: {order!r}")
 
 
-def _parse_market_order(order: Any) -> tuple[MarketKind, int]:
+def _parse_market_order(order: Any) -> tuple[MarketKind, int] | None:
+
     canonical = _canonical_market_order(order)
     opcode = str(canonical[0])
     if opcode == "HIRE":
@@ -239,9 +259,9 @@ def _parse_market_order(order: Any) -> tuple[MarketKind, int]:
         return MarketKind.BUY_LAND, 0
     item, quantity = str(canonical[1]), int(canonical[2])
     if quantity < 1:
-        # The engine drops n <= 0 orders as malformed; surface rather than
-        # guess what the teacher meant.
-        raise DemonstrationError(f"non-positive market quantity: {order!r}")
+        # Engine: `if n <= 0: continue` — the order is unread, not a STOP.
+        return None
+
     tables = {
         "BUY_SEED": _BUY_SEED_KINDS,
         "BUY_PRODUCT": _BUY_PRODUCT_KINDS,
@@ -304,18 +324,18 @@ def _engine_would_execute(
 
     tile = tiles[y][x]
     if name.startswith("PLACE_"):
-        animal = name[len("PLACE_") :]
-        holds_animal = int(inventory.get(animal, 0) or 0) > 0
-        installs = (
+        item = name[len("PLACE_") :]
+        holds_item = int(inventory.get(item, 0) or 0) > 0
+        installs = item in ANIMAL_STRUCTURE and (
             isinstance(tile, dict)
-            and tile.get("kind") == ANIMAL_STRUCTURE[animal]
+            and tile.get("kind") == ANIMAL_STRUCTURE[item]
             and "animal" not in tile
         )
-        if installs and holds_animal:
+        if installs and holds_item:
             return True
-        # Otherwise PLACE falls through to the engine's shed-deposit path.
         shed_room = SHED_CAPACITY - sum(int(value or 0) for value in remaining_shed.values())
-        return at_shed and holds_animal and shed_room > 0
+        return at_shed and holds_item and shed_room > 0
+
 
     # Everything below mutates the standing tile, which must be owned.
     if tile == "LOCKED":
@@ -396,7 +416,12 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
         unit_masks[unit] = unit_action_mask(
             observation, unit, remaining_seeds, remaining_shed, tiles
         )
-        selected, canonical = _parse_unit_command(commands[unit], remaining_shed)
+        selected, canonical = _parse_unit_command(
+            commands[unit],
+            remaining_shed,
+            _unit_inventory(observation.get("private") or {}, unit),
+        )
+
         if not unit_masks[unit, selected]:
             if _engine_would_execute(
                 observation, unit, selected, tiles, remaining_seeds, remaining_shed
@@ -436,8 +461,12 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
     market_active = np.zeros(MAX_MARKET_ORDERS, dtype=np.bool_)
     quantity_active = np.zeros(MAX_MARKET_ORDERS, dtype=np.bool_)
     for order in orders:
+        parsed = _parse_market_order(order)
+        if parsed is None:
+            continue
+        kind, quantity_index = parsed
         canonical_order = _canonical_market_order(order)
-        kind, quantity_index = _parse_market_order(order)
+
         slot = len(canonical_orders)
         kind_mask_now = _ledger_kind_mask(observation, ledger)
         if not kind_mask_now[kind]:

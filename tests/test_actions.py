@@ -448,14 +448,16 @@ def test_every_exact_market_quantity_compiles_in_one_slot() -> None:
         ]
 
 
-def test_drop_is_dominated_and_masked_when_shed_is_full() -> None:
+def test_drop_remains_legal_when_shed_is_full() -> None:
     observation = _observation()
     observation["private"]["shed"]["WHEAT"] = 100
     observation["private"]["inventories"][0]["MILK"] = 1
 
     mask = unit_action_mask(observation, 0)
 
-    assert not mask[UnitAction.DROP]
+    assert mask[UnitAction.DROP]
+
+
 
 
 def _python_sequential_factor_masks(
