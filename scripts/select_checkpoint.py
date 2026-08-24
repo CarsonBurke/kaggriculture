@@ -134,6 +134,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--pattern", default="checkpoint-*.pt")
     parser.add_argument(
+        "--agent",
+        type=int,
+        default=None,
+        help="population member to screen; required for multi-member checkpoints",
+    )
+    parser.add_argument(
         "--opponent",
         action="append",
         dest="opponents",
@@ -177,6 +183,7 @@ def main() -> None:
             evaluate(
                 SimpleNamespace(
                     artifact=checkpoint,
+                    agent=args.agent,
                     opponent=opponent,
                     seeds=args.seeds,
                     seed_start=args.seed_start,
@@ -185,6 +192,7 @@ def main() -> None:
                     device=args.device,
                     inference_equivalence=args.inference_equivalence,
                 )
+
             )
             for opponent in opponents
         ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -44,6 +45,79 @@ def test_replay_output_is_named_by_iteration_mode_seed_and_opponent(tmp_path: Pa
     assert (
         versus == tmp_path / "replays" / "iteration-000061-deterministic-seed0-vs-public-v27.html"
     )
+
+
+def test_replay_output_names_a_population_member(tmp_path: Path) -> None:
+    module = _script()
+    output = module.replay_output_path(tmp_path, 70, "deterministic", 0, "public-v27", 1)
+    assert output == tmp_path / "replays" / (
+        "iteration-000070-deterministic-seed0-vs-public-v27-member1.html"
+    )
+
+
+def test_replay_member_prefers_latest_v27_money(tmp_path: Path) -> None:
+    module = _script()
+    (tmp_path / "metrics-external.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "iteration": 50,
+                        "agent": 0,
+                        "opponent": "public-v27",
+                        "money_mean": 40_000,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "iteration": 70,
+                        "agent": 0,
+                        "opponent": "public-v27",
+                        "money_mean": 10_000,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "iteration": 70,
+                        "agent": 2,
+                        "opponent": "public-v27",
+                        "money_mean": 22_000,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "iteration": 70,
+                        "agent": 1,
+                        "opponent": "starter",
+                        "money_mean": 140_000,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert module.select_replay_member(tmp_path, 4) == 2
+
+
+def test_replay_member_falls_back_to_self_play_money(tmp_path: Path) -> None:
+    module = _script()
+    (tmp_path / "metrics.jsonl").write_text(
+        json.dumps(
+            {
+                "iteration": 12,
+                "agent0_money_mean": 8_000,
+                "agent1_money_mean": 19_000,
+                "agent2_money_mean": 11_000,
+                "agent3_money_mean": 4_000,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert module.select_replay_member(tmp_path, 4) == 1
+
+
 
 
 def test_external_opponent_occupies_the_seat_our_agent_does_not(monkeypatch) -> None:

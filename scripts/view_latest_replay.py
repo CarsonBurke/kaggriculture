@@ -8,13 +8,16 @@ never contends with training on the GPU.
 
 The candidate is the newest run's `latest.pt` by default, or any actor artifact
 passed to `--artifact` (a BC clone, an exported submission actor, an older
-checkpoint). The opponent is a mirror of the candidate by default; `--opponent`
-takes any spec the evaluation entry points accept, so `--opponent v27` renders
-the same head-to-head the acceptance evaluations score.
+checkpoint). A population checkpoint plays the member last richest against
+v27 (`--agent` overrides). The opponent is a mirror of the candidate by
+default; `--opponent` takes any spec the evaluation entry points accept, so
+`--opponent v27` renders the same head-to-head the acceptance evaluations
+score.
 
 Sampled mode (the default) draws actions at the training temperature and shows
 the behavior the training metrics measure; deterministic mode plays the argmax
 policy — exactly what a Kaggle submission does.
+
 """
 
 from __future__ import annotations
@@ -28,12 +31,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
-from kaggriculture.inference import CheckpointAgent
+
+from kaggriculture.inference import CheckpointAgent, checkpoint_agent_count
 from kaggriculture.opponents import normalize_opponent
 from kaggriculture.policy import act_batch
 from kaggriculture.production import PRODUCTION_EPISODE_STEPS, PRODUCTION_TEMPERATURE
 from kaggriculture.provenance import repository_root
+
 
 SELF_OPPONENT = "self"
 
@@ -51,10 +57,67 @@ def resolve_latest_run(runs_root: Path) -> Path:
 
 
 def replay_output_path(
-    run_directory: Path, iteration: int, mode: str, seed: int, opponent_label: str
+    run_directory: Path,
+    iteration: int,
+    mode: str,
+    seed: int,
+    opponent_label: str,
+    member: int | None = None,
 ) -> Path:
     stem = f"iteration-{iteration:06d}-{mode}-seed{seed}-vs-{opponent_label}"
+    if member is not None:
+        stem = f"{stem}-member{member}"
     return run_directory / "replays" / f"{stem}.html"
+
+
+_V27_LABELS = frozenset({"public-v27", "v27"})
+
+
+def select_replay_member(run_directory: Path, population: int) -> int:
+    """The member last seen richest against v27, else richest in self-play.
+
+    External eval is the only absolute reading; self-play money is the fallback
+    when that journal has not landed yet. Ties keep the lowest index.
+    """
+    if population < 1:
+        raise ValueError("population must be positive")
+    external = run_directory / "metrics-external.jsonl"
+    if external.is_file():
+        latest_iteration: int | None = None
+        scores: dict[int, float] = {}
+        for line in external.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("opponent") not in _V27_LABELS:
+                continue
+            agent = record.get("agent")
+            if agent is None:
+                continue
+            member = int(agent)
+            if not 0 <= member < population:
+                continue
+            iteration = int(record["iteration"])
+            if latest_iteration is None or iteration > latest_iteration:
+                latest_iteration = iteration
+                scores = {}
+            if iteration == latest_iteration:
+                scores[member] = float(record["money_mean"])
+        if scores:
+            return min(scores, key=lambda member: (-scores[member], member))
+    metrics = run_directory / "metrics.jsonl"
+    if metrics.is_file():
+        lines = [line for line in metrics.read_text(encoding="utf-8").splitlines() if line]
+        if lines:
+            record = json.loads(lines[-1])
+            scored = []
+            for member in range(population):
+                key = f"agent{member}_money_mean"
+                if key in record:
+                    scored.append((float(record[key]), member))
+            if scored:
+                return min(scored, key=lambda item: (-item[0], item[1]))[1]
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         "--artifact",
         type=Path,
         help="actor artifact or checkpoint to play; defaults to <run-dir>/latest.pt",
+    )
+    parser.add_argument(
+        "--agent",
+        type=int,
+        default=None,
+        help="population member to play; default is the latest v27 money leader",
     )
     parser.add_argument(
         "--opponent",
@@ -91,6 +160,8 @@ def parse_args() -> argparse.Namespace:
         "--no-open", action="store_true", help="write the replay without opening a browser"
     )
     return parser.parse_args()
+
+
 
 
 def play_match(
@@ -173,7 +244,17 @@ def main() -> None:
         # Snapshot the artifact so a concurrent training save cannot race the load.
         snapshot = Path(name) / artifact.name
         shutil.copyfile(artifact, snapshot)
-        agent = CheckpointAgent(snapshot, device="cpu", torch_threads=args.torch_threads)
+
+        payload = torch.load(snapshot, map_location="cpu", weights_only=False)
+        population = checkpoint_agent_count(payload)
+        member = args.agent
+        if member is None and population > 1:
+            member = select_replay_member(run_directory, population)
+        if member is not None and not 0 <= member < population:
+            raise ValueError(f"agent {member} is outside 0..{population - 1}")
+        agent = CheckpointAgent(
+            snapshot, device="cpu", torch_threads=args.torch_threads, agent=member
+        )
     iteration = int(agent.metadata.get("iteration", 0))
     environment = play_match(
         agent,
@@ -184,7 +265,10 @@ def main() -> None:
         opponent=opponent,
         candidate_seat=args.seat,
     )
-    output = replay_output_path(run_directory, iteration, args.mode, args.seed, opponent_label)
+    output = replay_output_path(
+        run_directory, iteration, args.mode, args.seed, opponent_label, member
+    )
+
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(environment.render(mode="html"), encoding="utf-8")
     final = environment.steps[-1]
@@ -195,6 +279,7 @@ def main() -> None:
                 "run_dir": str(run_directory),
                 "artifact": str(artifact),
                 "architecture": agent.metadata.get("architecture"),
+                "agent": member,
                 "opponent": opponent_label,
                 "candidate_seat": args.seat,
                 "iteration": iteration,

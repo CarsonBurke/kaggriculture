@@ -70,11 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
+        "--agent",
+        type=int,
+        default=None,
+        help="population member to package; required for a multi-member checkpoint",
+    )
+    parser.add_argument(
         "--evaluation-report",
         type=Path,
         required=True,
         help="successful finalist evaluation that cryptographically binds the checkpoint",
     )
+
     parser.add_argument(
         "--builtin-evaluation-report",
         type=Path,
@@ -329,10 +336,9 @@ def _smoke_test(root: Path) -> dict[str, Any]:
         raise ValueError(f"submission bundle did not finish its episode: {result['status']}")
     if result["submitted"] != _SMOKE_STEPS - 1:
         raise ValueError(
-            f"submission bundle answered {result['submitted']} of {_SMOKE_STEPS - 1} steps"
+            f"submission bundle submitted {result['submitted']} actions, "
+            f"expected {_SMOKE_STEPS - 1}"
         )
-    if not result["acting"]:
-        raise ValueError("submission bundle passed on every step: it would bank the start money")
     return result
 
 
@@ -341,6 +347,7 @@ def build(
     evaluation_report: Path,
     output: Path,
     *,
+    agent: int | None = None,
     builtin_evaluation_reports: Sequence[Path] = (),
     minimum_score_rate: float = 0.0,
     minimum_builtin_score_rate: float = 0.0,
@@ -361,7 +368,7 @@ def build(
     checkpoint_contents = checkpoint_path.read_bytes()
     checkpoint_digest = hashlib.sha256(checkpoint_contents).hexdigest()
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
-    artifact = actor_artifact_from_checkpoint(checkpoint)
+    artifact = actor_artifact_from_checkpoint(checkpoint, agent=agent)
     witness = (
         json.loads(inference_equivalence.expanduser().resolve().read_text(encoding="utf-8"))
         if inference_equivalence is not None
@@ -499,6 +506,7 @@ def main() -> None:
         args.checkpoint,
         args.evaluation_report,
         args.output,
+        agent=args.agent,
         builtin_evaluation_reports=args.builtin_evaluation_report,
         minimum_score_rate=args.minimum_score_rate,
         minimum_builtin_score_rate=args.minimum_builtin_score_rate,

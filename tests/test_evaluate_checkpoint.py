@@ -123,7 +123,8 @@ def test_worker_reuses_one_loaded_model_across_actions_and_paired_games(monkeypa
     monkeypatch.setattr(evaluator, "CheckpointAgent", fake_checkpoint_agent)
     monkeypatch.setattr(evaluator, "_make_environment", lambda *_args: FakeEnvironment())
 
-    evaluator._initialize_worker("artifact.pt", "cpu", 1, "pass")
+    evaluator._initialize_worker("artifact.pt", "cpu", 1, "pass", None)
+
     pair = evaluator._run_seed_pair(9)
 
     assert counters == {"loads": 1, "actions": 6}

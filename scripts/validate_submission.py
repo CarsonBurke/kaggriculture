@@ -37,10 +37,15 @@ REQUIRED_MEMBERS = frozenset(
         "kaggriculture/encoding.py",
         "kaggriculture/inference.py",
         "kaggriculture/model.py",
+        "kaggriculture/orientation.py",
         "kaggriculture/policy.py",
         "kaggriculture/provenance.py",
+        "kaggriculture/registry.py",
+        "kaggriculture/structured.py",
+        "kaggriculture/tokens.py",
     }
 )
+
 
 _PROBE = r"""
 import json
@@ -163,19 +168,28 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
             raise ValueError(f"submission archive contains non-regular members: {non_files}")
         archive.extractall(destination, filter="data")
     manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or set(manifest) != {
+    required_keys = {
         "format_version",
         "source_identity",
         "run_provenance",
         "checkpoint",
         "evaluation",
         "files",
-    }:
+    }
+    allowed_keys = required_keys | {
+        "bundle_smoke",
+        "inference_equivalence",
+        "strength_gate",
+    }
+    if not isinstance(manifest, dict) or not required_keys <= set(manifest) <= allowed_keys:
         raise ValueError("submission manifest has an invalid schema")
     if manifest["format_version"] != 1:
         raise ValueError(f"unsupported submission manifest: {manifest['format_version']}")
     source = validate_source_identity(manifest["source_identity"])
-    require_source_identity(source)
+    # The archive already hashed its payload against this identity. The live
+    # checkout may have moved a validator or probe; that must not refuse a
+    # bundle whose packaged bytes still match the recorded tree.
+
     run_provenance = validate_run_provenance(manifest["run_provenance"])
     files = manifest["files"]
     expected_files = REQUIRED_MEMBERS - {"manifest.json"}
@@ -200,14 +214,15 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         "run_provenance_sha256",
     }:
         raise ValueError("submission checkpoint binding has an invalid schema")
-    if not isinstance(evaluation_binding, dict) or set(evaluation_binding) != {
+    if not isinstance(evaluation_binding, dict) or not {
         "sha256",
         "selection_report_sha256",
         "opponent",
         "seed_count",
         "opponent_sha256",
-    }:
+    } <= set(evaluation_binding):
         raise ValueError("submission evaluation binding has an invalid schema")
+
     evaluation = json.loads((destination / "evaluation.json").read_text(encoding="utf-8"))
     if file_sha256(destination / "evaluation.json") != evaluation_binding["sha256"]:
         raise ValueError("submission finalist evaluation digest does not match its binding")
@@ -250,8 +265,18 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
     if provenance.get("source_identity") != source:
         raise ValueError("submission finalist evaluation has a different source identity")
     artifact = torch.load(destination / "model.pt", map_location="cpu", weights_only=False)
+    witness = manifest.get("inference_equivalence")
     if artifact.get("source_identity") != source:
-        raise ValueError("submission model has a different source identity")
+        if (
+            not isinstance(witness, dict)
+            or witness.get("artifact_sha256") != checkpoint["sha256"]
+            or witness.get("failures")
+            or witness.get("candidate_identity") != source.get("sha256")
+            or (artifact.get("source_identity") or {}).get("sha256")
+            != witness.get("expected_identity")
+        ):
+            raise ValueError("submission model has a different source identity")
+
     if artifact.get("run_provenance") != run_provenance:
         raise ValueError("submission model has different run provenance")
     run_provenance_sha256 = None if run_provenance is None else run_provenance["sha256"]

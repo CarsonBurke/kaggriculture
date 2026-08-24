@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import torch
 
@@ -100,9 +105,13 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
-def _artifact_provenance(path: Path, equivalence: dict[str, Any] | None = None) -> dict[str, Any]:
+def _artifact_provenance(
+    path: Path,
+    equivalence: dict[str, Any] | None = None,
+    agent: int | None = None,
+) -> dict[str, Any]:
     """Validate the artifact before spawning workers and record stable identity."""
-    actor, metadata = load_actor_artifact(path, device="cpu")
+    actor, metadata = load_actor_artifact(path, device="cpu", agent=agent)
     del actor
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -120,7 +129,10 @@ def _artifact_provenance(path: Path, equivalence: dict[str, Any] | None = None) 
         "model_config": metadata["model_config"],
         "source_identity": identity,
         "run_provenance": metadata.get("run_provenance"),
+        "agent": agent,
     }
+
+
 
 
 def _opponent_provenance(
@@ -214,15 +226,24 @@ def _initialize_worker(
     device: str,
     torch_threads: int,
     opponent: str,
+    agent: int | None,
 ) -> None:
     """Load one persistent candidate model per process, never per action or game."""
     global _WORKER_AGENT, _WORKER_OPPONENT
+    threads = max(1, int(torch_threads))
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
     _WORKER_AGENT = CheckpointAgent(
         Path(artifact),
         device=torch.device(device),
         torch_threads=torch_threads,
+        agent=agent,
     )
     _WORKER_OPPONENT = opponent
+
+
 
 
 def _make_environment(seed: int, episode_steps: int):
@@ -515,10 +536,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument(
+        "--agent",
+        type=int,
+        default=None,
+        help="population member to evaluate; required for a multi-member checkpoint",
+    )
+    parser.add_argument(
         "--opponent",
         default="v27",
         help="built-in name, Python agent path, or 'v27' for the fixed public opponent",
     )
+
     parser.add_argument(
         "--seeds",
         type=int,
@@ -569,10 +597,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         # `getattr`, matching `selection_report` below: `select_checkpoint` calls
         # this with a hand-built namespace carrying only the fields it sets.
         witness_path = getattr(args, "inference_equivalence", None)
+        member = getattr(args, "agent", None)
         artifact_provenance = _artifact_provenance(
             artifact_snapshot,
             None if witness_path is None else json.loads(witness_path.read_text(encoding="utf-8")),
+            agent=member,
         )
+
         artifact_provenance["path"] = str(artifact)
         selection = getattr(args, "selection_report", None)
         selection_provenance = (
@@ -608,6 +639,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 str(device),
                 args.torch_threads,
                 worker_opponent,
+                member,
             )
             pairs = [_run_seed_pair(seed) for seed in seeds]
         else:
@@ -620,6 +652,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     str(device),
                     args.torch_threads,
                     worker_opponent,
+                    member,
                 ),
             ) as pool:
                 pairs = list(pool.imap_unordered(_run_seed_pair, seeds))
@@ -631,6 +664,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "valid_for_selection": bool(summary["valid_for_selection"]),
         "artifact": str(artifact),
+        "agent": member,
         "artifact_provenance": artifact_provenance,
         "opponent": opponent,
         "opponent_label": opponent_label,
