@@ -112,9 +112,20 @@ class StructuredDynamics(nn.Module):
         market_quantities: Tensor,
         unit_categorical: Tensor,
         unit_active: Tensor,
+        *,
+        active_fields: tuple[bool, ...] | None = None,
     ) -> StructuredBelief:
         values = tuple(belief)
-        queries = [self._query(value, kind) for kind, value in enumerate(values)]
+        if active_fields is None:
+            active_fields = (True,) * len(values)
+        if len(active_fields) != len(values) or not any(active_fields):
+            raise ValueError("structured dynamics active fields must select belief families")
+        selected = [
+            (kind, value)
+            for kind, (value, active) in enumerate(zip(values, active_fields, strict=True))
+            if active
+        ]
+        queries = [self._query(value, kind) for kind, value in selected]
         unit_action, market_action = self.action(
             unit_actions,
             market_kinds,
@@ -126,11 +137,11 @@ class StructuredDynamics(nn.Module):
         joined = torch.cat(queries, dim=1)
         transitioned = self.transition(joined, context, context_norm=self.context_norm)
         residual = transitioned - joined
-        sizes = [value.shape[1] for value in values]
-        deltas = residual.split(sizes, dim=1)
-        return StructuredBelief(
-            *(value + delta for value, delta in zip(values, deltas, strict=True))
-        )
+        deltas = residual.split([value.shape[1] for _, value in selected], dim=1)
+        outputs = list(values)
+        for (kind, value), delta in zip(selected, deltas, strict=True):
+            outputs[kind] = value + delta
+        return StructuredBelief(*outputs)
 
 
 class StructuredDynamicsTerms(NamedTuple):
@@ -216,6 +227,25 @@ def _patch_losses(
     return 0.5 * (all_loss + changed_loss), all_loss, changed_loss, unchanged_loss
 
 
+def _active_belief_fields(
+    *,
+    decision_horizon: int,
+    own_patches_active: bool,
+    economy_active: bool,
+    opponent_summary_active: bool,
+    opponent_patches_active: bool,
+) -> tuple[bool, ...]:
+    return (
+        own_patches_active,
+        opponent_patches_active,
+        opponent_summary_active,
+        economy_active,
+        False,
+        bool(decision_horizon),
+        bool(decision_horizon),
+    )
+
+
 def structured_horizon_loss(
     dynamics: StructuredDynamics,
     belief: StructuredBelief,
@@ -225,6 +255,7 @@ def structured_horizon_loss(
     decode: DecodeContext | None,
     decision_horizon: int,
     patch_horizon: int,
+    own_patches_active: bool = True,
     economy_active: bool = False,
     opponent_summary_active: bool = False,
     opponent_patches_active: bool = False,
@@ -252,6 +283,13 @@ def structured_horizon_loss(
     decision_one = decision_final = zero
     patch_one = patch_final = zero
     residual_sums = [zero for _ in StructuredBelief._fields]
+    active_fields = _active_belief_fields(
+        decision_horizon=decision_horizon,
+        own_patches_active=own_patches_active,
+        economy_active=economy_active,
+        opponent_summary_active=opponent_summary_active,
+        opponent_patches_active=opponent_patches_active,
+    )
 
     rows = torch.arange(
         factors["episode_index"].shape[0],
@@ -267,6 +305,7 @@ def structured_horizon_loss(
             factors["market_quantities"][action_index],
             inputs.unit_categorical[action_index],
             inputs.unit_active[action_index],
+            active_fields=active_fields,
         )
         target_index, eligible = _target_index(factors["episode_index"], factors["step"], offset)
         joined_predicted = torch.cat(tuple(predicted), dim=1)
@@ -314,26 +353,27 @@ def structured_horizon_loss(
             decision_steps += 1
 
         if offset <= patch_horizon:
-            source_categorical = inputs.tile_categorical[:, :TILE_COUNT]
-            target_categorical = inputs.tile_categorical[target_index, :TILE_COUNT]
-            source_continuous = inputs.tile_continuous[:, :TILE_COUNT]
-            target_continuous = inputs.tile_continuous[target_index, :TILE_COUNT]
-            changed = (source_categorical != target_categorical).any(dim=-1) | (
-                source_continuous != target_continuous
-            ).any(dim=-1)
-            patch_terms = _patch_losses(
-                predicted.own_patches,
-                targets.own_patches[target_index],
-                eligible,
-                changed,
-            )
-            for position, value in enumerate(patch_terms, start=4):
-                sums[position] = sums[position] + value
-            if offset == 1:
-                patch_one = patch_terms[0]
-            if offset == patch_horizon:
-                patch_final = patch_terms[0]
-            patch_steps += 1
+            if own_patches_active:
+                source_categorical = inputs.tile_categorical[:, :TILE_COUNT]
+                target_categorical = inputs.tile_categorical[target_index, :TILE_COUNT]
+                source_continuous = inputs.tile_continuous[:, :TILE_COUNT]
+                target_continuous = inputs.tile_continuous[target_index, :TILE_COUNT]
+                changed = (source_categorical != target_categorical).any(dim=-1) | (
+                    source_continuous != target_continuous
+                ).any(dim=-1)
+                patch_terms = _patch_losses(
+                    predicted.own_patches,
+                    targets.own_patches[target_index],
+                    eligible,
+                    changed,
+                )
+                for position, value in enumerate(patch_terms, start=4):
+                    sums[position] = sums[position] + value
+                if offset == 1:
+                    patch_one = patch_terms[0]
+                if offset == patch_horizon:
+                    patch_final = patch_terms[0]
+                patch_steps += 1
 
             if economy_active:
                 sums[8] = sums[8] + _feature_l1(
@@ -351,6 +391,227 @@ def structured_horizon_loss(
                 sums[10] = sums[10] + _feature_l1(
                     predicted.opponent_patches,
                     targets.opponent_patches[target_index],
+                    eligible,
+                )
+            state_steps += 1
+        eligible_sum = eligible_sum + eligible.float().sum()
+
+    decision_divisor = max(decision_steps, 1)
+    patch_divisor = max(patch_steps, 1)
+    state_divisor = max(state_steps, 1)
+    return StructuredDynamicsTerms(
+        decision=sums[0] / decision_divisor,
+        decision_one=decision_one,
+        decision_final=decision_final,
+        decision_unit=sums[1] / decision_divisor,
+        decision_market_kind=sums[2] / decision_divisor,
+        decision_market_quantity=sums[3] / decision_divisor,
+        patch=sums[4] / patch_divisor,
+        patch_one=patch_one,
+        patch_final=patch_final,
+        patch_all=sums[5] / patch_divisor,
+        patch_changed=sums[6] / patch_divisor,
+        patch_unchanged=sums[7] / patch_divisor,
+        economy=sums[8] / state_divisor,
+        opponent_summary=sums[9] / state_divisor,
+        opponent_patches=sums[10] / state_divisor,
+        eligible=eligible_sum / max_horizon,
+        residual_ratio=sums[11] / max_horizon,
+        residual_own_patches=residual_sums[0] / max_horizon,
+        residual_opponent_patches=residual_sums[1] / max_horizon,
+        residual_opponent_summary=residual_sums[2] / max_horizon,
+        residual_economy_entities=residual_sums[3] / max_horizon,
+        residual_central_latents=residual_sums[4] / max_horizon,
+        residual_unit_decisions=residual_sums[5] / max_horizon,
+        residual_market_decisions=residual_sums[6] / max_horizon,
+    )
+
+
+def structured_window_loss(
+    dynamics: StructuredDynamics,
+    belief: StructuredBelief,
+    inputs: StructuredInputs,
+    factors: dict[str, Tensor],
+    *,
+    decode: DecodeContext | None,
+    decision_horizon: int,
+    patch_horizon: int,
+    own_patches_active: bool,
+    economy_active: bool,
+    opponent_summary_active: bool,
+    opponent_patches_active: bool,
+) -> StructuredDynamicsTerms:
+    """Score complete fixed-width windows without running invalid trailing rows.
+
+    ``structured_horizon_loss`` accepts arbitrary flat sequences and therefore
+    advances every row at every horizon before masking rows that crossed a
+    boundary. Predictor training already supplies validated windows of exactly
+    ``max_horizon + 1`` rows. For horizon two that generic path advances six
+    rows per window although only three are eligible. This path preserves the
+    same eligible predictions and reductions while advancing only those three.
+    """
+    max_horizon = max(decision_horizon, patch_horizon)
+    if max_horizon < 1:
+        raise ValueError("structured window objective needs a positive horizon")
+    width = max_horizon + 1
+    rows = belief.own_patches.shape[0]
+    if rows % width:
+        raise ValueError("structured window rows do not contain complete windows")
+    windows = rows // width
+
+    def window(value: Tensor) -> Tensor:
+        return value.reshape(windows, width, *value.shape[1:])
+
+    windowed_belief = StructuredBelief(*(window(value) for value in belief))
+    windowed_inputs = StructuredInputs(*(window(value) for value in inputs))
+    windowed_factors = {
+        name: window(value)
+        for name, value in factors.items()
+        if name not in {"episode_index", "step"}
+    }
+    zero = belief.own_patches.new_zeros(())
+    sums = [zero for _ in range(12)]
+    eligible_sum = zero
+    decision_steps = 0
+    patch_steps = 0
+    state_steps = 0
+    decision_one = decision_final = zero
+    patch_one = patch_final = zero
+    residual_sums = [zero for _ in StructuredBelief._fields]
+    active_fields = _active_belief_fields(
+        decision_horizon=decision_horizon,
+        own_patches_active=own_patches_active,
+        economy_active=economy_active,
+        opponent_summary_active=opponent_summary_active,
+        opponent_patches_active=opponent_patches_active,
+    )
+    predicted: StructuredBelief | None = None
+
+    for offset in range(1, max_horizon + 1):
+        source_positions = width - offset
+        if predicted is None:
+            previous = StructuredBelief(
+                *(value[:, :source_positions].flatten(0, 1) for value in windowed_belief)
+            )
+        else:
+            previous = StructuredBelief(
+                *(
+                    value.reshape(windows, source_positions + 1, *value.shape[1:])[
+                        :, :source_positions
+                    ].flatten(0, 1)
+                    for value in predicted
+                )
+            )
+        action_slice = slice(offset - 1, offset - 1 + source_positions)
+        current = dynamics(
+            previous,
+            windowed_factors["unit_actions"][:, action_slice].flatten(0, 1),
+            windowed_factors["market_kinds"][:, action_slice].flatten(0, 1),
+            windowed_factors["market_quantities"][:, action_slice].flatten(0, 1),
+            windowed_inputs.unit_categorical[:, action_slice].flatten(0, 1),
+            windowed_inputs.unit_active[:, action_slice].flatten(0, 1),
+            active_fields=active_fields,
+        )
+        predicted = current
+        target_slice = slice(offset, offset + source_positions)
+        targets = StructuredBelief(
+            *(value[:, target_slice].flatten(0, 1) for value in windowed_belief)
+        )
+        eligible = torch.ones(
+            windows * source_positions,
+            dtype=torch.bool,
+            device=belief.own_patches.device,
+        )
+        joined_predicted = torch.cat(tuple(current), dim=1)
+        joined_previous = torch.cat(tuple(previous), dim=1)
+        sums[11] = sums[11] + _eligible_rms_ratio(joined_predicted, joined_previous, eligible)
+        for kind, (predicted_value, previous_value) in enumerate(
+            zip(current, previous, strict=True)
+        ):
+            residual_sums[kind] = residual_sums[kind] + _eligible_rms_ratio(
+                predicted_value, previous_value, eligible
+            )
+
+        if offset <= decision_horizon:
+            if decode is None:
+                raise ValueError("decision horizon requires a decode context")
+            predicted_decisions = torch.cat(
+                (current.unit_decisions, current.market_decisions), dim=1
+            )
+            target_decisions = torch.cat((targets.unit_decisions, targets.market_decisions), dim=1)
+            teacher = decode.heads.decode(target_decisions.detach())
+            masks = DecodeMasks(
+                *(
+                    windowed_factors[field][:, target_slice].flatten(0, 1)
+                    for field in DecodeMasks._fields
+                )
+            )
+            terms = latent_decode_kl_terms(
+                predicted_decisions,
+                teacher.unit_logits,
+                teacher.market_kind_logits,
+                teacher.market_quantity_context,
+                decode.heads,
+                masks,
+                eligible,
+            )
+            sums[0] = sums[0] + terms.pooled
+            sums[1] = sums[1] + terms.unit
+            sums[2] = sums[2] + terms.market_kind
+            sums[3] = sums[3] + terms.market_quantity
+            if offset == 1:
+                decision_one = terms.pooled
+            if offset == decision_horizon:
+                decision_final = terms.pooled
+            decision_steps += 1
+
+        if offset <= patch_horizon:
+            if own_patches_active:
+                source_categorical = windowed_inputs.tile_categorical[
+                    :, :source_positions, :TILE_COUNT
+                ].flatten(0, 1)
+                target_categorical = windowed_inputs.tile_categorical[
+                    :, target_slice, :TILE_COUNT
+                ].flatten(0, 1)
+                source_continuous = windowed_inputs.tile_continuous[
+                    :, :source_positions, :TILE_COUNT
+                ].flatten(0, 1)
+                target_continuous = windowed_inputs.tile_continuous[
+                    :, target_slice, :TILE_COUNT
+                ].flatten(0, 1)
+                changed = (source_categorical != target_categorical).any(dim=-1) | (
+                    source_continuous != target_continuous
+                ).any(dim=-1)
+                patch_terms = _patch_losses(
+                    current.own_patches,
+                    targets.own_patches,
+                    eligible,
+                    changed,
+                )
+                for position, value in enumerate(patch_terms, start=4):
+                    sums[position] = sums[position] + value
+                if offset == 1:
+                    patch_one = patch_terms[0]
+                if offset == patch_horizon:
+                    patch_final = patch_terms[0]
+                patch_steps += 1
+
+            if economy_active:
+                sums[8] = sums[8] + _feature_l1(
+                    current.economy_entities,
+                    targets.economy_entities,
+                    eligible,
+                )
+            if opponent_summary_active:
+                sums[9] = sums[9] + _feature_l1(
+                    current.opponent_summary,
+                    targets.opponent_summary,
+                    eligible,
+                )
+            if opponent_patches_active:
+                sums[10] = sums[10] + _feature_l1(
+                    current.opponent_patches,
+                    targets.opponent_patches,
                     eligible,
                 )
             state_steps += 1

@@ -23,11 +23,17 @@ from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import RolloutBatch
-from kaggriculture.structured import StructuredActor, StructuredCritic, StructuredInputs
+from kaggriculture.structured import (
+    StructuredActor,
+    StructuredBelief,
+    StructuredCritic,
+    StructuredInputs,
+)
 from kaggriculture.structured_dynamics import (
     StructuredDynamics,
     StructuredDynamicsTerms,
     structured_horizon_loss,
+    structured_window_loss,
 )
 
 Critic = DistributionalCritic | StructuredCritic
@@ -629,6 +635,36 @@ class PpoConfig:
     structured_opponent_patch_coefficient: float = 0.0
     structured_decision_horizon: int = 2
     structured_patch_horizon: int = 1
+    # The predictor learns on every rollout, including critic-only warmup. It
+    # owns an optimizer so its warmup cannot advance the actor optimizer's
+    # schedule. The actor sees the auxiliary objective only after the trainer's
+    # held-out gate opens, and even then this ratio caps the auxiliary gradient
+    # against the PPO gradient before the ordinary global actor clip.
+    structured_learning_rate: float | None = None
+    structured_predictor_minibatch_size: int | None = None
+    structured_actor_gradient_ratio: float = 0.0
+    structured_gate_evaluation_windows: int = 4096
+    structured_gate_combined_ratio: float = 0.85
+    structured_gate_decision_ratio: float = 0.85
+    structured_gate_opponent_summary_ratio: float = 0.95
+    structured_gate_opponent_patch_ratio: float = 0.98
+    structured_gate_patience: int = 2
+
+    @property
+    def resolved_structured_learning_rate(self) -> float:
+        return (
+            self.actor_learning_rate
+            if self.structured_learning_rate is None
+            else self.structured_learning_rate
+        )
+
+    @property
+    def resolved_structured_predictor_minibatch_size(self) -> int:
+        return (
+            self.minibatch_size
+            if self.structured_predictor_minibatch_size is None
+            else self.structured_predictor_minibatch_size
+        )
 
     @property
     def structured_auxiliary_active(self) -> bool:
@@ -764,6 +800,33 @@ def _validate_config(config: PpoConfig) -> None:
     for name, value in coefficients.items():
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} coefficient must be finite and nonnegative")
+    if config.structured_learning_rate is not None and (
+        not math.isfinite(config.structured_learning_rate) or config.structured_learning_rate <= 0.0
+    ):
+        raise ValueError("structured learning rate must be finite and positive")
+    if config.structured_predictor_minibatch_size is not None and (
+        not isinstance(config.structured_predictor_minibatch_size, int)
+        or isinstance(config.structured_predictor_minibatch_size, bool)
+        or config.structured_predictor_minibatch_size < 1
+    ):
+        raise ValueError("structured predictor minibatch size must be a positive integer")
+    if (
+        not math.isfinite(config.structured_actor_gradient_ratio)
+        or config.structured_actor_gradient_ratio < 0.0
+    ):
+        raise ValueError("structured actor gradient ratio must be finite and nonnegative")
+    if config.structured_gate_evaluation_windows < 1:
+        raise ValueError("structured gate evaluation windows must be positive")
+    for name, value in (
+        ("combined", config.structured_gate_combined_ratio),
+        ("decision", config.structured_gate_decision_ratio),
+        ("opponent summary", config.structured_gate_opponent_summary_ratio),
+        ("opponent patch", config.structured_gate_opponent_patch_ratio),
+    ):
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(f"structured gate {name} ratio must be finite and in (0, 1]")
+    if config.structured_gate_patience < 1:
+        raise ValueError("structured gate patience must be positive")
     horizons = (
         config.structured_decision_horizon,
         config.structured_patch_horizon,
@@ -1119,19 +1182,29 @@ def prepare_advantages(
     )
 
 
+def _initialize_optimizer_schedule(
+    optimizer: torch.optim.Optimizer,
+    base_learning_rate: float,
+) -> None:
+    for group in optimizer.param_groups:
+        # Optimizer param-group metadata is checkpointed by PyTorch, so the
+        # schedule resumes exactly without a separate scheduler object.
+        group["base_lr"] = base_learning_rate
+        group["warmup_step"] = 0
+
+
 def make_optimizers(
     actor: Actor,
     critic: Critic,
     config: PpoConfig,
-    *,
-    structured_dynamics: StructuredDynamics | None = None,
 ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
     _validate_config(config)
-    _validate_structured_auxiliary_modules(actor, structured_dynamics, config)
     actor_device = next(actor.parameters()).device
     critic_device = next(critic.parameters()).device
     if actor_device != critic_device:
         raise ValueError("actor and critic must use the same device")
+    if config.structured_auxiliary_active and not isinstance(actor, StructuredActor):
+        raise ValueError("structured auxiliary coefficients require a structured actor")
     if config.optimizer == "normuon":
         # One learning rate per network drives both halves: the matrices under
         # NorMuon and the gains, biases and heads under Adam. They are not the
@@ -1139,14 +1212,8 @@ def make_optimizers(
         # orthogonalized update's Frobenius norm is `lr * sqrt(min(rows, cols))`
         # against a weight norm of about `sqrt(fan_out)`, while an Adam rate is
         # an ABSOLUTE per-element step. `adam_learning_rate_ratio` converts.
-        actor_matrices, actor_vectors = route_parameters(actor)
-        if structured_dynamics is not None:
-            dynamics_matrices, dynamics_vectors = route_parameters(structured_dynamics)
-            actor_matrices += dynamics_matrices
-            actor_vectors += dynamics_vectors
         actor_optimizer = NorMuon(
-            actor_matrices,
-            actor_vectors,
+            *route_parameters(actor),
             learning_rate=config.actor_learning_rate,
             adam_learning_rate=config.actor_learning_rate * config.adam_learning_rate_ratio,
             momentum=config.normuon_momentum,
@@ -1161,11 +1228,8 @@ def make_optimizers(
         )
         return actor_optimizer, critic_optimizer
     fused = actor_device.type == "cuda"
-    actor_parameters = list(actor.parameters())
-    if structured_dynamics is not None:
-        actor_parameters.extend(structured_dynamics.parameters())
     actor_optimizer = torch.optim.AdamW(
-        actor_parameters,
+        actor.parameters(),
         lr=config.actor_learning_rate,
         eps=1e-5,
         weight_decay=config.weight_decay,
@@ -1178,16 +1242,35 @@ def make_optimizers(
         weight_decay=config.weight_decay,
         fused=fused,
     )
-    for optimizer, base_lr in (
-        (actor_optimizer, config.actor_learning_rate),
-        (critic_optimizer, config.critic_learning_rate),
-    ):
-        for group in optimizer.param_groups:
-            # Optimizer param-group metadata is checkpointed by PyTorch, so the
-            # schedule resumes exactly without a separate scheduler object.
-            group["base_lr"] = base_lr
-            group["warmup_step"] = 0
+    _initialize_optimizer_schedule(actor_optimizer, config.actor_learning_rate)
+    _initialize_optimizer_schedule(critic_optimizer, config.critic_learning_rate)
     return actor_optimizer, critic_optimizer
+
+
+def make_structured_dynamics_optimizer(
+    dynamics: StructuredDynamics,
+    config: PpoConfig,
+) -> torch.optim.Optimizer:
+    """Build the predictor-only optimizer with an independent warmup clock."""
+    _validate_config(config)
+    learning_rate = config.resolved_structured_learning_rate
+    if config.optimizer == "normuon":
+        return NorMuon(
+            *route_parameters(dynamics),
+            learning_rate=learning_rate,
+            adam_learning_rate=learning_rate * config.adam_learning_rate_ratio,
+            momentum=config.normuon_momentum,
+            beta2=config.normuon_beta2,
+        )
+    optimizer = torch.optim.AdamW(
+        dynamics.parameters(),
+        lr=learning_rate,
+        eps=1e-5,
+        weight_decay=config.weight_decay,
+        fused=next(dynamics.parameters()).device.type == "cuda",
+    )
+    _initialize_optimizer_schedule(optimizer, learning_rate)
+    return optimizer
 
 
 def _stage_tensor(array: np.ndarray, device: torch.device) -> Tensor:
@@ -2166,6 +2249,10 @@ def _structured_auxiliary_terms(
     steps_per_trajectory: int,
     config: PpoConfig,
     autocast_enabled: bool,
+    actor_grad: bool,
+    complete_windows: bool,
+    belief_indices: Tensor | None = None,
+    belief_inverse: Tensor | None = None,
 ) -> tuple[Tensor, StructuredDynamicsTerms]:
     """Evaluate the configured typed objective on complete transition runs."""
     (inputs,) = _actor_batch_args(STRUCTURED, staged, indices)
@@ -2205,7 +2292,22 @@ def _structured_auxiliary_terms(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        _, belief = actor.forward_with_belief(inputs)
+        if actor_grad:
+            if belief_indices is not None or belief_inverse is not None:
+                raise ValueError("actor-gradient auxiliary cannot reuse detached beliefs")
+            _, belief = actor.forward_with_belief(inputs)
+        elif belief_indices is not None and belief_inverse is not None:
+            (belief_inputs,) = _actor_batch_args(STRUCTURED, staged, belief_indices)
+            if not isinstance(belief_inputs, StructuredInputs):
+                raise TypeError("structured auxiliary requires StructuredInputs")
+            with torch.no_grad():
+                _, unique_belief = actor.forward_with_belief(belief_inputs)
+            belief = StructuredBelief(*(value[belief_inverse] for value in unique_belief))
+        elif belief_indices is None and belief_inverse is None:
+            with torch.no_grad():
+                _, belief = actor.forward_with_belief(inputs)
+        else:
+            raise ValueError("belief indices and inverse must be supplied together")
         decode = (
             DecodeContext(
                 heads=DecodeHeads.from_actor(actor),
@@ -2222,7 +2324,8 @@ def _structured_auxiliary_terms(
             if decision_horizon
             else None
         )
-        terms = structured_horizon_loss(
+        loss_function = structured_window_loss if complete_windows else structured_horizon_loss
+        terms = loss_function(
             dynamics,
             belief,
             inputs,
@@ -2230,6 +2333,7 @@ def _structured_auxiliary_terms(
             decode=decode,
             decision_horizon=decision_horizon,
             patch_horizon=patch_horizon,
+            own_patches_active=bool(config.structured_patch_coefficient),
             economy_active=bool(config.structured_economy_coefficient),
             opponent_summary_active=bool(config.structured_opponent_summary_coefficient),
             opponent_patches_active=bool(config.structured_opponent_patch_coefficient),
@@ -2244,6 +2348,196 @@ def _structured_auxiliary_terms(
     return loss, terms
 
 
+def _structured_auxiliary_horizon(config: PpoConfig) -> int:
+    state_horizon = (
+        config.structured_patch_horizon
+        if any(
+            (
+                config.structured_patch_coefficient,
+                config.structured_economy_coefficient,
+                config.structured_opponent_summary_coefficient,
+                config.structured_opponent_patch_coefficient,
+            )
+        )
+        else 0
+    )
+    return max(
+        config.structured_decision_horizon if config.structured_decision_coefficient else 0,
+        state_horizon,
+    )
+
+
+def _structured_predictor_phase(
+    actor: StructuredActor,
+    dynamics: StructuredDynamics,
+    dynamics_optimizer: torch.optim.Optimizer,
+    staged: dict[str, Tensor],
+    windows: np.ndarray,
+    *,
+    steps_per_trajectory: int,
+    config: PpoConfig,
+    autocast_enabled: bool,
+    auxiliary_terms_fn: Any,
+) -> dict[str, float | int]:
+    """Measure then fit the predictor without changing or accumulating into the actor."""
+    device = next(actor.parameters()).device
+    predictor_minibatch_size = config.resolved_structured_predictor_minibatch_size
+    windows_per_batch = max(1, predictor_minibatch_size // windows.shape[1])
+
+    def batches(selected: np.ndarray) -> list[np.ndarray]:
+        rank = {int(window[0]): position for position, window in enumerate(selected)}
+        ordered = selected[np.argsort(selected[:, 0])]
+        grouped = [
+            ordered[batch_slice]
+            for batch_slice in _balanced_minibatch_slices(ordered.shape[0], windows_per_batch)
+        ]
+        grouped.sort(key=lambda batch: min(rank[int(window[0])] for window in batch))
+        return grouped
+
+    def zero_totals() -> dict[str, Tensor]:
+        return {
+            name: torch.zeros((), device=device, dtype=torch.float64)
+            for name in _STRUCTURED_AUXILIARY_METRICS
+        }
+
+    def record(
+        totals: dict[str, Tensor],
+        terms: StructuredDynamicsTerms,
+        weight: int,
+    ) -> None:
+        for name in _STRUCTURED_AUXILIARY_METRICS:
+            totals[name] += getattr(terms, name).detach().double() * weight
+
+    def indices_for(batch: np.ndarray) -> tuple[Tensor, Tensor, Tensor]:
+        host_indices = batch.reshape(-1)
+        unique, inverse = np.unique(host_indices, return_inverse=True)
+        return (
+            torch.from_numpy(host_indices).to(device=device),
+            torch.from_numpy(unique).to(device=device),
+            torch.from_numpy(inverse).to(device=device),
+        )
+
+    evaluation_windows = windows[: config.structured_gate_evaluation_windows]
+    preupdate_totals = zero_totals()
+    evaluated = 0
+    preupdate_loss_total = torch.zeros((), device=device, dtype=torch.float64)
+    dynamics.eval()
+    with torch.inference_mode():
+        for batch in batches(evaluation_windows):
+            indices, belief_indices, belief_inverse = indices_for(batch)
+            loss, terms = auxiliary_terms_fn(
+                actor,
+                dynamics,
+                staged,
+                indices,
+                steps_per_trajectory=steps_per_trajectory,
+                config=config,
+                autocast_enabled=autocast_enabled,
+                actor_grad=False,
+                complete_windows=True,
+                belief_indices=belief_indices,
+                belief_inverse=belief_inverse,
+            )
+            weight = batch.shape[0]
+            preupdate_loss_total += loss.detach().double() * weight
+            record(preupdate_totals, terms, weight)
+            evaluated += weight
+
+    # The actor heads decode predicted latents into decision targets. Freezing
+    # their parameters still lets their Jacobian carry gradients from those
+    # targets into the predictor, without allocating actor parameter gradients.
+    actor_parameters = tuple(actor.parameters())
+    actor_requires_grad = tuple(parameter.requires_grad for parameter in actor_parameters)
+    for parameter in actor_parameters:
+        parameter.requires_grad_(False)
+    dynamics.train()
+    training_totals = zero_totals()
+    trained = 0
+    gradient_norm_total = torch.zeros((), device=device, dtype=torch.float64)
+    training_loss_total = torch.zeros((), device=device, dtype=torch.float64)
+    training_updates = 0
+    actor_states = 0
+    predictor_nonfinite = torch.zeros((), device=device, dtype=torch.float32)
+    predictor_step_is_gateable = getattr(dynamics_optimizer, "supports_found_inf", False) or any(
+        group.get("fused", False) for group in dynamics_optimizer.param_groups
+    )
+    started = time.perf_counter()
+    try:
+        for batch in batches(windows):
+            indices, belief_indices, belief_inverse = indices_for(batch)
+            dynamics_optimizer.zero_grad(set_to_none=True)
+            loss, terms = auxiliary_terms_fn(
+                actor,
+                dynamics,
+                staged,
+                indices,
+                steps_per_trajectory=steps_per_trajectory,
+                config=config,
+                autocast_enabled=autocast_enabled,
+                actor_grad=False,
+                complete_windows=True,
+                belief_indices=belief_indices,
+                belief_inverse=belief_inverse,
+            )
+            loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                dynamics.parameters(), config.max_gradient_norm
+            ).detach()
+            finite = torch.isfinite(loss.detach()) & torch.isfinite(gradient_norm)
+            if predictor_step_is_gateable:
+                predictor_skip = (~finite).float()
+                predictor_nonfinite += predictor_skip
+            else:
+                if not bool(finite):
+                    raise FloatingPointError("non-finite structured predictor update")
+                predictor_skip = None
+            _optimizer_step(
+                dynamics_optimizer,
+                config.resolved_structured_learning_rate,
+                config.lr_warmup_steps,
+                found_inf=predictor_skip,
+            )
+            weight = batch.shape[0]
+            record(training_totals, terms, weight)
+            training_loss_total += loss.detach().double() * weight
+            training_updates += 1
+            gradient_norm_total += gradient_norm.double() * weight
+            actor_states += belief_indices.numel()
+            trained += weight
+    finally:
+        for parameter, requires_grad in zip(actor_parameters, actor_requires_grad, strict=True):
+            parameter.requires_grad_(requires_grad)
+    elapsed = time.perf_counter() - started
+    if predictor_nonfinite.item():
+        raise FloatingPointError("non-finite structured predictor update")
+
+    metrics: dict[str, float | int] = {
+        "structured_predictor_evaluation_windows": evaluated,
+        "structured_predictor_training_windows": trained,
+        "structured_predictor_updates": training_updates,
+        "structured_predictor_minibatch_size": predictor_minibatch_size,
+        "structured_predictor_gradient_norm": float(gradient_norm_total / max(1, trained)),
+        "structured_predictor_actor_states": actor_states,
+        "structured_predictor_seconds": elapsed,
+        "structured_learning_rate": float(dynamics_optimizer.param_groups[0]["lr"]),
+        "structured_preupdate_combined": float(preupdate_loss_total / max(1, evaluated)),
+        "structured_predictor_combined": float(training_loss_total / max(1, trained)),
+    }
+    metrics.update(
+        {
+            f"structured_preupdate_{name}": float(total / max(1, evaluated))
+            for name, total in preupdate_totals.items()
+        }
+    )
+    metrics.update(
+        {
+            f"structured_predictor_{name}": float(total / max(1, trained))
+            for name, total in training_totals.items()
+        }
+    )
+    return metrics
+
+
 def update_ppo(
     actor: Actor,
     critic: Critic,
@@ -2256,6 +2550,8 @@ def update_ppo(
     actor_epochs: int | None = None,
     rows: np.ndarray | None = None,
     structured_dynamics: StructuredDynamics | None = None,
+    structured_dynamics_optimizer: torch.optim.Optimizer | None = None,
+    structured_actor_auxiliary: bool = False,
     auxiliary_generator: np.random.Generator | None = None,
 ) -> dict[str, float | int]:
     """Replay one rollout with asymmetric, per-component clipped policy updates.
@@ -2276,20 +2572,34 @@ def update_ppo(
     """
     _validate_config(config)
     _validate_structured_auxiliary_modules(actor, structured_dynamics, config)
-    auxiliary_active = structured_dynamics is not None
-    if auxiliary_active != (auxiliary_generator is not None):
+    predictor_active = structured_dynamics is not None
+    if predictor_active != (structured_dynamics_optimizer is not None):
+        raise ValueError("active structured auxiliary requires exactly one predictor optimizer")
+    if predictor_active != (auxiliary_generator is not None):
         raise ValueError(
             "active structured auxiliary requires exactly one independent auxiliary generator"
         )
-    if structured_dynamics is not None:
-        optimized = {
+    if structured_actor_auxiliary and (
+        not predictor_active or config.structured_actor_gradient_ratio <= 0.0
+    ):
+        raise ValueError(
+            "actor-side structured auxiliary requires an active predictor "
+            "and positive gradient ratio"
+        )
+    if structured_dynamics is not None and structured_dynamics_optimizer is not None:
+        actor_optimized = {
             id(parameter) for group in actor_optimizer.param_groups for parameter in group["params"]
         }
-        missing = any(
-            id(parameter) not in optimized for parameter in structured_dynamics.parameters()
-        )
-        if missing:
-            raise ValueError("actor optimizer does not include every dynamics parameter")
+        dynamics_optimized = {
+            id(parameter)
+            for group in structured_dynamics_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        dynamics_parameters = {id(parameter) for parameter in structured_dynamics.parameters()}
+        if actor_optimized & dynamics_parameters:
+            raise ValueError("actor optimizer must not include dynamics parameters")
+        if not dynamics_parameters <= dynamics_optimized:
+            raise ValueError("predictor optimizer does not include every dynamics parameter")
     if actor_epochs is None:
         actor_epochs = config.epochs
     elif not 0 <= actor_epochs <= config.epochs:
@@ -2332,6 +2642,40 @@ def update_ppo(
     # step. The critic still holds exactly the behavior weights at this point.
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
+    actor.train()
+    critic.train()
+    # Predictor-only fitting must leave the actor with neither changed weights
+    # nor stale gradient buffers, including throughout critic warmup.
+    actor_optimizer.zero_grad(set_to_none=True)
+    predictor_metrics: dict[str, float | int] = {}
+    auxiliary_windows: np.ndarray | None = None
+    structured_terms_fn: Any = None
+    if predictor_active:
+        assert isinstance(actor, StructuredActor)
+        assert structured_dynamics is not None
+        assert structured_dynamics_optimizer is not None
+        assert auxiliary_generator is not None
+        # The predictor's locality-aware batches have dynamic unique-row counts.
+        # Compiling this path adds minutes of specialization latency without
+        # improving its narrow attention/reduction workload.
+        structured_terms_fn = _structured_auxiliary_terms
+        auxiliary_windows = _structured_transition_order(
+            rollout.valid,
+            rows,
+            _structured_auxiliary_horizon(config),
+            auxiliary_generator,
+        )
+        predictor_metrics = _structured_predictor_phase(
+            actor,
+            structured_dynamics,
+            structured_dynamics_optimizer,
+            staged,
+            auxiliary_windows,
+            steps_per_trajectory=rollout.valid.shape[1],
+            config=config,
+            autocast_enabled=autocast_enabled,
+            auxiliary_terms_fn=structured_terms_fn,
+        )
     behavior_values = _owned_behavior_values(
         critic,
         architecture,
@@ -2358,8 +2702,6 @@ def update_ppo(
                 compile_mode=compile_mode,
             )
         )
-    actor.train()
-    critic.train()
     if structured_dynamics is not None:
         structured_dynamics.train()
     prepared = prepare_advantages(rollout, behavior_values, config, rows=rows)
@@ -2415,42 +2757,22 @@ def update_ppo(
     completed_epochs = 0
     max_approx_kl = 0.0
     first_minibatch_kl = 0.0
+    actor_auxiliary_active = bool(predictor_active and structured_actor_auxiliary and actor_epochs)
     auxiliary_totals = (
         {
             name: torch.zeros((), device=device, dtype=torch.float64)
             for name in _STRUCTURED_AUXILIARY_METRICS
         }
-        if auxiliary_active
+        if actor_auxiliary_active
         else {}
     )
     auxiliary_updates = 0
     auxiliary_seconds = 0.0
     auxiliary_cursor = 0
-    auxiliary_windows: np.ndarray | None = None
-    if auxiliary_active and actor_epochs:
-        assert auxiliary_generator is not None
-        state_horizon = (
-            config.structured_patch_horizon
-            if any(
-                (
-                    config.structured_patch_coefficient,
-                    config.structured_economy_coefficient,
-                    config.structured_opponent_summary_coefficient,
-                    config.structured_opponent_patch_coefficient,
-                )
-            )
-            else 0
-        )
-        horizon = max(
-            config.structured_decision_horizon if config.structured_decision_coefficient else 0,
-            state_horizon,
-        )
-        auxiliary_windows = _structured_transition_order(
-            rollout.valid,
-            rows,
-            horizon,
-            auxiliary_generator,
-        )
+    ppo_actor_gradient_norm_total = torch.zeros((), device=device, dtype=torch.float64)
+    actor_auxiliary_raw_norm_total = torch.zeros((), device=device, dtype=torch.float64)
+    actor_auxiliary_applied_norm_total = torch.zeros((), device=device, dtype=torch.float64)
+    actor_auxiliary_scale_total = torch.zeros((), device=device, dtype=torch.float64)
     actor_terms = _cached_update_callable(
         actor, "_kaggriculture_update_terms", _actor_minibatch_terms, compile_mode
     )
@@ -2471,7 +2793,7 @@ def update_ppo(
     # optimizer's own device-side skip and report finiteness at the epoch
     # boundary, which is the first point the outcome can change what runs next.
     guard_host = torch.empty(
-        4 if auxiliary_active else 3,
+        4 if actor_auxiliary_active else 3,
         dtype=torch.float64,
         pin_memory=device.type == "cuda",
     )
@@ -2523,6 +2845,9 @@ def update_ppo(
             combined_actor_loss = actor_zero
             auxiliary_loss = actor_zero
             auxiliary_terms: StructuredDynamicsTerms | None = None
+            actor_auxiliary_raw_norm = actor_zero
+            actor_auxiliary_applied_norm = actor_zero
+            actor_auxiliary_scale = actor_zero
             auxiliary_started = 0.0
             auxiliary_start_event: torch.cuda.Event | None = None
             auxiliary_end_event: torch.cuda.Event | None = None
@@ -2579,11 +2904,14 @@ def update_ppo(
                 policy_loss = -policy_sum / component_count
                 entropy_mean = entropy_sum / component_count
                 # Release the PPO forward graph before building the predictor
-                # graph. Their gradients still add in the same parameter
-                # buffers, while peak memory stays near one actor forward
-                # instead of retaining both until a combined backward.
+                # graph. Gradients remain in the actor buffers, while peak
+                # memory stays near one actor forward.
                 policy_loss.backward()
-                if auxiliary_active:
+                ppo_gradients = [
+                    parameter.grad for parameter in actor.parameters() if parameter.grad is not None
+                ]
+                ppo_gradient_norm = torch.nn.utils.get_total_norm(ppo_gradients).detach()
+                if actor_auxiliary_active:
                     assert isinstance(actor, StructuredActor)
                     assert structured_dynamics is not None
                     assert auxiliary_windows is not None
@@ -2605,7 +2933,8 @@ def update_ppo(
                         auxiliary_start_event.record()
                     else:
                         auxiliary_started = time.perf_counter()
-                    auxiliary_loss, auxiliary_terms = _structured_auxiliary_terms(
+                    assert structured_terms_fn is not None
+                    auxiliary_loss, auxiliary_terms = structured_terms_fn(
                         actor,
                         structured_dynamics,
                         staged,
@@ -2613,24 +2942,49 @@ def update_ppo(
                         steps_per_trajectory=rollout.valid.shape[1],
                         config=config,
                         autocast_enabled=autocast_enabled,
+                        actor_grad=True,
+                        complete_windows=True,
                     )
-                    auxiliary_loss.backward()
+                    actor_parameters = tuple(actor.parameters())
+                    auxiliary_gradients = torch.autograd.grad(
+                        auxiliary_loss,
+                        actor_parameters,
+                        allow_unused=True,
+                    )
+                    present_auxiliary_gradients = [
+                        gradient for gradient in auxiliary_gradients if gradient is not None
+                    ]
+                    actor_auxiliary_raw_norm = torch.nn.utils.get_total_norm(
+                        present_auxiliary_gradients
+                    ).detach()
+                    actor_auxiliary_scale = torch.clamp(
+                        (
+                            config.structured_actor_gradient_ratio
+                            * ppo_gradient_norm
+                            / actor_auxiliary_raw_norm.clamp_min(torch.finfo(torch.float32).tiny)
+                        ),
+                        max=1.0,
+                    )
+                    if not torch.isfinite(actor_auxiliary_raw_norm):
+                        actor_auxiliary_scale = torch.zeros_like(actor_auxiliary_scale)
+                    actor_auxiliary_applied_norm = actor_auxiliary_raw_norm * actor_auxiliary_scale
+                    for parameter, gradient in zip(
+                        actor_parameters, auxiliary_gradients, strict=True
+                    ):
+                        if gradient is None:
+                            continue
+                        scaled_gradient = gradient * actor_auxiliary_scale
+                        if parameter.grad is None:
+                            parameter.grad = scaled_gradient
+                        else:
+                            parameter.grad.add_(scaled_gradient)
                     if auxiliary_end_event is not None:
                         auxiliary_end_event.record()
                     else:
                         auxiliary_seconds += time.perf_counter() - auxiliary_started
-                # PPO and the typed predictor share one optimizer step. Their
-                # independent backwards above accumulate the exact summed
-                # gradient without retaining both activation graphs.
                 combined_actor_loss = policy_loss.detach() + auxiliary_loss.detach()
-                gradient_parameters: Any = actor.parameters()
-                if structured_dynamics is not None:
-                    gradient_parameters = (
-                        *actor.parameters(),
-                        *structured_dynamics.parameters(),
-                    )
                 actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    gradient_parameters, config.max_gradient_norm
+                    actor.parameters(), config.max_gradient_norm
                 ).detach()
 
             # Target KL constrains only the actor. Keep fitting the critic for
@@ -2661,7 +3015,7 @@ def update_ppo(
                     policy_loss.detach().double(),
                     value_loss.detach().double(),
                 ]
-                if auxiliary_active:
+                if actor_auxiliary_active:
                     guard_values.append(combined_actor_loss.detach().double())
                 guard_values_tensor = torch.stack(guard_values)
                 guard_host.copy_(guard_values_tensor, non_blocking=True)
@@ -2680,7 +3034,7 @@ def update_ppo(
                 guard_values_list = guard_host.tolist()
                 batch_kl_value, policy_loss_value, value_loss_value = guard_values_list[:3]
                 combined_actor_loss_value = (
-                    guard_values_list[3] if auxiliary_active else policy_loss_value
+                    guard_values_list[3] if actor_auxiliary_active else policy_loss_value
                 )
                 if auxiliary_start_event is not None and auxiliary_end_event is not None:
                     auxiliary_seconds += (
@@ -2732,6 +3086,7 @@ def update_ppo(
                     totals["clip_fraction"] += clipped_sum.detach().double()
                     totals["actor_gradient_norm"] += actor_gradient_norm * states
                     total_components += component_count
+                    ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
                     actor_states += states
                     actor_updates += 1
                     if auxiliary_terms is not None:
@@ -2739,6 +3094,11 @@ def update_ppo(
                             auxiliary_totals[name] += (
                                 getattr(auxiliary_terms, name).detach().double()
                             )
+                        actor_auxiliary_raw_norm_total += actor_auxiliary_raw_norm.double() * states
+                        actor_auxiliary_applied_norm_total += (
+                            actor_auxiliary_applied_norm.double() * states
+                        )
+                        actor_auxiliary_scale_total += actor_auxiliary_scale.double() * states
                         auxiliary_updates += 1
                 if not math.isfinite(value_loss_value):
                     raise FloatingPointError("non-finite critic loss")
@@ -2868,13 +3228,28 @@ def update_ppo(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
     }
-    if auxiliary_active:
+    metrics.update(predictor_metrics)
+    if predictor_active:
+        metrics["structured_actor_auxiliary_enabled"] = int(actor_auxiliary_active)
+        metrics["ppo_actor_gradient_norm"] = float(
+            ppo_actor_gradient_norm_total / max(1, actor_states)
+        )
+    if actor_auxiliary_active:
         metrics.update(
             {
-                f"structured_{name}": float(total / max(1, auxiliary_updates))
+                f"structured_actor_{name}": float(total / max(1, auxiliary_updates))
                 for name, total in auxiliary_totals.items()
             }
         )
-        metrics["structured_auxiliary_updates"] = auxiliary_updates
-        metrics["structured_auxiliary_seconds"] = auxiliary_seconds
+        metrics["structured_actor_auxiliary_updates"] = auxiliary_updates
+        metrics["structured_actor_auxiliary_seconds"] = auxiliary_seconds
+        metrics["structured_actor_auxiliary_raw_gradient_norm"] = float(
+            actor_auxiliary_raw_norm_total / max(1, actor_states)
+        )
+        metrics["structured_actor_auxiliary_applied_gradient_norm"] = float(
+            actor_auxiliary_applied_norm_total / max(1, actor_states)
+        )
+        metrics["structured_actor_auxiliary_scale"] = float(
+            actor_auxiliary_scale_total / max(1, actor_states)
+        )
     return metrics

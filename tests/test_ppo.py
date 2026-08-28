@@ -28,6 +28,7 @@ from kaggriculture.ppo import (
     _explained_variance,
     _fit_explained_variance,
     _stage_tensor,
+    _structured_auxiliary_terms,
     _structured_transition_order,
     _target_correlation,
     _validate_config,
@@ -35,6 +36,7 @@ from kaggriculture.ppo import (
     actor_forward_args,
     generalized_advantage_and_targets,
     make_optimizers,
+    make_structured_dynamics_optimizer,
     prepare_advantages,
     replay_behavior_values,
     update_ppo,
@@ -118,6 +120,11 @@ def test_active_structured_auxiliary_horizons_must_be_positive() -> None:
                 structured_patch_horizon=0,
             )
         )
+
+
+def test_structured_predictor_minibatch_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="predictor minibatch size"):
+        _validate_config(PpoConfig(structured_predictor_minibatch_size=0))
 
 
 def test_minibatches_are_balanced_without_dropping_the_tail() -> None:
@@ -1337,6 +1344,120 @@ def test_structured_transition_order_never_crosses_trajectory_or_terminal_bounda
         assert trajectories[0] != 2
 
 
+def test_structured_window_loss_matches_generic_masked_unroll() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(
+        seed_start=205,
+        sampling_seed=27,
+    )
+    config = PpoConfig(
+        epochs=1,
+        minibatch_size=1 << 12,
+        use_bfloat16=False,
+        structured_decision_coefficient=0.5,
+        structured_opponent_summary_coefficient=0.5,
+        structured_opponent_patch_coefficient=0.0,
+        structured_decision_horizon=2,
+        structured_patch_horizon=1,
+    )
+    dynamics = StructuredDynamics(_small_structured_config())
+    device = torch.device("cpu")
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged |= {
+        "unit_actions": _stage_tensor(rollout.unit_actions, device),
+        "market_kinds": _stage_tensor(rollout.market_kinds, device),
+        "market_quantities": _stage_tensor(rollout.market_quantities, device),
+        "unit_masks": _stage_tensor(rollout.unit_masks, device),
+        "market_kind_masks": _stage_tensor(rollout.market_kind_masks, device),
+        "market_quantity_masks": _stage_tensor(rollout.market_quantity_masks, device),
+        "unit_active": _stage_tensor(rollout.unit_active, device),
+        "market_active": _stage_tensor(rollout.market_active, device),
+        "market_quantity_active": _stage_tensor(rollout.market_quantity_active, device),
+    }
+    windows = _structured_transition_order(
+        rollout.valid,
+        None,
+        2,
+        np.random.default_rng(28),
+    )
+    indices = torch.from_numpy(windows.reshape(-1))
+    unique_indices, inverse = np.unique(windows.reshape(-1), return_inverse=True)
+    belief_indices = torch.from_numpy(unique_indices)
+    belief_inverse = torch.from_numpy(inverse)
+
+    with torch.inference_mode():
+        generic_loss, generic = _structured_auxiliary_terms(
+            actor,
+            dynamics,
+            staged,
+            indices,
+            steps_per_trajectory=rollout.valid.shape[1],
+            config=config,
+            autocast_enabled=False,
+            actor_grad=False,
+            complete_windows=False,
+        )
+        window_loss, windowed = _structured_auxiliary_terms(
+            actor,
+            dynamics,
+            staged,
+            indices,
+            steps_per_trajectory=rollout.valid.shape[1],
+            config=config,
+            autocast_enabled=False,
+            actor_grad=False,
+            complete_windows=True,
+            belief_indices=belief_indices,
+            belief_inverse=belief_inverse,
+        )
+
+    torch.testing.assert_close(window_loss, generic_loss)
+    for window_value, generic_value in zip(windowed, generic, strict=True):
+        torch.testing.assert_close(window_value, generic_value)
+
+
+def test_sparse_structured_transition_preserves_active_belief_families() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(
+        seed_start=206,
+        sampling_seed=28,
+    )
+    dynamics = StructuredDynamics(_small_structured_config())
+    device = torch.device("cpu")
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged["unit_active"] = _stage_tensor(rollout.unit_active, device)
+    staged["unit_actions"] = _stage_tensor(rollout.unit_actions, device)
+    staged["market_kinds"] = _stage_tensor(rollout.market_kinds, device)
+    staged["market_quantities"] = _stage_tensor(rollout.market_quantities, device)
+    indices = torch.arange(3)
+    (inputs,) = _actor_batch_args(STRUCTURED, staged, indices)
+    _, belief = actor.forward_with_belief(inputs)
+
+    full = dynamics(
+        belief,
+        staged["unit_actions"][indices].long(),
+        staged["market_kinds"][indices].long(),
+        staged["market_quantities"][indices].long(),
+        inputs.unit_categorical,
+        inputs.unit_active,
+    )
+    active_fields = (False, False, True, False, False, True, True)
+    sparse = dynamics(
+        belief,
+        staged["unit_actions"][indices].long(),
+        staged["market_kinds"][indices].long(),
+        staged["market_quantities"][indices].long(),
+        inputs.unit_categorical,
+        inputs.unit_active,
+        active_fields=active_fields,
+    )
+    for position, (full_value, sparse_value, input_value) in enumerate(
+        zip(full, sparse, belief, strict=True)
+    ):
+        if active_fields[position]:
+            torch.testing.assert_close(sparse_value, full_value)
+        else:
+            torch.testing.assert_close(sparse_value, input_value)
+
+
 def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_ppo_rng() -> None:
     actor, rollout = _structured_rollout_with_quantity_orders(seed_start=207, sampling_seed=29)
     control_actor = copy.deepcopy(actor)
@@ -1355,21 +1476,20 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
         structured_opponent_patch_coefficient=0.5,
         structured_decision_horizon=2,
         structured_patch_horizon=1,
+        structured_actor_gradient_ratio=0.1,
     )
     dynamics = StructuredDynamics(_small_structured_config())
     control_optimizers = make_optimizers(control_actor, control_critic, control_config)
-    active_optimizers = make_optimizers(
-        active_actor,
-        active_critic,
-        active_config,
-        structured_dynamics=dynamics,
-    )
-    optimized_parameters = {
+    active_optimizers = make_optimizers(active_actor, active_critic, active_config)
+    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, active_config)
+    actor_optimized_parameters = {
         id(parameter)
         for group in active_optimizers[0].param_groups
         for parameter in group["params"]
     }
-    assert all(id(parameter) in optimized_parameters for parameter in dynamics.parameters())
+    assert all(
+        id(parameter) not in actor_optimized_parameters for parameter in dynamics.parameters()
+    )
     actor_before = {name: value.detach().clone() for name, value in active_actor.named_parameters()}
     dynamics_before = {name: value.detach().clone() for name, value in dynamics.named_parameters()}
     control_generator = np.random.default_rng(31)
@@ -1391,23 +1511,37 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
         active_config,
         generator=active_generator,
         structured_dynamics=dynamics,
+        structured_dynamics_optimizer=dynamics_optimizer,
+        structured_actor_auxiliary=True,
         auxiliary_generator=np.random.default_rng(32),
     )
 
     assert active_generator.bit_generator.state == control_generator.bit_generator.state
     assert not any(name.startswith("structured_") for name in control_metrics)
-    assert active_metrics["structured_auxiliary_updates"] == 1
-    assert active_metrics["structured_eligible"] > 0.0
+    assert active_metrics["structured_predictor_updates"] >= 1
+    assert active_metrics["structured_actor_auxiliary_updates"] == 1
+    assert active_metrics["structured_predictor_eligible"] > 0.0
+    assert (
+        active_metrics["structured_actor_auxiliary_applied_gradient_norm"]
+        <= (active_metrics["structured_actor_auxiliary_raw_gradient_norm"])
+    )
+    assert active_metrics["structured_actor_auxiliary_applied_gradient_norm"] <= (
+        active_config.structured_actor_gradient_ratio * active_metrics["ppo_actor_gradient_norm"]
+        + 1e-7
+    )
+    assert 0.0 <= active_metrics["structured_actor_auxiliary_scale"] <= 1.0
     for name in (
-        "structured_decision",
-        "structured_decision_unit",
-        "structured_decision_market_kind",
-        "structured_decision_market_quantity",
-        "structured_opponent_summary",
-        "structured_opponent_patches",
-        "structured_residual_ratio",
+        "structured_preupdate_combined",
+        "structured_preupdate_decision",
+        "structured_predictor_opponent_summary",
+        "structured_predictor_opponent_patches",
+        "structured_actor_decision",
+        "structured_actor_residual_ratio",
     ):
         assert math.isfinite(active_metrics[name])
+    assert active_metrics["structured_preupdate_decision"] > 0.0
+    assert active_metrics["structured_preupdate_opponent_summary"] > 0.0
+    assert active_metrics["structured_preupdate_opponent_patches"] > 0.0
     assert any(
         not torch.equal(value, actor_before[name])
         for name, value in active_actor.named_parameters()
@@ -1415,6 +1549,50 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
     assert any(
         not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
     )
+
+
+def test_structured_predictor_trains_during_critic_only_warmup_without_actor_gradients() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(seed_start=211, sampling_seed=41)
+    critic = StructuredCritic(_small_structured_config())
+    config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=1 << 12,
+        use_bfloat16=False,
+        structured_decision_coefficient=0.5,
+        structured_opponent_summary_coefficient=0.5,
+        structured_opponent_patch_coefficient=0.5,
+        structured_actor_gradient_ratio=0.1,
+    )
+    dynamics = StructuredDynamics(_small_structured_config())
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, config)
+    actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
+    dynamics_before = {name: value.detach().clone() for name, value in dynamics.named_parameters()}
+
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(43),
+        actor_epochs=0,
+        structured_dynamics=dynamics,
+        structured_dynamics_optimizer=dynamics_optimizer,
+        structured_actor_auxiliary=False,
+        auxiliary_generator=np.random.default_rng(44),
+    )
+
+    assert metrics["actor_updates"] == 0
+    assert metrics["structured_predictor_updates"] >= 1
+    assert metrics["structured_actor_auxiliary_enabled"] == 0
+    assert all(torch.equal(value, actor_before[name]) for name, value in actor.named_parameters())
+    assert any(
+        not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
+    )
+    assert all(parameter.grad is None for parameter in actor.parameters())
 
 
 def test_target_correlation_separates_noise_from_a_mis_scaled_critic() -> None:

@@ -7,7 +7,12 @@ import pytest
 import torch
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
-from kaggriculture.ppo import PpoConfig, make_optimizers
+from kaggriculture.ppo import (
+    PpoConfig,
+    _optimizer_step,
+    make_optimizers,
+    make_structured_dynamics_optimizer,
+)
 from kaggriculture.provenance import source_identity
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.structured_dynamics import StructuredDynamics
@@ -94,15 +99,15 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
     actor = StructuredActor(model_config)
     critic = StructuredCritic(model_config)
     dynamics = StructuredDynamics(model_config)
-    actor_optimizer, critic_optimizer = make_optimizers(
-        actor,
-        critic,
-        ppo_config,
-        structured_dynamics=dynamics,
-    )
-    actor_optimizer.zero_grad(set_to_none=True)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
+    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, ppo_config)
+    dynamics_optimizer.zero_grad(set_to_none=True)
     sum(parameter.square().mean() for parameter in dynamics.parameters()).backward()
-    actor_optimizer.step()
+    _optimizer_step(
+        dynamics_optimizer,
+        ppo_config.resolved_structured_learning_rate,
+        ppo_config.lr_warmup_steps,
+    )
     auxiliary_generator = np.random.default_rng(43)
     auxiliary_state = auxiliary_generator.bit_generator.state
     expected = auxiliary_generator.random(5)
@@ -117,6 +122,7 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
                 actor_optimizer,
                 critic_optimizer,
                 dynamics,
+                dynamics_optimizer,
             )
         ],
         model_config=model_config,
@@ -126,6 +132,7 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         metrics={},
         source_identity=source_identity(),
         auxiliary_rng_state=auxiliary_state,
+        structured_gate_state={"agents": [{"reference": None, "streak": 0, "enabled": False}]},
     )
 
     restored_actor = StructuredActor(model_config)
@@ -135,7 +142,10 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         restored_actor,
         restored_critic,
         ppo_config,
-        structured_dynamics=restored_dynamics,
+    )
+    restored_dynamics_optimizer = make_structured_dynamics_optimizer(
+        restored_dynamics,
+        ppo_config,
     )
     restored_agent = TrainingAgent(
         restored_actor,
@@ -143,18 +153,26 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         restored_actor_optimizer,
         restored_critic_optimizer,
         restored_dynamics,
+        restored_dynamics_optimizer,
     )
     payload = load_checkpoint(path, [restored_agent], device=torch.device("cpu"))
     restored_generator = np.random.default_rng()
     restored_generator.bit_generator.state = payload["structured_auxiliary_rng"]
 
+    assert payload["structured_gate_state"] == {
+        "agents": [{"reference": None, "streak": 0, "enabled": False}]
+    }
     for name, value in dynamics.state_dict().items():
         torch.testing.assert_close(restored_dynamics.state_dict()[name], value)
     assert restored_generator.random(5).tolist() == expected.tolist()
-    assert restored_actor_optimizer.state_dict()["state"]
-    assert len(restored_actor_optimizer.state_dict()["state"]) == len(
-        actor_optimizer.state_dict()["state"]
+    assert restored_dynamics_optimizer.state_dict()["state"]
+    assert len(restored_dynamics_optimizer.state_dict()["state"]) == len(
+        dynamics_optimizer.state_dict()["state"]
     )
+    assert dynamics_optimizer.param_groups[0]["warmup_step"] == 1
+    assert restored_dynamics_optimizer.param_groups[0]["warmup_step"] == 1
+    assert actor_optimizer.param_groups[0]["warmup_step"] == 0
+    assert restored_actor_optimizer.param_groups[0]["warmup_step"] == 0
 
     inactive_config = PpoConfig(
         optimizer="adamw",

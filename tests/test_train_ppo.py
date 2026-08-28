@@ -1654,6 +1654,56 @@ def test_the_entropy_reference_is_persisted_per_population_member() -> None:
         module._validate_entropy_references([-0.1, None, 0.29], population=3)
 
 
+def test_structured_predictor_gate_is_persisted_consecutive_and_revocable() -> None:
+    module = _training_script()
+    config = PpoConfig(
+        structured_actor_gradient_ratio=0.1,
+        structured_decision_coefficient=0.5,
+        structured_opponent_summary_coefficient=0.5,
+        structured_opponent_patch_coefficient=0.5,
+    )
+    state = module._new_structured_gate_states(1)[0]
+    reference_metrics = {
+        "structured_preupdate_combined": 2.0,
+        "structured_preupdate_decision": 4.0,
+        "structured_preupdate_opponent_summary": 0.06,
+        "structured_preupdate_opponent_patches": 0.03,
+    }
+
+    first = module._advance_structured_gate(state, reference_metrics, config)
+    assert first["structured_gate_passed"] == 0
+    assert state == {
+        "reference": {
+            "combined": 2.0,
+            "decision": 4.0,
+            "opponent_summary": 0.06,
+            "opponent_patches": 0.03,
+        },
+        "streak": 0,
+        "enabled": False,
+    }
+
+    qualified = {name: value * 0.8 for name, value in reference_metrics.items()}
+    second = module._advance_structured_gate(state, qualified, config)
+    assert second["structured_gate_streak"] == 1
+    assert second["structured_gate_actor_enabled_next"] == 0
+    third = module._advance_structured_gate(state, qualified, config)
+    assert third["structured_gate_streak"] == 2
+    assert third["structured_gate_actor_enabled_next"] == 1
+
+    revoked = dict(qualified)
+    revoked["structured_preupdate_opponent_patches"] = (
+        reference_metrics["structured_preupdate_opponent_patches"] * 0.99
+    )
+    fourth = module._advance_structured_gate(state, revoked, config)
+    assert fourth["structured_gate_passed"] == 0
+    assert fourth["structured_gate_actor_enabled_next"] == 0
+    assert state["streak"] == 0
+
+    record = module._structured_gate_record([state])
+    assert module._validate_structured_gate_states(record, 1) == [state]
+
+
 def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
     """A synthetic population wave with the row layout the collector's contract fixes.
 

@@ -38,23 +38,22 @@ AnyCritic = DistributionalCritic | StructuredCritic
 AnyModelConfig = ModelConfig | StructuredConfig
 
 #: The base states every member owns. A structured learner additionally owns a
-#: training-only dynamics module; its optimizer moments live in actor_optimizer.
+#: training-only dynamics module and its independent optimizer.
 AGENT_STATE_KEYS = ("actor", "critic", "actor_optimizer", "critic_optimizer")
-OPTIONAL_AGENT_STATE_KEYS = ("structured_dynamics",)
+OPTIONAL_AGENT_STATE_KEYS = ("structured_dynamics", "structured_dynamics_optimizer")
 
 
 def _complete_agent_state(state: object) -> bool:
     if not isinstance(state, Mapping):
         return False
     keys = set(state)
-    return (
-        set(AGENT_STATE_KEYS)
-        <= keys
-        <= {
-            *AGENT_STATE_KEYS,
-            *OPTIONAL_AGENT_STATE_KEYS,
-            "orientation",
-        }
+    allowed = {
+        *AGENT_STATE_KEYS,
+        *OPTIONAL_AGENT_STATE_KEYS,
+        "orientation",
+    }
+    return set(AGENT_STATE_KEYS) <= keys <= allowed and ("structured_dynamics" in keys) == (
+        "structured_dynamics_optimizer" in keys
     )
 
 
@@ -73,6 +72,7 @@ class TrainingAgent:
     actor_optimizer: torch.optim.Optimizer | None = None
     critic_optimizer: torch.optim.Optimizer | None = None
     structured_dynamics: StructuredDynamics | None = None
+    structured_dynamics_optimizer: torch.optim.Optimizer | None = None
 
     def state(self) -> dict[str, Any]:
         """This member's complete recovery state."""
@@ -84,8 +84,12 @@ class TrainingAgent:
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }
+        if (self.structured_dynamics is None) != (self.structured_dynamics_optimizer is None):
+            raise ValueError("structured dynamics and its optimizer must be checkpointed together")
         if self.structured_dynamics is not None:
+            assert self.structured_dynamics_optimizer is not None
             state["structured_dynamics"] = self.structured_dynamics.state_dict()
+            state["structured_dynamics_optimizer"] = self.structured_dynamics_optimizer.state_dict()
         return state
 
 
@@ -306,6 +310,7 @@ def checkpoint_payload(
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
+    structured_gate_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
     normalized_source_identity = validate_source_identity(source_identity)
@@ -344,11 +349,20 @@ def checkpoint_payload(
         raise ValueError("checkpoint RNG capture is incomplete")
     if not agents or any(not _complete_agent_state(agent) for agent in agents):
         raise ValueError(f"every checkpointed agent needs {AGENT_STATE_KEYS}")
-    auxiliary_members = ["structured_dynamics" in agent for agent in agents]
+    auxiliary_members = [
+        "structured_dynamics" in agent and "structured_dynamics_optimizer" in agent
+        for agent in agents
+    ]
     if any(auxiliary_members) != all(auxiliary_members):
         raise ValueError("checkpoint population cannot mix structured auxiliary presence")
     if any(auxiliary_members) != (auxiliary_rng_state is not None):
-        raise ValueError("structured dynamics and its auxiliary RNG must be checkpointed together")
+        raise ValueError(
+            "structured dynamics, optimizer, and auxiliary RNG must be checkpointed together"
+        )
+    if any(auxiliary_members) != (structured_gate_state is not None):
+        raise ValueError(
+            "structured dynamics and predictor gate state must be checkpointed together"
+        )
     # Evaluation and submission play the real board. Training cycles
     # symmetries per game, so a member has no private frame to record.
     # Identity is the code inference applies when it is asked to play.
@@ -383,6 +397,9 @@ def checkpoint_payload(
         **rng_states,
         "training_rng": training_rng_state,
         **auxiliary_recovery,
+        "structured_gate_state": (
+            None if structured_gate_state is None else dict(structured_gate_state)
+        ),
         "training_data_config": training_data_config,
         "league_snapshot_manifest": league_snapshot_manifest,
         # PFSP opponent estimates are part of the training state: without
@@ -525,6 +542,7 @@ def save_checkpoint(
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
+    structured_gate_state: Mapping[str, Any] | None = None,
 ) -> None:
     payload = checkpoint_payload(
         agents=[agent.state() for agent in agents],
@@ -545,6 +563,7 @@ def save_checkpoint(
         population_disagreement_reference=population_disagreement_reference,
         policy_entropy_reference=policy_entropy_reference,
         initial_actor=initial_actor,
+        structured_gate_state=structured_gate_state,
     )
     write_checkpoint(path, payload)
 
@@ -578,17 +597,25 @@ def load_checkpoint(
             f"checkpoint carries {len(states)} agents; this run configures {len(agents)}"
         )
     for agent, state in zip(agents, states, strict=True):
-        has_dynamics = "structured_dynamics" in state
-        expects_dynamics = agent.structured_dynamics is not None
+        has_dynamics = "structured_dynamics" in state and "structured_dynamics_optimizer" in state
+        expects_dynamics = (
+            agent.structured_dynamics is not None
+            and agent.structured_dynamics_optimizer is not None
+        )
         if has_dynamics != expects_dynamics:
             raise ValueError(
-                "checkpoint structured dynamics presence does not match the constructed learner"
+                "checkpoint structured dynamics optimizer presence does not match the "
+                "constructed learner"
             )
     for agent, state in zip(agents, states, strict=True):
         agent.actor.load_state_dict(state["actor"])
         agent.critic.load_state_dict(state["critic"])
         if agent.structured_dynamics is not None:
             agent.structured_dynamics.load_state_dict(state["structured_dynamics"])
+            assert agent.structured_dynamics_optimizer is not None
+            agent.structured_dynamics_optimizer.load_state_dict(
+                state["structured_dynamics_optimizer"]
+            )
         if agent.actor_optimizer is not None:
             agent.actor_optimizer.load_state_dict(state["actor_optimizer"])
         if agent.critic_optimizer is not None:
