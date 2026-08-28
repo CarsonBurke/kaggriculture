@@ -13,7 +13,7 @@ import pytest
 
 from kaggriculture.ppo import PpoConfig, _validate_config
 from kaggriculture.production import (
-    PRODUCTION_EXTERNAL_EVAL_EVERY,
+    PRODUCTION_CHECKPOINT_SECONDS,
     PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
@@ -50,6 +50,13 @@ def test_resume_detection_accepts_only_a_regular_latest_checkpoint(tmp_path: Pat
     latest.write_bytes(b"atomic checkpoint")
     assert resolve_resume_checkpoint(tmp_path) == latest
 
+    immutable = tmp_path / "checkpoint-000005.pt"
+    immutable.write_bytes(b"new checkpoint")
+    latest.unlink()
+    latest.hardlink_to(immutable)
+    assert resolve_resume_checkpoint(tmp_path) == latest
+    assert latest.stat().st_ino == immutable.stat().st_ino
+
     latest.unlink()
     latest.symlink_to(tmp_path / "checkpoint-000005.pt")
     with pytest.raises(ValueError, match="regular file"):
@@ -76,9 +83,9 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
     )
 
     assert command[-2:] == ["--resume", str(latest)]
-    # External probes are part of the production record: cadence and opponents
-    # must both be emitted so the launch command is complete.
-    assert command[command.index("--external-eval-every") + 1] == "10"
+    # External probes are triggered by each committed checkpoint event.
+    assert command[command.index("--checkpoint-seconds") + 1] == "420"
+    assert "--external-eval" in command
     assert (
         command[command.index("--external-eval-opponents") + 1]
         == PRODUCTION_EXTERNAL_EVAL_OPPONENTS
@@ -157,11 +164,10 @@ def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
     assert args.init_actor_from == artifacts
     assert args.league_games == 0
     assert args.league_builtin_lanes == 0
-    # A population has no built-in lane. External evaluation stays diagnostic
-    # and never enters the training wave; one worker reads each durable
-    # checkpoint, so the cadence must land on one.
-    assert args.external_eval_every == PRODUCTION_EXTERNAL_EVAL_EVERY
-    assert args.external_eval_every % args.checkpoint_every == 0
+    # A population has no built-in lane. Each immutable recovery event triggers
+    # external evaluation directly, with no iteration-modulo coupling.
+    assert args.external_eval
+    assert args.checkpoint_seconds == PRODUCTION_CHECKPOINT_SECONDS
     # Cost parity at N = 4: 156 games is a multiple of the 12 ordered pairings, so
     # every pairing gets 13 games and seat bias cancels exactly.
     assert args.games % (population * (population - 1)) == 0

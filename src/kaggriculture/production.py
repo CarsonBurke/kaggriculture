@@ -35,7 +35,7 @@ PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
 PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter,scripted-v27"
 PRODUCTION_LEAGUE_BUILTIN_LANES = 3
 PRODUCTION_EPISODE_STEPS = 720
-PRODUCTION_CHECKPOINT_EVERY = 5
+PRODUCTION_CHECKPOINT_SECONDS = 420
 # Every seat in a wave decodes at this one temperature, learner and league
 # alike. Splitting them is what a separate opponent temperature did, and it
 # was not neutral: the learner sampled at 1.0 while active lanes ran 0.8 and
@@ -74,8 +74,10 @@ PRODUCTION_ROLLOUT_BFLOAT16 = True
 # point of the direct launch being uncalibrated: the chain is what earns a
 # change here.
 PRODUCTION_UPDATE_COMPILE_MODE = "default"
-# Deterministic probes every N committed iterations give the journal an absolute
-# progress axis that self-play score rates cannot provide. The opponents are
+# Each committed recovery checkpoint gets a deterministic external probe, giving
+# the journal an absolute progress axis that self-play score rates cannot
+# provide. The checkpoint event itself is the trigger, so a population worker
+# can never be pointed at a missing or mutable artifact. The opponents are
 # emitted explicitly so the launch command is the complete record; unavailable
 # ones are dropped at launch with a warning, never fatal.
 #
@@ -84,11 +86,6 @@ PRODUCTION_UPDATE_COMPILE_MODE = "default"
 # 6/6, median bank 77,261 against 59,489. An absolute axis anchored only on
 # agents we already beat would saturate exactly where the interesting failure
 # lives. `starter` stays as the cheap floor that catches total collapse.
-#
-# A population run must keep this a multiple of `PRODUCTION_CHECKPOINT_EVERY`:
-# its members are probed out of the durable checkpoint, since `latest.pt` is
-# rewritten under the worker's feet.
-PRODUCTION_EXTERNAL_EVAL_EVERY = 10
 PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
 
 
@@ -247,14 +244,9 @@ def build_training_command(
         )
     # A population wave has no frozen or built-in lanes, so those flags are
     # emitted as the absence they are rather than left at the single-learner
-    # values -- a command that named lanes the run never plays would be a false
-    # record of what ran. External evaluation is the opposite case and stays on:
-    # with no built-in lane and every in-wave number relative, it is the run's
-    # ONLY absolute measurement, and the one instrument that can see the
-    # pathology this scheme was built against -- a member's bank falling while
-    # its relative score rate rises. One worker probes every member from the
-    # durable checkpoint, which is why the cadence must stay a multiple of
-    # `PRODUCTION_CHECKPOINT_EVERY`.
+    # values. A committed recovery checkpoint remains the run's absolute
+    # measurement: one worker probes every member from each immutable event and
+    # can see a member's bank falling while its relative score rate rises.
     league = population == 1
     command.extend(
         (
@@ -280,10 +272,9 @@ def build_training_command(
             str(PRODUCTION_EPISODE_STEPS),
             "--temperature",
             str(PRODUCTION_TEMPERATURE),
-            "--checkpoint-every",
-            str(PRODUCTION_CHECKPOINT_EVERY),
-            "--external-eval-every",
-            str(PRODUCTION_EXTERNAL_EVAL_EVERY),
+            "--checkpoint-seconds",
+            str(PRODUCTION_CHECKPOINT_SECONDS),
+            "--external-eval",
             "--external-eval-opponents",
             PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
             "--cnn-width",

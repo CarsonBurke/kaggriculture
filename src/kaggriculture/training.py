@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import random
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -406,6 +408,77 @@ def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
     finally:
         temporary.unlink(missing_ok=True)
 
+
+def write_immutable_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically serialize a checkpoint without replacing an existing event."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(payload, temporary)
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def replace_checkpoint_alias(source: Path, alias: Path) -> bool:
+    """Atomically point a regular-file alias at an immutable checkpoint.
+
+    The temporary hard link lives beside the alias, so replacing ``latest.pt``
+    never exposes a missing or partial file and never serializes the payload a
+    second time. ``False`` means the alias already named the same inode.
+    """
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"checkpoint alias source is not a regular file: {source}")
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    if alias.exists() and not alias.is_symlink() and os.path.samefile(source, alias):
+        return False
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{alias.name}.", suffix=".tmp", dir=alias.parent
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    temporary.unlink()
+    try:
+        os.link(source, temporary)
+        os.replace(temporary, alias)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+def install_immutable_checkpoint(source: Path, destination: Path) -> bool:
+    """Install an existing checkpoint once, preferring a byte-free hard link."""
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"checkpoint source is not a regular file: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if (
+            not destination.is_symlink()
+            and destination.is_file()
+            and os.path.samefile(source, destination)
+        ):
+            return False
+        raise FileExistsError(f"immutable checkpoint already exists: {destination}")
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    temporary.unlink()
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copyfile(source, temporary)
+        os.link(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
 
 def save_checkpoint(
     path: Path,

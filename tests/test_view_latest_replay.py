@@ -16,6 +16,21 @@ def _script():
     spec.loader.exec_module(module)
     return module
 
+def test_replay_snapshot_survives_atomic_latest_replacement(tmp_path: Path) -> None:
+    module = _script()
+    latest = tmp_path / "latest.pt"
+    snapshot = tmp_path / "snapshot.pt"
+    latest.write_bytes(b"old checkpoint")
+    module._snapshot_file(latest, snapshot)
+
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"new checkpoint")
+    replacement.replace(latest)
+
+    assert snapshot.read_bytes() == b"old checkpoint"
+    assert latest.read_bytes() == b"new checkpoint"
+    assert snapshot.stat().st_ino != latest.stat().st_ino
+
 
 def test_latest_run_is_the_one_with_the_newest_checkpoint(tmp_path: Path) -> None:
     module = _script()

@@ -23,7 +23,9 @@ policy — exactly what a Kaggle submission does.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import shutil
 import tempfile
 import webbrowser
@@ -39,6 +41,16 @@ from kaggriculture.opponents import normalize_opponent
 from kaggriculture.policy import act_batch
 from kaggriculture.production import PRODUCTION_EPISODE_STEPS, PRODUCTION_TEMPERATURE
 from kaggriculture.provenance import repository_root
+
+
+def _snapshot_file(source: Path, destination: Path) -> None:
+    """Snapshot an atomic artifact without copying on the common filesystem."""
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copyfile(source, destination)
 
 
 SELF_OPPONENT = "self"
@@ -243,7 +255,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="kaggriculture-replay-") as name:
         # Snapshot the artifact so a concurrent training save cannot race the load.
         snapshot = Path(name) / artifact.name
-        shutil.copyfile(artifact, snapshot)
+        _snapshot_file(artifact, snapshot)
 
         payload = torch.load(snapshot, map_location="cpu", weights_only=False)
         population = checkpoint_agent_count(payload)

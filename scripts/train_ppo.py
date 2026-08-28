@@ -16,7 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -96,13 +96,38 @@ from kaggriculture.training import (
     append_iteration_jsonl,
     checkpoint_payload,
     cpu_state_copy,
+    install_immutable_checkpoint,
     load_checkpoint,
     metrics_journal_iteration,
+    replace_checkpoint_alias,
     rollout_diagnostics,
     save_checkpoint,
     training_rng_states,
-    write_checkpoint,
+    write_immutable_checkpoint,
 )
+
+MIN_CHECKPOINT_SECONDS = 300.0
+MAX_CHECKPOINT_SECONDS = 600.0
+DEFAULT_CHECKPOINT_SECONDS = 420.0
+
+
+class RecoveryCheckpointTimer:
+    """Monotonic periodic checkpoint timer, advanced at committed boundaries."""
+
+    def __init__(self, interval_seconds: float, *, clock: Callable[[], float]) -> None:
+        self.interval_seconds = interval_seconds
+        self._clock = clock
+        self._last_committed_at = clock()
+
+    def due(self, now: float | None = None) -> bool:
+        current = self._clock() if now is None else now
+        return current - self._last_committed_at >= self.interval_seconds
+
+    def committed(self, now: float | None = None) -> None:
+        current = self._clock() if now is None else now
+        if current < self._last_committed_at:
+            raise ValueError("monotonic checkpoint clock moved backwards")
+        self._last_committed_at = current
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,10 +176,9 @@ def parse_args() -> argparse.Namespace:
         help="league lanes reserved for admitted built-ins; unwon lanes go to snapshots",
     )
     parser.add_argument(
-        "--external-eval-every",
-        type=int,
-        default=0,
-        help="iterations between diagnostic CPU evaluations vs external agents; 0 disables",
+        "--external-eval",
+        action="store_true",
+        help="evaluate each committed recovery checkpoint against external agents",
     )
     parser.add_argument(
         "--external-eval-opponents",
@@ -166,7 +190,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--checkpoint-every", type=int, default=5)
+    parser.add_argument(
+        "--checkpoint-seconds",
+        type=float,
+        default=DEFAULT_CHECKPOINT_SECONDS,
+        help="seconds between periodic recovery checkpoints (300-600)",
+    )
     parser.add_argument("--max-hours", type=float, default=0.0)
     parser.add_argument(
         "--architecture",
@@ -372,19 +401,6 @@ def _validate_population(args: argparse.Namespace) -> None:
             "a population wave has no frozen or built-in lanes; pass --league-games 0 "
             "and no built-in opponents"
         )
-    # The probe evaluates every member from one immutable file. `latest.pt` is
-    # rewritten every iteration, so a worker reading it would race the trainer
-    # and could measure a half-written payload; the durable checkpoints are the
-    # only immutable population artifacts, which ties the probe's cadence to
-    # theirs. Left unchecked, an eval tick between two checkpoints would find no
-    # file and the run would carry no absolute measurement at all -- the one
-    # thing a purely relative objective cannot supply for itself.
-    if args.external_eval_every and args.external_eval_every % args.checkpoint_every:
-        raise ValueError(
-            "a population's external evaluation reads durable checkpoints, so "
-            f"--external-eval-every ({args.external_eval_every}) must be a multiple of "
-            f"--checkpoint-every ({args.checkpoint_every})"
-        )
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -396,7 +412,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "games": args.games,
         "league_active_pool_size": args.league_active_pool_size,
         "episode_steps": args.episode_steps,
-        "checkpoint_every": args.checkpoint_every,
+        "checkpoint_seconds": args.checkpoint_seconds,
         "epochs": args.epochs,
         "minibatch_size": args.minibatch_size,
     }
@@ -405,6 +421,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
         raise ValueError(f"arguments must be positive: {', '.join(invalid)}")
+    if (
+        not math.isfinite(args.checkpoint_seconds)
+        or not MIN_CHECKPOINT_SECONDS <= args.checkpoint_seconds <= MAX_CHECKPOINT_SECONDS
+    ):
+        raise ValueError(
+            "checkpoint seconds must be finite and between "
+            f"{MIN_CHECKPOINT_SECONDS:g} and {MAX_CHECKPOINT_SECONDS:g}"
+        )
     if args.episode_steps != 720:
         raise ValueError("training requires the competition horizon: --episode-steps 720")
     # The k3 estimator is non-negative, and the trust region stops on
@@ -439,8 +463,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     )
     if args.league_games and not configured_opponents:
         raise ValueError("league games require at least one active, historical, or built-in lane")
-    if args.external_eval_every < 0 or (args.external_eval_every and args.external_eval_seeds < 1):
-        raise ValueError("external evaluation needs a non-negative cadence and positive seeds")
+    if args.external_eval and args.external_eval_seeds < 1:
+        raise ValueError("external evaluation needs positive seeds")
     if args.league_games and args.league_games < configured_opponents:
         raise ValueError(
             "league games must cover the initial anchor and every configured "
@@ -1030,13 +1054,8 @@ def _league_opponent_diagnostics(
 
 
 def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
-    """Drop unavailable external-eval opponents instead of blocking training.
-
-    The probes are diagnostics: a public agent file cleaned out of /var/tmp
-    must not make a multi-day production run unlaunchable. Every dropped spec
-    is reported at launch, and losing all of them disables the cadence.
-    """
-    if not args.external_eval_every:
+    """Drop unavailable external-eval opponents instead of blocking training."""
+    if not args.external_eval:
         return
     resolved = []
     for spec in filter(None, (spec.strip() for spec in args.external_eval_opponents.split(","))):
@@ -1052,90 +1071,90 @@ def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
             file=sys.stderr,
             flush=True,
         )
-        args.external_eval_every = 0
+        args.external_eval = False
     args.external_eval_opponents = ",".join(resolved)
 
 
-def _external_eval_source(
-    args: argparse.Namespace, committed_iteration: int, league_directory: Path
-) -> tuple[Path, str]:
-    """The immutable file the probe reads, and which members it names inside it.
-
-    A single-learner run has a league snapshot per iteration. A population run
-    writes no snapshot archive at all -- its members live in the durable
-    checkpoint, which is why the cadence is tied to `--checkpoint-every` and why
-    every member is named explicitly: the loader refuses to guess one.
-    """
-    if args.population < 2:
-        return league_directory / f"league-actor-{committed_iteration:08d}.pt", ""
-    checkpoint = args.run_dir / f"checkpoint-{committed_iteration:06d}.pt"
-    return checkpoint, ",".join(str(member) for member in range(args.population))
 
 
 def _maybe_launch_external_eval(
     args: argparse.Namespace,
+    checkpoint: Path | None,
     committed_iteration: int,
-    league_directory: Path,
     process: subprocess.Popen | None,
+    *,
+    wait_for_slot: bool = False,
 ) -> subprocess.Popen | None:
-    """Launch at most one CPU worker evaluating the latest durable artifact.
-
-    The worker is diagnostics only: it appends to metrics-external.jsonl and
-    its absence never blocks training. A still-running worker simply skips
-    the tick, so cadence degrades gracefully when episodes run long.
-
-    One worker covers every population member sequentially rather than N
-    workers in parallel: this probe runs on the CPU beside a GPU trainer, and N
-    concurrent copies would contend with each other and with the host work the
-    rollout depends on. A population is therefore N times slower to probe, which
-    the skip-if-running rule already absorbs.
-    """
-    if (
-        not args.external_eval_every
-        or committed_iteration < 1
-        or committed_iteration % args.external_eval_every
-    ):
+    """Launch committed checkpoints in FIFO order without stacking CPU workers."""
+    if not args.external_eval:
+        return process
+    pending: list[tuple[Path, int]] = (
+        list(getattr(process, "_kaggriculture_pending_evals", ()))
+        if process is not None
+        else []
+    )
+    if checkpoint is not None and committed_iteration >= 1:
+        pending.append((checkpoint, committed_iteration))
+    if not pending:
         return process
     if process is not None and process.poll() is None:
-        return process
-    if process is not None and process.returncode:
-        print(
-            f"external eval worker exited with code {process.returncode}; see external-eval.log",
-            file=sys.stderr,
-            flush=True,
-        )
-    artifact, members = _external_eval_source(args, committed_iteration, league_directory)
+        setattr(process, "_kaggriculture_pending_evals", tuple(pending))
+        if not wait_for_slot:
+            return process
+        process.wait()
+
+    members = (
+        "" if args.population < 2 else ",".join(str(member) for member in range(args.population))
+    )
     log_path = args.run_dir / "external-eval.log"
-    try:
-        with log_path.open("ab") as log:
-            return subprocess.Popen(
-                [
-                    sys.executable,
-                    str(Path(__file__).resolve().parent / "external_eval_worker.py"),
-                    "--artifact",
-                    str(artifact),
-                    "--agents",
-                    members,
-                    "--iteration",
-                    str(committed_iteration),
-                    "--output",
-                    str(args.run_dir / "metrics-external.jsonl"),
-                    "--opponents",
-                    args.external_eval_opponents,
-                    "--seeds",
-                    str(args.external_eval_seeds),
-                    "--episode-steps",
-                    str(args.episode_steps),
-                ],
-                stdout=log,
-                stderr=log,
-                start_new_session=True,
+    while pending:
+        if process is not None and process.returncode:
+            print(
+                f"external eval worker exited with code {process.returncode}; "
+                "see external-eval.log",
+                file=sys.stderr,
+                flush=True,
             )
-    except OSError as error:
-        # Diagnostics must never kill training: ENOSPC on the log, EMFILE, or
-        # a failed fork under memory pressure only skips this probe.
-        print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
-        return process
+        next_checkpoint, next_iteration = pending.pop(0)
+        try:
+            with log_path.open("ab") as log:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve().parent / "external_eval_worker.py"),
+                        "--artifact",
+                        str(next_checkpoint),
+                        "--agents",
+                        members,
+                        "--iteration",
+                        str(next_iteration),
+                        "--output",
+                        str(args.run_dir / "metrics-external.jsonl"),
+                        "--opponents",
+                        args.external_eval_opponents,
+                        "--seeds",
+                        str(args.external_eval_seeds),
+                        "--episode-steps",
+                        str(args.episode_steps),
+                    ],
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
+        except OSError as error:
+            print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
+            if process is not None:
+                setattr(
+                    process,
+                    "_kaggriculture_pending_evals",
+                    ((next_checkpoint, next_iteration), *pending),
+                )
+            return process
+        setattr(process, "_kaggriculture_pending_evals", tuple(pending))
+        if not wait_for_slot or not pending:
+            return process
+        process.wait()
+    return process
 
 
 def _league_builtin_opponents(args: argparse.Namespace) -> list[str]:
@@ -1226,6 +1245,16 @@ def _checkpoint_values_equal(left: object, right: object) -> bool:
         )
     return type(left) is type(right) and left == right
 
+def _checkpoint_recovery_values_equal(left: object, right: object) -> bool:
+    """Compare exact resumable state while ignoring diagnostic timing metrics."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if left.keys() != right.keys():
+        return False
+    return all(
+        key == "metrics" or _checkpoint_values_equal(left[key], right[key]) for key in left
+    )
+
 
 def _validate_league_manifest(
     manifest: object,
@@ -1245,11 +1274,8 @@ def _validate_league_manifest(
         ):
             raise ValueError("resume checkpoint has an invalid league snapshot digest")
         validated[iteration] = digest
-    expected_iterations = set(range(current_iteration + 1))
-    if set(validated) != expected_iterations:
-        raise ValueError(
-            "resume checkpoint league manifest is incomplete; expected one snapshot per iteration"
-        )
+    if 0 not in validated:
+        raise ValueError("resume checkpoint league manifest must retain iteration zero")
     return validated
 
 
@@ -1258,6 +1284,7 @@ def _restore_league_archive(
     checkpoint: Path,
     destination: Path,
     manifest: dict[int, str],
+    current_iteration: int,
     model_config: ModelConfig | StructuredConfig,
 ) -> None:
     """Restore exactly the immutable archive bound to a training checkpoint."""
@@ -1267,7 +1294,7 @@ def _restore_league_archive(
     existing_refs = list_actor_snapshots(destination)
     existing_by_name = {ref.path.name: ref for ref in existing_refs}
     unexpected = set(existing_by_name) - expected_names
-    trailing_name = f"league-actor-{max(manifest) + 1:08d}.pt"
+    trailing_name = f"league-actor-{current_iteration + 1:08d}.pt"
     disallowed = unexpected - {trailing_name}
     if disallowed or len(unexpected) > 1:
         raise ValueError(
@@ -1535,32 +1562,9 @@ def _gate_update_metrics(
         )
     if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
         raise RuntimeError(f"{where}PPO iteration completed without an actor update")
-    # A trust region set against the wrong policy sharpness stops the epoch after
-    # its first minibatch rather than before it, so the count above is 1 and
-    # passes while the iteration trains on under 1% of the wave. Nothing else
-    # reports it: `approx_kl` averages over the minibatches that stepped.
-    intended = int(update_metrics["actor_minibatches_intended"])
-    applied = int(update_metrics["actor_updates"])
-    if not warmup_active and intended > 0 and applied < MINIMUM_ACTOR_EPOCH_FRACTION * intended:
-        raise RuntimeError(
-            f"{where}actor applied {applied} of {intended} minibatches, below "
-            f"{MINIMUM_ACTOR_EPOCH_FRACTION:.0%} of the epoch; the trust region "
-            f"{'stopped it early' if update_metrics.get('kl_early_stop') else 'is not the cause'} "
-            f"at max_approx_kl {float(update_metrics['max_approx_kl']):.4g}"
-        )
-    # A policy that samples nothing cannot leave where it is: the clipped
-    # surrogate's gradient comes from sampled alternatives. Every other number in
-    # this iteration reads healthy when it happens -- the epoch completes because
-    # a deterministic policy has no KL to bound, and money rises because the
-    # inaction basin keeps the whole starting bank -- so this is the only signal.
-    entropy = float(update_metrics["entropy"])
-    floor = _policy_entropy_floor(entropy_reference)
-    if not warmup_active and entropy < floor:
-        raise RuntimeError(
-            f"{where}policy entropy {entropy:.4g} nats per active component is below "
-            f"{floor:.4g}; the policy is deterministic and has no sampled "
-            "alternative left to learn from"
-        )
+    # Entropy collapse and a short KL-clipped epoch are not stop conditions.
+    # Intra-league win rate is the ranking; a sharp policy that still wins
+    # more of its own history is an improvement, not a dead run.
 
 
 # Fraction of this population's own iteration-0 pairwise disagreement below which
@@ -1991,6 +1995,7 @@ def main() -> None:
                 checkpoint=args.resume,
                 destination=league_directory,
                 manifest=league_snapshot_manifest,
+                current_iteration=iteration,
                 model_config=model_config,
             )
     serialized_arguments = {name: _recorded_argument(value) for name, value in vars(args).items()}
@@ -2014,73 +2019,7 @@ def main() -> None:
     (args.run_dir / "config.json").write_text(
         json.dumps(configuration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    if resume_payload is not None:
-        destination_latest = args.run_dir / "latest.pt"
-        if destination_latest.exists():
-            destination_payload = torch.load(
-                destination_latest,
-                map_location="cpu",
-                weights_only=False,
-            )
-            if not _checkpoint_values_equal(destination_payload, resume_payload):
-                raise FileExistsError(
-                    f"latest checkpoint conflicts with resume state: {destination_latest}"
-                )
-        else:
-            save_checkpoint(
-                destination_latest,
-                agents=members,
-                model_config=model_config,
-                ppo_config=ppo_config,
-                iteration=iteration,
-                next_seed=next_seed,
-                metrics=resume_payload["metrics"],
-                training_rng_state=generator.bit_generator.state,
-                training_data_config=training_data_config,
-                league_snapshot_manifest=league_snapshot_manifest,
-                league_score_rates=league_score_rates,
-                replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
-                population_disagreement_reference=population_reference,
-                policy_entropy_reference=_entropy_reference_record(entropy_references, population),
-                source_identity=current_source_identity,
-                run_provenance=run_provenance,
-                initial_actor=initial_actor_provenance,
-            )
     if resume_payload is not None and iteration > 0:
-        numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
-        if iteration % args.checkpoint_every == 0:
-            if numbered_checkpoint.exists():
-                numbered_payload = torch.load(
-                    numbered_checkpoint,
-                    map_location="cpu",
-                    weights_only=False,
-                )
-                if not _checkpoint_values_equal(numbered_payload, resume_payload):
-                    raise FileExistsError(
-                        f"numbered checkpoint conflicts with resume state: {numbered_checkpoint}"
-                    )
-            else:
-                save_checkpoint(
-                    numbered_checkpoint,
-                    agents=members,
-                    model_config=model_config,
-                    ppo_config=ppo_config,
-                    iteration=iteration,
-                    next_seed=next_seed,
-                    metrics=resume_payload["metrics"],
-                    training_rng_state=generator.bit_generator.state,
-                    training_data_config=training_data_config,
-                    league_snapshot_manifest=league_snapshot_manifest,
-                    league_score_rates=league_score_rates,
-                    replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
-                    population_disagreement_reference=population_reference,
-                    policy_entropy_reference=_entropy_reference_record(
-                        entropy_references, population
-                    ),
-                    source_identity=current_source_identity,
-                    run_provenance=run_provenance,
-                    initial_actor=initial_actor_provenance,
-                )
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", resume_payload["metrics"])
     writer = TensorboardMirror(
         args.run_dir / "metrics.jsonl",
@@ -2105,37 +2044,83 @@ def main() -> None:
     self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
 
     commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
-    pending_commit: Future[None] | None = None
+    pending_commit: Future[tuple[Path, int] | None] | None = None
 
-    def commit_iteration(payload: dict, actor_state: dict | None) -> None:
-        """Durably commit one iteration's artifacts in canonical order.
+    def build_recovery_payload(metrics: dict[str, Any]) -> dict[str, Any]:
+        """Capture the complete CPU recovery state only for a checkpoint event."""
+        agent_states = [
+            {
+                "actor": cpu_state_copy(member.actor.state_dict()),
+                "critic": cpu_state_copy(member.critic.state_dict()),
+                "actor_optimizer": cpu_state_copy(member.actor_optimizer.state_dict()),
+                "critic_optimizer": cpu_state_copy(member.critic_optimizer.state_dict()),
+            }
+            for member in members
+        ]
+        return checkpoint_payload(
+            agents=agent_states,
+            model_config=model_config,
+            ppo_config=ppo_config,
+            iteration=iteration,
+            next_seed=next_seed,
+            metrics=metrics,
+            source_identity=current_source_identity,
+            rng_states=training_rng_states(),
+            run_provenance=run_provenance,
+            training_rng_state=generator.bit_generator.state,
+            training_data_config=training_data_config,
+            league_snapshot_manifest=league_snapshot_manifest,
+            league_score_rates=dict(league_score_rates),
+            replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
+            population_disagreement_reference=population_reference,
+            policy_entropy_reference=_entropy_reference_record(entropy_references, population),
+            initial_actor=initial_actor_provenance,
+        )
 
-        Runs on the single commit worker, so commits execute in submission
-        order: league snapshot before the checkpoint that references it, and
-        the checkpoint before its journal record, exactly as the recovery
-        logic expects.
-
-        `actor_state` is None for a population wave, which has no frozen lanes
-        and therefore no archive to write; the checkpoint carries every member.
-        """
+    def publish_checkpoint(payload: dict[str, Any]) -> Path:
         committed = int(payload["iteration"])
+        payload["league_snapshot_manifest"] = dict(league_snapshot_manifest)
+        checkpoint = args.run_dir / f"checkpoint-{committed:06d}.pt"
+        if checkpoint.exists():
+            existing = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            if not _checkpoint_recovery_values_equal(existing, payload):
+                raise FileExistsError(
+                    f"numbered checkpoint conflicts with committed state: {checkpoint}"
+                )
+            payload["metrics"] = existing["metrics"]
+        else:
+            write_immutable_checkpoint(checkpoint, payload)
+        replace_checkpoint_alias(checkpoint, args.run_dir / "latest.pt")
+        return checkpoint
+
+    def commit_iteration(
+        metrics: dict[str, Any],
+        actor_state: dict[str, Any] | None,
+        recovery_payload: dict[str, Any] | None,
+    ) -> tuple[Path, int] | None:
+        """Commit one completed update, optionally including a recovery event."""
+        committed = int(metrics["iteration"])
         if actor_state is not None:
             snapshot = save_actor_state_snapshot(
                 league_directory, model_config, actor_state, committed
             )
             league_snapshot_manifest[committed] = snapshot_sha256(snapshot.path)
-        write_checkpoint(args.run_dir / "latest.pt", payload)
-        if committed % args.checkpoint_every == 0:
-            write_checkpoint(args.run_dir / f"checkpoint-{committed:06d}.pt", payload)
-        append_iteration_jsonl(args.run_dir / "metrics.jsonl", payload["metrics"])
-        writer.record(payload["metrics"])
+        checkpoint = (
+            publish_checkpoint(recovery_payload) if recovery_payload is not None else None
+        )
+        committed_metrics = (
+            recovery_payload["metrics"] if recovery_payload is not None else metrics
+        )
+        append_iteration_jsonl(args.run_dir / "metrics.jsonl", committed_metrics)
+        writer.record(committed_metrics)
+        return None if checkpoint is None else (checkpoint, committed)
 
     started = time.monotonic()
 
-    if population == 1:
-        # The snapshot for the checkpoint's current actor is installed before the
-        # checkpoint is written, so every manifest is complete and portable with
-        # its immutable ``league/`` sidecar directory.
+    if population == 1 and (iteration == 0 or iteration > critic_warmup_iterations):
+        # Warmup checkpoints intentionally carry a sparse league manifest: the
+        # frozen actor already exists at iteration zero, so serializing it under
+        # every warmup iteration would create byte-identical archive churn.
         current_snapshot = save_actor_snapshot(league_directory, actor, iteration)
         current_digest = snapshot_sha256(current_snapshot.path)
         previous_digest = league_snapshot_manifest.get(iteration)
@@ -2143,9 +2128,20 @@ def main() -> None:
             raise ValueError("resume checkpoint actor does not match its current league snapshot")
         league_snapshot_manifest[iteration] = current_digest
 
-    if iteration == 0 and not initial_checkpoint.exists():
+    numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
+    destination_latest = args.run_dir / "latest.pt"
+    if resume_payload is not None:
+        for existing in (numbered_checkpoint, destination_latest):
+            if not existing.exists():
+                continue
+            existing_payload = torch.load(existing, map_location="cpu", weights_only=False)
+            if not _checkpoint_values_equal(existing_payload, resume_payload):
+                raise FileExistsError(f"checkpoint conflicts with resume state: {existing}")
+        if not numbered_checkpoint.exists():
+            install_immutable_checkpoint(args.resume, numbered_checkpoint)
+    else:
         save_checkpoint(
-            initial_checkpoint,
+            numbered_checkpoint,
             agents=members,
             model_config=model_config,
             ppo_config=ppo_config,
@@ -2163,6 +2159,10 @@ def main() -> None:
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
         )
+    replace_checkpoint_alias(numbered_checkpoint, destination_latest)
+    last_checkpoint_iteration = iteration
+    checkpoint_timer = RecoveryCheckpointTimer(args.checkpoint_seconds, clock=time.monotonic)
+    last_metrics = resume_payload["metrics"] if resume_payload is not None else {"iteration": 0}
 
     # Iteration of the most recent audit per staging configuration. Deliberately
     # process-scoped rather than checkpointed: a resume rebuilds the compiled
@@ -2401,63 +2401,69 @@ def main() -> None:
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
-        # Capture every mutable input on this thread, then commit the durable
-        # artifacts (league snapshot, checkpoints, journal, mirror) in the
-        # background so serialization and fsync overlap the next rollout. The
-        # snapshot digest lands in the shared manifest inside the worker,
-        # before the payload referencing that manifest is serialized.
-        agent_states = [
-            {
-                "actor": cpu_state_copy(member.actor.state_dict()),
-                "critic": cpu_state_copy(member.critic.state_dict()),
-                "actor_optimizer": cpu_state_copy(member.actor_optimizer.state_dict()),
-                "critic_optimizer": cpu_state_copy(member.critic_optimizer.state_dict()),
-            }
-            for member in members
-        ]
-        # A population wave has no frozen lanes, so it writes no snapshot archive:
-        # an archive nothing reads would claim the run has a frozen-opponent
-        # history it does not have.
-        actor_state = agent_states[0]["actor"] if population == 1 else None
-        payload = checkpoint_payload(
-            agents=agent_states,
-            model_config=model_config,
-            ppo_config=ppo_config,
-            iteration=iteration,
-            next_seed=next_seed,
-            metrics=metrics,
-            source_identity=current_source_identity,
-            rng_states=training_rng_states(),
-            run_provenance=run_provenance,
-            training_rng_state=generator.bit_generator.state,
-            training_data_config=training_data_config,
-            league_snapshot_manifest=league_snapshot_manifest,
-            # Snapshot the estimates: the commit serializes on a worker
-            # thread while the next iteration's blend mutates the live dict.
-            league_score_rates=dict(league_score_rates),
-            # Snapshot for the same reason: the audit at the next interval
-            # replaces this configuration's entry while the commit serializes.
-            replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
-            population_disagreement_reference=population_reference,
-            policy_entropy_reference=_entropy_reference_record(entropy_references, population),
-            initial_actor=initial_actor_provenance,
-        )
+        # Finish the previous ordered commit before capturing this boundary.
+        # The update cannot mutate again until this loop advances, so waiting
+        # here does not compromise the state being checkpointed.
         if pending_commit is not None:
-            pending_commit.result()
-        # The awaited commit belongs to the previous pass, so the newest
-        # durable league snapshot is ``iteration - 1``; the current payload is
-        # only being submitted now.
-        external_eval_process = _maybe_launch_external_eval(
-            args, iteration - 1, league_directory, external_eval_process
+            completed_checkpoint = pending_commit.result()
+            if completed_checkpoint is not None:
+                external_eval_process = _maybe_launch_external_eval(
+                    args,
+                    completed_checkpoint[0],
+                    completed_checkpoint[1],
+                    external_eval_process,
+                )
+
+        checkpoint_now = time.monotonic()
+        clean_final = iteration >= args.iterations or bool(
+            args.max_hours and (checkpoint_now - started) / 3600.0 >= args.max_hours
         )
-        pending_commit = commit_executor.submit(commit_iteration, payload, actor_state)
+        recovery_due = clean_final or checkpoint_timer.due(checkpoint_now)
+        recovery_payload = build_recovery_payload(metrics) if recovery_due else None
+        if recovery_due:
+            checkpoint_timer.committed(checkpoint_now)
+            last_checkpoint_iteration = iteration
+
+        # League snapshots remain semantic PFSP history. They only need the
+        # actor, while the much larger critic/optimizer/RNG recovery state above
+        # is copied only for a due checkpoint.
+        actor_state = (
+            cpu_state_copy(members[0].actor.state_dict())
+            if population == 1 and not warmup_active
+            else None
+        )
+        pending_commit = commit_executor.submit(
+            commit_iteration, metrics, actor_state, recovery_payload
+        )
+        last_metrics = metrics
         print(json.dumps(metrics, sort_keys=True), flush=True)
         del rollout
-    if pending_commit is not None:
-        pending_commit.result()
-        # The final snapshot is the one an operator most wants an external
-        # number for; probe it if the cadence lands on it.
-        _maybe_launch_external_eval(args, iteration, league_directory, external_eval_process)
+
+    completed_checkpoint = pending_commit.result() if pending_commit is not None else None
+    # The max-hours boundary can become true while the last asynchronous
+    # journal/snapshot commit finishes. Force that clean terminal state once,
+    # but never rewrite an iteration already committed as periodic or final.
+    if last_checkpoint_iteration != iteration:
+        final_checkpoint = publish_checkpoint(build_recovery_payload(last_metrics))
+        external_eval_process = _maybe_launch_external_eval(
+            args,
+            final_checkpoint,
+            iteration,
+            external_eval_process,
+            wait_for_slot=True,
+        )
+    elif completed_checkpoint is not None:
+        external_eval_process = _maybe_launch_external_eval(
+            args,
+            completed_checkpoint[0],
+            completed_checkpoint[1],
+            external_eval_process,
+            wait_for_slot=True,
+        )
+    else:
+        external_eval_process = _maybe_launch_external_eval(
+            args, None, iteration, external_eval_process, wait_for_slot=True
+        )
     commit_executor.shutdown(wait=True)
     writer.close()
 

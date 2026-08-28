@@ -191,10 +191,10 @@ weights, measured before launch.
 
 With no built-in and no `scripted-v27` lane, nothing inside the wave measures
 absolute strength — by design, since every internal number is relative. The
-existing external evaluator (`scripts/external_eval_worker.py`,
-`--external-eval-every`) becomes the only absolute signal and must run for **all
-N agents** against `starter`, `pass`, `random`, and `public-v27`. It is CPU-only,
-so it does not contend with the GPU.
+external evaluator (`scripts/external_eval_worker.py`, enabled by
+`--external-eval`) becomes the only absolute signal and must run for **all N
+agents** against `starter`, `pass`, `random`, and `public-v27`. Each immutable
+recovery checkpoint triggers it; the CPU-only worker does not contend with the GPU.
 
 Submission selection is unchanged in kind and N times wider in candidates:
 `scripts/select_checkpoint.py` screens on a fixed panel, `scripts/build_submission.py`

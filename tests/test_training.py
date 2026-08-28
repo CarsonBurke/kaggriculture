@@ -15,7 +15,9 @@ from kaggriculture.training import (
     append_iteration_jsonl,
     load_checkpoint,
     metrics_journal_iteration,
+    replace_checkpoint_alias,
     save_checkpoint,
+    write_immutable_checkpoint,
 )
 
 
@@ -63,6 +65,25 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert payload["league_score_rates"] == {1: 0.5, 3: 0.75}
     assert payload["source_identity"] == source_identity()
     assert restored.random(8).tolist() == expected.tolist()
+
+def test_latest_alias_atomically_tracks_immutable_regular_checkpoints(tmp_path) -> None:
+    first = tmp_path / "checkpoint-000001.pt"
+    second = tmp_path / "checkpoint-000002.pt"
+    latest = tmp_path / "latest.pt"
+    write_immutable_checkpoint(first, {"iteration": 1})
+    write_immutable_checkpoint(second, {"iteration": 2})
+
+    assert replace_checkpoint_alias(first, latest)
+    assert latest.is_file() and not latest.is_symlink()
+    assert latest.stat().st_ino == first.stat().st_ino
+    assert not replace_checkpoint_alias(first, latest)
+
+    assert replace_checkpoint_alias(second, latest)
+    assert latest.stat().st_ino == second.stat().st_ino
+    assert torch.load(latest, weights_only=False) == {"iteration": 2}
+    assert torch.load(first, weights_only=False) == {"iteration": 1}
+    with pytest.raises(FileExistsError):
+        write_immutable_checkpoint(first, {"iteration": 99})
 
 
 @pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])

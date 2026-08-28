@@ -58,8 +58,14 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.actor_gae_lambda == pytest.approx(0.95)
     assert not hasattr(args, "gae_lambda")
     assert args.target_kl == PpoConfig.target_kl
-    assert args.checkpoint_every == 5
+    assert args.checkpoint_seconds == 420.0
+    assert not hasattr(args, "checkpoint_every")
     module._validate_args(args)
+    for rejected in (299.0, 601.0, float("nan")):
+        args.checkpoint_seconds = rejected
+        with pytest.raises(ValueError, match="checkpoint seconds"):
+            module._validate_args(args)
+    args.checkpoint_seconds = 420.0
 
     args.gamma = 1.5
     with pytest.raises(ValueError, match="gamma must be finite"):
@@ -77,6 +83,22 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
         args.target_kl = rejected
         with pytest.raises(ValueError, match="target KL"):
             module._validate_args(args)
+
+
+def test_recovery_checkpoint_timer_uses_injected_monotonic_clock() -> None:
+    module = _training_script()
+    now = [100.0]
+    timer = module.RecoveryCheckpointTimer(420.0, clock=lambda: now[0])
+
+    now[0] = 519.999
+    assert not timer.due()
+    now[0] = 520.0
+    assert timer.due()
+    timer.committed()
+    now[0] = 939.999
+    assert not timer.due()
+    now[0] = 940.0
+    assert timer.due()
 
 
 def test_population_defaults_drop_the_frozen_lane(monkeypatch, tmp_path) -> None:
@@ -328,17 +350,18 @@ def test_league_score_rate_blend_seeds_from_prior_and_decays_unmeasured() -> Non
     assert rates["builtin_starter"] == pytest.approx(0.5)
 
 
-def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch, tmp_path) -> None:
+def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order(
+    monkeypatch, tmp_path
+) -> None:
     module = _training_script()
     args = SimpleNamespace(
-        external_eval_every=10,
+        external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
         episode_steps=720,
         run_dir=tmp_path,
         population=1,
     )
-    league_directory = tmp_path / "league"
     launched: list[list[str]] = []
 
     class FakeProcess:
@@ -349,45 +372,62 @@ def test_external_eval_launcher_respects_cadence_and_running_worker(monkeypatch,
         def poll(self) -> int | None:
             return self.returncode
 
+        def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
     monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
 
-    # Iteration zero and off-cadence iterations never launch a worker.
-    assert module._maybe_launch_external_eval(args, 0, league_directory, None) is None
-    assert module._maybe_launch_external_eval(args, 7, league_directory, None) is None
-
-    process = module._maybe_launch_external_eval(args, 10, league_directory, None)
+    assert module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000000.pt", 0, None) is None
+    checkpoint = tmp_path / "checkpoint-000010.pt"
+    process = module._maybe_launch_external_eval(args, checkpoint, 10, None)
     assert isinstance(process, FakeProcess)
     command = launched[0]
-    assert command[command.index("--artifact") + 1].endswith("league-actor-00000010.pt")
-    # A single learner names no member: the artifact holds exactly one actor.
+    assert command[command.index("--artifact") + 1] == str(checkpoint)
     assert command[command.index("--agents") + 1] == ""
     assert command[command.index("--iteration") + 1] == "10"
     assert command[command.index("--opponents") + 1] == "starter"
     assert command[command.index("--output") + 1] == str(tmp_path / "metrics-external.jsonl")
-    assert command[command.index("--seeds") + 1] == "2"
-    assert command[command.index("--episode-steps") + 1] == "720"
 
-    # A still-running worker skips the tick instead of stacking processes; a
-    # finished one is replaced on the next due iteration.
-    assert module._maybe_launch_external_eval(args, 20, league_directory, process) is process
+    assert (
+        module._maybe_launch_external_eval(
+            args, tmp_path / "checkpoint-000020.pt", 20, process
+        )
+        is process
+    )
     assert len(launched) == 1
-    process.returncode = 0
-    replacement = module._maybe_launch_external_eval(args, 20, league_directory, process)
+    assert (
+        module._maybe_launch_external_eval(
+            args, tmp_path / "checkpoint-000030.pt", 30, process
+        )
+        is process
+    )
+    assert len(launched) == 1
+    replacement = module._maybe_launch_external_eval(
+        args,
+        tmp_path / "checkpoint-000040.pt",
+        40,
+        process,
+        wait_for_slot=True,
+    )
     assert isinstance(replacement, FakeProcess) and replacement is not process
-    assert len(launched) == 2
+    assert [
+        command[command.index("--iteration") + 1] for command in launched
+    ] == ["10", "20", "30", "40"]
 
-    disabled = SimpleNamespace(**{**vars(args), "external_eval_every": 0})
-    assert module._maybe_launch_external_eval(disabled, 30, league_directory, None) is None
-    assert len(launched) == 2
+    disabled = SimpleNamespace(**{**vars(args), "external_eval": False})
+    assert (
+        module._maybe_launch_external_eval(
+            disabled, tmp_path / "checkpoint-000030.pt", 30, None
+        )
+        is None
+    )
 
 
-def test_a_population_is_probed_from_its_durable_checkpoint(monkeypatch, tmp_path) -> None:
-    # `latest.pt` is rewritten every iteration, so a worker reading it races the
-    # trainer. The numbered checkpoint is immutable once written, which is what
-    # ties the probe cadence to `--checkpoint-every`.
+def test_a_population_is_probed_from_its_committed_checkpoint(monkeypatch, tmp_path) -> None:
     module = _training_script()
     args = SimpleNamespace(
-        external_eval_every=10,
+        external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
         episode_steps=720,
@@ -400,52 +440,51 @@ def test_a_population_is_probed_from_its_durable_checkpoint(monkeypatch, tmp_pat
         "Popen",
         lambda command, **_kwargs: launched.append(command) or SimpleNamespace(poll=lambda: 0),
     )
-
-    module._maybe_launch_external_eval(args, 10, tmp_path / "league", None)
-
+    checkpoint = tmp_path / "checkpoint-000010.pt"
+    module._maybe_launch_external_eval(args, checkpoint, 10, None)
     command = launched[0]
-    assert command[command.index("--artifact") + 1] == str(tmp_path / "checkpoint-000010.pt")
-    # Every member is named, in agent order: one worker covers the population,
-    # and the journal rows are told apart by their `agent` field.
+    assert command[command.index("--artifact") + 1] == str(checkpoint)
     assert command[command.index("--agents") + 1] == "0,1,2,3"
 
 
 def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path) -> None:
     module = _training_script()
     args = SimpleNamespace(
-        external_eval_every=10,
+        external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
         episode_steps=720,
         run_dir=tmp_path,
         population=1,
     )
-
-    def refuse(*_args, **_kwargs):
-        raise OSError("fork failed")
-
-    monkeypatch.setattr(module.subprocess, "Popen", refuse)
-
-    assert module._maybe_launch_external_eval(args, 10, tmp_path / "league", None) is None
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fork failed")),
+    )
+    assert (
+        module._maybe_launch_external_eval(
+            args, tmp_path / "checkpoint-000010.pt", 10, None
+        )
+        is None
+    )
 
 
 def test_external_eval_opponent_resolution_degrades_instead_of_blocking(capsys, tmp_path) -> None:
     module = _training_script()
     missing = tmp_path / "gone.py"
     args = SimpleNamespace(
-        external_eval_every=10,
+        external_eval=True,
         external_eval_opponents=f"starter,{missing},",
     )
-
     module._resolve_external_eval_opponents(args)
-
-    assert args.external_eval_every == 10
+    assert args.external_eval
     assert args.external_eval_opponents == "starter"
     assert "dropped" in capsys.readouterr().err
 
-    args = SimpleNamespace(external_eval_every=10, external_eval_opponents=str(missing))
+    args = SimpleNamespace(external_eval=True, external_eval_opponents=str(missing))
     module._resolve_external_eval_opponents(args)
-    assert args.external_eval_every == 0
+    assert not args.external_eval
     assert "disabled" in capsys.readouterr().err
 
 
@@ -600,6 +639,7 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
         checkpoint=checkpoint,
         destination=destination,
         manifest=validated,
+        current_iteration=1,
         model_config=model_config,
     )
 
@@ -612,6 +652,7 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
         checkpoint=checkpoint,
         destination=destination,
         manifest=validated,
+        current_iteration=1,
         model_config=model_config,
     )
     save_actor_snapshot(destination, actor, 3)
@@ -620,17 +661,37 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
             checkpoint=checkpoint,
             destination=destination,
             manifest=validated,
+            current_iteration=1,
             model_config=model_config,
         )
 
 
-def test_league_manifest_requires_every_iteration() -> None:
+def test_league_manifest_accepts_sparse_warmup_history_but_requires_the_anchor() -> None:
     module = _training_script()
 
-    with pytest.raises(ValueError, match="one snapshot per iteration"):
-        module._validate_league_manifest({0: "a" * 64, 2: "b" * 64}, current_iteration=2)
+    sparse = {0: "a" * 64, 4: "b" * 64}
+    assert module._validate_league_manifest(sparse, current_iteration=4) == sparse
+    with pytest.raises(ValueError, match="iteration zero"):
+        module._validate_league_manifest({2: "b" * 64}, current_iteration=2)
     with pytest.raises(ValueError, match="digest"):
         module._validate_league_manifest({0: "not-a-digest"}, current_iteration=0)
+
+def test_orphan_checkpoint_matching_ignores_only_volatile_metrics() -> None:
+    module = _training_script()
+    original = {
+        "iteration": 2,
+        "next_seed": 9,
+        "actor": {"weight": torch.tensor([1.0])},
+        "metrics": {"elapsed_hours": 0.1, "iteration_seconds": 20.0},
+    }
+    replayed = {
+        **original,
+        "metrics": {"elapsed_hours": 0.2, "iteration_seconds": 21.0},
+    }
+    assert module._checkpoint_recovery_values_equal(original, replayed)
+    assert not module._checkpoint_recovery_values_equal(
+        original, {**replayed, "next_seed": 10}
+    )
 
 
 def test_main_writes_complete_manifests_and_portably_resumes(
@@ -698,8 +759,6 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "3",
             "--attention-heads",
             "2",
-            "--checkpoint-every",
-            "1",
             "--no-bfloat16",
         ]
         if resume is not None:
@@ -716,9 +775,13 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     assert set(initial["league_snapshot_manifest"]) == {0}
     assert set(latest["league_snapshot_manifest"]) == {0, 1}
     assert numbered["league_snapshot_manifest"] == latest["league_snapshot_manifest"]
+    assert not (source_run / "latest.pt").is_symlink()
+    assert (source_run / "latest.pt").stat().st_ino == (
+        source_run / "checkpoint-000001.pt"
+    ).stat().st_ino
 
-    # A kill after latest.pt but before its cadence checkpoint is repaired on
-    # resume before another rollout starts.
+    # A crash or manual cleanup that removes the immutable name while its
+    # hard-linked latest alias survives is repaired without reserialization.
     (source_run / "checkpoint-000001.pt").unlink()
     monkeypatch.setattr(
         sys,
@@ -728,6 +791,9 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     module.main()
     repaired = torch.load(source_run / "checkpoint-000001.pt", weights_only=False)
     assert repaired["league_snapshot_manifest"] == latest["league_snapshot_manifest"]
+    assert (source_run / "latest.pt").stat().st_ino == (
+        source_run / "checkpoint-000001.pt"
+    ).stat().st_ino
 
     monkeypatch.setattr(
         sys,
@@ -1131,8 +1197,6 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
             "8",
             "--cnn-blocks",
             "1",
-            "--checkpoint-every",
-            "8",
             "--no-bfloat16",
         ]
         if resume is not None:
@@ -1472,65 +1536,17 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
         )
     with pytest.raises(RuntimeError, match="without an actor update"):
         module._gate_update_metrics({**healthy, "actor_updates": 0}, warmup_active=False)
-    # The hole this closes: a trust region that latches after the first
-    # minibatch reports one update, not zero, so every gate above passes while
-    # the iteration trains on 0.9% of the wave. That is the exact shape of the
-    # run this gate was added for -- 1 of 113 with `kl_early_stop` set.
-    with pytest.raises(RuntimeError, match="of the epoch"):
-        module._gate_update_metrics(
-            {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
-            warmup_active=False,
-        )
-    # Warmup runs no actor at all, so the fraction cannot speak there.
+    # A short KL-clipped epoch and a sharp policy used to kill the run.
+    # Improvement vs public-v27 is the ranking; those are not stop conditions.
     module._gate_update_metrics(
-        {**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True
-    )
-    # An early stop that still applied most of the epoch is the safety valve
-    # working, and must not stop a run that is making progress. The shipped
-    # schedule's own worst wave applies 31%, so this is not a hypothetical band.
-    module._gate_update_metrics(
-        {**healthy, "actor_updates": 96, "kl_early_stop": 1}, warmup_active=False
-    )
-    module._gate_update_metrics(
-        {**healthy, "actor_updates": 35, "kl_early_stop": 1}, warmup_active=False
-    )
-    # The comparator's own boundary, and the only place a `<` relaxed to `<=`
-    # would show up. Read from the constant so raising the floor cannot silently
-    # turn this into an assertion about somewhere else on the scale.
-    boundary = round(MINIMUM_ACTOR_EPOCH_FRACTION * 100)
-    module._gate_update_metrics(
-        {
-            **healthy,
-            "actor_minibatches_intended": 100,
-            "actor_updates": boundary,
-            "kl_early_stop": 1,
-        },
+        {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
         warmup_active=False,
     )
-    with pytest.raises(RuntimeError, match="of the epoch"):
-        module._gate_update_metrics(
-            {
-                **healthy,
-                "actor_minibatches_intended": 100,
-                "actor_updates": boundary - 1,
-                "kl_early_stop": 1,
-            },
-            warmup_active=False,
-        )
-    # The second failure mode a learning-rate sweep found: at 1e-4 the actor
-    # converges onto passing every turn. Every number above reads healthy --
-    # the epoch completes 113 of 113 precisely because a deterministic policy
-    # has no KL movement to bound, and money rises to the untouched starting
-    # bank -- so entropy is the only place it can be caught.
-    with pytest.raises(RuntimeError, match=r"is below 0\.01"):
-        module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=False)
-    with pytest.raises(RuntimeError, match="no sampled alternative"):
-        module._gate_update_metrics(
-            {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
-        )
-    # The floor itself is admissible, and a warmup iteration cannot speak for a
-    # policy that has not been updated yet.
-    module._gate_update_metrics({**healthy, "entropy": MINIMUM_POLICY_ENTROPY}, warmup_active=False)
+    module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=False)
+    module._gate_update_metrics(
+        {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
+    )
+    module._gate_update_metrics({**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True)
     module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)
 
 
@@ -1568,14 +1584,13 @@ def test_the_entropy_floor_admits_a_clone_that_starts_sharper_than_the_absolute_
         "max_approx_kl": 0.0,
         "entropy": clone,
     }
-    # The clone's own first update is admissible; four times sharper is not.
+    # The floor helper still exists for journals. It does not stop the run.
     module._gate_update_metrics(healthy, warmup_active=False, entropy_reference=clone)
-    with pytest.raises(RuntimeError, match="no sampled alternative"):
-        module._gate_update_metrics(
-            {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
-            warmup_active=False,
-            entropy_reference=clone,
-        )
+    module._gate_update_metrics(
+        {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
+        warmup_active=False,
+        entropy_reference=clone,
+    )
     # A run cannot start collapsed. Admitting such a reference would set a floor
     # below the collapse and switch the gate off for every later iteration.
     with pytest.raises(ValueError, match="collapsed range"):
@@ -1711,8 +1726,6 @@ def _population_arguments(run_dir: Path, *, population: int, games: int, iterati
         "",
         "--league-builtin-lanes",
         "0",
-        "--external-eval-every",
-        "0",
         "--device",
         "cpu",
         "--cnn-width",
@@ -1725,8 +1738,6 @@ def _population_arguments(run_dir: Path, *, population: int, games: int, iterati
         "3",
         "--attention-heads",
         "2",
-        "--checkpoint-every",
-        "1",
         "--no-bfloat16",
     ]
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
@@ -323,7 +324,7 @@ def copy_actor_snapshot(
     *,
     expected_model_config: AnyModelConfig | dict[str, Any],
 ) -> SnapshotRef:
-    """Validate and atomically copy an immutable snapshot into another archive."""
+    """Validate and atomically install an immutable snapshot into another archive."""
     source = Path(source)
     payload = _load_payload(source)
     iteration = payload["iteration"]
@@ -342,6 +343,19 @@ def copy_actor_snapshot(
         return SnapshotRef(iteration, destination)
 
     directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        load_actor_snapshot(destination, expected_model_config=expected_model_config)
+        if snapshot_sha256(destination) != source_digest:
+            raise FileExistsError(f"conflicting concurrent league snapshot: {destination}")
+        return SnapshotRef(iteration, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    else:
+        return SnapshotRef(iteration, destination)
+
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".tmp", dir=directory
     )

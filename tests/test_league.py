@@ -96,6 +96,7 @@ def test_actor_snapshot_copy_is_byte_exact_validated_and_immutable(tmp_path) -> 
 
     assert copied.path.read_bytes() == source.path.read_bytes()
     assert snapshot_sha256(copied.path) == snapshot_sha256(source.path)
+    assert copied.path.stat().st_ino == source.path.stat().st_ino
     assert (
         copy_actor_snapshot(
             source.path,
