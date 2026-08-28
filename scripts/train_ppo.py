@@ -11,12 +11,12 @@ import random
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -54,11 +54,8 @@ from kaggriculture.ppo import (
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     MAX_VALUE_TARGET_SATURATED_FRACTION,
-    MINIMUM_ACTOR_EPOCH_FRACTION,
-    MINIMUM_POLICY_ENTROPY,
-    MINIMUM_POLICY_ENTROPY_REFERENCE,
-    POLICY_ENTROPY_FLOOR_FRACTION,
     UPDATE_COMPILE_MODES,
+    Actor,
     PpoConfig,
     actor_forward_args,
     make_optimizers,
@@ -73,7 +70,7 @@ from kaggriculture.provenance import (
     source_identity,
     validate_run_provenance,
 )
-from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, STRUCTURED, resolve_architecture
 from kaggriculture.rollout import (
     ROLLOUT_FORWARD_MODES,
     RolloutBatch,
@@ -84,6 +81,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.structured import StructuredConfig
+from kaggriculture.structured_dynamics import StructuredDynamics
 from kaggriculture.telemetry import (
     TensorboardMirror,
     population_agent_field,
@@ -305,6 +303,55 @@ def parse_args() -> argparse.Namespace:
         help="run the collection forward under bf16 autocast; default enabled",
     )
     parser.add_argument(
+        "--deterministic-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "require deterministic PyTorch/CUDA algorithms and disable cuDNN "
+            "benchmarking; recorded in checkpoints and fixed across resume"
+        ),
+    )
+    parser.add_argument(
+        "--structured-decision-coefficient",
+        type=float,
+        default=PpoConfig.structured_decision_coefficient,
+        help="weight on structured future-decision decode KL",
+    )
+    parser.add_argument(
+        "--structured-patch-coefficient",
+        type=float,
+        default=PpoConfig.structured_patch_coefficient,
+        help="weight on normalized future own-patch feature L1",
+    )
+    parser.add_argument(
+        "--structured-economy-coefficient",
+        type=float,
+        default=PpoConfig.structured_economy_coefficient,
+        help="weight on normalized future economy-entity feature L1",
+    )
+    parser.add_argument(
+        "--structured-opponent-summary-coefficient",
+        type=float,
+        default=PpoConfig.structured_opponent_summary_coefficient,
+        help="weight on normalized future opponent-summary feature L1",
+    )
+    parser.add_argument(
+        "--structured-opponent-patch-coefficient",
+        type=float,
+        default=PpoConfig.structured_opponent_patch_coefficient,
+        help="weight on normalized future opponent-patch feature L1",
+    )
+    parser.add_argument(
+        "--structured-decision-horizon",
+        type=int,
+        default=PpoConfig.structured_decision_horizon,
+    )
+    parser.add_argument(
+        "--structured-patch-horizon",
+        type=int,
+        default=PpoConfig.structured_patch_horizon,
+    )
+    parser.add_argument(
         "--expected-source-digest",
         help="require the immutable source digest selected by the calibration launcher",
     )
@@ -334,9 +381,7 @@ def parse_args() -> argparse.Namespace:
     # games plus 96 frozen) are not a valid population configuration, so they
     # must not be the implicit ones. An explicit flag still wins either way.
     if args.games is None:
-        args.games = (
-            args.population * (args.population - 1) * 13 if args.population > 1 else 112
-        )
+        args.games = args.population * (args.population - 1) * 13 if args.population > 1 else 112
     if args.league_games is None:
         args.league_games = 0 if args.population > 1 else 96
     return args
@@ -358,6 +403,18 @@ def _recorded_argument(value: object) -> object:
 def _initial_actor_paths(args: argparse.Namespace) -> list[Path]:
     """The pretrained artifacts a fresh run's members start from, in agent order."""
     return list(args.init_actor_from or ())
+
+
+def _structured_auxiliary_active(args: argparse.Namespace) -> bool:
+    return any(
+        (
+            args.structured_decision_coefficient,
+            args.structured_patch_coefficient,
+            args.structured_economy_coefficient,
+            args.structured_opponent_summary_coefficient,
+            args.structured_opponent_patch_coefficient,
+        )
+    )
 
 
 def _validate_population(args: argparse.Namespace) -> None:
@@ -382,6 +439,8 @@ def _validate_population(args: argparse.Namespace) -> None:
                 "a single learner has one actor to initialize; --population admits more"
             )
         return
+    if _structured_auxiliary_active(args):
+        raise ValueError("structured PPO auxiliary currently supports population 1 only")
     pairings = args.population * (args.population - 1)
     if args.games % pairings:
         raise ValueError(
@@ -437,6 +496,26 @@ def _validate_args(args: argparse.Namespace) -> None:
     # the update to near-zero optimizer steps silently rather than erroring.
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
+    structured_coefficients = (
+        args.structured_decision_coefficient,
+        args.structured_patch_coefficient,
+        args.structured_economy_coefficient,
+        args.structured_opponent_summary_coefficient,
+        args.structured_opponent_patch_coefficient,
+    )
+    if not all(math.isfinite(value) and value >= 0.0 for value in structured_coefficients):
+        raise ValueError("structured auxiliary coefficients must be finite and nonnegative")
+    structured_active = any(structured_coefficients)
+    if structured_active and args.architecture != STRUCTURED:
+        raise ValueError("structured auxiliary coefficients require --architecture structured")
+    if args.structured_decision_horizon < 0 or args.structured_patch_horizon < 0:
+        raise ValueError("structured auxiliary horizons cannot be negative")
+    if args.structured_decision_coefficient and args.structured_decision_horizon < 1:
+        raise ValueError("structured decision horizon must be positive when decision KL is active")
+    if any(structured_coefficients[1:]) and args.structured_patch_horizon < 1:
+        raise ValueError(
+            "structured patch horizon must be positive when feature prediction is active"
+        )
     if args.league_games < 0:
         raise ValueError("league games cannot be negative")
     if args.league_active_opponents < 0 or args.league_historical_opponents < 0:
@@ -1075,8 +1154,6 @@ def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
     args.external_eval_opponents = ",".join(resolved)
 
 
-
-
 def _maybe_launch_external_eval(
     args: argparse.Namespace,
     checkpoint: Path | None,
@@ -1089,16 +1166,14 @@ def _maybe_launch_external_eval(
     if not args.external_eval:
         return process
     pending: list[tuple[Path, int]] = (
-        list(getattr(process, "_kaggriculture_pending_evals", ()))
-        if process is not None
-        else []
+        list(getattr(process, "_kaggriculture_pending_evals", ())) if process is not None else []
     )
     if checkpoint is not None and committed_iteration >= 1:
         pending.append((checkpoint, committed_iteration))
     if not pending:
         return process
     if process is not None and process.poll() is None:
-        setattr(process, "_kaggriculture_pending_evals", tuple(pending))
+        setattr(process, "_kaggriculture_pending_evals", tuple(pending))  # noqa: B010
         if not wait_for_slot:
             return process
         process.wait()
@@ -1144,13 +1219,13 @@ def _maybe_launch_external_eval(
         except OSError as error:
             print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
             if process is not None:
-                setattr(
+                setattr(  # noqa: B010
                     process,
                     "_kaggriculture_pending_evals",
                     ((next_checkpoint, next_iteration), *pending),
                 )
             return process
-        setattr(process, "_kaggriculture_pending_evals", tuple(pending))
+        setattr(process, "_kaggriculture_pending_evals", tuple(pending))  # noqa: B010
         if not wait_for_slot or not pending:
             return process
         process.wait()
@@ -1199,6 +1274,7 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "games": args.games,
         "league_games": args.league_games,
         "league_active_opponents": args.league_active_opponents,
+        "deterministic_training": args.deterministic_training,
         "league_historical_opponents": args.league_historical_opponents,
         "league_active_pool_size": args.league_active_pool_size,
         # Which reference agents share the wave, and how many lanes they may
@@ -1245,15 +1321,14 @@ def _checkpoint_values_equal(left: object, right: object) -> bool:
         )
     return type(left) is type(right) and left == right
 
+
 def _checkpoint_recovery_values_equal(left: object, right: object) -> bool:
     """Compare exact resumable state while ignoring diagnostic timing metrics."""
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
     if left.keys() != right.keys():
         return False
-    return all(
-        key == "metrics" or _checkpoint_values_equal(left[key], right[key]) for key in left
-    )
+    return all(key == "metrics" or _checkpoint_values_equal(left[key], right[key]) for key in left)
 
 
 def _validate_league_manifest(
@@ -1351,7 +1426,7 @@ def _agent_fields(
 
 
 def _audit_replay_parity(
-    actor: torch.nn.Module,
+    actor: Actor,
     rollout: RolloutBatch,
     *,
     rows: np.ndarray | None,
@@ -1442,49 +1517,22 @@ def _audit_replay_parity(
     return metrics, _parity_measurements(metrics)
 
 
-def _policy_entropy_floor(reference: float | None) -> float:
-    """The entropy this policy must keep, given where its own updates started.
-
-    Whichever of the absolute level and a share of the reference is *lower*. A
-    warm start from a faithful clone begins below the absolute level while
-    playing well, so an absolute floor alone refuses the strongest artifacts
-    this project has; a share alone would refuse a policy for sharpening as it
-    converges, which is the expected trajectory.
-
-    `None` before the first actor-active iteration, where no reference exists
-    yet: the absolute level applies, which is what a run with no measured start
-    of its own can be held to.
-    """
-    if reference is None:
-        return MINIMUM_POLICY_ENTROPY
-    return min(MINIMUM_POLICY_ENTROPY, POLICY_ENTROPY_FLOOR_FRACTION * reference)
-
-
 def _validate_policy_entropy_reference(value: object) -> float:
-    """Validate one member's first actor-active entropy, persisted or measured.
+    """Validate a telemetry-only first-actor entropy reference.
 
-    The same function guards the live measurement and the resumed one, because
-    the bound is a property of the number rather than of where it came from.
-
-    Bounded below by the collapsed range this gate exists to catch. A run cannot
-    start collapsed: a reference inside the measured 0.000-0.001 would set a
-    floor below itself and switch the gate off for the rest of the run -- the
-    same defect `_gate_population_disagreement` refuses at a zero reference. No
-    upper bound, because `_policy_entropy_floor` takes the minimum with the
-    absolute level, so an implausibly large reference can only leave the floor
-    exactly where it was before any of this existed.
+    Entropy collapse is deliberately not a stop condition: a sharp policy that
+    still beats its history is useful, and a strong BC warm start can begin
+    below the from-scratch range. The reference remains checkpointed for
+    continuity and diagnostics, so it must be numeric, finite, and nonnegative,
+    but it must not reject that valid warm start.
     """
     if (
         not isinstance(value, float | int)
         or isinstance(value, bool)
         or not math.isfinite(float(value))
-        or float(value) < MINIMUM_POLICY_ENTROPY_REFERENCE
+        or float(value) < 0.0
     ):
-        raise ValueError(
-            f"policy entropy reference must be at least {MINIMUM_POLICY_ENTROPY_REFERENCE}: "
-            "a policy that starts inside the collapsed range has no sampled "
-            "alternative to learn from and cannot calibrate its own floor"
-        )
+        raise ValueError("policy entropy reference must be finite and nonnegative")
     return float(value)
 
 
@@ -1525,7 +1573,6 @@ def _gate_update_metrics(
     *,
     warmup_active: bool,
     agent: int | None = None,
-    entropy_reference: float | None = None,
 ) -> None:
     """Stop the run on an update whose numbers say the next one is wasted.
 
@@ -1538,12 +1585,6 @@ def _gate_update_metrics(
     gates are applied per member: one collapsed member has to stop the run as
     itself rather than be averaged into three healthy ones. `None` is the single
     learner, whose messages are unprefixed.
-
-    `entropy_reference` is this member's own first actor-active entropy, which
-    only relaxes the entropy floor -- see `_policy_entropy_floor`. It is per
-    member for the same reason the gates are: members warm-started from
-    differently trained artifacts arrive at different sharpnesses, so a pooled
-    reference would judge every member against whichever one started widest.
     """
     where = "" if agent is None else f"agent {agent} "
     first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
@@ -1661,8 +1702,6 @@ def _population_disagreement(
     return population_disagreement(logits, masks, active)
 
 
-
-
 def _validate_population_reference(value: object) -> float:
     """Validate the checkpointed iteration-0 disagreement the floor is a share of.
 
@@ -1743,6 +1782,7 @@ def _population_outcomes(rollout: RolloutBatch, population: int) -> dict[str, fl
     money = np.asarray(rollout.final_money, dtype=np.float64)
     margins = money - np.asarray(rollout.opponent_money, dtype=np.float64)
     outcomes = (margins > 0).astype(np.float64) - (margins < 0).astype(np.float64)
+
     scores = (outcomes + 1.0) / 2.0
     opponents = agents[np.arange(agents.size) ^ 1]
     fields: dict[str, float] = {}
@@ -1760,12 +1800,27 @@ def _population_outcomes(rollout: RolloutBatch, population: int) -> dict[str, fl
     return fields
 
 
+def _configure_training_determinism(enabled: bool) -> None:
+    """Apply the resume-bound deterministic execution contract."""
+    if enabled:
+        workspace = os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        if workspace not in (":4096:8", ":16:8"):
+            raise ValueError(
+                "deterministic training requires CUBLAS_WORKSPACE_CONFIG to be ':4096:8' or ':16:8'"
+            )
+    torch.use_deterministic_algorithms(enabled)
+    torch.backends.cudnn.deterministic = enabled
+    if enabled:
+        torch.backends.cudnn.benchmark = False
+
+
 def main() -> None:
     torch.set_num_threads(1)
     with suppress(RuntimeError):
         torch.set_num_interop_threads(1)
     args = parse_args()
     _validate_args(args)
+    _configure_training_determinism(args.deterministic_training)
     _resolve_external_eval_opponents(args)
     current_source_identity = source_identity()
     if (
@@ -1783,15 +1838,16 @@ def main() -> None:
     )
     # Exactly the knobs the decision attributes a speedup to, taken from the
     # validator that re-derives them rather than restated here. The rollout knob
-    # is mode-valued, so `!=` rather than the `is not` a boolean allowed.
     # `rollout_bfloat16` is deliberately not among them: collection precision is
     # fixed configuration, pinned identical on every chain node instead of
     # attributed, so the decision carries nothing to compare it against. It is
     # recorded in `_training_data_config`, where a resume must match it exactly.
-    if run_provenance is not None and any(
-        run_provenance["calibration"][knob] != getattr(args, knob) for knob in CALIBRATION_KNOBS
-    ):
-        raise ValueError("training compile mode does not match calibration run provenance")
+    if run_provenance is not None:
+        calibration = run_provenance["calibration"]
+        if not isinstance(calibration, Mapping):
+            raise ValueError("run provenance calibration must be a mapping")
+        if any(calibration[knob] != getattr(args, knob) for knob in CALIBRATION_KNOBS):
+            raise ValueError("training compile mode does not match calibration run provenance")
     device = _device(args.device)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1799,7 +1855,7 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = not args.deterministic_training
 
     architecture = resolve_architecture(args.architecture)
     model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
@@ -1820,6 +1876,13 @@ def main() -> None:
         optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,
+        structured_decision_coefficient=args.structured_decision_coefficient,
+        structured_patch_coefficient=args.structured_patch_coefficient,
+        structured_economy_coefficient=args.structured_economy_coefficient,
+        structured_opponent_summary_coefficient=(args.structured_opponent_summary_coefficient),
+        structured_opponent_patch_coefficient=(args.structured_opponent_patch_coefficient),
+        structured_decision_horizon=args.structured_decision_horizon,
+        structured_patch_horizon=args.structured_patch_horizon,
     )
     training_data_config = _training_data_config(args, device)
     # Derived from the configured trust region rather than fixed, because that
@@ -1835,12 +1898,28 @@ def main() -> None:
     members: list[TrainingAgent] = []
     for _ in range(population):
         member_actor = architecture.actor_class(model_config).to(device)
+        # Preserve the historical actor/critic initialization stream. The
+        # training-only predictor is constructed afterward, so enabling NextLat
+        # cannot silently change the critic seed it is compared against.
         member_critic = architecture.critic_class(model_config).to(device)
+        member_dynamics = (
+            StructuredDynamics(model_config).to(device)
+            if ppo_config.structured_auxiliary_active and isinstance(model_config, StructuredConfig)
+            else None
+        )
+        actor_optimizer, critic_optimizer = make_optimizers(
+            member_actor,
+            member_critic,
+            ppo_config,
+            structured_dynamics=member_dynamics,
+        )
         members.append(
             TrainingAgent(
                 member_actor,
                 member_critic,
-                *make_optimizers(member_actor, member_critic, ppo_config),
+                actor_optimizer,
+                critic_optimizer,
+                member_dynamics,
             )
         )
     # Member 0's networks are aliased for the single-learner code below; its
@@ -1849,7 +1928,7 @@ def main() -> None:
     # were the run's optimizer.
     actor = members[0].actor
     critic = members[0].critic
-    initial_actor_provenance = None
+    initial_actor_provenance: dict[str, Any] | None = None
     critic_warmup_iterations = 0
     initial_actors = _initial_actor_paths(args)
     if initial_actors:
@@ -1872,6 +1951,9 @@ def main() -> None:
         # resume; validation already guarantees the two arrive together.
         initial_actor_provenance["critic_warmup_iterations"] = critic_warmup_iterations
     generator = np.random.default_rng(args.seed + 1)
+    auxiliary_generator = (
+        np.random.default_rng(args.seed + 2) if ppo_config.structured_auxiliary_active else None
+    )
     iteration = 0
     next_seed = args.seed
     resume_payload = None
@@ -1904,6 +1986,8 @@ def main() -> None:
         next_seed = int(resume_payload["next_seed"])
         if resume_payload.get("training_rng") is not None:
             generator.bit_generator.state = resume_payload["training_rng"]
+        if auxiliary_generator is not None:
+            auxiliary_generator.bit_generator.state = resume_payload["structured_auxiliary_rng"]
         # Restore warm-start provenance: the resumed run must keep treating
         # the iteration-0 league snapshot as a pretrained baseline, and must
         # keep freezing the actor for whatever remains of the critic warmup.
@@ -2048,15 +2132,7 @@ def main() -> None:
 
     def build_recovery_payload(metrics: dict[str, Any]) -> dict[str, Any]:
         """Capture the complete CPU recovery state only for a checkpoint event."""
-        agent_states = [
-            {
-                "actor": cpu_state_copy(member.actor.state_dict()),
-                "critic": cpu_state_copy(member.critic.state_dict()),
-                "actor_optimizer": cpu_state_copy(member.actor_optimizer.state_dict()),
-                "critic_optimizer": cpu_state_copy(member.critic_optimizer.state_dict()),
-            }
-            for member in members
-        ]
+        agent_states = [cpu_state_copy(member.state()) for member in members]
         return checkpoint_payload(
             agents=agent_states,
             model_config=model_config,
@@ -2067,8 +2143,13 @@ def main() -> None:
             source_identity=current_source_identity,
             rng_states=training_rng_states(),
             run_provenance=run_provenance,
-            training_rng_state=generator.bit_generator.state,
+            training_rng_state=dict(generator.bit_generator.state),
             training_data_config=training_data_config,
+            auxiliary_rng_state=(
+                dict(auxiliary_generator.bit_generator.state)
+                if auxiliary_generator is not None
+                else None
+            ),
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=dict(league_score_rates),
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
@@ -2105,12 +2186,8 @@ def main() -> None:
                 league_directory, model_config, actor_state, committed
             )
             league_snapshot_manifest[committed] = snapshot_sha256(snapshot.path)
-        checkpoint = (
-            publish_checkpoint(recovery_payload) if recovery_payload is not None else None
-        )
-        committed_metrics = (
-            recovery_payload["metrics"] if recovery_payload is not None else metrics
-        )
+        checkpoint = publish_checkpoint(recovery_payload) if recovery_payload is not None else None
+        committed_metrics = recovery_payload["metrics"] if recovery_payload is not None else metrics
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", committed_metrics)
         writer.record(committed_metrics)
         return None if checkpoint is None else (checkpoint, committed)
@@ -2148,8 +2225,13 @@ def main() -> None:
             iteration=0,
             next_seed=next_seed,
             metrics={"iteration": 0},
-            training_rng_state=generator.bit_generator.state,
+            training_rng_state=dict(generator.bit_generator.state),
             training_data_config=training_data_config,
+            auxiliary_rng_state=(
+                dict(auxiliary_generator.bit_generator.state)
+                if auxiliary_generator is not None
+                else None
+            ),
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=league_score_rates,
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
@@ -2243,6 +2325,9 @@ def main() -> None:
                 pretrained_start=initial_actor_provenance is not None,
             )
             league_games = args.league_games if selections else 0
+            opponents = []
+            assignments = None
+            builtin_lanes: list[str] = []
             if league_games:
                 # The selection's contract puts every snapshot lane before every
                 # built-in lane, which is exactly the lane index space the wave
@@ -2263,11 +2348,11 @@ def main() -> None:
             # collector writes straight into the shared arena.
             rollout = collect_mixed_play_rust(
                 actor,
-                opponents if league_games else (),
+                opponents,
                 self_play_games=args.games,
                 league_games=league_games,
-                opponent_indices=assignments if league_games else None,
-                builtin_lanes=builtin_lanes if league_games else (),
+                opponent_indices=assignments,
+                builtin_lanes=builtin_lanes,
                 seed_start=next_seed,
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
@@ -2310,6 +2395,7 @@ def main() -> None:
                     for name, value in rollout_diagnostics(league_part).items()
                     if name not in indivisible_timings
                 }
+                assert assignments is not None
                 opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
                     league_part, assignments, selections
                 )
@@ -2347,6 +2433,8 @@ def main() -> None:
         # into another's step size.
         update_metrics: dict[str, float | int] = {}
         for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):
+            if member.actor_optimizer is None or member.critic_optimizer is None:
+                raise RuntimeError("training member has no optimizer")
             measured = update_ppo(
                 member.actor,
                 member.critic,
@@ -2357,6 +2445,8 @@ def main() -> None:
                 generator=generator,
                 actor_epochs=0 if warmup_active else None,
                 rows=rows,
+                structured_dynamics=member.structured_dynamics,
+                auxiliary_generator=auxiliary_generator,
             )
             # Per member, so one collapsed member stops the run as itself rather
             # than being averaged into three healthy ones.
@@ -2371,7 +2461,6 @@ def main() -> None:
                 measured,
                 warmup_active=warmup_active,
                 agent=None if population == 1 else agent,
-                entropy_reference=entropy_references[agent],
             )
             update_metrics.update(_agent_fields(measured, agent, population))
         update_seconds = time.monotonic() - update_started

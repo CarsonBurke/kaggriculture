@@ -9,6 +9,8 @@ import torch
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.provenance import source_identity
+from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+from kaggriculture.structured_dynamics import StructuredDynamics
 from kaggriculture.training import (
     CHECKPOINT_FORMAT_VERSION,
     TrainingAgent,
@@ -65,6 +67,153 @@ def test_checkpoint_round_trips_local_training_generator(tmp_path) -> None:
     assert payload["league_score_rates"] == {1: 0.5, 3: 0.75}
     assert payload["source_identity"] == source_identity()
     assert restored.random(8).tolist() == expected.tolist()
+
+
+def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
+    tmp_path,
+) -> None:
+    model_config = StructuredConfig(
+        model_dim=16,
+        attention_heads=2,
+        ffn_multiplier=1,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+        quantity_rank=4,
+    )
+    ppo_config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=4,
+        use_bfloat16=False,
+        structured_decision_coefficient=0.5,
+        structured_opponent_summary_coefficient=0.5,
+        structured_opponent_patch_coefficient=0.5,
+    )
+    actor = StructuredActor(model_config)
+    critic = StructuredCritic(model_config)
+    dynamics = StructuredDynamics(model_config)
+    actor_optimizer, critic_optimizer = make_optimizers(
+        actor,
+        critic,
+        ppo_config,
+        structured_dynamics=dynamics,
+    )
+    actor_optimizer.zero_grad(set_to_none=True)
+    sum(parameter.square().mean() for parameter in dynamics.parameters()).backward()
+    actor_optimizer.step()
+    auxiliary_generator = np.random.default_rng(43)
+    auxiliary_state = auxiliary_generator.bit_generator.state
+    expected = auxiliary_generator.random(5)
+    path = tmp_path / "structured.pt"
+
+    save_checkpoint(
+        path,
+        agents=[
+            TrainingAgent(
+                actor,
+                critic,
+                actor_optimizer,
+                critic_optimizer,
+                dynamics,
+            )
+        ],
+        model_config=model_config,
+        ppo_config=ppo_config,
+        iteration=2,
+        next_seed=9,
+        metrics={},
+        source_identity=source_identity(),
+        auxiliary_rng_state=auxiliary_state,
+    )
+
+    restored_actor = StructuredActor(model_config)
+    restored_critic = StructuredCritic(model_config)
+    restored_dynamics = StructuredDynamics(model_config)
+    restored_actor_optimizer, restored_critic_optimizer = make_optimizers(
+        restored_actor,
+        restored_critic,
+        ppo_config,
+        structured_dynamics=restored_dynamics,
+    )
+    restored_agent = TrainingAgent(
+        restored_actor,
+        restored_critic,
+        restored_actor_optimizer,
+        restored_critic_optimizer,
+        restored_dynamics,
+    )
+    payload = load_checkpoint(path, [restored_agent], device=torch.device("cpu"))
+    restored_generator = np.random.default_rng()
+    restored_generator.bit_generator.state = payload["structured_auxiliary_rng"]
+
+    for name, value in dynamics.state_dict().items():
+        torch.testing.assert_close(restored_dynamics.state_dict()[name], value)
+    assert restored_generator.random(5).tolist() == expected.tolist()
+    assert restored_actor_optimizer.state_dict()["state"]
+    assert len(restored_actor_optimizer.state_dict()["state"]) == len(
+        actor_optimizer.state_dict()["state"]
+    )
+
+    inactive_config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=4,
+        use_bfloat16=False,
+    )
+    inactive_actor = StructuredActor(model_config)
+    inactive_critic = StructuredCritic(model_config)
+    inactive_optimizers = make_optimizers(
+        inactive_actor,
+        inactive_critic,
+        inactive_config,
+    )
+    with pytest.raises(ValueError, match="auxiliary RNG presence"):
+        load_checkpoint(
+            path,
+            [TrainingAgent(inactive_actor, inactive_critic, *inactive_optimizers)],
+            device=torch.device("cpu"),
+        )
+
+    missing_path = tmp_path / "missing-structured.pt"
+    missing_payload = torch.load(path, weights_only=False)
+    missing_payload.pop("structured_dynamics")
+    missing_payload.pop("structured_auxiliary_rng")
+    torch.save(missing_payload, missing_path)
+    with pytest.raises(ValueError, match="auxiliary RNG presence"):
+        load_checkpoint(
+            missing_path,
+            [restored_agent],
+            device=torch.device("cpu"),
+        )
+
+
+def test_zero_auxiliary_checkpoint_keeps_the_historical_state_shape(tmp_path) -> None:
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    ppo_config = PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    optimizers = make_optimizers(actor, critic, ppo_config)
+    path = tmp_path / "plain.pt"
+
+    save_checkpoint(
+        path,
+        agents=[TrainingAgent(actor, critic, *optimizers)],
+        model_config=model_config,
+        ppo_config=ppo_config,
+        iteration=0,
+        next_seed=0,
+        metrics={},
+        source_identity=source_identity(),
+    )
+    payload = torch.load(path, weights_only=False)
+
+    assert "structured_dynamics" not in payload
+    assert "structured_auxiliary_rng" not in payload
+
 
 def test_latest_alias_atomically_tracks_immutable_regular_checkpoints(tmp_path) -> None:
     first = tmp_path / "checkpoint-000001.pt"

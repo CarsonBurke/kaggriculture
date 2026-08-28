@@ -21,7 +21,6 @@ from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.orientation import Orientation
-
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
@@ -32,16 +31,31 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+from kaggriculture.structured_dynamics import StructuredDynamics
 
 AnyActor = FarmActor | StructuredActor
 AnyCritic = DistributionalCritic | StructuredCritic
 AnyModelConfig = ModelConfig | StructuredConfig
 
-#: The four states one member of the population owns. Kept together because they
-#: are only ever saved and restored as a set: a critic restored without its
-#: optimizer refits from a cold moment estimate, which is the same silent
-#: half-resume the format version exists to prevent.
+#: The base states every member owns. A structured learner additionally owns a
+#: training-only dynamics module; its optimizer moments live in actor_optimizer.
 AGENT_STATE_KEYS = ("actor", "critic", "actor_optimizer", "critic_optimizer")
+OPTIONAL_AGENT_STATE_KEYS = ("structured_dynamics",)
+
+
+def _complete_agent_state(state: object) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    keys = set(state)
+    return (
+        set(AGENT_STATE_KEYS)
+        <= keys
+        <= {
+            *AGENT_STATE_KEYS,
+            *OPTIONAL_AGENT_STATE_KEYS,
+            "orientation",
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,17 +72,21 @@ class TrainingAgent:
     critic: AnyCritic
     actor_optimizer: torch.optim.Optimizer | None = None
     critic_optimizer: torch.optim.Optimizer | None = None
+    structured_dynamics: StructuredDynamics | None = None
 
     def state(self) -> dict[str, Any]:
-        """This member's four states in the layout the payload stores them in."""
+        """This member's complete recovery state."""
         if self.actor_optimizer is None or self.critic_optimizer is None:
             raise ValueError("a checkpointed agent needs both of its optimizers")
-        return {
+        state = {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }
+        if self.structured_dynamics is not None:
+            state["structured_dynamics"] = self.structured_dynamics.state_dict()
+        return state
 
 
 def checkpoint_agent_states(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -78,7 +96,11 @@ def checkpoint_agent_states(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         return list(members)
     # A single learner's orientation lives at the top level beside its states;
     # flattening it in here keeps every orientation reader shape-agnostic.
-    single = {name: payload[name] for name in AGENT_STATE_KEYS}
+    single = {
+        name: payload[name]
+        for name in (*AGENT_STATE_KEYS, *OPTIONAL_AGENT_STATE_KEYS)
+        if name in payload
+    }
     if "orientation" in payload:
         single["orientation"] = payload["orientation"]
     return [single]
@@ -112,13 +134,7 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
     if members is not None and (
         not isinstance(members, list)
         or len(members) < 2
-        or any(
-            not isinstance(entry, dict)
-            # Version 12 members carry an `orientation` code beside their four
-            # states; older-shaped entries stay valid and read as identity.
-            or tuple(entry) not in (AGENT_STATE_KEYS, (*AGENT_STATE_KEYS, "orientation"))
-            for entry in members
-        )
+        or any(not _complete_agent_state(entry) for entry in members)
     ):
         raise ValueError("checkpoint population is not a list of complete agent states")
     # A single learner keeps the four states at the top level, so a payload with
@@ -281,10 +297,11 @@ def checkpoint_payload(
     source_identity: dict[str, Any],
     rng_states: dict[str, Any],
     run_provenance: dict[str, Any] | None = None,
-    training_rng_state: dict[str, Any] | None = None,
+    training_rng_state: Mapping[str, Any] | None = None,
     training_data_config: dict[str, Any] | None = None,
+    auxiliary_rng_state: Mapping[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
-    league_score_rates: dict[int, float] | None = None,
+    league_score_rates: dict[str, float] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
@@ -325,11 +342,13 @@ def checkpoint_payload(
         )
     if set(rng_states) != {"torch_rng", "cuda_rng", "numpy_rng", "python_rng"}:
         raise ValueError("checkpoint RNG capture is incomplete")
-    if not agents or any(
-        tuple(agent) not in (AGENT_STATE_KEYS, (*AGENT_STATE_KEYS, "orientation"))
-        for agent in agents
-    ):
-        raise ValueError(f"every checkpointed agent needs exactly {AGENT_STATE_KEYS}")
+    if not agents or any(not _complete_agent_state(agent) for agent in agents):
+        raise ValueError(f"every checkpointed agent needs {AGENT_STATE_KEYS}")
+    auxiliary_members = ["structured_dynamics" in agent for agent in agents]
+    if any(auxiliary_members) != all(auxiliary_members):
+        raise ValueError("checkpoint population cannot mix structured auxiliary presence")
+    if any(auxiliary_members) != (auxiliary_rng_state is not None):
+        raise ValueError("structured dynamics and its auxiliary RNG must be checkpointed together")
     # Evaluation and submission play the real board. Training cycles
     # symmetries per game, so a member has no private frame to record.
     # Identity is the code inference applies when it is asked to play.
@@ -349,6 +368,9 @@ def checkpoint_payload(
         # POPULATION_CHECKPOINT_KEY: a member-zero alias there is how a reader
         # ends up reporting one arbitrary member as the whole run's strength.
         members = {POPULATION_CHECKPOINT_KEY: oriented}
+    auxiliary_recovery = (
+        {} if auxiliary_rng_state is None else {"structured_auxiliary_rng": auxiliary_rng_state}
+    )
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
@@ -360,6 +382,7 @@ def checkpoint_payload(
         "metrics": metrics,
         **rng_states,
         "training_rng": training_rng_state,
+        **auxiliary_recovery,
         "training_data_config": training_data_config,
         "league_snapshot_manifest": league_snapshot_manifest,
         # PFSP opponent estimates are part of the training state: without
@@ -449,6 +472,7 @@ def replace_checkpoint_alias(source: Path, alias: Path) -> bool:
         temporary.unlink(missing_ok=True)
     return True
 
+
 def install_immutable_checkpoint(source: Path, destination: Path) -> bool:
     """Install an existing checkpoint once, preferring a byte-free hard link."""
     if source.is_symlink() or not source.is_file():
@@ -480,6 +504,7 @@ def install_immutable_checkpoint(source: Path, destination: Path) -> bool:
         temporary.unlink(missing_ok=True)
     return True
 
+
 def save_checkpoint(
     path: Path,
     *,
@@ -491,10 +516,11 @@ def save_checkpoint(
     metrics: dict[str, Any],
     source_identity: dict[str, Any],
     run_provenance: dict[str, Any] | None = None,
-    training_rng_state: dict[str, Any] | None = None,
+    training_rng_state: Mapping[str, Any] | None = None,
     training_data_config: dict[str, Any] | None = None,
+    auxiliary_rng_state: Mapping[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
-    league_score_rates: dict[int, float] | None = None,
+    league_score_rates: dict[str, float] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
@@ -512,6 +538,7 @@ def save_checkpoint(
         run_provenance=run_provenance,
         training_rng_state=training_rng_state,
         training_data_config=training_data_config,
+        auxiliary_rng_state=auxiliary_rng_state,
         league_snapshot_manifest=league_snapshot_manifest,
         league_score_rates=league_score_rates,
         replay_parity_baseline=replay_parity_baseline,
@@ -537,6 +564,11 @@ def load_checkpoint(
         raise ValueError("checkpoint architecture does not match the constructed models")
     if payload["model_config"] != agents[0].actor.config.to_dict():
         raise ValueError("checkpoint model configuration does not match the constructed models")
+    expects_auxiliary_rng = any(agent.structured_dynamics is not None for agent in agents)
+    if ("structured_auxiliary_rng" in payload) != expects_auxiliary_rng:
+        raise ValueError(
+            "checkpoint structured auxiliary RNG presence does not match the constructed learner"
+        )
     states = checkpoint_agent_states(payload)
     # The population size is part of the run's identity, not something to pad or
     # truncate: restoring three members into four would leave the fourth training
@@ -546,8 +578,17 @@ def load_checkpoint(
             f"checkpoint carries {len(states)} agents; this run configures {len(agents)}"
         )
     for agent, state in zip(agents, states, strict=True):
+        has_dynamics = "structured_dynamics" in state
+        expects_dynamics = agent.structured_dynamics is not None
+        if has_dynamics != expects_dynamics:
+            raise ValueError(
+                "checkpoint structured dynamics presence does not match the constructed learner"
+            )
+    for agent, state in zip(agents, states, strict=True):
         agent.actor.load_state_dict(state["actor"])
         agent.critic.load_state_dict(state["critic"])
+        if agent.structured_dynamics is not None:
+            agent.structured_dynamics.load_state_dict(state["structured_dynamics"])
         if agent.actor_optimizer is not None:
             agent.actor_optimizer.load_state_dict(state["actor_optimizer"])
         if agent.critic_optimizer is not None:

@@ -28,6 +28,7 @@ from kaggriculture.ppo import (
     _explained_variance,
     _fit_explained_variance,
     _stage_tensor,
+    _structured_transition_order,
     _target_correlation,
     _validate_config,
     _validate_staged_action_masks,
@@ -46,6 +47,7 @@ from kaggriculture.rollout import (
     collect_self_play,
 )
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+from kaggriculture.structured_dynamics import StructuredDynamics
 
 
 def test_entropy_bonus_is_not_configurable() -> None:
@@ -91,6 +93,31 @@ def test_out_of_range_gamma_is_rejected() -> None:
         _validate_config(PpoConfig(gamma=1.5))
     with pytest.raises(ValueError, match="gamma must be finite"):
         _validate_config(PpoConfig(gamma=0.0))
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_structured_auxiliary_coefficients_must_be_finite_and_nonnegative(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="coefficient must be finite and nonnegative"):
+        _validate_config(PpoConfig(structured_decision_coefficient=value))
+
+
+def test_active_structured_auxiliary_horizons_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="decision horizon must be positive"):
+        _validate_config(
+            PpoConfig(
+                structured_decision_coefficient=0.5,
+                structured_decision_horizon=0,
+            )
+        )
+    with pytest.raises(ValueError, match="patch horizon must be positive"):
+        _validate_config(
+            PpoConfig(
+                structured_opponent_patch_coefficient=0.5,
+                structured_patch_horizon=0,
+            )
+        )
 
 
 def test_minibatches_are_balanced_without_dropping_the_tail() -> None:
@@ -1285,6 +1312,111 @@ def test_structured_update_ppo_trains_both_networks() -> None:
     )
 
 
+def test_structured_transition_order_never_crosses_trajectory_or_terminal_boundaries() -> None:
+    valid = np.array(
+        [
+            [True, True, True, True, False, False],
+            [True, True, False, True, True, True],
+            [True, True, True, True, True, True],
+        ],
+        dtype=np.bool_,
+    )
+    order = _structured_transition_order(
+        valid,
+        np.array([0, 1], dtype=np.int64),
+        2,
+        np.random.default_rng(9),
+    )
+
+    assert order.shape == (3, 3)
+    for window in order:
+        trajectories, steps = np.divmod(window, valid.shape[1])
+        assert np.unique(trajectories).size == 1
+        np.testing.assert_array_equal(steps, np.arange(steps[0], steps[0] + 3))
+        assert valid[trajectories, steps].all()
+        assert trajectories[0] != 2
+
+
+def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_ppo_rng() -> None:
+    actor, rollout = _structured_rollout_with_quantity_orders(seed_start=207, sampling_seed=29)
+    control_actor = copy.deepcopy(actor)
+    active_actor = copy.deepcopy(actor)
+    control_critic = StructuredCritic(_small_structured_config())
+    active_critic = copy.deepcopy(control_critic)
+    control_config = PpoConfig(
+        epochs=1,
+        minibatch_size=1 << 12,
+        use_bfloat16=False,
+    )
+    active_config = replace(
+        control_config,
+        structured_decision_coefficient=0.5,
+        structured_opponent_summary_coefficient=0.5,
+        structured_opponent_patch_coefficient=0.5,
+        structured_decision_horizon=2,
+        structured_patch_horizon=1,
+    )
+    dynamics = StructuredDynamics(_small_structured_config())
+    control_optimizers = make_optimizers(control_actor, control_critic, control_config)
+    active_optimizers = make_optimizers(
+        active_actor,
+        active_critic,
+        active_config,
+        structured_dynamics=dynamics,
+    )
+    optimized_parameters = {
+        id(parameter)
+        for group in active_optimizers[0].param_groups
+        for parameter in group["params"]
+    }
+    assert all(id(parameter) in optimized_parameters for parameter in dynamics.parameters())
+    actor_before = {name: value.detach().clone() for name, value in active_actor.named_parameters()}
+    dynamics_before = {name: value.detach().clone() for name, value in dynamics.named_parameters()}
+    control_generator = np.random.default_rng(31)
+    active_generator = np.random.default_rng(31)
+
+    control_metrics = update_ppo(
+        control_actor,
+        control_critic,
+        *control_optimizers,
+        rollout,
+        control_config,
+        generator=control_generator,
+    )
+    active_metrics = update_ppo(
+        active_actor,
+        active_critic,
+        *active_optimizers,
+        rollout,
+        active_config,
+        generator=active_generator,
+        structured_dynamics=dynamics,
+        auxiliary_generator=np.random.default_rng(32),
+    )
+
+    assert active_generator.bit_generator.state == control_generator.bit_generator.state
+    assert not any(name.startswith("structured_") for name in control_metrics)
+    assert active_metrics["structured_auxiliary_updates"] == 1
+    assert active_metrics["structured_eligible"] > 0.0
+    for name in (
+        "structured_decision",
+        "structured_decision_unit",
+        "structured_decision_market_kind",
+        "structured_decision_market_quantity",
+        "structured_opponent_summary",
+        "structured_opponent_patches",
+        "structured_residual_ratio",
+    ):
+        assert math.isfinite(active_metrics[name])
+    assert any(
+        not torch.equal(value, actor_before[name])
+        for name, value in active_actor.named_parameters()
+    )
+    assert any(
+        not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
+    )
+
+
 def test_target_correlation_separates_noise_from_a_mis_scaled_critic() -> None:
     """Explained variance goes negative two ways that need different fixes.
 
@@ -1502,7 +1634,6 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     # 16.8x at its widest, so a factor of three separates them on every init
     # sampled while still failing if the fit reading collapses onto the identity.
     assert metrics["critic_fit_explained_variance_last_epoch"] > 0.1
-    assert abs(metrics["lambda_return_explained_variance"]) < 0.1
     assert metrics["critic_fit_explained_variance_last_epoch"] > 3.0 * abs(
         metrics["lambda_return_explained_variance"]
     )

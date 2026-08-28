@@ -60,6 +60,16 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.target_kl == PpoConfig.target_kl
     assert args.checkpoint_seconds == 420.0
     assert not hasattr(args, "checkpoint_every")
+    assert not args.deterministic_training
+    assert not any(
+        (
+            args.structured_decision_coefficient,
+            args.structured_patch_coefficient,
+            args.structured_economy_coefficient,
+            args.structured_opponent_summary_coefficient,
+            args.structured_opponent_patch_coefficient,
+        )
+    )
     module._validate_args(args)
     for rejected in (299.0, 601.0, float("nan")):
         args.checkpoint_seconds = rejected
@@ -83,6 +93,58 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
         args.target_kl = rejected
         with pytest.raises(ValueError, match="target KL"):
             module._validate_args(args)
+
+
+def test_structured_auxiliary_cli_is_typed_population_one_and_resume_bound(
+    monkeypatch, tmp_path
+) -> None:
+    module = _training_script()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ppo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--architecture",
+            "structured",
+            "--structured-decision-coefficient",
+            "0.5",
+            "--structured-opponent-summary-coefficient",
+            "0.5",
+            "--structured-opponent-patch-coefficient",
+            "0.5",
+            "--deterministic-training",
+        ],
+    )
+    args = module.parse_args()
+    module._validate_args(args)
+
+    assert args.structured_decision_horizon == 2
+    assert args.structured_patch_horizon == 1
+    assert module._training_data_config(args, torch.device("cpu"))["deterministic_training"]
+
+    args.architecture = CONV_ENTITY
+    with pytest.raises(ValueError, match="require --architecture structured"):
+        module._validate_args(args)
+    args.architecture = STRUCTURED
+    args.population = 2
+    args.games = 2
+    with pytest.raises(ValueError, match="supports population 1 only"):
+        module._validate_args(args)
+
+
+def test_deterministic_training_configures_pytorch_and_cudnn(monkeypatch) -> None:
+    module = _training_script()
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    try:
+        module._configure_training_determinism(True)
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.backends.cudnn.deterministic
+        assert not torch.backends.cudnn.benchmark
+        assert module.os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    finally:
+        module._configure_training_determinism(False)
 
 
 def test_recovery_checkpoint_timer_uses_injected_monotonic_clock() -> None:
@@ -378,7 +440,9 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
 
     monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
 
-    assert module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000000.pt", 0, None) is None
+    assert (
+        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000000.pt", 0, None) is None
+    )
     checkpoint = tmp_path / "checkpoint-000010.pt"
     process = module._maybe_launch_external_eval(args, checkpoint, 10, None)
     assert isinstance(process, FakeProcess)
@@ -390,16 +454,12 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
     assert command[command.index("--output") + 1] == str(tmp_path / "metrics-external.jsonl")
 
     assert (
-        module._maybe_launch_external_eval(
-            args, tmp_path / "checkpoint-000020.pt", 20, process
-        )
+        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000020.pt", 20, process)
         is process
     )
     assert len(launched) == 1
     assert (
-        module._maybe_launch_external_eval(
-            args, tmp_path / "checkpoint-000030.pt", 30, process
-        )
+        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000030.pt", 30, process)
         is process
     )
     assert len(launched) == 1
@@ -411,15 +471,16 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
         wait_for_slot=True,
     )
     assert isinstance(replacement, FakeProcess) and replacement is not process
-    assert [
-        command[command.index("--iteration") + 1] for command in launched
-    ] == ["10", "20", "30", "40"]
+    assert [command[command.index("--iteration") + 1] for command in launched] == [
+        "10",
+        "20",
+        "30",
+        "40",
+    ]
 
     disabled = SimpleNamespace(**{**vars(args), "external_eval": False})
     assert (
-        module._maybe_launch_external_eval(
-            disabled, tmp_path / "checkpoint-000030.pt", 30, None
-        )
+        module._maybe_launch_external_eval(disabled, tmp_path / "checkpoint-000030.pt", 30, None)
         is None
     )
 
@@ -463,9 +524,7 @@ def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fork failed")),
     )
     assert (
-        module._maybe_launch_external_eval(
-            args, tmp_path / "checkpoint-000010.pt", 10, None
-        )
+        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000010.pt", 10, None)
         is None
     )
 
@@ -676,6 +735,7 @@ def test_league_manifest_accepts_sparse_warmup_history_but_requires_the_anchor()
     with pytest.raises(ValueError, match="digest"):
         module._validate_league_manifest({0: "not-a-digest"}, current_iteration=0)
 
+
 def test_orphan_checkpoint_matching_ignores_only_volatile_metrics() -> None:
     module = _training_script()
     original = {
@@ -689,9 +749,7 @@ def test_orphan_checkpoint_matching_ignores_only_volatile_metrics() -> None:
         "metrics": {"elapsed_hours": 0.2, "iteration_seconds": 21.0},
     }
     assert module._checkpoint_recovery_values_equal(original, replayed)
-    assert not module._checkpoint_recovery_values_equal(
-        original, {**replayed, "next_seed": 10}
-    )
+    assert not module._checkpoint_recovery_values_equal(original, {**replayed, "next_seed": 10})
 
 
 def test_main_writes_complete_manifests_and_portably_resumes(
@@ -1498,7 +1556,6 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     from kaggriculture.ppo import (
         MAX_FIRST_MINIBATCH_KL,
         MAX_VALUE_TARGET_SATURATED_FRACTION,
-        MINIMUM_ACTOR_EPOCH_FRACTION,
         MINIMUM_POLICY_ENTROPY,
     )
 
@@ -1546,59 +1603,28 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
     module._gate_update_metrics(
         {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
     )
-    module._gate_update_metrics({**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True)
+    module._gate_update_metrics(
+        {**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True
+    )
     module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)
 
 
-def test_the_entropy_floor_admits_a_clone_that_starts_sharper_than_the_absolute_level() -> None:
-    """A faithful clone begins below the from-scratch floor and still plays well.
-
-    Measured, not hypothetical: the v16-KL clones read 0.00896 nats at their
-    first actor-active iteration while holding 0.001 holdout NLL and beating
-    `public-v27` in the official engine. An absolute floor calibrated on
-    from-scratch entropy (0.14-0.37 healthy, 0.000-0.001 collapsed) refused them
-    on their first update, so the floor is the lower of that level and a share of
-    the run's own start.
-    """
-    from kaggriculture.ppo import (
-        MINIMUM_POLICY_ENTROPY,
-        MINIMUM_POLICY_ENTROPY_REFERENCE,
-        POLICY_ENTROPY_FLOOR_FRACTION,
-    )
-
+def test_sharp_clone_entropy_is_telemetry_not_a_stop_condition() -> None:
+    """A faithful BC clone may begin sharp while already playing well."""
     module = _training_script()
-    clone = 0.00896
-    # The reference only ever relaxes the floor: a from-scratch run whose quarter
-    # is looser than the absolute level is judged against the level, exactly as
-    # before this existed. `min` and not `max`, because a policy sharpening as it
-    # converges is the expected trajectory rather than a failure.
-    assert module._policy_entropy_floor(None) == MINIMUM_POLICY_ENTROPY
-    assert module._policy_entropy_floor(0.29) == MINIMUM_POLICY_ENTROPY
-    assert module._policy_entropy_floor(clone) == POLICY_ENTROPY_FLOOR_FRACTION * clone
-
     healthy = {
         "first_minibatch_approx_kl": 0.0,
         "value_target_saturated_fraction": 0.0,
         "actor_updates": 113,
         "actor_minibatches_intended": 113,
         "max_approx_kl": 0.0,
-        "entropy": clone,
+        "entropy": 0.0,
     }
-    # The floor helper still exists for journals. It does not stop the run.
-    module._gate_update_metrics(healthy, warmup_active=False, entropy_reference=clone)
-    module._gate_update_metrics(
-        {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
-        warmup_active=False,
-        entropy_reference=clone,
-    )
-    # A run cannot start collapsed. Admitting such a reference would set a floor
-    # below the collapse and switch the gate off for every later iteration.
-    with pytest.raises(ValueError, match="collapsed range"):
-        module._validate_policy_entropy_reference(MINIMUM_POLICY_ENTROPY_REFERENCE * 0.99)
-    assert (
-        module._validate_policy_entropy_reference(MINIMUM_POLICY_ENTROPY_REFERENCE)
-        == MINIMUM_POLICY_ENTROPY_REFERENCE
-    )
+
+    module._gate_update_metrics(healthy, warmup_active=False)
+    assert module._validate_policy_entropy_reference(0.0) == 0.0
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        module._validate_policy_entropy_reference(-1e-9)
 
 
 def test_the_entropy_reference_is_persisted_per_population_member() -> None:
@@ -1624,8 +1650,8 @@ def test_the_entropy_reference_is_persisted_per_population_member() -> None:
     assert module._validate_entropy_references(record, population=3) == references
     with pytest.raises(ValueError, match="every population member"):
         module._validate_entropy_references(record, population=4)
-    with pytest.raises(ValueError, match="collapsed range"):
-        module._validate_entropy_references([0.0, None, 0.29], population=3)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        module._validate_entropy_references([-0.1, None, 0.29], population=3)
 
 
 def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
@@ -1957,8 +1983,7 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     members = payload[POPULATION_CHECKPOINT_KEY]
     assert len(members) == population
     assert all(
-        set(member)
-        == {"actor", "critic", "actor_optimizer", "critic_optimizer", "orientation"}
+        set(member) == {"actor", "critic", "actor_optimizer", "critic_optimizer", "orientation"}
         for member in members
     )
     # Evaluation plays the real board. Training cycles frames per game,
