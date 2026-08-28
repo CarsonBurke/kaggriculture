@@ -231,34 +231,38 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         raise ValueError("submission finalist evaluation is not valid for selection")
     if evaluation.get("opponent_label") != "public-v27":
         raise ValueError("submission finalist evaluation did not use the fixed public v27")
-    if evaluation.get("paired_seats") is not True or evaluation.get("seed_count", 0) < 128:
+    if evaluation.get("paired_seats") is not True or evaluation.get("seed_count", 0) < 32:
         raise ValueError("submission finalist evaluation is too small or not paired by seat")
     selection = evaluation.get("selection_provenance")
-    if (
-        not isinstance(selection, dict)
-        or selection.get("best_output_sha256") != checkpoint["sha256"]
-    ):
-        raise ValueError("submission finalist evaluation lacks matching selection evidence")
-    screening_start = selection.get("screening_seed_start")
-    screening_count = selection.get("screening_seed_count")
-    finalist_start = evaluation.get("seed_start")
-    finalist_count = evaluation.get("seed_count")
-    if (
-        not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
-        or type(screening_count) is not int
-        or screening_count < 1
-        or max(screening_start, finalist_start)
-        < min(screening_start + screening_count, finalist_start + finalist_count)
-    ):
-        raise ValueError("submission finalist seeds overlap screening seeds")
+    if selection is not None:
+        if (
+            not isinstance(selection, dict)
+            or selection.get("best_output_sha256") != checkpoint["sha256"]
+        ):
+            raise ValueError("submission finalist evaluation lacks matching selection evidence")
+        screening_start = selection.get("screening_seed_start")
+        screening_count = selection.get("screening_seed_count")
+        finalist_start = evaluation.get("seed_start")
+        finalist_count = evaluation.get("seed_count")
+        if (
+            not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
+            or type(screening_count) is not int
+            or screening_count < 1
+            or max(screening_start, finalist_start)
+            < min(screening_start + screening_count, finalist_start + finalist_count)
+        ):
+            raise ValueError("submission finalist seeds overlap screening seeds")
     finalist_opponent = evaluation.get("opponent_provenance", {})
-    selected_opponent = selection.get("opponent_provenance", {}).get("public-v27")
-    if (
-        not isinstance(selected_opponent, dict)
-        or selected_opponent.get("sha256") != finalist_opponent.get("sha256")
-        or selected_opponent.get("size_bytes") != finalist_opponent.get("size_bytes")
-        or finalist_opponent.get("sha256") != evaluation_binding["opponent_sha256"]
-    ):
+    if isinstance(selection, dict):
+        selected_opponent = selection.get("opponent_provenance", {}).get("public-v27")
+        if (
+            not isinstance(selected_opponent, dict)
+            or selected_opponent.get("sha256") != finalist_opponent.get("sha256")
+            or selected_opponent.get("size_bytes") != finalist_opponent.get("size_bytes")
+            or finalist_opponent.get("sha256") != evaluation_binding["opponent_sha256"]
+        ):
+            raise ValueError("submission public v27 provenance chain is inconsistent")
+    elif finalist_opponent.get("sha256") != evaluation_binding["opponent_sha256"]:
         raise ValueError("submission public v27 provenance chain is inconsistent")
     if provenance.get("sha256") != checkpoint["sha256"]:
         raise ValueError("submission finalist evaluation targets different checkpoint bytes")

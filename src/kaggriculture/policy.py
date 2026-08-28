@@ -113,6 +113,29 @@ class PolicyStep:
     encoded: list[EncodedObservation] | list[StructuredObservation]
     factors: ActionFactors
 
+@dataclass(frozen=True)
+class PreparedQuantityHeads:
+    """Immutable CPU quantity parameters for a frozen inference actor."""
+
+    kind_gate: np.ndarray
+    values: np.ndarray
+    bias: np.ndarray
+
+
+def prepare_quantity_heads(actor: FarmActor | StructuredActor) -> PreparedQuantityHeads:
+    """Materialize quantity parameters once for repeated frozen-policy actions."""
+
+    def frozen(parameter: Tensor) -> np.ndarray:
+        array = parameter.detach().float().cpu().numpy().copy()
+        array.setflags(write=False)
+        return array
+
+    return PreparedQuantityHeads(
+        kind_gate=frozen(actor.market_quantity_kind_gate.weight),
+        values=frozen(actor.market_quantity_value.weight),
+        bias=frozen(actor.market_quantity_bias),
+    )
+
 
 @dataclass
 class MarketLedger:
@@ -456,6 +479,7 @@ def act_batch(
     temperature: float = 1.0,
     generator: np.random.Generator | None = None,
     orientation: Orientation = Orientation.IDENTITY,
+    quantity_heads: PreparedQuantityHeads | None = None,
 ) -> PolicyStep:
     """Encode, sample, mask, and compile a batch of decentralized actions.
 
@@ -510,9 +534,11 @@ def act_batch(
     unit_logits = output.unit_logits.float().cpu().numpy()
     market_kind_logits = output.market_kind_logits.float().cpu().numpy()
     market_quantity_context = output.market_quantity_context.float().cpu().numpy()
-    quantity_kind_gate = actor.market_quantity_kind_gate.weight.float().cpu().numpy()
-    quantity_values = actor.market_quantity_value.weight.float().cpu().numpy()
-    quantity_bias = actor.market_quantity_bias.float().cpu().numpy()
+    if quantity_heads is None:
+        quantity_heads = prepare_quantity_heads(actor)
+    quantity_kind_gate = quantity_heads.kind_gate
+    quantity_values = quantity_heads.values
+    quantity_bias = quantity_heads.bias
     batch_size = len(observations)
     generator = generator or np.random.default_rng()
     movement_map = movement_permutation(orientation)

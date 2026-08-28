@@ -15,6 +15,7 @@ from kaggriculture.policy import (
     act_batch,
     component_logprobs,
     component_selected_logprobs,
+    prepare_quantity_heads,
 )
 
 
@@ -103,6 +104,39 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
 
     next_state = environment.step(step.actions)
     assert all(row.status == "ACTIVE" for row in next_state)
+
+def test_prepared_quantity_heads_preserve_frozen_policy_actions() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 31})
+    observations = [row.observation for row in environment.reset(2)]
+    actor = FarmActor(
+        ModelConfig(
+            cnn_width=16,
+            cnn_blocks=1,
+            model_dim=32,
+            transformer_layers=3,
+            attention_heads=4,
+        )
+    )
+    _pin_kind_head_to_a_quantified_buy(actor)
+
+    expected = act_batch(actor, observations, deterministic=True)
+    prepared = prepare_quantity_heads(actor)
+    actual = act_batch(
+        actor,
+        observations,
+        deterministic=True,
+        quantity_heads=prepared,
+    )
+
+    assert actual.actions == expected.actions
+    for name in expected.factors.__dataclass_fields__:
+        np.testing.assert_array_equal(
+            getattr(actual.factors, name),
+            getattr(expected.factors, name),
+        )
+    assert not prepared.kind_gate.flags.writeable
+    assert not prepared.values.flags.writeable
+    assert not prepared.bias.flags.writeable
 
 
 def test_policy_skips_quantity_head_for_nonquantified_market_rows() -> None:
@@ -328,3 +362,4 @@ def test_component_selected_logprobs_matches_component_logprobs() -> None:
     # so it agrees bit-for-bit with the full statistics on every head.
     for lean, reference in zip(selected, full[:3], strict=True):
         torch.testing.assert_close(lean, reference, rtol=0.0, atol=0.0)
+

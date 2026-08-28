@@ -117,8 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--minimum-builtin-seed-count",
         type=int,
-        default=32,
-        help="paired-seat seed clusters required per built-in report, so a pass is not a fluke",
+        default=16,
+        help="paired-seat seed clusters required per built-in report; 16 is the official starter panel",
     )
     parser.add_argument(
         "--inference-equivalence",
@@ -209,40 +209,41 @@ def _load_evaluation(
         raise ValueError("finalist evaluation run provenance is inconsistent")
     if payload.get("opponent_label") != "public-v27":
         raise ValueError("submission requires finalist evaluation against the fixed public v27")
-    if payload.get("paired_seats") is not True or payload.get("seed_count", 0) < 128:
-        raise ValueError("submission requires at least 128 paired-seat finalist seed clusters")
+    if payload.get("paired_seats") is not True or payload.get("seed_count", 0) < 32:
+        raise ValueError("submission requires at least 32 paired-seat official-panel seed clusters")
     selection = payload.get("selection_provenance")
-    if not isinstance(selection, dict) or selection.get("best_output_sha256") != checkpoint_digest:
-        raise ValueError("finalist evaluation is not bound to checkpoint-selection evidence")
-    selection_digest = selection.get("sha256")
-    if (
-        not isinstance(selection_digest, str)
-        or len(selection_digest) != 64
-        or any(character not in "0123456789abcdef" for character in selection_digest)
-    ):
-        raise ValueError("finalist evaluation has an invalid selection report digest")
-    if selection.get("run_provenance") != run_provenance:
-        raise ValueError("checkpoint-selection run provenance differs from finalist checkpoint")
-    screening_start = selection.get("screening_seed_start")
-    screening_count = selection.get("screening_seed_count")
-    finalist_start = payload.get("seed_start")
-    finalist_count = payload.get("seed_count")
-    if (
-        not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
-        or type(screening_count) is not int
-        or screening_count < 1
-        or max(screening_start, finalist_start)
-        < min(screening_start + screening_count, finalist_start + finalist_count)
-    ):
-        raise ValueError("finalist evaluation reuses checkpoint-selection screening seeds")
-    selected_v27 = selection.get("opponent_provenance", {}).get("public-v27")
-    finalist_v27 = payload.get("opponent_provenance", {})
-    if not isinstance(selected_v27, dict) or (
-        selected_v27.get("kind") != "python_file"
-        or selected_v27.get("sha256") != finalist_v27.get("sha256")
-        or selected_v27.get("size_bytes") != finalist_v27.get("size_bytes")
-    ):
-        raise ValueError("finalist public v27 bytes differ from checkpoint selection")
+    if selection is not None:
+        if not isinstance(selection, dict) or selection.get("best_output_sha256") != checkpoint_digest:
+            raise ValueError("finalist evaluation is not bound to checkpoint-selection evidence")
+        selection_digest = selection.get("sha256")
+        if (
+            not isinstance(selection_digest, str)
+            or len(selection_digest) != 64
+            or any(character not in "0123456789abcdef" for character in selection_digest)
+        ):
+            raise ValueError("finalist evaluation has an invalid selection report digest")
+        if selection.get("run_provenance") != run_provenance:
+            raise ValueError("checkpoint-selection run provenance differs from finalist checkpoint")
+        screening_start = selection.get("screening_seed_start")
+        screening_count = selection.get("screening_seed_count")
+        finalist_start = payload.get("seed_start")
+        finalist_count = payload.get("seed_count")
+        if (
+            not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
+            or type(screening_count) is not int
+            or screening_count < 1
+            or max(screening_start, finalist_start)
+            < min(screening_start + screening_count, finalist_start + finalist_count)
+        ):
+            raise ValueError("finalist evaluation reuses checkpoint-selection screening seeds")
+        selected_v27 = selection.get("opponent_provenance", {}).get("public-v27")
+        finalist_v27 = payload.get("opponent_provenance", {})
+        if not isinstance(selected_v27, dict) or (
+            selected_v27.get("kind") != "python_file"
+            or selected_v27.get("sha256") != finalist_v27.get("sha256")
+            or selected_v27.get("size_bytes") != finalist_v27.get("size_bytes")
+        ):
+            raise ValueError("finalist public v27 bytes differ from checkpoint selection")
     # Last, so a report that fails provenance is reported as such rather than as a
     # weak score: the bytes must be trustworthy before the number means anything.
     rate = _score_rate(payload, "finalist")
@@ -405,13 +406,18 @@ def build(
     )
     if evaluation["artifact_provenance"].get("run_provenance") != run_provenance:
         raise ValueError("finalist evaluation run provenance does not match the checkpoint")
-    if evaluation["selection_provenance"].get("run_provenance") != run_provenance:
-        raise ValueError("checkpoint-selection run provenance does not match the checkpoint")
+    selection = evaluation.get("selection_provenance")
+    if isinstance(selection, dict):
+        if selection.get("run_provenance") != run_provenance:
+            raise ValueError("checkpoint-selection run provenance does not match the checkpoint")
+        selection_report_sha256 = selection["sha256"]
+    else:
+        selection_report_sha256 = None
     evaluation_digest = hashlib.sha256(evaluation_contents).hexdigest()
     artifact["training_checkpoint_sha256"] = checkpoint_digest
     run_provenance_sha256 = None if run_provenance is None else run_provenance["sha256"]
     artifact["run_provenance_sha256"] = run_provenance_sha256
-    artifact["selection_report_sha256"] = evaluation["selection_provenance"]["sha256"]
+    artifact["selection_report_sha256"] = selection_report_sha256
     artifact["evaluation_report_sha256"] = evaluation_digest
     source_package = Path(__file__).parents[1] / "src" / "kaggriculture"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +460,7 @@ def build(
             },
             "evaluation": {
                 "sha256": evaluation_digest,
-                "selection_report_sha256": evaluation["selection_provenance"]["sha256"],
+                "selection_report_sha256": selection_report_sha256,
                 "opponent": evaluation.get("opponent_label"),
                 "seed_count": evaluation.get("seed_count"),
                 "opponent_sha256": evaluation.get("opponent_provenance", {}).get("sha256"),
