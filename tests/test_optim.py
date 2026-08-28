@@ -15,6 +15,8 @@ from kaggriculture.optim import (
 from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.production import production_model_config
 from kaggriculture.registry import resolve_architecture
+from kaggriculture.structured import StructuredConfig
+from kaggriculture.structured_dynamics import StructuredDynamics
 
 SHAPES = ((96, 96), (384, 96), (96, 384), (48, 432), (22, 100))
 
@@ -341,6 +343,17 @@ def test_heads_and_embeddings_stay_on_adam_while_hidden_matrices_do_not() -> Non
             if parameter.ndim == 4 and id(parameter) in matrix_ids
         ]
         assert convolutions
+
+
+def test_structured_transition_lookup_tables_stay_on_adam() -> None:
+    dynamics = StructuredDynamics(
+        StructuredConfig(model_dim=16, attention_heads=2, ffn_multiplier=1)
+    )
+    _, vectors = route_parameters(dynamics)
+    vector_ids = {id(parameter) for parameter in vectors}
+    for module in dynamics.modules():
+        if isinstance(module, torch.nn.Embedding):
+            assert id(module.weight) in vector_ids
 
 
 def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:

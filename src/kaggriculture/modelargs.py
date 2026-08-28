@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import fields
-from typing import Any
+from typing import Any, get_args, get_origin, get_type_hints
 
 from kaggriculture.registry import ARCHITECTURES, Architecture
 
@@ -58,13 +58,47 @@ def _default_summary(name: str, families: list[str]) -> str:
     return "default " + ", ".join(f"{value} for {family}" for family, value in defaults.items())
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected boolean, got {value!r}")
+
+
+def _field_parser(annotation: Any):
+    origin = get_origin(annotation)
+    if annotation is bool:
+        return _parse_bool
+    if origin is tuple and get_args(annotation) == (int, Ellipsis):
+        def parse_tuple(value: str) -> tuple[int, ...]:
+            try:
+                return tuple(int(part) for part in value.split(",") if part)
+            except ValueError as error:
+                raise argparse.ArgumentTypeError(
+                    f"expected comma-separated integers, got {value!r}"
+                ) from error
+
+        return parse_tuple
+    if annotation in (int, str):
+        return annotation
+    raise TypeError(f"unsupported model-config field type: {annotation!r}")
+
 def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
     """Add every family's structural flags, each defaulting to its dataclass value."""
+    annotations = {
+        architecture.name: get_type_hints(architecture.config_class)
+        for architecture in ARCHITECTURES.values()
+    }
     for name, families in _families_by_field().items():
         applies = "every architecture" if len(families) == len(ARCHITECTURES) else families[0]
+        field_types = {annotations[family][name] for family in families}
+        if len(field_types) != 1:
+            raise TypeError(f"model-config field {name!r} has inconsistent family types")
         parser.add_argument(
             _flag(name),
-            type=int,
+            type=_field_parser(field_types.pop()),
             default=None,
             help=f"{name.replace('_', ' ')} ({applies}); {_default_summary(name, families)}",
         )
@@ -73,7 +107,7 @@ def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
 def model_config_from_args(architecture: Architecture, args: argparse.Namespace) -> Any:
     """Build this family's model configuration from the explicitly-passed flags."""
     accepted = set(model_config_fields(architecture))
-    overrides: dict[str, int] = {}
+    overrides: dict[str, Any] = {}
     foreign: list[str] = []
     for name in _families_by_field():
         value = getattr(args, name, None)

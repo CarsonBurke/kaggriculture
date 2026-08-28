@@ -191,6 +191,51 @@ def test_structured_retokenization_yields_matched_rows(dataset_dir: Path) -> Non
     assert train_split.staged["tile_continuous"].dtype == torch.float16
 
 
+@pytest.mark.parametrize("architecture", [CONV_ENTITY, STRUCTURED])
+def test_encoded_episode_cache_reuses_provenance_bound_arrays(
+    dataset_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+) -> None:
+    trainer = _load_trainer()
+    cache = tmp_path / architecture
+    expected_train, expected_holdout, records = trainer.load_dataset(
+        [dataset_dir],
+        architecture=architecture,
+        holdout_seeds=1,
+        encode_workers=1,
+        encoded_cache=cache,
+    )
+    assert records[0]["encoded_cache_schema"] == trainer._encoding_cache_schema(architecture)
+    assert len(list(cache.rglob("*.npz"))) == 4
+
+    def unexpected_encode(*_args, **_kwargs):
+        raise AssertionError("warm encoded cache retokenized an observation")
+
+    monkeypatch.setattr(
+        trainer,
+        "encode_observation" if architecture == CONV_ENTITY else "encode_structured_observation",
+        unexpected_encode,
+    )
+    actual_train, actual_holdout, _ = trainer.load_dataset(
+        [dataset_dir],
+        architecture=architecture,
+        holdout_seeds=1,
+        encode_workers=1,
+        encoded_cache=cache,
+    )
+
+    for expected, actual in (
+        (expected_train, actual_train),
+        (expected_holdout, actual_holdout),
+    ):
+        assert expected.staged.keys() == actual.staged.keys()
+        for name in expected.staged:
+            torch.testing.assert_close(expected.staged[name], actual.staged[name])
+        np.testing.assert_array_equal(expected.row_components, actual.row_components)
+
+
 def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path: Path) -> None:
     trainer = _load_trainer()
     corrupt = tmp_path / "corrupt"
@@ -475,6 +520,19 @@ def test_unflagged_clone_builds_the_family_default_configuration(
     config = trainer.model_config_from_args(trainer.resolve_architecture(architecture), args)
 
     assert config == expected
+
+
+def test_clone_help_formats_literal_percentages(monkeypatch, capsys) -> None:
+    trainer = _load_trainer()
+    monkeypatch.setattr(sys, "argv", ["train_bc.py", "--help"])
+
+    with pytest.raises(SystemExit) as raised:
+        trainer.parse_args()
+
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "99.996% accuracy" in help_text
+    assert "0.6% of throughput" in help_text
 
 
 def test_clone_rejects_a_config_from_another_family(dataset_dir: Path, tmp_path: Path) -> None:
@@ -1098,6 +1156,69 @@ def test_the_latent_auxiliary_trains_and_is_journalled(dataset_dir: Path, tmp_pa
     # p_psi is training-only: it must never reach an actor artifact, which
     # inference, league snapshots and the frozen-ensemble stack all load whole.
     assert not any(name.startswith("predictor") for name in payload["actor"])
+
+
+def test_the_structured_auxiliary_trains_and_is_journalled(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """Typed decision and patch objectives share one actor pass and stay training-only."""
+    trainer = _load_trainer()
+    output = tmp_path / "run-structured-aux"
+    trainer.train(
+        dataset_dirs=[dataset_dir],
+        output_dir=output,
+        architecture=STRUCTURED,
+        config=_tiny_structured_config(),
+        holdout_seeds=1,
+        epochs=1,
+        patience=1,
+        batch_size=64,
+        run_length=4,
+        structured_decision_coefficient=0.5,
+        structured_patch_coefficient=0.25,
+        structured_decision_horizon=2,
+        structured_patch_horizon=1,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+    )
+
+    record = json.loads((output / "metrics.jsonl").read_text().splitlines()[0])
+    for name in (
+        "structured_decision",
+        "structured_decision_unit",
+        "structured_decision_market_kind",
+        "structured_patch",
+        "structured_patch_all",
+        "structured_residual_ratio",
+        "structured_residual_own_patches",
+        "structured_decision_one",
+        "structured_decision_final",
+        "structured_patch_one",
+        "structured_patch_final",
+    ):
+        assert np.isfinite(record[name]) and record[name] > 0.0, name
+    assert record["structured_eligible"] > 0.0
+    assert record["structured_decision"] == pytest.approx(
+        (record["structured_decision_one"] + record["structured_decision_final"]) / 2
+    )
+    assert record["structured_patch"] == pytest.approx(record["structured_patch_one"])
+    assert record["structured_patch"] == pytest.approx(record["structured_patch_final"])
+    for suffix in ("variance", "effective_rank", "cosine", "dispersion"):
+        assert np.isfinite(record[f"structured_own_patches_{suffix}"])
+    assert record["structured_own_patches_variance"] > 0.0
+    assert record["structured_own_patches_effective_rank"] >= 1.0
+    payload = torch.load(output / "bc-actor.pt", map_location="cpu", weights_only=False)
+    provenance = payload["bc_provenance"]
+    assert provenance["structured_decision_coefficient"] == 0.5
+    assert provenance["structured_patch_coefficient"] == 0.25
+    assert provenance["structured_decision_horizon"] == 2
+    assert provenance["structured_patch_horizon"] == 1
+    assert not any(name.startswith(("action.", "transition.")) for name in payload["actor"])
 
 
 def test_the_auxiliary_is_refused_when_the_sampler_gives_it_no_pairs(

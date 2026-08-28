@@ -358,6 +358,58 @@ def _decision_kl(
     return (pointwise.sum(dim=-1) * weight).sum(), weight.sum()
 
 
+class DecodeKLTerms(NamedTuple):
+    """Pooled decision KL and its independently normalized factor diagnostics."""
+
+    pooled: Tensor
+    unit: Tensor
+    market_kind: Tensor
+    market_quantity: Tensor
+
+
+def latent_decode_kl_terms(
+    predicted: Tensor,
+    teacher_unit_logits: Tensor,
+    teacher_kind_logits: Tensor,
+    teacher_quantity_context: Tensor,
+    heads: DecodeHeads,
+    masks: DecodeMasks,
+    eligible: Tensor,
+) -> DecodeKLTerms:
+    """Decode KL with the policy-pooled objective and per-factor diagnostics."""
+    if predicted.ndim != 3:
+        raise ValueError("predicted belief must be one vector per belief token per row")
+    if eligible.shape != predicted.shape[:1]:
+        raise ValueError("eligibility mask must have one entry per row")
+    student = heads.decode(predicted)
+    row = eligible.bool().unsqueeze(-1)
+    unit_kl, unit_weight = _decision_kl(
+        student.unit_logits,
+        teacher_unit_logits,
+        masks.unit_masks,
+        (row & masks.unit_active).float(),
+    )
+    kind_kl, kind_weight = _decision_kl(
+        student.market_kind_logits,
+        teacher_kind_logits,
+        masks.market_kind_masks,
+        (row & masks.market_active).float(),
+    )
+    quantity_kl, quantity_weight = _decision_kl(
+        heads.quantity_logits(student.market_quantity_context, masks.market_kinds),
+        heads.quantity_logits(teacher_quantity_context, masks.market_kinds),
+        masks.market_quantity_masks,
+        (row & masks.market_quantity_active).float(),
+    )
+    decisions = unit_weight + kind_weight + quantity_weight
+    return DecodeKLTerms(
+        pooled=(unit_kl + kind_kl + quantity_kl) / decisions.clamp_min(1.0),
+        unit=unit_kl / unit_weight.clamp_min(1.0),
+        market_kind=kind_kl / kind_weight.clamp_min(1.0),
+        market_quantity=quantity_kl / quantity_weight.clamp_min(1.0),
+    )
+
+
 def latent_decode_kl(
     predicted: Tensor,
     teacher_unit_logits: Tensor,
@@ -381,36 +433,15 @@ def latent_decode_kl(
     the same way the clone loss pools its log-likelihoods: one mean over the
     concatenated active components, so a factor's weight is its decision count.
     """
-    if predicted.ndim != 3:
-        raise ValueError("predicted belief must be one vector per belief token per row")
-    if eligible.shape != predicted.shape[:1]:
-        raise ValueError("eligibility mask must have one entry per row")
-    student = heads.decode(predicted)
-    row = eligible.bool().unsqueeze(-1)
-    # Every slot has its own token, so every slot has its own distribution on
-    # both sides. Nothing is broadcast: a row-level distribution shared by all
-    # 16 unit slots could not express "unit 3 harvests while unit 7 walks", and
-    # it is not what the policy computes.
-    unit_kl, unit_weight = _decision_kl(
-        student.unit_logits,
+    return latent_decode_kl_terms(
+        predicted,
         teacher_unit_logits,
-        masks.unit_masks,
-        (row & masks.unit_active).float(),
-    )
-    kind_kl, kind_weight = _decision_kl(
-        student.market_kind_logits,
         teacher_kind_logits,
-        masks.market_kind_masks,
-        (row & masks.market_active).float(),
-    )
-    quantity_kl, quantity_weight = _decision_kl(
-        heads.quantity_logits(student.market_quantity_context, masks.market_kinds),
-        heads.quantity_logits(teacher_quantity_context, masks.market_kinds),
-        masks.market_quantity_masks,
-        (row & masks.market_quantity_active).float(),
-    )
-    decisions = unit_weight + kind_weight + quantity_weight
-    return (unit_kl + kind_kl + quantity_kl) / decisions.clamp_min(1.0)
+        teacher_quantity_context,
+        heads,
+        masks,
+        eligible,
+    ).pooled
 
 
 def consecutive_rows(episode_index: Tensor, step: Tensor) -> Tensor:

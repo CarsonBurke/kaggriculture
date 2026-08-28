@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+from dataclasses import replace
+
 import pytest
 import torch
 from kaggle_environments import make
@@ -7,6 +10,8 @@ from kaggle_environments import make
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import (
     StructuredActor,
     StructuredConfig,
@@ -76,6 +81,142 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
     expanded = bias_logits.expand_as(output.unit_logits)
     assert torch.allclose(output.unit_logits[inactive], expanded[inactive])
 
+
+def test_structured_actor_exposes_typed_training_belief(
+    real_inputs: StructuredInputs,
+) -> None:
+    actor = StructuredActor(_tiny_config())
+
+    output, belief = actor.forward_with_belief(real_inputs)
+
+    assert output.unit_logits.shape[:2] == (real_inputs.unit_active.shape)
+    assert belief.own_patches.shape == (real_inputs.unit_active.shape[0], 100, 32)
+    assert belief.opponent_patches.shape == belief.own_patches.shape
+    assert belief.opponent_summary.shape == (real_inputs.unit_active.shape[0], 4, 32)
+    assert belief.central_latents.shape == (real_inputs.unit_active.shape[0], 8, 32)
+    assert belief.unit_decisions.shape == (real_inputs.unit_active.shape[0], 16, 32)
+    assert belief.market_decisions.shape == (real_inputs.unit_active.shape[0], 10, 32)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"global_refresh_layers": (1,), "global_refresh_context": "economy"},
+        {"global_refresh_layers": (1,), "global_refresh_context": "all"},
+        {"input_reinject_layers": (1,)},
+        {"core_skip_source": 1, "core_skip_target": 2},
+        {"global_modulation": True},
+        {"mudd_lite": True, "core_layers": 6},
+    ],
+)
+def test_zero_initialized_transport_paths_begin_as_noops(
+    real_inputs: StructuredInputs,
+    changes: dict,
+) -> None:
+    torch.manual_seed(7)
+    baseline = StructuredActor(replace(_tiny_config(), core_layers=changes.get("core_layers", 2)))
+    torch.manual_seed(11)
+    candidate = StructuredActor(replace(baseline.config, **changes))
+    common = {
+        name: value
+        for name, value in baseline.state_dict().items()
+        if name in candidate.state_dict() and candidate.state_dict()[name].shape == value.shape
+    }
+    candidate.load_state_dict(common, strict=False)
+
+    expected = baseline(real_inputs)
+    actual = candidate(real_inputs)
+
+    torch.testing.assert_close(actual.unit_logits, expected.unit_logits)
+    torch.testing.assert_close(actual.market_kind_logits, expected.market_kind_logits)
+    torch.testing.assert_close(
+        actual.market_quantity_context,
+        expected.market_quantity_context,
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"fuse_market_decoder": True},
+        {"fuse_unit_decoder": True},
+        {"split_clock_token": True},
+        {"zero_init_branches": True},
+    ],
+)
+def test_structured_variants_preserve_finite_output_contract(
+    real_inputs: StructuredInputs,
+    changes: dict,
+) -> None:
+    actor = StructuredActor(replace(_tiny_config(), **changes))
+
+    output = actor(real_inputs)
+
+    assert torch.isfinite(output.unit_logits).all()
+    assert torch.isfinite(output.market_kind_logits).all()
+    assert torch.isfinite(output.market_quantity_context).all()
+
+
+def test_structured_model_arguments_parse_typed_regression_fields() -> None:
+    parser = argparse.ArgumentParser()
+    add_model_config_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--global-refresh-layers",
+            "2,5",
+            "--global-refresh-context",
+            "all",
+            "--zero-init-branches",
+            "true",
+        ]
+    )
+
+    config = model_config_from_args(resolve_architecture("structured"), args)
+
+    assert config.global_refresh_layers == (2, 5)
+    assert config.global_refresh_context == "all"
+    assert config.zero_init_branches is True
+
+def test_structured_farm_batch_matches_separate_canonical_encoding(
+    real_inputs: StructuredInputs,
+) -> None:
+    torch.manual_seed(0)
+    actor = StructuredActor(_tiny_config())
+    trunk = actor.trunk
+    tiles = trunk.tiles(real_inputs.tile_categorical, real_inputs.tile_continuous)
+    batch = tiles.shape[0]
+    board = torch.stack(
+        torch.meshgrid(
+            torch.arange(10),
+            torch.arange(10),
+            indexing="ij",
+        )[::-1],
+        dim=-1,
+    ).reshape(1, 100, 2)
+    reference_rotation = trunk.rope.rotation(board.expand(batch, -1, -1))
+
+    def separately(farm: torch.Tensor) -> torch.Tensor:
+        hidden = farm
+        for block in trunk.farm_local:
+            hidden = block(
+                hidden,
+                query_rotation=reference_rotation,
+                key_rotation=reference_rotation,
+            )
+        return hidden
+
+    expected = (
+        separately(tiles[:, :100]),
+        separately(tiles[:, 100:]),
+    )
+    batched_rotation = (
+        trunk.rope.cosine.view(1, 1, 100, -1).expand(batch * 2, -1, -1, -1),
+        trunk.rope.sine.view(1, 1, 100, -1).expand(batch * 2, -1, -1, -1),
+    )
+    actual = trunk.encode_farms(tiles, batched_rotation)
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
 
 def test_structured_actor_shares_the_head_bias_prior_with_farm_actor() -> None:
     torch.manual_seed(0)

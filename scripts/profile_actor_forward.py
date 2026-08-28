@@ -26,8 +26,11 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from kaggriculture.model import FarmActor
-from kaggriculture.rollout import _native_encoded_wave
+from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.rollout import _native_wave
 from kaggriculture.rust_env import load_native
+from kaggriculture.structured import StructuredActor
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,16 +40,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        default=CONV_ENTITY,
+    )
+    add_model_config_arguments(parser)
     parser.add_argument("--top-kernels", type=int, default=14)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
-def _instrument(actor: FarmActor) -> None:
+def _instrument(actor: FarmActor | StructuredActor) -> None:
     """Wrap the forward's top-level sections in profiler scopes."""
-    spatial, transformer = actor.spatial, actor.transformer
 
-    def scoped(name: str, module: torch.nn.Module):
+    def scoped(name: str, module: torch.nn.Module) -> None:
         original = module.forward
 
         def forward(*args, **kwargs):
@@ -55,6 +63,26 @@ def _instrument(actor: FarmActor) -> None:
 
         module.forward = forward
 
+    if isinstance(actor, StructuredActor):
+        trunk = actor.trunk
+        for name in ("tiles", "units", "economy"):
+            scoped(f"tokenizer::{name}", getattr(trunk, name))
+        for index, block in enumerate(trunk.farm_local):
+            scoped(f"farm_block::{index:02d}", block)
+        scoped("section::opponent_summary", trunk.opponent_summary)
+        scoped("section::latent_read", trunk.latent_read)
+        for index, block in enumerate(trunk.core):
+            scoped(f"core_block::{index:02d}", block)
+        for name in (
+            "unit_decoder",
+            "unit_local_decoder",
+            "market_decoder",
+            "market_economy_decoder",
+        ):
+            scoped(f"decoder::{name}", getattr(actor, name))
+        return
+
+    spatial, transformer = actor.spatial, actor.transformer
     scoped("section::spatial_trunk", spatial)
     scoped("section::entity_transformer", transformer)
     blocks = [
@@ -68,7 +96,7 @@ def _instrument(actor: FarmActor) -> None:
         scoped(f"cnn::{name}", getattr(spatial, name))
 
 
-def _profile(actor: FarmActor, inputs, autocast: bool, args) -> dict:
+def _profile(actor: FarmActor | StructuredActor, inputs, autocast: bool, args) -> dict:
     device = torch.device(args.device)
     for _ in range(args.warmup):
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast):
@@ -84,7 +112,15 @@ def _profile(actor: FarmActor, inputs, autocast: bool, args) -> dict:
                 actor(*inputs)
         torch.cuda.synchronize(device)
 
-    scopes = ("section::", "block::", "cnn::")
+    scopes = (
+        "section::",
+        "block::",
+        "cnn::",
+        "tokenizer::",
+        "farm_block::",
+        "core_block::",
+        "decoder::",
+    )
     sections: dict[str, float] = {}
     for event in prof.key_averages():
         if event.key.startswith(scopes):
@@ -121,13 +157,21 @@ def main() -> None:
 
     seeds = np.arange(args.seed, args.seed + args.games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
-    actor = FarmActor().to(device).eval()
-    wave = _native_encoded_wave(environment, device)
+    architecture = resolve_architecture(args.architecture)
+    config = model_config_from_args(architecture, args)
+    actor = architecture.build_actor(config.to_dict()).to(device).eval()
+    wave = _native_wave(args.architecture, environment, device)
     wave.refresh(environment)
     wave.copy_to_device()
     _instrument(actor)
 
-    report = {"games": args.games, "rows": args.games * 2, "iters": args.iters}
+    report = {
+        "architecture": args.architecture,
+        "model_config": config.to_dict(),
+        "games": args.games,
+        "rows": args.games * 2,
+        "iters": args.iters,
+    }
     with torch.inference_mode():
         inputs = wave.inputs()
         for label, autocast in (("float32", False), ("bfloat16", True)):

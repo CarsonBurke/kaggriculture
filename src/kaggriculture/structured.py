@@ -15,8 +15,8 @@ ensembles consume both architectures interchangeably.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
-from typing import NamedTuple
+from dataclasses import asdict, dataclass, replace
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -63,12 +63,27 @@ class StructuredConfig:
     latents: int = 32
     core_layers: int = 8
     quantity_rank: int = 32
+    global_refresh_layers: tuple[int, ...] = ()
+    global_refresh_context: str = "none"
+    input_reinject_layers: tuple[int, ...] = ()
+    core_skip_source: int = 0
+    core_skip_target: int = 0
+    zero_init_branches: bool = False
+    mudd_lite: bool = False
+    fuse_market_decoder: bool = False
+    fuse_unit_decoder: bool = False
+    split_clock_token: bool = False
+    global_modulation: bool = False
+    critic_core_layers: int = 0
+    critic_latents: int = 0
     value_atoms: int = 101
     value_min: float = -2.2
     value_max: float = 2.2
     value_sigma_ratio: float = 0.75
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "global_refresh_layers", tuple(self.global_refresh_layers))
+        object.__setattr__(self, "input_reinject_layers", tuple(self.input_reinject_layers))
         if self.model_dim <= 0:
             raise ValueError("model_dim must be positive")
         if self.attention_heads <= 0 or self.model_dim % self.attention_heads:
@@ -87,6 +102,31 @@ class StructuredConfig:
             raise ValueError("core_layers must be positive")
         if self.quantity_rank <= 0:
             raise ValueError("quantity_rank must be positive")
+        for name, layers in (
+            ("global_refresh_layers", self.global_refresh_layers),
+            ("input_reinject_layers", self.input_reinject_layers),
+        ):
+            if tuple(sorted(set(layers))) != layers:
+                raise ValueError(f"{name} must be sorted and unique")
+            if any(layer < 1 or layer > self.core_layers for layer in layers):
+                raise ValueError(f"{name} must name layers in 1..core_layers")
+        if self.global_refresh_context not in {"none", "economy", "all"}:
+            raise ValueError("global_refresh_context must be none, economy, or all")
+        if bool(self.global_refresh_layers) != (self.global_refresh_context != "none"):
+            raise ValueError("global refresh layers and context must be enabled together")
+        skip_enabled = bool(self.core_skip_source or self.core_skip_target)
+        if skip_enabled and not (
+            1 <= self.core_skip_source < self.core_skip_target <= self.core_layers
+        ):
+            raise ValueError("core skip must name an ordered source and target layer")
+        if self.mudd_lite and self.core_layers < 6:
+            raise ValueError("MUDD-lite needs at least six core layers")
+        for name, value in (
+            ("critic_core_layers", self.critic_core_layers),
+            ("critic_latents", self.critic_latents),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
         if self.value_atoms < 2:
             raise ValueError("value_atoms must be at least 2")
         if not math.isfinite(self.value_min) or not math.isfinite(self.value_max):
@@ -96,7 +136,7 @@ class StructuredConfig:
         if not math.isfinite(self.value_sigma_ratio) or self.value_sigma_ratio <= 0:
             raise ValueError("value_sigma_ratio must be finite and positive")
 
-    def to_dict(self) -> dict[str, int | float]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -198,6 +238,8 @@ class Attention(nn.Module):
         self.query_norm = RMSNorm(self.head_dim)
         self.key_norm = RMSNorm(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
+        if config.zero_init_branches:
+            nn.init.zeros_(self.output.weight)
 
     def forward(
         self,
@@ -249,6 +291,9 @@ class FeedForward(nn.Module):
         self.input = nn.Linear(config.model_dim, hidden)
         self.activation = ReluSquared()
         self.output = nn.Linear(hidden, config.model_dim)
+        if config.zero_init_branches:
+            nn.init.zeros_(self.output.weight)
+            nn.init.zeros_(self.output.bias)
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.output(self.activation(self.input(inputs)))
@@ -257,14 +302,26 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     """Pre-norm attention + FFN block with near-identity gated residuals."""
 
-    def __init__(self, config: StructuredConfig) -> None:
+    def __init__(
+        self,
+        config: StructuredConfig,
+        *,
+        residual_initial: float = 0.1,
+        conditioned: bool = False,
+    ) -> None:
         super().__init__()
         self.attention_norm = RMSNorm(config.model_dim)
         self.attention = Attention(config)
-        self.attention_gate = GatedResidual(config.model_dim)
+        self.attention_gate = GatedResidual(config.model_dim, residual_initial)
         self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = FeedForward(config)
-        self.ffn_gate = GatedResidual(config.model_dim)
+        self.ffn_gate = GatedResidual(config.model_dim, residual_initial)
+        self.modulation = (
+            nn.Linear(config.model_dim, 4 * config.model_dim) if conditioned else None
+        )
+        if self.modulation is not None:
+            nn.init.zeros_(self.modulation.weight)
+            nn.init.zeros_(self.modulation.bias)
 
     def forward(
         self,
@@ -275,23 +332,40 @@ class Block(nn.Module):
         query_rotation: tuple[Tensor, Tensor] | None = None,
         key_rotation: tuple[Tensor, Tensor] | None = None,
         context_valid: Tensor | None = None,
+        conditioning: Tensor | None = None,
     ) -> Tensor:
-        normalized = self.attention_norm(queries)
+        attention_input = self.attention_norm(queries)
+        ffn_scale = ffn_shift = None
+        if self.modulation is not None:
+            if conditioning is None:
+                raise ValueError("conditioned block requires one vector per batch row")
+            attention_scale, attention_shift, ffn_scale, ffn_shift = self.modulation(
+                conditioning
+            ).chunk(4, dim=-1)
+            attention_input = (
+                attention_input * (1 + attention_scale.unsqueeze(1))
+                + attention_shift.unsqueeze(1)
+            )
+        elif conditioning is not None:
+            raise ValueError("unconditioned block does not accept conditioning")
         if context is None:
-            keys = normalized
+            keys = attention_input
         else:
             keys = context_norm(context) if context_norm is not None else context
         hidden = self.attention_gate(
             queries,
             self.attention(
-                normalized,
+                attention_input,
                 keys,
                 query_rotation=query_rotation,
                 key_rotation=key_rotation,
                 context_valid=context_valid,
             ),
         )
-        return self.ffn_gate(hidden, self.ffn(self.ffn_norm(hidden)))
+        ffn_input = self.ffn_norm(hidden)
+        if ffn_scale is not None and ffn_shift is not None:
+            ffn_input = ffn_input * (1 + ffn_scale.unsqueeze(1)) + ffn_shift.unsqueeze(1)
+        return self.ffn_gate(hidden, self.ffn(ffn_input))
 
 
 class TileEmbedder(nn.Module):
@@ -385,35 +459,67 @@ class EconomyEmbedder(nn.Module):
         )
         crop_width = len(CROP_TOKEN_FIELDS) + (len(CROP_PRIVATE_FIELDS) if private_columns else 0)
         self.private_columns = private_columns
+        self.split_clock = config.split_clock_token
         self.product_identity = nn.Embedding(len(PRODUCTS), width)
         self.product_projection = nn.Linear(product_width, width)
         self.crop_identity = nn.Embedding(len(CROPS), width)
         self.crop_projection = nn.Linear(crop_width, width)
         self.farm_identity = nn.Embedding(2, width)
         self.farm_projection = nn.Linear(len(FARM_TOKEN_FIELDS), width)
-        self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS), width)
+        if self.split_clock:
+            self.clock_projection = nn.Linear(6, width)
+            self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS) - 6, width)
+        else:
+            self.clock_projection = None
+            self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS), width)
 
     def forward(self, products: Tensor, crops: Tensor, farms: Tensor, town: Tensor) -> Tensor:
         dtype = self.product_projection.weight.dtype
-        return torch.cat(
-            (
-                self.product_projection(products.to(dtype)) + self.product_identity.weight,
-                self.crop_projection(crops.to(dtype)) + self.crop_identity.weight,
-                self.farm_projection(farms.to(dtype)) + self.farm_identity.weight,
-                self.town_projection(town.to(dtype)).unsqueeze(1),
-            ),
-            dim=1,
-        )
+        tokens = [
+            self.product_projection(products.to(dtype)) + self.product_identity.weight,
+            self.crop_projection(crops.to(dtype)) + self.crop_identity.weight,
+            self.farm_projection(farms.to(dtype)) + self.farm_identity.weight,
+        ]
+        if self.clock_projection is None:
+            tokens.append(self.town_projection(town.to(dtype)).unsqueeze(1))
+        else:
+            tokens.extend(
+                (
+                    self.clock_projection(town[..., :6].to(dtype)).unsqueeze(1),
+                    self.town_projection(town[..., 6:].to(dtype)).unsqueeze(1),
+                )
+            )
+        return torch.cat(tokens, dim=1)
 
 
 class TrunkOutput(NamedTuple):
-    """Everything the decoders read from the shared encoder."""
+    """Everything the decoders and training auxiliaries read."""
 
     latents: Tensor  # [B, latents, model_dim], RMS-normalized
+    own_patches: Tensor  # [B, 100, model_dim], post farm-local blocks
+    opponent_patches: Tensor  # [B, 100, model_dim], post farm-local blocks
+    opponent_summary: Tensor  # [B, opponent_latents, model_dim]
     unit_tokens: Tensor  # [B, MAX_UNITS, model_dim], inactive rows zeroed
     unit_local_tiles: Tensor  # [B, MAX_UNITS, 5, model_dim]
     economy_tokens: Tensor  # [B, economy tokens, model_dim]
 
+
+class MuddLite(nn.Module):
+    """One late dynamic residual route over four aligned latent streams."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.norm = RMSNorm(width)
+        self.input = nn.Linear(width, 64)
+        self.activation = ReluSquared()
+        self.output = nn.Linear(64, 4)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, current: Tensor, sources: tuple[Tensor, Tensor, Tensor, Tensor]) -> Tensor:
+        coefficients = 0.1 * self.output(self.activation(self.input(self.norm(current))))
+        stacked = torch.stack(sources, dim=-2)
+        return (coefficients.unsqueeze(-1) * stacked).sum(dim=-2)
 
 class StructuredTrunk(nn.Module):
     """Shared encoder: farm-local blocks, opponent summary, latent core."""
@@ -435,24 +541,42 @@ class StructuredTrunk(nn.Module):
         self.latent_queries = nn.Parameter(torch.randn(config.latents, config.model_dim) * 0.02)
         self.latent_read = Block(config)
         self.latent_context_norm = RMSNorm(config.model_dim)
-        self.core = nn.ModuleList(Block(config) for _ in range(config.core_layers))
+        self.core = nn.ModuleList(
+            Block(config, conditioned=config.global_modulation)
+            for _ in range(config.core_layers)
+        )
         self.core_norm = RMSNorm(config.model_dim)
-        board = torch.stack(
-            torch.meshgrid(
-                torch.arange(BOARD_SIZE),
-                torch.arange(BOARD_SIZE),
-                indexing="ij",
-            )[::-1],
-            dim=-1,
-        ).reshape(1, TILE_COUNT, 2)
-        self.register_buffer("board_positions", board, persistent=False)
+        self.global_refresh = nn.ModuleDict(
+            {
+                str(layer): Block(config, residual_initial=0.0)
+                for layer in config.global_refresh_layers
+            }
+        )
+        self.global_context_norm = (
+            RMSNorm(config.model_dim) if config.global_refresh_layers else None
+        )
+        self.reinject_norm = (
+            RMSNorm(config.model_dim) if config.input_reinject_layers else None
+        )
+        self.reinject_gates = nn.ParameterDict(
+            {
+                str(layer): nn.Parameter(torch.zeros(config.model_dim))
+                for layer in config.input_reinject_layers
+            }
+        )
+        self.skip_gate = (
+            nn.Parameter(torch.zeros(config.model_dim)) if config.core_skip_target else None
+        )
+        self.mudd = MuddLite(config.model_dim) if config.mudd_lite else None
 
-    def encode_farm(self, tiles: Tensor, rotation: tuple[Tensor, Tensor]) -> Tensor:
-        """Run the shared farm-local blocks over one farm's 100 tile tokens."""
-        hidden = tiles
+    def encode_farms(self, tiles: Tensor, rotation: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+        """Run shared farm-local blocks over both farms in one larger batch."""
+        batch = tiles.shape[0]
+        hidden = tiles.view(batch * 2, TILE_COUNT, self.config.model_dim)
         for block in self.farm_local:
             hidden = block(hidden, query_rotation=rotation, key_rotation=rotation)
-        return hidden
+        own, opponent = hidden.view(batch, 2, TILE_COUNT, self.config.model_dim).unbind(dim=1)
+        return own, opponent
 
     def forward(
         self,
@@ -463,9 +587,11 @@ class StructuredTrunk(nn.Module):
     ) -> TrunkOutput:
         batch = inputs.tile_categorical.shape[0]
         tiles = self.tiles(inputs.tile_categorical, inputs.tile_continuous)
-        rotation = self.rope.rotation(self.board_positions.expand(batch, -1, -1))
-        own_tiles = self.encode_farm(tiles[:, :TILE_COUNT], rotation)
-        opponent_tiles = self.encode_farm(tiles[:, TILE_COUNT:], rotation)
+        rotation = (
+            self.rope.cosine.view(1, 1, TILE_COUNT, -1).expand(batch * 2, -1, -1, -1),
+            self.rope.sine.view(1, 1, TILE_COUNT, -1).expand(batch * 2, -1, -1, -1),
+        )
+        own_tiles, opponent_tiles = self.encode_farms(tiles, rotation)
 
         local = self.units.local_tiles(
             own_tiles, inputs.unit_tile_gather, inputs.unit_tile_gather_valid
@@ -506,15 +632,80 @@ class StructuredTrunk(nn.Module):
             context_norm=self.latent_context_norm,
             context_valid=context_valid,
         )
-        for block in self.core:
-            latents = block(latents)
+        x0 = latents
+        normalized_x0 = self.reinject_norm(x0) if self.reinject_norm is not None else None
+        if self.config.global_refresh_context == "economy":
+            global_context = economy_tokens
+            global_valid = torch.ones(
+                batch, economy_tokens.shape[1], dtype=torch.bool, device=tiles.device
+            )
+        elif self.config.global_refresh_context == "all":
+            global_context = torch.cat((summary, unit_tokens, economy_tokens), dim=1)
+            global_valid = torch.cat(
+                (
+                    torch.ones(batch, summary.shape[1], dtype=torch.bool, device=tiles.device),
+                    inputs.unit_active,
+                    torch.ones(
+                        batch,
+                        economy_tokens.shape[1],
+                        dtype=torch.bool,
+                        device=tiles.device,
+                    ),
+                ),
+                dim=1,
+            )
+        else:
+            global_context = global_valid = None
+        conditioning = economy_tokens.mean(dim=1) if self.config.global_modulation else None
+        snapshots: dict[int, Tensor] = {}
+        for layer, block in enumerate(self.core, start=1):
+            if self.mudd is not None and layer == self.config.core_layers:
+                latents = latents + self.mudd(
+                    latents,
+                    (x0, snapshots[2], snapshots[5], latents),
+                )
+            latents = block(latents, conditioning=conditioning)
+            gate = self.reinject_gates[str(layer)] if str(layer) in self.reinject_gates else None
+            if gate is not None:
+                assert normalized_x0 is not None
+                latents = latents + gate * normalized_x0
+            if layer == self.config.core_skip_target:
+                assert self.skip_gate is not None
+                latents = latents + self.skip_gate * snapshots[self.config.core_skip_source]
+            refresh = self.global_refresh[str(layer)] if str(layer) in self.global_refresh else None
+            if refresh is not None:
+                assert global_context is not None
+                assert global_valid is not None
+                assert self.global_context_norm is not None
+                latents = refresh(
+                    latents,
+                    global_context,
+                    context_norm=self.global_context_norm,
+                    context_valid=global_valid,
+                )
+            snapshots[layer] = latents
         latents = self.core_norm(latents)
         return TrunkOutput(
             latents=latents,
+            own_patches=own_tiles,
+            opponent_patches=opponent_tiles,
+            opponent_summary=summary,
             unit_tokens=unit_tokens,
             unit_local_tiles=local,
             economy_tokens=economy_tokens,
         )
+
+
+class StructuredBelief(NamedTuple):
+    """Typed actor representations exposed only to training auxiliaries."""
+
+    own_patches: Tensor
+    opponent_patches: Tensor
+    opponent_summary: Tensor
+    economy_entities: Tensor
+    central_latents: Tensor
+    unit_decisions: Tensor
+    market_decisions: Tensor
 
 
 class StructuredActor(nn.Module):
@@ -526,13 +717,13 @@ class StructuredActor(nn.Module):
         self.config = config
         self.trunk = StructuredTrunk(config, private_columns=False)
         self.unit_decoder = Block(config)
-        self.unit_local_decoder = Block(config)
+        self.unit_local_decoder = None if config.fuse_unit_decoder else Block(config)
         # The trunk's latents leave core_norm already normalized; raw local
         # tiles and economy tokens each get their own context norm.
         self.local_context_norm = RMSNorm(config.model_dim)
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
         self.market_decoder = Block(config)
-        self.market_economy_decoder = Block(config)
+        self.market_economy_decoder = None if config.fuse_market_decoder else Block(config)
         self.economy_context_norm = RMSNorm(config.model_dim)
 
         self.unit_head = nn.Sequential(
@@ -565,42 +756,89 @@ class StructuredActor(nn.Module):
             self.config.quantity_rank,
         )
 
-    def forward(self, inputs: StructuredInputs) -> ActorOutput:
+    def forward_with_belief(
+        self, inputs: StructuredInputs
+    ) -> tuple[ActorOutput, StructuredBelief]:
         batch = inputs.tile_categorical.shape[0]
         trunk = self.trunk(inputs)
-
-        unit_hidden = self.unit_decoder(trunk.unit_tokens, trunk.latents)
-        # Relation-aware read of each unit's own and NSEW tiles: fold the
-        # per-unit local context into a batch of 5-key attention windows.
         local = trunk.unit_local_tiles
         units, slots, width = local.shape[1], local.shape[2], local.shape[3]
-        # Inactive units have no valid gathers; SDPA turns a fully masked row
-        # into NaN, whose backward poisons shared parameters even though the
-        # forward values are discarded below. Opening the HERE slot for them
-        # keeps every attention row attendable.
         local_valid = inputs.unit_tile_gather_valid.clone()
         local_valid[..., 0] |= ~inputs.unit_active
-        unit_hidden = self.unit_local_decoder(
-            unit_hidden.reshape(batch * units, 1, width),
-            local.reshape(batch * units, slots, width),
-            context_norm=self.local_context_norm,
-            context_valid=local_valid.reshape(batch * units, slots),
-        ).view(batch, units, width)
+
+        if self.unit_local_decoder is None:
+            latent_context = trunk.latents[:, None].expand(-1, units, -1, -1)
+            unit_context = torch.cat(
+                (
+                    latent_context,
+                    self.local_context_norm(local),
+                ),
+                dim=2,
+            ).reshape(batch * units, trunk.latents.shape[1] + slots, width)
+            unit_valid = torch.cat(
+                (
+                    torch.ones(
+                        batch,
+                        units,
+                        trunk.latents.shape[1],
+                        dtype=torch.bool,
+                        device=local.device,
+                    ),
+                    local_valid,
+                ),
+                dim=2,
+            ).reshape(batch * units, trunk.latents.shape[1] + slots)
+            unit_hidden = self.unit_decoder(
+                trunk.unit_tokens.reshape(batch * units, 1, width),
+                unit_context,
+                context_valid=unit_valid,
+            ).view(batch, units, width)
+        else:
+            unit_hidden = self.unit_decoder(trunk.unit_tokens, trunk.latents)
+            unit_hidden = self.unit_local_decoder(
+                unit_hidden.reshape(batch * units, 1, width),
+                local.reshape(batch * units, slots, width),
+                context_norm=self.local_context_norm,
+                context_valid=local_valid.reshape(batch * units, slots),
+            ).view(batch, units, width)
         unit_hidden = torch.where(inputs.unit_active.unsqueeze(-1), unit_hidden, 0.0)
 
-        market_hidden = self.market_decoder(
-            self.market_queries.weight.unsqueeze(0).expand(batch, -1, -1),
-            trunk.latents,
-        )
-        market_hidden = self.market_economy_decoder(
-            market_hidden, trunk.economy_tokens, context_norm=self.economy_context_norm
-        )
+        market_queries = self.market_queries.weight.unsqueeze(0).expand(batch, -1, -1)
+        if self.market_economy_decoder is None:
+            market_context = torch.cat(
+                (
+                    trunk.latents,
+                    self.economy_context_norm(trunk.economy_tokens),
+                ),
+                dim=1,
+            )
+            market_hidden = self.market_decoder(market_queries, market_context)
+        else:
+            market_hidden = self.market_decoder(market_queries, trunk.latents)
+            market_hidden = self.market_economy_decoder(
+                market_hidden,
+                trunk.economy_tokens,
+                context_norm=self.economy_context_norm,
+            )
         market_hidden = self.market_norm(market_hidden)
-        return ActorOutput(
+        output = ActorOutput(
             unit_logits=self.unit_head(unit_hidden).contiguous(),
             market_kind_logits=self.market_kind(market_hidden).contiguous(),
             market_quantity_context=self.market_quantity_context(market_hidden).contiguous(),
         )
+        belief = StructuredBelief(
+            own_patches=trunk.own_patches,
+            opponent_patches=trunk.opponent_patches,
+            opponent_summary=trunk.opponent_summary,
+            economy_entities=trunk.economy_tokens,
+            central_latents=trunk.latents,
+            unit_decisions=unit_hidden,
+            market_decisions=market_hidden,
+        )
+        return output, belief
+
+    def forward(self, inputs: StructuredInputs) -> ActorOutput:
+        return self.forward_with_belief(inputs)[0]
 
 
 class StructuredCritic(nn.Module):
@@ -610,9 +848,32 @@ class StructuredCritic(nn.Module):
         super().__init__()
         config = config or StructuredConfig()
         self.config = config
-        self.trunk = StructuredTrunk(config, private_columns=True)
+        critic_layers = config.critic_core_layers or config.core_layers
+        skip_fits = config.core_skip_target <= critic_layers
+        trunk_config = replace(
+            config,
+            core_layers=critic_layers,
+            latents=config.critic_latents or config.latents,
+            global_refresh_layers=tuple(
+                layer for layer in config.global_refresh_layers if layer <= critic_layers
+            ),
+            global_refresh_context=(
+                config.global_refresh_context
+                if any(layer <= critic_layers for layer in config.global_refresh_layers)
+                else "none"
+            ),
+            input_reinject_layers=tuple(
+                layer for layer in config.input_reinject_layers if layer <= critic_layers
+            ),
+            core_skip_source=config.core_skip_source if skip_fits else 0,
+            core_skip_target=config.core_skip_target if skip_fits else 0,
+            mudd_lite=config.mudd_lite and critic_layers >= 6,
+            critic_core_layers=0,
+            critic_latents=0,
+        )
+        self.trunk = StructuredTrunk(trunk_config, private_columns=True)
         self.value_query = nn.Parameter(torch.randn(1, config.model_dim) * 0.02)
-        self.value_decoder = Block(config)
+        self.value_decoder = Block(trunk_config)
         self.value_head = nn.Linear(config.model_dim, config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)

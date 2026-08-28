@@ -106,6 +106,18 @@ ADAM_PARAMETER_ROLES: frozenset[str] = frozenset(
         "value_head",
         # Gate.
         "market_quantity_kind_gate",
+        # Training-only transition embeddings: every row is an independent
+        # action, slot, coordinate, type, or position lookup.
+        "unit_action",
+        "unit_slot",
+        "unit_row",
+        "unit_column",
+        "unit_active",
+        "market_quantity",
+        "market_slot",
+        "action_type",
+        "type_identity",
+        "position_identity",
     }
 )
 
