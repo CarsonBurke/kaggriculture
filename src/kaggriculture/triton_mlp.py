@@ -112,20 +112,62 @@ class _FusedReLUSquaredMLP(torch.autograd.Function):
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
-    def forward(ctx, values: Tensor, up_weight: Tensor, down_weight: Tensor) -> Tensor:
+    def forward(
+        values: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         original_shape = values.shape
         flat = values.reshape(-1, original_shape[-1]).contiguous()
         post = _linear_relu_square(flat, up_weight)
         output = post @ down_weight
-        ctx.save_for_backward(values, up_weight, down_weight, post)
-        return output.view(original_shape)
+        return output.view(original_shape), post
+
+    @staticmethod
+    def setup_context(
+        ctx: object,
+        inputs: tuple[Tensor, Tensor, Tensor],
+        output: tuple[Tensor, Tensor],
+    ) -> None:
+        values, up_weight, down_weight = inputs
+        _, post = output
+        ctx.save_for_backward(values, up_weight, down_weight, post)  # type: ignore[attr-defined]
+        ctx.mark_non_differentiable(post)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def vmap(  # pyright: ignore[reportIncompatibleMethodOverride]
+        info: object,
+        in_dims: tuple[int | None, int | None, int | None],
+        values: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+    ) -> tuple[tuple[Tensor, Tensor], tuple[int, int]]:
+        """Use batched matmuls when a frozen-policy ensemble vmaps this MLP."""
+        batch_size = info.batch_size  # type: ignore[attr-defined]
+
+        def batch(tensor: Tensor, dim: int | None) -> Tensor:
+            if dim is None:
+                return tensor.unsqueeze(0).expand(batch_size, *tensor.shape)
+            return tensor.movedim(dim, 0)
+
+        batched_values = batch(values, in_dims[0])
+        batched_up = batch(up_weight, in_dims[1])
+        batched_down = batch(down_weight, in_dims[2])
+        original_shape = batched_values.shape
+        flat = batched_values.flatten(1, -2)
+        hidden = torch.relu(torch.bmm(flat, batched_up.transpose(1, 2)))
+        post = hidden * hidden
+        output = torch.bmm(post, batched_down)
+        return (output.view(original_shape), post), (0, 0)
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
-        ctx, gradient: Tensor
+        ctx: object,
+        gradient: Tensor,
+        _post_gradient: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        values, up_weight, down_weight, post = ctx.saved_tensors
+        values, up_weight, down_weight, post = ctx.saved_tensors  # type: ignore[attr-defined]
         flat_values = values.reshape(-1, values.shape[-1])
         flat_gradient = gradient.reshape(-1, gradient.shape[-1]).contiguous()
         down_gradient = post.T @ flat_gradient
@@ -143,6 +185,7 @@ def fused_relu_squared_mlp(
     """Apply the hardware-native bias-free MLP, with a portable eager fallback."""
     fused_dtypes = values.dtype == up_weight.dtype == down_weight.dtype == torch.bfloat16
     if values.device.type == "cuda" and (torch.is_autocast_enabled("cuda") or fused_dtypes):
-        return _FusedReLUSquaredMLP.apply(values, up_weight, down_weight)
+        output, _ = _FusedReLUSquaredMLP.apply(values, up_weight, down_weight)
+        return output
     hidden = torch.relu(values @ up_weight.T)
     return (hidden * hidden) @ down_weight

@@ -21,6 +21,7 @@ from kaggriculture.structured import (
 )
 from kaggriculture.structured_dynamics import _latent_smooth_l1
 from kaggriculture.tokens import encode_structured_observation
+from kaggriculture.triton_mlp import _FusedReLUSquaredMLP
 
 
 def _tiny_config() -> StructuredConfig:
@@ -121,6 +122,23 @@ def test_hardware_native_structured_actor_backpropagates_on_cpu(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in fused_parameters
     )
+
+
+def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
+    torch.manual_seed(0)
+    values = torch.randn(3, 2, 4, 8, dtype=torch.bfloat16)
+    up_weight = torch.randn(3, 16, 8, dtype=torch.bfloat16)
+    down_weight = torch.randn(3, 16, 8, dtype=torch.bfloat16)
+
+    actual, _ = torch.vmap(_FusedReLUSquaredMLP.apply)(values, up_weight, down_weight)
+    expected = torch.stack(
+        [
+            torch.relu(value @ up.T).square() @ down
+            for value, up, down in zip(values, up_weight, down_weight, strict=True)
+        ]
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def test_structured_actor_exposes_typed_training_belief(
