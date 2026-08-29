@@ -145,6 +145,7 @@ class StructuredDynamics(nn.Module):
 
 
 class StructuredDynamicsTerms(NamedTuple):
+    latent: Tensor
     decision: Tensor
     decision_one: Tensor
     decision_final: Tensor
@@ -195,6 +196,21 @@ def _feature_l1(predicted: Tensor, target: Tensor, eligible: Tensor) -> Tensor:
     error = (_rms_normalize(predicted) - _rms_normalize(target.detach())).abs().mean(dim=-1)
     weight = eligible.float().unsqueeze(-1)
     return (error * weight).sum() / (weight.sum() * error.shape[1]).clamp_min(1.0)
+
+
+def _latent_smooth_l1(
+    predicted: Tensor,
+    target: Tensor,
+    eligible: Tensor,
+) -> Tensor:
+    """Mean SmoothL1 over eligible predicted-latent elements, as in NextLat."""
+    error = nn.functional.smooth_l1_loss(
+        predicted.float(),
+        target.detach().float(),
+        reduction="none",
+    )
+    weight = eligible.float().reshape(-1, *([1] * (error.ndim - 1)))
+    return (error * weight).sum() / weight.expand_as(error).sum().clamp_min(1.0)
 
 
 def _eligible_rms_ratio(predicted: Tensor, previous: Tensor, eligible: Tensor) -> Tensor:
@@ -256,26 +272,27 @@ def structured_horizon_loss(
     decision_horizon: int,
     patch_horizon: int,
     own_patches_active: bool = True,
+    latent_horizon: int = 0,
     economy_active: bool = False,
     opponent_summary_active: bool = False,
     opponent_patches_active: bool = False,
     target_belief: StructuredBelief | None = None,
 ) -> StructuredDynamicsTerms:
     """Unroll typed dynamics against exact contiguous demonstrated successors."""
-    if decision_horizon < 0 or patch_horizon < 0:
+    if decision_horizon < 0 or patch_horizon < 0 or latent_horizon < 0:
         raise ValueError("structured horizons cannot be negative")
     auxiliary_horizon = (
         patch_horizon
         if (patch_horizon or economy_active or opponent_summary_active or opponent_patches_active)
         else 0
     )
-    max_horizon = max(decision_horizon, auxiliary_horizon)
+    max_horizon = max(decision_horizon, auxiliary_horizon, latent_horizon)
     if max_horizon < 1:
         raise ValueError("at least one structured auxiliary horizon must be active")
     targets = belief if target_belief is None else target_belief
     predicted = belief
     zero = belief.central_latents.new_zeros((), dtype=torch.float32)
-    sums = [zero for _ in range(12)]
+    sums = [zero for _ in range(13)]
     eligible_sum = zero
     decision_steps = 0
     patch_steps = 0
@@ -284,7 +301,7 @@ def structured_horizon_loss(
     patch_one = patch_final = zero
     residual_sums = [zero for _ in StructuredBelief._fields]
     active_fields = _active_belief_fields(
-        decision_horizon=decision_horizon,
+        decision_horizon=max(decision_horizon, latent_horizon),
         own_patches_active=own_patches_active,
         economy_active=economy_active,
         opponent_summary_active=opponent_summary_active,
@@ -316,6 +333,24 @@ def structured_horizon_loss(
         ):
             residual_sums[kind] = residual_sums[kind] + _eligible_rms_ratio(
                 predicted_value, previous_value, eligible
+            )
+
+        if offset <= latent_horizon:
+            joined_predicted_latent = torch.cat(
+                (predicted.unit_decisions, predicted.market_decisions),
+                dim=1,
+            )
+            joined_target = torch.cat(
+                (
+                    targets.unit_decisions[target_index],
+                    targets.market_decisions[target_index],
+                ),
+                dim=1,
+            )
+            sums[12] = sums[12] + _latent_smooth_l1(
+                joined_predicted_latent,
+                joined_target,
+                eligible,
             )
 
         if offset <= decision_horizon:
@@ -400,6 +435,7 @@ def structured_horizon_loss(
     patch_divisor = max(patch_steps, 1)
     state_divisor = max(state_steps, 1)
     return StructuredDynamicsTerms(
+        latent=sums[12] / max(latent_horizon, 1),
         decision=sums[0] / decision_divisor,
         decision_one=decision_one,
         decision_final=decision_final,
@@ -621,6 +657,7 @@ def structured_window_loss(
     patch_divisor = max(patch_steps, 1)
     state_divisor = max(state_steps, 1)
     return StructuredDynamicsTerms(
+        latent=zero,
         decision=sums[0] / decision_divisor,
         decision_one=decision_one,
         decision_final=decision_final,

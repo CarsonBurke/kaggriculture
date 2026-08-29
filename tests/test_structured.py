@@ -19,6 +19,7 @@ from kaggriculture.structured import (
     StructuredInputs,
     stack_structured,
 )
+from kaggriculture.structured_dynamics import _latent_smooth_l1
 from kaggriculture.tokens import encode_structured_observation
 
 
@@ -32,6 +33,21 @@ def _tiny_config() -> StructuredConfig:
         latents=8,
         core_layers=2,
     )
+
+
+def test_structured_latent_loss_matches_reference_element_mean() -> None:
+    predicted = torch.zeros(2, 2, 2, requires_grad=True)
+    target = torch.tensor(
+        [[[1.0, 1.0], [1.0, 1.0]], [[9.0, 9.0], [9.0, 9.0]]],
+        requires_grad=True,
+    )
+
+    loss = _latent_smooth_l1(predicted, target, torch.tensor([True, False]))
+    loss.backward()
+
+    assert float(loss.detach()) == pytest.approx(0.5)
+    assert predicted.grad is not None
+    assert target.grad is None
 
 
 @pytest.fixture(scope="module")

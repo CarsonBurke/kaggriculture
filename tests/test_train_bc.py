@@ -1161,7 +1161,7 @@ def test_the_latent_auxiliary_trains_and_is_journalled(dataset_dir: Path, tmp_pa
 def test_the_structured_auxiliary_trains_and_is_journalled(
     dataset_dir: Path, tmp_path: Path
 ) -> None:
-    """Typed decision and patch objectives share one actor pass and stay training-only."""
+    """Reference-normalized latent and decode terms train jointly with the clone."""
     trainer = _load_trainer()
     output = tmp_path / "run-structured-aux"
     trainer.train(
@@ -1174,10 +1174,10 @@ def test_the_structured_auxiliary_trains_and_is_journalled(
         patience=1,
         batch_size=64,
         run_length=4,
-        structured_decision_coefficient=0.5,
-        structured_patch_coefficient=0.25,
-        structured_decision_horizon=2,
-        structured_patch_horizon=1,
+        compile_mode="default",
+        structured_latent_coefficient=1.0,
+        structured_decision_coefficient=1.0,
+        structured_decision_horizon=1,
         matrix_learning_rate=1e-3,
         matrix_weight_decay=0.0,
         adam_learning_rate_ratio=0.35,
@@ -1189,35 +1189,30 @@ def test_the_structured_auxiliary_trains_and_is_journalled(
 
     record = json.loads((output / "metrics.jsonl").read_text().splitlines()[0])
     for name in (
+        "structured_latent",
         "structured_decision",
         "structured_decision_unit",
         "structured_decision_market_kind",
-        "structured_patch",
-        "structured_patch_all",
         "structured_residual_ratio",
         "structured_residual_own_patches",
         "structured_decision_one",
         "structured_decision_final",
-        "structured_patch_one",
-        "structured_patch_final",
     ):
         assert np.isfinite(record[name]) and record[name] > 0.0, name
     assert record["structured_eligible"] > 0.0
-    assert record["structured_decision"] == pytest.approx(
-        (record["structured_decision_one"] + record["structured_decision_final"]) / 2
-    )
-    assert record["structured_patch"] == pytest.approx(record["structured_patch_one"])
-    assert record["structured_patch"] == pytest.approx(record["structured_patch_final"])
+    assert record["structured_decision"] == pytest.approx(record["structured_decision_one"])
+    assert record["structured_decision"] == pytest.approx(record["structured_decision_final"])
     for suffix in ("variance", "effective_rank", "cosine", "dispersion"):
         assert np.isfinite(record[f"structured_own_patches_{suffix}"])
     assert record["structured_own_patches_variance"] > 0.0
     assert record["structured_own_patches_effective_rank"] >= 1.0
     payload = torch.load(output / "bc-actor.pt", map_location="cpu", weights_only=False)
     provenance = payload["bc_provenance"]
-    assert provenance["structured_decision_coefficient"] == 0.5
-    assert provenance["structured_patch_coefficient"] == 0.25
-    assert provenance["structured_decision_horizon"] == 2
-    assert provenance["structured_patch_horizon"] == 1
+    assert provenance["structured_latent_coefficient"] == 1.0
+    assert provenance["structured_decision_coefficient"] == 1.0
+    assert provenance["structured_decision_horizon"] == 1
+    assert provenance["compile_mode"] == "none"
+    assert provenance["requested_compile_mode"] == "default"
     assert not any(name.startswith(("action.", "transition.")) for name in payload["actor"])
 
 

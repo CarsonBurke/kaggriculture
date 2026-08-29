@@ -240,6 +240,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--structured-latent-coefficient",
+        type=float,
+        default=0.0,
+        help=(
+            "weight on the reference-normalized SmoothL1 over policy-read "
+            "structured decision tokens"
+        ),
+    )
+    parser.add_argument(
         "--structured-decision-coefficient",
         type=float,
         default=0.0,
@@ -318,6 +327,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.005,
         help="cautious decay on the parameters Adam takes",
+    )
+    parser.add_argument(
+        "--gradient-clip",
+        type=float,
+        default=1.0,
+        help="global gradient-norm clip; matches the NextLat pretraining recipe",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -865,6 +880,7 @@ class StructuredCloneTerms(NamedTuple):
     """Clone loss and typed structured-auxiliary diagnostics from one trunk pass."""
 
     clone: torch.Tensor
+    latent: torch.Tensor
     decision: torch.Tensor
     decision_one: torch.Tensor
     decision_final: torch.Tensor
@@ -898,6 +914,7 @@ def _clone_and_structured_loss(
     factors: dict[str, torch.Tensor],
     autocast: bool,
     decision_horizon: int,
+    latent_horizon: int,
     patch_horizon: int,
     economy_active: bool,
     opponent_summary_active: bool,
@@ -937,6 +954,7 @@ def _clone_and_structured_loss(
             factors,
             decode=decode,
             decision_horizon=decision_horizon,
+            latent_horizon=latent_horizon,
             patch_horizon=patch_horizon,
             economy_active=economy_active,
             opponent_summary_active=opponent_summary_active,
@@ -1099,6 +1117,7 @@ _LATENT_FIELDS = (
     "latent_steps",
 )
 _STRUCTURED_FIELDS = (
+    "structured_latent",
     "structured_decision",
     "structured_decision_one",
     "structured_decision_final",
@@ -1245,6 +1264,7 @@ def train(
     latent_dynamics_coefficient: float = 0.0,
     latent_decode_coefficient: float = 0.0,
     latent_horizon: int = 1,
+    structured_latent_coefficient: float = 0.0,
     structured_decision_coefficient: float = 0.0,
     structured_patch_coefficient: float = 0.0,
     structured_economy_coefficient: float = 0.0,
@@ -1256,6 +1276,7 @@ def train(
     matrix_weight_decay: float,
     adam_learning_rate_ratio: float,
     adam_weight_decay: float,
+    gradient_clip: float = 1.0,
     seed: int,
     device: torch.device,
     encode_workers: int,
@@ -1268,6 +1289,8 @@ def train(
     _pin_host_threads(torch_threads)
     if epochs < 1 or patience < 1 or batch_size < 1 or run_length < 1:
         raise ValueError("epochs, patience, batch size, and run length must be positive")
+    if gradient_clip <= 0:
+        raise ValueError("gradient clip must be positive")
     # Checked before the corpus is staged, which takes minutes: a typo'd mode
     # otherwise surfaces at the first minibatch, after the wait. Inductor owns
     # the list, so this cannot drift from what torch actually accepts.
@@ -1275,6 +1298,18 @@ def train(
         raise ValueError(
             f"unknown compile mode {compile_mode!r}; expected 'none' or one of {COMPILE_MODES}"
         )
+    requested_compile_mode = compile_mode
+    if structured_latent_coefficient and compile_mode != "none":
+        # Inductor's backward is non-finite on the first step when the typed
+        # transition selects only the policy-read decision queries. The same
+        # source-bound jobs train normally in eager mode. Keep the default CLI
+        # usable, and record both values rather than emitting a corrupt actor.
+        print(
+            "structured latent training uses eager mode because its compiled "
+            "backward is numerically invalid",
+            flush=True,
+        )
+        compile_mode = "none"
     # A captured graph is bound to one set of shapes, and an epoch's last
     # minibatch is a short tail, so a cudagraphs mode would recapture per shape
     # or fail outright. Read from inductor's config for the mode rather than
@@ -1298,6 +1333,7 @@ def train(
         raise ValueError("latent horizon must be at least one step")
     entity_coefficients = (latent_dynamics_coefficient, latent_decode_coefficient)
     structured_coefficients = (
+        structured_latent_coefficient,
         structured_decision_coefficient,
         structured_patch_coefficient,
         structured_economy_coefficient,
@@ -1317,15 +1353,21 @@ def train(
         raise ValueError("structured auxiliary coefficients require --architecture structured")
     if entity_active and structured_active:
         raise ValueError("entity and structured auxiliaries cannot be active together")
-    if structured_decision_coefficient and structured_decision_horizon < 1:
-        raise ValueError("structured decision horizon must be positive when decision KL is active")
-    state_active = any(structured_coefficients[1:])
+    if (structured_latent_coefficient or structured_decision_coefficient) and (
+        structured_decision_horizon < 1
+    ):
+        raise ValueError("structured latent horizon must be positive when NextLat is active")
+    state_active = any(structured_coefficients[2:])
     if state_active and structured_patch_horizon < 1:
         raise ValueError(
             "structured patch horizon must be positive when feature prediction is active"
         )
     entity_horizon = latent_horizon if entity_active else 0
-    decision_horizon = structured_decision_horizon if structured_decision_coefficient else 0
+    decision_horizon = (
+        structured_decision_horizon
+        if structured_latent_coefficient or structured_decision_coefficient
+        else 0
+    )
     patch_horizon = structured_patch_horizon if state_active else 0
     auxiliary_horizon = max(entity_horizon, decision_horizon, patch_horizon)
     if auxiliary_horizon and run_length <= auxiliary_horizon:
@@ -1434,9 +1476,11 @@ def train(
         "batch_size": batch_size,
         "run_length": run_length,
         "compile_mode": compile_mode,
+        "requested_compile_mode": requested_compile_mode,
         "latent_dynamics_coefficient": latent_dynamics_coefficient,
         "latent_decode_coefficient": latent_decode_coefficient,
         "latent_horizon": latent_horizon,
+        "structured_latent_coefficient": structured_latent_coefficient,
         "structured_decision_coefficient": structured_decision_coefficient,
         "structured_patch_coefficient": structured_patch_coefficient,
         "structured_economy_coefficient": structured_economy_coefficient,
@@ -1444,6 +1488,7 @@ def train(
         "structured_opponent_patch_coefficient": structured_opponent_patch_coefficient,
         "structured_decision_horizon": decision_horizon,
         "structured_patch_horizon": patch_horizon,
+        "gradient_clip": gradient_clip,
         "command": sys.argv,
     }
     # A scalar teacher survives only when the mixture agrees on one, because a
@@ -1499,7 +1544,8 @@ def train(
                         actor_args,
                         factors,
                         autocast,
-                        decision_horizon,
+                        decision_horizon if structured_decision_coefficient else 0,
+                        decision_horizon if structured_latent_coefficient else 0,
                         patch_horizon,
                         bool(structured_economy_coefficient),
                         bool(structured_opponent_summary_coefficient),
@@ -1507,6 +1553,7 @@ def train(
                     )
                     loss = (
                         terms.clone
+                        + structured_latent_coefficient * terms.latent
                         + structured_decision_coefficient * terms.decision
                         + structured_patch_coefficient * terms.patch
                         + structured_economy_coefficient * terms.economy
@@ -1529,9 +1576,24 @@ def train(
                         + latent_decode_coefficient * terms.decode
                     )
                 if not torch.isfinite(loss):
-                    raise FloatingPointError(f"non-finite clone loss in epoch {epoch}")
+                    if isinstance(terms, StructuredCloneTerms):
+                        values = {
+                            "clone": float(terms.clone.detach()),
+                            "latent": float(terms.latent.detach()),
+                            "decision": float(terms.decision.detach()),
+                        }
+                    else:
+                        values = {"combined": float(loss.detach())}
+                    raise FloatingPointError(
+                        f"non-finite training loss in epoch {epoch}, step {step_index}: {values}"
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    matrices + vectors,
+                    gradient_clip,
+                    error_if_nonfinite=True,
+                )
                 _apply_schedule(optimizer, step_index, total_steps)
                 optimizer.step()
                 step_index += 1
@@ -1548,6 +1610,7 @@ def train(
                 epoch_loss += float(clone_term.detach()) * components
                 epoch_components += components
                 if isinstance(dynamics, StructuredDynamics):
+                    diagnostic_sums["structured_latent"] += float(terms.latent.detach())
                     diagnostic_sums["structured_decision"] += float(terms.decision.detach())
                     diagnostic_sums["structured_decision_one"] += float(terms.decision_one.detach())
                     diagnostic_sums["structured_decision_final"] += float(
@@ -1703,6 +1766,7 @@ def main() -> None:
         latent_dynamics_coefficient=args.latent_dynamics_coefficient,
         latent_decode_coefficient=args.latent_decode_coefficient,
         latent_horizon=args.latent_horizon,
+        structured_latent_coefficient=args.structured_latent_coefficient,
         structured_decision_coefficient=args.structured_decision_coefficient,
         structured_patch_coefficient=args.structured_patch_coefficient,
         structured_economy_coefficient=args.structured_economy_coefficient,
@@ -1714,6 +1778,7 @@ def main() -> None:
         matrix_weight_decay=args.matrix_weight_decay,
         adam_learning_rate_ratio=args.adam_learning_rate_ratio,
         adam_weight_decay=args.adam_weight_decay,
+        gradient_clip=args.gradient_clip,
         seed=args.seed,
         device=torch.device(args.device),
         encode_workers=args.encode_workers,
