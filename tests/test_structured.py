@@ -82,6 +82,31 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
     assert torch.allclose(output.unit_logits[inactive], expanded[inactive])
 
 
+def test_hardware_native_structured_actor_backpropagates_on_cpu(
+    real_inputs: StructuredInputs,
+) -> None:
+    actor = StructuredActor(replace(_tiny_config(), fused_mlp=True))
+
+    output = actor(real_inputs)
+    loss = (
+        output.unit_logits.square().mean()
+        + output.market_kind_logits.square().mean()
+        + output.market_quantity_context.square().mean()
+    )
+    loss.backward()
+
+    fused_parameters = [
+        parameter
+        for name, parameter in actor.named_parameters()
+        if name.endswith(("up_weight", "down_weight"))
+    ]
+    assert fused_parameters
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in fused_parameters
+    )
+
+
 def test_structured_actor_exposes_typed_training_belief(
     real_inputs: StructuredInputs,
 ) -> None:
@@ -177,6 +202,7 @@ def test_structured_model_arguments_parse_typed_regression_fields() -> None:
     assert config.global_refresh_context == "all"
     assert config.zero_init_branches is True
 
+
 def test_structured_farm_batch_matches_separate_canonical_encoding(
     real_inputs: StructuredInputs,
 ) -> None:
@@ -217,6 +243,7 @@ def test_structured_farm_batch_matches_separate_canonical_encoding(
 
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
+
 
 def test_structured_actor_shares_the_head_bias_prior_with_farm_actor() -> None:
     torch.manual_seed(0)

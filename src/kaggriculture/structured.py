@@ -49,6 +49,7 @@ from kaggriculture.tokens import (
     UNIT_ROLES,
     UNIT_TILE_GATHERS,
 )
+from kaggriculture.triton_mlp import fused_relu_squared_mlp
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class StructuredConfig:
     fuse_unit_decoder: bool = False
     split_clock_token: bool = False
     global_modulation: bool = False
+    fused_mlp: bool = False
     critic_core_layers: int = 0
     critic_latents: int = 0
     value_atoms: int = 101
@@ -299,6 +301,23 @@ class FeedForward(nn.Module):
         return self.output(self.activation(self.input(inputs)))
 
 
+class FusedFeedForward(nn.Module):
+    """Bias-free hardware-native MLP with a TMA-persistent up projection."""
+
+    def __init__(self, config: StructuredConfig) -> None:
+        super().__init__()
+        hidden = config.model_dim * config.ffn_multiplier
+        self.up_weight = nn.Parameter(torch.empty(hidden, config.model_dim))
+        self.down_weight = nn.Parameter(torch.empty(hidden, config.model_dim))
+        nn.init.kaiming_uniform_(self.up_weight, a=5**0.5)
+        nn.init.kaiming_uniform_(self.down_weight.T, a=5**0.5)
+        if config.zero_init_branches:
+            nn.init.zeros_(self.down_weight)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return fused_relu_squared_mlp(inputs, self.up_weight, self.down_weight)
+
+
 class Block(nn.Module):
     """Pre-norm attention + FFN block with near-identity gated residuals."""
 
@@ -314,11 +333,9 @@ class Block(nn.Module):
         self.attention = Attention(config)
         self.attention_gate = GatedResidual(config.model_dim, residual_initial)
         self.ffn_norm = RMSNorm(config.model_dim)
-        self.ffn = FeedForward(config)
+        self.ffn = FusedFeedForward(config) if config.fused_mlp else FeedForward(config)
         self.ffn_gate = GatedResidual(config.model_dim, residual_initial)
-        self.modulation = (
-            nn.Linear(config.model_dim, 4 * config.model_dim) if conditioned else None
-        )
+        self.modulation = nn.Linear(config.model_dim, 4 * config.model_dim) if conditioned else None
         if self.modulation is not None:
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
@@ -342,10 +359,9 @@ class Block(nn.Module):
             attention_scale, attention_shift, ffn_scale, ffn_shift = self.modulation(
                 conditioning
             ).chunk(4, dim=-1)
-            attention_input = (
-                attention_input * (1 + attention_scale.unsqueeze(1))
-                + attention_shift.unsqueeze(1)
-            )
+            attention_input = attention_input * (
+                1 + attention_scale.unsqueeze(1)
+            ) + attention_shift.unsqueeze(1)
         elif conditioning is not None:
             raise ValueError("unconditioned block does not accept conditioning")
         if context is None:
@@ -521,6 +537,7 @@ class MuddLite(nn.Module):
         stacked = torch.stack(sources, dim=-2)
         return (coefficients.unsqueeze(-1) * stacked).sum(dim=-2)
 
+
 class StructuredTrunk(nn.Module):
     """Shared encoder: farm-local blocks, opponent summary, latent core."""
 
@@ -542,8 +559,7 @@ class StructuredTrunk(nn.Module):
         self.latent_read = Block(config)
         self.latent_context_norm = RMSNorm(config.model_dim)
         self.core = nn.ModuleList(
-            Block(config, conditioned=config.global_modulation)
-            for _ in range(config.core_layers)
+            Block(config, conditioned=config.global_modulation) for _ in range(config.core_layers)
         )
         self.core_norm = RMSNorm(config.model_dim)
         self.global_refresh = nn.ModuleDict(
@@ -555,9 +571,7 @@ class StructuredTrunk(nn.Module):
         self.global_context_norm = (
             RMSNorm(config.model_dim) if config.global_refresh_layers else None
         )
-        self.reinject_norm = (
-            RMSNorm(config.model_dim) if config.input_reinject_layers else None
-        )
+        self.reinject_norm = RMSNorm(config.model_dim) if config.input_reinject_layers else None
         self.reinject_gates = nn.ParameterDict(
             {
                 str(layer): nn.Parameter(torch.zeros(config.model_dim))
@@ -665,15 +679,15 @@ class StructuredTrunk(nn.Module):
                     (x0, snapshots[2], snapshots[5], latents),
                 )
             latents = block(latents, conditioning=conditioning)
-            gate = self.reinject_gates[str(layer)] if str(layer) in self.reinject_gates else None
-            if gate is not None:
+            if str(layer) in self.reinject_gates:
+                gate = self.reinject_gates[str(layer)]
                 assert normalized_x0 is not None
                 latents = latents + gate * normalized_x0
             if layer == self.config.core_skip_target:
                 assert self.skip_gate is not None
                 latents = latents + self.skip_gate * snapshots[self.config.core_skip_source]
-            refresh = self.global_refresh[str(layer)] if str(layer) in self.global_refresh else None
-            if refresh is not None:
+            if str(layer) in self.global_refresh:
+                refresh = self.global_refresh[str(layer)]
                 assert global_context is not None
                 assert global_valid is not None
                 assert self.global_context_norm is not None
@@ -756,9 +770,7 @@ class StructuredActor(nn.Module):
             self.config.quantity_rank,
         )
 
-    def forward_with_belief(
-        self, inputs: StructuredInputs
-    ) -> tuple[ActorOutput, StructuredBelief]:
+    def forward_with_belief(self, inputs: StructuredInputs) -> tuple[ActorOutput, StructuredBelief]:
         batch = inputs.tile_categorical.shape[0]
         trunk = self.trunk(inputs)
         local = trunk.unit_local_tiles
