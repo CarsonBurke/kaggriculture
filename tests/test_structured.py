@@ -196,7 +196,7 @@ def test_hardware_native_structured_ensemble_compiles_batched_forward(
     )
     actors = [StructuredActor(config).cuda().eval() for _ in range(2)]
     with torch.no_grad():
-        actors[1].unit_head.weight.add_(0.01)
+        actors[1].unit_head[-1].weight.add_(0.01)
     cuda_inputs = StructuredInputs(*(field.cuda() for field in real_inputs))
     lane_inputs = StructuredInputs(*(torch.stack((field, field)) for field in cuda_inputs))
     ensemble = _StackedActorEnsemble(actors)
