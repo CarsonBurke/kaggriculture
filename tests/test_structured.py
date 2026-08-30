@@ -216,11 +216,15 @@ def test_hardware_native_structured_ensemble_compiles_batched_forward(
             [output.market_quantity_context for output in expected],
         ),
     ):
+        # The rollout packer explicitly converts every head to FP32. Inductor's
+        # functional vmap may retain that dtype while the single-lane autocast
+        # reference returns BF16, so the observable contract here is numeric.
         torch.testing.assert_close(
             component,
             torch.stack(references),
             rtol=1e-2,
             atol=1e-1,
+            check_dtype=False,
         )
 
 
