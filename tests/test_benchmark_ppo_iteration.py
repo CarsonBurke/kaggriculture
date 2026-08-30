@@ -52,9 +52,22 @@ def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> No
     module = _script()
     monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py"])
 
-    config = model_config_from_args(resolve_architecture(CONV_ENTITY), module.parse_args())
+    args = module.parse_args()
+    config = model_config_from_args(resolve_architecture(CONV_ENTITY), args)
 
+    assert not args.deterministic_training
     assert config.to_dict() == production_model_config()
+
+
+def test_benchmark_can_measure_the_deterministic_training_contract(monkeypatch) -> None:
+    module = _script()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["benchmark_ppo_iteration.py", "--deterministic-training"],
+    )
+
+    assert module.parse_args().deterministic_training
 
 
 def test_hardware_identity_records_common_cpu_metadata() -> None:

@@ -284,6 +284,12 @@ def parse_args() -> argparse.Namespace:
         "so this alone decides whether the update compiles",
     )
     parser.add_argument("--no-bfloat16", action="store_true")
+    parser.add_argument(
+        "--deterministic-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="match train_ppo's deterministic CUDA algorithm contract",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tensorboard-dir", type=Path)
     return parser.parse_args()
@@ -442,9 +448,17 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
+    if args.deterministic_training:
+        workspace = os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        if workspace not in (":4096:8", ":16:8"):
+            raise ValueError(
+                "deterministic training requires CUBLAS_WORKSPACE_CONFIG to be ':4096:8' or ':16:8'"
+            )
+    torch.use_deterministic_algorithms(args.deterministic_training)
+    torch.backends.cudnn.deterministic = args.deterministic_training
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = not args.deterministic_training
 
     architecture = resolve_architecture(args.architecture)
     model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
@@ -462,6 +476,7 @@ def main() -> None:
             "event": "configuration",
             "architecture": architecture.name,
             "device": str(device),
+            "deterministic_training": args.deterministic_training,
             "hardware": _hardware_identity(device),
             "self_play_game_counts": game_counts,
             "league_games_per_iteration": args.league_games,
