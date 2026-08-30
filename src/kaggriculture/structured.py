@@ -520,9 +520,9 @@ class Block(nn.Module):
         if self.modulation is not None:
             if conditioning is None:
                 raise ValueError("conditioned block requires one vector per batch row")
-            attention_scale, attention_shift, ffn_scale, ffn_shift = self.modulation(
-                conditioning
-            ).chunk(4, dim=-1)
+            attention_scale, attention_shift, ffn_scale, ffn_shift = (
+                self.modulation(conditioning).to(attention_input.dtype).chunk(4, dim=-1)
+            )
             attention_input = attention_input * (
                 1 + attention_scale.unsqueeze(1)
             ) + attention_shift.unsqueeze(1)

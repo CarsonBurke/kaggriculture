@@ -193,6 +193,7 @@ def test_hardware_native_structured_ensemble_compiles_batched_forward(
         attention_heads=4,
         ffn_multiplier=2,
         fused_mlp=True,
+        global_modulation=True,
     )
     actors = [StructuredActor(config).cuda().eval() for _ in range(2)]
     with torch.no_grad():
