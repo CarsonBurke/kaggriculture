@@ -145,6 +145,26 @@ def test_hardware_native_mlp_compiles_fp8_forward_and_backward() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hardware_native_mlp_compiles_bf16_backward() -> None:
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=4,
+        ffn_multiplier=2,
+        fused_mlp=True,
+    )
+    module = FusedFeedForward(config).cuda().eval()
+    values = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    torch.compile(module, fullgraph=True)(values).float().square().mean().backward()
+
+    assert values.grad is not None and torch.isfinite(values.grad).all()
+    assert module.up_weight.grad is not None and torch.isfinite(module.up_weight.grad).all()
+    assert module.down_weight.grad is not None and torch.isfinite(module.down_weight.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_actor_runs_autocast_with_fp32_master_weights(
     real_inputs: StructuredInputs,
 ) -> None:

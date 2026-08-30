@@ -526,12 +526,18 @@ def _setup_fused_relu_squared_mlp_bf16_context(
     ctx.mark_non_differentiable(post)  # type: ignore[attr-defined]
 
 
-def _backward_fused_relu_squared_mlp_bf16(
-    ctx: object,
+@torch.library.custom_op(
+    "kaggriculture::fused_relu_squared_mlp_bf16_backward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_relu_squared_mlp_bf16_backward(
     gradient: Tensor,
-    _post_gradient: Tensor | None,
-) -> tuple[Tensor | None, ...]:
-    values, up_weight_bf16, down_weight_bf16, post = ctx.saved_tensors  # type: ignore[attr-defined]
+    values: Tensor,
+    up_weight_bf16: Tensor,
+    down_weight_bf16: Tensor,
+    post: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
     flat_values = values.reshape(-1, values.shape[-1])
     flat_gradient = gradient.reshape(-1, gradient.shape[-1]).contiguous()
     down_gradient = post.T @ flat_gradient
@@ -543,9 +549,38 @@ def _backward_fused_relu_squared_mlp_bf16(
         input_gradient.view_as(values),
         up_gradient.float(),
         down_gradient.float(),
-        None,
-        None,
     )
+
+
+@_fused_relu_squared_mlp_bf16_backward.register_fake
+def _fake_fused_relu_squared_mlp_bf16_backward(
+    _gradient: Tensor,
+    values: Tensor,
+    up_weight_bf16: Tensor,
+    down_weight_bf16: Tensor,
+    _post: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return (
+        values.new_empty(values.shape),
+        up_weight_bf16.new_empty(up_weight_bf16.shape, dtype=torch.float32),
+        down_weight_bf16.new_empty(down_weight_bf16.shape, dtype=torch.float32),
+    )
+
+
+def _backward_fused_relu_squared_mlp_bf16(
+    ctx: object,
+    gradient: Tensor,
+    _post_gradient: Tensor | None,
+) -> tuple[Tensor | None, ...]:
+    values, up_weight_bf16, down_weight_bf16, post = ctx.saved_tensors  # type: ignore[attr-defined]
+    input_gradient, up_gradient, down_gradient = _fused_relu_squared_mlp_bf16_backward(
+        gradient,
+        values,
+        up_weight_bf16,
+        down_weight_bf16,
+        post,
+    )
+    return input_gradient, up_gradient, down_gradient, None, None
 
 
 _fused_relu_squared_mlp_bf16.register_autograd(
