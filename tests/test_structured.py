@@ -12,6 +12,7 @@ from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
+from kaggriculture.rollout import _StackedActorEnsemble
 from kaggriculture.structured import (
     FusedFeedForward,
     StructuredActor,
@@ -179,6 +180,48 @@ def test_hardware_native_actor_runs_autocast_with_fp32_master_weights(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in fused_parameters
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hardware_native_structured_ensemble_compiles_batched_forward(
+    real_inputs: StructuredInputs,
+) -> None:
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=4,
+        ffn_multiplier=2,
+        fused_mlp=True,
+    )
+    actors = [StructuredActor(config).cuda().eval() for _ in range(2)]
+    with torch.no_grad():
+        actors[1].unit_head.weight.add_(0.01)
+    cuda_inputs = StructuredInputs(*(field.cuda() for field in real_inputs))
+    lane_inputs = StructuredInputs(*(torch.stack((field, field)) for field in cuda_inputs))
+    ensemble = _StackedActorEnsemble(actors)
+
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = [actor(cuda_inputs) for actor in actors]
+        actual = ensemble(lane_inputs, mode="inductor")
+
+    for component, references in (
+        (actual.unit_logits, [output.unit_logits for output in expected]),
+        (
+            actual.market_kind_logits,
+            [output.market_kind_logits for output in expected],
+        ),
+        (
+            actual.market_quantity_context,
+            [output.market_quantity_context for output in expected],
+        ),
+    ):
+        torch.testing.assert_close(
+            component,
+            torch.stack(references),
+            rtol=1e-2,
+            atol=1e-1,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
