@@ -164,6 +164,7 @@ def test_replay_member_ignores_incomplete_probe_and_torn_tail(tmp_path: Path) ->
                 "money_mean": None,
             }
         )
+        + "\n"
         + '{"iteration": 71, "agent":',
         encoding="utf-8",
     )
