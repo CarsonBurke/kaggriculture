@@ -19,7 +19,6 @@ import torch
 
 from kaggriculture.provenance import (
     file_sha256,
-    require_source_identity,
     validate_run_provenance,
     validate_source_identity,
 )
@@ -42,6 +41,7 @@ REQUIRED_MEMBERS = frozenset(
         "kaggriculture/provenance.py",
         "kaggriculture/registry.py",
         "kaggriculture/structured.py",
+        "kaggriculture/triton_mlp.py",
         "kaggriculture/tokens.py",
     }
 )
@@ -212,6 +212,7 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         "sha256",
         "iteration",
         "run_provenance_sha256",
+        "agent",
     }:
         raise ValueError("submission checkpoint binding has an invalid schema")
     if not isinstance(evaluation_binding, dict) or not {
@@ -245,7 +246,9 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         finalist_start = evaluation.get("seed_start")
         finalist_count = evaluation.get("seed_count")
         if (
-            not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
+            not all(
+                type(value) is int and value >= 0 for value in (screening_start, finalist_start)
+            )
             or type(screening_count) is not int
             or screening_count < 1
             or max(screening_start, finalist_start)
@@ -268,18 +271,19 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         raise ValueError("submission finalist evaluation targets different checkpoint bytes")
     if provenance.get("source_identity") != source:
         raise ValueError("submission finalist evaluation has a different source identity")
+    if provenance.get("agent") != checkpoint["agent"]:
+        raise ValueError("submission finalist evaluation measured a different population member")
     artifact = torch.load(destination / "model.pt", map_location="cpu", weights_only=False)
     witness = manifest.get("inference_equivalence")
-    if artifact.get("source_identity") != source:
-        if (
-            not isinstance(witness, dict)
-            or witness.get("artifact_sha256") != checkpoint["sha256"]
-            or witness.get("failures")
-            or witness.get("candidate_identity") != source.get("sha256")
-            or (artifact.get("source_identity") or {}).get("sha256")
-            != witness.get("expected_identity")
-        ):
-            raise ValueError("submission model has a different source identity")
+    if artifact.get("source_identity") != source and (
+        not isinstance(witness, dict)
+        or witness.get("artifact_sha256") != checkpoint["sha256"]
+        or witness.get("failures")
+        or witness.get("candidate_identity") != source.get("sha256")
+        or (artifact.get("source_identity") or {}).get("sha256")
+        != witness.get("expected_identity")
+    ):
+        raise ValueError("submission model has a different source identity")
 
     if artifact.get("run_provenance") != run_provenance:
         raise ValueError("submission model has different run provenance")
@@ -290,12 +294,19 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
         raise ValueError("submission model has a different run provenance digest")
     if provenance.get("run_provenance") != run_provenance:
         raise ValueError("submission finalist evaluation has different run provenance")
-    if selection.get("run_provenance") != run_provenance:
-        raise ValueError("submission checkpoint selection has different run provenance")
+    if isinstance(selection, dict):
+        if selection.get("run_provenance") != run_provenance:
+            raise ValueError("submission checkpoint selection has different run provenance")
+        if selection.get("sha256") != evaluation_binding["selection_report_sha256"]:
+            raise ValueError(
+                "submission finalist evaluation has a different selection report binding"
+            )
+    elif evaluation_binding["selection_report_sha256"] is not None:
+        raise ValueError("submission without selection evidence has a selection report binding")
     if artifact.get("training_checkpoint_sha256") != checkpoint["sha256"]:
         raise ValueError("submission model has a different training checkpoint binding")
-    if selection.get("sha256") != evaluation_binding["selection_report_sha256"]:
-        raise ValueError("submission finalist evaluation has a different selection report binding")
+    if artifact.get("checkpoint_agent") != checkpoint["agent"]:
+        raise ValueError("submission model has a different population member binding")
     if artifact.get("selection_report_sha256") != evaluation_binding["selection_report_sha256"]:
         raise ValueError("submission model has a different selection report binding")
     if artifact.get("evaluation_report_sha256") != evaluation_binding["sha256"]:

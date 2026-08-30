@@ -134,9 +134,10 @@ def _artifact_provenance(
     path: Path,
     equivalence: dict[str, Any] | None = None,
     agent: int | None = None,
+    device: torch.device | str = "cpu",
 ) -> dict[str, Any]:
     """Validate the artifact before spawning workers and record stable identity."""
-    actor, metadata = load_actor_artifact(path, device="cpu", agent=agent)
+    actor, metadata = load_actor_artifact(path, device=device, agent=agent)
     del actor
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -758,6 +759,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             artifact_snapshot,
             None if witness_path is None else json.loads(witness_path.read_text(encoding="utf-8")),
             agent=member,
+            device=device,
         )
 
         artifact_provenance["path"] = str(artifact)

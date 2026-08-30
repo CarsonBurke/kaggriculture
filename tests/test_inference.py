@@ -26,6 +26,7 @@ from kaggriculture.provenance import (
     run_provenance_from_decision,
     source_identity,
 )
+from kaggriculture.structured import StructuredActor, StructuredConfig
 
 
 @pytest.mark.parametrize(
@@ -59,6 +60,34 @@ def test_actor_artifact_round_trip(tmp_path: Path, checkpoint_version: int) -> N
     assert metadata["format_version"] == ACTOR_ARTIFACT_FORMAT_VERSION
     for expected, actual in zip(actor.parameters(), restored.parameters(), strict=True):
         assert torch.equal(expected, actual)
+
+
+def test_fused_structured_artifact_rejects_cpu_inference(tmp_path: Path) -> None:
+    config = StructuredConfig(
+        model_dim=128,
+        attention_heads=8,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=4,
+        latents=8,
+        core_layers=2,
+        fused_mlp=True,
+    )
+    actor = StructuredActor(config)
+    path = tmp_path / "fused.pt"
+    torch.save(
+        {
+            "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
+            "architecture": "structured",
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "source_identity": source_identity(),
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match="require CUDA inference"):
+        load_actor_artifact(path, device="cpu")
 
 
 @pytest.mark.parametrize(
@@ -235,6 +264,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/registry.py",
         "kaggriculture/structured.py",
         "kaggriculture/tokens.py",
+        "kaggriculture/triton_mlp.py",
     }
     with tarfile.open(archive, "r:gz") as bundle:
         assert set(bundle.getnames()) == required
@@ -300,6 +330,15 @@ def _build_submission_module():
     return module
 
 
+def _validate_submission_module():
+    path = Path(__file__).parents[1] / "scripts" / "validate_submission.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_validate_submission", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
     """A checkpoint and the two reports a submission needs, all mutually bound."""
     config = ModelConfig()
@@ -355,6 +394,31 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
         "artifact_provenance": provenance,
     }
     return checkpoint, finalist, starter
+
+
+def test_submission_reports_bind_the_exported_population_member(tmp_path: Path) -> None:
+    builder = _build_submission_module()
+    checkpoint, finalist, starter = _submission_inputs(tmp_path)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    finalist["artifact_provenance"]["agent"] = 0
+
+    with pytest.raises(ValueError, match="different population member"):
+        builder._load_evaluation(
+            json.dumps(finalist).encode(),
+            digest,
+            source_identity(),
+            0.0,
+            1,
+        )
+    with pytest.raises(ValueError, match="different population member"):
+        builder._load_builtin_evaluation(
+            json.dumps(starter).encode(),
+            digest,
+            source_identity(),
+            0.0,
+            1,
+            1,
+        )
 
 
 def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
@@ -424,7 +488,6 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
         )
 
 
-
 def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
     tmp_path: Path,
 ) -> None:
@@ -450,6 +513,14 @@ def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
     assert manifest["evaluation"]["seed_count"] == 32
     assert manifest["evaluation"]["selection_report_sha256"] is None
     assert manifest["evaluation"]["score_rate"] == 0.75
+    extracted = tmp_path / "validated"
+    extracted.mkdir()
+    names, validated_manifest = _validate_submission_module()._extract(
+        tmp_path / "submission.tar.gz",
+        extracted,
+    )
+    assert "manifest.json" in names
+    assert validated_manifest == manifest
 
 
 def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Path) -> None:

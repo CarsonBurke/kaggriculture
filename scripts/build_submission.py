@@ -49,6 +49,7 @@ PACKAGE_FILES = (
     "provenance.py",
     "registry.py",
     "structured.py",
+    "triton_mlp.py",
     "tokens.py",
 )
 MAIN = '''"""Kaggriculture PPO submission entrypoint."""
@@ -118,7 +119,10 @@ def parse_args() -> argparse.Namespace:
         "--minimum-builtin-seed-count",
         type=int,
         default=16,
-        help="paired-seat seed clusters required per built-in report; 16 is the official starter panel",
+        help=(
+            "paired-seat seed clusters required per built-in report; 16 is the official "
+            "starter panel"
+        ),
     )
     parser.add_argument(
         "--inference-equivalence",
@@ -153,6 +157,7 @@ def _load_builtin_evaluation(
     source: dict[str, Any],
     minimum_score_rate: float,
     minimum_seed_count: int,
+    agent: int | None,
 ) -> tuple[str, float]:
     """Check one built-in report and return its label and score rate.
 
@@ -173,6 +178,8 @@ def _load_builtin_evaluation(
         raise ValueError(f"{label} evaluation does not bind the selected checkpoint bytes")
     if provenance.get("source_identity") != source:
         raise ValueError(f"{label} evaluation source identity does not match the checkpoint")
+    if provenance.get("agent") != agent:
+        raise ValueError(f"{label} evaluation measured a different population member")
     if payload.get("paired_seats") is not True:
         raise ValueError(f"{label} evaluation must use paired seats to cancel the seat advantage")
     seed_count = payload.get("seed_count", 0)
@@ -195,6 +202,7 @@ def _load_evaluation(
     checkpoint_digest: str,
     source: dict[str, Any],
     minimum_score_rate: float,
+    agent: int | None,
 ) -> dict[str, Any]:
     payload = json.loads(contents.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
@@ -204,6 +212,8 @@ def _load_evaluation(
         raise ValueError("finalist evaluation does not bind the selected checkpoint bytes")
     if provenance.get("source_identity") != source:
         raise ValueError("finalist evaluation source identity does not match the checkpoint")
+    if provenance.get("agent") != agent:
+        raise ValueError("finalist evaluation measured a different population member")
     run_provenance = validate_run_provenance(provenance.get("run_provenance"))
     if run_provenance != payload.get("artifact_provenance", {}).get("run_provenance"):
         raise ValueError("finalist evaluation run provenance is inconsistent")
@@ -213,7 +223,10 @@ def _load_evaluation(
         raise ValueError("submission requires at least 32 paired-seat official-panel seed clusters")
     selection = payload.get("selection_provenance")
     if selection is not None:
-        if not isinstance(selection, dict) or selection.get("best_output_sha256") != checkpoint_digest:
+        if (
+            not isinstance(selection, dict)
+            or selection.get("best_output_sha256") != checkpoint_digest
+        ):
             raise ValueError("finalist evaluation is not bound to checkpoint-selection evidence")
         selection_digest = selection.get("sha256")
         if (
@@ -229,7 +242,9 @@ def _load_evaluation(
         finalist_start = payload.get("seed_start")
         finalist_count = payload.get("seed_count")
         if (
-            not all(type(value) is int and value >= 0 for value in (screening_start, finalist_start))
+            not all(
+                type(value) is int and value >= 0 for value in (screening_start, finalist_start)
+            )
             or type(screening_count) is not int
             or screening_count < 1
             or max(screening_start, finalist_start)
@@ -340,6 +355,8 @@ def _smoke_test(root: Path) -> dict[str, Any]:
             f"submission bundle submitted {result['submitted']} actions, "
             f"expected {_SMOKE_STEPS - 1}"
         )
+    if result["acting"] == 0:
+        raise ValueError("submission bundle passed on every step")
     return result
 
 
@@ -389,6 +406,7 @@ def build(
             source,
             minimum_builtin_score_rate,
             minimum_builtin_seed_count,
+            agent,
         )
         if label in builtin_score_rates:
             raise ValueError(f"two evaluations supplied for the built-in {label}")
@@ -403,6 +421,7 @@ def build(
         checkpoint_digest,
         source,
         minimum_score_rate,
+        agent,
     )
     if evaluation["artifact_provenance"].get("run_provenance") != run_provenance:
         raise ValueError("finalist evaluation run provenance does not match the checkpoint")
@@ -419,6 +438,7 @@ def build(
     artifact["run_provenance_sha256"] = run_provenance_sha256
     artifact["selection_report_sha256"] = selection_report_sha256
     artifact["evaluation_report_sha256"] = evaluation_digest
+    artifact["checkpoint_agent"] = agent
     source_package = Path(__file__).parents[1] / "src" / "kaggriculture"
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="kaggriculture-submission-") as temporary_name:
@@ -457,6 +477,7 @@ def build(
                 "sha256": checkpoint_digest,
                 "iteration": int(artifact["iteration"]),
                 "run_provenance_sha256": run_provenance_sha256,
+                "agent": agent,
             },
             "evaluation": {
                 "sha256": evaluation_digest,

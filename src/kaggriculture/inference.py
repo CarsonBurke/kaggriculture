@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -189,7 +189,8 @@ def actor_artifact_from_checkpoint(
 def load_actor_artifact(
     path: Path, device: torch.device | str = "cpu", *, agent: int | None = None
 ) -> tuple[nn.Module, dict[str, Any]]:
-    payload = torch.load(path, map_location=device, weights_only=False)
+    target_device = torch.device(device)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     version = payload.get("format_version")
     if version not in SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS:
         expected = ", ".join(map(str, sorted(SUPPORTED_ACTOR_INPUT_FORMAT_VERSIONS)))
@@ -219,7 +220,12 @@ def load_actor_artifact(
     run_provenance = validate_run_provenance(stored)
     if run_provenance is not None and run_provenance["source_identity"] != identity:
         raise ValueError("actor artifact run provenance source does not match source identity")
-    actor = resolve_architecture(payload).build_actor(payload["model_config"]).to(device)
+
+    model_config = payload.get("model_config")
+    fused_mlp = isinstance(model_config, Mapping) and bool(model_config.get("fused_mlp", False))
+    if fused_mlp and target_device.type != "cuda":
+        raise ValueError("fused structured artifacts require CUDA inference")
+    actor = resolve_architecture(payload).build_actor(model_config).to(target_device)
     actor.load_state_dict(checkpoint_actor_state(payload, agent))
     actor.eval()
     return actor, payload
@@ -244,6 +250,10 @@ class CheckpointAgent:
         self.actor, self.metadata = load_actor_artifact(artifact, device, agent=agent)
         self.member = agent
         self.quantity_heads = prepare_quantity_heads(self.actor)
+        model_config = self.metadata.get("model_config")
+        self.fused_mlp = isinstance(model_config, Mapping) and bool(
+            model_config.get("fused_mlp", False)
+        )
 
         # Training may have cycled frames; the competition board is identity.
         # A stored member code on a legacy artifact is ignored.
@@ -251,13 +261,19 @@ class CheckpointAgent:
 
     def act_many(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Act on independent environments in one model forward."""
-        actions = act_batch(
-            self.actor,
-            observations,
-            deterministic=True,
-            orientation=self.orientation,
-            quantity_heads=self.quantity_heads,
-        ).actions
+        inference_context = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if self.fused_mlp
+            else nullcontext()
+        )
+        with inference_context:
+            actions = act_batch(
+                self.actor,
+                observations,
+                deterministic=True,
+                orientation=self.orientation,
+                quantity_heads=self.quantity_heads,
+            ).actions
         return [
             clear_standing_weeds(observation, action)
             for observation, action in zip(observations, actions, strict=True)
