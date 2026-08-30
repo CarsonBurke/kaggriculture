@@ -1952,8 +1952,11 @@ def _replay_to_update_minibatch_kl(
         + rollout.market_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
         + rollout.market_quantity_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
     )
+    # The audit runs while the collector actor is in eval mode; sharing its
+    # compiled callable with the training update would freeze the BF16
+    # inference branch and bypass the FP8 projections after actor.train().
     terms = _cached_update_callable(
-        actor, "_kaggriculture_update_terms", _actor_minibatch_terms, resolved_mode
+        actor, "_kaggriculture_update_audit_terms", _actor_minibatch_terms, resolved_mode
     )
     # The permutation only has to be *a* shuffle, not the training run's: the
     # residual comes from minibatches being composed differently than the replay
