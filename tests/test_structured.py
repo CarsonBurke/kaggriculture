@@ -24,7 +24,7 @@ from kaggriculture.structured import (
 )
 from kaggriculture.structured_dynamics import _latent_smooth_l1
 from kaggriculture.tokens import encode_structured_observation
-from kaggriculture.triton_mlp import _FusedReLUSquaredMLP
+from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
 
 
 def _tiny_config() -> StructuredConfig:
@@ -231,7 +231,7 @@ def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
     up_weight = torch.randn(3, 256, 128, device="cuda", dtype=torch.bfloat16)
     down_weight = torch.randn(3, 256, 128, device="cuda", dtype=torch.bfloat16)
 
-    actual, _ = torch.vmap(_FusedReLUSquaredMLP.apply)(
+    actual, _ = torch.vmap(_fused_relu_squared_mlp_bf16)(
         values,
         up_weight.float(),
         down_weight.float(),

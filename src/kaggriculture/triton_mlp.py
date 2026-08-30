@@ -458,81 +458,103 @@ def quantize_transpose_mlp_down_weight(
     reduce_mlp_activation_scale(partial_amax, next_scale, headroom=headroom)
 
 
-class _FusedReLUSquaredMLP(torch.autograd.Function):
-    """BF16 fused MLP used by evaluation and frozen-policy ensembles."""
+@torch.library.custom_op(
+    "kaggriculture::fused_relu_squared_mlp_bf16",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _fused_relu_squared_mlp_bf16(
+    values: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+    up_weight_bf16: Tensor,
+    down_weight_bf16: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Opaque BF16 projection op with a native lane-batched vmap rule."""
+    _require_cuda_bf16(values, up_weight_bf16, down_weight_bf16)
+    original_shape = values.shape
+    flat = values.reshape(-1, original_shape[-1]).contiguous()
+    post = _linear_relu_square(flat, up_weight_bf16)
+    assert isinstance(post, Tensor)
+    output = post @ down_weight_bf16
+    return output.view(original_shape), post
 
-    @staticmethod
-    def forward(
-        values: Tensor,
-        up_weight: Tensor,
-        down_weight: Tensor,
-        up_weight_bf16: Tensor,
-        down_weight_bf16: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        _require_cuda_bf16(values, up_weight_bf16, down_weight_bf16)
-        original_shape = values.shape
-        flat = values.reshape(-1, original_shape[-1]).contiguous()
-        post = _linear_relu_square(flat, up_weight_bf16)
-        assert isinstance(post, Tensor)
-        output = post @ down_weight_bf16
-        return output.view(original_shape), post
 
-    @staticmethod
-    def setup_context(
-        ctx: object,
-        inputs: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
-        output: tuple[Tensor, Tensor],
-    ) -> None:
-        values, _, _, up_weight_bf16, down_weight_bf16 = inputs
-        _, post = output
-        ctx.save_for_backward(  # type: ignore[attr-defined]
-            values,
-            up_weight_bf16,
-            down_weight_bf16,
-            post,
-        )
-        ctx.mark_non_differentiable(post)  # type: ignore[attr-defined]
+@_fused_relu_squared_mlp_bf16.register_fake
+def _fake_fused_relu_squared_mlp_bf16(
+    values: Tensor,
+    _up_weight: Tensor,
+    _down_weight: Tensor,
+    up_weight_bf16: Tensor,
+    _down_weight_bf16: Tensor,
+) -> tuple[Tensor, Tensor]:
+    rows = values.numel() // values.shape[-1]
+    post = values.new_empty((rows, up_weight_bf16.shape[0]))
+    return values.new_empty(values.shape), post
 
-    @staticmethod
-    def vmap(  # pyright: ignore[reportIncompatibleMethodOverride]
-        _info: object,
-        in_dims: tuple[int | None, ...],
-        values: Tensor,
-        _up_weight: Tensor,
-        _down_weight: Tensor,
-        up_weight_bf16: Tensor,
-        down_weight_bf16: Tensor,
-    ) -> tuple[tuple[Tensor, Tensor], tuple[int, int]]:
-        if in_dims != (0, 0, 0, 0, 0):
-            raise RuntimeError("fused structured MLP vmap requires lane-major tensors")
-        output, post = _batched_fused_mlp(
-            values,
-            up_weight_bf16,
-            down_weight_bf16,
-        )
-        return (output, post), (0, 0)
 
-    @staticmethod
-    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
-        ctx: object,
-        gradient: Tensor,
-        _post_gradient: Tensor | None,
-    ) -> tuple[Tensor | None, ...]:
-        values, up_weight_bf16, down_weight_bf16, post = ctx.saved_tensors  # type: ignore[attr-defined]
-        flat_values = values.reshape(-1, values.shape[-1])
-        flat_gradient = gradient.reshape(-1, gradient.shape[-1]).contiguous()
-        down_gradient = post.T @ flat_gradient
-        pre_gradient = _linear_relu_square(flat_gradient, down_weight_bf16, post)
-        assert isinstance(pre_gradient, Tensor)
-        up_gradient = pre_gradient.T @ flat_values
-        input_gradient = pre_gradient @ up_weight_bf16
-        return (
-            input_gradient.view_as(values),
-            up_gradient.float(),
-            down_gradient.float(),
-            None,
-            None,
-        )
+def _setup_fused_relu_squared_mlp_bf16_context(
+    ctx: object,
+    inputs: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+    output: tuple[Tensor, Tensor],
+) -> None:
+    values, _, _, up_weight_bf16, down_weight_bf16 = inputs
+    _, post = output
+    ctx.save_for_backward(  # type: ignore[attr-defined]
+        values,
+        up_weight_bf16,
+        down_weight_bf16,
+        post,
+    )
+    ctx.mark_non_differentiable(post)  # type: ignore[attr-defined]
+
+
+def _backward_fused_relu_squared_mlp_bf16(
+    ctx: object,
+    gradient: Tensor,
+    _post_gradient: Tensor | None,
+) -> tuple[Tensor | None, ...]:
+    values, up_weight_bf16, down_weight_bf16, post = ctx.saved_tensors  # type: ignore[attr-defined]
+    flat_values = values.reshape(-1, values.shape[-1])
+    flat_gradient = gradient.reshape(-1, gradient.shape[-1]).contiguous()
+    down_gradient = post.T @ flat_gradient
+    pre_gradient = _linear_relu_square(flat_gradient, down_weight_bf16, post)
+    assert isinstance(pre_gradient, Tensor)
+    up_gradient = pre_gradient.T @ flat_values
+    input_gradient = pre_gradient @ up_weight_bf16
+    return (
+        input_gradient.view_as(values),
+        up_gradient.float(),
+        down_gradient.float(),
+        None,
+        None,
+    )
+
+
+_fused_relu_squared_mlp_bf16.register_autograd(
+    _backward_fused_relu_squared_mlp_bf16,
+    setup_context=_setup_fused_relu_squared_mlp_bf16_context,
+)
+
+
+@torch.library.register_vmap(_fused_relu_squared_mlp_bf16)
+def _vmap_fused_relu_squared_mlp_bf16(
+    _info: object,
+    in_dims: tuple[int | None, ...],
+    values: Tensor,
+    _up_weight: Tensor,
+    _down_weight: Tensor,
+    up_weight_bf16: Tensor,
+    down_weight_bf16: Tensor,
+) -> tuple[tuple[Tensor, Tensor], tuple[int, int]]:
+    if in_dims != (0, 0, 0, 0, 0):
+        raise RuntimeError("fused structured MLP vmap requires lane-major tensors")
+    output, post = _batched_fused_mlp(
+        values,
+        up_weight_bf16,
+        down_weight_bf16,
+    )
+    return (output, post), (0, 0)
 
 
 class _FP8FusedReLUSquaredMLP(torch.autograd.Function):
@@ -638,7 +660,7 @@ def fused_relu_squared_mlp(
     """Apply the CUDA-native MLP; fused configurations have no portable path."""
     _require_cuda_bf16(values, up_weight_bf16, down_weight_bf16)
     if fp8_state is None:
-        output, _ = _FusedReLUSquaredMLP.apply(
+        output, _ = _fused_relu_squared_mlp_bf16(
             values,
             up_weight,
             down_weight,
