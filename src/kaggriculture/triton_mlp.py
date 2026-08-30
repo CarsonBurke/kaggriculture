@@ -294,6 +294,11 @@ def _batched_linear_kernel(
     )
 
 
+@torch.library.custom_op(
+    "kaggriculture::batched_fused_relu_squared_mlp_bf16",
+    mutates_args=(),
+    device_types="cuda",
+)
 def _batched_fused_mlp(
     values: Tensor, up_weight: Tensor, down_weight: Tensor
 ) -> tuple[Tensor, Tensor]:
@@ -349,6 +354,18 @@ def _batched_fused_mlp(
         num_warps=8,  # pyright: ignore[reportCallIssue]
     )
     return output.view(original_shape), post
+
+
+@_batched_fused_mlp.register_fake
+def _fake_batched_fused_mlp(
+    values: Tensor,
+    up_weight: Tensor,
+    _down_weight: Tensor,
+) -> tuple[Tensor, Tensor]:
+    lanes = values.shape[0]
+    rows = values.numel() // (lanes * values.shape[-1])
+    post = values.new_empty((lanes, rows, up_weight.shape[1]))
+    return values.new_empty(values.shape), post
 
 
 @triton.jit
