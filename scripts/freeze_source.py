@@ -20,10 +20,10 @@ def main() -> None:
     args = parse_args()
     identity = source_identity()
     destination = args.output_root.expanduser().resolve() / identity["sha256"]
-    freeze_source(destination)
+    frozen_identity = freeze_source(destination)
     print(
         json.dumps(
-            {"source_root": str(destination), "source_identity": identity},
+            {"source_root": str(destination), "source_identity": frozen_identity},
             sort_keys=True,
         )
     )

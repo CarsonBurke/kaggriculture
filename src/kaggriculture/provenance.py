@@ -640,6 +640,11 @@ def freeze_source(destination: Path, root: Path | None = None) -> dict[str, Any]
     source_root = repository_root() if root is None else Path(root).resolve()
     identity = source_identity(source_root)
     destination = Path(destination).expanduser().resolve()
+    if destination.name != identity["sha256"]:
+        raise ValueError(
+            "frozen source destination must be named for its verified identity "
+            f"({destination.name} != {identity['sha256']})"
+        )
     if destination.exists():
         if not destination.is_dir():
             raise FileExistsError(destination)

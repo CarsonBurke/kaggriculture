@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from concurrent.futures import Future
@@ -71,3 +72,86 @@ def test_teacher_sits_both_seats_against_a_distinct_opponent() -> None:
         ("starter", "v16", (1,)),
     )
     assert extractor.teacher_jobs("starter", "starter") == (("starter", "starter", (0, 1)),)
+
+
+def test_failed_generation_commit_preserves_committed_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extractor = _load_extractor()
+    output = tmp_path / "dataset"
+    output.mkdir()
+    old_archive = output / "episode-old.npz"
+    old_archive.write_bytes(b"old generation")
+    old_manifest = {"episodes": [{"file": old_archive.name}]}
+    (output / "manifest.json").write_text(json.dumps(old_manifest), encoding="utf-8")
+
+    staging = tmp_path / ".dataset.staging-test"
+    staging.mkdir()
+    new_archive = staging / "episode-new.npz"
+    new_archive.write_bytes(b"new generation")
+    manifest = {
+        "episodes": [
+            {
+                "file": new_archive.name,
+                "sha256": extractor.file_sha256(new_archive),
+            }
+        ]
+    }
+
+    def fail_manifest(*_args, **_kwargs) -> None:
+        raise OSError("simulated manifest failure")
+
+    monkeypatch.setattr(extractor, "_write_manifest_atomic", fail_manifest)
+    with pytest.raises(OSError, match="simulated manifest failure"):
+        extractor.commit_dataset_generation(staging, output, manifest)
+
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8")) == old_manifest
+    assert old_archive.read_bytes() == b"old generation"
+
+
+def test_resume_requires_matching_configuration_and_archive_digests(tmp_path: Path) -> None:
+    extractor = _load_extractor()
+    output = tmp_path / "dataset"
+    output.mkdir()
+    configuration = {
+        "format_version": extractor.DATASET_FORMAT_VERSION,
+        "teacher": {"label": "teacher", "sha256": "teacher-digest"},
+        "opponent": {"label": "opponent", "sha256": "opponent-digest"},
+        "episode_steps": 720,
+        "seed_start": 4,
+        "episode_count": 1,
+        "extractor_source_identity": "source-digest",
+    }
+    records = []
+    for seat in (0, 1):
+        archive = output / f"episode-00000004-seat{seat}.npz"
+        archive.write_bytes(f"seat {seat}".encode())
+        records.append(
+            {
+                "file": archive.name,
+                "seed": 4,
+                "seat": seat,
+                "sha256": extractor.file_sha256(archive),
+            }
+        )
+    (output / "manifest.json").write_text(
+        json.dumps({**configuration, "episodes": records}),
+        encoding="utf-8",
+    )
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    recovered = extractor._load_resumable_records(output, staging, configuration)
+    assert {(record["seed"], record["seat"]) for record in recovered} == {(4, 0), (4, 1)}
+
+    mismatched = {
+        **configuration,
+        "teacher": {"label": "other", "sha256": "other-digest"},
+    }
+    with pytest.raises(ValueError, match="provenance does not match"):
+        extractor._load_resumable_records(output, staging, mismatched)
+
+    (output / records[0]["file"]).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        extractor._load_resumable_records(output, staging, configuration)

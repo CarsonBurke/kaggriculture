@@ -350,6 +350,11 @@ def test_freeze_source_is_exact_read_only_and_idempotent(tmp_path: Path) -> None
     with pytest.raises(PermissionError, match="permissions are mutable"):
         freeze_source(destination, source)
 
+    wrong_destination = tmp_path / "snapshots" / ("0" * 64)
+    with pytest.raises(ValueError, match="must be named for its verified identity"):
+        freeze_source(wrong_destination, source)
+    assert not wrong_destination.exists()
+
 
 def test_run_provenance_is_portable_canonical_and_tamper_evident(tmp_path: Path) -> None:
     _minimal_source(tmp_path)
