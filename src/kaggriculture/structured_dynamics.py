@@ -214,12 +214,15 @@ def _latent_smooth_l1(
 
 
 def _eligible_rms_ratio(predicted: Tensor, previous: Tensor, eligible: Tensor) -> Tensor:
+    """Measure transition size without adding a diagnostic branch to backward."""
+    predicted_value = predicted.detach().float()
+    previous_value = previous.detach().float()
     weight = eligible.float().reshape(-1, *([1] * (predicted.ndim - 1)))
     elements = weight.sum() * predicted[0].numel()
     residual_rms = (
-        ((predicted.float() - previous.float()).square() * weight).sum() / elements.clamp_min(1)
+        ((predicted_value - previous_value).square() * weight).sum() / elements.clamp_min(1)
     ).sqrt()
-    baseline_rms = ((previous.float().square() * weight).sum() / elements.clamp_min(1)).sqrt()
+    baseline_rms = ((previous_value.square() * weight).sum() / elements.clamp_min(1)).sqrt()
     return residual_rms / baseline_rms.clamp_min(1e-6)
 
 

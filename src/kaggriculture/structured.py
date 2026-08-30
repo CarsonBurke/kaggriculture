@@ -49,7 +49,10 @@ from kaggriculture.tokens import (
     UNIT_ROLES,
     UNIT_TILE_GATHERS,
 )
-from kaggriculture.triton_mlp import fused_relu_squared_mlp
+from kaggriculture.triton_mlp import (
+    fused_relu_squared_mlp,
+    quantize_transpose_mlp_down_weight,
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,10 @@ class StructuredConfig:
             raise ValueError("attention head width must be divisible by 4 for axial RoPE")
         if self.ffn_multiplier <= 0:
             raise ValueError("ffn_multiplier must be positive")
+        if self.fused_mlp and (self.model_dim % 128 or self.model_dim * self.ffn_multiplier % 256):
+            raise ValueError(
+                "fused MLP requires model width divisible by 128 and hidden width by 256"
+            )
         if self.farm_blocks <= 0:
             raise ValueError("farm_blocks must be positive")
         if self.opponent_latents <= 0:
@@ -225,7 +232,8 @@ class GatedResidual(nn.Module):
         self.gate = nn.Parameter(torch.full((width,), initial))
 
     def forward(self, residual: Tensor, branch: Tensor) -> Tensor:
-        return residual + self.gate * branch
+        compute_dtype = branch.dtype
+        return residual.to(compute_dtype) + self.gate.to(compute_dtype) * branch
 
 
 class Attention(nn.Module):
@@ -302,20 +310,176 @@ class FeedForward(nn.Module):
 
 
 class FusedFeedForward(nn.Module):
-    """Bias-free hardware-native MLP with a TMA-persistent up projection."""
+    """CUDA-native BF16/FP8 MLP with explicitly refreshed projection copies."""
+
+    _up_weight_bf16: Tensor
+    _down_weight_bf16: Tensor
+    _up_weight_f8: Tensor
+    _up_weight_scale: Tensor
+    _down_weight_f8_storage: Tensor
+    _down_weight_scale: Tensor
+    _down_weight_next_scale: Tensor
+    _down_activation_scale: Tensor
+    _down_partial_amax: Tensor
+    _down_weight_partial_amax: Tensor
 
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
         hidden = config.model_dim * config.ffn_multiplier
-        self.up_weight = nn.Parameter(torch.empty(hidden, config.model_dim))
-        self.down_weight = nn.Parameter(torch.empty(hidden, config.model_dim))
-        nn.init.kaiming_uniform_(self.up_weight, a=5**0.5)
-        nn.init.kaiming_uniform_(self.down_weight.T, a=5**0.5)
+        up_weight = torch.empty(hidden, config.model_dim)
+        down_weight = torch.empty(hidden, config.model_dim)
+        nn.init.kaiming_uniform_(up_weight, a=5**0.5)
+        nn.init.kaiming_uniform_(down_weight.T, a=5**0.5)
         if config.zero_init_branches:
-            nn.init.zeros_(self.down_weight)
+            nn.init.zeros_(down_weight)
+        self.up_weight = nn.Parameter(up_weight)
+        self.down_weight = nn.Parameter(down_weight)
+        self.register_buffer(
+            "_up_weight_bf16",
+            up_weight.bfloat16(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_weight_bf16",
+            down_weight.bfloat16(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_up_weight_f8",
+            torch.empty(0, dtype=torch.float8_e4m3fn),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_up_weight_scale",
+            torch.ones(1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_weight_f8_storage",
+            torch.empty(0, dtype=torch.float8_e4m3fn),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_weight_scale",
+            torch.ones(1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_weight_next_scale",
+            torch.ones(1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_activation_scale",
+            torch.ones(1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_partial_amax",
+            torch.empty(0, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_down_weight_partial_amax",
+            torch.empty(0, dtype=torch.float32),
+            persistent=False,
+        )
+        self._fp8_ready = False
+        self.register_load_state_dict_post_hook(self._invalidate_fp8_after_load)
+
+    def _invalidate_fp8_after_load(
+        self,
+        _module: nn.Module,
+        _incompatible_keys: object,
+    ) -> None:
+        self._fp8_ready = False
+        self._up_weight_bf16.copy_(self.up_weight)
+        self._down_weight_bf16.copy_(self.down_weight)
+
+    @torch.no_grad()
+    def refresh_fp8(self, *, bootstrap_down: bool = False) -> None:
+        if self.up_weight.device.type != "cuda":
+            raise RuntimeError("FP8 projection refresh requires CUDA")
+        self._up_weight_bf16.copy_(self.up_weight)
+        self._down_weight_bf16.copy_(self.down_weight)
+        hidden, width = self.up_weight.shape
+        sms = torch.cuda.get_device_properties(self.up_weight.device).multi_processor_count
+        weight_tiles = ((hidden + 63) // 64) * ((width + 63) // 64)
+        if self._up_weight_f8.shape != self.up_weight.shape:
+            self._up_weight_f8 = torch.empty_like(
+                self.up_weight,
+                dtype=torch.float8_e4m3fn,
+            )
+            self._down_weight_f8_storage = torch.empty(
+                width,
+                hidden,
+                dtype=torch.float8_e4m3fn,
+                device=self.up_weight.device,
+            )
+            self._down_partial_amax = torch.empty(
+                sms,
+                dtype=torch.float32,
+                device=self.up_weight.device,
+            )
+            self._down_weight_partial_amax = torch.empty(
+                weight_tiles,
+                dtype=torch.float32,
+                device=self.up_weight.device,
+            )
+
+        up_scale = self._up_weight_bf16.float().abs().amax().clamp_min(1.0e-12) / 448.0
+        self._up_weight_scale.copy_(up_scale)
+        self._up_weight_f8.copy_(
+            (self._up_weight_bf16 / self._up_weight_scale).to(torch.float8_e4m3fn)
+        )
+        if bootstrap_down:
+            down_scale = self._down_weight_bf16.float().abs().amax().clamp_min(1.0e-12) / 448.0
+            self._down_weight_next_scale.copy_(down_scale)
+        quantize_transpose_mlp_down_weight(
+            self._down_weight_bf16,
+            self._down_weight_f8_storage,
+            self._down_weight_next_scale,
+            self._down_weight_scale,
+            self._down_weight_partial_amax,
+        )
+        self._fp8_ready = True
 
     def forward(self, inputs: Tensor) -> Tensor:
-        return fused_relu_squared_mlp(inputs, self.up_weight, self.down_weight)
+        fp8_state = None
+        if self.training:
+            if not self._fp8_ready:
+                raise RuntimeError("training a fused MLP requires refreshed FP8 projections")
+            fp8_state = (
+                self._up_weight_f8,
+                self._up_weight_scale,
+                self._down_weight_f8_storage.T,
+                self._down_weight_scale,
+                self._down_activation_scale,
+                self._down_partial_amax,
+            )
+        return fused_relu_squared_mlp(
+            inputs,
+            self.up_weight,
+            self.down_weight,
+            self._up_weight_bf16,
+            self._down_weight_bf16,
+            fp8_state=fp8_state,
+        )
+
+
+def refresh_fused_mlp_fp8(
+    module: nn.Module,
+    *,
+    bootstrap_down: bool | None = None,
+) -> None:
+    """Initialize missing FP8 state or refresh every projection after an update."""
+    for child in module.modules():
+        if isinstance(child, FusedFeedForward):
+            if bootstrap_down is None and child._fp8_ready:
+                continue
+            child.refresh_fp8(
+                bootstrap_down=not child._fp8_ready if bootstrap_down is None else bootstrap_down
+            )
 
 
 class Block(nn.Module):

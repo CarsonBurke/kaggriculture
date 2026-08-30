@@ -346,14 +346,16 @@ def _decision_kl(
 ) -> tuple[Tensor, Tensor]:
     """Masked KL(teacher || student) summed over decisions, and its weight sum.
 
-    Masks are not validated: an inactive order slot carries an all-false mask,
-    which the policy path also tolerates (`train_bc._clone_loss` passes
-    ``validate_masks=False``). Such a slot decodes to the same uniform
-    distribution on both sides, contributes exactly zero, and is excluded by
-    ``weight`` regardless.
+    Inactive slots carry all-false legality masks. Give those slots one inert
+    category before log-softmax, then remove them with ``weight``. This keeps
+    their KL and gradient exactly zero without asking a compiled log-softmax to
+    normalize a row filled with the smallest finite float.
     """
-    student = mask_logits(student_logits, mask, validate=False).log_softmax(dim=-1)
-    teacher = mask_logits(teacher_logits, mask, validate=False).log_softmax(dim=-1)
+    inactive = ~weight.bool()
+    first_category = torch.arange(mask.shape[-1], device=mask.device) == 0
+    safe_mask = mask | (inactive.unsqueeze(-1) & first_category)
+    student = mask_logits(student_logits, safe_mask, validate=False).log_softmax(dim=-1)
+    teacher = mask_logits(teacher_logits, safe_mask, validate=False).log_softmax(dim=-1)
     pointwise = F.kl_div(student, teacher, log_target=True, reduction="none")
     return (pointwise.sum(dim=-1) * weight).sum(), weight.sum()
 

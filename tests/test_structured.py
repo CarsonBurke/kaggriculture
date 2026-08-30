@@ -13,10 +13,12 @@ from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import (
+    FusedFeedForward,
     StructuredActor,
     StructuredConfig,
     StructuredCritic,
     StructuredInputs,
+    refresh_fused_mlp_fp8,
     stack_structured,
 )
 from kaggriculture.structured_dynamics import _latent_smooth_l1
@@ -99,17 +101,71 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
     assert torch.allclose(output.unit_logits[inactive], expanded[inactive])
 
 
-def test_hardware_native_structured_actor_backpropagates_on_cpu(
+def test_hardware_native_mlp_rejects_cpu_execution() -> None:
+    module = FusedFeedForward(
+        replace(
+            _tiny_config(),
+            model_dim=128,
+            attention_heads=4,
+            ffn_multiplier=2,
+            fused_mlp=True,
+        )
+    ).eval()
+
+    with pytest.raises(RuntimeError, match="require CUDA"):
+        module(torch.randn(2, 4, 128, dtype=torch.bfloat16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hardware_native_mlp_compiles_fp8_forward_and_backward() -> None:
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=4,
+        ffn_multiplier=2,
+        fused_mlp=True,
+    )
+    module = FusedFeedForward(config).cuda().train()
+    refresh_fused_mlp_fp8(module, bootstrap_down=True)
+    values = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(module, fullgraph=True)
+
+    compiled(values).float().square().mean().backward()
+
+    assert values.grad is not None and torch.isfinite(values.grad).all()
+    assert module.up_weight.grad is not None and torch.isfinite(module.up_weight.grad).all()
+    assert module.down_weight.grad is not None and torch.isfinite(module.down_weight.grad).all()
+    prior = module._up_weight_f8.clone()
+    with torch.no_grad():
+        module.up_weight.add_(0.01)
+    refresh_fused_mlp_fp8(module, bootstrap_down=False)
+    assert not torch.equal(prior, module._up_weight_f8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_hardware_native_actor_runs_autocast_with_fp32_master_weights(
     real_inputs: StructuredInputs,
 ) -> None:
-    actor = StructuredActor(replace(_tiny_config(), fused_mlp=True))
-
-    output = actor(real_inputs)
-    loss = (
-        output.unit_logits.square().mean()
-        + output.market_kind_logits.square().mean()
-        + output.market_quantity_context.square().mean()
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=4,
+        ffn_multiplier=2,
+        fused_mlp=True,
     )
+    actor = StructuredActor(config).cuda().train()
+    refresh_fused_mlp_fp8(actor, bootstrap_down=True)
+    cuda_inputs = StructuredInputs(*(field.cuda() for field in real_inputs))
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = actor(cuda_inputs)
+        loss = (
+            output.unit_logits.float().square().mean()
+            + output.market_kind_logits.float().square().mean()
+            + output.market_quantity_context.float().square().mean()
+        )
     loss.backward()
 
     fused_parameters = [
@@ -118,19 +174,27 @@ def test_hardware_native_structured_actor_backpropagates_on_cpu(
         if name.endswith(("up_weight", "down_weight"))
     ]
     assert fused_parameters
+    assert all(parameter.dtype == torch.float32 for parameter in fused_parameters)
     assert all(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in fused_parameters
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
     torch.manual_seed(0)
-    values = torch.randn(3, 2, 4, 8, dtype=torch.bfloat16)
-    up_weight = torch.randn(3, 16, 8, dtype=torch.bfloat16)
-    down_weight = torch.randn(3, 16, 8, dtype=torch.bfloat16)
+    values = torch.randn(3, 2, 4, 128, device="cuda", dtype=torch.bfloat16)
+    up_weight = torch.randn(3, 256, 128, device="cuda", dtype=torch.bfloat16)
+    down_weight = torch.randn(3, 256, 128, device="cuda", dtype=torch.bfloat16)
 
-    actual, _ = torch.vmap(_FusedReLUSquaredMLP.apply)(values, up_weight, down_weight)
+    actual, _ = torch.vmap(_FusedReLUSquaredMLP.apply)(
+        values,
+        up_weight.float(),
+        down_weight.float(),
+        up_weight,
+        down_weight,
+    )
     expected = torch.stack(
         [
             torch.relu(value @ up.T).square() @ down
@@ -138,7 +202,7 @@ def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
         ]
     )
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-1)
 
 
 def test_structured_actor_exposes_typed_training_belief(

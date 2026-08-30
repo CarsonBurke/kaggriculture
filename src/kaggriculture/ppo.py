@@ -28,6 +28,7 @@ from kaggriculture.structured import (
     StructuredBelief,
     StructuredCritic,
     StructuredInputs,
+    refresh_fused_mlp_fp8,
 )
 from kaggriculture.structured_dynamics import (
     StructuredDynamics,
@@ -2451,6 +2452,7 @@ def _structured_predictor_phase(
     for parameter in actor_parameters:
         parameter.requires_grad_(False)
     dynamics.train()
+    refresh_fused_mlp_fp8(dynamics)
     training_totals = zero_totals()
     trained = 0
     gradient_norm_total = torch.zeros((), device=device, dtype=torch.float64)
@@ -2497,6 +2499,7 @@ def _structured_predictor_phase(
                 config.lr_warmup_steps,
                 found_inf=predictor_skip,
             )
+            refresh_fused_mlp_fp8(dynamics, bootstrap_down=False)
             weight = batch.shape[0]
             record(training_totals, terms, weight)
             training_loss_total += loss.detach().double() * weight
@@ -2644,6 +2647,8 @@ def update_ppo(
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
     actor.train()
     critic.train()
+    refresh_fused_mlp_fp8(actor)
+    refresh_fused_mlp_fp8(critic)
     # Predictor-only fitting must leave the actor with neither changed weights
     # nor stale gradient buffers, including throughout critic warmup.
     actor_optimizer.zero_grad(set_to_none=True)
@@ -3080,6 +3085,7 @@ def update_ppo(
                         config.actor_learning_rate,
                         config.lr_warmup_steps,
                     )
+                    refresh_fused_mlp_fp8(actor, bootstrap_down=False)
                     totals["policy_loss"] += policy_loss.detach().double() * component_count
                     totals["entropy"] += entropy_mean.detach().double() * component_count
                     totals["approx_kl"] += batch_kl * component_count
@@ -3123,6 +3129,7 @@ def update_ppo(
                 config.lr_warmup_steps,
                 found_inf=critic_skip,
             )
+            refresh_fused_mlp_fp8(critic, bootstrap_down=False)
 
             totals["value_loss"] += value_loss.detach().double() * states
             totals["critic_gradient_norm"] += critic_gradient_norm * states

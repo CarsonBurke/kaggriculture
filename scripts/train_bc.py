@@ -71,7 +71,12 @@ from kaggriculture.registry import (
     architecture_of_config,
     resolve_architecture,
 )
-from kaggriculture.structured import StructuredActor, StructuredBelief, StructuredInputs
+from kaggriculture.structured import (
+    StructuredActor,
+    StructuredBelief,
+    StructuredInputs,
+    refresh_fused_mlp_fp8,
+)
 from kaggriculture.structured_dynamics import StructuredDynamics, structured_horizon_loss
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.tokens import encode_structured_observation
@@ -1298,18 +1303,6 @@ def train(
         raise ValueError(
             f"unknown compile mode {compile_mode!r}; expected 'none' or one of {COMPILE_MODES}"
         )
-    requested_compile_mode = compile_mode
-    if structured_latent_coefficient and compile_mode != "none":
-        # Inductor's backward is non-finite on the first step when the typed
-        # transition selects only the policy-read decision queries. The same
-        # source-bound jobs train normally in eager mode. Keep the default CLI
-        # usable, and record both values rather than emitting a corrupt actor.
-        print(
-            "structured latent training uses eager mode because its compiled "
-            "backward is numerically invalid",
-            flush=True,
-        )
-        compile_mode = "none"
     # A captured graph is bound to one set of shapes, and an epoch's last
     # minibatch is a short tail, so a cudagraphs mode would recapture per shape
     # or fail outright. Read from inductor's config for the mode rather than
@@ -1421,6 +1414,9 @@ def train(
         dynamics = StructuredDynamics(config).to(device)
     else:
         dynamics = None
+    refresh_fused_mlp_fp8(actor, bootstrap_down=True)
+    if dynamics is not None:
+        refresh_fused_mlp_fp8(dynamics, bootstrap_down=True)
     matrices, vectors = route_parameters(actor)
     if dynamics is not None:
         extra_matrices, extra_vectors = route_parameters(dynamics)
@@ -1476,7 +1472,6 @@ def train(
         "batch_size": batch_size,
         "run_length": run_length,
         "compile_mode": compile_mode,
-        "requested_compile_mode": requested_compile_mode,
         "latent_dynamics_coefficient": latent_dynamics_coefficient,
         "latent_decode_coefficient": latent_decode_coefficient,
         "latent_horizon": latent_horizon,
@@ -1596,6 +1591,13 @@ def train(
                 )
                 _apply_schedule(optimizer, step_index, total_steps)
                 optimizer.step()
+                bootstrap_fp8_down = step_index < 16
+                refresh_fused_mlp_fp8(actor, bootstrap_down=bootstrap_fp8_down)
+                if dynamics is not None:
+                    refresh_fused_mlp_fp8(
+                        dynamics,
+                        bootstrap_down=bootstrap_fp8_down,
+                    )
                 step_index += 1
                 # The loss is a mean over active components, so the epoch
                 # average must weight by that same count, exactly as the PPO

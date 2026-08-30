@@ -343,7 +343,7 @@ def test_load_dataset_rejects_disagreeing_episode_steps(dataset_dir: Path, tmp_p
         )
 
 
-def _tagging_encoder() -> Callable[[str, str], dict[str, np.ndarray]]:
+def _tagging_encoder() -> Callable[..., dict[str, np.ndarray]]:
     """A stand-in tokenizer that makes the split assignment observable.
 
     The fixture's 8-step starter episodes encode byte-identically for every
@@ -354,7 +354,12 @@ def _tagging_encoder() -> Callable[[str, str], dict[str, np.ndarray]]:
     """
     order = itertools.count()
 
-    def encode(path_text: str, architecture_name: str) -> dict[str, np.ndarray]:
+    def encode(
+        path_text: str,
+        cache_path: str | None,
+        *,
+        architecture_name: str,
+    ) -> dict[str, np.ndarray]:
         return {
             "tag": np.array([[next(order)]], dtype=np.int64),
             "unit_actions": np.zeros((1, 1), dtype=np.int8),
@@ -621,8 +626,21 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
     from kaggriculture.model import FarmActor
 
     actor = FarmActor(_tiny_config())
+    run_starts, run_lengths = trainer._run_blocks(
+        train_split.staged["episode_index"],
+        1,
+    )
+    order = trainer._run_epoch_order(
+        run_starts,
+        run_lengths,
+        torch.Generator(device="cpu").manual_seed(0),
+    )
     actor_args, factors = trainer._batch(
-        CONV_ENTITY, train_split, torch.arange(train_split.rows), torch.device("cpu")
+        CONV_ENTITY,
+        train_split,
+        order,
+        torch.device("cpu"),
+        orientation_rng=np.random.default_rng(0),
     )
     loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
 
@@ -1211,8 +1229,8 @@ def test_the_structured_auxiliary_trains_and_is_journalled(
     assert provenance["structured_latent_coefficient"] == 1.0
     assert provenance["structured_decision_coefficient"] == 1.0
     assert provenance["structured_decision_horizon"] == 1
-    assert provenance["compile_mode"] == "none"
-    assert provenance["requested_compile_mode"] == "default"
+    assert provenance["compile_mode"] == "default"
+    assert "requested_compile_mode" not in provenance
     assert not any(name.startswith(("action.", "transition.")) for name in payload["actor"])
 
 
