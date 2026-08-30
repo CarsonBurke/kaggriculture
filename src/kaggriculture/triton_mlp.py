@@ -184,7 +184,10 @@ def fused_relu_squared_mlp(
 ) -> Tensor:
     """Apply the hardware-native bias-free MLP, with a portable eager fallback."""
     fused_dtypes = values.dtype == up_weight.dtype == down_weight.dtype == torch.bfloat16
-    if values.device.type == "cuda" and (torch.is_autocast_enabled("cuda") or fused_dtypes):
+    fused_eligible = values.device.type == "cuda" and not (
+        torch._C._are_functorch_transforms_active()
+    )
+    if fused_eligible and (torch.is_autocast_enabled("cuda") or fused_dtypes):
         output, _ = _FusedReLUSquaredMLP.apply(values, up_weight, down_weight)
         return output
     hidden = torch.relu(values @ up_weight.T)
