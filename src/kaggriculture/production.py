@@ -297,8 +297,6 @@ def build_training_command(
             str(ppo["critic_learning_rate"]),
             "--lr-warmup-steps",
             str(ppo["lr_warmup_steps"]),
-            "--weight-decay",
-            str(ppo["weight_decay"]),
             "--epochs",
             str(ppo["epochs"]),
             "--critic-epochs",

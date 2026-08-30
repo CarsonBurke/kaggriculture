@@ -93,12 +93,13 @@ def main() -> None:
         dynamics,
         actor_args,
         factors,
-        device.type == "cuda",
-        0,
-        1,
-        False,
-        False,
-        False,
+        autocast=device.type == "cuda",
+        decision_horizon=0,
+        latent_horizon=0,
+        patch_horizon=1,
+        economy_active=False,
+        opponent_summary_active=False,
+        opponent_patches_active=False,
     )
     trunk_parameters = tuple(
         parameter for parameter in actor.trunk.parameters() if parameter.requires_grad

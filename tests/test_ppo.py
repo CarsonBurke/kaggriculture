@@ -48,8 +48,13 @@ from kaggriculture.rollout import (
     _TRAJECTORY_METADATA_FIELDS,
     collect_self_play,
 )
-from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.structured_dynamics import StructuredDynamics
+from kaggriculture.structured import (
+    StructuredActor,
+    StructuredBelief,
+    StructuredConfig,
+    StructuredCritic,
+)
+from kaggriculture.structured_dynamics import StructuredDynamics, _active_belief_fields
 
 
 def test_entropy_bonus_is_not_configurable() -> None:
@@ -1052,7 +1057,6 @@ def test_zero_policy_advantage_leaves_actor_unchanged(monkeypatch) -> None:
         epochs=1,
         minibatch_size=rollout.state_count,
         lr_warmup_steps=0,
-        weight_decay=0.0,
         use_bfloat16=False,
         actor_learning_rate=1.0e-2,
     )
@@ -1415,6 +1419,22 @@ def test_structured_window_loss_matches_generic_masked_unroll() -> None:
         torch.testing.assert_close(window_value, generic_value)
 
 
+def test_multistep_structured_dynamics_activates_central_workspace() -> None:
+    common = {
+        "decision_horizon": 0,
+        "own_patches_active": True,
+        "economy_active": False,
+        "opponent_summary_active": False,
+        "opponent_patches_active": False,
+    }
+
+    single_step = _active_belief_fields(recurrent_workspace=False, **common)
+    multi_step = _active_belief_fields(recurrent_workspace=True, **common)
+
+    assert not single_step[StructuredBelief._fields.index("central_latents")]
+    assert multi_step[StructuredBelief._fields.index("central_latents")]
+
+
 def test_sparse_structured_transition_preserves_active_belief_families() -> None:
     actor, rollout = _structured_rollout_with_quantity_orders(
         seed_start=206,
@@ -1593,6 +1613,29 @@ def test_structured_predictor_trains_during_critic_only_warmup_without_actor_gra
         not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
     )
     assert all(parameter.grad is None for parameter in actor.parameters())
+
+
+def test_ppo_adamw_optimizers_never_apply_weight_decay() -> None:
+    model_config = ModelConfig(
+        cnn_width=8,
+        cnn_blocks=1,
+        model_dim=16,
+        transformer_layers=3,
+        attention_heads=2,
+    )
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    dynamics = StructuredDynamics(_small_structured_config())
+    config = PpoConfig(optimizer="adamw")
+
+    optimizers = (
+        *make_optimizers(actor, critic, config),
+        make_structured_dynamics_optimizer(dynamics, config),
+    )
+
+    assert all(
+        group["weight_decay"] == 0.0 for optimizer in optimizers for group in optimizer.param_groups
+    )
 
 
 def test_target_correlation_separates_noise_from_a_mis_scaled_critic() -> None:

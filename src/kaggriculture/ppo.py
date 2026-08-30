@@ -522,10 +522,6 @@ class PpoConfig:
     # decay. `modded-nanogpt` ships both.
     normuon_momentum: float = 0.95
     normuon_beta2: float = 0.9
-    # No weight decay: with decay the AdamW update is not scale-invariant and
-    # steadily shrinks norm gains and biases, and the CleanRL reference runs
-    # plain Adam. Zero makes AdamW identical to Adam.
-    weight_decay: float = 0.0
     epochs: int = 4
     # Total epochs for the critic; the actor participates only in the first
     # `epochs` of them, so values above `epochs` are critic-only refits over
@@ -777,8 +773,6 @@ def _validate_config(config: PpoConfig) -> None:
     ):
         if not math.isfinite(value) or not 0.0 <= value < 1.0:
             raise ValueError(f"{name} must be finite and in [0, 1)")
-    if not math.isfinite(config.weight_decay) or config.weight_decay < 0.0:
-        raise ValueError("weight decay must be finite and non-negative")
     if config.epochs < 1 or config.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
     if config.critic_epochs is not None and config.critic_epochs < config.epochs:
@@ -1233,14 +1227,14 @@ def make_optimizers(
         actor.parameters(),
         lr=config.actor_learning_rate,
         eps=1e-5,
-        weight_decay=config.weight_decay,
+        weight_decay=0.0,
         fused=fused,
     )
     critic_optimizer = torch.optim.AdamW(
         critic.parameters(),
         lr=config.critic_learning_rate,
         eps=1e-5,
-        weight_decay=config.weight_decay,
+        weight_decay=0.0,
         fused=fused,
     )
     _initialize_optimizer_schedule(actor_optimizer, config.actor_learning_rate)
@@ -1267,7 +1261,7 @@ def make_structured_dynamics_optimizer(
         dynamics.parameters(),
         lr=learning_rate,
         eps=1e-5,
-        weight_decay=config.weight_decay,
+        weight_decay=0.0,
         fused=next(dynamics.parameters()).device.type == "cuda",
     )
     _initialize_optimizer_schedule(optimizer, learning_rate)

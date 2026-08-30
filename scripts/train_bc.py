@@ -1368,6 +1368,11 @@ def train(
             f"an auxiliary horizon of {auxiliary_horizon} needs --run-length above it; "
             f"got {run_length}, which yields no eligible pair"
         )
+    if auxiliary_horizon and batch_size <= auxiliary_horizon:
+        raise ValueError(
+            f"an auxiliary horizon of {auxiliary_horizon} needs --batch-size above it; "
+            f"got {batch_size}, so every minibatch has no eligible pair"
+        )
     artifact_path = output_dir / "bc-actor.pt"
     metrics_path = output_dir / "metrics.jsonl"
     # A second clone into a populated directory would overwrite an artifact
@@ -1393,6 +1398,14 @@ def train(
         seeds_per_dataset=seeds_per_dataset,
         encoded_cache=encoded_cache,
     )
+    if auxiliary_horizon:
+        minibatches = _balanced_minibatch_slices(train_split.rows, batch_size)
+        minimum_minibatch = min(batch.stop - batch.start for batch in minibatches)
+        if minimum_minibatch <= auxiliary_horizon:
+            raise ValueError(
+                f"an auxiliary horizon of {auxiliary_horizon} needs every balanced "
+                f"minibatch above it; the smallest minibatch has {minimum_minibatch} rows"
+            )
     print(
         f"dataset: {len(datasets)} corpora, {train_split.rows} train rows, "
         f"{holdout_split.rows} holdout rows ({holdout_seeds} held-out seeds each)",

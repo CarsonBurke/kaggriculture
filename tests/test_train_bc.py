@@ -1040,7 +1040,12 @@ def test_the_schedule_sets_every_group_from_its_own_base_rate() -> None:
     matrix = torch.nn.Parameter(torch.randn(16, 16))
     vector = torch.nn.Parameter(torch.randn(16))
     optimizer = NorMuon(
-        [matrix], [vector], learning_rate=3e-3, adam_learning_rate=1e-3, weight_decay=1.2
+        [matrix],
+        [vector],
+        learning_rate=3e-3,
+        adam_learning_rate=1e-3,
+        weight_decay=1.2,
+        adam_weight_decay=0.005,
     )
     total = 100
     trainer._apply_schedule(optimizer, total, total)
@@ -1050,6 +1055,8 @@ def test_the_schedule_sets_every_group_from_its_own_base_rate() -> None:
         expected = group["base_lr"] * trainer.FINAL_RATE_FRACTION
         assert group["lr"] == pytest.approx(expected)
     assert groups["normuon"]["momentum"] == pytest.approx(trainer.MOMENTUM_MINIMUM)
+    assert groups["normuon"]["weight_decay"] == pytest.approx(1.2)
+    assert groups["adam"]["weight_decay"] == pytest.approx(0.005)
     # The Adam half has no Nesterov coefficient to schedule, and inventing one
     # here would be read by nothing.
     assert "momentum" not in groups["adam"]
@@ -1254,6 +1261,28 @@ def test_the_auxiliary_is_refused_when_the_sampler_gives_it_no_pairs(
             patience=1,
             batch_size=64,
             run_length=1,
+            latent_dynamics_coefficient=1.0,
+            latent_horizon=1,
+            matrix_learning_rate=1e-3,
+            matrix_weight_decay=1.2,
+            adam_learning_rate_ratio=0.35,
+            adam_weight_decay=0.005,
+            seed=0,
+            device=torch.device("cpu"),
+            encode_workers=1,
+        )
+
+    with pytest.raises(ValueError, match="needs --batch-size above it"):
+        trainer.train(
+            dataset_dirs=[dataset_dir],
+            output_dir=tmp_path / "singleton-minibatches",
+            architecture=CONV_ENTITY,
+            config=_tiny_config(),
+            holdout_seeds=1,
+            epochs=1,
+            patience=1,
+            batch_size=1,
+            run_length=2,
             latent_dynamics_coefficient=1.0,
             latent_horizon=1,
             matrix_learning_rate=1e-3,

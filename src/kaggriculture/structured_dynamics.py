@@ -250,6 +250,7 @@ def _active_belief_fields(
     *,
     decision_horizon: int,
     own_patches_active: bool,
+    recurrent_workspace: bool,
     economy_active: bool,
     opponent_summary_active: bool,
     opponent_patches_active: bool,
@@ -259,7 +260,7 @@ def _active_belief_fields(
         opponent_patches_active,
         opponent_summary_active,
         economy_active,
-        False,
+        recurrent_workspace,
         bool(decision_horizon),
         bool(decision_horizon),
     )
@@ -305,6 +306,7 @@ def structured_horizon_loss(
     residual_sums = [zero for _ in StructuredBelief._fields]
     active_fields = _active_belief_fields(
         decision_horizon=max(decision_horizon, latent_horizon),
+        recurrent_workspace=max_horizon > 1,
         own_patches_active=own_patches_active,
         economy_active=economy_active,
         opponent_summary_active=opponent_summary_active,
@@ -519,6 +521,7 @@ def structured_window_loss(
     residual_sums = [zero for _ in StructuredBelief._fields]
     active_fields = _active_belief_fields(
         decision_horizon=decision_horizon,
+        recurrent_workspace=max_horizon > 1,
         own_patches_active=own_patches_active,
         economy_active=economy_active,
         opponent_summary_active=opponent_summary_active,
