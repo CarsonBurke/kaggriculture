@@ -29,7 +29,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.league import (
-    LEAGUE_OPPONENT_KEY,
     PFSP_UNMEASURED_SCORE_RATE,
     BuiltinSelection,
     FrozenActorPool,
@@ -89,6 +88,7 @@ from kaggriculture.telemetry import (
     population_disagreement_field,
     population_disagreement_pair_field,
     population_head_to_head_field,
+    read_jsonl_snapshot,
 )
 from kaggriculture.training import (
     TrainingAgent,
@@ -213,7 +213,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-lr", type=float, default=PpoConfig.actor_learning_rate)
     parser.add_argument("--critic-lr", type=float, default=PpoConfig.critic_learning_rate)
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument(
         "--critic-epochs",
@@ -1158,7 +1157,13 @@ def _validate_league_score_rates(rates: object) -> dict[str, float]:
         raise ValueError("resume checkpoint has no valid league score-rate state")
     validated: dict[str, float] = {}
     for key, rate in rates.items():
-        if type(key) is not str or LEAGUE_OPPONENT_KEY.fullmatch(key) is None:
+        valid_snapshot = type(key) is str and len(key) == 8 and key.isascii() and key.isdigit()
+        valid_builtin = (
+            type(key) is str
+            and key.startswith("builtin_")
+            and key.removeprefix("builtin_") in BUILTIN_OPPONENTS
+        )
+        if not valid_snapshot and not valid_builtin:
             raise ValueError("resume checkpoint has an invalid league score-rate opponent")
         if type(rate) is not float or not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
             raise ValueError("resume checkpoint has an invalid league score rate")
@@ -1229,6 +1234,62 @@ def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
     args.external_eval_opponents = ",".join(resolved)
 
 
+_EXTERNAL_EVAL_PENDING = "external-eval-pending.json"
+
+
+def _external_eval_pending(args: argparse.Namespace) -> list[tuple[Path, int]]:
+    cached = getattr(args, "_kaggriculture_pending_evals", None)
+    if cached is not None:
+        return list(cached)
+    path = args.run_dir / _EXTERNAL_EVAL_PENDING
+    pending: list[tuple[Path, int]] = []
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"invalid external evaluation queue: {path}")
+        for event in payload:
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("checkpoint"), str)
+                or type(event.get("iteration")) is not int
+                or event["iteration"] < 1
+            ):
+                raise ValueError(f"invalid external evaluation queue event: {event!r}")
+            pending.append((Path(event["checkpoint"]), event["iteration"]))
+    args._kaggriculture_pending_evals = tuple(pending)
+    return pending
+
+
+def _persist_external_eval_pending(
+    args: argparse.Namespace,
+    pending: Sequence[tuple[Path, int]],
+) -> None:
+    events = tuple(pending)
+    args._kaggriculture_pending_evals = events
+    path = args.run_dir / _EXTERNAL_EVAL_PENDING
+    if not events:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                [
+                    {"checkpoint": str(checkpoint), "iteration": iteration}
+                    for checkpoint, iteration in events
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _maybe_launch_external_eval(
     args: argparse.Namespace,
     checkpoint: Path | None,
@@ -1240,15 +1301,14 @@ def _maybe_launch_external_eval(
     """Launch committed checkpoints in FIFO order without stacking CPU workers."""
     if not args.external_eval:
         return process
-    pending: list[tuple[Path, int]] = (
-        list(getattr(process, "_kaggriculture_pending_evals", ())) if process is not None else []
-    )
-    if checkpoint is not None and committed_iteration >= 1:
-        pending.append((checkpoint, committed_iteration))
+    pending = _external_eval_pending(args)
+    event = (checkpoint, committed_iteration)
+    if checkpoint is not None and committed_iteration >= 1 and event not in pending:
+        pending.append(event)
+        _persist_external_eval_pending(args, pending)
     if not pending:
         return process
     if process is not None and process.poll() is None:
-        setattr(process, "_kaggriculture_pending_evals", tuple(pending))  # noqa: B010
         if not wait_for_slot:
             return process
         process.wait()
@@ -1292,15 +1352,11 @@ def _maybe_launch_external_eval(
                     start_new_session=True,
                 )
         except OSError as error:
+            pending.insert(0, (next_checkpoint, next_iteration))
+            _persist_external_eval_pending(args, pending)
             print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
-            if process is not None:
-                setattr(  # noqa: B010
-                    process,
-                    "_kaggriculture_pending_evals",
-                    ((next_checkpoint, next_iteration), *pending),
-                )
             return process
-        setattr(process, "_kaggriculture_pending_evals", tuple(pending))  # noqa: B010
+        _persist_external_eval_pending(args, pending)
         if not wait_for_slot or not pending:
             return process
         process.wait()
@@ -1429,6 +1485,45 @@ def _validate_league_manifest(
     return validated
 
 
+def _rollback_metrics_journal(
+    path: Path,
+    checkpoint_iteration: int,
+    checkpoint_metrics: Mapping[str, Any],
+) -> None:
+    """Atomically discard journal rows beyond a verified recovery boundary."""
+    snapshot = read_jsonl_snapshot(path)
+    iterations: list[int] = []
+    kept: list[dict[str, Any]] = []
+    boundary: dict[str, Any] | None = None
+    for record in snapshot.records:
+        iteration = record.get("iteration")
+        if type(iteration) is not int or iteration < 1:
+            raise ValueError("metrics journal has an invalid iteration")
+        if iterations and iteration <= iterations[-1]:
+            raise ValueError("metrics journal iterations are not strictly increasing")
+        iterations.append(iteration)
+        if iteration <= checkpoint_iteration:
+            kept.append(record)
+        if iteration == checkpoint_iteration:
+            boundary = record
+    if checkpoint_iteration > 0 and (
+        boundary is None or not _checkpoint_values_equal(boundary, dict(checkpoint_metrics))
+    ):
+        raise ValueError("metrics journal checkpoint boundary does not match recovery state")
+    if not iterations or iterations[-1] <= checkpoint_iteration:
+        return
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.rollback")
+    try:
+        temporary.write_text(
+            "".join(json.dumps(record, sort_keys=True, allow_nan=False) + "\n" for record in kept),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _restore_league_archive(
     *,
     checkpoint: Path,
@@ -1444,46 +1539,47 @@ def _restore_league_archive(
     existing_refs = list_actor_snapshots(destination)
     existing_by_name = {ref.path.name: ref for ref in existing_refs}
     unexpected = set(existing_by_name) - expected_names
-    trailing_name = f"league-actor-{current_iteration + 1:08d}.pt"
-    disallowed = unexpected - {trailing_name}
-    if disallowed or len(unexpected) > 1:
-        raise ValueError(
-            "resume destination contains league snapshots outside the checkpoint manifest; "
-            "use a fresh --run-dir when rewinding a run"
-        )
-    if trailing_name in unexpected:
-        # A kill after committing snapshot K+1 but before atomically replacing
-        # latest.pt leaves exactly this recoverable state. It remains
-        # ineligible while replaying iteration K; save_actor_snapshot later
-        # requires the regenerated actor state to match exactly.
+    rollback: list[SnapshotRef] = []
+    for name in sorted(unexpected):
+        ref = existing_by_name[name]
+        if ref.iteration <= current_iteration:
+            raise ValueError(
+                "resume destination contains a league snapshot missing from the "
+                f"checkpoint manifest: {ref.path}"
+            )
         load_actor_snapshot(
-            existing_by_name[trailing_name].path,
+            ref.path,
             expected_model_config=model_config,
             device="cpu",
         )
+        rollback.append(ref)
+    missing: list[Path] = []
     for iteration, expected_digest in sorted(manifest.items()):
         name = f"league-actor-{iteration:08d}.pt"
         target = destination / name
-        if not target.exists():
-            source = source_directory / name
-            if not source.is_file():
-                raise FileNotFoundError(
-                    f"checkpoint league sidecar is incomplete; missing snapshot: {source}"
-                )
-            copy_actor_snapshot(
-                source,
-                destination,
-                expected_model_config=model_config,
+        source = target if target.exists() else source_directory / name
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"checkpoint league sidecar is incomplete; missing snapshot: {source}"
             )
-        else:
-            load_actor_snapshot(
-                target,
-                expected_model_config=model_config,
-                device="cpu",
-            )
-        actual_digest = snapshot_sha256(target)
-        if actual_digest != expected_digest:
-            raise ValueError(f"league snapshot digest mismatch: {target}")
+        load_actor_snapshot(
+            source,
+            expected_model_config=model_config,
+            device="cpu",
+        )
+        if snapshot_sha256(source) != expected_digest:
+            raise ValueError(f"league snapshot digest mismatch: {source}")
+        if source != target:
+            missing.append(source)
+
+    for ref in rollback:
+        ref.path.unlink()
+    for source in missing:
+        copy_actor_snapshot(
+            source,
+            destination,
+            expected_model_config=model_config,
+        )
 
 
 def _agent_fields(
@@ -2054,7 +2150,6 @@ def main() -> None:
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
         lr_warmup_steps=args.lr_warmup_steps,
-        weight_decay=args.weight_decay,
         epochs=args.epochs,
         critic_epochs=args.critic_epochs,
         minibatch_size=args.minibatch_size,
@@ -2210,12 +2305,11 @@ def main() -> None:
         )
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
-    journal_iteration = metrics_journal_iteration(args.run_dir / "metrics.jsonl")
+    journal_path = args.run_dir / "metrics.jsonl"
+    journal_iteration = metrics_journal_iteration(journal_path)
     if resume_payload is not None and journal_iteration > iteration:
-        raise ValueError(
-            "resume destination has committed metrics newer than the checkpoint; "
-            "use a fresh --run-dir when rewinding a run"
-        )
+        _rollback_metrics_journal(journal_path, iteration, resume_payload["metrics"])
+        journal_iteration = metrics_journal_iteration(journal_path)
     initial_checkpoint = args.run_dir / "checkpoint-000000.pt"
     if (
         iteration == 0
@@ -2424,12 +2518,17 @@ def main() -> None:
     numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
     destination_latest = args.run_dir / "latest.pt"
     if resume_payload is not None:
+        in_place_resume = args.resume.parent.resolve() == args.run_dir.resolve()
         for existing in (numbered_checkpoint, destination_latest):
             if not existing.exists():
                 continue
             existing_payload = torch.load(existing, map_location="cpu", weights_only=False)
-            if not _checkpoint_values_equal(existing_payload, resume_payload):
-                raise FileExistsError(f"checkpoint conflicts with resume state: {existing}")
+            if _checkpoint_values_equal(existing_payload, resume_payload):
+                continue
+            if existing == destination_latest and in_place_resume:
+                replace_checkpoint_alias(args.resume, destination_latest)
+                continue
+            raise FileExistsError(f"checkpoint conflicts with resume state: {existing}")
         if not numbered_checkpoint.exists():
             install_immutable_checkpoint(args.resume, numbered_checkpoint)
     else:
@@ -2472,6 +2571,19 @@ def main() -> None:
     last_parity_audit: dict[str, int] = {}
     external_eval_process: subprocess.Popen | None = None
     while iteration < args.iterations:
+        # Opponent discovery below must observe the previous iteration's
+        # immutable actor snapshot. The same barrier publishes its metrics and
+        # recovery checkpoint before this iteration consumes league RNG.
+        if pending_commit is not None:
+            completed_checkpoint = pending_commit.result()
+            pending_commit = None
+            if completed_checkpoint is not None:
+                external_eval_process = _maybe_launch_external_eval(
+                    args,
+                    completed_checkpoint[0],
+                    completed_checkpoint[1],
+                    external_eval_process,
+                )
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
             break
         iteration_started = time.monotonic()
@@ -2729,18 +2841,6 @@ def main() -> None:
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
-        # Finish the previous ordered commit before capturing this boundary.
-        # The update cannot mutate again until this loop advances, so waiting
-        # here does not compromise the state being checkpointed.
-        if pending_commit is not None:
-            completed_checkpoint = pending_commit.result()
-            if completed_checkpoint is not None:
-                external_eval_process = _maybe_launch_external_eval(
-                    args,
-                    completed_checkpoint[0],
-                    completed_checkpoint[1],
-                    external_eval_process,
-                )
 
         checkpoint_now = time.monotonic()
         clean_final = iteration >= args.iterations or bool(

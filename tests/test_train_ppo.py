@@ -379,6 +379,8 @@ def test_league_score_rate_validation_accepts_only_finite_unit_interval_state() 
         "00000003": 0.25,
         "builtin_starter": 1.0,
     }
+    builtin_rates = {f"builtin_{name}": 0.5 for name in module.BUILTIN_OPPONENTS}
+    assert module._validate_league_score_rates(builtin_rates) == builtin_rates
     for invalid in (
         None,
         [("00000003", 0.25)],
@@ -508,7 +510,10 @@ def test_a_population_is_probed_from_its_committed_checkpoint(monkeypatch, tmp_p
     assert command[command.index("--agents") + 1] == "0,1,2,3"
 
 
-def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path) -> None:
+def test_external_eval_launch_failure_is_retried_from_the_durable_fifo(
+    monkeypatch,
+    tmp_path,
+) -> None:
     module = _training_script()
     args = SimpleNamespace(
         external_eval=True,
@@ -523,10 +528,32 @@ def test_external_eval_launch_failure_never_kills_training(monkeypatch, tmp_path
         "Popen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fork failed")),
     )
-    assert (
-        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000010.pt", 10, None)
-        is None
+    checkpoint = tmp_path / "checkpoint-000010.pt"
+    assert module._maybe_launch_external_eval(args, checkpoint, 10, None) is None
+    pending_path = tmp_path / module._EXTERNAL_EVAL_PENDING
+    assert pending_path.is_file()
+
+    resumed = SimpleNamespace(
+        **{key: value for key, value in vars(args).items() if key != "_kaggriculture_pending_evals"}
     )
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def __init__(self, command, **_kwargs):
+            launched.append(command)
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
+    process = module._maybe_launch_external_eval(resumed, None, 0, None)
+
+    assert isinstance(process, FakeProcess)
+    assert launched[0][launched[0].index("--artifact") + 1] == str(checkpoint)
+    assert launched[0][launched[0].index("--iteration") + 1] == "10"
+    assert not pending_path.exists()
 
 
 def test_external_eval_opponent_resolution_degrades_instead_of_blocking(capsys, tmp_path) -> None:
@@ -707,6 +734,18 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
     } == manifest
 
     save_actor_snapshot(destination, actor, 2)
+    save_actor_snapshot(destination, actor, 3)
+    invalid = {**validated, 1: "0" * 64}
+    with pytest.raises(ValueError, match="digest mismatch"):
+        module._restore_league_archive(
+            checkpoint=checkpoint,
+            destination=destination,
+            manifest=invalid,
+            current_iteration=1,
+            model_config=model_config,
+        )
+    assert [ref.iteration for ref in module.list_actor_snapshots(destination)] == [0, 1, 2, 3]
+
     module._restore_league_archive(
         checkpoint=checkpoint,
         destination=destination,
@@ -714,13 +753,24 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
         current_iteration=1,
         model_config=model_config,
     )
-    save_actor_snapshot(destination, actor, 3)
-    with pytest.raises(ValueError, match="fresh --run-dir"):
+    assert [ref.iteration for ref in module.list_actor_snapshots(destination)] == [0, 1]
+
+    sparse_destination = tmp_path / "sparse" / "league"
+    sparse_manifest = {0: manifest[0]}
+    module._restore_league_archive(
+        checkpoint=checkpoint,
+        destination=sparse_destination,
+        manifest=sparse_manifest,
+        current_iteration=2,
+        model_config=model_config,
+    )
+    save_actor_snapshot(sparse_destination, actor, 1)
+    with pytest.raises(ValueError, match="missing from the checkpoint manifest"):
         module._restore_league_archive(
             checkpoint=checkpoint,
-            destination=destination,
-            manifest=validated,
-            current_iteration=1,
+            destination=sparse_destination,
+            manifest=sparse_manifest,
+            current_iteration=2,
             model_config=model_config,
         )
 
@@ -750,6 +800,32 @@ def test_orphan_checkpoint_matching_ignores_only_volatile_metrics() -> None:
     }
     assert module._checkpoint_recovery_values_equal(original, replayed)
     assert not module._checkpoint_recovery_values_equal(original, {**replayed, "next_seed": 10})
+
+
+def test_metrics_journal_rolls_back_to_a_verified_checkpoint_boundary(tmp_path: Path) -> None:
+    module = _training_script()
+    path = tmp_path / "metrics.jsonl"
+    records = [
+        {"iteration": 1, "value_loss": 1.0},
+        {"iteration": 2, "value_loss": 0.5},
+        {"iteration": 3, "value_loss": 0.25},
+    ]
+    path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    module._rollback_metrics_journal(path, 1, records[0])
+
+    assert path.read_text(encoding="utf-8") == json.dumps(records[0], sort_keys=True) + "\n"
+
+    path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match recovery state"):
+        module._rollback_metrics_journal(path, 1, {"iteration": 1, "value_loss": 9.0})
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 3
 
 
 def test_main_writes_complete_manifests_and_portably_resumes(
@@ -852,14 +928,6 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     assert (source_run / "latest.pt").stat().st_ino == (
         source_run / "checkpoint-000001.pt"
     ).stat().st_ino
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        arguments(source_run, 1, source_run / "checkpoint-000000.pt"),
-    )
-    with pytest.raises(ValueError, match="newer than the checkpoint"):
-        module.main()
 
     monkeypatch.setattr(sys, "argv", arguments(source_run, 1))
     with pytest.raises(FileExistsError, match="pre-existing initial checkpoint"):

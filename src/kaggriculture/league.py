@@ -33,10 +33,6 @@ AnyModelConfig = ModelConfig | StructuredConfig
 LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
 _SNAPSHOT_NAME = re.compile(r"league-actor-(\d{8})\.pt")
 _MAX_CANONICAL_ITERATION = 99_999_999
-# Identity of a league opponent in the PFSP score-rate state and in the journal.
-# Snapshots key on their zero-padded iteration; built-ins on their engine name.
-# One keyspace, because one weighting decides which of them plays.
-LEAGUE_OPPONENT_KEY = re.compile(r"\d{8}|builtin_[a-z]+")
 
 
 @dataclass(frozen=True, order=True)
@@ -345,10 +341,12 @@ def copy_actor_snapshot(
     directory.mkdir(parents=True, exist_ok=True)
     try:
         os.link(source, destination)
-    except FileExistsError:
+    except FileExistsError as error:
         load_actor_snapshot(destination, expected_model_config=expected_model_config)
         if snapshot_sha256(destination) != source_digest:
-            raise FileExistsError(f"conflicting concurrent league snapshot: {destination}")
+            raise FileExistsError(
+                f"conflicting concurrent league snapshot: {destination}"
+            ) from error
         return SnapshotRef(iteration, destination)
     except OSError as error:
         if error.errno != errno.EXDEV:
