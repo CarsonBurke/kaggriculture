@@ -16,6 +16,7 @@ def _script():
     spec.loader.exec_module(module)
     return module
 
+
 def test_replay_snapshot_survives_atomic_latest_replacement(tmp_path: Path) -> None:
     module = _script()
     latest = tmp_path / "latest.pt"
@@ -81,6 +82,8 @@ def test_replay_member_prefers_latest_v27_money(tmp_path: Path) -> None:
                         "agent": 0,
                         "opponent": "public-v27",
                         "money_mean": 40_000,
+                        "games": 8,
+                        "completed_games": 8,
                     }
                 ),
                 json.dumps(
@@ -89,6 +92,8 @@ def test_replay_member_prefers_latest_v27_money(tmp_path: Path) -> None:
                         "agent": 0,
                         "opponent": "public-v27",
                         "money_mean": 10_000,
+                        "games": 8,
+                        "completed_games": 8,
                     }
                 ),
                 json.dumps(
@@ -97,6 +102,8 @@ def test_replay_member_prefers_latest_v27_money(tmp_path: Path) -> None:
                         "agent": 2,
                         "opponent": "public-v27",
                         "money_mean": 22_000,
+                        "games": 8,
+                        "completed_games": 8,
                     }
                 ),
                 json.dumps(
@@ -133,6 +140,39 @@ def test_replay_member_falls_back_to_self_play_money(tmp_path: Path) -> None:
     assert module.select_replay_member(tmp_path, 4) == 1
 
 
+def test_replay_member_ignores_incomplete_probe_and_torn_tail(tmp_path: Path) -> None:
+    module = _script()
+    (tmp_path / "metrics-external.jsonl").write_text(
+        json.dumps(
+            {
+                "iteration": 69,
+                "agent": 0,
+                "opponent": "public-v27",
+                "games": 8,
+                "completed_games": 8,
+                "money_mean": 99_000.0,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "iteration": 70,
+                "agent": 0,
+                "opponent": "public-v27",
+                "games": 8,
+                "completed_games": 0,
+                "money_mean": None,
+            }
+        )
+        + '{"iteration": 71, "agent":',
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics.jsonl").write_text(
+        json.dumps({"iteration": 70, "agent0_money_mean": 1.0, "agent1_money_mean": 2.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert module.select_replay_member(tmp_path, 2) == 1
 
 
 def test_external_opponent_occupies_the_seat_our_agent_does_not(monkeypatch) -> None:

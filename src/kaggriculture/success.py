@@ -12,12 +12,13 @@ Incomplete rows do not drop out of the mean — they invalidate the tick.
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from kaggriculture.telemetry import read_jsonl_snapshot
 
 PRIMARY_OPPONENT = "v27"
 FLOOR_OPPONENT = "starter"
@@ -176,19 +177,14 @@ def probe_from_record(record: Mapping[str, Any]) -> OpponentProbe | None:
 def load_external_journal(path: Path) -> tuple[IterationSuccess, ...]:
     """Fold `metrics-external.jsonl` into per-iteration success snapshots."""
     grouped: dict[tuple[int, int], dict[str, OpponentProbe]] = {}
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            text = line.strip()
-            if not text:
-                continue
-            record = json.loads(text)
-            probe = probe_from_record(record)
-            if probe is None:
-                continue
-            iteration = int(record["iteration"])
-            agent = record.get("agent")
-            member = 0 if agent is None else int(agent)
-            grouped.setdefault((iteration, member), {})[probe.opponent] = probe
+    for record in read_jsonl_snapshot(path).records:
+        probe = probe_from_record(record)
+        if probe is None:
+            continue
+        iteration = int(record["iteration"])
+        agent = record.get("agent")
+        member = 0 if agent is None else int(agent)
+        grouped.setdefault((iteration, member), {})[probe.opponent] = probe
     iterations: dict[int, list[MemberSuccess]] = {}
     for (iteration, member), probes in grouped.items():
         iterations.setdefault(iteration, []).append(

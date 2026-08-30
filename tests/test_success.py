@@ -155,6 +155,19 @@ def test_latest_valid_ignores_a_truncated_tick(tmp_path: Path) -> None:
     assert peak(snapshots).best.v27_money == 80_000.0
 
 
+def test_external_journal_preserves_complete_rows_before_a_torn_tail(tmp_path: Path) -> None:
+    journal = _write_journal(
+        tmp_path / "metrics-external.jsonl",
+        [_row(10, "public-v27", 80_000.0, 1.0)],
+    )
+    with journal.open("a", encoding="utf-8") as stream:
+        stream.write('{"iteration": 20, "opponent":')
+
+    snapshots = load_external_journal(journal)
+
+    assert latest_valid(snapshots).iteration == 10
+
+
 def test_peak_can_precede_latest(tmp_path: Path) -> None:
     journal = _write_journal(
         tmp_path / "metrics-external.jsonl",

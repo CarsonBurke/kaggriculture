@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -32,7 +33,10 @@ def _destination(journal: Path, output_root: Path | None) -> Path:
         training_step_field(record) is not None for record in snapshot.records
     )
     if output_root is not None:
-        return output_root.expanduser().resolve() / journal.stem
+        resolved = journal.expanduser().resolve()
+        path_digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+        run_name = f"{resolved.parent.name}-{resolved.stem}-{path_digest}"
+        return output_root.expanduser().resolve() / run_name
     if training and journal.name == "metrics.jsonl":
         return journal.expanduser().resolve().parent / "tensorboard"
     return journal.expanduser().resolve().parent / "tensorboard" / journal.stem

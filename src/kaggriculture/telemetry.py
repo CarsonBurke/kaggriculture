@@ -156,6 +156,7 @@ def _manifest_payload(snapshot: JournalSnapshot, log_dir: Path) -> dict[str, Any
         "format_version": TENSORBOARD_MIRROR_FORMAT_VERSION,
         "source": {
             "name": snapshot.path.name,
+            "path": str(snapshot.path),
             "sha256": snapshot.sha256,
             "size_bytes": snapshot.size_bytes,
             "records": len(snapshot.records),
@@ -1277,6 +1278,7 @@ class TensorboardMirror:
                     "format_version": TENSORBOARD_MIRROR_FORMAT_VERSION,
                     "source": {
                         "name": self.journal_path.name,
+                        "path": str(self.journal_path),
                         "sha256": self._journal_sha.hexdigest(),
                         "size_bytes": self._journal_size,
                         "records": self._journal_records,

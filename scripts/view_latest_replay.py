@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -35,12 +36,12 @@ from typing import Any
 import numpy as np
 import torch
 
-
 from kaggriculture.inference import CheckpointAgent, checkpoint_agent_count
 from kaggriculture.opponents import normalize_opponent
 from kaggriculture.policy import act_batch
 from kaggriculture.production import PRODUCTION_EPISODE_STEPS, PRODUCTION_TEMPERATURE
 from kaggriculture.provenance import repository_root
+from kaggriculture.telemetry import read_jsonl_snapshot
 
 
 def _snapshot_file(source: Path, destination: Path) -> None:
@@ -97,11 +98,16 @@ def select_replay_member(run_directory: Path, population: int) -> int:
     if external.is_file():
         latest_iteration: int | None = None
         scores: dict[int, float] = {}
-        for line in external.read_text(encoding="utf-8").splitlines():
-            if not line:
-                continue
-            record = json.loads(line)
+        for record in read_jsonl_snapshot(external).records:
             if record.get("opponent") not in _V27_LABELS:
+                continue
+            iteration = record.get("iteration")
+            if type(iteration) is not int:
+                continue
+            if latest_iteration is None or iteration > latest_iteration:
+                latest_iteration = iteration
+                scores = {}
+            if iteration != latest_iteration:
                 continue
             agent = record.get("agent")
             if agent is None:
@@ -109,12 +115,19 @@ def select_replay_member(run_directory: Path, population: int) -> int:
             member = int(agent)
             if not 0 <= member < population:
                 continue
-            iteration = int(record["iteration"])
-            if latest_iteration is None or iteration > latest_iteration:
-                latest_iteration = iteration
-                scores = {}
-            if iteration == latest_iteration:
-                scores[member] = float(record["money_mean"])
+            games = record.get("games")
+            completed_games = record.get("completed_games")
+            money_mean = record.get("money_mean")
+            if (
+                type(games) is not int
+                or games < 1
+                or completed_games != games
+                or not isinstance(money_mean, (int, float))
+                or isinstance(money_mean, bool)
+                or not math.isfinite(money_mean)
+            ):
+                continue
+            scores[member] = float(money_mean)
         if scores:
             return min(scores, key=lambda member: (-scores[member], member))
     metrics = run_directory / "metrics.jsonl"
@@ -172,8 +185,6 @@ def parse_args() -> argparse.Namespace:
         "--no-open", action="store_true", help="write the replay without opening a browser"
     )
     return parser.parse_args()
-
-
 
 
 def play_match(

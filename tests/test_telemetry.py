@@ -74,6 +74,8 @@ def test_training_jsonl_migration_is_idempotent_and_rebuilds_after_append(tmp_pa
     assert first.rebuilt
     assert not second.rebuilt
     assert _scalars(log_dir, "critic/value_loss") == [(1, 0.5), (2, 0.25)]
+    manifest = json.loads((log_dir / ".kaggriculture-tensorboard.json").read_text())
+    assert manifest["source"]["path"] == str(journal.resolve())
 
     records.append({"iteration": 3, "value_loss": 0.125})
     _write_jsonl(journal, records)
