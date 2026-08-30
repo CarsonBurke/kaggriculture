@@ -287,9 +287,24 @@ class Attention(nn.Module):
         if context_valid is not None:
             attention_mask = context_valid.view(batch, 1, 1, key_tokens)
         query, key, value = _sdpa_inputs(query, key, value)
-        attended = nn.functional.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0
-        )
+        # Efficient SDPA's backward reserves multi-GB workspace when a large
+        # flattened batch attends from one query to a handful of local slots.
+        if query.device.type == "cuda" and query_tokens == 1 and key_tokens <= 8:
+            scores = torch.matmul(query, key.transpose(-2, -1)) * (self.head_dim**-0.5)
+            if attention_mask is not None:
+                valid_rows = attention_mask.any(dim=-1, keepdim=True)
+                scores = scores.masked_fill(~attention_mask, -torch.inf)
+                # Avoid NaN softmax inputs for inactive units whose entire local
+                # context is masked. SDPA defines both their output and gradient as zero.
+                scores = torch.where(valid_rows, scores, 0.0)
+            probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+            if attention_mask is not None:
+                probabilities = torch.where(attention_mask, probabilities, 0.0)
+            attended = torch.matmul(probabilities.to(value.dtype), value)
+        else:
+            attended = nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0
+            )
         attended = attended.to(dtype=queries.dtype)
         return self.output(attended.transpose(1, 2).reshape(batch, query_tokens, width))
 

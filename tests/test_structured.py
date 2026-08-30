@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import replace
 
 import pytest
@@ -14,6 +15,7 @@ from kaggriculture.modelargs import add_model_config_arguments, model_config_fro
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import _StackedActorEnsemble
 from kaggriculture.structured import (
+    Attention,
     FusedFeedForward,
     StructuredActor,
     StructuredConfig,
@@ -100,6 +102,71 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
     bias_logits = actor.unit_head(torch.zeros(1, 1, actor.config.model_dim))
     expanded = bias_logits.expand_as(output.unit_logits)
     assert torch.allclose(output.unit_logits[inactive], expanded[inactive])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() -> None:
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=8,
+    )
+    tiny = Attention(config).cuda().train()
+    general = copy.deepcopy(tiny)
+    queries = torch.randn(8, 1, 128, device="cuda", requires_grad=True)
+    context = torch.randn(8, 5, 128, device="cuda", requires_grad=True)
+    general_queries = queries.detach().clone().requires_grad_()
+    general_context = context.detach().clone().requires_grad_()
+    padding = torch.randn(8, 4, 128, device="cuda", requires_grad=True)
+    valid = torch.tensor(
+        [
+            [False, False, False, False, False],
+            [True, False, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+            [True, True, True, True, False],
+            [True, True, True, True, True],
+            [False, True, False, True, False],
+            [True, False, True, False, True],
+        ],
+        device="cuda",
+    )
+    general_valid = torch.cat(
+        (valid, torch.zeros(8, 4, dtype=torch.bool, device="cuda")),
+        dim=1,
+    )
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        tiny_output = torch.compile(tiny, fullgraph=True)(
+            queries,
+            context,
+            context_valid=valid,
+        )
+        general_output = general(
+            general_queries,
+            torch.cat((general_context, padding), dim=1),
+            context_valid=general_valid,
+        )
+    upstream = torch.randn_like(tiny_output)
+    tiny_output.backward(upstream)
+    general_output.backward(upstream)
+
+    assert torch.count_nonzero(tiny_output[0]) == 0
+    torch.testing.assert_close(tiny_output, general_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(queries.grad, general_queries.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(context.grad, general_context.grad, rtol=3e-2, atol=3e-2)
+    for tiny_parameter, general_parameter in zip(
+        tiny.parameters(), general.parameters(), strict=True
+    ):
+        assert tiny_parameter.grad is not None
+        assert general_parameter.grad is not None
+        torch.testing.assert_close(
+            tiny_parameter.grad,
+            general_parameter.grad,
+            rtol=3e-2,
+            atol=3e-2,
+        )
 
 
 def test_hardware_native_mlp_rejects_cpu_execution() -> None:

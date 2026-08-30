@@ -562,8 +562,9 @@ class PpoConfig:
     # Sampling temperature cannot supply the exploration instead: `rollout.py`
     # rejects any learner temperature other than 1.0, because the replay-parity
     # contract needs the update forward to reproduce the sampler's likelihoods.
-    # So the policy's own entropy is the only exploration that exists, which is
-    # what makes this a term in the objective rather than a sampling knob.
+    # So the policy's own entropy is the only exploration that exists. The
+    # coefficient measured below is zero, leaving entropy as a liveness metric
+    # rather than an objective term.
     #
     # Measured, and the answer is zero. Four coefficients ran 12 iterations each
     # from the same warm checkpoint on the same wave sequence, against the native
@@ -947,20 +948,36 @@ def actor_forward_args(
 
 
 def _critic_batch_args(
-    architecture: str, staged: dict[str, Tensor], indices: Tensor | slice
+    architecture: str,
+    staged: dict[str, Tensor],
+    indices: Tensor | slice,
+    *,
+    actor_args: tuple[Any, ...] | None = None,
 ) -> tuple[Any, ...]:
     """Build one minibatch of critic forward arguments from staged storage.
 
     The structured centralized critic reads the actor's viewpoint with the
     opponent's private economy columns concatenated onto the product and crop
     tokens, plus the opponent's unit tokens as attention context.
+
+    When the actor runs on the same minibatch, its already-gathered inputs are
+    reused. They are immutable, non-gradient rollout tensors, so this removes a
+    second index-select for every shared field, plus any dtype conversion that
+    field needed, without coupling either network's autograd graph.
     """
     if architecture == CONV_ENTITY:
+        board = (
+            _batch_tensor(staged["board"], indices, torch.float32)
+            if actor_args is None
+            else actor_args[0]
+        )
         return (
-            _batch_tensor(staged["board"], indices, torch.float32),
+            board,
             _batch_tensor(staged["critic_features"], indices, torch.float32),
         )
-    (actor_inputs,) = _actor_batch_args(architecture, staged, indices)
+    (actor_inputs,) = (
+        _actor_batch_args(architecture, staged, indices) if actor_args is None else actor_args
+    )
     inputs = actor_inputs._replace(
         products=torch.cat(
             (
@@ -1610,10 +1627,10 @@ def _actor_minibatch_terms(
     count). Normalization by the per-minibatch component count stays outside
     so the varying host integer never enters the captured graph.
 
-    The entropy sum carries grad because it is an objective term, not only a
-    metric: sampling temperature is pinned to 1.0 by the replay-parity contract
-    (`rollout.py` rejects any other value), so the policy's own entropy is the
-    only exploration this pipeline has.
+    Entropy and KL are telemetry, not objective terms. Detaching their sums
+    inside this compiled region preserves their exact forward values while
+    keeping their softmax-sized derivative branches and saved intermediates
+    out of the actor backward.
     """
     (
         new_unit,
@@ -1655,7 +1672,7 @@ def _actor_minibatch_terms(
         entropy_sum = entropy_sum + (entropy * active).sum()
         kl_sum = kl_sum + component_kl
         clipped_sum = clipped_sum + component_clipped
-    return policy_sum, entropy_sum, kl_sum, clipped_sum
+    return policy_sum, entropy_sum.detach(), kl_sum.detach(), clipped_sum
 
 
 def _critic_minibatch_loss(
@@ -2833,11 +2850,11 @@ def update_ppo(
         for batch_slice in _balanced_minibatch_slices(shuffled.size, config.minibatch_size):
             host_indices = shuffled[batch_slice]
             indices = shuffled_device[batch_slice]
-            critic_args = _critic_batch_args(architecture, staged, indices)
+            run_actor = epoch_index < actor_epochs and not stop_for_kl
+            actor_args = _actor_batch_args(architecture, staged, indices) if run_actor else None
+            critic_args = _critic_batch_args(architecture, staged, indices, actor_args=actor_args)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
             states = indices.numel()
-
-            run_actor = epoch_index < actor_epochs and not stop_for_kl
             component_count = 0
             batch_kl = actor_zero
             policy_loss = actor_zero
@@ -2854,6 +2871,7 @@ def update_ppo(
             auxiliary_start_event: torch.cuda.Event | None = None
             auxiliary_end_event: torch.cuda.Event | None = None
             if run_actor:
+                assert actor_args is not None
                 # Component activity is immutable rollout metadata. Reducing it
                 # on the host avoids a CUDA synchronization in every minibatch
                 # merely to recover a denominator already known before staging.
@@ -2900,7 +2918,7 @@ def update_ppo(
                     config.clip_low,
                     config.clip_high,
                     autocast_enabled,
-                    *_actor_batch_args(architecture, staged, indices),
+                    *actor_args,
                 )
                 batch_kl = kl_sum.detach().double() / component_count
                 policy_loss = -policy_sum / component_count
@@ -2909,11 +2927,14 @@ def update_ppo(
                 # graph. Gradients remain in the actor buffers, while peak
                 # memory stays near one actor forward.
                 policy_loss.backward()
-                ppo_gradients = [
-                    parameter.grad for parameter in actor.parameters() if parameter.grad is not None
-                ]
-                ppo_gradient_norm = torch.nn.utils.get_total_norm(ppo_gradients).detach()
+                ppo_gradient_norm: Tensor | None = None
                 if actor_auxiliary_active:
+                    ppo_gradients = [
+                        parameter.grad
+                        for parameter in actor.parameters()
+                        if parameter.grad is not None
+                    ]
+                    ppo_gradient_norm = torch.nn.utils.get_total_norm(ppo_gradients).detach()
                     assert isinstance(actor, StructuredActor)
                     assert structured_dynamics is not None
                     assert auxiliary_windows is not None
@@ -2988,6 +3009,12 @@ def update_ppo(
                 actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                     actor.parameters(), config.max_gradient_norm
                 ).detach()
+                if ppo_gradient_norm is None:
+                    # `clip_grad_norm_` returns the same pre-clip total norm. In
+                    # the ordinary PPO path, reuse it instead of launching a
+                    # second complete parameter-gradient reduction solely for
+                    # telemetry that is not even emitted without a predictor.
+                    ppo_gradient_norm = actor_gradient_norm
 
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch even after policy replay is frozen.
@@ -3089,7 +3116,9 @@ def update_ppo(
                     totals["clip_fraction"] += clipped_sum.detach().double()
                     totals["actor_gradient_norm"] += actor_gradient_norm * states
                     total_components += component_count
-                    ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
+                    if predictor_active:
+                        assert ppo_gradient_norm is not None
+                        ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
                     actor_states += states
                     actor_updates += 1
                     if auxiliary_terms is not None:

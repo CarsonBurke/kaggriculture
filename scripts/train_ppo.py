@@ -2854,9 +2854,15 @@ def main() -> None:
 
         # League snapshots remain semantic PFSP history. They only need the
         # actor, while the much larger critic/optimizer/RNG recovery state above
-        # is copied only for a due checkpoint.
+        # is copied only for a due checkpoint. On checkpoint iterations, reuse
+        # that payload's already-detached actor tensors instead of synchronously
+        # copying the same GPU parameters to CPU a second time.
         actor_state = (
-            cpu_state_copy(members[0].actor.state_dict())
+            (
+                recovery_payload["actor"]
+                if recovery_payload is not None
+                else cpu_state_copy(members[0].actor.state_dict())
+            )
             if population == 1 and not warmup_active
             else None
         )

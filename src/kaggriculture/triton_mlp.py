@@ -150,20 +150,16 @@ def _linear_relu_square(
     block_m, block_n = 128, 128
     block_k = 128 if use_fp8 else 64
     forward = post is None
-    auxiliary = (
-        torch.empty((block_m, block_n // 2), device=values.device, dtype=torch.bfloat16)
-        if forward
-        else post
-    )
     input_kernel = values_f8 if values_f8 is not None else values
     weight_kernel = weight_f8 if weight_f8 is not None else weight
     input_descriptor = TensorDescriptor.from_tensor(input_kernel, [block_m, block_k])
     weight_descriptor = TensorDescriptor.from_tensor(weight_kernel, [block_n, block_k])
     output_descriptor = TensorDescriptor.from_tensor(result, [block_m, block_n // 2])
-    auxiliary_descriptor = TensorDescriptor.from_tensor(
-        auxiliary,
-        [block_m, block_n // 2],
-    )
+    if forward:
+        auxiliary_descriptor = output_descriptor
+    else:
+        assert post is not None
+        auxiliary_descriptor = TensorDescriptor.from_tensor(post, [block_m, block_n // 2])
 
     if emit_fp8:
         assert activation_scale is not None
