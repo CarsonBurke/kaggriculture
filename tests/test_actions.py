@@ -24,10 +24,12 @@ from kaggriculture.actions import (
 from kaggriculture.constants import (
     CROPS,
     MARKET_I0,
+    MARKET_PARAMS,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
     PRODUCTS,
     QUANTITY_BINS,
+    market_price,
 )
 from kaggriculture.policy import (
     MarketLedger,
@@ -176,6 +178,16 @@ def test_every_pickup_variant_matches_official_engine(
 
     assert following["private"]["shed"][item] == 100 - quantity
     assert following["private"]["inventories"][0][item] == quantity
+
+
+@pytest.mark.parametrize("item", MARKET_PARAMS)
+def test_default_market_prices_match_official_engine_on_both_sides(item: str) -> None:
+    pricing = MARKET_PARAMS[item]
+    initial = int(pricing["I0"])
+    scale = int(pricing["T"])
+
+    for inventory in (initial - scale, initial - 1, initial, initial + 1, initial + scale):
+        assert market_price(item, inventory) == official.market_price(item, inventory)
 
 
 @pytest.mark.parametrize("quantity", range(1, 101))
@@ -456,8 +468,6 @@ def test_drop_remains_legal_when_shed_is_full() -> None:
     mask = unit_action_mask(observation, 0)
 
     assert mask[UnitAction.DROP]
-
-
 
 
 def _python_sequential_factor_masks(

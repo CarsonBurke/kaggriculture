@@ -18,6 +18,7 @@ from dataclasses import fields
 import numpy as np
 import pytest
 import torch
+from test_rollout import _assert_stored_rows_replay_from_current_actor
 
 from kaggriculture.actions import N_UNIT_ACTIONS
 from kaggriculture.model import FarmActor, ModelConfig
@@ -25,6 +26,7 @@ from kaggriculture.orientation import (
     Orientation,
     inverse_permutation,
     movement_permutation,
+    orient_boards,
     orient_unit_actions,
     orient_unit_logits,
     orient_unit_masks,
@@ -37,8 +39,6 @@ from kaggriculture.rollout import (
     slice_trajectories,
 )
 from kaggriculture.structured import StructuredActor, StructuredConfig
-
-from test_rollout import _assert_stored_rows_replay_from_current_actor
 
 _CONFIG = ModelConfig(
     cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
@@ -63,8 +63,6 @@ def _collect_population_wave() -> tuple[list[FarmActor], RolloutBatch]:
     return actors, rollout
 
 
-
-
 def _assert_batches_identical(first: RolloutBatch, second: RolloutBatch) -> None:
     """Every stored buffer of two waves agrees exactly; timing is not a buffer.
 
@@ -82,11 +80,22 @@ def _assert_batches_identical(first: RolloutBatch, second: RolloutBatch) -> None
             np.testing.assert_array_equal(getattr(first, field.name), getattr(second, field.name))
 
 
-
-
 def test_seat_orientations_repeat_each_game_code() -> None:
     codes = seat_orientations(5)
     np.testing.assert_array_equal(codes, [0, 0, 1, 1, 2, 2, 3, 3, 0, 0])
+
+
+def test_orient_boards_writes_each_heterogeneous_row_back() -> None:
+    board = np.arange(4 * 2 * 3, dtype=np.int16).reshape(4, 1, 2, 3)
+    expected = board.copy()
+    expected[1] = expected[1, ..., ::-1]
+    expected[2] = expected[2, ..., ::-1, :]
+    expected[3] = expected[3, ..., ::-1, ::-1]
+
+    returned = orient_boards(board, row_orientations(np.arange(4)))
+
+    assert returned is board
+    np.testing.assert_array_equal(board, expected)
 
 
 def test_identity_orientation_reproduces_the_pre_orientation_path(monkeypatch) -> None:
@@ -206,8 +215,6 @@ def test_both_seats_of_a_game_share_one_orientation() -> None:
     assert set(int(code) for code in codes) == {0, 1}
     assert set(int(agent) for agent in rollout.agents[:2]) == {0, 1}
     assert set(int(agent) for agent in rollout.agents[2:4]) == {0, 1}
-
-
 
 
 def test_structured_wave_refuses_non_identity_frames() -> None:

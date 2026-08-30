@@ -96,8 +96,6 @@ def test_zero_quantity_market_order_is_discarded() -> None:
     assert projected.canonical_action["market"] == [["HIRE"]]
 
 
-
-
 def test_pickup_without_quantity_defaults_to_one() -> None:
     observation = _observation()
     observation["private"]["shed"]["WHEAT"] = 5
@@ -163,6 +161,26 @@ def test_market_over_ask_clamps_to_the_ledger_affordability_bound() -> None:
     assert projected.market_kinds[0] == MarketKind.BUY_SEED_MELON
     assert QUANTITY_BINS[projected.market_quantities[0]] == 4
     assert projected.canonical_action["market"] == [["BUY_SEED", "MELON", 4]]
+
+
+def test_seed_over_ask_rejects_an_executed_fill_above_the_quantity_space() -> None:
+    observation = _observation()
+    observation["farms"][0]["money"] = float(101 * SEED_COST["WHEAT"])
+    action = {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 101]]}
+
+    with pytest.raises(DemonstrationError, match="outside the factored quantity space"):
+        project_demonstration(observation, action)
+
+
+def test_seed_over_ask_projects_an_affordable_fill_within_the_quantity_space() -> None:
+    observation = _observation()
+    observation["farms"][0]["money"] = float(100 * SEED_COST["WHEAT"])
+    action = {"farmer": ["PASS"], "hands": [], "market": [["BUY_SEED", "WHEAT", 101]]}
+
+    projected = _project(observation, action)
+
+    assert QUANTITY_BINS[projected.market_quantities[0]] == 100
+    assert projected.canonical_action["market"] == [["BUY_SEED", "WHEAT", 100]]
 
 
 def test_zero_fill_market_order_is_dropped_and_later_orders_shift() -> None:

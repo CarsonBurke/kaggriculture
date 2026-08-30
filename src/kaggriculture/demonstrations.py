@@ -51,6 +51,7 @@ from kaggriculture.constants import (
     MAX_UNITS,
     PRODUCTS,
     QUANTITY_BINS,
+    SEED_COST,
     SHED_CAPACITY,
     fibonacci_hire_cost,
     shed_access_tiles,
@@ -234,7 +235,6 @@ def _parse_unit_command(
     return UnitAction[f"PICKUP_{item}_{executed}"], ["PICKUP", item, executed]
 
 
-
 def _canonical_market_order(order: Any) -> list[Any]:
     """Reduce a demonstrated market order to what the engine actually reads."""
     if not isinstance(order, (list, tuple)) or not order:
@@ -271,10 +271,7 @@ def _parse_market_order(order: Any) -> tuple[MarketKind, int] | None:
     table = tables[opcode]
     if item not in table:
         raise DemonstrationError(f"unknown market order: {order!r}")
-    # Demands above the largest bin are legitimate engine over-asks (the
-    # engine fills per-unit until resources run out); the projection clamps
-    # them to the mask's affordability bound below.
-    return table[item], min(quantity, QUANTITY_BINS[-1]) - 1
+    return table[item], quantity
 
 
 def _engine_would_execute(
@@ -335,7 +332,6 @@ def _engine_would_execute(
             return True
         shed_room = SHED_CAPACITY - sum(int(value or 0) for value in remaining_shed.values())
         return at_shed and holds_item and shed_room > 0
-
 
     # Everything below mutates the standing tile, which must be owned.
     if tile == "LOCKED":
@@ -464,8 +460,9 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
         parsed = _parse_market_order(order)
         if parsed is None:
             continue
-        kind, quantity_index = parsed
+        kind, requested_quantity = parsed
         canonical_order = _canonical_market_order(order)
+        quantity_index = 0
 
         slot = len(canonical_orders)
         kind_mask_now = _ledger_kind_mask(observation, ledger)
@@ -488,22 +485,29 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
         quantity_masks[slot] = _ledger_quantity_mask(observation, kind, ledger)
         if kind in QUANTIFIED_MARKET_KINDS:
             quantity_active[slot] = True
+            affordable = np.flatnonzero(quantity_masks[slot])
+            if affordable.size == 0:
+                raise DemonstrationError(
+                    f"market slot {slot} demonstrated {kind.name} but our ledger "
+                    "affords no quantity at all — mask divergence"
+                )
+            maximum = int(QUANTITY_BINS[int(affordable[-1])])
+            if canonical_order[0] == "BUY_SEED" and requested_quantity > maximum:
+                maximum = int(ledger.money // SEED_COST[str(canonical_order[1])])
+            executed_quantity = min(requested_quantity, maximum)
+            if executed_quantity > int(QUANTITY_BINS[-1]):
+                raise DemonstrationError(
+                    f"market slot {slot} executed {kind.name} x{executed_quantity}, "
+                    f"outside the factored quantity space (1..{QUANTITY_BINS[-1]})"
+                )
+            quantity_index = executed_quantity - 1
             if not quantity_masks[slot, quantity_index]:
-                # The engine fills quantified orders one unit at a time and
-                # simply stops when resources run out, so a demand above our
-                # ledger's affordability bound executes as the bound itself
-                # (verified against real games: BUY_SEED MELON x7 with money
-                # for 4 fills exactly 4). Project the executed fill.
-                affordable = np.flatnonzero(quantity_masks[slot, :quantity_index])
-                if affordable.size == 0:
-                    raise DemonstrationError(
-                        f"market slot {slot} demonstrated {kind.name} x"
-                        f"{QUANTITY_BINS[quantity_index]} but our ledger affords "
-                        "no quantity at all — mask divergence"
-                    )
-                quantity_index = int(affordable[-1])
+                raise DemonstrationError(
+                    f"market slot {slot} executed {kind.name} x{executed_quantity}, "
+                    "which our legality mask forbids"
+                )
             market_quantities[slot] = quantity_index
-            canonical_order = [*canonical_order[:2], int(QUANTITY_BINS[quantity_index])]
+            canonical_order = [*canonical_order[:2], executed_quantity]
         canonical_orders.append(canonical_order)
         _apply_ledger_order(observation, kind, QUANTITY_BINS[quantity_index], ledger)
 

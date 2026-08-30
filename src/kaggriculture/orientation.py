@@ -103,7 +103,6 @@ def seat_orientations(game_count: int) -> np.ndarray:
     return np.repeat(game_orientations(game_count), 2)
 
 
-
 def movement_permutation(orientation: Orientation) -> np.ndarray:
     """Oriented action index -> real action index, identity off movement.
 
@@ -148,7 +147,7 @@ def orient_boards(board: np.ndarray, orientations: np.ndarray) -> np.ndarray:
         if orientation == Orientation.IDENTITY:
             continue
         rows = np.flatnonzero(orientations == code)
-        flip_board(board[rows], orientation)
+        board[rows] = flip_board(board[rows], orientation)
     return board
 
 
