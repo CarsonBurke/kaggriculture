@@ -111,7 +111,6 @@ class _FusedReLUSquaredMLP(torch.autograd.Function):
     """TMA-persistent up projection with activation-aware manual backward."""
 
     @staticmethod
-    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
     def forward(
         values: Tensor,
         up_weight: Tensor,
@@ -161,7 +160,6 @@ class _FusedReLUSquaredMLP(torch.autograd.Function):
         return (output.view(original_shape), post), (0, 0)
 
     @staticmethod
-    @torch.amp.custom_bwd(device_type="cuda")
     def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
         ctx: object,
         gradient: Tensor,
@@ -188,7 +186,11 @@ def fused_relu_squared_mlp(
         torch._C._are_functorch_transforms_active()
     )
     if fused_eligible and (torch.is_autocast_enabled("cuda") or fused_dtypes):
-        output, _ = _FusedReLUSquaredMLP.apply(values, up_weight, down_weight)
+        output, _ = _FusedReLUSquaredMLP.apply(
+            values.to(torch.bfloat16),
+            up_weight.to(torch.bfloat16),
+            down_weight.to(torch.bfloat16),
+        )
         return output
     hidden = torch.relu(values @ up_weight.T)
     return (hidden * hidden) @ down_weight
