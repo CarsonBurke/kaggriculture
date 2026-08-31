@@ -90,6 +90,74 @@ def test_fused_structured_artifact_rejects_cpu_inference(tmp_path: Path) -> None
         load_actor_artifact(path, device="cpu")
 
 
+def _load_export_cpu_actor():
+    spec = importlib.util.spec_from_file_location(
+        "export_cpu_actor_under_test",
+        Path(__file__).parents[1] / "scripts" / "export_cpu_actor.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_fused_structured_artifact_exports_to_cpu_linear_layout(tmp_path: Path) -> None:
+    config = StructuredConfig(
+        model_dim=128,
+        attention_heads=8,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=4,
+        latents=8,
+        core_layers=2,
+        fused_mlp=True,
+    )
+    fused = StructuredActor(config)
+    exporter = _load_export_cpu_actor()
+
+    artifact = exporter.export_cpu_actor(
+        {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "architecture": "structured",
+            "model_config": config.to_dict(),
+            "actor": fused.state_dict(),
+            "iteration": 7,
+            "source_identity": source_identity(),
+        }
+    )
+    assert all(tensor.device.type == "cpu" for tensor in artifact["actor"].values())
+    path = tmp_path / "portable.pt"
+    torch.save(artifact, path)
+    portable, metadata = load_actor_artifact(path, device="cpu")
+
+    assert metadata["model_config"]["fused_mlp"] is False
+    assert metadata["iteration"] == 7
+    portable_state = portable.state_dict()
+    for name, value in fused.state_dict().items():
+        if name.endswith(".ffn.up_weight"):
+            prefix = name.removesuffix("up_weight")
+            assert torch.equal(portable_state[f"{prefix}input.weight"], value)
+            assert torch.count_nonzero(portable_state[f"{prefix}input.bias"]) == 0
+        elif name.endswith(".ffn.down_weight"):
+            prefix = name.removesuffix("down_weight")
+            assert torch.equal(portable_state[f"{prefix}output.weight"], value.T)
+            assert torch.count_nonzero(portable_state[f"{prefix}output.bias"]) == 0
+        else:
+            assert torch.equal(portable_state[name], value)
+
+
+def test_fused_structured_state_rejects_portable_key_collisions() -> None:
+    exporter = _load_export_cpu_actor()
+    state = {
+        "block.ffn.up_weight": torch.ones(4, 2),
+        "block.ffn.down_weight": torch.ones(4, 2),
+        "block.ffn.input.weight": torch.zeros(4, 2),
+    }
+
+    with pytest.raises(ValueError, match="overwrite state key"):
+        exporter._portable_structured_state(state)
+
+
 @pytest.mark.parametrize(
     "checkpoint_version",
     [*sorted(LEGACY_CHECKPOINT_FORMAT_VERSIONS), CHECKPOINT_FORMAT_VERSION],
