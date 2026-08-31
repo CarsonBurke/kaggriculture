@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor as _TensorDescriptor
+except ModuleNotFoundError:
+    # Kaggle's CPU runtime ships an older Triton without this optional helper.
+    # Portable structured actors never execute these CUDA-only kernels, so keep
+    # the module importable and fail explicitly only if a fused path is called.
+    _TensorDescriptor = None
 
 _E4M3_MAX = 448.0
+
+
+def _tensor_descriptor(tensor: Tensor, block_shape: list[int]) -> Any:
+    if _TensorDescriptor is None:
+        raise RuntimeError("fused structured MLPs require Triton TensorDescriptor support")
+    return _TensorDescriptor.from_tensor(tensor, block_shape)
 
 
 def _require_cuda_bf16(*tensors: Tensor) -> None:
@@ -152,14 +167,14 @@ def _linear_relu_square(
     forward = post is None
     input_kernel = values_f8 if values_f8 is not None else values
     weight_kernel = weight_f8 if weight_f8 is not None else weight
-    input_descriptor = TensorDescriptor.from_tensor(input_kernel, [block_m, block_k])
-    weight_descriptor = TensorDescriptor.from_tensor(weight_kernel, [block_n, block_k])
-    output_descriptor = TensorDescriptor.from_tensor(result, [block_m, block_n // 2])
+    input_descriptor = _tensor_descriptor(input_kernel, [block_m, block_k])
+    weight_descriptor = _tensor_descriptor(weight_kernel, [block_n, block_k])
+    output_descriptor = _tensor_descriptor(result, [block_m, block_n // 2])
     if forward:
         auxiliary_descriptor = output_descriptor
     else:
         assert post is not None
-        auxiliary_descriptor = TensorDescriptor.from_tensor(post, [block_m, block_n // 2])
+        auxiliary_descriptor = _tensor_descriptor(post, [block_m, block_n // 2])
 
     if emit_fp8:
         assert activation_scale is not None
@@ -169,7 +184,7 @@ def _linear_relu_square(
             device=values.device,
             dtype=torch.float8_e4m3fn,
         )
-        post_fp8_descriptor = TensorDescriptor.from_tensor(
+        post_fp8_descriptor = _tensor_descriptor(
             post_fp8,
             [block_m, block_n // 2],
         )
@@ -315,9 +330,9 @@ def _batched_fused_mlp(
     rows = flat.shape[1]
     post = torch.empty((lanes, rows, hidden), device=values.device, dtype=torch.bfloat16)
     output = torch.empty((lanes, rows, width), device=values.device, dtype=torch.bfloat16)
-    up_input = TensorDescriptor.from_tensor(flat, [1, 128, 128])
-    up_weights = TensorDescriptor.from_tensor(up_weight.contiguous(), [1, 128, 128])
-    post_descriptor = TensorDescriptor.from_tensor(post, [1, 128, 64])
+    up_input = _tensor_descriptor(flat, [1, 128, 128])
+    up_weights = _tensor_descriptor(up_weight.contiguous(), [1, 128, 128])
+    post_descriptor = _tensor_descriptor(post, [1, 128, 64])
     up_tiles = triton.cdiv(rows, 128) * triton.cdiv(hidden, 128)
     _batched_linear_relu_square_kernel[(lanes, up_tiles)](
         up_input,
@@ -332,9 +347,9 @@ def _batched_fused_mlp(
         num_stages=2,  # pyright: ignore[reportCallIssue]
         num_warps=8,  # pyright: ignore[reportCallIssue]
     )
-    down_input = TensorDescriptor.from_tensor(post, [1, 128, 128])
-    down_weights = TensorDescriptor.from_tensor(down_weight.contiguous(), [1, 128, 128])
-    output_descriptor = TensorDescriptor.from_tensor(output, [1, 128, 128])
+    down_input = _tensor_descriptor(post, [1, 128, 128])
+    down_weights = _tensor_descriptor(down_weight.contiguous(), [1, 128, 128])
+    output_descriptor = _tensor_descriptor(output, [1, 128, 128])
     down_tiles = triton.cdiv(rows, 128) * triton.cdiv(width, 128)
     _batched_linear_kernel[(lanes, down_tiles)](
         down_input,

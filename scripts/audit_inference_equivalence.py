@@ -33,7 +33,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 import numpy as np
 import torch
 
@@ -46,11 +45,8 @@ from kaggriculture.actions import (
 )
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.inference import load_actor_artifact
+from kaggriculture.rollout import _native_wave
 from kaggriculture.rust_env import load_native
-
-#: Digested rather than stored: a dump is a claim about equality, and equality of
-#: 719 steps of float tensors is checked the same way with 32 bytes per field.
-_DIGEST_FIELDS = ("board", "global_features", "units", "unit_positions")
 
 
 def _digest(*arrays: np.ndarray) -> str:
@@ -78,11 +74,12 @@ def _dump(args: argparse.Namespace) -> dict[str, Any]:
     module = load_native()
     seeds = np.arange(args.seed_start, args.seed_start + args.games, dtype=np.uint64)
     environment = module.BatchEnv(seeds)
-    actor, _ = load_actor_artifact(
+    actor, metadata = load_actor_artifact(
         Path(args.artifact).resolve(),
         device=torch.device("cpu"),
         agent=getattr(args, "agent", None),
     )
+    encoded_wave = _native_wave(metadata["architecture"], environment, torch.device("cpu"))
 
     actor = actor.eval().requires_grad_(False)
     generator = np.random.default_rng(args.driver_seed)
@@ -94,17 +91,19 @@ def _dump(args: argparse.Namespace) -> dict[str, Any]:
         units, kinds, quantities = _driven_factors(generator, args.games)
         masks = environment.factor_masks(units, kinds, quantities)
         mask_digests.append(_digest(*(np.asarray(masks[name]) for name in sorted(masks.keys()))))
-        encoded = environment.encoded()
-        observation_digests.append(_digest(*(np.asarray(encoded[name]) for name in _DIGEST_FIELDS)))
+        encoded_wave.refresh(environment)
+        encoded_wave.copy_to_device()
+        inputs = encoded_wave.inputs()
+        input_tensors = tuple(
+            tensor
+            for entry in inputs
+            for tensor in (entry if isinstance(entry, tuple) else (entry,))
+        )
+        observation_digests.append(
+            _digest(*(tensor.detach().cpu().numpy() for tensor in input_tensors))
+        )
         with torch.inference_mode():
-            output = actor(
-                *(
-                    torch.as_tensor(np.asarray(encoded[name]), dtype=torch.float32)
-                    if name != "unit_positions"
-                    else torch.as_tensor(np.asarray(encoded[name]))
-                    for name in _DIGEST_FIELDS
-                )
-            )
+            output = actor(*inputs)
         logit_digests.append(
             _digest(
                 output.unit_logits.numpy(),
@@ -239,9 +238,7 @@ def main() -> int:
             text=True,
         )
         if completed.returncode != 0:
-            raise SystemExit(
-                f"reference tree dump failed:\n{completed.stdout}\n{completed.stderr}"
-            )
+            raise SystemExit(f"reference tree dump failed:\n{completed.stdout}\n{completed.stderr}")
         reference = json.loads(reference_dump.read_text(encoding="utf-8"))
     candidate = _dump(args)
     failures = _compare(reference, candidate, INFERENCE_SURFACES)

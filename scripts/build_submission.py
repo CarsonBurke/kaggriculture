@@ -387,6 +387,12 @@ def build(
     checkpoint_digest = hashlib.sha256(checkpoint_contents).hexdigest()
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
     artifact = actor_artifact_from_checkpoint(checkpoint, agent=agent)
+    # Evaluation reports bind the bytes that were evaluated and therefore carry
+    # the checkpoint's original source identity. An equivalence witness may
+    # authorize packaging from a newer tree, but it does not retroactively
+    # rewrite those reports. Validate reports against the artifact identity and
+    # packaged files against the admitted candidate identity below.
+    evaluation_source = artifact["source_identity"]
     witness = (
         json.loads(inference_equivalence.expanduser().resolve().read_text(encoding="utf-8"))
         if inference_equivalence is not None
@@ -403,7 +409,7 @@ def build(
         label, rate = _load_builtin_evaluation(
             path.read_bytes(),
             checkpoint_digest,
-            source,
+            evaluation_source,
             minimum_builtin_score_rate,
             minimum_builtin_seed_count,
             agent,
@@ -419,7 +425,7 @@ def build(
     evaluation = _load_evaluation(
         evaluation_contents,
         checkpoint_digest,
-        source,
+        evaluation_source,
         minimum_score_rate,
         agent,
     )

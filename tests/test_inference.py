@@ -22,6 +22,7 @@ from kaggriculture.inference import (
 )
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.provenance import (
+    _identity_digest,
     is_legacy_run_provenance,
     run_provenance_from_decision,
     source_identity,
@@ -88,6 +89,24 @@ def test_fused_structured_artifact_rejects_cpu_inference(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="require CUDA inference"):
         load_actor_artifact(path, device="cpu")
+
+
+def test_portable_structured_import_tolerates_triton_without_tensor_descriptor() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.modules['triton.tools.tensor_descriptor'] = None; "
+                "import kaggriculture.structured"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _load_export_cpu_actor():
@@ -588,6 +607,68 @@ def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
         extracted,
     )
     assert "manifest.json" in names
+    assert validated_manifest == manifest
+
+
+def test_submission_equivalence_keeps_evaluations_bound_to_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _build_submission_module()
+    checkpoint, finalist, starter = _submission_inputs(tmp_path)
+    finalist_path = tmp_path / "finalist.json"
+    starter_path = tmp_path / "starter.json"
+    witness_path = tmp_path / "equivalence.json"
+    finalist_path.write_text(json.dumps(finalist), encoding="utf-8")
+    starter_path.write_text(json.dumps(starter), encoding="utf-8")
+    artifact_source = source_identity()
+    candidate_files = {
+        **artifact_source["files"],
+        "tests/equivalence-sentinel.py": "0" * 64,
+    }
+    candidate_source = {
+        "format_version": artifact_source["format_version"],
+        "sha256": _identity_digest(candidate_files),
+        "files": candidate_files,
+    }
+    checkpoint_digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    witness = {
+        "artifact_sha256": checkpoint_digest,
+        "expected_identity": artifact_source["sha256"],
+        "candidate_identity": candidate_source["sha256"],
+        "surfaces": {
+            name: {"equal": True, "reference": name, "candidate": name}
+            for name in ("observations", "masks", "logits")
+        },
+        "games": 1,
+        "steps": 1,
+        "failures": [],
+    }
+    witness_path.write_text(json.dumps(witness), encoding="utf-8")
+    monkeypatch.setattr(
+        builder,
+        "require_source_identity",
+        lambda *_args, **_kwargs: candidate_source,
+    )
+
+    manifest = builder.build(
+        checkpoint,
+        finalist_path,
+        tmp_path / "submission.tar.gz",
+        builtin_evaluation_reports=[starter_path],
+        minimum_score_rate=0.5,
+        minimum_builtin_score_rate=0.9,
+        minimum_builtin_seed_count=16,
+        inference_equivalence=witness_path,
+    )
+
+    assert manifest["source_identity"] == candidate_source
+    assert manifest["evaluation"]["score_rate"] == finalist["summary"]["score_rate"]
+    extracted = tmp_path / "equivalent-validated"
+    extracted.mkdir()
+    _, validated_manifest = _validate_submission_module()._extract(
+        tmp_path / "submission.tar.gz",
+        extracted,
+    )
     assert validated_manifest == manifest
 
 

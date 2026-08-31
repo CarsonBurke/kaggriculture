@@ -19,6 +19,7 @@ import torch
 
 from kaggriculture.provenance import (
     file_sha256,
+    validate_inference_equivalence,
     validate_run_provenance,
     validate_source_identity,
 )
@@ -60,6 +61,11 @@ seeds = int(sys.argv[3])
 seed_start = int(sys.argv[4])
 action_timeout = float(sys.argv[5])
 sys.path.insert(0, str(root))
+# Kaggle's CPU image includes an older Triton without this optional CUDA helper.
+# Block the local workstation's newer copy so archive import exercises the same
+# dependency surface instead of passing only because development has more packages.
+sys.modules["triton.tools.tensor_descriptor"] = None
+
 
 from kaggle_environments import make
 from kaggle_environments.agent import get_last_callable
@@ -267,21 +273,21 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
             raise ValueError("submission public v27 provenance chain is inconsistent")
     elif finalist_opponent.get("sha256") != evaluation_binding["opponent_sha256"]:
         raise ValueError("submission public v27 provenance chain is inconsistent")
+    artifact = torch.load(destination / "model.pt", map_location="cpu", weights_only=False)
+    artifact_source = validate_source_identity(artifact.get("source_identity"))
+    witness = manifest.get("inference_equivalence")
+    validated_witness = None if witness is None else validate_inference_equivalence(witness)
     if provenance.get("sha256") != checkpoint["sha256"]:
         raise ValueError("submission finalist evaluation targets different checkpoint bytes")
-    if provenance.get("source_identity") != source:
+    if provenance.get("source_identity") != artifact_source:
         raise ValueError("submission finalist evaluation has a different source identity")
     if provenance.get("agent") != checkpoint["agent"]:
         raise ValueError("submission finalist evaluation measured a different population member")
-    artifact = torch.load(destination / "model.pt", map_location="cpu", weights_only=False)
-    witness = manifest.get("inference_equivalence")
-    if artifact.get("source_identity") != source and (
-        not isinstance(witness, dict)
-        or witness.get("artifact_sha256") != checkpoint["sha256"]
-        or witness.get("failures")
-        or witness.get("candidate_identity") != source.get("sha256")
-        or (artifact.get("source_identity") or {}).get("sha256")
-        != witness.get("expected_identity")
+    if artifact_source != source and (
+        validated_witness is None
+        or validated_witness["artifact_sha256"] != checkpoint["sha256"]
+        or validated_witness["candidate_identity"] != source["sha256"]
+        or validated_witness["expected_identity"] != artifact_source["sha256"]
     ):
         raise ValueError("submission model has a different source identity")
 
