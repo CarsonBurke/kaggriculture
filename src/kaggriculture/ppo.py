@@ -1371,15 +1371,9 @@ def _replayed_component_logprobs(
     """Replay stored actions through the update-path policy forward.
 
     This defines the current-likelihood side of the PPO importance ratio in
-    every actor minibatch. The behavior side is produced at unchanged weights
-    by `_replayed_selected_logprobs`, which runs the identical forward,
-    masking, fp32 log_softmax, and gather math minus the entropy branch, so
-    the ratio starts at one up to numerics. The residual — separate Inductor
-    graphs when compiled, and minibatch composition that differs by the
-    update loop's shuffle (row counts differ by at most one) — is observed
-    directly by the `first_minibatch_approx_kl` metric and gated at
-    `MAX_FIRST_MINIBATCH_KL`. Autocast keeps log_softmax in fp32 by policy,
-    so the returned log-likelihoods are full precision either way.
+    every actor minibatch. The behavior side uses the entropy-free replay at
+    unchanged weights with an identical row partition. Autocast keeps
+    log_softmax in fp32 by policy.
     """
     with torch.autocast(
         device_type=unit_actions.device.type,
@@ -1447,25 +1441,11 @@ def replay_behavior_logprobs(
     autocast_enabled: bool,
     compile_mode: str = UNCOMPILED_UPDATE_COMPILE_MODE,
 ) -> dict[str, Tensor]:
-    """Recompute behavior log-likelihoods through the update-path forward.
+    """Recompute behavior likelihoods with the update precision and partition.
 
-    The rollout path samples actions from logits produced by a differently
-    compiled (and differently batched) forward, so its recorded likelihoods
-    differ from the update path's by kernel-selection noise. Recomputing them
-    here at unchanged weights, with the update path's forward and logprob
-    math at the update's precision, starts the importance ratio at one up to
-    numerics — which is what makes a reduced-precision update forward legal.
-    (The match is not bit-exact: the update loop shuffles its balanced
-    minibatches so a row's batch size can differ by one, and the compiled
-    replay and minibatch graphs are separate Inductor artifacts. That
-    residual is measured by `first_minibatch_approx_kl` and gated at
-    `MAX_FIRST_MINIBATCH_KL`.) The rollout-vs-update divergence becomes an
-    off-policy sampling bias instead of a ratio error; `update_replay_parity`
-    measures exactly that divergence.
-
-    Must run before the first actor optimizer step. `torch.no_grad` rather
-    than inference mode: the outputs are later gathered inside the autograd
-    minibatch graph, which inference tensors do not permit.
+    The caller supplies the exact actor-epoch row order. The remaining
+    inference-versus-training graph drift is measured by
+    `first_minibatch_approx_kl`.
     """
     if minibatch_size < 1:
         raise ValueError("minibatch size must be positive")
@@ -1624,8 +1604,7 @@ def _actor_minibatch_terms(
     """One actor minibatch: policy replay plus clipped surrogate reductions.
 
     Returns device-side (policy objective sum, entropy sum, k3 KL sum, clipped
-    count). Normalization by the per-minibatch component count stays outside
-    so the varying host integer never enters the captured graph.
+    count). Normalization stays outside so host integers never enter the graph.
 
     Entropy and KL are telemetry, not objective terms. Detaching their sums
     inside this compiled region preserves their exact forward values while
@@ -1778,6 +1757,23 @@ def update_replay_parity(
         )
     }
     ordered = torch.from_numpy(valid_indices).to(device=device)
+    behavior_replayed = {
+        "old_unit_logprobs": torch.zeros(
+            (staged["unit_actions"].shape[0], staged["unit_actions"].shape[1]),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "old_market_kind_logprobs": torch.zeros(
+            (staged["market_kinds"].shape[0], staged["market_kinds"].shape[1]),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "old_market_quantity_logprobs": torch.zeros(
+            (staged["market_quantities"].shape[0], staged["market_quantities"].shape[1]),
+            dtype=torch.float32,
+            device=device,
+        ),
+    }
     replay = _cached_update_callable(
         actor,
         "_kaggriculture_logprob_replay",
@@ -1813,6 +1809,12 @@ def update_replay_parity(
             autocast_enabled,
             *_actor_batch_args(rollout.architecture, staged, indices),
         )
+        for key, values in (
+            ("old_unit_logprobs", replayed[0]),
+            ("old_market_kind_logprobs", replayed[1]),
+            ("old_market_quantity_logprobs", replayed[2]),
+        ):
+            behavior_replayed[key].index_copy_(0, indices, values.float())
         for name, new_logprobs, old_key, active_key in (
             ("unit", replayed[0], "old_unit_logprobs", "unit_active"),
             ("kind", replayed[1], "old_market_kind_logprobs", "market_active"),
@@ -1856,7 +1858,7 @@ def update_replay_parity(
     first_minibatch_kl, mean_first_minibatch_kl = _replay_to_update_minibatch_kl(
         actor,
         rollout,
-        staged,
+        staged | behavior_replayed,
         valid_indices,
         minibatch_size=minibatch_size,
         compile_mode=compile_mode,
@@ -1928,35 +1930,20 @@ def _replay_to_update_minibatch_kl(
 
     This is the quantity `MAX_FIRST_MINIBATCH_KL` bounds, and it is not any of
     the sampling-versus-replay numbers this module's other statistics report.
-    `update_ppo` replaces the rollout's sampling likelihoods with a replay
-    through the update path, so its importance ratio starts at one by
-    construction and the residual its gate observes comes only from a separate
-    compiled graph and a shuffled batch composition. Auditing a sampling-path
-    number against that bound compares two different quantities that happen to
-    sit at a similar magnitude on a cloned actor.
+    The first side is the no-grad update-path replay already produced by
+    `update_replay_parity`; the comparison runs `_actor_minibatch_terms` over
+    shuffled minibatches. This audit intentionally preserves the independent
+    inference/training graphs whose numerical drift it measures. The optimizer
+    itself uses a stricter same-training-graph replay.
 
-    Both sides are therefore produced the way the update produces them: the
-    replay through `replay_behavior_logprobs`, the comparison through the same
-    `_actor_minibatch_terms` callable and the same permuted slicing. Advantages
-    are zero because the k3 sum does not depend on them, and every minibatch of
-    one epoch is measured rather than only the first, since the gate draws one
-    at random each iteration and the worst draw is the one that has to clear.
+    Advantages are zero because the k3 sum does not depend on them, and every
+    minibatch of one epoch is measured rather than only the first.
     """
     device = next(actor.parameters()).device
     resolved_mode = _device_compile_mode(compile_mode, device)
     # The k3 sum ignores both the advantages and the clip bounds, so the
     # defaults stand in for a config this audit is not otherwise given.
     clip = PpoConfig()
-    replayed = replay_behavior_logprobs(
-        actor,
-        rollout.architecture,
-        staged,
-        valid_indices,
-        minibatch_size=minibatch_size,
-        autocast_enabled=autocast_enabled,
-        compile_mode=compile_mode,
-    )
-    staged = staged | replayed
     flat_valid_size = rollout.valid.size
     flat_component_counts = (
         rollout.unit_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
@@ -2659,9 +2646,13 @@ def update_ppo(
     # step. The critic still holds exactly the behavior weights at this point.
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
-    actor.train()
+    # The fused actor's train-mode FP8 path advances delayed activation scales
+    # on every forward, making its likelihood depend on prior minibatches.
+    # Eval mode retains gradients but selects the stateless fused BF16 path, so
+    # PPO can replay a fixed behavior policy. The measured steady cost is small
+    # relative to the correctness and memory failures of a duplicate FP8 graph.
+    actor.eval()
     critic.train()
-    refresh_fused_mlp_fp8(actor)
     refresh_fused_mlp_fp8(critic)
     # Predictor-only fitting must leave the actor with neither changed weights
     # nor stale gradient buffers, including throughout critic warmup.
@@ -2704,18 +2695,17 @@ def update_ppo(
         compile_mode=compile_mode,
         autocast_enabled=autocast_enabled,
     )
-    # Behavior likelihoods are recomputed through the update path itself (same
-    # callable, precision, and minibatch partitioning as the loop below), not
-    # taken from the rollout's sampling-path logits. The stored rollout
-    # likelihoods remain the sampling ground truth that `update_replay_parity`
-    # audits this replay against.
-    if actor_epochs > 0:
+    # Recompute behavior likelihoods in the exact row order reused by every
+    # actor epoch. Matching the static partition removes batch-composition
+    # numerics between the separate inference and grad-tracking compiled graphs.
+    actor_order = generator.permutation(valid_indices) if actor_epochs > 0 else None
+    if actor_order is not None:
         staged.update(
             replay_behavior_logprobs(
                 actor,
                 architecture,
                 staged,
-                valid_indices,
+                actor_order,
                 minibatch_size=config.minibatch_size,
                 autocast_enabled=autocast_enabled,
                 compile_mode=compile_mode,
@@ -2837,15 +2827,19 @@ def update_ppo(
     epoch_marks: list[tuple[Tensor, int]] = []
     # What a complete actor epoch would have applied, fixed before the loop so a
     # trust-region stop cannot shrink the denominator it is measured against.
-    # The partition is recomputed per epoch from a fresh permutation, but its
-    # length depends only on the state count and the minibatch size, so one
-    # epoch's count times the actor's epochs is exact.
+    # Every actor epoch reuses the behavior replay's row partition, keeping the
+    # importance-ratio baseline independent of shuffle composition. Critic-only
+    # epochs keep independent permutations.
     actor_minibatches_intended = actor_epochs * len(
         _balanced_minibatch_slices(valid_indices.size, config.minibatch_size)
     )
     actor_zero = torch.zeros((), device=device, dtype=torch.float32)
     for epoch_index in range(critic_epochs):
-        shuffled = generator.permutation(valid_indices)
+        shuffled = (
+            actor_order
+            if epoch_index < actor_epochs and actor_order is not None
+            else generator.permutation(valid_indices)
+        )
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
         for batch_slice in _balanced_minibatch_slices(shuffled.size, config.minibatch_size):
             host_indices = shuffled[batch_slice]
@@ -2861,6 +2855,7 @@ def update_ppo(
             entropy_mean = actor_zero
             clipped_sum = actor_zero
             actor_gradient_norm = actor_zero
+            ppo_gradient_norm = actor_zero
             combined_actor_loss = actor_zero
             auxiliary_loss = actor_zero
             auxiliary_terms: StructuredDynamicsTerms | None = None
@@ -2895,11 +2890,10 @@ def update_ppo(
                 advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
                 actor_optimizer.zero_grad(set_to_none=True)
-                # Behavior likelihoods were replayed above at unchanged
-                # weights through the update path's logprob math, so the ratio
-                # starts at one up to numerics (separate compiled graphs and
-                # shuffle-dependent batch composition); the first-minibatch KL
-                # metric observes that residual.
+                # Behavior likelihoods were replayed above at unchanged weights
+                # with this exact partition and the same initial FP8 activation
+                # scales. The first-minibatch metric observes only the remaining
+                # inference-versus-training graph residual.
                 policy_sum, entropy_sum, kl_sum, clipped_sum = actor_terms(
                     actor,
                     unit_actions,
@@ -2927,7 +2921,6 @@ def update_ppo(
                 # graph. Gradients remain in the actor buffers, while peak
                 # memory stays near one actor forward.
                 policy_loss.backward()
-                ppo_gradient_norm: Tensor | None = None
                 if actor_auxiliary_active:
                     ppo_gradients = [
                         parameter.grad
@@ -3009,7 +3002,7 @@ def update_ppo(
                 actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                     actor.parameters(), config.max_gradient_norm
                 ).detach()
-                if ppo_gradient_norm is None:
+                if not actor_auxiliary_active:
                     # `clip_grad_norm_` returns the same pre-clip total norm. In
                     # the ordinary PPO path, reuse it instead of launching a
                     # second complete parameter-gradient reduction solely for
@@ -3109,7 +3102,6 @@ def update_ppo(
                         config.actor_learning_rate,
                         config.lr_warmup_steps,
                     )
-                    refresh_fused_mlp_fp8(actor, bootstrap_down=False)
                     totals["policy_loss"] += policy_loss.detach().double() * component_count
                     totals["entropy"] += entropy_mean.detach().double() * component_count
                     totals["approx_kl"] += batch_kl * component_count
@@ -3117,7 +3109,7 @@ def update_ppo(
                     totals["actor_gradient_norm"] += actor_gradient_norm * states
                     total_components += component_count
                     if predictor_active:
-                        assert ppo_gradient_norm is not None
+                        assert run_actor
                         ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
                     actor_states += states
                     actor_updates += 1

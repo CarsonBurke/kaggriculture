@@ -528,15 +528,10 @@ def main() -> None:
         # comparisons are not confounded by a different policy/action mix.
         torch.manual_seed(args.seed)
         # Compilation state is part of that independence. The update path
-        # compiles with dynamic=False, so every distinct minibatch shape
-        # specializes, and each shape specializes twice more because
-        # `_replayed_selected_logprobs` is reached both from the grad-tracking
-        # update and from the no-grad parity audit, whose tensors differ in
-        # their autograd dispatch keys. That is four cache entries per batch
-        # size against Dynamo's limit of eight, so a third batch size used to
-        # abort the sweep outright under fullgraph=True. Resetting also stops
-        # each batch size from measuring a cold start that the previous one
-        # already paid for.
+        # specializes each static minibatch shape, and grad-tracking training
+        # graphs specialize separately from the no-grad parity audit. Resetting
+        # stops a later batch size from inheriting artifacts or cache pressure
+        # that an earlier case paid to compile.
         torch._dynamo.reset()
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
