@@ -14,18 +14,23 @@ remains configurable; no player identity or policy is hardcoded. The population
 validator rejects frozen snapshots, built-ins, and fixed opponents whenever
 `N > 1`.
 
-Each seat optimizes its own non-telescoping economy:
-`mean_t tanh((farm_value_t - 3000) / 75000)` plus the same transform of final
-bank. Reducing the opponent's wealth never raises your reward. Equal rich play
-is therefore better than equal collapse, and sustaining capital matters even
-when two trajectories share an endpoint. Entropy remains telemetry only; there
-is no entropy coefficient in either `PpoConfig` or the CLI.
+Each seat receives the exact negative of the other seat's potential change.
+The nonterminal potential is
+`log1p(liquid_assets_0) - log1p(liquid_assets_1)`; liquid assets are bank plus
+the exact proceeds from selling every held market product. The terminal
+potential uses banked money only. With `gamma = 1`, rewards telescope from the
+symmetric initial potential to the terminal bank log-ratio. Dense shaping adds
+no early-lead or occupancy objective. Entropy remains telemetry only; there is
+no entropy coefficient in either `PpoConfig` or the CLI.
 
 ## Measured four-learner result
 
-`runs/pop4-economic-lr3e5/checkpoint-000050.pt` is the selected population
-checkpoint. It contains four independently initialized live learners after ten
-actor-active round-robin self-play iterations. The training wave contained no
+`runs/pop4-economic-lr3e5/checkpoint-000050.pt` is the historical checkpoint
+selected under the retired absolute-economic reward. It contains four
+independently initialized live learners after ten actor-active round-robin
+self-play iterations. Its actor can seed a fresh run, but its critic and
+optimizer state are incompatible with the zero-sum objective and source
+identity prevents resuming it as the same run. The training wave contained no
 fixed, frozen, scripted, or built-in player.
 
 Evaluation used eight held-out seeds, both seat orders, and the full 720-step
@@ -276,8 +281,9 @@ per-row agent assignment from the balanced pairing schedule, every row stored,
 `RolloutBatch.agents` populated, one ensemble forward over N lanes, no frozen or
 built-in lanes. *Acceptance:* a wave of G = 156 returns 312 trajectories with an
 exactly balanced 12-pairing histogram and exactly balanced seat counts per agent;
-each seat receives its own bounded economic reward, with no opponent-bank term;
-CPU test coverage for the schedule, partition, and reward independence.
+each game's two seats receive exact opposite log-relative rewards at every
+transition; CPU coverage pins the pairing, partition, antisymmetry, and terminal
+bank-log-ratio contracts.
 
 **Stage 3 - N-agent training loop.** N actors, critics, and optimizer pairs;
 per-agent updates and per-agent gates (`_gate_update_metrics`, including
@@ -387,7 +393,7 @@ the policies are worst, because diverging to exploit each other is diversity.
 Only the external anchor detected anything, which is the argument for it.
 
 **Stage 6 - ablations.** PFSP versus uniform pairing and population size, after
-the absolute non-telescoping reward has established a stable baseline.
+the zero-sum potential-difference reward has established a stable baseline.
 
 ## Risks
 
@@ -396,19 +402,19 @@ proposal added `scripted-v27` as a permanent lane, but that violates the
 four-live-learner requirement and makes training quality depend on one hardcoded
 policy. External opponents remain useful evaluation diagnostics only.
 
-The replacement addresses the mechanism directly. Under the old antisymmetric
-reward, opponent loss could outweigh learner loss and equal farms scored zero at
-any absolute wealth. Under the economic reward, each seat is monotone only in
-its own farm value; lowering the opponent changes nothing. The time-average term
-also distinguishes early sustained growth from a last-step endpoint, so it
-cannot telescope into the same return.
+The reward is aligned with the selected relative-wealth objective: one seat's
+gain is the other's equal loss, and the complete shaped return is exactly the
+final bank log-ratio. Equal rich and equal poor states both score zero. Lowering
+the opponent relative to the learner does improve the learner's terminal score;
+that is intended zero-sum strategy. External evaluation remains the required
+absolute-strength measurement.
 
-The remaining risk is reward-model error in the illiquid credits. Exact
-liquidation value covers bank and market products, while seeds, animals, pending
-yields, and land use conservative cost-basis fractions. A policy could overhold
-those assets mid-episode, but the final bank bonus ignores every unsold asset and
-has equal total weight to the whole occupancy average. Native/Python reward
-parity and the external bank curves are the gates for that failure.
+The mid-episode potential includes only assets the market can actually
+liquidate. Seeds, animals, planted crops, pending yields, and land receive no
+invented cost-basis credit. Potential differences telescope regardless, but
+their timing can still bias finite-sample GAE when the critic is imperfect, so
+native/Python potential parity and external bank curves remain the shaping
+gates.
 
 **Market denial is still positively rewarded. Measured on this run's own
 members.** `artifacts/probes/pop4-denial.json`, 16 games per ordered cell, two
@@ -500,21 +506,19 @@ in Stage 0 with an existing instrument.
    (`worst_first_minibatch_kl` 2.5e-05, `worst_update_replay_max_kl` 4.4e-04,
    11x under the shipped replay ceiling), so vmap replay parity is not the
    constraint either.
-3. **The reward has an absolute, non-telescoping anchor.** The measured Stage 5
-   run made every learner poorer while relative margins improved, so a purely
-   antisymmetric objective is retired. Each transition now pays one horizon
-   share of the learner's own bounded farm value and the terminal transition
-   adds its bounded final bank. The complete return is a time average plus an
-   endpoint, not a potential difference.
+3. **The reward is an exactly zero-sum potential difference.** Each transition
+   pays `potential_after - potential_before` to player zero and its exact
+   negative to player one. The nonterminal potential is the natural-log ratio
+   of actual liquid assets; the terminal potential is the natural-log ratio of
+   final bank money. `log1p` keeps zero assets in-domain using the one-dollar
+   economic unit, with no fitted scale or saturation.
 
-   This removes both null directions that mattered: equal rich and equal poor
-   play no longer score identically, and sacrificing your bank to reduce the
-   opponent's cannot improve your reward. The return remains inside `(-2, 2)`,
-   market-product trades remain value-neutral, and terminal scoring still ignores
-   unsold inventory.
+   Gamma is one. The complete return therefore telescopes from the symmetric
+   initial potential of zero to the terminal bank log-ratio. There is no
+   time-average occupancy term, no repeated payment for holding an early lead,
+   and no extra terminal bonus.
 
-   What the population does fix is the defect the measurements actually
-   condemned: 93% of the last run's experience came from the learner's own
-   current or frozen weaker weights, so beating them measured nothing. Every
-   opponent is now a live peer of equal competence that improves as the learner
-   improves, and no pairing is zero by construction.
+   Zero-sum self-play cannot measure absolute population strength: equal rich
+   and equal poor play both average to zero. Every committed recovery
+   checkpoint therefore requires the external opponent panel described above;
+   internal score rate is a pairing diagnostic, not a selection metric.

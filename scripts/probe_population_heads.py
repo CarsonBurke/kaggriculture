@@ -172,7 +172,9 @@ PLAYERS = 2
 # One transition fewer than the configured episode: the last one ends the game.
 MAX_TRANSITIONS = EPISODE_STEPS - 1
 # `sample_buffers` keys whose leading axis is the game, not the factor row.
-GAME_OUTPUTS = frozenset({"rewards", "final_money", "economic_scores", "training_rewards", "dones"})
+GAME_OUTPUTS = frozenset(
+    {"rewards", "final_money", "shaped_rewards", "previous_potentials", "potentials", "dones"}
+)
 # Temperatures cycled across rows so the per-row temperature array is exercised
 # rather than left at the scalar the current self-play path passes.
 ROW_TEMPERATURES = (1.0, 0.75, 1.25, 1.0)

@@ -87,10 +87,10 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         _validate_staged_action_masks(staged, valid)
 
 
-def test_default_gae_matches_the_cleanrl_standard() -> None:
+def test_default_gae_preserves_the_finite_horizon_objective() -> None:
     config = PpoConfig()
 
-    assert config.gamma == 0.99
+    assert config.gamma == 1.0
     assert config.actor_gae_lambda == pytest.approx(0.95)
     assert config.actor_gae_lambda == DEFAULT_ACTOR_GAE_LAMBDA
 
@@ -243,8 +243,8 @@ def test_discounted_advantages_and_targets_match_the_reference_recurrence() -> N
     expected_advantages = torch.tensor([[expected_0, expected_1, expected_2]])
     torch.testing.assert_close(advantages, expected_advantages)
     torch.testing.assert_close(targets, expected_advantages + values)
-    # Production discounts at CleanRL's standard gamma=0.99; the general
-    # recurrence still supports any gamma in (0, 1] correctly.
+    # The general recurrence still supports discounted auxiliary experiments;
+    # production uses gamma one to preserve its finite-horizon objective.
     monte_carlo = torch.tensor([[0.2 + 0.9 * (-0.1 + 0.9 * 0.3), -0.1 + 0.9 * 0.3, 0.3]])
     assert not torch.allclose(targets, monte_carlo)
 
@@ -985,8 +985,8 @@ def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
-    # A reward far outside the environment's bounded economic score, so the
-    # return leaves the support no matter what the critic predicts.
+    # A reward far outside the critic's calibrated support, so the target
+    # saturates no matter what the critic predicts.
     rollout.rewards[:, -1] = np.float32(9.0)
     config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
@@ -1674,8 +1674,8 @@ def test_a_mis_scaled_critic_still_explains_its_own_bootstrapped_target() -> Non
     the bootstrapped reading would have retired the measurement that diagnosed
     this critic in the first place.
     """
-    # Small dense economic rewards over a horizon long against the lambda
-    # window, matching the occupancy-reward scale of the 719-step episode.
+    # Small dense margin rewards over a horizon long against the lambda window,
+    # matching the 719-step objective's per-transition scale.
     generator = np.random.default_rng(5)
     rewards = generator.normal(0.002, 0.001, size=(4, 64)).astype(np.float32)
     valid = np.ones_like(rewards, dtype=np.bool_)
@@ -1846,16 +1846,14 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     identity = 1.0 - (metrics["advantage_std"] / metrics["value_target_std"]) ** 2
     assert metrics["lambda_return_explained_variance"] == pytest.approx(identity, abs=1e-5)
 
-    # The fit reading is materially positive on a critic the conventional reading
-    # calls near-worthless, and their SEPARATION is what the pair exists for.
-    # Swept over twelve initializations, the absolute levels do not support a
-    # fixed threshold -- the last-epoch fit spans 0.111 to 0.412 and the identity
-    # 0.018 to 0.096, so the two ranges overlap and either bound can be a hair
-    # from firing. The ratio is the stable statistic: 3.8x at its tightest,
-    # 16.8x at its widest, so a factor of three separates them on every init
-    # sampled while still failing if the fit reading collapses onto the identity.
+    # The fit reading is materially positive on a critic the conventional
+    # reading calls weak, and their separation is what the pair exists for.
+    # Gamma one increases the suffix target's explained variance; this pinned
+    # fixture reads a 2.66x separation. A factor of two still fails if the fit
+    # reading collapses toward the algebraic identity without encoding a stale
+    # threshold calibrated under the retired discounted objective.
     assert metrics["critic_fit_explained_variance_last_epoch"] > 0.1
-    assert metrics["critic_fit_explained_variance_last_epoch"] > 3.0 * abs(
+    assert metrics["critic_fit_explained_variance_last_epoch"] > 2.0 * abs(
         metrics["lambda_return_explained_variance"]
     )
 

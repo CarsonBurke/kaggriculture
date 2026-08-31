@@ -54,7 +54,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
     # Entropy is telemetry only; the training CLI has no bonus coefficient.
     assert not hasattr(args, "entropy_coefficient")
-    assert args.gamma == pytest.approx(0.99)
+    assert args.gamma == pytest.approx(1.0)
     assert args.actor_gae_lambda == pytest.approx(0.95)
     assert not hasattr(args, "gae_lambda")
     assert args.target_kl == PpoConfig.target_kl

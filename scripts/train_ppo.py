@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         "--gamma",
         type=float,
         default=PpoConfig.gamma,
-        help="reward discount; defaults to CleanRL's standard 0.99",
+        help="reward discount; defaults to 1.0 for the fixed-horizon zero-sum game",
     )
     parser.add_argument(
         "--actor-gae-lambda",

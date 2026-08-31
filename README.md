@@ -3,8 +3,9 @@
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
 The learner is direct, from-scratch self-play PPO with DAPO's asymmetric clip
-band and CleanRL's standard gamma/GAE-lambda schedule. Training does not currently depend on
-expert demonstrations, distillation, behavior cloning, or value pretraining. An exact
+band, an undiscounted finite-horizon objective, and GAE lambda 0.95. Training
+does not currently depend on expert demonstrations, distillation, behavior
+cloning, or value pretraining. An exact
 batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
 environment remains the parity oracle and final evaluator.
 
@@ -190,51 +191,48 @@ the chain.
 Sweep with `--games 64,112,128,256` when the question is scaling or memory
 headroom, which is a separate study from this one.
 
-Training rewards each learner for its own economy; they are not zero-sum and do
-not read the opponent's bank. For player `i` after transition `t`,
+Training uses an exactly zero-sum potential difference. Let `L[i,t]` be player
+`i`'s actual liquid assets: bank money plus the exact proceeds from selling
+every held product at the current market curve. For player-zero potential
+`p[t]`,
 
 ```
-s[i,t] = tanh((value[i,t] - 3000) / 75000)
-r[i,t] = s[i,t] / 719 + terminal(t) * s[i,t]
+p[t] = log1p(L[0,t])    - log1p(L[1,t])     # nonterminal
+p[T] = log1p(bank[0,T]) - log1p(bank[1,T])  # terminal
+r[0,t] = p[t+1] - p[t]
+r[1,t] = -r[0,t]
 ```
 
-so the episode return is the geometrically weighted sum of post-action
-economic scores plus the discounted final bank score. It is deliberately
-non-telescoping: two trajectories with
-the same endpoint receive different returns when one sustained useful capital
-for longer. Equal rich learners both receive positive reward; equal bankrupt
-learners both receive negative reward. Reducing the opponent's bank never raises
-your reward, which removes the self-play failure where all four policies became
-poorer while improving their relative margin against one another.
+The symmetric initial state has `p[0] = 0`, so the complete return telescopes
+exactly to the terminal bank log-ratio. Dense liquid-asset shaping changes
+credit assignment without repeatedly paying for an existing lead. Equal assets
+always score zero; only changes in relative liquid wealth move the potential,
+and unsold terminal inventory earns nothing. Every transition, including the
+terminal transition, sums to exactly zero.
 
-Mid-episode `value` is an exact liquidation core -- bank money plus the exact
-proceeds of selling every held product, unit by unit at the quotes the engine
-would actually pay -- plus conservative cost-basis credit for assets the market
-cannot buy back: seeds at 0.85 of engine cost in the shed and 0.8 once planted,
-animals at 0.82 in the shed and 0.85 once placed, pending yields at 0.72 of
-their posted price, and extra land at 0.9 of purchase price. Market-product
-trades are exactly value-neutral, so cycling inventory cannot manufacture
-reward. These credits bridge the invest-produce-sell delay without making an
-investment look like pure loss. On the terminal transition `value` becomes
-banked money alone, so unsold inventory and heuristic credits do not enter the
-final bonus.
+`log1p` makes the comparison percentage-like and remains defined when a player
+has no liquid assets. One dollar is the game's smallest economic unit, so this
+is `log((L[0] + 1) / (L[1] + 1))`; there is no fitted dollar scale or nonlinear
+margin saturation.
 
-The 3,000-dollar baseline makes doing nothing exactly zero. The 75,000-dollar
-scale keeps measured neural final banks -- roughly 40,000 to 140,000 -- in the
-informative part of tanh while bounding each score inside `(-1, 1)`. The
-time-average contributes less than one and the final bonus contributes less than
-one, so every complete return remains strictly inside `(-2, 2)`, matching the
-critic's HL-Gauss support. The constant is duplicated as `ECONOMIC_SCALE` in
-`src/kaggriculture/encoding.py` and `rust/kagg_env/src/core.rs`; native/Python
-parity covers both the score and reward.
+Liquid assets deliberately exclude seeds, animals, planted crops, pending
+yields, and land because the market cannot liquidate them. Market products are
+valued by walking the engine's sell arithmetic unit by unit, including its
+price-floor restock rule. Moving those products into the bank is therefore
+potential-neutral, so cycling inventory cannot manufacture reward.
 
-Gamma and GAE lambda follow CleanRL's standard PPO schedule (`gamma = 0.99`,
-`gae_lambda = 0.95`) and the actor advantages and critic targets share them:
-critic targets are the matching lambda-return `advantage + value`. A lambda-one
-suffix return would fold all later action noise into every earlier target; the
-shorter window keeps the local dense signal while the critic supplies
-continuation value. Targets that bootstrap beyond the categorical support
-saturate at the outer atom and the saturated fraction is reported.
+The log potential is not artificially bounded. Critic targets outside the
+categorical support saturate at its outer atom, and the saturated fraction is a
+reported training gate rather than a hidden reward transform. Native/Python
+parity covers both the potential and its difference.
+
+Gamma is `1.0`: discounting a fixed 719-transition game would alter the
+terminal objective and break telescoping. GAE lambda remains `0.95`; it controls
+the sampled advantage horizon while the critic supplies the continuation
+estimate. Actor advantages and critic targets share the same recurrence, and
+critic targets are `advantage + value`. Targets that bootstrap beyond the
+categorical support saturate at the outer atom and the saturated fraction is
+reported.
 
 The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
 population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
@@ -272,8 +270,8 @@ actions are discrete. Market quantities use a state- and order-conditioned
 masked categorical over every integer from 1 through 100, which preserves exact
 PPO likelihoods and multimodal quantity choices; a continuous Beta density would
 not be a valid likelihood for these integer actions. The centralized critic uses
-HL-Gauss labels on a bounded categorical support with headroom around the proven
-`[-2, 2]` return range.
+HL-Gauss labels on a bounded categorical support; target saturation is measured
+and gated because the log-relative economic return itself is not clipped.
 
 Future ablation, intentionally not implemented yet: actor-only pretraining on
 the public v27 route. Demonstrations must first be projected through the exact
@@ -332,10 +330,10 @@ silently excluded:
 ```
 
 The official 32-seed paired panel is enough to package. Do not re-run 128 seeds
-against an artifact you already screened. Rank that panel, not the training
-self-play score -- which is 0.5 by symmetry however much or little either side
-is worth, and is part of why the objective needed an absolute dollar anchor --
-or `latest.pt`. If you must evaluate, use `--device cuda`. Evaluation takes no
+against an artifact you already screened. Rank that panel, not the symmetric
+self-play score -- a zero-sum population averages 0.5 internally regardless of
+its absolute strength -- or `latest.pt`. If you must evaluate, use `--device cuda`.
+Evaluation takes no
 compilation flag: `--rollout-forward-mode`, `--rollout-bfloat16` and
 `--update-compile-mode` are training knobs, decided by the calibration described
 above, and the evaluation and selection scripts accept none of them.

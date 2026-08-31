@@ -577,13 +577,13 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # CleanRL's standard PPO schedule (cleanrl/ppo.py): `gae_lambda = 0.95`
-    # shared by the actor advantages and the critic's lambda-return targets, and
-    # `gamma = 0.99`. The economic objective still supplies a bounded signal on
-    # every transition plus a final-bank bonus; discounting weights near-term
-    # transitions more heavily instead of the undiscounted equal weighting.
+    # The game has a fixed finite horizon and the shaped rewards telescope to
+    # its terminal bank log-ratio only without discounting. Gamma is therefore
+    # one. GAE lambda remains CleanRL's 0.95 variance-control default; it
+    # shortens sampled credit assignment while the critic supplies the
+    # continuation estimate, without changing the objective.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
-    gamma: float = 0.99
+    gamma: float = 1.0
     # Measured to bind on EVERY minibatch, which makes this the step-size
     # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
     # 1264 production-shaped minibatches in four configurations -- BC actor with
@@ -702,7 +702,7 @@ def generalized_advantage_and_targets(
     values: Tensor,
     valid: Tensor,
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
-    gamma: float = 0.99,
+    gamma: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     """Compute lambda-GAE advantages and the matching lambda-return targets.
 
@@ -711,9 +711,9 @@ def generalized_advantage_and_targets(
     wherever the value function is exact and trades the remaining bias for a
     variance reduction that grows with the horizon: over 719 transitions the
     lambda-one Monte Carlo suffix return accumulates the noise of every later
-    action into every earlier state's target. The dense economic occupancy
-    reward exposes progress throughout the episode, so the shorter window keeps
-    useful local signal while the critic supplies the continuation estimate.
+    action into every earlier state's target. Dense potential differences expose
+    relative progress throughout the episode, so the shorter window keeps useful
+    local signal while the critic supplies the continuation estimate.
     """
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")

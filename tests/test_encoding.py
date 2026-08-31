@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from itertools import pairwise
 
 import numpy as np
 from kaggle_environments import make
@@ -9,21 +10,13 @@ from kaggriculture.constants import MAX_UNITS, PRICE_FLOOR, market_price
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
-    ECONOMIC_SCALE,
     GLOBAL_FEATURES,
-    ILLIQUID_LAND_CREDIT,
-    ILLIQUID_PENDING_YIELD_CREDIT,
-    ILLIQUID_PLACED_ANIMAL_CREDIT,
-    ILLIQUID_PLANTED_SEED_CREDIT,
-    ILLIQUID_SHED_ANIMAL_CREDIT,
-    ILLIQUID_SHED_SEED_CREDIT,
-    STARTING_MONEY,
     UNIT_FEATURES,
-    economic_pair_reward,
     encode_observation,
-    illiquid_value,
     liquidation_value,
-    pair_economic_scores,
+    pair_potential,
+    shaped_pair_reward,
+    terminal_pair_potential,
 )
 
 
@@ -48,50 +41,41 @@ def test_encoding_shapes_and_viewpoint_symmetry() -> None:
     assert encoded.global_features.dtype == np.float16
     assert encoded.critic_features.dtype == np.float16
     assert encoded.units.dtype == np.float16
-    assert pair_economic_scores(zero, one) == (0.0, 0.0)
+    assert pair_potential(zero, one) == 0.0
 
 
-def test_pair_economic_scores_are_absolute_and_independent() -> None:
+def test_pair_potential_is_a_zero_sum_log_liquid_asset_ratio() -> None:
     zero, one = _observations()
     zero["farms"][0]["money"] = 9000
     one["farms"][1]["money"] = 3000
 
-    assert pair_economic_scores(zero, one) == (
-        math.tanh(6000 / ECONOMIC_SCALE),
-        0.0,
-    )
+    lead = math.log1p(9000) - math.log1p(3000)
+    assert pair_potential(zero, one) == lead
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 9000
-    assert pair_economic_scores(zero, one) == (
-        0.0,
-        math.tanh(6000 / ECONOMIC_SCALE),
-    )
+    assert pair_potential(zero, one) == -lead
 
-    # Equal rich farms are positively reinforced; equal collapse is not a
-    # zero-sum tie with the same reward.
+    # Equal farms have zero potential at any absolute wealth, including zero.
     zero["farms"][0]["money"] = 5000
     one["farms"][1]["money"] = 5000
-    rich_tie = pair_economic_scores(zero, one)
-    assert rich_tie[0] == rich_tie[1] > 0.0
+    assert pair_potential(zero, one) == 0.0
     zero["farms"][0]["money"] = 0
     one["farms"][1]["money"] = 0
-    poor_tie = pair_economic_scores(zero, one)
-    assert poor_tie[0] == poor_tie[1] < 0.0
+    assert pair_potential(zero, one) == 0.0
+    one["farms"][1]["money"] = 3000
+    assert pair_potential(zero, one) == -math.log1p(3000)
+    zero["farms"][0]["money"] = 3000
+    one["farms"][1]["money"] = 0
+    assert pair_potential(zero, one) == math.log1p(3000)
 
-    # Held products contribute their own exact liquidation proceeds and never
-    # enter the other player's score.
-    zero["farms"][0]["money"] = STARTING_MONEY
-    one["farms"][1]["money"] = STARTING_MONEY
+    # Held products contribute their exact liquidation proceeds.
+    zero["farms"][0]["money"] = 3000
+    one["farms"][1]["money"] = 3000
     zero["private"]["shed"]["WHEAT"] = 40
     one["private"]["shed"]["MILK"] = 5
     value_zero = liquidation_value(zero, 0)
     value_one = liquidation_value(one, 1)
-    assert value_zero > STARTING_MONEY
-    assert value_one > STARTING_MONEY
-    assert pair_economic_scores(zero, one) == (
-        math.tanh((value_zero - STARTING_MONEY) / ECONOMIC_SCALE),
-        math.tanh((value_one - STARTING_MONEY) / ECONOMIC_SCALE),
-    )
+    assert pair_potential(zero, one) == math.log1p(value_zero) - math.log1p(value_one)
 
 
 def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
@@ -109,102 +93,73 @@ def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
 
     assert liquidation_value(zero, 0) == expected
 
-    # Walking that same curve is what keeps a market product sale exactly
+    # Walking that same curve keeps a market product sale exactly
     # potential-neutral: the proceeds land in the bank at precisely the quotes
-    # the held units were already credited at, so no amount of trading back and
-    # forth manufactures shaped reward. Any monotone squash of the same value
-    # difference preserves this, so the margin rescale cannot have broken it.
-    before = pair_economic_scores(zero, one)[0]
+    # the held units were already credited at.
+    before = pair_potential(zero, one)
     zero["farms"][0]["money"] = expected
     zero["private"]["shed"]["WHEAT"] = 0
     zero["private"]["inventories"][0]["WHEAT"] = 0
     zero["market"]["inventory"]["WHEAT"] = inventory_level
-    assert pair_economic_scores(zero, one)[0] == before
+    assert pair_potential(zero, one) == before
 
 
-def test_illiquid_value_credits_cost_basis_fractions() -> None:
+def test_pair_potential_excludes_assets_that_cannot_be_liquidated() -> None:
     zero, one = _observations()
-    assert illiquid_value(zero, 0) == 0.0
-    assert illiquid_value(one, 1) == 0.0
+    baseline = pair_potential(zero, one)
 
     zero["private"]["shed"]["GOOSE"] = 2
     zero["private"]["seeds"]["TOMATO"] = 4
     zero["farms"][0]["tiles"][0][3] = {"kind": "PLANT", "crop": "WHEAT", "yield_units": 2}
     zero["farms"][0]["tiles"][0][7] = {"animal": "COW", "yield_units": 3}
     zero["farms"][0]["unlocked_quadrants"] = ["NW", "NE", "SW"]
-    prices = zero["market"]["prices"]
 
-    expected = (
-        ILLIQUID_SHED_ANIMAL_CREDIT * 2 * 300
-        + ILLIQUID_SHED_SEED_CREDIT * 4 * 50
-        + ILLIQUID_PLANTED_SEED_CREDIT * 10
-        + ILLIQUID_PENDING_YIELD_CREDIT * 2 * prices["WHEAT"]
-        + ILLIQUID_PLACED_ANIMAL_CREDIT * 400
-        + ILLIQUID_PENDING_YIELD_CREDIT * 3 * prices["MILK"]
-        + ILLIQUID_LAND_CREDIT * (1000 + 2000)
-    )
-    assert abs(illiquid_value(zero, 0) - expected) < 1e-9
-    # Investment moves the shaping potential instead of reading as pure loss.
-    assert pair_economic_scores(zero, one)[0] > 0.0
+    assert pair_potential(zero, one) == baseline
 
 
-def test_terminal_economic_scores_use_bank_only() -> None:
+def test_terminal_pair_potential_uses_bank_only() -> None:
     zero, one = _observations()
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 1000
     zero["private"]["shed"]["WHEAT"] = 100
 
-    terminal = pair_economic_scores(zero, one, terminal=True)
-    assert terminal == (
-        0.0,
-        math.tanh(-2000 / ECONOMIC_SCALE),
-    )
-    # A hundred unsold WHEAT is useful mid-episode but scores nothing at the
-    # terminal bank, so the final bonus still requires liquidating production.
-    assert pair_economic_scores(zero, one)[0] > terminal[0]
+    terminal = terminal_pair_potential(zero, one)
+    assert terminal == math.log1p(3000) - math.log1p(1000)
+    # Unsold WHEAT contributes mid-episode but not to the terminal objective.
+    assert pair_potential(zero, one) > terminal
 
 
-def test_economic_score_cannot_pay_for_shrinking_an_opponent() -> None:
-    """Each learner's reward is monotone in its own economy only."""
+def test_log_asset_ratio_tracks_relative_not_absolute_wealth() -> None:
     zero, one = _observations()
-    zero["farms"][0]["money"] = 9000
-    one["farms"][1]["money"] = 3000
-    original = pair_economic_scores(zero, one)
+    zero["farms"][0]["money"] = 8999
+    one["farms"][1]["money"] = 2999
+    original = pair_potential(zero, one)
 
-    one["farms"][1]["money"] = 0
-    opponent_destroyed = pair_economic_scores(zero, one)
-    assert opponent_destroyed[0] == original[0]
-    assert opponent_destroyed[1] < original[1]
+    # Lowering the opponent increases the learner's score through the resulting
+    # relative liquid-asset advantage.
+    one["farms"][1]["money"] = 999
+    assert pair_potential(zero, one) > original
 
-    zero["farms"][0]["money"] = 7000
-    learner_destroyed = pair_economic_scores(zero, one)
-    assert learner_destroyed[0] < opponent_destroyed[0]
+    # Scaling both (money + one dollar) values equally preserves their ratio.
+    zero["farms"][0]["money"] = 2999
+    assert math.isclose(pair_potential(zero, one), original, abs_tol=1e-15)
 
 
-def test_economic_rewards_do_not_telescope() -> None:
-    terminal_scores = (0.4, 0.2)
-    late_growth = [
-        economic_pair_reward((0.0, 0.0), terminal=False, transitions=2),
-        economic_pair_reward(terminal_scores, terminal=True, transitions=2),
-    ]
-    sustained_growth = [
-        economic_pair_reward(terminal_scores, terminal=False, transitions=2),
-        economic_pair_reward(terminal_scores, terminal=True, transitions=2),
+def test_shaped_rewards_telescope_and_are_zero_sum() -> None:
+    potentials = np.asarray([0.0, 0.125, -0.25, 0.5], dtype=np.float32)
+    rewards = [
+        shaped_pair_reward(previous, following) for previous, following in pairwise(potentials)
     ]
 
-    # Same endpoint, different path: sustained capital earns more. A potential
-    # difference would telescope both paths to the same terminal score.
-    assert tuple(map(sum, zip(*sustained_growth, strict=True))) > tuple(
-        map(sum, zip(*late_growth, strict=True))
-    )
-    assert economic_pair_reward((0.5, 0.25), terminal=False, transitions=4) == (
-        0.125,
-        0.0625,
-    )
-    assert economic_pair_reward((0.5, 0.25), terminal=True, transitions=4) == (
-        0.625,
-        0.3125,
-    )
+    returns = tuple(map(sum, zip(*rewards, strict=True)))
+    assert returns == (float(potentials[-1] - potentials[0]), float(potentials[0] - potentials[-1]))
+    assert shaped_pair_reward(-0.25, 0.5) == (0.75, -0.75)
+
+
+def test_shaped_rewards_match_native_binary32_subtraction() -> None:
+    # Both inputs narrow to the same native cached potential. A binary64
+    # subtraction would invent a tiny backend-specific reward here.
+    assert shaped_pair_reward(8.0, 8.0 + 1e-7) == (0.0, -0.0)
 
 
 def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:

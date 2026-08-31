@@ -9,19 +9,16 @@ from typing import Any
 import numpy as np
 
 from kaggriculture.constants import (
-    ANIMAL_COST,
     ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
     CROPS,
     EPISODE_STEPS,
-    LAND_PRICES,
     MARKET_I0,
     MAX_UNITS,
     PRICE_FLOOR,
     PRIVATE_ITEMS,
     PRODUCTS,
-    SEED_COST,
     SHOP_NAMES,
     TURNS_PER_DAY,
     market_price,
@@ -300,148 +297,49 @@ def liquidation_value(observation: dict[str, Any], expected_player: int) -> floa
     return value
 
 
-_ANIMAL_PRODUCT = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
-
-# Illiquid cost-basis credit fractions for the shaping potential.  Kept near
-# engine cost so buying an asset is only a small potential dip: a deep dip
-# (land once sat at 0.45) makes every purchase an immediate shaped-reward
-# cliff the policy never crosses, starving the critic of post-purchase data.
-# Must stay identical to ILLIQUID_* in rust/kagg_env/src/core.rs.
-ILLIQUID_SHED_ANIMAL_CREDIT = 0.82
-ILLIQUID_SHED_SEED_CREDIT = 0.85
-ILLIQUID_PLACED_ANIMAL_CREDIT = 0.85
-ILLIQUID_PLANTED_SEED_CREDIT = 0.8
-ILLIQUID_PENDING_YIELD_CREDIT = 0.72
-ILLIQUID_LAND_CREDIT = 0.9
+def _log_asset_ratio(zero: float, one: float) -> float:
+    """Natural-log relative wealth, defined even when either side has nothing."""
+    if not math.isfinite(zero) or zero < 0.0 or not math.isfinite(one) or one < 0.0:
+        raise ValueError("economic values must be finite and non-negative")
+    # Money is integral, so one dollar is the smallest non-zero economic unit.
+    # log1p therefore supplies a domain-safe ratio without a fitted scale:
+    # log((zero + $1) / (one + $1)).
+    return math.log1p(zero) - math.log1p(one)
 
 
-def illiquid_value(observation: dict[str, Any], expected_player: int) -> float:
-    """Heuristic cost-basis credit for assets the market cannot buy back.
-
-    Animals, seeds, planted crops, pending yields, and land have no exact cash
-    value, so this credits fractions of engine cost (posted prices for pending
-    yields) purely to smooth credit assignment across the invest-produce-sell
-    loop: without it, self-play collapses into a never-spend tie equilibrium
-    before harvests can pay back.  The terminal bank override keeps the
-    objective exact regardless of these weights.
-    """
-    player = _validated_player(observation, expected_player)
-    farm = (observation.get("farms") or [])[player]
-    private = observation.get("private") or {}
-    prices = (observation.get("market") or {}).get("prices") or {}
-    shed = private.get("shed") or {}
-    inventories = private.get("inventories") or []
-    seeds = private.get("seeds") or {}
-    value = 0.0
-    for animal, cost in ANIMAL_COST.items():
-        held = int(shed.get(animal, 0) or 0) + sum(
-            int(inventory.get(animal, 0) or 0) for inventory in inventories
-        )
-        value += ILLIQUID_SHED_ANIMAL_CREDIT * held * cost
-    for crop in CROPS:
-        value += ILLIQUID_SHED_SEED_CREDIT * int(seeds.get(crop, 0) or 0) * SEED_COST[crop]
-    for row in farm.get("tiles") or []:
-        for tile in row:
-            if not isinstance(tile, dict):
-                continue
-            animal = tile.get("animal")
-            if animal is not None:
-                # Raise on schema drift: a silently skipped tile would diverge
-                # from the rust potential without tripping the parity oracle.
-                product = _ANIMAL_PRODUCT[animal]
-                value += ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[animal]
-                value += (
-                    ILLIQUID_PENDING_YIELD_CREDIT
-                    * int(tile.get("yield_units", 0) or 0)
-                    * float(prices.get(product, BASE_PRICE[product]) or 0)
-                )
-            elif tile.get("kind") == "PLANT":
-                crop = tile.get("crop")
-                if crop not in SEED_COST:
-                    raise ValueError(f"unknown crop {crop!r} on planted tile")
-                value += ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[crop]
-                value += (
-                    ILLIQUID_PENDING_YIELD_CREDIT
-                    * int(tile.get("yield_units", 0) or 0)
-                    * float(prices.get(crop, BASE_PRICE[crop]) or 0)
-                )
-    extra_land = max(0, len(farm.get("unlocked_quadrants") or []) - 1)
-    value += ILLIQUID_LAND_CREDIT * sum(LAND_PRICES[:extra_land])
-    return value
-
-
-#: Economic value above the starting bank at which the bounded score reaches
-#: tanh's knee. Neural-versus-neural final banks span roughly 40k-140k, so this
-#: keeps the region that separates collapsed from healthy play informative while
-#: bounding one episode's return below 2. Must match ECONOMIC_SCALE in core.rs.
-ECONOMIC_SCALE = 75_000.0
-STARTING_MONEY = 3_000.0
-
-
-def _economic_score(value: float, starting_money: float = STARTING_MONEY) -> float:
-    """Bounded absolute economic competence above the initial endowment."""
-    if (
-        not math.isfinite(value)
-        or value < 0.0
-        or not math.isfinite(starting_money)
-        or starting_money < 0.0
-    ):
-        raise ValueError("economic value and starting money must be finite and non-negative")
-    return math.tanh((value - starting_money) / ECONOMIC_SCALE)
-
-
-def pair_economic_scores(
-    observation_zero: dict[str, Any],
-    observation_one: dict[str, Any],
-    *,
-    terminal: bool = False,
-    starting_money: float = STARTING_MONEY,
-) -> tuple[float, float]:
-    """Absolute per-player economic scores for one post-action state.
-
-    Mid-episode value combines exact liquidation proceeds with conservative
-    cost-basis credit for illiquid investments. The terminal score uses banked
-    money only, matching the competition's actual result. Neither player's score
-    reads the other's value: shrinking an opponent's economy cannot compensate
-    for shrinking your own.
-    """
-    if terminal:
-        values = (
-            _scored_money(observation_zero, 0),
-            _scored_money(observation_one, 1),
-        )
-    else:
-        values = (
-            liquidation_value(observation_zero, 0) + illiquid_value(observation_zero, 0),
-            liquidation_value(observation_one, 1) + illiquid_value(observation_one, 1),
-        )
-    return (
-        _economic_score(values[0], starting_money),
-        _economic_score(values[1], starting_money),
+def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
+    """Log-relative actual liquid assets from player zero's perspective."""
+    return _log_asset_ratio(
+        liquidation_value(observation_zero, 0),
+        liquidation_value(observation_one, 1),
     )
 
 
-def economic_pair_reward(
-    scores: tuple[float, float],
-    *,
-    terminal: bool,
-    transitions: int = EPISODE_STEPS - 1,
-) -> tuple[float, float]:
-    """Non-telescoping economic return for one post-action state.
-
-    Every transition contributes its share of the episode's time-average farm
-    value. The terminal transition adds the final bank score once more, so the
-    total return is ``mean(post_action_farm_scores) + final_bank_score`` and is
-    strictly bounded inside ``(-2, 2)``. Sustaining useful capital therefore
-    matters even when all four learners finish with the same bank; equal rich
-    play is rewarded and equal collapse is not.
-    """
-    if transitions < 1:
-        raise ValueError("transitions must be positive")
-    if len(scores) != 2 or any(not math.isfinite(score) for score in scores):
-        raise ValueError("economic scores must contain two finite values")
-    terminal_bonus = 1.0 if terminal else 0.0
-    return (
-        scores[0] / transitions + terminal_bonus * scores[0],
-        scores[1] / transitions + terminal_bonus * scores[1],
+def terminal_pair_potential(
+    observation_zero: dict[str, Any], observation_one: dict[str, Any]
+) -> float:
+    """Log-relative terminal bank money from player zero's perspective."""
+    return _log_asset_ratio(
+        _scored_money(observation_zero, 0),
+        _scored_money(observation_one, 1),
     )
+
+
+def shaped_pair_reward(
+    previous_potential: float,
+    next_potential: float,
+) -> tuple[float, float]:
+    """Exact zero-sum binary32 change in the pair potential.
+
+    Native rollout caches and subtracts binary32 potentials. Mirroring that
+    precision here keeps interpreted rollout and parity-oracle rewards bitwise
+    aligned instead of narrowing a binary64 subtraction after the fact. With
+    gamma one, rewards telescope from the symmetric initial potential to the
+    terminal bank log-ratio up to binary32 accumulation precision.
+    """
+    previous = np.float32(previous_potential)
+    following = np.float32(next_potential)
+    if not np.isfinite(previous) or not np.isfinite(following):
+        raise ValueError("pair potentials must be finite")
+    reward_zero = float(np.float32(following - previous))
+    return reward_zero, -reward_zero

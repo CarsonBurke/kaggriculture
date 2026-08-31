@@ -116,24 +116,6 @@ const V27_REBALANCE_INTERVAL: u16 = 24;
 /// Weight the rebalance branch gives that overstock urgency.
 const V27_DEMAND_ALPHA: f64 = 0.25;
 
-// Illiquid cost-basis credit fractions for the shaping potential.  Kept near
-// engine cost so buying an asset is only a small potential dip: a deep dip
-// (land once sat at 0.45) makes every purchase an immediate shaped-reward
-// cliff the policy never crosses, starving the critic of post-purchase data.
-// Must stay identical to ILLIQUID_* in src/kaggriculture/encoding.py.
-const ILLIQUID_SHED_ANIMAL_CREDIT: f64 = 0.82;
-const ILLIQUID_SHED_SEED_CREDIT: f64 = 0.85;
-const ILLIQUID_PLACED_ANIMAL_CREDIT: f64 = 0.85;
-const ILLIQUID_PLANTED_SEED_CREDIT: f64 = 0.8;
-const ILLIQUID_PENDING_YIELD_CREDIT: f64 = 0.72;
-const ILLIQUID_LAND_CREDIT: f64 = 0.9;
-
-// Economic value above the starting bank at which the bounded score reaches
-// tanh's knee. Neural-versus-neural final banks span roughly 40k-140k, so this
-// separates collapsed from healthy play without letting one episode's return
-// leave (-2, 2). Must match ECONOMIC_SCALE in encoding.py.
-const ECONOMIC_SCALE: f64 = 75_000.0;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TileKind {
@@ -1126,83 +1108,26 @@ impl Game {
         value
     }
 
-    /// Heuristic cost-basis credit for assets the market cannot buy back.
-    ///
-    /// Animals, seeds, planted crops, pending yields, and land have no exact
-    /// cash value, so this credits fractions of engine cost (posted prices
-    /// for pending yields) purely to smooth credit assignment across the
-    /// invest-produce-sell loop: without it, self-play collapses into a
-    /// never-spend tie equilibrium before harvests can pay back.  The
-    /// terminal bank override keeps the objective exact regardless of these
-    /// weights.
-    pub fn illiquid_value(&self, player: usize) -> f64 {
-        let mut value = 0.0;
-        let units = usize::from(self.farms[player].units);
-        for animal in 0..ANIMALS {
-            let mut held = i64::from(self.privates[player].shed[PRODUCTS + animal]);
-            for inventory in &self.privates[player].inventories[..units] {
-                held += i64::from(inventory[PRODUCTS + animal]);
-            }
-            value += ILLIQUID_SHED_ANIMAL_CREDIT * held as f64 * ANIMAL_COST[animal] as f64;
-        }
-        #[allow(clippy::needless_range_loop)]
-        for crop in 0..CROPS {
-            value += ILLIQUID_SHED_SEED_CREDIT
-                * f64::from(self.privates[player].seeds[crop])
-                * SEED_COST[crop] as f64;
-        }
-        for tile in self.farms[player].tiles {
-            if tile.has_animal {
-                let animal = usize::from(tile.species);
-                value += ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[animal] as f64;
-                value += ILLIQUID_PENDING_YIELD_CREDIT
-                    * f64::from(tile.yield_units)
-                    * self.market_prices[ANIMAL_PRODUCT[animal]] as f64;
-            } else if tile.kind == TileKind::Plant {
-                let crop = usize::from(tile.species);
-                value += ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[crop] as f64;
-                value += ILLIQUID_PENDING_YIELD_CREDIT
-                    * f64::from(tile.yield_units)
-                    * self.market_prices[crop] as f64;
-            }
-        }
-        let extra = self.farms[player].unlocked.count_ones().saturating_sub(1) as usize;
-        value += ILLIQUID_LAND_CREDIT * LAND_PRICES[..extra].iter().sum::<i64>() as f64;
-        value
+    /// Log-relative actual liquid assets from player zero's perspective.
+    pub fn pair_potential(&self) -> f32 {
+        log_asset_ratio(self.liquidation_value(0), self.liquidation_value(1))
     }
 
-    /// Per-player absolute economic competence in the current state.
-    ///
-    /// Mid-episode value combines exact liquidation proceeds with conservative
-    /// cost-basis credit for illiquid investments. The terminal state uses bank
-    /// only. One player's score never reads the other's value, so destroying an
-    /// opponent's economy cannot compensate for destroying your own.
-    pub fn economic_scores(&self) -> [f32; PLAYERS] {
-        std::array::from_fn(|player| {
-            let value = if self.done {
-                self.farms[player].money as f64
-            } else {
-                self.liquidation_value(player) + self.illiquid_value(player)
-            };
-            economic_score(value, self.config.starting_money as f64)
-        })
+    /// Log-relative terminal bank money from player zero's perspective.
+    pub fn terminal_pair_potential(&self) -> f32 {
+        log_asset_ratio(self.farms[0].money as f64, self.farms[1].money as f64)
     }
 
-    /// Non-telescoping economic reward for the current post-action state.
+    /// Potential of the current post-action state.
     ///
-    /// Every transition contributes one horizon-normalized economic score and
-    /// the terminal transition adds the final bank score once more. The episode
-    /// return is therefore mean post-action farm value plus final bank value,
-    /// strictly inside (-2, 2).
-    pub fn training_rewards(&self) -> [f32; PLAYERS] {
-        let scores = self.economic_scores();
-        let transitions = f32::from(
-            self.config
-                .episode_steps
-                .checked_sub(1)
-                .expect("episode must contain a transition"),
-        );
-        scores.map(|score| score / transitions + if self.done { score } else { 0.0 })
+    /// Terminal states switch to bank-only scoring. Potential differences then
+    /// telescope exactly to the terminal bank log-ratio from the symmetric start.
+    pub fn post_step_potential(&self) -> f32 {
+        if self.done {
+            self.terminal_pair_potential()
+        } else {
+            self.pair_potential()
+        }
     }
 
     /// The action the named built-in reference agent takes for `player`.
@@ -2560,7 +2485,6 @@ fn place_product(action: u8) -> Option<usize> {
         .then(|| usize::from(action - 59))
 }
 
-
 #[inline]
 fn unit_plant_crop(action: u8) -> Option<usize> {
     (45..=49)
@@ -2653,7 +2577,6 @@ const MARKET_PARAMS: [(f64, f64, Shape, f64, Shape, f64); PRODUCTS] = [
 ];
 
 const HINGE_GAIN: f64 = 8.0;
-
 
 fn money_feature(amount: i64) -> f32 {
     let value = amount as f64;
@@ -2896,12 +2819,15 @@ fn shape(kind: Shape, x: f64, scale: f64) -> f64 {
     }
 }
 
-/// Bounded absolute economic competence above the initial endowment.
+/// Natural-log relative wealth, defined even when either side has nothing.
 ///
-/// Computed in f64 and narrowed once, matching `encoding._economic_score` so
-/// native/Python reward parity holds to the same tolerance as state encoding.
-fn economic_score(value: f64, starting_money: f64) -> f32 {
-    ((value - starting_money) / ECONOMIC_SCALE).tanh() as f32
+/// Money is integral, so one dollar is the smallest non-zero economic unit.
+/// `ln_1p` therefore supplies a domain-safe ratio without a fitted scale:
+/// ln((zero + $1) / (one + $1)).
+fn log_asset_ratio(zero: f64, one: f64) -> f32 {
+    debug_assert!(zero.is_finite() && zero >= 0.0);
+    debug_assert!(one.is_finite() && one >= 0.0);
+    (zero.ln_1p() - one.ln_1p()) as f32
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
@@ -3142,35 +3068,26 @@ mod tests {
     }
 
     #[test]
-    fn economic_scores_are_absolute_and_independent() {
+    fn pair_potential_is_a_zero_sum_log_liquid_asset_ratio() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 9_000;
         game.farms[1].money = 3_000;
-        let scores = game.economic_scores();
-        assert_eq!(scores[0], (6_000.0 / ECONOMIC_SCALE).tanh() as f32);
-        assert_eq!(scores[1], 0.0);
+        let lead = log_asset_ratio(9_000.0, 3_000.0);
+        assert_eq!(game.pair_potential(), lead);
 
-        // Destroying the opponent's bank cannot raise the learner's score.
-        game.farms[1].money = 0;
-        let opponent_destroyed = game.economic_scores();
-        assert_eq!(opponent_destroyed[0], scores[0]);
-        assert!(opponent_destroyed[1] < scores[1]);
+        game.farms[0].money = 3_000;
+        game.farms[1].money = 9_000;
+        assert_eq!(game.pair_potential(), -lead);
 
-        // Equal rich play is positively reinforced instead of collapsing onto
-        // the same zero reward as an equal bankrupt pair.
+        // Equal farms have zero potential at any absolute wealth.
         game.farms[0].money = 250_000;
         game.farms[1].money = 250_000;
-        let rich_tie = game.economic_scores();
-        assert_eq!(rich_tie[0], rich_tie[1]);
-        assert!(rich_tie[0] > 0.0);
+        assert_eq!(game.pair_potential(), 0.0);
         game.farms[0].money = 0;
         game.farms[1].money = 0;
-        let poor_tie = game.economic_scores();
-        assert_eq!(poor_tie[0], poor_tie[1]);
-        assert!(poor_tie[0] < 0.0);
+        assert_eq!(game.pair_potential(), 0.0);
 
-        // Held products count at their own exact sale proceeds, whether they
-        // sit in the shed or in a hired unit's hands.
+        // Held products count at their exact sale proceeds.
         game.farms[0].money = 1_000;
         game.farms[1].money = 1_000;
         game.farms[0].units = 2;
@@ -3179,41 +3096,11 @@ mod tests {
         game.privates[1].shed[4] = 5;
         let zero = game.liquidation_value(0);
         let one = game.liquidation_value(1);
-        assert_eq!(
-            game.economic_scores(),
-            [
-                economic_score(zero, game.config.starting_money as f64),
-                economic_score(one, game.config.starting_money as f64),
-            ]
-        );
+        assert_eq!(game.pair_potential(), log_asset_ratio(zero, one));
 
         // Unhired unit slots are outside the observation and must not count.
         game.privates[0].inventories[5][0] = 99;
         assert_eq!(game.liquidation_value(0), zero);
-    }
-
-    #[test]
-    fn training_reward_is_non_telescoping_and_bounded() {
-        let mut game = Game::new(
-            0,
-            GameConfig {
-                episode_steps: 3,
-                ..GameConfig::default()
-            },
-        );
-        game.farms[0].money = 78_000;
-        game.farms[1].money = 78_000;
-        let score = game.economic_scores()[0];
-        let occupancy = game.training_rewards()[0];
-        assert_eq!(occupancy, score / 2.0);
-
-        game.done = true;
-        let terminal = game.training_rewards()[0];
-        assert_eq!(terminal, score * 1.5);
-        // Same endpoint, different path: carrying value through the preceding
-        // state adds occupancy reward instead of telescoping away.
-        assert!(occupancy + terminal > terminal);
-        assert!(occupancy + terminal < 2.0);
     }
 
     #[test]
@@ -3227,9 +3114,9 @@ mod tests {
         // floor, exercising the floor-conditional market restock.
         game.market_inventory[4] = 10_320;
         let predicted = game.liquidation_value(0);
-        // Selling at the quoted price only moves proceeds from the shed into
-        // the bank, so the economic score is exactly trade-neutral.
-        let score_before = game.economic_scores()[0];
+        // Selling moves the credited liquidation proceeds into the bank, so
+        // the liquid-asset potential is exactly trade-neutral.
+        let score_before = game.pair_potential();
 
         for item in [0, 4, 8] {
             while game.privates[0].shed[item] > 0 {
@@ -3244,66 +3131,39 @@ mod tests {
         }
 
         assert_eq!(predicted, game.farms[0].money as f64);
-        assert_eq!(game.economic_scores()[0], score_before);
+        assert_eq!(game.pair_potential(), score_before);
     }
 
     #[test]
-    fn illiquid_value_credits_cost_basis_fractions() {
+    fn pair_potential_excludes_assets_that_cannot_be_liquidated() {
         let mut game = Game::new(0, GameConfig::default());
-        assert_eq!(game.illiquid_value(0), 0.0);
-        assert_eq!(game.illiquid_value(1), 0.0);
+        let baseline = game.pair_potential();
 
         game.privates[0].shed[9] = 2; // geese in the shed
         game.privates[0].seeds[2] = 4; // tomato seeds
         game.farms[0].tiles[3].kind = TileKind::Plant;
-        game.farms[0].tiles[3].species = 0; // wheat
+        game.farms[0].tiles[3].species = 0;
         game.farms[0].tiles[3].yield_units = 2;
-        // All three species, pinning the species -> product price mapping
-        // (goose -> egg, cow -> milk, sheep -> wool).
         game.farms[0].tiles[7].has_animal = true;
-        game.farms[0].tiles[7].species = 1; // cow
+        game.farms[0].tiles[7].species = 1;
         game.farms[0].tiles[7].yield_units = 3;
-        game.farms[0].tiles[9].has_animal = true;
-        game.farms[0].tiles[9].species = 0; // goose
-        game.farms[0].tiles[9].yield_units = 1;
-        game.farms[0].tiles[11].has_animal = true;
-        game.farms[0].tiles[11].species = 2; // sheep
-        game.farms[0].tiles[11].yield_units = 2;
         game.farms[0].unlocked = 0b111;
 
-        let expected = ILLIQUID_SHED_ANIMAL_CREDIT * 2.0 * ANIMAL_COST[0] as f64
-            + ILLIQUID_SHED_SEED_CREDIT * 4.0 * SEED_COST[2] as f64
-            + ILLIQUID_PLANTED_SEED_CREDIT * SEED_COST[0] as f64
-            + ILLIQUID_PENDING_YIELD_CREDIT * 2.0 * game.market_prices[0] as f64
-            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[1] as f64
-            + ILLIQUID_PENDING_YIELD_CREDIT * 3.0 * game.market_prices[6] as f64 // cow -> MILK
-            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[0] as f64
-            + ILLIQUID_PENDING_YIELD_CREDIT * 1.0 * game.market_prices[5] as f64 // goose -> EGG
-            + ILLIQUID_PLACED_ANIMAL_CREDIT * ANIMAL_COST[2] as f64
-            + ILLIQUID_PENDING_YIELD_CREDIT * 2.0 * game.market_prices[7] as f64 // sheep -> WOOL
-            + ILLIQUID_LAND_CREDIT * (LAND_PRICES[0] + LAND_PRICES[1]) as f64;
-        assert!((game.illiquid_value(0) - expected).abs() < 1e-9);
-        // Investment contributes economic value instead of reading as pure
-        // loss, so self-play does not prefer the never-spend basin.
-        assert!(game.economic_scores()[0] > 0.0);
+        assert_eq!(game.pair_potential(), baseline);
     }
 
     #[test]
-    fn terminal_economic_score_uses_bank_only() {
+    fn terminal_pair_potential_uses_bank_only() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
         game.privates[1].shed.fill(100);
-        let mid_episode = game.economic_scores();
-        assert!(mid_episode[1] > 0.0);
+        assert!(game.pair_potential() < 0.0);
 
         game.done = true;
-        let banked = [0.0, ((1_000.0 - 3_000.0) / ECONOMIC_SCALE).tanh() as f32];
-        assert_eq!(game.economic_scores(), banked);
-        let terminal_rewards = game.training_rewards();
-        let terminal_weight = 1.0 + 1.0 / 719.0;
-        assert_eq!(terminal_rewards[0], 0.0);
-        assert_eq!(terminal_rewards[1], banked[1] * terminal_weight);
+        let banked = log_asset_ratio(3_000.0, 1_000.0);
+        assert_eq!(game.terminal_pair_potential(), banked);
+        assert_eq!(game.post_step_potential(), banked);
     }
 
     #[test]
@@ -3547,8 +3407,6 @@ mod tests {
         assert_eq!(game.privates[0].inventories[0][6], 0);
         assert_eq!(game.privates[0].shed[0], 100);
     }
-
-
 
     #[test]
     fn build_then_place_does_not_consume_shed_capacity_in_unit_ledger() {

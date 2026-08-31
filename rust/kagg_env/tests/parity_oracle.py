@@ -20,7 +20,12 @@ from kaggriculture.actions import (
     compile_action,
 )
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
-from kaggriculture.encoding import economic_pair_reward, encode_observation, pair_economic_scores
+from kaggriculture.encoding import (
+    encode_observation,
+    pair_potential,
+    shaped_pair_reward,
+    terminal_pair_potential,
+)
 from kaggriculture.rust_env import load_native
 
 
@@ -38,6 +43,13 @@ def main() -> None:
         environment.reset(2)
     native = load_native(release=True).BatchEnv(seeds)
     encoded_buffers = native.encoded_buffers()
+    potentials = np.asarray(
+        [
+            pair_potential(environment.state[0].observation, environment.state[1].observation)
+            for environment in official
+        ],
+        dtype=np.float32,
+    )
     rng = np.random.default_rng(args.seed)
 
     for transition in range(args.steps + 1):
@@ -90,8 +102,8 @@ def main() -> None:
             size=(args.games, 2, MAX_MARKET_ORDERS),
             dtype=np.uint8,
         )
-        expected_scores = []
-        expected_rewards = []
+        expected_potentials = np.empty(args.games, dtype=np.float32)
+        expected_rewards = np.empty((args.games, 2), dtype=np.float32)
         for game, environment in enumerate(official):
             environment.step(
                 [
@@ -104,21 +116,30 @@ def main() -> None:
                     for player in range(2)
                 ]
             )
-            terminal = environment.done
-            scores = pair_economic_scores(
-                environment.state[0].observation,
-                environment.state[1].observation,
-                terminal=terminal,
+            next_potential = (
+                terminal_pair_potential(
+                    environment.state[0].observation,
+                    environment.state[1].observation,
+                )
+                if environment.done
+                else pair_potential(
+                    environment.state[0].observation,
+                    environment.state[1].observation,
+                )
             )
-            expected_scores.append(scores)
-            expected_rewards.append(economic_pair_reward(scores, terminal=terminal))
+            expected_potentials[game] = next_potential
+            expected_rewards[game] = shaped_pair_reward(potentials[game], expected_potentials[game])
         native_step = native.step_factors(unit, kinds, quantities)
         np.testing.assert_allclose(
-            native_step["economic_scores"], expected_scores, atol=1e-7, rtol=0
+            native_step["previous_potentials"], potentials, atol=1e-7, rtol=0
         )
         np.testing.assert_allclose(
-            native_step["training_rewards"], expected_rewards, atol=1e-7, rtol=0
+            native_step["potentials"], expected_potentials, atol=1e-7, rtol=0
         )
+        np.testing.assert_allclose(
+            native_step["shaped_rewards"], expected_rewards, atol=1e-7, rtol=0
+        )
+        potentials = expected_potentials
         for game, environment in enumerate(official):
             python_state = json.loads(
                 json.dumps(

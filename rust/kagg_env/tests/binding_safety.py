@@ -25,7 +25,6 @@ RANK = 3
 def sampler_inputs() -> list[np.ndarray]:
     return [
         np.zeros((ROWS, 16, N_UNIT_ACTIONS), dtype=np.float32),
-
         np.zeros((ROWS, 10, 22), dtype=np.float32),
         np.zeros((ROWS, 10, RANK), dtype=np.float32),
         np.zeros((1, 22, RANK), dtype=np.float32),
@@ -134,20 +133,18 @@ def main() -> None:
             f"stdout:\n{child.stdout}\nstderr:\n{child.stderr}"
         )
 
-    assert_output_rejected_without_step(lambda output: output.pop("training_rewards"))
+    assert_output_rejected_without_step(lambda output: output.pop("shaped_rewards"))
     assert_output_rejected_without_step(
         lambda output: output.__setitem__(
-            "training_rewards", np.zeros((BATCH + 1, 2), dtype=np.float32)
+            "shaped_rewards", np.zeros((BATCH + 1, 2), dtype=np.float32)
         )
     )
     assert_output_rejected_without_step(
-        lambda output: output.__setitem__(
-            "training_rewards", np.zeros((BATCH, 2), dtype=np.float64)
-        )
+        lambda output: output.__setitem__("shaped_rewards", np.zeros((BATCH, 2), dtype=np.float64))
     )
 
     def make_readonly(output: dict[str, np.ndarray]) -> None:
-        output["training_rewards"].flags.writeable = False
+        output["shaped_rewards"].flags.writeable = False
 
     assert_output_rejected_without_step(make_readonly)
     assert_output_rejected_without_step(
