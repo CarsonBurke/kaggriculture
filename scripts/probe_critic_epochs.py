@@ -21,12 +21,12 @@ seed and therefore land on the same side -- the critic is refitted on the fit
 games alone under the production schedule (same `_stage_tensor` staging, same
 `_balanced_minibatch_slices` partitioning at 2048, same `make_optimizers`
 construction and `_optimizer_step` warmup, same bf16 autocast, same
-`update_compile_mode`, same `_critic_minibatch_loss`), and after every epoch
+`update_compile_mode`, same `_critic_minibatch_objective`), and after every epoch
 explained variance and the optimized distributional loss are measured on both
 sides at frozen weights, with a CUDA-synchronized wall clock around each epoch's
-gradient steps. Explained variance is the repo's own
-`_fit_moments`/`_accumulate_fit_moments`/`_fit_explained_variance` streamed
-definition, so the numbers are directly comparable to run telemetry.
+gradient steps. Explained variance uses the same four target/residual moments
+and `_fit_explained_variance` definition as run telemetry; the probe computes
+those moments outside the timed path.
 
 The curve runs past the production four epochs (default eight) so its shape is
 measured rather than extrapolated, and over several repeats with different
@@ -76,15 +76,15 @@ from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
     PpoConfig,
-    _accumulate_fit_moments,
     _balanced_minibatch_slices,
     _batch_tensor,
     _cached_update_callable,
     _critic_batch_args,
-    _critic_minibatch_loss,
+    _critic_minibatch_fit_terms,
+    _critic_minibatch_objective,
     _device_compile_mode,
     _fit_explained_variance,
-    _fit_moments,
+    _fit_moment_mapping,
     _optimizer_step,
     _stage_tensor,
     make_optimizers,
@@ -260,7 +260,7 @@ def _critic_epoch(
     a host synchronization.
     """
     loss_fn = _cached_update_callable(
-        critic, "_kaggriculture_update_loss", _critic_minibatch_loss, compile_mode
+        critic, "_kaggriculture_update_objective", _critic_minibatch_objective, compile_mode
     )
     gateable = any(group.get("fused", False) for group in critic_optimizer.param_groups)
     nonfinite = torch.zeros((), dtype=torch.float64, device=device)
@@ -276,7 +276,7 @@ def _critic_epoch(
         critic_args = _critic_batch_args(architecture, staged, batch)
         value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
         critic_optimizer.zero_grad(set_to_none=True)
-        value_loss, _ = loss_fn(critic, value_targets, autocast_enabled, *critic_args)
+        value_loss = loss_fn(critic, value_targets, autocast_enabled, *critic_args)
         value_loss.backward()
         torch.nn.utils.clip_grad_norm_(critic.parameters(), config.max_gradient_norm)
         if gateable:
@@ -318,10 +318,11 @@ def _evaluate(
     minibatch shape on the same code object the gradient path already fills,
     against a per-code-object limit of eight that a `fullgraph=True` region
     overruns as a hard failure. This pass is off the timed path, runs the same
-    `_critic_minibatch_loss` under the same autocast, and the Inductor-versus-eager
-    difference on an explained variance is far below the gains being resolved.
+    `_critic_minibatch_fit_terms` under the same autocast, and the
+    Inductor-versus-eager difference on an explained variance is far below the
+    gains being resolved.
     """
-    sums = _fit_moments(device)
+    sums = torch.zeros(4, dtype=torch.float64, device=device)
     loss_total = torch.zeros((), dtype=torch.float64, device=device)
     states = int(indices.size)
     device_indices = torch.from_numpy(indices).to(device=device)
@@ -332,15 +333,15 @@ def _evaluate(
             batch = device_indices[batch_slice]
             critic_args = _critic_batch_args(architecture, staged, batch)
             value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
-            value_loss, predictions = _critic_minibatch_loss(
+            value_loss, moments = _critic_minibatch_fit_terms(
                 critic, value_targets, autocast_enabled, *critic_args
             )
-            _accumulate_fit_moments(sums, value_targets.double(), predictions.double())
+            sums += moments
             loss_total += value_loss.double() * batch.numel()
     finally:
         critic.train(was_training)
     return {
-        "explained_variance": _fit_explained_variance(sums, states),
+        "explained_variance": _fit_explained_variance(_fit_moment_mapping(sums), states),
         "loss": float(loss_total) / max(1, states),
         "states": states,
     }

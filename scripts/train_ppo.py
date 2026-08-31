@@ -2435,7 +2435,11 @@ def main() -> None:
     self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
 
     commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
-    pending_commit: Future[tuple[Path, int] | None] | None = None
+    pending_commit: Future[tuple[tuple[Path, int] | None, SnapshotRef | None]] | None = None
+    # The archive is immutable and this process is its only steady-state
+    # publisher. Keep its ordered refs in memory instead of rescanning and
+    # stat'ing every historical snapshot before every rollout; resume already
+    # validates/restores the complete directory before this cache is built.
 
     def build_recovery_payload(metrics: dict[str, Any]) -> dict[str, Any]:
         """Capture the complete CPU recovery state only for a checkpoint event."""
@@ -2488,9 +2492,10 @@ def main() -> None:
         metrics: dict[str, Any],
         actor_state: dict[str, Any] | None,
         recovery_payload: dict[str, Any] | None,
-    ) -> tuple[Path, int] | None:
+    ) -> tuple[tuple[Path, int] | None, SnapshotRef | None]:
         """Commit one completed update, optionally including a recovery event."""
         committed = int(metrics["iteration"])
+        snapshot = None
         if actor_state is not None:
             snapshot = save_actor_state_snapshot(
                 league_directory, model_config, actor_state, committed
@@ -2500,7 +2505,8 @@ def main() -> None:
         committed_metrics = recovery_payload["metrics"] if recovery_payload is not None else metrics
         append_iteration_jsonl(args.run_dir / "metrics.jsonl", committed_metrics)
         writer.record(committed_metrics)
-        return None if checkpoint is None else (checkpoint, committed)
+        checkpoint_event = None if checkpoint is None else (checkpoint, committed)
+        return checkpoint_event, snapshot
 
     started = time.monotonic()
 
@@ -2514,6 +2520,7 @@ def main() -> None:
         if previous_digest is not None and previous_digest != current_digest:
             raise ValueError("resume checkpoint actor does not match its current league snapshot")
         league_snapshot_manifest[iteration] = current_digest
+    league_snapshot_refs = list_actor_snapshots(league_directory)
 
     numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
     destination_latest = args.run_dir / "latest.pt"
@@ -2575,8 +2582,10 @@ def main() -> None:
         # immutable actor snapshot. The same barrier publishes its metrics and
         # recovery checkpoint before this iteration consumes league RNG.
         if pending_commit is not None:
-            completed_checkpoint = pending_commit.result()
+            completed_checkpoint, completed_snapshot = pending_commit.result()
             pending_commit = None
+            if completed_snapshot is not None:
+                league_snapshot_refs.append(completed_snapshot)
             if completed_checkpoint is not None:
                 external_eval_process = _maybe_launch_external_eval(
                     args,
@@ -2649,7 +2658,7 @@ def main() -> None:
             agent_rows = [None]
             selections = _select_league_opponents(
                 args,
-                list_actor_snapshots(league_directory),
+                league_snapshot_refs,
                 iteration,
                 generator,
                 league_score_rates,
@@ -2873,7 +2882,10 @@ def main() -> None:
         print(json.dumps(metrics, sort_keys=True), flush=True)
         del rollout
 
-    completed_checkpoint = pending_commit.result() if pending_commit is not None else None
+    completed_commit = pending_commit.result() if pending_commit is not None else (None, None)
+    completed_checkpoint, completed_snapshot = completed_commit
+    if completed_snapshot is not None:
+        league_snapshot_refs.append(completed_snapshot)
     # The max-hours boundary can become true while the last asynchronous
     # journal/snapshot commit finishes. Force that clean terminal state once,
     # but never rewrite an iteration already committed as periodic or final.

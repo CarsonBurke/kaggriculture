@@ -39,7 +39,6 @@ from kaggriculture.orientation import (
     orient_unit_masks,
     seat_orientations,
 )
-
 from kaggriculture.policy import PolicyStep, act_batch
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
@@ -357,30 +356,76 @@ def _quantity_heads(
     )
 
 
-def _select_inputs(inputs: tuple[Any, ...], rows: torch.Tensor) -> tuple[Any, ...]:
-    """Gather rows of a model-argument tuple, recursing into token bundles."""
+def _empty_selected_inputs(
+    inputs: tuple[Any, ...], leading_shape: tuple[int, ...]
+) -> tuple[Any, ...]:
+    """Allocate a reusable row-gather destination matching model inputs."""
+
+    def empty(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            (*leading_shape, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
     return tuple(
-        type(entry)(*(tensor.index_select(0, rows) for tensor in entry))
+        type(entry)(*(empty(tensor) for tensor in entry))
         if isinstance(entry, tuple)
-        else entry.index_select(0, rows)
+        else empty(entry)
         for entry in inputs
     )
+
+
+def _select_inputs(
+    inputs: tuple[Any, ...],
+    rows: torch.Tensor,
+    out: tuple[Any, ...] | None = None,
+) -> tuple[Any, ...]:
+    """Gather rows of a model-argument tuple, optionally into persistent storage."""
+    if out is None:
+        return tuple(
+            type(entry)(*(tensor.index_select(0, rows) for tensor in entry))
+            if isinstance(entry, tuple)
+            else entry.index_select(0, rows)
+            for entry in inputs
+        )
+    for entry, destination in zip(inputs, out, strict=True):
+        if isinstance(entry, tuple):
+            for tensor, target in zip(entry, destination, strict=True):
+                torch.index_select(tensor, 0, rows, out=target)
+        else:
+            torch.index_select(entry, 0, rows, out=destination)
+    return out
 
 
 def _lane_view_inputs(
-    inputs: tuple[Any, ...], rows: torch.Tensor, lanes: int, width: int
+    inputs: tuple[Any, ...],
+    rows: torch.Tensor,
+    lanes: int,
+    width: int,
+    out: tuple[Any, ...] | None = None,
 ) -> tuple[Any, ...]:
-    """Gather ensemble rows and fold them into [lanes, width, ...] shapes."""
+    """Gather rows and fold them into [lanes, width, ...] shapes."""
+    if out is None:
 
-    def folded(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.index_select(0, rows).view(lanes, width, *tensor.shape[1:])
+        def folded(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.index_select(0, rows).view(lanes, width, *tensor.shape[1:])
 
-    return tuple(
-        type(entry)(*(folded(tensor) for tensor in entry))
-        if isinstance(entry, tuple)
-        else folded(entry)
-        for entry in inputs
-    )
+        return tuple(
+            type(entry)(*(folded(tensor) for tensor in entry))
+            if isinstance(entry, tuple)
+            else folded(entry)
+            for entry in inputs
+        )
+    for entry, destination in zip(inputs, out, strict=True):
+        if isinstance(entry, tuple):
+            for tensor, target in zip(entry, destination, strict=True):
+                torch.index_select(
+                    tensor, 0, rows, out=target.view(rows.numel(), *tensor.shape[1:])
+                )
+        else:
+            torch.index_select(entry, 0, rows, out=destination.view(rows.numel(), *entry.shape[1:]))
+    return out
 
 
 def _leading_tensor(inputs: tuple[Any, ...]) -> torch.Tensor:
@@ -471,8 +516,9 @@ def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncod
     )
 
 
-# Host-to-device transport groups for the structured wave: every group packs
-# into one pinned block so a wave costs three asynchronous uploads.
+# Structured Rust output uses three storage dtypes, but all of them travel as
+# raw bytes in one pinned block. The typed views below retain the encoder and
+# model layouts while reducing each CUDA wave to one host-to-device upload.
 _STRUCTURED_CONTINUOUS_BUFFERS = (
     "tile_continuous",
     "unit_continuous",
@@ -488,19 +534,27 @@ _STRUCTURED_FLAG_BUFFERS = ("unit_active", "unit_tile_gather_valid")
 @dataclass(frozen=True)
 class _NativeStructuredWave:
     arrays: dict[str, np.ndarray]
-    host_continuous: torch.Tensor
-    host_categorical: torch.Tensor
-    host_flags: torch.Tensor
+    host_transport: torch.Tensor
+    staged_transport: torch.Tensor
+    staged_continuous: torch.Tensor
+    staged_categorical: torch.Tensor
     device_continuous: torch.Tensor
     device_categorical: torch.Tensor
-    device_flags: torch.Tensor
     device_inputs: StructuredInputs
 
     def copy_to_device(self) -> None:
+        """Upload once, then widen the two model-input groups in place.
+
+        Direct CPU-to-CUDA copies between different dtypes make ATen allocate a
+        same-dtype device temporary for every call. Keeping that temporary in
+        the wave removes the two per-step allocations. Packing flags into the
+        same byte transport also removes two H2D launches and the separate flag
+        copy; the model reads its bool views directly from the staged block.
+        """
         non_blocking = self.device_continuous.device.type == "cuda"
-        self.device_continuous.copy_(self.host_continuous, non_blocking=non_blocking)
-        self.device_categorical.copy_(self.host_categorical, non_blocking=non_blocking)
-        self.device_flags.copy_(self.host_flags, non_blocking=non_blocking)
+        self.staged_transport.copy_(self.host_transport, non_blocking=non_blocking)
+        self.device_continuous.copy_(self.staged_continuous)
+        self.device_categorical.copy_(self.staged_categorical)
 
     def refresh(self, environment: Any) -> None:
         environment.structured_into(self.arrays)
@@ -510,46 +564,51 @@ class _NativeStructuredWave:
 
 
 def _native_structured_wave(environment: Any, device: torch.device) -> _NativeStructuredWave:
-    """Build reusable structured Rust output plus packed device token tensors.
-
-    Categorical indices upload straight from their int8 staging bytes into
-    int64 embedding-index tensors; continuous features upload from float16
-    staging into the float32 the model consumes.
-    """
+    """Build reusable structured Rust output plus packed device token tensors."""
     arrays = {name: np.asarray(value) for name, value in environment.structured_buffers().items()}
-    pin_memory = device.type == "cuda"
+    continuous_elements = sum(arrays[name].size for name in _STRUCTURED_CONTINUOUS_BUFFERS)
+    categorical_elements = sum(arrays[name].size for name in _STRUCTURED_CATEGORICAL_BUFFERS)
+    flag_elements = sum(arrays[name].size for name in _STRUCTURED_FLAG_BUFFERS)
+    continuous_bytes = continuous_elements * 2
+    categorical_end = continuous_bytes + categorical_elements
+    transport_bytes = categorical_end + flag_elements
 
-    def packed(
-        names: tuple[str, ...], host_dtype: torch.dtype, device_dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        sizes = [arrays[name].size for name in names]
-        host = torch.empty(sum(sizes), dtype=host_dtype, pin_memory=pin_memory)
-        block = torch.empty(sum(sizes), dtype=device_dtype, device=device)
-        views: dict[str, torch.Tensor] = {}
+    host_transport = torch.empty(
+        transport_bytes,
+        dtype=torch.uint8,
+        pin_memory=device.type == "cuda",
+    )
+    staged_transport = torch.empty(transport_bytes, dtype=torch.uint8, device=device)
+    host_continuous = host_transport[:continuous_bytes].view(torch.float16)
+    host_categorical = host_transport[continuous_bytes:categorical_end].view(torch.int8)
+    host_flags = host_transport[categorical_end:].view(torch.bool)
+    staged_continuous = staged_transport[:continuous_bytes].view(torch.float16)
+    staged_categorical = staged_transport[continuous_bytes:categorical_end].view(torch.int8)
+    staged_flags = staged_transport[categorical_end:].view(torch.bool)
+    device_continuous = torch.empty(continuous_elements, dtype=torch.float32, device=device)
+    device_categorical = torch.empty(categorical_elements, dtype=torch.int64, device=device)
+    views: dict[str, torch.Tensor] = {}
+
+    def map_group(names: tuple[str, ...], host: torch.Tensor, destination: torch.Tensor) -> None:
         cursor = 0
-        for name, size in zip(names, sizes, strict=True):
+        for name in names:
             shape = arrays[name].shape
-            views[name] = block[cursor : cursor + size].reshape(shape)
+            size = arrays[name].size
             arrays[name] = host[cursor : cursor + size].reshape(shape).numpy()
+            views[name] = destination[cursor : cursor + size].reshape(shape)
             cursor += size
-        return host, block, views
 
-    host_continuous, device_continuous, views = packed(
-        _STRUCTURED_CONTINUOUS_BUFFERS, torch.float16, torch.float32
-    )
-    host_categorical, device_categorical, categorical_views = packed(
-        _STRUCTURED_CATEGORICAL_BUFFERS, torch.int8, torch.int64
-    )
-    host_flags, device_flags, flag_views = packed(_STRUCTURED_FLAG_BUFFERS, torch.bool, torch.bool)
-    views |= categorical_views | flag_views
+    map_group(_STRUCTURED_CONTINUOUS_BUFFERS, host_continuous, device_continuous)
+    map_group(_STRUCTURED_CATEGORICAL_BUFFERS, host_categorical, device_categorical)
+    map_group(_STRUCTURED_FLAG_BUFFERS, host_flags, staged_flags)
     return _NativeStructuredWave(
         arrays=arrays,
-        host_continuous=host_continuous,
-        host_categorical=host_categorical,
-        host_flags=host_flags,
+        host_transport=host_transport,
+        staged_transport=staged_transport,
+        staged_continuous=staged_continuous,
+        staged_categorical=staged_categorical,
         device_continuous=device_continuous,
         device_categorical=device_categorical,
-        device_flags=device_flags,
         device_inputs=StructuredInputs(**{name: views[name] for name in StructuredInputs._fields}),
     )
 
@@ -1148,6 +1207,7 @@ def collect_mixed_play_rust(
     trajectories = self_play_rows + league_games
     fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
     encoded_wave = _native_wave(architecture, environment, device)
+    wave_inputs = encoded_wave.inputs()
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
 
@@ -1189,6 +1249,8 @@ def collect_mixed_play_rust(
     store_rows: np.ndarray | slice = slice(None) if not league_games else stored_rows
     stored_pair_rows = stored_rows ^ 1
     current_tensor = None if not league_games else torch.as_tensor(stored_rows, device=device)
+    current_gather: tuple[Any, ...] | None = None
+    lane_gather: tuple[Any, ...] | None = None
     if league_games:
         frozen_groups = tuple(
             frozen_rows[np.flatnonzero(assignments == lane)] for lane in range(lane_count)
@@ -1221,6 +1283,14 @@ def collect_mixed_play_rust(
             if opponents
             else None
         )
+        # Structured mixed play gathers eleven token tensors for the learner
+        # and, when present, eleven more for the lane ensemble on every step.
+        # Fixed destinations keep those CUDA addresses stable and replace the
+        # per-step allocator traffic with index_select writes into owned memory.
+        if architecture == STRUCTURED:
+            current_gather = _empty_selected_inputs(wave_inputs, (stored_rows.size,))
+            if ensemble is not None:
+                lane_gather = _empty_selected_inputs(wave_inputs, (lanes, lane_width))
         # Zeroed rather than uninitialized: with no ensemble nothing scatters
         # into the frozen rows, and handing the sampler uninitialized memory --
         # even in rows it is contracted to ignore -- is not worth the page.
@@ -1247,7 +1317,7 @@ def collect_mixed_play_rust(
         encoded_wave.copy_to_device()
         _mark_cuda_graph_step(device, compiled_forward)
         if not league_games:
-            output = run_actor(*encoded_wave.inputs())
+            output = run_actor(*wave_inputs)
             host_outputs, packed_transfer = _packed_outputs_to_host((output,), packed_transfer)
             host = host_outputs[0]
             step_unit_logits = host.unit_logits
@@ -1255,7 +1325,8 @@ def collect_mixed_play_rust(
             step_quantity_context = host.market_quantity_context
             unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
         else:
-            current_output = run_actor(*_select_inputs(encoded_wave.inputs(), current_tensor))
+            assert current_tensor is not None
+            current_output = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
             if ensemble is None:
                 host_outputs, packed_transfer = _packed_outputs_to_host(
                     (current_output,), packed_transfer
@@ -1265,7 +1336,9 @@ def collect_mixed_play_rust(
             else:
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
                     lane_output = ensemble(
-                        *_lane_view_inputs(encoded_wave.inputs(), frozen_tensor, lanes, lane_width),
+                        *_lane_view_inputs(
+                            wave_inputs, frozen_tensor, lanes, lane_width, lane_gather
+                        ),
                         mode=forward_mode,
                     )
                 frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
@@ -1498,7 +1571,6 @@ def collect_population_play_rust(
             "a population that cycles non-identity frames needs the convolutional "
             "entity architecture"
         )
-
 
     seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
@@ -1968,7 +2040,6 @@ _TRAJECTORY_METADATA_FIELDS = (
     "orientations",
     "entropy_sums",
 )
-
 
 
 def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:

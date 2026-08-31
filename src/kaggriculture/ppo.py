@@ -1654,20 +1654,13 @@ def _actor_minibatch_terms(
     return policy_sum, entropy_sum.detach(), kl_sum.detach(), clipped_sum
 
 
-def _critic_minibatch_loss(
+def _critic_logits_and_loss(
     critic: Critic,
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
 ) -> tuple[Tensor, Tensor]:
-    """One critic minibatch: the distributional loss and the mean it implies.
-
-    The predicted mean rides along because the forward that produced the logits
-    is the only place it is free. Scoring the critic's fit to its own target
-    otherwise costs a second full-rollout replay -- 230k states at the
-    measured 42k states/s, about 15% of an iteration -- to recover numbers the
-    update already computed and threw away.
-    """
+    """The shared critic forward and distributional objective."""
     with torch.autocast(
         device_type=value_targets.device.type,
         dtype=torch.bfloat16,
@@ -1681,7 +1674,66 @@ def _critic_minibatch_loss(
         sigma_ratio=critic.config.value_sigma_ratio,
         validate=False,
     ).mean()
+    return loss, critic_logits
+
+
+def _critic_minibatch_objective(
+    critic: Critic,
+    value_targets: Tensor,
+    autocast_enabled: bool,
+    *critic_args: Any,
+) -> Tensor:
+    """One critic minibatch without the value telemetry scoring epochs need."""
+    loss, _critic_logits = _critic_logits_and_loss(
+        critic, value_targets, autocast_enabled, *critic_args
+    )
+    return loss
+
+
+def _critic_minibatch_loss(
+    critic: Critic,
+    value_targets: Tensor,
+    autocast_enabled: bool,
+    *critic_args: Any,
+) -> tuple[Tensor, Tensor]:
+    """One critic minibatch: the distributional loss and the mean it implies.
+
+    The predicted mean rides along because the forward that produced the logits
+    is the only place it is free. Callers that do not score this prediction use
+    `_critic_minibatch_objective`, avoiding the softmax and support reduction.
+    """
+    loss, critic_logits = _critic_logits_and_loss(
+        critic, value_targets, autocast_enabled, *critic_args
+    )
     return loss, critic.value(critic_logits).detach()
+
+
+def _critic_minibatch_fit_terms(
+    critic: Critic,
+    value_targets: Tensor,
+    autocast_enabled: bool,
+    *critic_args: Any,
+) -> tuple[Tensor, Tensor]:
+    """Critic loss plus float64 target/residual moments for a scoring epoch.
+
+    Keeping the moment computation inside the compiled region lets Inductor
+    consume the predicted values where they are produced instead of returning
+    a full minibatch and materializing five eager float64 intermediates.
+    """
+    loss, predictions = _critic_minibatch_loss(
+        critic, value_targets, autocast_enabled, *critic_args
+    )
+    targets = value_targets.double()
+    residuals = targets - predictions.double()
+    moments = torch.stack(
+        (
+            targets.sum(),
+            targets.square().sum(),
+            residuals.sum(),
+            residuals.square().sum(),
+        )
+    )
+    return loss, moments
 
 
 # `torch.no_grad` rather than inference mode, and the choice is load-bearing
@@ -2086,21 +2138,14 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.
     return 1.0 - float(np.var(selected_targets - selected_predictions)) / variance
 
 
-def _fit_moments(device: torch.device) -> dict[str, Tensor]:
-    """Zeroed float64 accumulators for one critic epoch's fit statistics."""
-    return {
-        key: torch.zeros((), device=device, dtype=torch.float64)
-        for key in ("target", "target_square", "residual", "residual_square")
-    }
+_FIT_MOMENT_KEYS = ("target", "target_square", "residual", "residual_square")
 
 
-def _accumulate_fit_moments(sums: dict[str, Tensor], targets: Tensor, predictions: Tensor) -> None:
-    """Stream one minibatch's target and residual moments into float64 sums."""
-    residuals = targets - predictions
-    sums["target"] += targets.sum()
-    sums["target_square"] += targets.square().sum()
-    sums["residual"] += residuals.sum()
-    sums["residual_square"] += residuals.square().sum()
+def _fit_moment_mapping(sums: Tensor) -> dict[str, Tensor]:
+    """Name a compiled fit accumulator's four scalar views."""
+    if sums.shape != (len(_FIT_MOMENT_KEYS),):
+        raise ValueError("fit moment vector has the wrong shape")
+    return dict(zip(_FIT_MOMENT_KEYS, sums.unbind(), strict=True))
 
 
 def _fit_explained_variance(sums: dict[str, Tensor], states: int) -> float:
@@ -2751,11 +2796,11 @@ def update_ppo(
         )
     }
     # Streamed moments of the scoring critic epochs' targets and residuals.
-    # Kept on the device in float64 and reduced once at the end, so scoring the
-    # regression costs four reductions over a minibatch already resident rather
-    # than a retained copy of every prediction.
-    first_fit_sums = _fit_moments(device)
-    last_fit_sums = _fit_moments(device)
+    # The compiled scoring callable reduces each minibatch directly into this
+    # four-scalar vector, avoiding full-sized float64 temporaries and replacing
+    # four eager accumulator launches with one vector addition.
+    first_fit_sums = torch.zeros(len(_FIT_MOMENT_KEYS), device=device, dtype=torch.float64)
+    last_fit_sums = torch.zeros_like(first_fit_sums)
     first_fit_states = 0
     last_fit_states = 0
     total_states = 0
@@ -2785,8 +2830,17 @@ def update_ppo(
     actor_terms = _cached_update_callable(
         actor, "_kaggriculture_update_terms", _actor_minibatch_terms, compile_mode
     )
-    critic_loss_fn = _cached_update_callable(
-        critic, "_kaggriculture_update_loss", _critic_minibatch_loss, compile_mode
+    critic_objective_fn = _cached_update_callable(
+        critic,
+        "_kaggriculture_update_objective",
+        _critic_minibatch_objective,
+        compile_mode,
+    )
+    critic_fit_terms_fn = _cached_update_callable(
+        critic,
+        "_kaggriculture_update_fit_terms",
+        _critic_minibatch_fit_terms,
+        compile_mode,
     )
     stop_for_kl = False
     # Guard scalars leave the device through one pinned async copy per ACTOR
@@ -2835,6 +2889,7 @@ def update_ppo(
     )
     actor_zero = torch.zeros((), device=device, dtype=torch.float32)
     for epoch_index in range(critic_epochs):
+        deferred_critic_finiteness = False
         shuffled = (
             actor_order
             if epoch_index < actor_epochs and actor_order is not None
@@ -3012,25 +3067,25 @@ def update_ppo(
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch even after policy replay is frozen.
             critic_optimizer.zero_grad(set_to_none=True)
-            value_loss, predicted_values = critic_loss_fn(
-                critic, value_targets, autocast_enabled, *critic_args
-            )
-            # The first and last critic epochs, accumulated separately. The
-            # first scores every state before this update has fitted it, so it
-            # reads out of sample; the last scores each one on its fourth pass.
-            # A critic that is generalizing keeps the two together, one that is
-            # memorizing the batch pulls them apart. The epochs between are
-            # never mixed in: averaging predictions from weights three passes
-            # apart reports a fit no single critic ever had.
+            # Only the first and last epochs score the critic's regression.
+            # Middle epochs need the distributional objective alone; asking
+            # `critic.value` for predictions that are immediately discarded
+            # would add an fp32 softmax, support multiply, and reduction over
+            # every state in those epochs.
             if epoch_index == 0 or epoch_index == critic_epochs - 1:
-                targets = value_targets.double()
-                predictions = predicted_values.double()
+                value_loss, fit_moments = critic_fit_terms_fn(
+                    critic, value_targets, autocast_enabled, *critic_args
+                )
                 if epoch_index == 0:
-                    _accumulate_fit_moments(first_fit_sums, targets, predictions)
+                    first_fit_sums += fit_moments
                     first_fit_states += states
                 if epoch_index == critic_epochs - 1:
-                    _accumulate_fit_moments(last_fit_sums, targets, predictions)
+                    last_fit_sums += fit_moments
                     last_fit_states += states
+            else:
+                value_loss = critic_objective_fn(
+                    critic, value_targets, autocast_enabled, *critic_args
+                )
             if run_actor:
                 guard_values = [
                     batch_kl,
@@ -3141,6 +3196,7 @@ def update_ppo(
                 # fp32, which is the only dtype the fused optimizer's skip accepts.
                 critic_skip = (~torch.isfinite(value_loss.detach())).float()
                 critic_nonfinite += critic_skip
+                deferred_critic_finiteness = True
             _optimizer_step(
                 critic_optimizer,
                 config.critic_learning_rate,
@@ -3155,8 +3211,10 @@ def update_ppo(
             updates += 1
         epoch_marks.append((totals["value_loss"].clone(), total_states))
         # Their steps were already gated on the device, so the critic reaching
-        # this line has never absorbed a non-finite loss.
-        if critic_nonfinite.item():
+        # this line has never absorbed a non-finite loss. If every minibatch was
+        # checked through the actor guard or an ungateable optimizer, there is
+        # no deferred result and therefore no device read to perform.
+        if deferred_critic_finiteness and critic_nonfinite.item():
             raise FloatingPointError("non-finite critic loss")
         completed_epochs += 1
 
@@ -3228,10 +3286,10 @@ def update_ppo(
         # fitted it, the last scores each one on its fourth pass. With a single
         # configured critic epoch they coincide, that epoch being both.
         "critic_fit_explained_variance_first_epoch": _fit_explained_variance(
-            first_fit_sums, first_fit_states
+            _fit_moment_mapping(first_fit_sums), first_fit_states
         ),
         "critic_fit_explained_variance_last_epoch": _fit_explained_variance(
-            last_fit_sums, last_fit_states
+            _fit_moment_mapping(last_fit_sums), last_fit_states
         ),
         # An explained variance alone cannot say why it is what it is, and the
         # suffix-return one was measured at -0.4 to -0.75 across a whole

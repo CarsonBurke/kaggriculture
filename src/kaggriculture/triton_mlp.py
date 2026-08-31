@@ -522,6 +522,42 @@ def _setup_fused_relu_squared_mlp_bf16_context(
     ctx.mark_non_differentiable(post)  # type: ignore[attr-defined]
 
 
+@triton.jit
+def _widen_mlp_weight_gradients_kernel(
+    up_gradient,
+    down_gradient,
+    up_gradient_fp32,
+    down_gradient_fp32,
+    elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elements
+    up_values = tl.load(up_gradient + offsets, mask=mask)
+    tl.store(up_gradient_fp32 + offsets, up_values.to(tl.float32), mask=mask)
+    down_values = tl.load(down_gradient + offsets, mask=mask)
+    tl.store(down_gradient_fp32 + offsets, down_values.to(tl.float32), mask=mask)
+
+
+def _widen_mlp_weight_gradients(
+    up_gradient: Tensor,
+    down_gradient: Tensor,
+) -> tuple[Tensor, Tensor]:
+    up_gradient_fp32 = torch.empty_like(up_gradient, dtype=torch.float32)
+    down_gradient_fp32 = torch.empty_like(down_gradient, dtype=torch.float32)
+    block_size = 1024
+    _widen_mlp_weight_gradients_kernel[(triton.cdiv(up_gradient.numel(), block_size),)](
+        up_gradient,
+        down_gradient,
+        up_gradient_fp32,
+        down_gradient_fp32,
+        up_gradient.numel(),
+        BLOCK_SIZE=block_size,
+        num_warps=8,  # pyright: ignore[reportCallIssue]
+    )
+    return up_gradient_fp32, down_gradient_fp32
+
+
 @torch.library.custom_op(
     "kaggriculture::fused_relu_squared_mlp_bf16_backward",
     mutates_args=(),
@@ -541,10 +577,14 @@ def _fused_relu_squared_mlp_bf16_backward(
     assert isinstance(pre_gradient, Tensor)
     up_gradient = pre_gradient.T @ flat_values
     input_gradient = pre_gradient @ up_weight_bf16
+    up_gradient_fp32, down_gradient_fp32 = _widen_mlp_weight_gradients(
+        up_gradient,
+        down_gradient,
+    )
     return (
         input_gradient.view_as(values),
-        up_gradient.float(),
-        down_gradient.float(),
+        up_gradient_fp32,
+        down_gradient_fp32,
     )
 
 
