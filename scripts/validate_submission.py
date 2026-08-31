@@ -236,6 +236,8 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
     provenance = evaluation.get("artifact_provenance", {})
     if evaluation.get("valid_for_selection") is not True:
         raise ValueError("submission finalist evaluation is not valid for selection")
+    if evaluation.get("device") != "cpu":
+        raise ValueError("submission finalist evaluation did not run on Kaggle's CPU backend")
     if evaluation.get("opponent_label") != "public-v27":
         raise ValueError("submission finalist evaluation did not use the fixed public v27")
     if evaluation.get("paired_seats") is not True or evaluation.get("seed_count", 0) < 32:

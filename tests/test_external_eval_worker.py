@@ -6,9 +6,14 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
+from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
+from kaggriculture.league import LEAGUE_SNAPSHOT_FORMAT_VERSION
 from kaggriculture.opponents import normalize_opponent
 from kaggriculture.orientation import Orientation
+from kaggriculture.provenance import source_identity
+from kaggriculture.structured import StructuredActor, StructuredConfig
 
 
 def _script():
@@ -114,6 +119,102 @@ def test_members_refuses_a_spec_a_reader_could_not_deduplicate() -> None:
         module._members("-1")
     with pytest.raises(ValueError, match="named no member"):
         module._members(",")
+
+
+def test_fused_structured_snapshot_is_evaluated_through_cpu_submission_layout(
+    tmp_path: Path,
+) -> None:
+    module = _script()
+    config = StructuredConfig(
+        model_dim=128,
+        attention_heads=8,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=4,
+        latents=8,
+        core_layers=2,
+        fused_mlp=True,
+    )
+    fused = StructuredActor(config)
+    artifact = tmp_path / "league-actor-00000012.pt"
+    torch.save(
+        {
+            "format_version": LEAGUE_SNAPSHOT_FORMAT_VERSION,
+            "architecture": "structured",
+            "iteration": 12,
+            "model_config": config.to_dict(),
+            "actor": fused.state_dict(),
+        },
+        artifact,
+    )
+
+    portable, orientation = module._load_member(artifact, None)
+
+    assert isinstance(portable, StructuredActor)
+    assert portable.config.fused_mlp is False
+    assert next(portable.parameters()).device.type == "cpu"
+    assert orientation is Orientation.IDENTITY
+
+    with pytest.raises(ValueError, match="single actor"):
+        module._load_member(artifact, 0)
+
+
+def test_fused_population_member_preserves_selected_weights_and_orientation(
+    tmp_path: Path,
+) -> None:
+    module = _script()
+    config = StructuredConfig(
+        model_dim=128,
+        attention_heads=8,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=4,
+        latents=8,
+        core_layers=2,
+        fused_mlp=True,
+    )
+    fused = StructuredActor(config)
+    first = {name: value.clone() for name, value in fused.state_dict().items()}
+    second = {name: value.clone() for name, value in fused.state_dict().items()}
+    copied_key = next(
+        name
+        for name in second
+        if not name.endswith(".mlp.up.weight") and not name.endswith(".mlp.down.weight")
+    )
+    first[copied_key].zero_()
+    second[copied_key].fill_(1)
+    artifact = tmp_path / "population.pt"
+    torch.save(
+        {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "architecture": "structured",
+            "iteration": 12,
+            "model_config": config.to_dict(),
+            "agents": [
+                {"actor": first, "orientation": int(Orientation.IDENTITY)},
+                {"actor": second, "orientation": int(Orientation.MIRROR_X)},
+            ],
+            "source_identity": source_identity(),
+            "run_provenance": None,
+        },
+        artifact,
+    )
+
+    portable, orientation = module._load_member(artifact, 1)
+
+    assert portable.config.fused_mlp is False
+    assert torch.equal(portable.state_dict()[copied_key], second[copied_key])
+    assert orientation is Orientation.MIRROR_X
+    malformed = tmp_path / "malformed-population.pt"
+    torch.save(
+        {
+            **torch.load(artifact, map_location="cpu", weights_only=False),
+            "source_identity": None,
+        },
+        malformed,
+    )
+    with pytest.raises(ValueError, match="source identity"):
+        module._load_member(malformed, 1)
 
 
 def test_opponent_digest_follows_the_runnable_not_the_label(monkeypatch, tmp_path: Path) -> None:

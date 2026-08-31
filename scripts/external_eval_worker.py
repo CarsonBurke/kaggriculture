@@ -16,6 +16,7 @@ import io
 import json
 import math
 import time
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,8 +24,17 @@ from typing import Any
 
 import torch
 
-from kaggriculture.inference import checkpoint_orientation, load_actor_artifact
-from kaggriculture.league import load_actor_snapshot, snapshot_sha256
+from kaggriculture.inference import (
+    actor_artifact_from_checkpoint,
+    checkpoint_orientation,
+    cpu_portable_actor,
+    load_actor_artifact,
+)
+from kaggriculture.league import (
+    load_actor_snapshot,
+    load_actor_snapshot_payload,
+    snapshot_sha256,
+)
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch
@@ -255,15 +265,29 @@ def _load_member(artifact: Path, member: int | None) -> tuple[Any, Orientation]:
     scores differently when probed upright, and the difference would look like
     drift in the weights rather than a rendering mismatch.
     """
-    if member is not None:
-        actor, payload = load_actor_artifact(artifact, agent=member)
-        return actor, checkpoint_orientation(payload, agent=member)
     payload = torch.load(artifact, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"actor file is not a dictionary: {artifact}")
     snapshot_keys = {"format_version", "iteration", "model_config", "actor"}
-    if snapshot_keys <= set(payload) and not set(payload) - snapshot_keys - {"architecture"}:
+    is_snapshot = snapshot_keys <= set(payload) and not set(payload) - snapshot_keys - {
+        "architecture"
+    }
+    if is_snapshot:
+        validated = load_actor_snapshot_payload(artifact)
+        if member is not None:
+            raise ValueError("league snapshot holds a single actor and cannot select a member")
+        snapshot_config = validated["model_config"]
+        if isinstance(snapshot_config, Mapping) and snapshot_config.get("fused_mlp", False):
+            return cpu_portable_actor(validated), Orientation.IDENTITY
         return load_actor_snapshot(artifact), Orientation.IDENTITY
+    model_config = payload.get("model_config")
+    if isinstance(model_config, Mapping) and model_config.get("fused_mlp", False):
+        orientation = checkpoint_orientation(payload, agent=member)
+        artifact_payload = actor_artifact_from_checkpoint(payload, agent=member)
+        return cpu_portable_actor(artifact_payload), orientation
+    if member is not None:
+        actor, loaded = load_actor_artifact(artifact, agent=member)
+        return actor, checkpoint_orientation(loaded, agent=member)
     actor, _ = load_actor_artifact(artifact)
     return actor, checkpoint_orientation(payload)
 
@@ -291,9 +315,9 @@ def _agent_for(actor: Any, orientation: Orientation) -> Any:
     """
 
     def agent(observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(
-            actor, [observation], deterministic=True, orientation=orientation
-        ).actions[0]
+        return act_batch(actor, [observation], deterministic=True, orientation=orientation).actions[
+            0
+        ]
 
     return agent
 

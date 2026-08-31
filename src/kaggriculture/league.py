@@ -224,11 +224,11 @@ def save_actor_state_snapshot(
     return SnapshotRef(iteration, path)
 
 
-def _validated_snapshot_state(
+def _validated_snapshot_payload(
     path: Path,
     expected_model_config: AnyModelConfig | dict[str, Any] | None,
-) -> tuple[Architecture, AnyModelConfig, dict[str, torch.Tensor]]:
-    """Validate one snapshot file and return its family, configuration, and state."""
+) -> tuple[dict[str, Any], Architecture, AnyModelConfig]:
+    """Validate one snapshot file and return its payload, family, and configuration."""
     path = Path(path)
     payload = _load_payload(path)
     _validate_canonical_filename(path, payload["iteration"])
@@ -245,6 +245,25 @@ def _validated_snapshot_state(
         config = architecture.config_class(**payload["model_config"])
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid league snapshot model configuration: {path}") from error
+    return payload, architecture, config
+
+
+def load_actor_snapshot_payload(
+    path: Path,
+    *,
+    expected_model_config: AnyModelConfig | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a frozen actor snapshot without constructing its device-specific actor."""
+    payload, _, _ = _validated_snapshot_payload(Path(path), expected_model_config)
+    return payload
+
+
+def _validated_snapshot_state(
+    path: Path,
+    expected_model_config: AnyModelConfig | dict[str, Any] | None,
+) -> tuple[Architecture, AnyModelConfig, dict[str, torch.Tensor]]:
+    """Validate one snapshot file and return its family, configuration, and state."""
+    payload, architecture, config = _validated_snapshot_payload(path, expected_model_config)
     return architecture, config, payload["actor"]
 
 

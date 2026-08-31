@@ -17,7 +17,9 @@ from kaggriculture.inference import (
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
     LEGACY_CHECKPOINT_FORMAT_VERSIONS,
+    _cpu_portable_structured_state,
     actor_artifact_from_checkpoint,
+    cpu_portable_actor_artifact,
     load_actor_artifact,
 )
 from kaggriculture.model import FarmActor, ModelConfig
@@ -109,17 +111,6 @@ def test_portable_structured_import_tolerates_triton_without_tensor_descriptor()
     assert completed.returncode == 0, completed.stderr
 
 
-def _load_export_cpu_actor():
-    spec = importlib.util.spec_from_file_location(
-        "export_cpu_actor_under_test",
-        Path(__file__).parents[1] / "scripts" / "export_cpu_actor.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_fused_structured_artifact_exports_to_cpu_linear_layout(tmp_path: Path) -> None:
     config = StructuredConfig(
         model_dim=128,
@@ -132,9 +123,7 @@ def test_fused_structured_artifact_exports_to_cpu_linear_layout(tmp_path: Path) 
         fused_mlp=True,
     )
     fused = StructuredActor(config)
-    exporter = _load_export_cpu_actor()
-
-    artifact = exporter.export_cpu_actor(
+    artifact = cpu_portable_actor_artifact(
         {
             "format_version": CHECKPOINT_FORMAT_VERSION,
             "architecture": "structured",
@@ -165,16 +154,22 @@ def test_fused_structured_artifact_exports_to_cpu_linear_layout(tmp_path: Path) 
             assert torch.equal(portable_state[name], value)
 
 
-def test_fused_structured_state_rejects_portable_key_collisions() -> None:
-    exporter = _load_export_cpu_actor()
-    state = {
-        "block.ffn.up_weight": torch.ones(4, 2),
-        "block.ffn.down_weight": torch.ones(4, 2),
-        "block.ffn.input.weight": torch.zeros(4, 2),
-    }
+def test_fused_structured_state_rejects_hybrid_portable_keys() -> None:
+    config = StructuredConfig(
+        model_dim=128,
+        attention_heads=8,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=4,
+        latents=8,
+        core_layers=2,
+        fused_mlp=True,
+    )
+    state = dict(StructuredActor(config).state_dict())
+    state["trunk.farm_local.0.ffn.input.weight"] = torch.zeros(256, 128)
 
-    with pytest.raises(ValueError, match="overwrite state key"):
-        exporter._portable_structured_state(state)
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        _cpu_portable_structured_state(config.to_dict(), state)
 
 
 @pytest.mark.parametrize(
@@ -268,6 +263,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         json.dumps(
             {
                 "valid_for_selection": True,
+                "device": "cpu",
                 "opponent_label": "public-v27",
                 "seed_count": 128,
                 "seed_start": 20_000_000,
@@ -302,6 +298,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         json.dumps(
             {
                 "valid_for_selection": True,
+                "device": "cpu",
                 "opponent_label": "starter",
                 "seed_count": 64,
                 "paired_seats": True,
@@ -449,6 +446,7 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
     }
     finalist = {
         "valid_for_selection": True,
+        "device": "cpu",
         "opponent_label": "public-v27",
         "seed_count": 128,
         "seed_start": 20_000_000,
@@ -474,6 +472,7 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
     }
     starter = {
         "valid_for_selection": True,
+        "device": "cpu",
         "opponent_label": "starter",
         "seed_count": 64,
         "paired_seats": True,
@@ -543,6 +542,13 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
     assert manifest["evaluation"]["score_rate"] == 0.75
     assert manifest["strength_gate"]["builtin_score_rates"] == {"starter": 1.0}
 
+    write({**finalist, "device": "cuda"}, starter)
+    with pytest.raises(ValueError, match="finalist evaluation must run on CPU"):
+        attempt()
+    write(finalist, {**starter, "device": "cuda"})
+    with pytest.raises(ValueError, match="built-in evaluation must run on CPU"):
+        attempt()
+
     # The exact historical failure: every seat lost, provenance immaculate.
     write({**finalist, "summary": {"score_rate": 0.0}}, starter)
     with pytest.raises(ValueError, match="below the required"):
@@ -608,6 +614,53 @@ def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
     )
     assert "manifest.json" in names
     assert validated_manifest == manifest
+
+
+def test_submission_validator_rejects_internally_consistent_cuda_evaluation(
+    tmp_path: Path,
+) -> None:
+    builder = _build_submission_module()
+    validator = _validate_submission_module()
+    checkpoint, finalist, starter = _submission_inputs(tmp_path)
+    finalist_path = tmp_path / "finalist.json"
+    starter_path = tmp_path / "starter.json"
+    archive_path = tmp_path / "submission.tar.gz"
+    finalist_path.write_text(json.dumps(finalist), encoding="utf-8")
+    starter_path.write_text(json.dumps(starter), encoding="utf-8")
+    builder.build(
+        checkpoint,
+        finalist_path,
+        archive_path,
+        builtin_evaluation_reports=[starter_path],
+        minimum_score_rate=0.5,
+        minimum_builtin_score_rate=0.9,
+        minimum_builtin_seed_count=16,
+    )
+
+    root = tmp_path / "tampered"
+    root.mkdir()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(root, filter="data")
+    evaluation_path = root / "evaluation.json"
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    evaluation["device"] = "cuda"
+    evaluation_path.write_text(json.dumps(evaluation), encoding="utf-8")
+    evaluation_digest = hashlib.sha256(evaluation_path.read_bytes()).hexdigest()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evaluation"]["sha256"] = evaluation_digest
+    manifest["files"]["evaluation.json"] = evaluation_digest
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    tampered_archive = tmp_path / "cuda-evaluated-submission.tar.gz"
+    with tarfile.open(tampered_archive, "w:gz") as archive:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                archive.add(path, arcname=path.relative_to(root), recursive=False)
+
+    destination = tmp_path / "rejected"
+    destination.mkdir()
+    with pytest.raises(ValueError, match="did not run on Kaggle's CPU backend"):
+        validator._extract(tampered_archive, destination)
 
 
 def test_submission_equivalence_keeps_evaluations_bound_to_artifact(

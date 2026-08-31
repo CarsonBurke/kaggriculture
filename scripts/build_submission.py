@@ -151,6 +151,13 @@ def _score_rate(payload: dict[str, Any], context: str) -> float:
     return float(rate)
 
 
+def _require_cpu_evaluation(payload: dict[str, Any], context: str) -> None:
+    if payload.get("device") != "cpu":
+        raise ValueError(
+            f"{context} evaluation must run on CPU, matching Kaggle's inference backend"
+        )
+
+
 def _load_builtin_evaluation(
     contents: bytes,
     checkpoint_digest: str,
@@ -170,6 +177,7 @@ def _load_builtin_evaluation(
     payload = json.loads(contents.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
         raise ValueError("built-in evaluation did not complete successfully")
+    _require_cpu_evaluation(payload, "built-in")
     label = payload.get("opponent_label")
     if label not in BUILTIN_OPPONENTS:
         raise ValueError(f"built-in evaluation names a non-built-in opponent: {label!r}")
@@ -207,6 +215,7 @@ def _load_evaluation(
     payload = json.loads(contents.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
         raise ValueError("submission requires a successful finalist evaluation")
+    _require_cpu_evaluation(payload, "finalist")
     provenance = payload.get("artifact_provenance")
     if not isinstance(provenance, dict) or provenance.get("sha256") != checkpoint_digest:
         raise ValueError("finalist evaluation does not bind the selected checkpoint bytes")

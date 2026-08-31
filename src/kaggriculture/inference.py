@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch, prepare_quantity_heads
@@ -186,6 +186,108 @@ def actor_artifact_from_checkpoint(
     }
 
 
+def _cpu_portable_structured_state(
+    model_config: Mapping[str, Any],
+    state: Mapping[str, Tensor],
+) -> tuple[dict[str, Any], dict[str, Tensor]]:
+    """Convert bias-free fused MLP parameters into ordinary CPU Linear layers.
+
+    The layouts are algebraically equivalent, not numerically identical across
+    CUDA BF16 and CPU FP32. Callers use this path specifically to measure the
+    policy that can execute in Kaggle rather than treating CUDA evaluation as a
+    proxy for it.
+    """
+    if not model_config.get("fused_mlp", False):
+        raise ValueError("actor does not use fused structured MLPs")
+    fused_payload = {
+        "architecture": "structured",
+        "model_config": dict(model_config),
+    }
+    fused_actor = resolve_architecture(fused_payload).build_actor(dict(model_config))
+    fused_actor.load_state_dict(state, strict=True)
+
+    converted: dict[str, Tensor] = {}
+    up_prefixes: set[str] = set()
+    down_prefixes: set[str] = set()
+
+    def store(name: str, value: Tensor) -> None:
+        if name in converted:
+            raise ValueError(f"fused MLP conversion would overwrite state key {name!r}")
+        converted[name] = value.detach().to(device="cpu", copy=True)
+
+    for name, value in state.items():
+        if name.endswith(".ffn.up_weight"):
+            prefix = name.removesuffix("up_weight")
+            store(f"{prefix}input.weight", value)
+            store(f"{prefix}input.bias", value.new_zeros(value.shape[0]))
+            up_prefixes.add(prefix)
+        elif name.endswith(".ffn.down_weight"):
+            prefix = name.removesuffix("down_weight")
+            store(f"{prefix}output.weight", value.detach().T.contiguous())
+            store(f"{prefix}output.bias", value.new_zeros(value.shape[1]))
+            down_prefixes.add(prefix)
+        else:
+            store(name, value)
+    if not up_prefixes:
+        raise ValueError("fused actor contains no fused MLP weights")
+    if up_prefixes != down_prefixes:
+        missing_up = sorted(down_prefixes - up_prefixes)
+        missing_down = sorted(up_prefixes - down_prefixes)
+        raise ValueError(
+            f"incomplete fused MLP state: missing up={missing_up}, missing down={missing_down}"
+        )
+
+    portable_config = dict(model_config)
+    portable_config["fused_mlp"] = False
+    portable_payload = {
+        "architecture": "structured",
+        "model_config": portable_config,
+    }
+    portable_actor = resolve_architecture(portable_payload).build_actor(portable_config)
+    portable_actor.load_state_dict(converted, strict=True)
+    return portable_config, converted
+
+
+def cpu_portable_actor(
+    checkpoint: Mapping[str, Any],
+    *,
+    agent: int | None = None,
+) -> nn.Module:
+    """Build the CPU policy that a fused structured checkpoint can submit."""
+    if resolve_architecture(dict(checkpoint)).name != "structured":
+        raise ValueError("CPU conversion applies only to structured actors")
+    model_config = checkpoint.get("model_config")
+    if not isinstance(model_config, Mapping):
+        raise ValueError("actor is missing its model configuration")
+    portable_config, portable_state = _cpu_portable_structured_state(
+        model_config,
+        checkpoint_actor_state(checkpoint, agent),
+    )
+    payload = {"architecture": "structured", "model_config": portable_config}
+    actor = resolve_architecture(payload).build_actor(portable_config)
+    actor.load_state_dict(portable_state, strict=True)
+    actor.eval()
+    return actor
+
+
+def cpu_portable_actor_artifact(
+    checkpoint: Mapping[str, Any],
+    *,
+    agent: int | None = None,
+) -> dict[str, Any]:
+    """Export the exact CPU policy shape used by submission and external evaluation."""
+    artifact = actor_artifact_from_checkpoint(dict(checkpoint), agent=agent)
+    portable_config, portable_state = _cpu_portable_structured_state(
+        artifact["model_config"],
+        artifact["actor"],
+    )
+    return {
+        **artifact,
+        "model_config": portable_config,
+        "actor": portable_state,
+    }
+
+
 def load_actor_artifact(
     path: Path, device: torch.device | str = "cpu", *, agent: int | None = None
 ) -> tuple[nn.Module, dict[str, Any]]:
@@ -222,10 +324,12 @@ def load_actor_artifact(
         raise ValueError("actor artifact run provenance source does not match source identity")
 
     model_config = payload.get("model_config")
-    fused_mlp = isinstance(model_config, Mapping) and bool(model_config.get("fused_mlp", False))
+    if not isinstance(model_config, Mapping):
+        raise ValueError("actor artifact is missing its model configuration")
+    fused_mlp = bool(model_config.get("fused_mlp", False))
     if fused_mlp and target_device.type != "cuda":
         raise ValueError("fused structured artifacts require CUDA inference")
-    actor = resolve_architecture(payload).build_actor(model_config).to(target_device)
+    actor = resolve_architecture(payload).build_actor(dict(model_config)).to(target_device)
     actor.load_state_dict(checkpoint_actor_state(payload, agent))
     actor.eval()
     return actor, payload
