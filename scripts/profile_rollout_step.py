@@ -28,11 +28,13 @@ from typing import Any
 import numpy as np
 import torch
 
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA
 from kaggriculture.model import FarmActor
 from kaggriculture.rollout import (
     ROLLOUT_FORWARD_MODES,
     _categorical_draws,
     _native_encoded_wave,
+    _native_pair_rewards,
     _packed_outputs_to_host,
     _PackedTransfer,
     _quantity_heads,
@@ -156,7 +158,7 @@ def main() -> None:
             timed("rust_sample_step", stage, sample_step)
 
             def bookkeeping() -> None:
-                np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+                _native_pair_rewards(sampled, DEFAULT_REWARD_GAMMA).reshape(-1)
                 counts = (
                     np.asarray(sampled["unit_active"]).sum(axis=1)
                     + np.asarray(sampled["market_active"]).sum(axis=1)

@@ -191,29 +191,32 @@ the chain.
 Sweep with `--games 64,112,128,256` when the question is scaling or memory
 headroom, which is a separate study from this one.
 
-Training uses an exactly zero-sum potential difference. Let `L[i,t]` be player
-`i`'s actual liquid assets: bank money plus the exact proceeds from selling
-every held product at the current market curve. For player-zero potential
-`p[t]`,
+Training uses discount-correct, exactly zero-sum potential shaping. Let `L[i,t]`
+be player `i`'s actual liquid assets: bank money plus the exact proceeds from
+selling every held product at the current market curve. With the game-defined
+starting bank `k = 3000`,
 
 ```
-p[t] = log1p(L[0,t])    - log1p(L[1,t])     # nonterminal
-p[T] = log1p(bank[0,T]) - log1p(bank[1,T])  # terminal
-r[0,t] = p[t+1] - p[t]
+P[t] = log((L[0,t]       + k) / (L[1,t]       + k))  # nonterminal potential
+U[T] = log((bank[0,T]    + k) / (bank[1,T]    + k))  # terminal utility
+
+r[0,t] = gamma * P[t+1] - P[t]  # nonterminal
+r[0,T-1] = U[T] - P[T-1]        # terminal; terminal shaping potential is zero
 r[1,t] = -r[0,t]
 ```
 
-The symmetric initial state has `p[0] = 0`, so the complete return telescopes
-exactly to the terminal bank log-ratio. Dense liquid-asset shaping changes
-credit assignment without repeatedly paying for an existing lead. Equal assets
-always score zero; only changes in relative liquid wealth move the potential,
-and unsold terminal inventory earns nothing. Every transition, including the
+The production discount is `gamma = 0.997`. From the symmetric initial state
+`P[0] = 0`, the discounted complete return is
+`gamma^(T-1) * U[T]`. Every game has the same horizon, so this factor cannot
+change the ordering of terminal outcomes. The intermediate potential cancels
+without requiring gamma one, adding dense credit assignment without an
+early-lead or time-average occupancy objective. Every transition, including the
 terminal transition, sums to exactly zero.
 
-`log1p` makes the comparison percentage-like and remains defined when a player
-has no liquid assets. One dollar is the game's smallest economic unit, so this
-is `log((L[0] + 1) / (L[1] + 1))`; there is no fitted dollar scale or nonlinear
-margin saturation.
+The starting bank supplies a game-defined zero-asset prior. This keeps the
+comparison percentage-like and defined at zero without the extreme slope of a
+one-dollar pseudocount: `3000` versus `0` scores `log(2)`, not `log(3001)`.
+There is no fitted dollar scale or nonlinear margin saturation.
 
 Liquid assets deliberately exclude seeds, animals, planted crops, pending
 yields, and land because the market cannot liquidate them. Market products are
@@ -223,16 +226,15 @@ potential-neutral, so cycling inventory cannot manufacture reward.
 
 The log potential is not artificially bounded. Critic targets outside the
 categorical support saturate at its outer atom, and the saturated fraction is a
-reported training gate rather than a hidden reward transform. Native/Python
-parity covers both the potential and its difference.
+reported training gate rather than a hidden reward transform. Rust supplies
+binary32 potentials and terminal utility; one Python reward implementation
+applies the same configurable gamma to native and interpreted rollouts.
 
-Gamma is `1.0`: discounting a fixed 719-transition game would alter the
-terminal objective and break telescoping. GAE lambda remains `0.95`; it controls
-the sampled advantage horizon while the critic supplies the continuation
-estimate. Actor advantages and critic targets share the same recurrence, and
-critic targets are `advantage + value`. Targets that bootstrap beyond the
-categorical support saturate at the outer atom and the saturated fraction is
-reported.
+GAE lambda remains `0.95`; it controls the sampled advantage horizon while the
+critic supplies the continuation estimate. Actor advantages, critic targets,
+and collection shaping all use the same gamma. Critic targets are
+`advantage + value`; targets beyond categorical support saturate at the outer
+atom and the saturated fraction is reported.
 
 The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
 population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region

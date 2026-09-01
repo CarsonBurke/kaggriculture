@@ -1110,21 +1110,29 @@ impl Game {
 
     /// Log-relative actual liquid assets from player zero's perspective.
     pub fn pair_potential(&self) -> f32 {
-        log_asset_ratio(self.liquidation_value(0), self.liquidation_value(1))
+        log_asset_ratio(
+            self.liquidation_value(0),
+            self.liquidation_value(1),
+            self.config.starting_money as f64,
+        )
     }
 
-    /// Log-relative terminal bank money from player zero's perspective.
-    pub fn terminal_pair_potential(&self) -> f32 {
-        log_asset_ratio(self.farms[0].money as f64, self.farms[1].money as f64)
+    /// Terminal log-relative bank utility from player zero's perspective.
+    pub fn terminal_pair_utility(&self) -> f32 {
+        log_asset_ratio(
+            self.farms[0].money as f64,
+            self.farms[1].money as f64,
+            self.config.starting_money as f64,
+        )
     }
 
-    /// Potential of the current post-action state.
+    /// Shaping potential of the current post-action state.
     ///
-    /// Terminal states switch to bank-only scoring. Potential differences then
-    /// telescope exactly to the terminal bank log-ratio from the symmetric start.
+    /// Terminal states have zero shaping potential; their bank utility is paid
+    /// separately so discounted potential shaping preserves the objective.
     pub fn post_step_potential(&self) -> f32 {
         if self.done {
-            self.terminal_pair_potential()
+            0.0
         } else {
             self.pair_potential()
         }
@@ -2819,15 +2827,12 @@ fn shape(kind: Shape, x: f64, scale: f64) -> f64 {
     }
 }
 
-/// Natural-log relative wealth, defined even when either side has nothing.
-///
-/// Money is integral, so one dollar is the smallest non-zero economic unit.
-/// `ln_1p` therefore supplies a domain-safe ratio without a fitted scale:
-/// ln((zero + $1) / (one + $1)).
-fn log_asset_ratio(zero: f64, one: f64) -> f32 {
+/// Log-relative wealth regularized by each player's starting bank.
+fn log_asset_ratio(zero: f64, one: f64, starting_money: f64) -> f32 {
     debug_assert!(zero.is_finite() && zero >= 0.0);
     debug_assert!(one.is_finite() && one >= 0.0);
-    (zero.ln_1p() - one.ln_1p()) as f32
+    debug_assert!(starting_money.is_finite() && starting_money > 0.0);
+    ((zero / starting_money).ln_1p() - (one / starting_money).ln_1p()) as f32
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
@@ -3072,7 +3077,7 @@ mod tests {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 9_000;
         game.farms[1].money = 3_000;
-        let lead = log_asset_ratio(9_000.0, 3_000.0);
+        let lead = log_asset_ratio(9_000.0, 3_000.0, game.config.starting_money as f64);
         assert_eq!(game.pair_potential(), lead);
 
         game.farms[0].money = 3_000;
@@ -3096,7 +3101,10 @@ mod tests {
         game.privates[1].shed[4] = 5;
         let zero = game.liquidation_value(0);
         let one = game.liquidation_value(1);
-        assert_eq!(game.pair_potential(), log_asset_ratio(zero, one));
+        assert_eq!(
+            game.pair_potential(),
+            log_asset_ratio(zero, one, game.config.starting_money as f64)
+        );
 
         // Unhired unit slots are outside the observation and must not count.
         game.privates[0].inventories[5][0] = 99;
@@ -3153,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_pair_potential_uses_bank_only() {
+    fn terminal_pair_utility_uses_bank_only_and_zeroes_terminal_potential() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 3000;
         game.farms[1].money = 1000;
@@ -3161,9 +3169,9 @@ mod tests {
         assert!(game.pair_potential() < 0.0);
 
         game.done = true;
-        let banked = log_asset_ratio(3_000.0, 1_000.0);
-        assert_eq!(game.terminal_pair_potential(), banked);
-        assert_eq!(game.post_step_potential(), banked);
+        let banked = log_asset_ratio(3_000.0, 1_000.0, game.config.starting_money as f64);
+        assert_eq!(game.terminal_pair_utility(), banked);
+        assert_eq!(game.post_step_potential(), 0.0);
     }
 
     #[test]

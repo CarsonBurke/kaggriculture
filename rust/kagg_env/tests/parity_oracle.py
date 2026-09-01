@@ -19,13 +19,14 @@ from kaggriculture.actions import (
     N_UNIT_ACTIONS,
     compile_action,
 )
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.encoding import (
     encode_observation,
     pair_potential,
     shaped_pair_reward,
-    terminal_pair_potential,
+    terminal_pair_utility,
 )
+from kaggriculture.rollout import _native_pair_rewards
 from kaggriculture.rust_env import load_native
 
 
@@ -103,6 +104,7 @@ def main() -> None:
             dtype=np.uint8,
         )
         expected_potentials = np.empty(args.games, dtype=np.float32)
+        expected_utilities = np.zeros(args.games, dtype=np.float32)
         expected_rewards = np.empty((args.games, 2), dtype=np.float32)
         for game, environment in enumerate(official):
             environment.step(
@@ -116,19 +118,29 @@ def main() -> None:
                     for player in range(2)
                 ]
             )
-            next_potential = (
-                terminal_pair_potential(
+            if environment.done:
+                utility = terminal_pair_utility(
                     environment.state[0].observation,
                     environment.state[1].observation,
                 )
-                if environment.done
-                else pair_potential(
+                next_potential = 0.0
+                reward = shaped_pair_reward(
+                    potentials[game],
+                    None,
+                    terminal_utility=utility,
+                    gamma=DEFAULT_REWARD_GAMMA,
+                )
+                expected_utilities[game] = utility
+            else:
+                next_potential = pair_potential(
                     environment.state[0].observation,
                     environment.state[1].observation,
                 )
-            )
+                reward = shaped_pair_reward(
+                    potentials[game], next_potential, gamma=DEFAULT_REWARD_GAMMA
+                )
             expected_potentials[game] = next_potential
-            expected_rewards[game] = shaped_pair_reward(potentials[game], expected_potentials[game])
+            expected_rewards[game] = reward
         native_step = native.step_factors(unit, kinds, quantities)
         np.testing.assert_allclose(
             native_step["previous_potentials"], potentials, atol=1e-7, rtol=0
@@ -137,7 +149,13 @@ def main() -> None:
             native_step["potentials"], expected_potentials, atol=1e-7, rtol=0
         )
         np.testing.assert_allclose(
-            native_step["shaped_rewards"], expected_rewards, atol=1e-7, rtol=0
+            native_step["terminal_utilities"], expected_utilities, atol=1e-7, rtol=0
+        )
+        np.testing.assert_allclose(
+            _native_pair_rewards(native_step, DEFAULT_REWARD_GAMMA),
+            expected_rewards,
+            atol=1e-7,
+            rtol=0,
         )
         potentials = expected_potentials
         for game, environment in enumerate(official):

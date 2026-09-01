@@ -635,12 +635,15 @@ impl BatchEnv {
         output.set_item("dones", dones.into_pyarray(py))?;
         let post_potentials: Vec<f32> = self.games.iter().map(Game::post_step_potential).collect();
         self.potential_cache.copy_from_slice(&post_potentials);
-        let shaped: Vec<f32> = previous_potentials
+        let terminal_utilities: Vec<f32> = self
+            .games
             .iter()
-            .zip(post_potentials.iter())
-            .flat_map(|(&previous, &post)| {
-                let reward_zero = post - previous;
-                [reward_zero, -reward_zero]
+            .map(|game| {
+                if game.done {
+                    game.terminal_pair_utility()
+                } else {
+                    0.0
+                }
             })
             .collect();
         output.set_item(
@@ -652,10 +655,8 @@ impl BatchEnv {
             Array1::from_vec(post_potentials).into_pyarray(py),
         )?;
         output.set_item(
-            "shaped_rewards",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), shaped)
-                .expect("shaped reward shape is internal")
-                .into_pyarray(py),
+            "terminal_utilities",
+            Array1::from_vec(terminal_utilities).into_pyarray(py),
         )?;
         Ok(output)
     }
@@ -969,11 +970,11 @@ fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound
         )?;
     }
     output.set_item("entropy", PyArray1::<f32>::zeros(py, rows, false))?;
-    for name in ["rewards", "final_money", "shaped_rewards"] {
+    for name in ["rewards", "final_money"] {
         output.set_item(name, PyArray2::<f32>::zeros(py, [batch, PLAYERS], false))?;
     }
     output.set_item("dones", PyArray1::<bool>::zeros(py, batch, false))?;
-    for name in ["previous_potentials", "potentials"] {
+    for name in ["previous_potentials", "potentials", "terminal_utilities"] {
         output.set_item(name, PyArray1::<f32>::zeros(py, batch, false))?;
     }
     Ok(output)
@@ -998,7 +999,7 @@ struct SampleOutputArrays<'py> {
     dones: PyReadwriteArray1<'py, bool>,
     previous: PyReadwriteArray1<'py, f32>,
     potentials: PyReadwriteArray1<'py, f32>,
-    shaped: PyReadwriteArray2<'py, f32>,
+    utilities: PyReadwriteArray1<'py, f32>,
 }
 
 impl<'py> SampleOutputArrays<'py> {
@@ -1064,7 +1065,7 @@ impl<'py> SampleOutputArrays<'py> {
             dones: output_array!("dones", PyArray1<bool>, [batch]),
             previous: output_array!("previous_potentials", PyArray1<f32>, [batch]),
             potentials: output_array!("potentials", PyArray1<f32>, [batch]),
-            shaped: output_array!("shaped_rewards", PyArray2<f32>, [batch, PLAYERS]),
+            utilities: output_array!("terminal_utilities", PyArray1<f32>, [batch]),
         })
     }
 
@@ -1088,7 +1089,7 @@ impl<'py> SampleOutputArrays<'py> {
             dones,
             previous,
             potentials,
-            shaped,
+            utilities,
         } = self;
         Ok(SampleOutputSlices {
             unit_actions: unit_actions
@@ -1143,9 +1144,9 @@ impl<'py> SampleOutputArrays<'py> {
             potentials: potentials
                 .as_slice_mut()
                 .map_err(|_| non_contiguous("potentials"))?,
-            shaped: shaped
+            utilities: utilities
                 .as_slice_mut()
-                .map_err(|_| non_contiguous("shaped_rewards"))?,
+                .map_err(|_| non_contiguous("terminal_utilities"))?,
         })
     }
 }
@@ -1169,7 +1170,7 @@ struct SampleOutputSlices<'a> {
     dones: &'a mut [bool],
     previous: &'a mut [f32],
     potentials: &'a mut [f32],
-    shaped: &'a mut [f32],
+    utilities: &'a mut [f32],
 }
 
 fn required_output<'py>(output: &Bound<'py, PyDict>, name: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -1373,7 +1374,7 @@ fn fill_sample_step_output(
         dones,
         previous,
         potentials,
-        shaped,
+        utilities,
     } = output;
 
     for (row_index, row) in sampled.iter().enumerate() {
@@ -1417,10 +1418,12 @@ fn fill_sample_step_output(
         previous[game_index] = pre;
         let post = game.post_step_potential();
         potentials[game_index] = post;
+        utilities[game_index] = if result.done {
+            game.terminal_pair_utility()
+        } else {
+            0.0
+        };
         *cached = post;
-        let reward_zero = post - pre;
-        shaped[offset] = reward_zero;
-        shaped[offset + 1] = -reward_zero;
     }
 }
 

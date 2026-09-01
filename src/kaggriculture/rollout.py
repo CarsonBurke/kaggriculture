@@ -15,6 +15,7 @@ from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
 from kaggriculture.constants import (
     BOARD_SIZE,
     CROPS,
+    DEFAULT_REWARD_GAMMA,
     EPISODE_STEPS,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
@@ -27,7 +28,7 @@ from kaggriculture.encoding import (
     UNIT_FEATURES,
     pair_potential,
     shaped_pair_reward,
-    terminal_pair_potential,
+    terminal_pair_utility,
 )
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
@@ -984,6 +985,24 @@ def _validate_learner_temperature(temperature: float) -> None:
         raise ValueError("on-policy rollout collection requires learner temperature 1.0")
 
 
+def _validate_reward_gamma(gamma: float) -> None:
+    if not np.isfinite(gamma) or not 0.0 < gamma <= 1.0:
+        raise ValueError("reward gamma must be finite and in (0, 1]")
+
+
+def _native_pair_rewards(sampled: dict[str, Any], gamma: float) -> np.ndarray:
+    """Build discounted shaping rewards from native state potentials."""
+    _validate_reward_gamma(gamma)
+    previous = np.asarray(sampled["previous_potentials"], dtype=np.float32)
+    following = np.asarray(sampled["potentials"], dtype=np.float32)
+    dones = np.asarray(sampled["dones"], dtype=np.bool_)
+    reward_zero = np.float32(gamma) * following - previous
+    if dones.any():
+        utilities = np.asarray(sampled["terminal_utilities"], dtype=np.float32)
+        reward_zero[dones] = utilities[dones] - previous[dones]
+    return np.column_stack((reward_zero, -reward_zero)).astype(np.float32, copy=False)
+
+
 _SAMPLED_FIELD_SOURCES = {
     "unit_actions": "unit_actions",
     "market_kinds": "market_kinds",
@@ -1095,6 +1114,7 @@ def collect_mixed_play_rust(
     episode_steps: int = 720,
     deterministic: bool = False,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     # Matches `temperature` above, so a caller that omits it gets the symmetric
     # wave production runs. It defaulted to 0.8 while training sharpened its
     # league seats, and that default silently reached instruments which never
@@ -1155,6 +1175,7 @@ def collect_mixed_play_rust(
     if len(opponents) > np.iinfo(np.uint16).max:
         raise ValueError("too many frozen opponents for native head identifiers")
     _validate_learner_temperature(temperature)
+    _validate_reward_gamma(gamma)
     if opponent_temperatures is None:
         frozen_temperatures = np.full(len(opponents), opponent_temperature, dtype=np.float32)
     else:
@@ -1398,7 +1419,7 @@ def collect_mixed_play_rust(
             builtin_agents,
             sampled,
         )
-        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
         _store_native_wave(
             architecture,
             fields,
@@ -1502,6 +1523,7 @@ def collect_population_play_rust(
     seed_start: int,
     episode_steps: int = EPISODE_STEPS,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -1546,6 +1568,7 @@ def collect_population_play_rust(
     if episode_steps != EPISODE_STEPS:
         raise ValueError("the native simulator currently supports the competition horizon 720")
     _validate_learner_temperature(temperature)
+    _validate_reward_gamma(gamma)
     pairings = population_pairings(population, games)
     started = time.perf_counter()
     for member in actors:
@@ -1661,7 +1684,7 @@ def collect_population_play_rust(
             builtin_agents,
             sampled,
         )
-        rewards = np.asarray(sampled["shaped_rewards"], dtype=np.float32).reshape(-1)
+        rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
         # Storage keeps the unit factors in oriented space so the replay path
         # reads features, masks and actions out of one label space. The stored
         # log-probabilities need no remap: P(oriented index i) and P(the real
@@ -1718,6 +1741,7 @@ def collect_self_play_rust(
     episode_steps: int = 720,
     deterministic: bool = False,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -1733,6 +1757,7 @@ def collect_self_play_rust(
         episode_steps=episode_steps,
         deterministic=deterministic,
         temperature=temperature,
+        gamma=gamma,
         sampling_seed=sampling_seed,
         forward_mode=forward_mode,
         forward_autocast=forward_autocast,
@@ -1749,6 +1774,7 @@ def collect_frozen_opponents_play_rust(
     seed_start: int,
     episode_steps: int = 720,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     opponent_temperature: float = 0.8,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
@@ -1771,6 +1797,7 @@ def collect_frozen_opponents_play_rust(
         episode_steps=episode_steps,
         deterministic=deterministic,
         temperature=temperature,
+        gamma=gamma,
         opponent_temperature=opponent_temperature,
         opponent_temperatures=opponent_temperatures,
         deterministic_opponent=deterministic_opponent,
@@ -1790,6 +1817,7 @@ def collect_frozen_opponent_play_rust(
     seed_start: int,
     episode_steps: int = 720,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,
@@ -1805,6 +1833,7 @@ def collect_frozen_opponent_play_rust(
         seed_start=seed_start,
         episode_steps=episode_steps,
         temperature=temperature,
+        gamma=gamma,
         opponent_temperature=opponent_temperature,
         deterministic_opponent=deterministic_opponent,
         deterministic=deterministic,
@@ -1822,6 +1851,7 @@ def collect_self_play(
     episode_steps: int = 720,
     deterministic: bool = False,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     sampling_seed: int = 0,
 ) -> RolloutBatch:
     """Collect both valid on-policy trajectories from every self-play game."""
@@ -1830,6 +1860,7 @@ def collect_self_play(
     if episode_steps < 2:
         raise ValueError("episode_steps must be at least two")
     _validate_learner_temperature(temperature)
+    _validate_reward_gamma(gamma)
     started = time.perf_counter()
     actor.eval()
     architecture = architecture_of(actor).name
@@ -1883,14 +1914,18 @@ def collect_self_play(
                 )
                 final_money[offset : offset + 2] = money
                 opponent_money[offset : offset + 2] = money[::-1]
-                next_potential = np.float32(
-                    terminal_pair_potential(next_state[0].observation, next_state[1].observation)
+                utility = terminal_pair_utility(
+                    next_state[0].observation, next_state[1].observation
+                )
+                next_potential = np.float32(0.0)
+                pair_rewards = shaped_pair_reward(
+                    potentials[game], None, terminal_utility=utility, gamma=gamma
                 )
             else:
                 next_potential = np.float32(
                     pair_potential(next_state[0].observation, next_state[1].observation)
                 )
-            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
+                pair_rewards = shaped_pair_reward(potentials[game], next_potential, gamma=gamma)
             potentials[game] = next_potential
             step_rewards[offset : offset + 2] = pair_rewards
         fields["rewards"].append(step_rewards)
@@ -1924,6 +1959,7 @@ def collect_frozen_opponent_play(
     seed_start: int,
     episode_steps: int = 720,
     temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,
@@ -1935,6 +1971,7 @@ def collect_frozen_opponent_play(
     if episode_steps < 2:
         raise ValueError("episode_steps must be at least two")
     _validate_learner_temperature(temperature)
+    _validate_reward_gamma(gamma)
     started = time.perf_counter()
     actor.eval()
     opponent.eval()
@@ -2006,14 +2043,18 @@ def collect_frozen_opponent_play(
                 player_money = (float(farms[0]["money"]), float(farms[1]["money"]))
                 final_money[game] = player_money[int(seat)]
                 opponent_money[game] = player_money[1 - int(seat)]
-                next_potential = np.float32(
-                    terminal_pair_potential(next_state[0].observation, next_state[1].observation)
+                utility = terminal_pair_utility(
+                    next_state[0].observation, next_state[1].observation
+                )
+                next_potential = np.float32(0.0)
+                pair_rewards = shaped_pair_reward(
+                    potentials[game], None, terminal_utility=utility, gamma=gamma
                 )
             else:
                 next_potential = np.float32(
                     pair_potential(next_state[0].observation, next_state[1].observation)
                 )
-            pair_rewards = shaped_pair_reward(potentials[game], next_potential)
+                pair_rewards = shaped_pair_reward(potentials[game], next_potential, gamma=gamma)
             potentials[game] = next_potential
             step_rewards[game] = pair_rewards[int(seat)]
         fields["rewards"].append(step_rewards)

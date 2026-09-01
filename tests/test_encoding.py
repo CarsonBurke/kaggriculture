@@ -6,7 +6,13 @@ from itertools import pairwise
 import numpy as np
 from kaggle_environments import make
 
-from kaggriculture.constants import MAX_UNITS, PRICE_FLOOR, market_price
+from kaggriculture.constants import (
+    DEFAULT_REWARD_GAMMA,
+    MAX_UNITS,
+    PRICE_FLOOR,
+    STARTING_MONEY,
+    market_price,
+)
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
     CRITIC_FEATURES,
@@ -16,7 +22,7 @@ from kaggriculture.encoding import (
     liquidation_value,
     pair_potential,
     shaped_pair_reward,
-    terminal_pair_potential,
+    terminal_pair_utility,
 )
 
 
@@ -49,7 +55,7 @@ def test_pair_potential_is_a_zero_sum_log_liquid_asset_ratio() -> None:
     zero["farms"][0]["money"] = 9000
     one["farms"][1]["money"] = 3000
 
-    lead = math.log1p(9000) - math.log1p(3000)
+    lead = math.log1p(9000 / STARTING_MONEY) - math.log1p(3000 / STARTING_MONEY)
     assert pair_potential(zero, one) == lead
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 9000
@@ -63,10 +69,10 @@ def test_pair_potential_is_a_zero_sum_log_liquid_asset_ratio() -> None:
     one["farms"][1]["money"] = 0
     assert pair_potential(zero, one) == 0.0
     one["farms"][1]["money"] = 3000
-    assert pair_potential(zero, one) == -math.log1p(3000)
+    assert pair_potential(zero, one) == -math.log(2.0)
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 0
-    assert pair_potential(zero, one) == math.log1p(3000)
+    assert pair_potential(zero, one) == math.log(2.0)
 
     # Held products contribute their exact liquidation proceeds.
     zero["farms"][0]["money"] = 3000
@@ -75,7 +81,9 @@ def test_pair_potential_is_a_zero_sum_log_liquid_asset_ratio() -> None:
     one["private"]["shed"]["MILK"] = 5
     value_zero = liquidation_value(zero, 0)
     value_one = liquidation_value(one, 1)
-    assert pair_potential(zero, one) == math.log1p(value_zero) - math.log1p(value_one)
+    assert pair_potential(zero, one) == math.log1p(value_zero / STARTING_MONEY) - math.log1p(
+        value_one / STARTING_MONEY
+    )
 
 
 def test_liquidation_value_walks_the_engine_sell_curve_exactly() -> None:
@@ -117,49 +125,64 @@ def test_pair_potential_excludes_assets_that_cannot_be_liquidated() -> None:
     assert pair_potential(zero, one) == baseline
 
 
-def test_terminal_pair_potential_uses_bank_only() -> None:
+def test_terminal_pair_utility_uses_bank_only() -> None:
     zero, one = _observations()
     zero["farms"][0]["money"] = 3000
     one["farms"][1]["money"] = 1000
     zero["private"]["shed"]["WHEAT"] = 100
 
-    terminal = terminal_pair_potential(zero, one)
-    assert terminal == math.log1p(3000) - math.log1p(1000)
+    terminal = terminal_pair_utility(zero, one)
+    assert terminal == math.log(2.0) - math.log1p(1000 / STARTING_MONEY)
     # Unsold WHEAT contributes mid-episode but not to the terminal objective.
     assert pair_potential(zero, one) > terminal
 
 
 def test_log_asset_ratio_tracks_relative_not_absolute_wealth() -> None:
     zero, one = _observations()
-    zero["farms"][0]["money"] = 8999
-    one["farms"][1]["money"] = 2999
+    zero["farms"][0]["money"] = 9000
+    one["farms"][1]["money"] = 3000
     original = pair_potential(zero, one)
 
     # Lowering the opponent increases the learner's score through the resulting
     # relative liquid-asset advantage.
-    one["farms"][1]["money"] = 999
+    one["farms"][1]["money"] = 0
     assert pair_potential(zero, one) > original
 
-    # Scaling both (money + one dollar) values equally preserves their ratio.
-    zero["farms"][0]["money"] = 2999
+    # Scaling both (money + starting bank) values equally preserves the ratio.
+    zero["farms"][0]["money"] = 3000
     assert math.isclose(pair_potential(zero, one), original, abs_tol=1e-15)
 
 
-def test_shaped_rewards_telescope_and_are_zero_sum() -> None:
-    potentials = np.asarray([0.0, 0.125, -0.25, 0.5], dtype=np.float32)
+def test_discounted_shaped_rewards_preserve_terminal_utility_and_zero_sum() -> None:
+    gamma = 0.5
+    potentials = np.asarray([0.0, 0.125, -0.25], dtype=np.float32)
+    terminal_utility = 0.5
     rewards = [
-        shaped_pair_reward(previous, following) for previous, following in pairwise(potentials)
+        shaped_pair_reward(previous, following, gamma=gamma)
+        for previous, following in pairwise(potentials)
     ]
+    rewards.append(
+        shaped_pair_reward(potentials[-1], None, terminal_utility=terminal_utility, gamma=gamma)
+    )
 
-    returns = tuple(map(sum, zip(*rewards, strict=True)))
-    assert returns == (float(potentials[-1] - potentials[0]), float(potentials[0] - potentials[-1]))
-    assert shaped_pair_reward(-0.25, 0.5) == (0.75, -0.75)
+    returns = np.asarray(rewards, dtype=np.float64)
+    discounted = (returns * np.asarray([1.0, gamma, gamma**2])[:, None]).sum(axis=0)
+    np.testing.assert_allclose(
+        discounted,
+        [gamma**2 * terminal_utility, -(gamma**2 * terminal_utility)],
+        atol=1e-15,
+    )
+    expected_stable = float(
+        np.float32(np.float32(DEFAULT_REWARD_GAMMA) * np.float32(0.25) - np.float32(0.25))
+    )
+    assert shaped_pair_reward(0.25, 0.25) == (expected_stable, -expected_stable)
+    assert shaped_pair_reward(-0.25, None, terminal_utility=0.5) == (0.75, -0.75)
 
 
-def test_shaped_rewards_match_native_binary32_subtraction() -> None:
-    # Both inputs narrow to the same native cached potential. A binary64
-    # subtraction would invent a tiny backend-specific reward here.
-    assert shaped_pair_reward(8.0, 8.0 + 1e-7) == (0.0, -0.0)
+def test_shaped_rewards_match_binary32_subtraction() -> None:
+    # Both inputs narrow to the same cached potential. A binary64 subtraction
+    # would invent a tiny backend-specific reward here.
+    assert shaped_pair_reward(8.0, 8.0 + 1e-7, gamma=1.0) == (0.0, -0.0)
 
 
 def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:

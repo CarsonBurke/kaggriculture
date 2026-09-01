@@ -54,7 +54,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
     # Entropy is telemetry only; the training CLI has no bonus coefficient.
     assert not hasattr(args, "entropy_coefficient")
-    assert args.gamma == pytest.approx(1.0)
+    assert args.gamma == pytest.approx(0.997)
     assert args.actor_gae_lambda == pytest.approx(0.95)
     assert not hasattr(args, "gae_lambda")
     assert args.target_kl == PpoConfig.target_kl
@@ -848,8 +848,14 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             pass
 
     rollout = SimpleNamespace(state_count=1)
+    collected_gammas: list[float] = []
+
+    def collect(*args, **kwargs):
+        collected_gammas.append(kwargs["gamma"])
+        return rollout
+
     monkeypatch.setattr(module, "SummaryWriter", Writer)
-    monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *args, **kwargs: rollout)
+    monkeypatch.setattr(module, "collect_mixed_play_rust", collect)
     monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(
@@ -894,6 +900,8 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "--attention-heads",
             "2",
             "--no-bfloat16",
+            "--gamma",
+            "0.91",
         ]
         if resume is not None:
             values.extend(("--resume", str(resume)))
@@ -974,6 +982,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     )
     module.main()
     assert (portable_only / "latest.pt").is_file()
+    assert collected_gammas and set(collected_gammas) == {0.91}
 
 
 def test_parity_audit_is_due_per_staging_configuration_and_on_a_cadence() -> None:
@@ -1933,9 +1942,14 @@ def _run_population_main(
     wave = _population_wave(module, games=games, population=max(population, 2))
     if population == 1:
         wave.agents = np.zeros(wave.agents.size, dtype=np.int64)
+
+    def collect(*args, **kwargs):
+        assert kwargs["gamma"] == pytest.approx(0.997)
+        return wave
+
     monkeypatch.setattr(module, "SummaryWriter", Writer)
-    monkeypatch.setattr(module, "collect_population_play_rust", lambda *a, **k: wave)
-    monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *a, **k: wave)
+    monkeypatch.setattr(module, "collect_population_play_rust", collect)
+    monkeypatch.setattr(module, "collect_mixed_play_rust", collect)
     monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(module, "update_replay_parity", lambda *a, **k: _parity_metrics(module))
@@ -2035,10 +2049,10 @@ def test_the_disagreement_gate_separates_converged_members_from_distinct_ones() 
 
 
 def test_members_starting_from_the_same_weights_are_rejected(monkeypatch, tmp_path) -> None:
-    """Four agents built from one checkpoint are numerically identical, which makes
-    every one of their first games a mirror scoring 0.5, so the run would train on
-    a wave with no gradient in it. Both spellings of that mistake must fail: the
-    same path twice, and two paths holding the same weights."""
+    """Four agents built from one checkpoint are numerically identical, which
+    removes the population diversity the run is configured to preserve. Both
+    spellings of that mistake must fail: the same path twice, and two paths
+    holding the same weights."""
     module = _training_script()
     artifact = _actor_artifact(
         tmp_path / "bc-actor.pt", _distinct_actors(_TINY_CONFIG, 1)[0], _TINY_CONFIG

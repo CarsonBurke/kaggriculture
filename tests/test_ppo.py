@@ -87,10 +87,10 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         _validate_staged_action_masks(staged, valid)
 
 
-def test_default_gae_preserves_the_finite_horizon_objective() -> None:
+def test_default_gae_uses_discounted_reward_contract() -> None:
     config = PpoConfig()
 
-    assert config.gamma == 1.0
+    assert config.gamma == pytest.approx(0.997)
     assert config.actor_gae_lambda == pytest.approx(0.95)
     assert config.actor_gae_lambda == DEFAULT_ACTOR_GAE_LAMBDA
 
@@ -243,8 +243,8 @@ def test_discounted_advantages_and_targets_match_the_reference_recurrence() -> N
     expected_advantages = torch.tensor([[expected_0, expected_1, expected_2]])
     torch.testing.assert_close(advantages, expected_advantages)
     torch.testing.assert_close(targets, expected_advantages + values)
-    # The general recurrence still supports discounted auxiliary experiments;
-    # production uses gamma one to preserve its finite-horizon objective.
+    # The general recurrence still supports explicit gamma-one experiments;
+    # production uses the shared discounted shaping/PPO gamma.
     monte_carlo = torch.tensor([[0.2 + 0.9 * (-0.1 + 0.9 * 0.3), -0.1 + 0.9 * 0.3, 0.3]])
     assert not torch.allclose(targets, monte_carlo)
 
@@ -1848,10 +1848,10 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
 
     # The fit reading is materially positive on a critic the conventional
     # reading calls weak, and their separation is what the pair exists for.
-    # Gamma one increases the suffix target's explained variance; this pinned
-    # fixture reads a 2.66x separation. A factor of two still fails if the fit
-    # reading collapses toward the algebraic identity without encoding a stale
-    # threshold calibrated under the retired discounted objective.
+    # The long discounted suffix increases the target's explained variance;
+    # this pinned fixture reads a 2.66x separation. A factor of two still fails
+    # if the fit reading collapses toward the algebraic identity without
+    # encoding an exact threshold for one sampled return distribution.
     assert metrics["critic_fit_explained_variance_last_epoch"] > 0.1
     assert metrics["critic_fit_explained_variance_last_epoch"] > 2.0 * abs(
         metrics["lambda_return_explained_variance"]

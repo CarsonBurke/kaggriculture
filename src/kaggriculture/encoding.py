@@ -13,6 +13,7 @@ from kaggriculture.constants import (
     BASE_PRICE,
     BOARD_SIZE,
     CROPS,
+    DEFAULT_REWARD_GAMMA,
     EPISODE_STEPS,
     MARKET_I0,
     MAX_UNITS,
@@ -20,6 +21,7 @@ from kaggriculture.constants import (
     PRIVATE_ITEMS,
     PRODUCTS,
     SHOP_NAMES,
+    STARTING_MONEY,
     TURNS_PER_DAY,
     market_price,
 )
@@ -298,13 +300,12 @@ def liquidation_value(observation: dict[str, Any], expected_player: int) -> floa
 
 
 def _log_asset_ratio(zero: float, one: float) -> float:
-    """Natural-log relative wealth, defined even when either side has nothing."""
+    """Log-relative wealth regularized by each player's starting bank."""
     if not math.isfinite(zero) or zero < 0.0 or not math.isfinite(one) or one < 0.0:
         raise ValueError("economic values must be finite and non-negative")
-    # Money is integral, so one dollar is the smallest non-zero economic unit.
-    # log1p therefore supplies a domain-safe ratio without a fitted scale:
-    # log((zero + $1) / (one + $1)).
-    return math.log1p(zero) - math.log1p(one)
+    # The game-defined starting stake supplies the zero-asset prior. This keeps
+    # the ratio percentage-like without the extreme log($1) slope near ruin.
+    return math.log1p(zero / STARTING_MONEY) - math.log1p(one / STARTING_MONEY)
 
 
 def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
@@ -315,10 +316,10 @@ def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, 
     )
 
 
-def terminal_pair_potential(
+def terminal_pair_utility(
     observation_zero: dict[str, Any], observation_one: dict[str, Any]
 ) -> float:
-    """Log-relative terminal bank money from player zero's perspective."""
+    """Terminal log-relative bank utility from player zero's perspective."""
     return _log_asset_ratio(
         _scored_money(observation_zero, 0),
         _scored_money(observation_one, 1),
@@ -327,19 +328,36 @@ def terminal_pair_potential(
 
 def shaped_pair_reward(
     previous_potential: float,
-    next_potential: float,
+    next_potential: float | None,
+    *,
+    terminal_utility: float | None = None,
+    gamma: float = DEFAULT_REWARD_GAMMA,
 ) -> tuple[float, float]:
-    """Exact zero-sum binary32 change in the pair potential.
+    """Discount-correct, exactly zero-sum binary32 potential shaping.
 
-    Native rollout caches and subtracts binary32 potentials. Mirroring that
-    precision here keeps interpreted rollout and parity-oracle rewards bitwise
-    aligned instead of narrowing a binary64 subtraction after the fact. With
-    gamma one, rewards telescope from the symmetric initial potential to the
-    terminal bank log-ratio up to binary32 accumulation precision.
+    Nonterminal rewards are ``gamma * Phi(next) - Phi(current)``. A terminal
+    transition instead pays the bank utility minus ``Phi(current)`` and treats
+    the terminal shaping potential as zero. Discounted returns therefore retain
+    the terminal objective for any fixed horizon and matching PPO gamma.
     """
+    if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be finite and in (0, 1]")
     previous = np.float32(previous_potential)
-    following = np.float32(next_potential)
-    if not np.isfinite(previous) or not np.isfinite(following):
-        raise ValueError("pair potentials must be finite")
-    reward_zero = float(np.float32(following - previous))
-    return reward_zero, -reward_zero
+    if not np.isfinite(previous):
+        raise ValueError("previous potential must be finite")
+    if terminal_utility is None:
+        if next_potential is None:
+            raise ValueError("nonterminal reward requires next potential")
+        following = np.float32(next_potential)
+        if not np.isfinite(following):
+            raise ValueError("next potential must be finite")
+        reward_zero = np.float32(np.float32(gamma) * following - previous)
+    else:
+        if next_potential is not None:
+            raise ValueError("terminal reward must not receive next potential")
+        utility = np.float32(terminal_utility)
+        if not np.isfinite(utility):
+            raise ValueError("terminal utility must be finite")
+        reward_zero = np.float32(utility - previous)
+    result = float(reward_zero)
+    return result, -result

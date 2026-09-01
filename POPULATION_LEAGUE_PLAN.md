@@ -14,14 +14,14 @@ remains configurable; no player identity or policy is hardcoded. The population
 validator rejects frozen snapshots, built-ins, and fixed opponents whenever
 `N > 1`.
 
-Each seat receives the exact negative of the other seat's potential change.
-The nonterminal potential is
-`log1p(liquid_assets_0) - log1p(liquid_assets_1)`; liquid assets are bank plus
-the exact proceeds from selling every held market product. The terminal
-potential uses banked money only. With `gamma = 1`, rewards telescope from the
-symmetric initial potential to the terminal bank log-ratio. Dense shaping adds
-no early-lead or occupancy objective. Entropy remains telemetry only; there is
-no entropy coefficient in either `PpoConfig` or the CLI.
+Each seat receives the exact negative of the other seat's discounted potential
+shaping reward. The nonterminal potential is the log ratio of liquid assets
+regularized by the 3000 starting bank; liquid assets are bank plus the exact
+proceeds from selling every held market product. Terminal bank utility is paid
+separately and terminal shaping potential is zero. With `gamma = 0.997`,
+discounted returns preserve the terminal bank utility while exposing dense
+progress without an early-lead or occupancy objective. Entropy remains
+telemetry only; there is no entropy coefficient in either `PpoConfig` or the CLI.
 
 ## Measured four-learner result
 
@@ -403,18 +403,18 @@ four-live-learner requirement and makes training quality depend on one hardcoded
 policy. External opponents remain useful evaluation diagnostics only.
 
 The reward is aligned with the selected relative-wealth objective: one seat's
-gain is the other's equal loss, and the complete shaped return is exactly the
-final bank log-ratio. Equal rich and equal poor states both score zero. Lowering
-the opponent relative to the learner does improve the learner's terminal score;
-that is intended zero-sum strategy. External evaluation remains the required
-absolute-strength measurement.
+gain is the other's equal loss, and the discounted complete return is a
+fixed-horizon scalar multiple of final bank utility. Equal rich and equal poor
+states both score zero. Lowering the opponent relative to the learner improves
+the learner's terminal score; that is intended zero-sum strategy. External
+evaluation remains the required absolute-strength measurement.
 
 The mid-episode potential includes only assets the market can actually
 liquidate. Seeds, animals, planted crops, pending yields, and land receive no
-invented cost-basis credit. Potential differences telescope regardless, but
-their timing can still bias finite-sample GAE when the critic is imperfect, so
-native/Python potential parity and external bank curves remain the shaping
-gates.
+invented cost-basis credit. Discount-correct potential shaping cancels this
+intermediate proxy from the complete return, but timing can still bias
+finite-sample GAE when the critic is imperfect. Native/Python potential parity
+and external bank curves remain the shaping gates.
 
 **Market denial is still positively rewarded. Measured on this run's own
 members.** `artifacts/probes/pop4-denial.json`, 16 games per ordered cell, two
@@ -506,17 +506,17 @@ in Stage 0 with an existing instrument.
    (`worst_first_minibatch_kl` 2.5e-05, `worst_update_replay_max_kl` 4.4e-04,
    11x under the shipped replay ceiling), so vmap replay parity is not the
    constraint either.
-3. **The reward is an exactly zero-sum potential difference.** Each transition
-   pays `potential_after - potential_before` to player zero and its exact
-   negative to player one. The nonterminal potential is the natural-log ratio
-   of actual liquid assets; the terminal potential is the natural-log ratio of
-   final bank money. `log1p` keeps zero assets in-domain using the one-dollar
-   economic unit, with no fitted scale or saturation.
+3. **The reward is discount-correct, exactly zero-sum potential shaping.**
+   Nonterminal transitions pay `gamma * potential_after - potential_before` to
+   player zero and its exact negative to player one. The terminal transition
+   pays bank utility minus the previous potential, with terminal shaping
+   potential zero.
 
-   Gamma is one. The complete return therefore telescopes from the symmetric
-   initial potential of zero to the terminal bank log-ratio. There is no
-   time-average occupancy term, no repeated payment for holding an early lead,
-   and no extra terminal bonus.
+   Both potential and terminal utility are log wealth ratios regularized by the
+   game-defined 3000 starting bank. The discounted complete return at
+   `gamma = 0.997` is a fixed-horizon scalar multiple of terminal bank utility.
+   There is no time-average occupancy term, no repeated payment for holding an
+   early lead, and no extra terminal bonus.
 
    Zero-sum self-play cannot measure absolute population strength: equal rich
    and equal poor play both average to zero. Every committed recovery

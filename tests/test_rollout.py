@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from kaggriculture.actions import MarketKind, UnitAction
-from kaggriculture.encoding import pair_potential, terminal_pair_potential
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
+from kaggriculture.encoding import pair_potential, terminal_pair_utility
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
@@ -18,6 +19,7 @@ from kaggriculture.rollout import (
     _builtin_agent_rows,
     _cached_compiled_forward,
     _categorical_draws,
+    _native_pair_rewards,
     _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
@@ -42,15 +44,25 @@ class _NearOneGenerator:
 
 
 def _terminal_log_ratio(own: np.ndarray, opponent: np.ndarray) -> np.ndarray:
-    """Vectorized terminal log-relative bank value used by the training reward."""
-    return np.log1p(own) - np.log1p(opponent)
+    """Vectorized terminal log-relative bank utility used by training."""
+    return np.log1p(own / STARTING_MONEY) - np.log1p(opponent / STARTING_MONEY)
 
 
-def _assert_zero_sum_reward_contract(rollout: RolloutBatch, *, atol: float = 2e-6) -> None:
+def _discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
+    discount = float(np.float32(gamma))
+    discounts = np.power(discount, np.arange(rewards.shape[1], dtype=np.float64))
+    return (rewards.astype(np.float64) * discounts).sum(axis=1)
+
+
+def _assert_zero_sum_reward_contract(
+    rollout: RolloutBatch, *, gamma: float = DEFAULT_REWARD_GAMMA, atol: float = 1e-5
+) -> None:
+    # Each stored reward rounds one potential difference to binary32. Summing
+    # 719 of them therefore telescopes only to binary32 accumulation accuracy.
     terminal_scores = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(
-        rollout.rewards.sum(axis=1),
-        terminal_scores,
+        _discounted_returns(rollout.rewards, gamma),
+        float(np.float32(gamma)) ** (rollout.horizon - 1) * terminal_scores,
         atol=atol,
     )
     assert np.isfinite(rollout.rewards).all()
@@ -81,11 +93,23 @@ def test_on_policy_collectors_reject_nonunit_temperature(collector, temperature:
         )
 
 
-def test_short_self_play_rollout_rewards_telescope_to_terminal_log_ratio() -> None:
+@pytest.mark.parametrize("collector", (collect_self_play, collect_self_play_rust))
+@pytest.mark.parametrize("gamma", (0.0, 1.01, float("nan")))
+def test_collectors_reject_invalid_reward_gamma(collector, gamma: float) -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    with pytest.raises(ValueError, match="reward gamma must be finite"):
+        collector(FarmActor(config), games=1, seed_start=1, gamma=gamma)
+
+
+def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None:
     config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
     actor = FarmActor(config)
+    gamma = 0.91
 
     rollout = collect_self_play(
         actor,
@@ -93,6 +117,7 @@ def test_short_self_play_rollout_rewards_telescope_to_terminal_log_ratio() -> No
         seed_start=50,
         episode_steps=8,
         deterministic=False,
+        gamma=gamma,
         sampling_seed=9,
     )
 
@@ -102,7 +127,11 @@ def test_short_self_play_rollout_rewards_telescope_to_terminal_log_ratio() -> No
     assert rollout.states["board"].shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
     terminal_scores = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), terminal_scores, atol=1e-6)
+    np.testing.assert_allclose(
+        _discounted_returns(rollout.rewards, gamma),
+        gamma ** (rollout.horizon - 1) * terminal_scores,
+        atol=1e-6,
+    )
     np.testing.assert_allclose(rollout.rewards[::2], -rollout.rewards[1::2], atol=1e-7)
     assert rollout.seats.tolist() == [0, 1, 0, 1]
     assert rollout.episode_seeds.tolist() == [50, 50, 51, 51]
@@ -873,8 +902,8 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
 
 
-def test_native_shaped_rewards_telescope_to_terminal_bank_log_ratio() -> None:
-    """Every step is antisymmetric and the complete return is the terminal log ratio."""
+def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> None:
+    """Every step is antisymmetric and discounted return retains terminal utility."""
     import json
 
     from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
@@ -882,6 +911,7 @@ def test_native_shaped_rewards_telescope_to_terminal_bank_log_ratio() -> None:
     native = load_native()
     environment = native.BatchEnv(np.asarray([911], dtype=np.uint64))
     returns = np.zeros(2, dtype=np.float64)
+    gamma = 0.91
     step = 0
     while True:
         unit = np.zeros((1, 2, MAX_UNITS), dtype=np.uint8)
@@ -891,13 +921,18 @@ def test_native_shaped_rewards_telescope_to_terminal_bank_log_ratio() -> None:
             kinds[0, 0, 0] = MarketKind.BUY_PRODUCT_WHEAT
             quantities[0, 0, 0] = 79  # quantity bin 79 orders 80 units
         out = environment.step_factors(unit, kinds, quantities)
-        np.testing.assert_array_equal(out["shaped_rewards"][:, 0], -out["shaped_rewards"][:, 1])
-        np.testing.assert_allclose(
-            out["shaped_rewards"][:, 0],
-            out["potentials"] - out["previous_potentials"],
-            atol=0,
-        )
-        returns += np.asarray(out["shaped_rewards"], dtype=np.float64)[0]
+        rewards = _native_pair_rewards(out, gamma)
+        np.testing.assert_array_equal(rewards[:, 0], -rewards[:, 1])
+        if np.asarray(out["dones"]).all():
+            terminal_scores = _terminal_log_ratio(
+                np.asarray(out["final_money"])[:, 0],
+                np.asarray(out["final_money"])[:, 1],
+            )
+            expected_zero = terminal_scores - out["previous_potentials"]
+        else:
+            expected_zero = gamma * out["potentials"] - out["previous_potentials"]
+        np.testing.assert_allclose(rewards[:, 0], expected_zero, atol=1e-7)
+        returns += gamma**step * rewards[0]
         step += 1
         if np.asarray(out["dones"]).all():
             break
@@ -914,7 +949,7 @@ def test_native_shaped_rewards_telescope_to_terminal_bank_log_ratio() -> None:
     ]
     assert observations[0]["private"]["shed"]["WHEAT"] == 80
     mid_episode = pair_potential(observations[0], observations[1])
-    terminal = terminal_pair_potential(observations[0], observations[1])
+    terminal = terminal_pair_utility(observations[0], observations[1])
     assert mid_episode > terminal
 
     money = np.asarray(out["final_money"], dtype=np.float64)[0]
@@ -922,8 +957,8 @@ def test_native_shaped_rewards_telescope_to_terminal_bank_log_ratio() -> None:
     expected_zero = _terminal_log_ratio(money[0], money[1])
     expected_terminal = np.asarray([expected_zero, -expected_zero])
     assert terminal == pytest.approx(expected_zero, abs=1e-9)
-    np.testing.assert_allclose(out["potentials"], [terminal], atol=1e-7)
-    np.testing.assert_allclose(returns, expected_terminal, atol=1e-6)
+    np.testing.assert_array_equal(out["potentials"], [0.0])
+    np.testing.assert_allclose(returns, gamma ** (step - 1) * expected_terminal, atol=1e-6)
 
     # Reset must clear the terminal potential cache; otherwise the next episode
     # starts by paying the negation of the previous game's result.
@@ -1138,7 +1173,11 @@ def test_population_wave_rewards_are_zero_sum_within_every_game(population_wave)
     np.testing.assert_array_equal(rollout.final_money[::2], rollout.opponent_money[1::2])
     np.testing.assert_array_equal(rollout.final_money[1::2], rollout.opponent_money[::2])
     expected_terminal = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
-    np.testing.assert_allclose(rollout.rewards.sum(axis=1), expected_terminal, atol=2e-6)
+    np.testing.assert_allclose(
+        _discounted_returns(rollout.rewards, DEFAULT_REWARD_GAMMA),
+        DEFAULT_REWARD_GAMMA ** (rollout.horizon - 1) * expected_terminal,
+        atol=2e-6,
+    )
     for game in range(_POPULATION_GAMES):
         np.testing.assert_allclose(
             rollout.rewards[2 * game],

@@ -97,10 +97,10 @@ singular direction carries signal above its across-minibatch noise.  The
 gradients are also far from flat -- stable rank 2.7-3.3 out of 96 for linear
 weights, top-over-median singular value 48-62 -- so flattening spends the step
 budget on a tail that is entirely noise.  That is precisely the low-SNR,
-episode-level regime arXiv 2607.16169 reports Muon failing in, and the reward
-this probe measured was a terminal money difference at `gamma = 1.0`, the same
-undiscounted finite-horizon objective used by current zero-sum training, with a
-measured raw advantage standard deviation of 0.13-0.16.
+episode-level regime arXiv 2607.16169 reports Muon failing in, and this probe's
+historical reward used `gamma = 1.0`. Current training uses discount-correct
+potential shaping at `gamma = 0.997`; the old probe remains evidence about
+optimizer scale, not a measurement of the new return distribution.
 
 A side measurement that does not concern Muon: `partitions[*].
 minibatch_fraction_above_clip` is 1.000 in all 1264 minibatches, so

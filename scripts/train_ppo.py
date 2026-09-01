@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         "--gamma",
         type=float,
         default=PpoConfig.gamma,
-        help="reward discount; defaults to 1.0 for the fixed-horizon zero-sum game",
+        help="shared reward-shaping and PPO discount; defaults to 0.997",
     )
     parser.add_argument(
         "--actor-gae-lambda",
@@ -2616,6 +2616,7 @@ def main() -> None:
                 seed_start=next_seed,
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
+                gamma=args.gamma,
                 sampling_seed=sampling_seed,
                 forward_mode=args.rollout_forward_mode,
                 forward_autocast=args.rollout_bfloat16,
@@ -2696,6 +2697,7 @@ def main() -> None:
                 seed_start=next_seed,
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
+                gamma=args.gamma,
                 # Every league seat decodes exactly as the learner does.
                 # Sharpening them instead -- active lanes at 0.8, historical ones
                 # at argmax -- handed the learner an opponent that was a strictly

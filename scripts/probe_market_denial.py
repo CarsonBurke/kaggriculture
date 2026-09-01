@@ -29,16 +29,16 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from kaggriculture.inference import checkpoint_orientation, load_actor_artifact
-from kaggriculture.orientation import Orientation
 from kaggriculture.league import load_actor_snapshot
+from kaggriculture.orientation import Orientation
 from kaggriculture.production import PRODUCTION_EPISODE_STEPS
 from kaggriculture.registry import architecture_of
 from kaggriculture.rollout import collect_mixed_play_rust
 from kaggriculture.training import AnyActor
 
-#: Kept at the production value: the reward telescopes to the terminal relative
-#: bank score only over a full episode, so a shortened one measures a different
-#: quantity than the run optimized.
+#: Kept at the production value: discount-correct shaping preserves terminal
+#: bank utility over the complete fixed horizon, so a shortened episode measures
+#: a different quantity than the run optimized.
 _STEPS = PRODUCTION_EPISODE_STEPS
 
 

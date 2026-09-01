@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA
 from kaggriculture.latent_dynamics import DecodeContext, DecodeHeads, DecodeMasks
 from kaggriculture.model import (
     DistributionalCritic,
@@ -577,13 +578,13 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # The game has a fixed finite horizon and the shaped rewards telescope to
-    # its terminal bank log-ratio only without discounting. Gamma is therefore
-    # one. GAE lambda remains CleanRL's 0.95 variance-control default; it
-    # shortens sampled credit assignment while the critic supplies the
-    # continuation estimate, without changing the objective.
+    # Discount-correct shaping uses this same gamma during collection:
+    # nonterminal rewards are gamma * Phi(next) - Phi(current), while terminal
+    # bank utility is paid separately. The fixed-horizon discounted return
+    # therefore preserves the terminal objective without forcing the critic to
+    # propagate all 719 transitions at gamma one.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
-    gamma: float = 1.0
+    gamma: float = DEFAULT_REWARD_GAMMA
     # Measured to bind on EVERY minibatch, which makes this the step-size
     # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
     # 1264 production-shaped minibatches in four configurations -- BC actor with
@@ -702,7 +703,7 @@ def generalized_advantage_and_targets(
     values: Tensor,
     valid: Tensor,
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
-    gamma: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
 ) -> tuple[Tensor, Tensor]:
     """Compute lambda-GAE advantages and the matching lambda-return targets.
 
