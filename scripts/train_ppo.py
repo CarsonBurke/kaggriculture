@@ -108,6 +108,7 @@ from kaggriculture.training import (
 MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
+DEFAULT_CRITIC_WARMUP_ITERATIONS = 5
 
 
 class RecoveryCheckpointTimer:
@@ -421,10 +422,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "iterations of critic-only updates before the actor participates; "
+            f"defaults to {DEFAULT_CRITIC_WARMUP_ITERATIONS} for a fresh warm start, "
             "belongs to the warm start, and a resumed run restores it from its checkpoint"
         ),
     )
     args = parser.parse_args()
+    if args.init_actor_from is not None and args.critic_warmup_iterations is None:
+        args.critic_warmup_iterations = DEFAULT_CRITIC_WARMUP_ITERATIONS
     # A population wave is all learners; the single-learner defaults (112 live
     # games plus 96 frozen) are not a valid population configuration, so they
     # must not be the implicit ones. An explicit flag still wins either way.
@@ -693,9 +697,11 @@ def _load_initial_actor(
     beating its own starting point.
     """
     pretrained, payload = load_actor_artifact(path, device)
-    if resolve_architecture(payload).name != architecture_name:
+    artifact_architecture = resolve_architecture(payload)
+    if artifact_architecture.name != architecture_name:
         raise ValueError("initial actor artifact architecture does not match arguments")
-    if payload["model_config"] != model_config.to_dict():
+    artifact_config = artifact_architecture.config_class(**payload["model_config"]).to_dict()
+    if artifact_config != model_config.to_dict():
         raise ValueError("initial actor artifact model configuration does not match arguments")
     actor.load_state_dict(pretrained.state_dict())
     return {

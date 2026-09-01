@@ -1489,6 +1489,21 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     with pytest.raises(ValueError, match="fresh run"):
         module._validate_args(args)
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ppo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--init-actor-from",
+            str(tmp_path / "bc-actor.pt"),
+        ],
+    )
+    defaulted = module.parse_args()
+    module._validate_args(defaulted)
+    assert defaulted.critic_warmup_iterations == module.DEFAULT_CRITIC_WARMUP_ITERATIONS == 5
+
 
 def test_critic_warmup_cannot_be_restated_on_a_resume(monkeypatch, tmp_path) -> None:
     """The count is persisted with the warm start, so a relaunch must not be
@@ -1959,6 +1974,8 @@ def _run_population_main(
     )
     for artifact in initial_actors:
         arguments.extend(("--init-actor-from", str(artifact)))
+    if initial_actors:
+        arguments.extend(("--critic-warmup-iterations", "0"))
     if resume is not None:
         arguments.extend(("--resume", str(resume)))
     monkeypatch.setattr(sys, "argv", arguments)
@@ -2061,14 +2078,32 @@ def test_members_starting_from_the_same_weights_are_rejected(monkeypatch, tmp_pa
     twin.write_bytes(artifact.read_bytes())
 
     repeated = _population_arguments(tmp_path / "repeated", population=2, games=2)
-    repeated.extend(("--init-actor-from", str(artifact), "--init-actor-from", str(artifact)))
+    repeated.extend(
+        (
+            "--init-actor-from",
+            str(artifact),
+            "--init-actor-from",
+            str(artifact),
+            "--critic-warmup-iterations",
+            "0",
+        )
+    )
     monkeypatch.setattr(sys, "argv", repeated)
     with pytest.raises(ValueError, match="different artifact per agent"):
         module.main()
 
     # Distinct paths, so validation cannot see it: only the artifacts' digests can.
     copied = _population_arguments(tmp_path / "copied", population=2, games=2)
-    copied.extend(("--init-actor-from", str(artifact), "--init-actor-from", str(twin)))
+    copied.extend(
+        (
+            "--init-actor-from",
+            str(artifact),
+            "--init-actor-from",
+            str(twin),
+            "--critic-warmup-iterations",
+            "0",
+        )
+    )
     monkeypatch.setattr(sys, "argv", copied)
     with pytest.raises(ValueError, match="different weights per agent"):
         module.main()
