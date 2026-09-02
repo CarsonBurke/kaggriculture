@@ -1662,6 +1662,134 @@ impl Game {
         }
     }
 
+    /// Select masked factors from GPU-produced random utilities.
+    ///
+    /// Unit and market-kind rows carry one Gumbel utility per action.
+    /// Quantity rows store the preferred action for every valid-prefix length,
+    /// exploiting the quantity mask's prefix invariant without sorting 100
+    /// values per kind. Legality remains owned by the engine while it evolves
+    /// the same unit and market ledgers used by `sample_factors`.
+    pub fn select_factors(
+        &self,
+        player: usize,
+        unit_utilities: &[f32],
+        market_kind_utilities: &[f32],
+        market_quantity_prefix_choices: &[u8],
+    ) -> SampledFactors {
+        debug_assert_eq!(unit_utilities.len(), MAX_UNITS * UNIT_ACTIONS);
+        debug_assert_eq!(
+            market_kind_utilities.len(),
+            MAX_MARKET_ORDERS * MARKET_KINDS
+        );
+        debug_assert_eq!(
+            market_quantity_prefix_choices.len(),
+            MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES
+        );
+        let select = |utilities: &[f32], mask: &[bool]| {
+            let mut selected = None;
+            for (candidate, (&utility, &valid)) in utilities.iter().zip(mask).enumerate() {
+                debug_assert!(utility.is_finite());
+                if valid
+                    && selected.is_none_or(|(_, best_utility): (usize, f32)| utility > best_utility)
+                {
+                    selected = Some((candidate, utility));
+                }
+            }
+            selected
+                .map(|(candidate, _)| candidate)
+                .expect("factor masks always contain a valid action")
+        };
+
+        let mut action = CompactAction::default();
+        let day = self.step / self.config.turns_per_day;
+        let mut unit_ledger = UnitLedger::from_game(self, player);
+        let active_units = usize::from(self.farms[player].units);
+        for unit in 0..MAX_UNITS {
+            let mut mask = [false; UNIT_ACTIONS];
+            if unit >= active_units {
+                mask[0] = true;
+            } else {
+                for (candidate, valid) in mask.iter_mut().enumerate() {
+                    *valid = unit_ledger.action_valid(unit, candidate as u8, day);
+                }
+            }
+            let offset = unit * UNIT_ACTIONS;
+            let selected = select(&unit_utilities[offset..offset + UNIT_ACTIONS], &mask);
+            action.units[unit] = selected as u8;
+            if unit < active_units {
+                unit_ledger.apply_action(unit, selected as u8, day);
+            }
+        }
+
+        let farm = &unit_ledger.farm;
+        let mut ledger = PolicyMarketLedger {
+            money: farm.money,
+            shed: unit_ledger.private.shed,
+            hires: farm.hires_today,
+            original_hires: farm.hires_today,
+            original_units: farm.units,
+            extra_land: farm.unlocked.count_ones() as usize - 1,
+            inventory: self.market_inventory,
+        };
+        let mut still_active = true;
+        for slot in 0..MAX_MARKET_ORDERS {
+            let mut kind_mask = [false; MARKET_KINDS];
+            if still_active {
+                fill_market_kind_mask(&unit_ledger.config, &ledger, &mut kind_mask);
+            } else {
+                kind_mask[0] = true;
+            }
+            let kind_offset = slot * MARKET_KINDS;
+            let kind = select(
+                &market_kind_utilities[kind_offset..kind_offset + MARKET_KINDS],
+                &kind_mask,
+            );
+            action.market_kinds[slot] = kind as u8;
+            if !still_active || kind == 0 {
+                still_active = false;
+                continue;
+            }
+
+            let mut quantity_mask = [false; MARKET_QUANTITIES];
+            fill_market_quantity_mask(&unit_ledger.config, &ledger, kind as u8, &mut quantity_mask);
+            if kind < 3 {
+                apply_policy_market_order(&unit_ledger.config, &mut ledger, kind as u8, 1);
+                continue;
+            }
+            let quantity_offset = (slot * MARKET_KINDS + kind) * MARKET_QUANTITIES;
+            let max_valid = quantity_mask
+                .iter()
+                .rposition(|&valid| valid)
+                .expect("quantity masks always contain a valid action");
+            let candidate =
+                usize::from(market_quantity_prefix_choices[quantity_offset + max_valid]);
+            let quantity = if candidate <= max_valid && quantity_mask[candidate] {
+                candidate
+            } else {
+                max_valid
+            };
+            action.market_quantities[slot] = quantity as u8;
+            apply_policy_market_order(
+                &unit_ledger.config,
+                &mut ledger,
+                kind as u8,
+                quantity as u16 + 1,
+            );
+        }
+
+        SampledFactors {
+            masks: self.factor_masks(player, &action),
+            action,
+            unit_logprobs: [0.0; MAX_UNITS],
+            market_kind_logprobs: [0.0; MAX_MARKET_ORDERS],
+            market_quantity_logprobs: [0.0; MAX_MARKET_ORDERS],
+            unit_entropies: [0.0; MAX_UNITS],
+            market_kind_entropies: [0.0; MAX_MARKET_ORDERS],
+            market_quantity_entropies: [0.0; MAX_MARKET_ORDERS],
+            mean_entropy: 0.0,
+        }
+    }
+
     fn apply_unit_actions(&mut self, player: usize, actions: &CompactAction, day: u16) {
         let units = usize::from(self.farms[player].units);
         let scope = if actions.external {

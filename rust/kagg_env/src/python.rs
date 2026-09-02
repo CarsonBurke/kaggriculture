@@ -11,15 +11,15 @@ use half::f16;
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
-    PyUntypedArrayMethods,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadwriteArray1, PyReadwriteArray2,
+    PyReadwriteArray3, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
 
-#[pyclass(name = "BatchEnv", unsendable)]
+#[pyclass(name = "BatchEnv")]
 pub(crate) struct BatchEnv {
     games: Vec<Game>,
     sampled_scratch: Vec<SampledFactors>,
@@ -554,6 +554,140 @@ impl BatchEnv {
                                 [market_draw_offset..market_draw_offset + MAX_MARKET_ORDERS],
                             deterministic_rows[row],
                             temperatures[row],
+                        );
+                    });
+            });
+        }
+        {
+            let sampled = &self.sampled_scratch;
+            py.detach(|| {
+                self.games
+                    .par_iter_mut()
+                    .zip(self.results_scratch.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(game_index, (game, result))| {
+                        let row = game_index * PLAYERS;
+                        *result = game.step(&[sampled[row].action, sampled[row + 1].action]);
+                    });
+            });
+        }
+        fill_sample_step_output(
+            &self.games,
+            &self.sampled_scratch,
+            &self.results_scratch,
+            &mut self.potential_cache,
+            &mut output_slices,
+        );
+        Ok(())
+    }
+
+    /// Apply GPU-produced categorical random utilities under exact engine
+    /// legality, then advance every game.
+    ///
+    /// The output carries actions and masks immediately. Policy statistics are
+    /// zeroed for learned rows so the CUDA caller can fill them from the logits
+    /// and exact masks without transferring policy heads to the host.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        unit_utilities, market_kind_utilities, market_quantity_prefix_choices,
+        builtin_agents, output
+    ))]
+    fn select_and_step_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        unit_utilities: PyReadonlyArray3<'py, f32>,
+        market_kind_utilities: PyReadonlyArray3<'py, f32>,
+        market_quantity_prefix_choices: PyReadonlyArray4<'py, u8>,
+        builtin_agents: PyReadonlyArray1<'py, u8>,
+        output: &Bound<'py, PyDict>,
+    ) -> PyResult<()> {
+        let rows = self.games.len() * PLAYERS;
+        ensure_shape(
+            unit_utilities.shape(),
+            &[rows, MAX_UNITS, UNIT_ACTIONS],
+            "unit_utilities",
+        )?;
+        ensure_shape(
+            market_kind_utilities.shape(),
+            &[rows, MAX_MARKET_ORDERS, MARKET_KINDS],
+            "market_kind_utilities",
+        )?;
+        ensure_shape(
+            market_quantity_prefix_choices.shape(),
+            &[rows, MAX_MARKET_ORDERS, MARKET_KINDS, MARKET_QUANTITIES],
+            "market_quantity_prefix_choices",
+        )?;
+        ensure_shape(builtin_agents.shape(), &[rows], "builtin_agents")?;
+        for (contiguous, name) in [
+            (unit_utilities.is_c_contiguous(), "unit_utilities"),
+            (
+                market_kind_utilities.is_c_contiguous(),
+                "market_kind_utilities",
+            ),
+            (
+                market_quantity_prefix_choices.is_c_contiguous(),
+                "market_quantity_prefix_choices",
+            ),
+            (builtin_agents.is_c_contiguous(), "builtin_agents"),
+        ] {
+            if !contiguous {
+                return Err(PyValueError::new_err(format!(
+                    "{name} must be C-contiguous"
+                )));
+            }
+        }
+        let unit_utilities = unit_utilities.as_slice()?;
+        let kind_utilities = market_kind_utilities.as_slice()?;
+        let quantity_prefix_choices = market_quantity_prefix_choices.as_slice()?;
+        let builtin_agents = builtin_agents.as_slice()?;
+        validate_builtin_agents(builtin_agents)?;
+
+        let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
+        let mut output_slices = output_arrays.slices()?;
+        {
+            let games = &self.games;
+            let sampled = &mut self.sampled_scratch;
+            let v27_states = &mut self.v27_states;
+            py.detach(|| {
+                sampled
+                    .par_iter_mut()
+                    .zip(v27_states.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(row, (output, v27_state))| {
+                        let game = &games[row / PLAYERS];
+                        let player = row % PLAYERS;
+                        let builtin = BuiltinAgent::from_code(builtin_agents[row])
+                            .expect("codes are validated above");
+                        if let Some(agent) = builtin {
+                            let action = game.builtin_action(
+                                player,
+                                agent,
+                                &mut builtin_rng(game, player),
+                                v27_state,
+                            );
+                            output.masks = game.factor_masks(player, &action);
+                            output.action = action;
+                            output.unit_logprobs.fill(0.0);
+                            output.market_kind_logprobs.fill(0.0);
+                            output.market_quantity_logprobs.fill(0.0);
+                            output.unit_entropies.fill(0.0);
+                            output.market_kind_entropies.fill(0.0);
+                            output.market_quantity_entropies.fill(0.0);
+                            output.mean_entropy = 0.0;
+                            return;
+                        }
+                        let unit_offset = row * MAX_UNITS * UNIT_ACTIONS;
+                        let kind_offset = row * MAX_MARKET_ORDERS * MARKET_KINDS;
+                        let quantity_offset =
+                            row * MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES;
+                        *output = game.select_factors(
+                            player,
+                            &unit_utilities[unit_offset..unit_offset + MAX_UNITS * UNIT_ACTIONS],
+                            &kind_utilities
+                                [kind_offset..kind_offset + MAX_MARKET_ORDERS * MARKET_KINDS],
+                            &quantity_prefix_choices[quantity_offset
+                                ..quantity_offset
+                                    + MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES],
                         );
                     });
             });
