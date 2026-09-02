@@ -1,24 +1,43 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 
 import numpy as np
 import pytest
 import torch
 
-from kaggriculture.actions import MarketKind, UnitAction
-from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
+from kaggriculture.actions import (
+    N_MARKET_KINDS,
+    N_QUANTITIES,
+    N_UNIT_ACTIONS,
+    MarketKind,
+    UnitAction,
+)
+from kaggriculture.constants import (
+    DEFAULT_REWARD_GAMMA,
+    MAX_MARKET_ORDERS,
+    MAX_UNITS,
+    STARTING_MONEY,
+)
 from kaggriculture.encoding import pair_potential, terminal_pair_utility
-from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.model import ActorOutput, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
+    CAPTURING_ROLLOUT_FORWARD_MODES,
+    COMPILED_ROLLOUT_FORWARD_MODES,
+    ROLLOUT_FORWARD_MODES,
     RolloutBatch,
     _builtin_agent_rows,
     _cached_compiled_forward,
     _categorical_draws,
+    _cuda_graph_generation,
+    _fill_gpu_policy_statistics,
+    _gumbel_preference_order,
+    _gumbel_prefix_choices,
     _native_pair_rewards,
     _state_field_specs,
     allocate_rollout_storage,
@@ -75,6 +94,182 @@ def test_native_categorical_draw_transport_stays_strictly_below_one() -> None:
         assert component.dtype == np.float32
         assert (component < 1.0).all()
         assert (component == np.nextafter(np.float32(1.0), np.float32(0.0))).all()
+
+
+def test_gumbel_preferences_follow_categorical_probabilities() -> None:
+    rows = 60_000
+    logits = torch.tensor([0.0, np.log(2.0), np.log(3.0)]).expand(rows, -1)
+    generator = torch.Generator().manual_seed(41)
+    order = _gumbel_preference_order(
+        logits,
+        torch.ones(rows),
+        torch.zeros(rows, dtype=torch.bool),
+        torch.arange(rows),
+        torch.empty(0, dtype=torch.long),
+        generator,
+        torch.Generator().manual_seed(99),
+    )
+
+    frequencies = torch.bincount(order[:, 0].long(), minlength=3).float() / rows
+    torch.testing.assert_close(
+        frequencies,
+        torch.tensor([1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0]),
+        atol=0.01,
+        rtol=0.0,
+    )
+
+    tied_prefix = _gumbel_prefix_choices(
+        torch.tensor([[1.0, 1.0, 0.0]]),
+        torch.ones(1),
+        torch.ones(1, dtype=torch.bool),
+        torch.arange(1),
+        torch.empty(0, dtype=torch.long),
+        torch.Generator().manual_seed(1),
+        torch.Generator().manual_seed(2),
+    )
+    torch.testing.assert_close(tied_prefix, torch.zeros_like(tied_prefix))
+
+
+def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
+    rows = 2
+    rank = 4
+    generator = np.random.default_rng(9)
+    unit_logits = generator.standard_normal((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
+    kind_logits = generator.standard_normal(
+        (rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32
+    )
+    quantity_context = generator.standard_normal((rows, MAX_MARKET_ORDERS, rank), dtype=np.float32)
+    kind_gate = generator.standard_normal((1, N_MARKET_KINDS, rank), dtype=np.float32)
+    quantity_values = generator.standard_normal((1, N_QUANTITIES, rank), dtype=np.float32)
+    quantity_bias = generator.standard_normal((1, N_MARKET_KINDS, N_QUANTITIES), dtype=np.float32)
+    all_quantity_logits = (
+        np.einsum(
+            "bskr,qr->bskq",
+            quantity_context[:, :, None] * (1.0 + kind_gate[0, None]),
+            quantity_values[0],
+        )
+        + quantity_bias[0, None]
+    )
+    unit_utilities = unit_logits.copy()
+    kind_utilities = kind_logits.copy()
+    quantity_prefix_choices = np.empty_like(all_quantity_logits, dtype=np.uint8)
+    for maximum in range(N_QUANTITIES):
+        quantity_prefix_choices[..., maximum] = np.argmax(
+            all_quantity_logits[..., : maximum + 1], axis=-1
+        )
+    zeros = np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+    temperatures = np.asarray([0.7, 1.3], dtype=np.float32)
+    native = load_native()
+    sampled_environment = native.BatchEnv(np.asarray([17], dtype=np.uint64))
+    selected_environment = native.BatchEnv(np.asarray([17], dtype=np.uint64))
+    sampled = sampled_environment.sample_buffers()
+    selected = selected_environment.sample_buffers()
+
+    sampled_environment.sample_and_step_into(
+        unit_logits,
+        kind_logits,
+        quantity_context,
+        kind_gate,
+        quantity_values,
+        quantity_bias,
+        np.zeros(rows, dtype=np.uint16),
+        np.zeros((rows, MAX_UNITS), dtype=np.float32),
+        zeros,
+        zeros,
+        np.ones(rows, dtype=np.bool_),
+        temperatures,
+        np.zeros(rows, dtype=np.uint8),
+        sampled,
+    )
+    selected_environment.select_and_step_into(
+        unit_utilities,
+        kind_utilities,
+        quantity_prefix_choices,
+        np.zeros(rows, dtype=np.uint8),
+        selected,
+    )
+    _fill_gpu_policy_statistics(
+        selected,
+        ActorOutput(
+            torch.from_numpy(unit_logits),
+            torch.from_numpy(kind_logits),
+            torch.from_numpy(quantity_context),
+        ),
+        (
+            torch.from_numpy(kind_gate),
+            torch.from_numpy(quantity_values),
+            torch.from_numpy(quantity_bias),
+        ),
+        torch.zeros(rows, dtype=torch.long),
+        torch.zeros(rows, dtype=torch.uint8),
+        torch.from_numpy(temperatures),
+    )
+
+    for name in (
+        "unit_actions",
+        "market_kinds",
+        "market_quantities",
+        "unit_masks",
+        "market_kind_masks",
+        "market_quantity_masks",
+        "unit_active",
+        "market_active",
+        "market_quantity_active",
+        "rewards",
+        "dones",
+        "final_money",
+    ):
+        np.testing.assert_array_equal(np.asarray(selected[name]), np.asarray(sampled[name]))
+    for name in (
+        "unit_logprobs",
+        "market_kind_logprobs",
+        "market_quantity_logprobs",
+        "entropy",
+    ):
+        np.testing.assert_allclose(
+            np.asarray(selected[name]), np.asarray(sampled[name]), rtol=2e-5, atol=2e-5
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_sampler_pipelines_two_shards_in_seed_order() -> None:
+    actor = StructuredActor(
+        StructuredConfig(
+            model_dim=32,
+            attention_heads=4,
+            attention_kv_heads=2,
+            ffn_multiplier=2,
+            farm_blocks=1,
+            opponent_latents=2,
+            latents=4,
+            core_layers=1,
+        )
+    ).cuda()
+
+    rollout = collect_mixed_play_rust(
+        actor,
+        self_play_games=2,
+        seed_start=31,
+        sampling_seed=13,
+        forward_mode="eager",
+        forward_autocast=True,
+    )
+
+    np.testing.assert_array_equal(rollout.episode_seeds, [31, 31, 32, 32])
+    assert rollout.valid.all()
+    for actions, masks in (
+        (rollout.unit_actions, rollout.unit_masks),
+        (rollout.market_kinds, rollout.market_kind_masks),
+        (rollout.market_quantities, rollout.market_quantity_masks),
+    ):
+        selected = np.take_along_axis(masks, actions[..., None], axis=-1).squeeze(-1)
+        assert selected.all()
+    for logprobs in (
+        rollout.old_unit_logprobs,
+        rollout.old_market_kind_logprobs,
+        rollout.old_market_quantity_logprobs,
+    ):
+        assert np.isfinite(logprobs).all()
 
 
 @pytest.mark.parametrize("collector", (collect_self_play, collect_self_play_rust))
@@ -1211,3 +1406,125 @@ def test_single_learner_waves_label_every_row_as_agent_zero() -> None:
 
     assert rollout.agents.tolist() == [0, 0, 0, 0]
     assert rollout.agents.dtype == np.int64
+
+
+def _generation_counter() -> int:
+    from torch._inductor.cudagraph_trees import MarkStepBox
+
+    return int(MarkStepBox.mark_step_counter)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("mode", "peer_is_held_out"),
+    [(mode, mode in CAPTURING_ROLLOUT_FORWARD_MODES) for mode in COMPILED_ROLLOUT_FORWARD_MODES],
+)
+def test_the_generation_guard_pins_the_counter_for_exactly_the_capturing_modes(
+    mode: str, peer_is_held_out: bool
+) -> None:
+    """A shard's step must see one generation, and only capture may pay for it.
+
+    `cudagraph_trees` gives every thread its own tree manager but reads a single
+    process-global counter to decide when a generation -- and so the lifetime of
+    the previous forward's output buffers -- has ended. A peer shard marking
+    inside this shard's step is therefore what retires an output the step has
+    not consumed yet. The guard has to make that impossible under capture, and
+    has to stay out of the way otherwise: for `inductor_default` the compiled
+    region is the whole launch sequence the two shards exist to overlap. Only
+    the compiled modes appear here: `eager` and `graph` never enter
+    `cudagraph_trees` at all, so they have no generation to pin, and that they
+    never mark is the next test.
+    """
+    device = torch.device("cuda")
+    peer_entered = threading.Event()
+    peer_left = threading.Event()
+
+    def peer() -> None:
+        with _cuda_graph_generation(device, mode):
+            peer_entered.set()
+        peer_left.set()
+
+    with _cuda_graph_generation(device, mode):
+        inside = _generation_counter()
+        thread = threading.Thread(target=peer)
+        thread.start()
+        # A blocked peer never reaches its own mark, so the counter this shard
+        # read at entry is still the one its manager will compare against.
+        assert peer_entered.wait(timeout=2.0) is not peer_is_held_out
+        assert (_generation_counter() == inside) is peer_is_held_out
+    assert peer_left.wait(timeout=10.0)
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_the_generation_guard_marks_the_compiled_modes_and_only_those() -> None:
+    """Only a forward that goes through `cudagraph_trees` has a generation.
+
+    `graph` captures too, but it owns its graph outright, so marking on its
+    behalf would move a counter that other compiled callables in the process
+    read and nothing here writes.
+    """
+    device = torch.device("cuda")
+    for mode in ROLLOUT_FORWARD_MODES:
+        before = _generation_counter()
+        with _cuda_graph_generation(device, mode):
+            pass
+        moved = _generation_counter() != before
+        assert moved is (mode in COMPILED_ROLLOUT_FORWARD_MODES), mode
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
+    """`graph` must be the same wave as `eager`, not merely a similar one.
+
+    Capture replays the identical kernel sequence over the identical buffers, so
+    unlike the compiled modes -- which reassociate and refuse a bitwise contract,
+    and are bounded semantically by `update_replay_parity` instead -- this one
+    owes exact equality. Anything less means the graph is reading something the
+    step did not just upload, which is the failure mode capture actually has.
+
+    The wave carries both a self-play pair and league rows against a distinct
+    opponent, because the current-policy forward and the stacked frozen ensemble
+    are captured as one region and only a league wave exercises the second.
+    """
+    config = StructuredConfig(
+        model_dim=32,
+        attention_heads=4,
+        attention_kv_heads=2,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+    )
+    actor = StructuredActor(config).cuda()
+    opponent = StructuredActor(config).cuda()
+
+    def collect(mode: str):
+        return collect_mixed_play_rust(
+            actor,
+            (opponent,),
+            self_play_games=1,
+            league_games=2,
+            opponent_indices=np.asarray([0, 0]),
+            seed_start=77,
+            sampling_seed=5,
+            forward_mode=mode,
+            forward_autocast=True,
+        )
+
+    reference = collect("eager")
+    captured = collect("graph")
+
+    np.testing.assert_array_equal(captured.episode_seeds, reference.episode_seeds)
+    np.testing.assert_array_equal(captured.valid, reference.valid)
+    for name in ("unit_actions", "market_kinds", "market_quantities"):
+        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
+    for name in (
+        "old_unit_logprobs",
+        "old_market_kind_logprobs",
+        "old_market_quantity_logprobs",
+        "rewards",
+    ):
+        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))

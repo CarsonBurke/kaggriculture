@@ -1,11 +1,14 @@
-"""Synchronous self-play rollout collection against the official simulator."""
+"""Pipelined self-play rollout collection against the official simulator."""
 
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import numpy as np
 import torch
@@ -41,7 +44,7 @@ from kaggriculture.orientation import (
     orient_unit_masks,
     seat_orientations,
 )
-from kaggriculture.policy import PolicyStep, act_batch
+from kaggriculture.policy import PolicyStep, act_batch, categorical_statistics
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredInputs
@@ -712,6 +715,264 @@ def _packed_outputs_to_host(
     return host_outputs, transfer
 
 
+@dataclass(frozen=True)
+class _GpuPreferenceTransfer:
+    """Pinned mirrors for GPU-produced categorical preference permutations."""
+
+    units: torch.Tensor
+    kinds: torch.Tensor
+    quantities: torch.Tensor
+
+
+def _quantity_head_tensors(
+    actors: Sequence[FarmActor | StructuredActor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.stack([actor.market_quantity_kind_gate.weight for actor in actors]),
+        torch.stack([actor.market_quantity_value.weight for actor in actors]),
+        torch.stack([actor.market_quantity_bias for actor in actors]),
+    )
+
+
+def _all_quantity_logits(
+    context: torch.Tensor,
+    head_ids: torch.Tensor,
+    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    kind_gate, values, bias = heads
+    row_gate = kind_gate[head_ids]
+    row_values = values[head_ids]
+    row_bias = bias[head_ids]
+    features = context.float().unsqueeze(2) * (1.0 + row_gate.float().unsqueeze(1))
+    return torch.einsum(
+        "bskr,bqr->bskq", features, row_values.float()
+    ) + row_bias.float().unsqueeze(1)
+
+
+def _selected_quantity_logits(
+    context: torch.Tensor,
+    kinds: torch.Tensor,
+    head_ids: torch.Tensor,
+    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    kind_gate, values, bias = heads
+    kinds = kinds.long()
+    row = torch.arange(context.shape[0], device=context.device)[:, None]
+    row_gate = kind_gate[head_ids]
+    row_bias = bias[head_ids]
+    selected_gate = row_gate[row, kinds]
+    selected_bias = row_bias[row, kinds]
+    features = context.float() * (1.0 + selected_gate.float())
+    return torch.einsum("bsr,bqr->bsq", features, values[head_ids].float()) + selected_bias.float()
+
+
+def _gumbel_utilities(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    deterministic_rows: torch.Tensor,
+    current_rows: torch.Tensor,
+    frozen_rows: torch.Tensor,
+    current_generator: torch.Generator,
+    frozen_generator: torch.Generator,
+) -> torch.Tensor:
+    scores = logits.float() / temperatures.reshape(
+        temperatures.shape[0], *((1,) * (logits.ndim - 1))
+    )
+    noise = torch.empty_like(scores)
+    for rows, generator in (
+        (current_rows, current_generator),
+        (frozen_rows, frozen_generator),
+    ):
+        if rows.numel():
+            uniforms = torch.rand(
+                (rows.numel(), *scores.shape[1:]),
+                dtype=torch.float32,
+                device=scores.device,
+                generator=generator,
+            )
+            uniforms.clamp_(
+                min=torch.finfo(torch.float32).tiny, max=1.0 - torch.finfo(torch.float32).eps
+            )
+            noise[rows] = -torch.log(-torch.log(uniforms))
+    return torch.where(
+        deterministic_rows.reshape(deterministic_rows.shape[0], *((1,) * (logits.ndim - 1))),
+        scores,
+        scores + noise,
+    )
+
+
+def _gumbel_preference_order(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    deterministic_rows: torch.Tensor,
+    current_rows: torch.Tensor,
+    frozen_rows: torch.Tensor,
+    current_generator: torch.Generator,
+    frozen_generator: torch.Generator,
+) -> torch.Tensor:
+    """Rank GPU-side Gumbel utilities for exact native masked selection."""
+    scores = _gumbel_utilities(
+        logits,
+        temperatures,
+        deterministic_rows,
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
+    )
+    return scores.argsort(dim=-1, descending=True, stable=True).to(torch.uint8)
+
+
+def _gumbel_prefix_choices(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    deterministic_rows: torch.Tensor,
+    current_rows: torch.Tensor,
+    frozen_rows: torch.Tensor,
+    current_generator: torch.Generator,
+    frozen_generator: torch.Generator,
+) -> torch.Tensor:
+    """Return the best Gumbel utility for every legal quantity prefix."""
+    scores = _gumbel_utilities(
+        logits,
+        temperatures,
+        deterministic_rows,
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
+    )
+    running_max = scores.cummax(dim=-1).values
+    previous_max = torch.cat(
+        (torch.full_like(running_max[..., :1], -torch.inf), running_max[..., :-1]), dim=-1
+    )
+    indices = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int64)
+    records = torch.where(scores > previous_max, indices, 0)
+    return records.cummax(dim=-1).values.to(torch.uint8)
+
+
+def _gpu_preferences_to_host(
+    output: ActorOutput,
+    all_quantity_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    deterministic_rows: torch.Tensor,
+    current_rows: torch.Tensor,
+    frozen_rows: torch.Tensor,
+    current_generator: torch.Generator,
+    frozen_generator: torch.Generator,
+    transfer: _GpuPreferenceTransfer | None,
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], _GpuPreferenceTransfer]:
+    preferences = (
+        _gumbel_utilities(
+            output.unit_logits,
+            temperatures,
+            deterministic_rows,
+            current_rows,
+            frozen_rows,
+            current_generator,
+            frozen_generator,
+        ),
+        _gumbel_utilities(
+            output.market_kind_logits,
+            temperatures,
+            deterministic_rows,
+            current_rows,
+            frozen_rows,
+            current_generator,
+            frozen_generator,
+        ),
+        _gumbel_prefix_choices(
+            all_quantity_logits,
+            temperatures,
+            deterministic_rows,
+            current_rows,
+            frozen_rows,
+            current_generator,
+            frozen_generator,
+        ),
+    )
+    if transfer is None or any(
+        host.shape != preference.shape or host.dtype != preference.dtype
+        for host, preference in zip(
+            (transfer.units, transfer.kinds, transfer.quantities), preferences, strict=True
+        )
+    ):
+        transfer = _GpuPreferenceTransfer(
+            *(
+                torch.empty(
+                    preference.shape,
+                    dtype=preference.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for preference in preferences
+            )
+        )
+    host_tensors = (transfer.units, transfer.kinds, transfer.quantities)
+    for host, preference in zip(host_tensors, preferences, strict=True):
+        host.copy_(preference, non_blocking=True)
+    torch.cuda.current_stream(output.unit_logits.device).synchronize()
+    return (
+        (host_tensors[0].numpy(), host_tensors[1].numpy(), host_tensors[2].numpy()),
+        transfer,
+    )
+
+
+def _fill_gpu_policy_statistics(
+    sampled: dict[str, np.ndarray],
+    output: ActorOutput,
+    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    head_ids: torch.Tensor,
+    builtin_agents: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> None:
+    device = output.unit_logits.device
+    unit_actions = torch.as_tensor(sampled["unit_actions"], device=device)
+    market_kinds = torch.as_tensor(sampled["market_kinds"], device=device)
+    market_quantities = torch.as_tensor(sampled["market_quantities"], device=device)
+    unit_masks = torch.as_tensor(sampled["unit_masks"], device=device)
+    kind_masks = torch.as_tensor(sampled["market_kind_masks"], device=device)
+    quantity_masks = torch.as_tensor(sampled["market_quantity_masks"], device=device)
+    scale = temperatures[:, None, None]
+    unit_logits = output.unit_logits / scale
+    kind_logits = output.market_kind_logits / scale
+    quantity_logits = (
+        _selected_quantity_logits(output.market_quantity_context, market_kinds, head_ids, heads)
+        / scale
+    )
+    unit_logprob, unit_entropy = categorical_statistics(unit_logits, unit_masks, unit_actions)
+    kind_logprob, kind_entropy = categorical_statistics(kind_logits, kind_masks, market_kinds)
+    quantity_logprob, quantity_entropy = categorical_statistics(
+        quantity_logits, quantity_masks, market_quantities
+    )
+    learned = builtin_agents == 0
+    for values in (
+        unit_logprob,
+        kind_logprob,
+        quantity_logprob,
+        unit_entropy,
+        kind_entropy,
+        quantity_entropy,
+    ):
+        values.mul_(learned[:, None])
+    unit_active = torch.as_tensor(sampled["unit_active"], device=device)
+    kind_active = torch.as_tensor(sampled["market_active"], device=device)
+    quantity_active = torch.as_tensor(sampled["market_quantity_active"], device=device)
+    counts = unit_active.sum(1) + kind_active.sum(1) + quantity_active.sum(1)
+    entropy = (
+        (unit_entropy * unit_active).sum(1)
+        + (kind_entropy * kind_active).sum(1)
+        + (quantity_entropy * quantity_active).sum(1)
+    ) / counts.clamp_min(1)
+    for name, values in (
+        ("unit_logprobs", unit_logprob),
+        ("market_kind_logprobs", kind_logprob),
+        ("market_quantity_logprobs", quantity_logprob),
+        ("entropy", entropy),
+    ):
+        np.copyto(np.asarray(sampled[name]), values.float().cpu().numpy())
+
+
 #: Execution mode for the collection forward. Collection spends roughly two
 #: thirds of its wall clock in this one call, so the choice here is the single
 #: largest lever on rollout cost -- and the shipped default was measurably the
@@ -751,7 +1012,19 @@ def _packed_outputs_to_host(
 #: preserve the previous behavior so `benchmark_rust_rollout.py` and its
 #: recorded drift artifacts stay comparable; the training and calibration
 #: entrypoints state the measured decision explicitly.
-ROLLOUT_FORWARD_MODES = ("eager", "cudagraphs", "inductor")
+ROLLOUT_FORWARD_MODES = ("eager", "graph", "cudagraphs", "inductor", "inductor_default")
+
+#: Modes that reach the device through `torch.compile`, and so through
+#: `torch._inductor.cudagraph_trees`' generation bookkeeping.
+COMPILED_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor", "inductor_default")
+
+#: The subset of those that lets `cudagraph_trees` capture rather than only
+#: fuse. Capture is what makes a forward's outputs live in a reused private
+#: pool, so it is what `_cuda_graph_generation` has to serialise; fusion alone
+#: owns its outputs normally and must stay unserialised, because for
+#: `inductor_default` the compiled region is the whole launch sequence the two
+#: shards exist to overlap.
+CAPTURING_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor")
 
 
 def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cudagraphs") -> Any:
@@ -762,10 +1035,28 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
     the behavior policy relative to the update-path replay. That drift is bounded
     semantically rather than bitwise, by `update_replay_parity`.
 
-    `reduce-overhead` is what makes the Inductor mode worth its drift: plain
-    Inductor keeps the launch cost this forward is dominated by, so the fused
-    kernels alone would not pay. One compiled callable is cached per mode so a
-    parity audit can measure several in one process without recompiling.
+    `inductor` is `reduce-overhead`, which adds CUDA graphs to the fusion, and
+    `inductor_default` is the fusion alone. Both used to hang at the first
+    compiled collection, and the split was introduced expecting them to hang for
+    different reasons. They did not. The hang was one bug and it was neither
+    fusion nor capture: `torch.compile` returns a lazy wrapper, so caching it
+    here compiles nothing, the first *call* does, and under the two-shard
+    pipeline both first calls entered the compiler from two shard threads at
+    once. The collector now drives one shard's first step through to completion
+    before the peer's (`_pipeline_ready` / `_pipeline_wait` in
+    `_collect_mixed_play_rust_wave`), which is enough for both modes.
+
+    Capture then has a second and unrelated problem that fusion does not have,
+    and it is the one the split was originally guessing at: see
+    `_cuda_graph_generation`, which has to serialise each shard's mark and
+    forwards because `cudagraph_trees` keys generations off a process-global
+    counter while holding the tree managers that read it per thread.
+
+    One compiled callable is cached per mode so a parity audit can measure
+    several in one process without recompiling -- but note the cache itself is
+    written from both shard threads and is not synchronized, which is harmless
+    only because a duplicate wrapper is equivalent, not because the race cannot
+    happen.
     """
     if mode not in ROLLOUT_FORWARD_MODES:
         raise ValueError(f"unknown rollout forward mode {mode!r}")
@@ -783,7 +1074,10 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
             )
         else:
             compiled = torch.compile(
-                model.forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+                model.forward,
+                mode="default" if mode == "inductor_default" else "reduce-overhead",
+                fullgraph=True,
+                dynamic=False,
             )
         cache[mode] = compiled
     return compiled
@@ -804,7 +1098,7 @@ def _rollout_model_forward(
     absence of a flag. The stacked ensemble takes the same mode, so a wave
     cannot end up compiling one of its two forwards and not the other.
     """
-    if mode == "eager" or _leading_tensor(inputs).device.type != "cuda":
+    if mode not in COMPILED_ROLLOUT_FORWARD_MODES or _leading_tensor(inputs).device.type != "cuda":
         return model(*inputs)
     return _cached_compiled_forward(model, mode)(*inputs)
 
@@ -828,9 +1122,24 @@ class _StackedActorEnsemble:
     """
 
     def __init__(self, models: Sequence[FarmActor | StructuredActor]) -> None:
-        self.template = type(models[0])(models[0].config).to("meta")
+        first = models[0]
+        self.template = (
+            StructuredActor(first.config)
+            if isinstance(first, StructuredActor)
+            else FarmActor(first.config)
+        ).to("meta")
         self.template.eval()
         import torch._dynamo
+
+        # Dynamo's recompile budget is per Python code object, not per compiled
+        # callable. Every lane-count-specific ensemble below shares
+        # `_forward.__code__`, so the normal growth from one to N league lanes
+        # otherwise trips the default limit of eight even though each shape has
+        # its own persistent callable. N is also a strict upper bound on the
+        # distinct positive lane counts that can precede this instance.
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, len(models)
+        )
 
         # The stacked tensors outlive any inference-mode region the collector
         # runs under; inference tensors would reject the in-place `load`
@@ -881,9 +1190,15 @@ class _StackedActorEnsemble:
         reason: `cudagraphs` is slower here than not compiling, because this
         forward is limited by per-kernel overhead rather than launch cost, and
         only fusion reduces the kernel count.
+
+        `graph` takes the uncompiled path along with `eager`, because there the
+        capture is the collector's and this forward is inside it. Entering the
+        compiler from within a stream capture is not merely slow, it is
+        forbidden: it raises `cudaErrorStreamCaptureUnsupported` and invalidates
+        the capture in progress.
         """
         leading = _leading_tensor(inputs)
-        if mode == "eager" or leading.device.type != "cuda":
+        if mode not in COMPILED_ROLLOUT_FORWARD_MODES or leading.device.type != "cuda":
             return self._forward(*inputs)
         # One compiled callable per lane width and mode: league assignments may
         # change the padded width between waves, and sharing one callable would
@@ -898,7 +1213,10 @@ class _StackedActorEnsemble:
                 )
             else:
                 compiled = torch.compile(
-                    self._forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+                    self._forward,
+                    mode="default" if mode == "inductor_default" else "reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,
                 )
             self._compiled[key] = compiled
         return compiled(*inputs)
@@ -909,9 +1227,16 @@ _STACKED_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedActorEnsemble] = {}
 
 def _stacked_actor_ensemble(
     models: Sequence[FarmActor | StructuredActor],
+    namespace: int = 0,
 ) -> _StackedActorEnsemble:
     """Fetch or build the persistent stacked ensemble for these lanes."""
-    key = (type(models[0]), models[0].config, len(models), next(models[0].parameters()).device)
+    key = (
+        namespace,
+        type(models[0]),
+        models[0].config,
+        len(models),
+        next(models[0].parameters()).device,
+    )
     ensemble = _STACKED_ENSEMBLE_CACHE.get(key)
     if ensemble is None:
         ensemble = _StackedActorEnsemble(models)
@@ -927,6 +1252,121 @@ def _mark_cuda_graph_step(device: torch.device, enabled: bool) -> None:
     mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
     if callable(mark):
         mark()
+
+
+# `torch._inductor.cudagraph_trees` keeps one tree manager per *thread* but a
+# single process-wide generation counter: `MarkStepBox.mark_step_counter`,
+# which `cudagraph_mark_step_begin` decrements and which every manager reads
+# through `get_curr_generation`. A manager concludes that a new generation has
+# begun -- and so that the previous generation's output buffers may be reused --
+# by seeing that counter differ from the value it recorded on its own last
+# compiled call. Two shard threads each marking once per step break that: the
+# peer's mark lands between this shard's actor forward and its ensemble
+# forward, the manager retires the actor output the ensemble step has not
+# consumed yet, and the `index_copy_` that reads it raises "accessing tensor
+# output of CUDAGraphs that has been overwritten by a subsequent run".
+#
+# Holding this across a shard's mark and every compiled forward of one step
+# restores the invariant the counter is meant to carry -- it changes between
+# our steps and never inside one -- which both keeps outputs alive for the
+# whole step and makes every generation the same node sequence, so the tree
+# records once instead of branching on whichever interleaving occurred. Only
+# capture pays for it, and under capture the protected region is a mark plus a
+# graph launch, so the shards still overlap on all of the native stepping,
+# sampling, and storage that the pipeline exists to hide.
+_CUDA_GRAPH_GENERATION = threading.Lock()
+
+
+#: What one step's forward region produces: either a single whole-wave actor
+#: output, or the current-policy and frozen-opponent outputs of a league wave.
+#: Exactly one of the two shapes is populated, which the consumers assert.
+_StepOutputs = tuple["ActorOutput | None", "ActorOutput | None", "ActorOutput | None"]
+
+#: Whatever a captured region returns. The mixed-play wave and the population
+#: wave capture different shapes and each keeps its own.
+_Captured = TypeVar("_Captured")
+
+
+# Capture switches the caching allocator to a private pool and is a
+# once-per-collection event, so the two shards take it in turns. The shard
+# barrier already orders the first step, but capture is too easy to get subtly
+# wrong under concurrency for that to be the only thing holding it.
+_CUDA_GRAPH_CAPTURE = threading.Lock()
+
+
+class _CapturedStep(Generic[_Captured]):
+    """One CUDA graph over a shard's whole per-step forward region.
+
+    The collector is launch-bound rather than compute-bound -- a production step
+    issues about 1,669 kernels for 4.7 ms of device work and spends the rest of
+    its 30 ms in the gaps between launches -- so the win is in replacing a step's
+    launch sequence with a single graph launch, not in making any kernel faster.
+
+    This is deliberately not `torch.compile(mode="reduce-overhead")`, which
+    reaches the same idea through `torch._inductor.cudagraph_trees`. That layer
+    keeps a tree manager per thread but decides generation boundaries from a
+    process-global counter, so two shard threads invalidate each other's live
+    outputs; `_cuda_graph_generation` repairs that particular race and the mode
+    still wedges. Owning the graph directly removes the entire question: nothing
+    decides on our behalf when a recording is retired or reused.
+
+    What makes it safe here is that the collector already holds every input at a
+    fixed address for the life of the wave. `_NativeStructuredWave.copy_to_device`
+    refreshes persistent device buffers in place, `_select_inputs` and
+    `_lane_view_inputs` gather into persistent `out=` storage, every row-index
+    tensor is built once before the step loop, and `_pipeline_replica` refills
+    the peer shard's weights through `load_state_dict` rather than rebuilding the
+    module. A replay therefore reads exactly what the step just uploaded.
+
+    Outputs live in the graph's private pool and are overwritten by the next
+    replay, which is the same contract the step already honours: it consumes
+    them into persistent storage before it advances.
+    """
+
+    def __init__(self, run: Callable[[], _Captured], warmup: int = 3) -> None:
+        with _CUDA_GRAPH_CAPTURE:
+            # The documented recipe: warm up on a side stream so that allocator
+            # growth, cuBLAS handle creation, and any lazy kernel load happen
+            # before the capture rather than inside it.
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(warmup):
+                    run()
+            torch.cuda.current_stream().wait_stream(side)
+            self._graph = torch.cuda.CUDAGraph()
+            # `thread_local` scopes the capture to this thread, so the peer
+            # shard issuing on its own stream cannot abort it. The default
+            # ("global") treats any other thread's CUDA work as an error.
+            with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):
+                self._outputs = run()
+
+    def __call__(self) -> _Captured:
+        self._graph.replay()
+        return self._outputs
+
+    def close(self) -> None:
+        """Release the executable graph and the pool its outputs live in.
+
+        A wave allocates its own device buffers, so a graph cannot outlive the
+        wave that captured it and a run collects hundreds of times. Dropping the
+        outputs first matters: they are allocated *inside* the private pool, so
+        the pool cannot come back while anything still points into it. Leaving
+        this to refcounting alone works but leaves the order implicit, and the
+        order is the whole point.
+        """
+        del self._outputs
+        self._graph.reset()
+
+
+@contextmanager
+def _cuda_graph_generation(device: torch.device, mode: str) -> Iterator[None]:
+    """Run one step's compiled forwards as a single CUDA graph generation."""
+    with ExitStack() as stack:
+        if device.type == "cuda" and mode in CAPTURING_ROLLOUT_FORWARD_MODES:
+            stack.enter_context(_CUDA_GRAPH_GENERATION)
+        _mark_cuda_graph_step(device, mode in COMPILED_ROLLOUT_FORWARD_MODES)
+        yield
 
 
 def _categorical_draws(
@@ -1102,7 +1542,7 @@ def _native_batch(
 
 
 @torch.inference_mode()
-def collect_mixed_play_rust(
+def _collect_mixed_play_rust_wave(
     actor: FarmActor | StructuredActor,
     opponents: Sequence[FarmActor | StructuredActor] = (),
     *,
@@ -1127,6 +1567,9 @@ def collect_mixed_play_rust(
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
+    _ensemble_namespace: int = 0,
+    _pipeline_ready: Callable[[], None] | None = None,
+    _pipeline_wait: Callable[[], None] | None = None,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect self-play and frozen-league games in one native wave.
@@ -1241,6 +1684,8 @@ def collect_mixed_play_rust(
     generator = np.random.default_rng(sampling_seed)
     frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
     kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
+    gpu_sampling = device.type == "cuda"
+    gpu_heads = _quantity_head_tensors((actor, *opponents)) if gpu_sampling else None
     # Per-lane decode of everything a frozen row needs. A built-in lane has no
     # network, so it borrows the learner's quantity head and neutral sampling
     # settings; the native agent replaces that row's whole action regardless.
@@ -1265,6 +1710,28 @@ def collect_mixed_play_rust(
     entropy_sums = np.zeros(trajectories, dtype=np.float64)
     final = None
     packed_transfer: _PackedTransfer | None = None
+    preference_transfer: _GpuPreferenceTransfer | None = None
+    gpu_current_generator: torch.Generator | None = None
+    gpu_frozen_generator: torch.Generator | None = None
+    gpu_current_rows: torch.Tensor | None = None
+    gpu_frozen_rows: torch.Tensor | None = None
+    gpu_head_ids: torch.Tensor | None = None
+    gpu_deterministic_rows: torch.Tensor | None = None
+    gpu_temperatures: torch.Tensor | None = None
+    gpu_builtin_agents: torch.Tensor | None = None
+    if gpu_sampling:
+        gpu_current_generator = torch.Generator(device=device)
+        gpu_current_generator.manual_seed(sampling_seed)
+        gpu_frozen_generator = torch.Generator(device=device)
+        gpu_frozen_generator.manual_seed(sampling_seed ^ 0x5EED_1EAF)
+        gpu_current_rows = torch.as_tensor(stored_rows, dtype=torch.long, device=device)
+        gpu_frozen_rows = torch.as_tensor(frozen_rows, dtype=torch.long, device=device)
+        gpu_head_ids = torch.as_tensor(head_ids, dtype=torch.long, device=device)
+        gpu_deterministic_rows = torch.as_tensor(
+            deterministic_rows, dtype=torch.bool, device=device
+        )
+        gpu_temperatures = torch.as_tensor(temperatures, dtype=torch.float32, device=device)
+        gpu_builtin_agents = torch.as_tensor(builtin_agents, dtype=torch.uint8, device=device)
 
     # A pure self-play wave keeps the learner forward over the contiguous full
     # batch and stores every row, avoiding gather/scatter work entirely.
@@ -1273,6 +1740,17 @@ def collect_mixed_play_rust(
     current_tensor = None if not league_games else torch.as_tensor(stored_rows, device=device)
     current_gather: tuple[Any, ...] | None = None
     lane_gather: tuple[Any, ...] | None = None
+    ensemble: _StackedActorEnsemble | None = None
+    frozen_tensor: torch.Tensor | None = None
+    frozen_store_tensor: torch.Tensor | None = None
+    lane_valid_tensor: torch.Tensor | None = None
+    frozen_store_rows: np.ndarray | None = None
+    lane_valid_flat: np.ndarray | None = None
+    lanes = 0
+    lane_width = 0
+    unit_logits: torch.Tensor | np.ndarray | None = None
+    kind_logits: torch.Tensor | np.ndarray | None = None
+    quantity_context: torch.Tensor | np.ndarray | None = None
     if league_games:
         frozen_groups = tuple(
             frozen_rows[np.flatnonzero(assignments == lane)] for lane in range(lane_count)
@@ -1293,14 +1771,16 @@ def collect_mixed_play_rust(
         lane_valid_flat = lane_valid.reshape(-1)
         frozen_store_rows = np.concatenate(active_groups)
         frozen_tensor = torch.as_tensor(lane_rows.reshape(-1), device=device)
+        frozen_store_tensor = torch.as_tensor(frozen_store_rows, device=device)
+        lane_valid_tensor = torch.as_tensor(lane_valid_flat, device=device)
         # Built-in lanes keep their slot in the stack, borrowing the last
         # frozen opponent's weights, so the ensemble's batch shape follows the
-        # lane count instead of this iteration's snapshot/built-in mix and a
         # captured CUDA graph survives the next draw. Their logits are never
         # read. A wave with no frozen network at all runs no ensemble.
         ensemble = (
             _stacked_actor_ensemble(
-                [opponents[min(index, len(opponents) - 1)] for index in active_indices]
+                [opponents[min(index, len(opponents) - 1)] for index in active_indices],
+                _ensemble_namespace,
             )
             if opponents
             else None
@@ -1316,17 +1796,32 @@ def collect_mixed_play_rust(
         # Zeroed rather than uninitialized: with no ensemble nothing scatters
         # into the frozen rows, and handing the sampler uninitialized memory --
         # even in rows it is contracted to ignore -- is not worth the page.
-        unit_logits = np.zeros((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
-        kind_logits = np.zeros((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
-        quantity_context = np.zeros(
-            (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
-        )
+        if gpu_sampling:
+            output_dtype = torch.bfloat16 if forward_autocast else torch.float32
+            unit_logits = torch.zeros(
+                (rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=output_dtype, device=device
+            )
+            kind_logits = torch.zeros(
+                (rows, MAX_MARKET_ORDERS, N_MARKET_KINDS),
+                dtype=output_dtype,
+                device=device,
+            )
+            quantity_context = torch.zeros(
+                (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank),
+                dtype=output_dtype,
+                device=device,
+            )
+        else:
+            unit_logits = np.zeros((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32)
+            kind_logits = np.zeros((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32)
+            quantity_context = np.zeros(
+                (rows, MAX_MARKET_ORDERS, actor.config.quantity_rank), dtype=np.float32
+            )
     # Collection runs the actor under whatever precision the audited decision
     # chose. It is bf16 in the update path regardless, so an fp32 collection
     # forward is not the conservative option: it is a second precision, and the
     # gap between the two is what `update_replay_parity` measures.
     autocast_forward = forward_autocast and device.type == "cuda"
-    compiled_forward = forward_mode != "eager"
 
     def run_actor(*inputs: Any) -> ActorOutput:
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
@@ -1334,91 +1829,211 @@ def collect_mixed_play_rust(
         assert isinstance(output, ActorOutput)
         return output
 
+    def step_forwards() -> _StepOutputs:
+        """Every device-side forward of one step, and nothing else.
+
+        Kept to exactly the region that reads persistent input buffers and
+        writes fresh outputs, because that is what `_CapturedStep` can capture
+        as a unit: the sampling and storage that follow round-trip to the host.
+        """
+        if not league_games:
+            return run_actor(*wave_inputs), None, None
+        assert current_tensor is not None
+        current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
+        frozen = None
+        if ensemble is not None:
+            assert frozen_tensor is not None
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+                lane_output = ensemble(
+                    *_lane_view_inputs(wave_inputs, frozen_tensor, lanes, lane_width, lane_gather),
+                    mode=forward_mode,
+                )
+            frozen = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+        return None, current, frozen
+
+    graphed = forward_mode == "graph" and device.type == "cuda"
+    step_graph: _CapturedStep[_StepOutputs] | None = None
+    pipeline_started = False
     for step in range(horizon):
         encoded_wave.refresh(environment)
         encoded_wave.copy_to_device()
-        _mark_cuda_graph_step(device, compiled_forward)
-        if not league_games:
-            output = run_actor(*wave_inputs)
-            host_outputs, packed_transfer = _packed_outputs_to_host((output,), packed_transfer)
-            host = host_outputs[0]
-            step_unit_logits = host.unit_logits
-            step_kind_logits = host.market_kind_logits
-            step_quantity_context = host.market_quantity_context
-            unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+        if graphed and step_graph is None:
+            # Captured on the first step, once the wave holds real uploaded
+            # values, and replayed for the remaining 719. The shard barrier
+            # below already keeps the peer out of its own first step until this
+            # one is through, so the two captures cannot overlap.
+            step_graph = _CapturedStep(step_forwards)
+        if step_graph is not None:
+            full_output, current_output, frozen_output = step_graph()
         else:
-            assert current_tensor is not None
-            current_output = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
-            if ensemble is None:
-                host_outputs, packed_transfer = _packed_outputs_to_host(
-                    (current_output,), packed_transfer
-                )
-                (current_host,) = host_outputs
-                frozen_host = None
-            else:
-                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
-                    lane_output = ensemble(
-                        *_lane_view_inputs(
-                            wave_inputs, frozen_tensor, lanes, lane_width, lane_gather
-                        ),
-                        mode=forward_mode,
+            with _cuda_graph_generation(device, forward_mode):
+                full_output, current_output, frozen_output = step_forwards()
+        if league_games:
+            assert current_output is not None
+            if gpu_sampling:
+                assert isinstance(unit_logits, torch.Tensor)
+                assert isinstance(kind_logits, torch.Tensor)
+                assert isinstance(quantity_context, torch.Tensor)
+                assert gpu_current_rows is not None
+                assert frozen_store_tensor is not None
+                assert lane_valid_tensor is not None
+                for destination, current_values, frozen_values in zip(
+                    (unit_logits, kind_logits, quantity_context),
+                    current_output,
+                    (None, None, None) if frozen_output is None else frozen_output,
+                    strict=True,
+                ):
+                    destination.index_copy_(
+                        0, gpu_current_rows, current_values.to(destination.dtype)
                     )
-                frozen_output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
-                host_outputs, packed_transfer = _packed_outputs_to_host(
-                    (current_output, frozen_output), packed_transfer
+                    if frozen_values is not None:
+                        selected_frozen = frozen_values[lane_valid_tensor]
+                        destination.index_copy_(
+                            0, frozen_store_tensor, selected_frozen.to(destination.dtype)
+                        )
+            else:
+                assert isinstance(unit_logits, np.ndarray)
+                assert isinstance(kind_logits, np.ndarray)
+                assert isinstance(quantity_context, np.ndarray)
+                assert frozen_store_rows is not None
+                assert lane_valid_flat is not None
+                transfer_outputs = (
+                    (current_output,) if frozen_output is None else (current_output, frozen_output)
                 )
-                current_host, frozen_host = host_outputs
-            for destination, current_values, frozen_values in zip(
-                (unit_logits, kind_logits, quantity_context),
-                (
-                    current_host.unit_logits,
-                    current_host.market_kind_logits,
-                    current_host.market_quantity_context,
-                ),
-                (None, None, None)
-                if frozen_host is None
-                else (
-                    frozen_host.unit_logits,
-                    frozen_host.market_kind_logits,
-                    frozen_host.market_quantity_context,
-                ),
-                strict=True,
-            ):
-                destination[stored_rows] = current_values
-                if frozen_values is not None:
-                    destination[frozen_store_rows] = frozen_values[lane_valid_flat]
-            step_unit_logits = unit_logits
-            step_kind_logits = kind_logits
-            step_quantity_context = quantity_context
-            unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
-            kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-            quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-            current_draws = _categorical_draws(generator, stored_rows.size)
-            frozen_draws = _categorical_draws(frozen_generator, league_games)
-            for destination, current_values, frozen_values in zip(
-                (unit_draws, kind_draws, quantity_draws),
-                current_draws,
-                frozen_draws,
-                strict=True,
-            ):
-                destination[stored_rows] = current_values
-                destination[frozen_rows] = frozen_values
-        environment.sample_and_step_into(
-            step_unit_logits,
-            step_kind_logits,
-            step_quantity_context,
-            kind_gate,
-            quantity_values,
-            quantity_bias,
-            head_ids,
-            unit_draws,
-            kind_draws,
-            quantity_draws,
-            deterministic_rows,
-            temperatures,
-            builtin_agents,
-            sampled,
-        )
+                host_outputs, packed_transfer = _packed_outputs_to_host(
+                    transfer_outputs, packed_transfer
+                )
+                current_host = host_outputs[0]
+                frozen_host = None if frozen_output is None else host_outputs[1]
+                for destination, current_values, frozen_values in zip(
+                    (unit_logits, kind_logits, quantity_context),
+                    (
+                        current_host.unit_logits,
+                        current_host.market_kind_logits,
+                        current_host.market_quantity_context,
+                    ),
+                    (
+                        (None, None, None)
+                        if frozen_host is None
+                        else (
+                            frozen_host.unit_logits,
+                            frozen_host.market_kind_logits,
+                            frozen_host.market_quantity_context,
+                        )
+                    ),
+                    strict=True,
+                ):
+                    destination[stored_rows] = current_values
+                    if frozen_values is not None:
+                        destination[frozen_store_rows] = frozen_values[lane_valid_flat]
+            if gpu_sampling:
+                assert isinstance(unit_logits, torch.Tensor)
+                assert isinstance(kind_logits, torch.Tensor)
+                assert isinstance(quantity_context, torch.Tensor)
+                full_output = ActorOutput(unit_logits, kind_logits, quantity_context)
+            else:
+                full_output = current_output
+
+        assert full_output is not None
+        if gpu_sampling:
+            assert gpu_heads is not None
+            assert gpu_head_ids is not None
+            assert gpu_temperatures is not None
+            assert gpu_deterministic_rows is not None
+            assert gpu_current_rows is not None
+            assert gpu_frozen_rows is not None
+            assert gpu_current_generator is not None
+            assert gpu_frozen_generator is not None
+            assert gpu_builtin_agents is not None
+            quantity_logits = _all_quantity_logits(
+                full_output.market_quantity_context, gpu_head_ids, gpu_heads
+            )
+            preferences, preference_transfer = _gpu_preferences_to_host(
+                full_output,
+                quantity_logits,
+                gpu_temperatures,
+                gpu_deterministic_rows,
+                gpu_current_rows,
+                gpu_frozen_rows,
+                gpu_current_generator,
+                gpu_frozen_generator,
+                preference_transfer,
+            )
+            if not pipeline_started:
+                # Compilation is entered lazily by the first call, so under any
+                # `forward_mode` that compiles, this is the step that runs the
+                # compiler -- and it runs it inside a shard thread. Announcing
+                # readiness here and then waiting for the peer shard to reach
+                # the same point keeps exactly one thread inside the compiler at
+                # a time: shard 0 compiles while shard 1 is still parked on the
+                # stagger, then shard 0 parks here while shard 1 compiles, and
+                # only then do both run pipelined. Serialising one step of 720
+                # costs a seventh of a percent of the overlap and is what lets a
+                # compiled collection start at all.
+                if _pipeline_ready is not None:
+                    _pipeline_ready()
+                pipeline_started = True
+                if _pipeline_wait is not None:
+                    _pipeline_wait()
+            environment.select_and_step_into(
+                *preferences,
+                builtin_agents,
+                sampled,
+            )
+            _fill_gpu_policy_statistics(
+                sampled,
+                full_output,
+                gpu_heads,
+                gpu_head_ids,
+                gpu_builtin_agents,
+                gpu_temperatures,
+            )
+        else:
+            if not league_games:
+                host_outputs, packed_transfer = _packed_outputs_to_host(
+                    (full_output,), packed_transfer
+                )
+                host = host_outputs[0]
+                step_unit_logits = host.unit_logits
+                step_kind_logits = host.market_kind_logits
+                step_quantity_context = host.market_quantity_context
+                unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+            else:
+                assert isinstance(unit_logits, np.ndarray)
+                assert isinstance(kind_logits, np.ndarray)
+                assert isinstance(quantity_context, np.ndarray)
+                step_unit_logits = np.asarray(unit_logits)
+                step_kind_logits = np.asarray(kind_logits)
+                step_quantity_context = np.asarray(quantity_context)
+                unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
+                kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+                quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+                current_draws = _categorical_draws(generator, stored_rows.size)
+                frozen_draws = _categorical_draws(frozen_generator, league_games)
+                for destination, current_values, frozen_values in zip(
+                    (unit_draws, kind_draws, quantity_draws),
+                    current_draws,
+                    frozen_draws,
+                    strict=True,
+                ):
+                    destination[stored_rows] = current_values
+                    destination[frozen_rows] = frozen_values
+            environment.sample_and_step_into(
+                step_unit_logits,
+                step_kind_logits,
+                step_quantity_context,
+                kind_gate,
+                quantity_values,
+                quantity_bias,
+                head_ids,
+                unit_draws,
+                kind_draws,
+                quantity_draws,
+                deterministic_rows,
+                temperatures,
+                builtin_agents,
+                sampled,
+            )
         rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
         _store_native_wave(
             architecture,
@@ -1442,6 +2057,9 @@ def collect_mixed_play_rust(
         if step + 1 == horizon and not dones.all():
             raise RuntimeError("native rollout did not terminate at the competition horizon")
         final = np.asarray(sampled["final_money"], dtype=np.float32)
+
+    if step_graph is not None:
+        step_graph.close()
 
     assert final is not None
     self_final = final[:self_play_games]
@@ -1470,6 +2088,195 @@ def collect_mixed_play_rust(
         ),
         agents=np.zeros(trajectories, dtype=np.int64),
         entropy_sums=entropy_sums,
+        started=started,
+    )
+
+
+def _pipeline_replica(
+    model: FarmActor | StructuredActor,
+) -> FarmActor | StructuredActor:
+    replica = getattr(model, "_kaggriculture_pipeline_replica", None)
+    if replica is None or type(replica) is not type(model) or replica.config != model.config:
+        replica = (
+            StructuredActor(model.config)
+            if isinstance(model, StructuredActor)
+            else FarmActor(model.config)
+        ).to(next(model.parameters()).device)
+        object.__setattr__(model, "_kaggriculture_pipeline_replica", replica)
+    replica.load_state_dict(model.state_dict())
+    replica.eval()
+    return replica
+
+
+@torch.inference_mode()
+def collect_mixed_play_rust(
+    actor: FarmActor | StructuredActor,
+    opponents: Sequence[FarmActor | StructuredActor] = (),
+    *,
+    self_play_games: int = 0,
+    league_games: int = 0,
+    opponent_indices: Sequence[int] | np.ndarray | None = None,
+    builtin_lanes: Sequence[str] = (),
+    seed_start: int,
+    episode_steps: int = 720,
+    deterministic: bool = False,
+    temperature: float = 1.0,
+    gamma: float = DEFAULT_REWARD_GAMMA,
+    opponent_temperature: float = 1.0,
+    opponent_temperatures: Sequence[float] | np.ndarray | None = None,
+    deterministic_opponent: bool = False,
+    deterministic_opponents: Sequence[bool] | np.ndarray | None = None,
+    sampling_seed: int = 0,
+    forward_mode: str = "cudagraphs",
+    forward_autocast: bool = False,
+    storage: dict[str, np.ndarray] | None = None,
+) -> RolloutBatch:
+    """Collect two independent CUDA waves concurrently into one ordered batch.
+
+    The split occurs only at game boundaries and each shard writes a contiguous
+    slice of the caller's rollout arena, so scheduling cannot reorder seeds or
+    trajectories. Each shard owns its BatchEnv, CUDA stream, actor replica, and
+    Gumbel generators. The fixed shard-derived seeds make stochastic actions
+    independent of thread scheduling; current and frozen policy streams remain
+    separate within each shard.
+    """
+    games = self_play_games + league_games
+    device = next(actor.parameters()).device
+    if device.type != "cuda" or games < 2:
+        return _collect_mixed_play_rust_wave(
+            actor,
+            opponents,
+            self_play_games=self_play_games,
+            league_games=league_games,
+            opponent_indices=opponent_indices,
+            builtin_lanes=builtin_lanes,
+            seed_start=seed_start,
+            episode_steps=episode_steps,
+            deterministic=deterministic,
+            temperature=temperature,
+            gamma=gamma,
+            opponent_temperature=opponent_temperature,
+            opponent_temperatures=opponent_temperatures,
+            deterministic_opponent=deterministic_opponent,
+            deterministic_opponents=deterministic_opponents,
+            sampling_seed=sampling_seed,
+            forward_mode=forward_mode,
+            forward_autocast=forward_autocast,
+            storage=storage,
+        )
+    if self_play_games < 0 or league_games < 0:
+        raise ValueError("game counts cannot be negative")
+    if episode_steps != 720:
+        raise ValueError("the native simulator currently supports the competition horizon 720")
+
+    started = time.perf_counter()
+    architecture = architecture_of(actor).name
+    horizon = episode_steps - 1
+    trajectories = 2 * self_play_games + league_games
+    fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
+    game_cut = games // 2
+    left_self_play = min(self_play_games, game_cut)
+    left_league = game_cut - left_self_play
+    right_self_play = self_play_games - left_self_play
+    right_league = league_games - left_league
+    trajectory_cut = 2 * left_self_play + left_league
+    field_views = (
+        {name: values[:trajectory_cut] for name, values in fields.items()},
+        {name: values[trajectory_cut:] for name, values in fields.items()},
+    )
+    if opponent_indices is None:
+        assignment_slices: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
+    else:
+        assignments = np.asarray(opponent_indices)
+        assignment_slices = (
+            assignments[:left_league],
+            assignments[left_league:],
+        )
+    actor_replica = _pipeline_replica(actor)
+    opponent_replicas = tuple(_pipeline_replica(opponent) for opponent in opponents)
+    streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=device))
+    first_forward = (threading.Event(), threading.Event())
+
+    def collect_shard(
+        shard: int,
+        shard_actor: FarmActor | StructuredActor,
+        shard_opponents: Sequence[FarmActor | StructuredActor],
+        shard_self_play: int,
+        shard_league: int,
+        shard_seed_start: int,
+    ) -> RolloutBatch:
+        if shard:
+            first_forward[0].wait()
+        with torch.cuda.device(device), torch.cuda.stream(streams[shard]):
+            try:
+                return _collect_mixed_play_rust_wave(
+                    shard_actor,
+                    shard_opponents if shard_league else (),
+                    self_play_games=shard_self_play,
+                    league_games=shard_league,
+                    opponent_indices=assignment_slices[shard],
+                    builtin_lanes=builtin_lanes if shard_league else (),
+                    seed_start=shard_seed_start,
+                    episode_steps=episode_steps,
+                    deterministic=deterministic,
+                    temperature=temperature,
+                    gamma=gamma,
+                    opponent_temperature=opponent_temperature,
+                    opponent_temperatures=opponent_temperatures if shard_league else None,
+                    deterministic_opponent=deterministic_opponent,
+                    deterministic_opponents=deterministic_opponents if shard_league else None,
+                    sampling_seed=(
+                        sampling_seed if shard == 0 else (sampling_seed ^ 0x51ED_5EED_71CE_DA7A)
+                    ),
+                    forward_mode=forward_mode,
+                    forward_autocast=forward_autocast,
+                    storage=field_views[shard],
+                    _ensemble_namespace=shard,
+                    _pipeline_ready=first_forward[shard].set,
+                    _pipeline_wait=first_forward[1].wait if shard == 0 else None,
+                )
+            finally:
+                # Both, unconditionally: shard 0 unblocks a peer waiting to
+                # start, and shard 1 unblocks a peer waiting to resume.
+                first_forward[0].set()
+                first_forward[1].set()
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rollout-shard") as executor:
+        futures = (
+            executor.submit(
+                collect_shard,
+                0,
+                actor,
+                opponents,
+                left_self_play,
+                left_league,
+                seed_start,
+            ),
+            executor.submit(
+                collect_shard,
+                1,
+                actor_replica,
+                opponent_replicas,
+                right_self_play,
+                right_league,
+                seed_start + game_cut,
+            ),
+        )
+        shards = tuple(future.result() for future in futures)
+
+    def joined(name: str) -> np.ndarray:
+        return np.concatenate([getattr(shard, name) for shard in shards])
+
+    return _native_batch(
+        architecture,
+        fields,
+        episode_seeds=joined("episode_seeds"),
+        final_money=joined("final_money"),
+        opponent_money=joined("opponent_money"),
+        seats=joined("seats"),
+        agents=joined("agents"),
+        orientations=joined("orientations"),
+        entropy_sums=joined("entropy_sums"),
         started=started,
     )
 
@@ -1636,8 +2443,18 @@ def collect_population_play_rust(
         (rows, MAX_MARKET_ORDERS, actors[0].config.quantity_rank), dtype=np.float32
     )
     autocast_forward = forward_autocast and device.type == "cuda"
-    compiled_forward = forward_mode != "eager"
 
+    def step_forward() -> ActorOutput:
+        """The population wave's whole device-side forward, as one capturable unit."""
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+            lane_output = ensemble(
+                *_lane_view_inputs(encoded_wave.inputs(), lane_tensor, population, lane_width),
+                mode=forward_mode,
+            )
+        return ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+
+    graphed = forward_mode == "graph" and device.type == "cuda"
+    step_graph: _CapturedStep[ActorOutput] | None = None
     for step in range(horizon):
         encoded_wave.refresh(environment)
         # refresh() re-encodes every array straight from the simulator, so the
@@ -1648,13 +2465,13 @@ def collect_population_play_rust(
         orient_boards(encoded["board"], codes)
         orient_unit_features(encoded["units"], encoded["unit_positions"], codes)
         encoded_wave.copy_to_device()
-        _mark_cuda_graph_step(device, compiled_forward)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
-            lane_output = ensemble(
-                *_lane_view_inputs(encoded_wave.inputs(), lane_tensor, population, lane_width),
-                mode=forward_mode,
-            )
-        output = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+        if graphed and step_graph is None:
+            step_graph = _CapturedStep(step_forward)
+        if step_graph is not None:
+            output = step_graph()
+        else:
+            with _cuda_graph_generation(device, forward_mode):
+                output = step_forward()
         host_outputs, packed_transfer = _packed_outputs_to_host((output,), packed_transfer)
         (host,) = host_outputs
         for destination, values in zip(
@@ -1715,6 +2532,9 @@ def collect_population_play_rust(
         if step + 1 == horizon and not dones.all():
             raise RuntimeError("native rollout did not terminate at the competition horizon")
         final = np.asarray(sampled["final_money"], dtype=np.float32)
+
+    if step_graph is not None:
+        step_graph.close()
 
     assert final is not None
     # Copied off the native buffer rather than viewed: the batch outlives this
