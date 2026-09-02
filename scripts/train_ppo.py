@@ -49,6 +49,7 @@ from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
+    DEFAULT_CRITIC_GAE_LAMBDA,
     MAX_FIRST_MINIBATCH_KL,
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
@@ -62,6 +63,7 @@ from kaggriculture.ppo import (
     update_ppo,
     update_replay_parity,
 )
+from kaggriculture.production import PRODUCTION_LEAGUE_GAMES, PRODUCTION_SELF_PLAY_GAMES
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
     file_sha256,
@@ -108,6 +110,7 @@ from kaggriculture.training import (
 MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
+DEFAULT_CRITIC_EPOCHS = 4
 DEFAULT_CRITIC_WARMUP_ITERATIONS = 5
 
 
@@ -139,8 +142,8 @@ def parse_args() -> argparse.Namespace:
         "--games",
         type=int,
         default=None,
-        help="games per wave; defaults to 112 for a single learner and "
-        "13 copies of every ordered pairing for a population",
+        help=f"games per wave; defaults to {PRODUCTION_SELF_PLAY_GAMES} for a single "
+        "learner and 13 copies of every ordered pairing for a population",
     )
     parser.add_argument(
         "--population",
@@ -158,11 +161,19 @@ def parse_args() -> argparse.Namespace:
         "--league-games",
         type=int,
         default=None,
-        help="frozen-league games per wave; defaults to 96 for a single learner "
-        "and 0 for a population (which has no frozen lane)",
+        help=f"frozen-league games per wave; defaults to {PRODUCTION_LEAGUE_GAMES} for "
+        "a single learner and 0 for a population (which has no frozen lane)",
     )
     parser.add_argument("--league-active-opponents", type=int, default=2)
-    parser.add_argument("--league-historical-opponents", type=int, default=2)
+    parser.add_argument(
+        "--league-historical-opponents",
+        type=int,
+        default=6,
+        help=(
+            "log-age PFSP snapshot lanes per wave; defaults to 6 so a 500-iteration "
+            "archive fills every occupied log2 rung outside the active window"
+        ),
+    )
     parser.add_argument("--league-active-pool-size", type=int, default=16)
     parser.add_argument(
         "--league-builtin-opponents",
@@ -205,24 +216,19 @@ def parse_args() -> argparse.Namespace:
         "family's model configuration and a flag from another family is rejected",
     )
     add_model_config_arguments(parser)
-    # These two read the dataclass rather than restating it. `actor_learning_rate`
-    # is a measurement -- the largest rate whose full epoch fits inside
-    # `target_kl` -- and a second copy here would silently outrank it whenever
-    # this script is driven by hand. The neighbours below deliberately do not
-    # follow: `--epochs` defaults to 1 against the dataclass's 4, because the
-    # shipped schedule reaches its critic epochs through `--critic-epochs`.
+    # Direct launches read PPO defaults from the algorithm configuration rather
+    # than maintaining a second schedule in this parser.
     parser.add_argument("--actor-lr", type=float, default=PpoConfig.actor_learning_rate)
     parser.add_argument("--critic-lr", type=float, default=PpoConfig.critic_learning_rate)
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=PpoConfig.epochs)
     parser.add_argument(
         "--critic-epochs",
         type=int,
-        default=None,
-        help="total critic epochs (>= --epochs; the excess are critic-only refits); "
-        "defaults to --epochs",
+        default=DEFAULT_CRITIC_EPOCHS,
+        help="total critic epochs (>= --epochs; the excess are critic-only refits)",
     )
-    parser.add_argument("--minibatch-size", type=int, default=2048)
+    parser.add_argument("--minibatch-size", type=int, default=PpoConfig.minibatch_size)
     parser.add_argument("--clip-low", type=float, default=0.80)
     parser.add_argument("--clip-high", type=float, default=1.28)
     parser.add_argument(
@@ -236,9 +242,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            "GAE lambda; defaults to CleanRL's standard 0.95. It sets the "
-            "critic too: the target is the lambda-return the advantage came from"
+            "policy GAE lambda; defaults to VAPO's formula 1-1/(0.05*719) at the "
+            "fixed competition horizon. Critic targets use --critic-gae-lambda"
         ),
+    )
+    parser.add_argument(
+        "--critic-gae-lambda",
+        type=float,
+        default=DEFAULT_CRITIC_GAE_LAMBDA,
+        help="critic GAE lambda; defaults to 1.0 (VAPO decoupled GAE, unbiased return)",
     )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
@@ -262,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     # speedups on the conv model fall on opposite sides of the threshold.
     # Neither knob is a boolean, and for the same reason on both sides -- the
     # decision is which execution mode, and the modes are not one measurement.
-    # On the collection side that is measured: on production 112-game waves with
+    # On the collection side that is measured: on 112-game waves with
     # a real BC actor the isolated forward runs 4.907 ms eager, 5.309 ms
     # cudagraphs and 2.720 ms inductor in fp32, so the old boolean's
     # `cudagraphs` was a pessimization dressed as an optimization. On the update
@@ -280,7 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-bfloat16", action="store_true")
     # The collection forward is ~64% of a wave's wall clock, and these two
     # defaults are where the measurement landed on both axes rather than a
-    # preference. Production 112-game waves, real BC actor: the rollout sweep
+    # preference. Measured 112-game waves with a real BC actor: the rollout sweep
     # moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x, and the
     # shipped 4-wave `scripts/audit_replay_parity.py` gate on the league-mixed
     # path moves worst max_kl 1.9089e-03 -> 2.2786e-04, 8.4x lower drift.
@@ -429,13 +441,17 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.init_actor_from is not None and args.critic_warmup_iterations is None:
         args.critic_warmup_iterations = DEFAULT_CRITIC_WARMUP_ITERATIONS
-    # A population wave is all learners; the single-learner defaults (112 live
-    # games plus 96 frozen) are not a valid population configuration, so they
+    # A population wave is all learners; the single-learner defaults (128 live
+    # games plus 64 frozen) are not a valid population configuration, so they
     # must not be the implicit ones. An explicit flag still wins either way.
     if args.games is None:
-        args.games = args.population * (args.population - 1) * 13 if args.population > 1 else 112
+        args.games = (
+            args.population * (args.population - 1) * 13
+            if args.population > 1
+            else PRODUCTION_SELF_PLAY_GAMES
+        )
     if args.league_games is None:
-        args.league_games = 0 if args.population > 1 else 96
+        args.league_games = 0 if args.population > 1 else PRODUCTION_LEAGUE_GAMES
     return args
 
 
@@ -664,6 +680,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(args.actor_gae_lambda) or not 0.0 <= args.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
+    if not math.isfinite(args.critic_gae_lambda) or not 0.0 <= args.critic_gae_lambda <= 1.0:
+        raise ValueError("critic GAE lambda must be finite and in [0, 1]")
     if not math.isfinite(args.max_hours) or args.max_hours < 0.0:
         raise ValueError("max hours must be finite and non-negative")
     if args.seed < 0:
@@ -2163,6 +2181,7 @@ def main() -> None:
         clip_high=args.clip_high,
         gamma=args.gamma,
         actor_gae_lambda=args.actor_gae_lambda,
+        critic_gae_lambda=args.critic_gae_lambda,
         max_gradient_norm=args.max_gradient_norm,
         target_kl=args.target_kl,
         optimizer=args.optimizer,

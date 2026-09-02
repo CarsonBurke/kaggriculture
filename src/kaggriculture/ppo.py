@@ -1,4 +1,4 @@
-"""PPO masked-token update with CleanRL's standard GAE schedule and lambda-return targets."""
+"""PPO masked-token update with VAPO's decoupled GAE and lambda-return targets."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from kaggriculture.constants import DEFAULT_REWARD_GAMMA
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, EPISODE_STEPS
 from kaggriculture.latent_dynamics import DecodeContext, DecodeHeads, DecodeMasks
 from kaggriculture.model import (
     DistributionalCritic,
@@ -41,9 +41,16 @@ from kaggriculture.structured_dynamics import (
 Critic = DistributionalCritic | StructuredCritic
 Actor = FarmActor | StructuredActor
 
-#: CleanRL's standard PPO GAE lambda (cleanrl/ppo.py `gae_lambda = 0.95`), shared
-#: by the actor advantages and the critic's lambda-return targets.
-DEFAULT_ACTOR_GAE_LAMBDA = 0.95
+#: VAPO (arXiv:2504.05118) GAE alpha. Length-adaptive GAE would set
+#: ``lambda_policy = 1 - 1 / (alpha * length)`` per sequence because LLM
+#: responses vary. Kaggriculture episodes are a known 719-action horizon, so
+#: the same formula is a constant rather than a per-row schedule.
+VAPO_GAE_ALPHA = 0.05
+COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (VAPO_GAE_ALPHA * COMPETITION_ACTION_STEPS)
+#: VAPO / VC-PPO decoupled GAE: the critic regresses on the unbiased
+#: lambda-one return. Policy advantages keep the shorter actor lambda.
+DEFAULT_CRITIC_GAE_LAMBDA = 1.0
 
 #: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
 _OPTIMIZERS = ("normuon", "adamw")
@@ -254,9 +261,10 @@ MAX_FIRST_MINIBATCH_KL = 1.1e-1
 _REPLAY_AUDIT_SHUFFLE_SEED = 20260815
 
 #: Share of value targets the critic support may saturate before the run is
-#: stopped. The lambda-return adds the critic's own prediction to the reward, so
-#: no support width contains it by construction and a small saturated share is
-#: ordinary critic error escaping the outermost atom. What this catches is the
+#: stopped. VAPO decoupled GAE fits the critic on the lambda-one return, which
+#: does not add the critic's own prediction, but a bounded categorical mean
+#: still cannot represent a target outside the atoms. A small saturated share
+#: is ordinary error escaping the outermost atom. What this catches is the
 #: degenerate end: a critic collapsed onto the edge atom, whose every target is
 #: then clipped to a constant label that holds it there.
 #:
@@ -523,28 +531,16 @@ class PpoConfig:
     # decay. `modded-nanogpt` ships both.
     normuon_momentum: float = 0.95
     normuon_beta2: float = 0.9
-    epochs: int = 4
+    epochs: int = 2
     # Total epochs for the critic; the actor participates only in the first
     # `epochs` of them, so values above `epochs` are critic-only refits over
-    # the same rollout. None matches the actor epoch count. The actor's trust
-    # region binds near one pass per state, but a single critic pass leaves
-    # explained variance oscillating and starves rarely-visited states of
-    # value estimates.
+    # the same rollout. None matches the actor epoch count.
     critic_epochs: int | None = None
-    # Measured optimal, not a convention. `scripts/sweep_update_batch.py` runs
-    # the production schedule at 2048/4096/8192/16384 nominal rows against both
-    # compiled modes: 2048 is the fastest cell in every run, 4096 is 2.2-4.8%
-    # slower despite halving the minibatch count, and 8192 and 16384 do not fit.
-    # Larger batches lose because device time per row rises (critic 20.88 ->
-    # 22.20 us/row) while kernel count per minibatch stays flat -- the count is a
-    # property of the compiled graph, so doubling rows doubles the work inside
-    # each kernel instead of removing kernels. Activation memory is linear at
-    # 4.22-4.25 MiB/row, which puts 8192 effective rows at ~32.5 GiB against a
-    # 31.36 GiB card: above 4096 there is no headroom on this axis at all.
-    # Raising it would also halve the points at which `target_kl` can bind and
-    # double the warmup measured in iterations, so there is no wall-clock win to
-    # weigh against those.
-    minibatch_size: int = 2048
+    # Largest measured update batch with working headroom for the structured
+    # n16 model. 2048 rows was 2.2-4.8% faster in the earlier throughput sweep,
+    # but used roughly 12 GiB and left the device underfilled. 4096 uses roughly
+    # 24 GiB; 8192 exceeds this 31.36-GiB GPU.
+    minibatch_size: int = 4096
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
     # collapse: a symmetric band clips a low-probability action's upside at the
@@ -581,9 +577,15 @@ class PpoConfig:
     # Discount-correct shaping uses this same gamma during collection:
     # nonterminal rewards are gamma * Phi(next) - Phi(current), while terminal
     # bank utility is paid separately. The fixed-horizon discounted return
-    # therefore preserves the terminal objective without forcing the critic to
-    # propagate all 719 transitions at gamma one.
+    # therefore preserves the terminal objective without forcing gamma one.
+    #
+    # VAPO decoupled GAE (arXiv:2504.05118, following VC-PPO): the policy uses
+    # a shorter lambda so advantages stay low-variance; the critic regresses on
+    # the lambda-one return so long-horizon reward does not decay as lambda^t.
+    # Length-adaptive GAE is not used -- every episode is COMPETITION_ACTION_STEPS
+    # long, so actor_gae_lambda is VAPO's formula evaluated at that constant.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
+    critic_gae_lambda: float = DEFAULT_CRITIC_GAE_LAMBDA
     gamma: float = DEFAULT_REWARD_GAMMA
     # Measured to bind on EVERY minibatch, which makes this the step-size
     # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
@@ -682,12 +684,13 @@ class PpoConfig:
 class AdvantageBatch:
     advantages: np.ndarray
     value_targets: np.ndarray
-    # The gamma-discounted suffix return (lambda one). Nothing trains on it: it
-    # is the target the critic used to fit, kept as the one measurement of
-    # critic quality the critic cannot move. Explained variance against
-    # `value_targets` is scored against a target that contains the prediction,
-    # so it improves when the critic merely agrees with itself; against this
-    # it does not.
+    # Policy-lambda return ``A_policy + V``. The critic does not regress on it.
+    # Explained variance against this target is the conventional PPO identity
+    # ``1 - Var(A)/Var(G_lambda)``: it rises when the critic merely agrees with
+    # itself. Monte Carlo explained variance against `monte_carlo_returns` is
+    # the measurement the critic cannot move. Default critic_gae_lambda is 1, so
+    # `value_targets` equal those suffix returns.
+    policy_lambda_returns: np.ndarray
     monte_carlo_returns: np.ndarray
     # Location and scale of the advantages before normalization. The normalized
     # array is zero-mean and unit-variance by construction, so measuring it
@@ -702,19 +705,14 @@ def generalized_advantage_and_targets(
     rewards: Tensor,
     values: Tensor,
     valid: Tensor,
-    actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
+    gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA,
     gamma: float = DEFAULT_REWARD_GAMMA,
 ) -> tuple[Tensor, Tensor]:
-    """Compute lambda-GAE advantages and the matching lambda-return targets.
+    """Compute lambda-GAE advantages and the matching lambda-return ``A + V``.
 
-    The critic target is the standard PPO return, `advantage + value`, which is
-    the lambda-return under the same lambda the actor uses. It is unbiased
-    wherever the value function is exact and trades the remaining bias for a
-    variance reduction that grows with the horizon: over 719 transitions the
-    lambda-one Monte Carlo suffix return accumulates the noise of every later
-    action into every earlier state's target. Dense potential differences expose
-    relative progress throughout the episode, so the shorter window keeps useful
-    local signal while the critic supplies the continuation estimate.
+    Callers pick the lambda: the actor uses `PpoConfig.actor_gae_lambda`, the
+    critic uses `PpoConfig.critic_gae_lambda` (VAPO's decoupled GAE, lambda one
+    by default). This helper is the recurrence only.
     """
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")
@@ -722,8 +720,8 @@ def generalized_advantage_and_targets(
         raise ValueError("values must be [trajectories, time]")
     if not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
         raise ValueError("gamma must be finite and in (0, 1]")
-    if not math.isfinite(actor_gae_lambda) or not 0.0 <= actor_gae_lambda <= 1.0:
-        raise ValueError("actor GAE lambda must be finite and in [0, 1]")
+    if not math.isfinite(gae_lambda) or not 0.0 <= gae_lambda <= 1.0:
+        raise ValueError("GAE lambda must be finite and in [0, 1]")
     if values.size(1) == 0:
         return torch.zeros_like(values), torch.zeros_like(values)
 
@@ -747,7 +745,7 @@ def generalized_advantage_and_targets(
     for step in range(values.size(1) - 1, -1, -1):
         next_valid = next_valids[:, step]
         running_advantage = (
-            deltas[:, step] + gamma * actor_gae_lambda * running_advantage * next_valid
+            deltas[:, step] + gamma * gae_lambda * running_advantage * next_valid
         ) * valid[:, step]
         advantage_columns.append(running_advantage)
     advantages = torch.stack(advantage_columns[::-1], dim=1).to(values.dtype)
@@ -787,6 +785,8 @@ def _validate_config(config: PpoConfig) -> None:
         raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
+    if not math.isfinite(config.critic_gae_lambda) or not 0.0 <= config.critic_gae_lambda <= 1.0:
+        raise ValueError("critic GAE lambda must be finite and in [0, 1]")
     coefficients = {
         "structured decision": config.structured_decision_coefficient,
         "structured patch": config.structured_patch_coefficient,
@@ -1148,7 +1148,7 @@ def prepare_advantages(
     *,
     rows: np.ndarray | None = None,
 ) -> AdvantageBatch:
-    """Lambda-GAE advantages and targets, normalized over the states one update owns.
+    """VAPO decoupled GAE: policy advantages at actor lambda, critic targets at critic lambda.
 
     `rows` restricts every statistic to those trajectory rows: the location and
     scale the advantages are normalized by are that subset's own, and rows
@@ -1163,11 +1163,18 @@ def prepare_advantages(
     rewards = torch.from_numpy(rollout.rewards).float()
     values = torch.from_numpy(values).float()
     valid = torch.from_numpy(_owned_valid(rollout, rows)).float()
-    advantages, targets = generalized_advantage_and_targets(
+    advantages, policy_lambda_returns = generalized_advantage_and_targets(
         rewards,
         values,
         valid,
-        actor_gae_lambda=config.actor_gae_lambda,
+        gae_lambda=config.actor_gae_lambda,
+        gamma=config.gamma,
+    )
+    _, critic_targets = generalized_advantage_and_targets(
+        rewards,
+        values,
+        valid,
+        gae_lambda=config.critic_gae_lambda,
         gamma=config.gamma,
     )
     selected = advantages[valid.bool()]
@@ -1183,12 +1190,13 @@ def prepare_advantages(
         rewards,
         torch.zeros_like(values),
         valid,
-        actor_gae_lambda=1.0,
+        gae_lambda=1.0,
         gamma=config.gamma,
     )[1]
     return AdvantageBatch(
         advantages=normalized.numpy(),
-        value_targets=targets.numpy(),
+        value_targets=critic_targets.numpy(),
+        policy_lambda_returns=policy_lambda_returns.numpy(),
         monte_carlo_returns=monte_carlo.numpy(),
         raw_advantage_mean=float(raw_mean),
         raw_advantage_std=float(raw_std),
@@ -1520,9 +1528,9 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function, m
     justified refusing CUDA graphs on the claim that capturing the update's
     forward+backward "would permanently pin every minibatch's activations in
     private pools". That is false, and false in the opposite direction. Measured
-    by `scripts/profile_update_backends.py` over the production schedule -- 73
-    actor and 292 critic minibatches at 2048 -- as wall clock / peak reserved /
-    compile time:
+    by `scripts/profile_update_backends.py` over its measured baseline schedule
+    -- 73 actor and 292 critic minibatches at 2048 -- as wall clock / peak
+    reserved / compile time:
 
         eager                        41.444 s   11.34 GiB     0.8 s
         default                      17.107 s   11.34 GiB    34.3 s
@@ -2153,11 +2161,12 @@ def _fit_explained_variance(sums: dict[str, Tensor], states: int) -> float:
     """Explained variance of the critic's own regression, from streamed sums.
 
     The two explained variances taken from the pre-update replay cannot answer
-    whether the regression worked. Against the suffix return the critic is
-    scored on a quantity it never fits directly. Against the lambda-return the
-    residual is identically the advantage -- the target is `advantages + values`
-    and the prediction is those same `values` -- so the number rises whenever
-    the critic's predictions merely gain variance, agreeing with themselves.
+    whether the regression worked. Against the policy lambda-return the residual
+    is identically the advantage -- that target is ``A_policy + V`` -- so the
+    number rises whenever the critic's predictions merely gain variance. Against
+    the Monte Carlo suffix the critic can fail while still looking good on the
+    short-horizon identity. With decoupled GAE those two split: the critic
+    fits the suffix, and the policy-lambda reading stays the identity.
 
     This one is neither: the targets are fixed before the update and the
     predictions are the critic's own, so a critic that is fitting what it was
@@ -2771,13 +2780,10 @@ def update_ppo(
         raise ValueError("critic value support must be finite, increasing, and evenly spaced")
     if not np.isfinite(valid_value_targets).all():
         raise ValueError("value targets must be finite")
-    # The lambda-return bootstraps off the critic's own prediction, so its range
-    # is the reward range plus the critic's rather than the reward range alone;
-    # no bounded support can contain it by construction, and every categorical
-    # critic saturates the target at the outermost atom for exactly this reason.
-    # Saturation is therefore measured rather than fatal: it is the critic's own
-    # error escaping the support, and the fraction over time is the signal --
-    # killing a run on one excursion would report the same fact by crashing.
+    # The critic target is the decoupled lambda-one return. A bounded
+    # categorical mean still cannot represent a target outside its atoms, so
+    # saturation is measured rather than fatal: it is error escaping the
+    # support, and the fraction over time is the signal.
     saturated = np.count_nonzero(
         (valid_value_targets < value_support[0]) | (valid_value_targets > value_support[-1])
     )
@@ -2850,12 +2856,12 @@ def update_ppo(
     # instead of serializing the stream after every actor forward.
     #
     # Critic-only minibatches take no such wait. The host wait exists to enforce
-    # the actor's trust region inside the epoch that produced it, and on the
-    # production schedule (epochs=1, critic_epochs=4) three of every four epochs
-    # have no actor at all -- 219 of 292 minibatches were paying for a decision
-    # with no branch to inform. Those gate the critic step with the fused
-    # optimizer's own device-side skip and report finiteness at the epoch
-    # boundary, which is the first point the outcome can change what runs next.
+    # the actor's trust region inside the epoch that produced it. On the current
+    # 230,080-state schedule (epochs=2, critic_epochs=4, minibatch_size=4096),
+    # two of four epochs have no actor -- 114 of 228 minibatches need no host
+    # decision. Those gate the critic step with the fused optimizer's own
+    # device-side skip and report finiteness at the epoch boundary, which is the
+    # first point the outcome can change what runs next.
     guard_host = torch.empty(
         4 if actor_auxiliary_active else 3,
         dtype=torch.float64,
@@ -3246,40 +3252,29 @@ def update_ppo(
         "value_target_std": float(prepared.value_targets[owned_valid].std()),
         "value_target_min": float(prepared.value_targets[owned_valid].min()),
         "value_target_max": float(prepared.value_targets[owned_valid].max()),
-        # Every target statistic here, and the suffix-return and lambda-return
-        # explained variances and the correlation below, are taken from the
-        # unclipped return, so they all describe one quantity -- what the
-        # target was, and how much of it the support could not hold.
-        # `value_loss` and the two critic-fit explained variances are the
-        # exceptions by necessity, since the critic regresses on the saturated
-        # copy and scoring a fit against a target no bounded support can reach
-        # would measure the support width. During a saturation episode the two
-        # conventions diverge -- a fixed-error critic reads about +0.16 higher
-        # on the clipped target at this fraction's run-killing bound -- and
-        # this fraction is what says so.
+        # Every target statistic here, and the suffix-return explained variance
+        # and the correlation below, are taken from the unclipped critic target
+        # (the lambda-one return). `value_loss` and the two critic-fit explained
+        # variances are the exceptions by necessity, since the critic regresses
+        # on the saturated copy.
         "value_target_saturated_fraction": float(saturated) / float(valid_value_targets.size),
         "actor_gae_lambda": config.actor_gae_lambda,
+        "critic_gae_lambda": config.critic_gae_lambda,
         "gamma": config.gamma,
         "actor_learning_rate": float(actor_optimizer.param_groups[0]["lr"]),
         "critic_learning_rate": float(critic_optimizer.param_groups[0]["lr"]),
-        # Four explained variances against three targets, because one number
-        # cannot carry the questions the run has been misread for want of
-        # separating.
-        #
-        # Against the discounted suffix return. The critic does not regress
+        # Against the discounted suffix return, which decoupled GAE also uses
+        # as the critic target. Pre-update predictions, so this is not a fit.
         "monte_carlo_explained_variance": _explained_variance(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
-        # Against the target actually regressed on, from the pre-update
-        # predictions -- which are inside that target, since it is
-        # `advantages + values`. The residual is therefore identically the
-        # advantage and this is exactly `1 - Var(A)/Var(G_lambda)`: the
-        # conventional PPO reading, and one the critic can raise by merely
-        # gaining prediction variance.
+        # Against the policy lambda-return ``A + V``. Residual is identically
+        # the advantage: ``1 - Var(A)/Var(G_lambda)``. The critic does not fit
+        # this target.
         "lambda_return_explained_variance": _explained_variance(
-            prepared.value_targets, behavior_values, owned_valid
+            prepared.policy_lambda_returns, behavior_values, owned_valid
         ),
-        # Against the same target with predictions taken during the update, so
+        # Against the critic target with predictions taken during the update, so
         # the residual is a fit error rather than an algebraic identity. These
         # two are what say whether the regression is working, and the gap
         # between them says whether it is generalizing rather than memorizing

@@ -62,9 +62,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260812)
     # The self-play-only wave has production's exact state count -- 320
     # trajectories of 719 -- but not its opponent composition. A league wave
-    # replaces 128 of the learner's 224 self-play rows with 96 rows played
-    # against frozen snapshots, whose state distribution is what the KL is
-    # measured on. Pass `--league-games` to sweep the shipped mixture.
+    # replaces 64 of those current-policy rows with 64 rows played against
+    # frozen snapshots, whose state distribution is what the KL is measured on.
+    # Pass `--league-games` to sweep the shipped mixture.
     parser.add_argument("--league-games", type=int, default=0)
     parser.add_argument("--league-dir", type=Path, default=None)
     parser.add_argument(

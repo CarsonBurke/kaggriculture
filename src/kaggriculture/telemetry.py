@@ -51,7 +51,10 @@ from typing import Any, Protocol
 #: every rule into `misc/agent0_value_loss`, a tag the new scheme never writes, so
 #: an epoch 7 mirror appended to under this one would serve one agent's critic
 #: loss from two categories at once.
-_LAYOUT_EPOCH = 8
+#: 9: VAPO decoupled GAE adds `schedule/critic_gae_lambda` beside the actor
+#: lambda. The fingerprint would already rebuild, but an epoch bump keeps the
+#: human ledger in the same file as the tables.
+_LAYOUT_EPOCH = 9
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -516,6 +519,7 @@ _TRAINING_TAGS = {
     "actor_learning_rate": "schedule/actor_learning_rate",
     "critic_learning_rate": "schedule/critic_learning_rate",
     "actor_gae_lambda": "schedule/actor_gae_lambda",
+    "critic_gae_lambda": "schedule/critic_gae_lambda",
     "gamma": "schedule/gamma",
     "epochs": "schedule/epochs",
     "updates": "schedule/updates",

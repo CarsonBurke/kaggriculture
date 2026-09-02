@@ -9,15 +9,14 @@ minibatch's activations in private pools" -- an assertion with no number behind
 it, and the identical reasoning that turned out to be wrong for collection,
 where the shipped graph backend was slower than not compiling at all.
 
-So this measures both halves of that claim on the production schedule: wall
-clock AND peak allocated bytes, over the real `_actor_minibatch_terms` and
+So this measures both halves of that claim on the original benchmark schedule:
+wall clock AND peak allocated bytes, over the real `_actor_minibatch_terms` and
 `_critic_minibatch_loss` including their backwards, the gradient clip, and the
 fused optimizer step.
 
-The schedule is production's: 73 actor minibatches and 292 critic minibatches
-per iteration (epochs=1, critic_epochs=4, minibatch_size=2048), alternating so
-the two compiled graphs interleave exactly as they do in `update_ppo` -- which
-is what decides whether CUDA-graph pools can be reused or must coexist.
+The measured baseline has 73 actor minibatches and 292 critic minibatches per
+iteration (epochs=1, critic_epochs=4, minibatch_size=2048), alternating so the
+two compiled graphs interleave exactly as they do in `update_ppo`.
 """
 
 from __future__ import annotations

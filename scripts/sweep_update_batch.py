@@ -86,11 +86,10 @@ from kaggriculture.ppo import (
     make_optimizers,
 )
 
-#: 73 * 2048, the state count that reproduces production's observed schedule of
-#: 73 actor and 292 critic minibatches at the production minibatch size. The
-#: real per-iteration count is the number of valid states in a wave, which lands
-#: within one minibatch of this; pinning it here keeps the 2048 cell directly
-#: comparable with the single-axis measurements in `_cached_update_callable`.
+#: 73 * 2048, the state count used by the original production measurement.
+#: Pinning it here keeps the 2048 cell directly comparable with the single-axis
+#: measurements in `_cached_update_callable`; it is benchmark evidence, not the
+#: current training wave size.
 PRODUCTION_STATES = 149_504
 
 #: Device-side Kineto categories. `kernel` is a launched CUDA kernel; the memory

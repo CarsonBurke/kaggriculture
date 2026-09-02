@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Measure whether the last critic epochs of a PPO update generalize or memorize.
 
-Production runs `epochs=1, critic_epochs=4` at `minibatch_size=2048`, and the
-critic refit is roughly 26 s of a 33.7 s iteration -- about 6.5 s per critic
-epoch, so `critic_epochs=4 -> 2` would be a ~1.6x iteration speedup. The
-hypothesis under test is that the later epochs buy nothing the run can use. The
-run's own telemetry is what raises it: `critic_fit_explained_variance_first_epoch`
-against `_last_epoch` measured 0.906 against 0.987, which is the signature of a
+The original schedule measured here ran `epochs=1, critic_epochs=4` at
+`minibatch_size=2048`; the critic refit was roughly 26 s of a 33.7 s iteration,
+about 6.5 s per critic epoch. The hypothesis under test is that the later epochs
+buy nothing the run can use. The run's own telemetry raises it:
+`critic_fit_explained_variance_first_epoch` against `_last_epoch` measured
+0.906 against 0.987, which is the signature of a
 regression that keeps improving on the rollout batch it is being fitted to
 rather than on states it has not seen.
 
@@ -18,10 +18,10 @@ strongly correlated, so a random state split puts near-duplicates of fitted
 states into the holdout and would report memorization as generalization. Games
 are split 80/20 on `episode_seeds` -- both self-play seats of a game share one
 seed and therefore land on the same side -- the critic is refitted on the fit
-games alone under the production schedule (same `_stage_tensor` staging, same
-`_balanced_minibatch_slices` partitioning at 2048, same `make_optimizers`
-construction and `_optimizer_step` warmup, same bf16 autocast, same
-`update_compile_mode`, same `_critic_minibatch_objective`), and after every epoch
+games alone under the measured schedule (same `_stage_tensor` staging, same
+`_balanced_minibatch_slices` partitioning, same `make_optimizers` construction
+and `_optimizer_step` warmup, same bf16 autocast, same `update_compile_mode`,
+same `_critic_minibatch_objective`), and after every epoch
 explained variance and the optimized distributional loss are measured on both
 sides at frozen weights, with a CUDA-synchronized wall clock around each epoch's
 gradient steps. Explained variance uses the same four target/residual moments
@@ -112,12 +112,11 @@ from kaggriculture.rollout import (
 def _production_critic_minibatches_per_epoch(minibatch_size: int) -> int:
     """Critic minibatches one production epoch runs, from the shipped wave shape.
 
-    (112 self-play games x 2 seats + 96 league games) x 719 stored steps is
+    (128 self-play games x 2 seats + 64 league games) x 719 stored steps is
     230,080 states, every one of them a valid learner state, and
     `_balanced_minibatch_slices` partitions an epoch into
-    ceil(states / minibatch_size) of them -- 113 at 2048. The shipped iteration
-    benchmark confirms the count rather than leaving it derived: 452 critic
-    minibatches over `critic_epochs=4`, at a median update phase of 28.03 s.
+    ceil(states / minibatch_size) minibatches -- 57 at the current 4096-row
+    ceiling, or 228 critic minibatches over four epochs.
 
     This probe fits self-play states minus a holdout, so its per-epoch seconds
     are reported raw AND rescaled through this count, which is the unit an

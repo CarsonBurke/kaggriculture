@@ -16,6 +16,7 @@ from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
+    DEFAULT_CRITIC_GAE_LAMBDA,
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
     UNCOMPILED_UPDATE_COMPILE_MODE,
@@ -87,12 +88,21 @@ def test_rollout_action_masks_are_validated_once_before_replay() -> None:
         _validate_staged_action_masks(staged, valid)
 
 
-def test_default_gae_uses_discounted_reward_contract() -> None:
+def test_default_gae_uses_vapo_decoupled_contract() -> None:
     config = PpoConfig()
 
     assert config.gamma == pytest.approx(0.997)
-    assert config.actor_gae_lambda == pytest.approx(0.95)
+    assert config.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
     assert config.actor_gae_lambda == DEFAULT_ACTOR_GAE_LAMBDA
+    assert config.critic_gae_lambda == pytest.approx(1.0)
+    assert config.critic_gae_lambda == DEFAULT_CRITIC_GAE_LAMBDA
+
+
+def test_out_of_range_critic_gae_lambda_is_rejected() -> None:
+    with pytest.raises(ValueError, match="critic GAE lambda must be finite"):
+        _validate_config(PpoConfig(critic_gae_lambda=1.5))
+    with pytest.raises(ValueError, match="critic GAE lambda must be finite"):
+        _validate_config(PpoConfig(critic_gae_lambda=float("nan")))
 
 
 def test_out_of_range_gamma_is_rejected() -> None:
@@ -144,27 +154,73 @@ def test_minibatches_are_balanced_without_dropping_the_tail() -> None:
     assert slices[-1].stop == 230_080
 
 
-def test_the_critic_target_is_the_lambda_return_the_actor_advantage_came_from() -> None:
-    """Standard PPO: the critic regresses on `advantage + value`.
+def test_gae_at_a_lambda_returns_advantage_plus_value() -> None:
+    """The recurrence itself still yields ``A + V`` at the lambda it was given.
 
-    Only the terminal target is the Monte Carlo return, because nothing is left
-    to bootstrap from. Every earlier one is pulled toward the value function by
-    the same lambda that truncates the actor's advantage, which is the whole
-    point of bootstrapping a dense reward: the target for a state 719 steps from
-    the end stops carrying 719 steps of sampling noise.
+    Decoupling happens in `prepare_advantages`, which calls this twice.
     """
     rewards = torch.tensor([[0.0, 0.0, 1.0]])
     values = torch.tensor([[0.2, -0.1, 0.5]])
     valid = torch.ones_like(rewards)
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=0.5, gamma=1.0
+        rewards, values, valid, gae_lambda=0.5, gamma=1.0
     )
 
     torch.testing.assert_close(advantages, torch.tensor([[0.125, 0.85, 0.5]]))
     torch.testing.assert_close(targets, torch.tensor([[0.325, 0.75, 1.0]]))
-    # The lambda-one Monte Carlo suffix return the critic used to fit.
     assert not torch.allclose(targets, torch.ones_like(targets))
+
+
+def test_prepare_advantages_fits_the_critic_on_the_lambda_one_return() -> None:
+    """VAPO decoupled GAE: critic targets are Monte Carlo, not the policy lambda-return."""
+    rewards = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+    values = np.array([[0.2, -0.1, 0.5]], dtype=np.float32)
+    valid = np.ones_like(rewards, dtype=np.bool_)
+    rollout = SimpleNamespace(rewards=rewards, valid=valid)
+
+    prepared = prepare_advantages(
+        rollout, values, PpoConfig(actor_gae_lambda=0.5, critic_gae_lambda=1.0, gamma=1.0)
+    )
+
+    np.testing.assert_allclose(prepared.policy_lambda_returns, [[0.325, 0.75, 1.0]], atol=1e-6)
+    np.testing.assert_allclose(prepared.value_targets, [[1.0, 1.0, 1.0]], atol=1e-6)
+    np.testing.assert_allclose(prepared.monte_carlo_returns, prepared.value_targets, atol=1e-6)
+    assert not np.allclose(prepared.value_targets, prepared.policy_lambda_returns)
+
+
+def test_prepare_advantages_uses_the_configured_critic_lambda() -> None:
+    """A non-default critic lambda must change the target, not silently stay MC."""
+    rewards = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+    values = np.array([[0.2, -0.1, 0.5]], dtype=np.float32)
+    valid = np.ones_like(rewards, dtype=np.bool_)
+    prepared = prepare_advantages(
+        SimpleNamespace(rewards=rewards, valid=valid),
+        values,
+        PpoConfig(actor_gae_lambda=0.5, critic_gae_lambda=0.5, gamma=1.0),
+    )
+
+    np.testing.assert_allclose(prepared.value_targets, [[0.325, 0.75, 1.0]], atol=1e-6)
+    np.testing.assert_allclose(prepared.policy_lambda_returns, prepared.value_targets, atol=1e-6)
+    assert not np.allclose(prepared.value_targets, prepared.monte_carlo_returns)
+
+
+def test_policy_lambda_explained_variance_is_the_advantage_identity() -> None:
+    """EV against G_policy is ``1 - Var(A)/Var(G_policy)``, not critic fit."""
+    rewards = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+    values = np.array([[0.2, -0.1, 0.5]], dtype=np.float32)
+    valid = np.ones_like(rewards, dtype=np.bool_)
+    prepared = prepare_advantages(
+        SimpleNamespace(rewards=rewards, valid=valid),
+        values,
+        PpoConfig(actor_gae_lambda=0.5, critic_gae_lambda=1.0, gamma=1.0),
+    )
+    residual = prepared.policy_lambda_returns - values
+    identity = 1.0 - residual[valid].var() / prepared.policy_lambda_returns[valid].var()
+    assert _explained_variance(prepared.policy_lambda_returns, values, valid) == pytest.approx(
+        identity
+    )
+    assert _explained_variance(prepared.value_targets, values, valid) != pytest.approx(identity)
 
 
 def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
@@ -180,9 +236,9 @@ def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
     valid = torch.ones_like(rewards)
     exact = potentials[:, -1:] - potentials[:, :-1]
 
-    for actor_gae_lambda in (0.0, 0.5, 1.0):
+    for gae_lambda in (0.0, 0.5, 1.0):
         advantages, targets = generalized_advantage_and_targets(
-            rewards, exact, valid, actor_gae_lambda=actor_gae_lambda, gamma=1.0
+            rewards, exact, valid, gae_lambda=gae_lambda, gamma=1.0
         )
 
         torch.testing.assert_close(advantages, torch.zeros_like(advantages))
@@ -192,7 +248,7 @@ def test_an_exact_critic_makes_the_target_exact_at_any_lambda() -> None:
     # target ignoring it: displace the critic and the target moves with it,
     # which the Monte Carlo suffix return it replaced would not have done.
     displaced = generalized_advantage_and_targets(
-        rewards, exact + 0.5, valid, actor_gae_lambda=0.5, gamma=1.0
+        rewards, exact + 0.5, valid, gae_lambda=0.5, gamma=1.0
     )[1]
     assert not torch.allclose(displaced, exact)
 
@@ -202,13 +258,13 @@ def test_dense_gae_matches_reference_recurrence_at_scale() -> None:
     rewards = torch.randn(4, 719, generator=generator)
     values = torch.randn(4, 719, generator=generator)
     valid = torch.ones_like(rewards)
-    gamma, actor_gae_lambda = 1.0, DEFAULT_ACTOR_GAE_LAMBDA
+    gamma, gae_lambda = 1.0, DEFAULT_ACTOR_GAE_LAMBDA
 
     advantages, targets = generalized_advantage_and_targets(
         rewards,
         values,
         valid,
-        actor_gae_lambda=actor_gae_lambda,
+        gae_lambda=gae_lambda,
         gamma=gamma,
     )
 
@@ -218,7 +274,7 @@ def test_dense_gae_matches_reference_recurrence_at_scale() -> None:
     expected = torch.empty_like(deltas)
     running = torch.zeros(deltas.size(0))
     for step in range(deltas.size(1) - 1, -1, -1):
-        running = deltas[:, step] + gamma * actor_gae_lambda * running
+        running = deltas[:, step] + gamma * gae_lambda * running
         expected[:, step] = running
 
     torch.testing.assert_close(advantages, expected)
@@ -231,7 +287,7 @@ def test_discounted_advantages_and_targets_match_the_reference_recurrence() -> N
     valid = torch.ones_like(rewards)
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=0.5, gamma=0.9
+        rewards, values, valid, gae_lambda=0.5, gamma=0.9
     )
 
     delta_2 = 0.3 - (-0.2)
@@ -267,7 +323,7 @@ def test_lambda_one_recovers_the_monte_carlo_return_whatever_the_critic_says() -
         torch.tensor([[-2.0, 6.0, 9.0], [-5.0, 11.0, 0.5]]),
     ):
         targets = generalized_advantage_and_targets(
-            rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
+            rewards, values, valid, gae_lambda=1.0, gamma=1.0
         )[1]
 
         torch.testing.assert_close(targets, monte_carlo)
@@ -276,7 +332,7 @@ def test_lambda_one_recovers_the_monte_carlo_return_whatever_the_critic_says() -
         rewards,
         torch.tensor([[10.0, -7.0, 3.0], [4.0, 1.0, -8.0]]),
         valid,
-        actor_gae_lambda=0.99,
+        gae_lambda=0.99,
         gamma=1.0,
     )[1]
     assert not torch.allclose(shortened, monte_carlo)
@@ -288,7 +344,7 @@ def test_masked_gae_does_not_bootstrap_through_padding() -> None:
     valid = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
+        rewards, values, valid, gae_lambda=1.0, gamma=1.0
     )
     torch.testing.assert_close(targets[0], torch.tensor([1.0, 1.0, 0.0]))
     torch.testing.assert_close(advantages[0], torch.tensor([0.75, 0.5, 0.0]))
@@ -310,7 +366,7 @@ def test_a_truncated_trajectory_anchors_its_last_target_on_the_reward_alone() ->
     valid = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=0.5, gamma=1.0
+        rewards, values, valid, gae_lambda=0.5, gamma=1.0
     )
     torch.testing.assert_close(
         advantages, torch.tensor([[0.225, -0.55, 0.7, 0.0], [-0.35, 1.1, 0.0, 0.0]])
@@ -329,7 +385,7 @@ def test_masked_gae_ignores_nonfinite_padding_but_rejects_nonfinite_valid_data()
     valid = torch.tensor([[True, True, False]])
 
     advantages, targets = generalized_advantage_and_targets(
-        rewards, values, valid, actor_gae_lambda=1.0, gamma=1.0
+        rewards, values, valid, gae_lambda=1.0, gamma=1.0
     )
     torch.testing.assert_close(advantages, torch.tensor([[0.75, 0.5, 0.0]]))
     torch.testing.assert_close(targets, torch.tensor([[1.0, 1.0, 0.0]]))
@@ -883,16 +939,10 @@ def test_one_ppo_update_is_finite() -> None:
     assert math.isfinite(metrics["policy_loss"])
     assert 0.0 <= metrics["clip_fraction"] <= 1.0
     assert metrics["actor_gae_lambda"] == config.actor_gae_lambda
-    assert "critic_gae_lambda" not in metrics
+    assert metrics["critic_gae_lambda"] == config.critic_gae_lambda
     assert metrics["gamma"] == config.gamma
-    # The critic target is the lambda-return `advantage + value` at every valid
-    # state, so the three means the update reports are the same identity read
-    # off the whole batch. The Monte Carlo target it replaced satisfied no such
-    # relation, because it never saw the values at all.
+    # Critic targets are the lambda-one return, not ``A_policy + V``.
     assert metrics["value_target_std"] > 0.05
-    assert metrics["value_target_mean"] == pytest.approx(
-        metrics["advantage_mean"] + metrics["value_prediction_mean"], abs=1e-6
-    )
     assert metrics["value_target_min"] < metrics["value_target_max"]
     # A random-init critic on this support stays well inside atoms that span
     # the reward range with headroom, so nothing needed saturating.
@@ -1663,19 +1713,14 @@ def test_target_correlation_separates_noise_from_a_mis_scaled_critic() -> None:
     assert _target_correlation(targets, np.zeros(256), valid) == 0.0
 
 
-def test_a_mis_scaled_critic_still_explains_its_own_bootstrapped_target() -> None:
-    """Why the Monte Carlo reading is kept after the target stopped being it.
+def test_a_mis_scaled_critic_explains_the_policy_lambda_return_not_monte_carlo() -> None:
+    """Decoupled GAE: the critic target is Monte Carlo; the policy lambda-return is not.
 
-    A critic predicting three times the true return is badly wrong, and the
-    explained variance against the suffix return says so: exactly -3. But the
-    bootstrapped target is built from that same prediction, so its residual is
-    only the advantage -- one lambda-window of reward against a full trajectory
-    of value -- and the same critic scores near one against it. Reporting only
-    the bootstrapped reading would have retired the measurement that diagnosed
-    this critic in the first place.
+    A critic predicting three times the true return scores exactly -3 against
+    the suffix return. That suffix is now also the critic target, so the same
+    -3 is the value-target reading. The policy lambda-return is still built
+    from that prediction, so the same critic scores near one against it.
     """
-    # Small dense margin rewards over a horizon long against the lambda window,
-    # matching the 719-step objective's per-transition scale.
     generator = np.random.default_rng(5)
     rewards = generator.normal(0.002, 0.001, size=(4, 64)).astype(np.float32)
     valid = np.ones_like(rewards, dtype=np.bool_)
@@ -1688,14 +1733,16 @@ def test_a_mis_scaled_critic_still_explains_its_own_bootstrapped_target() -> Non
     prepared = prepare_advantages(
         SimpleNamespace(rewards=rewards, valid=valid),
         mis_scaled,
-        PpoConfig(actor_gae_lambda=0.5, gamma=1.0),
+        PpoConfig(actor_gae_lambda=0.5, critic_gae_lambda=1.0, gamma=1.0),
     )
 
     np.testing.assert_allclose(prepared.monte_carlo_returns, monte_carlo, atol=1e-6)
+    np.testing.assert_allclose(prepared.value_targets, monte_carlo, atol=1e-6)
     assert _explained_variance(prepared.monte_carlo_returns, mis_scaled, valid) == pytest.approx(
         -3.0
     )
-    assert _explained_variance(prepared.value_targets, mis_scaled, valid) > 0.8
+    assert _explained_variance(prepared.value_targets, mis_scaled, valid) == pytest.approx(-3.0)
+    assert _explained_variance(prepared.policy_lambda_returns, mis_scaled, valid) > 0.8
 
 
 def _fit_sums(targets: np.ndarray, predictions: np.ndarray) -> dict[str, torch.Tensor]:
@@ -1841,10 +1888,9 @@ def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -
     )
 
     assert metrics["value_prediction_std"] > 0.0
-    # Both standard deviations are population ones, so the identity is exact up
-    # to the float32 the advantages and targets are held in.
-    identity = 1.0 - (metrics["advantage_std"] / metrics["value_target_std"]) ** 2
-    assert metrics["lambda_return_explained_variance"] == pytest.approx(identity, abs=1e-5)
+    # The policy-lambda EV is an algebraic identity of A and G_policy, not a
+    # critic-fit score. The fit reading is the one that can see a working
+    # refit; this test keeps them distinct.
 
     # The fit reading is materially positive on a critic the conventional
     # reading calls weak, and their separation is what the pair exists for.
@@ -1894,7 +1940,7 @@ def test_advantage_statistics_describe_the_rollout_not_the_normalizer() -> None:
         torch.from_numpy(rewards),
         torch.from_numpy(values),
         torch.ones_like(torch.from_numpy(rewards)),
-        actor_gae_lambda=PpoConfig().actor_gae_lambda,
+        gae_lambda=PpoConfig().actor_gae_lambda,
         gamma=PpoConfig().gamma,
     )
     selected = raw.reshape(-1)

@@ -42,20 +42,23 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
 
     args = module.parse_args()
 
-    assert (args.games, args.league_games) == (112, 96)
-    assert (args.league_active_opponents, args.league_historical_opponents) == (2, 2)
+    assert (args.games, args.league_games) == (128, 64)
+    # Self-play contributes both learner seats; a league game contributes one.
+    assert args.games * 2 == 4 * args.league_games
+    assert (args.league_active_opponents, args.league_historical_opponents) == (2, 6)
     assert args.league_active_pool_size == 16
     assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
-    assert args.epochs == 1
+    assert (args.epochs, args.critic_epochs) == (2, 4)
     assert args.critic_lr == pytest.approx(2.5e-4)
-    assert args.minibatch_size == 2048
+    assert args.minibatch_size == 4096
     # An unflagged run is exactly the family's dataclass configuration, which
     # is what a warm-start artifact and the calibration benchmark both carry.
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
     # Entropy is telemetry only; the training CLI has no bonus coefficient.
     assert not hasattr(args, "entropy_coefficient")
     assert args.gamma == pytest.approx(0.997)
-    assert args.actor_gae_lambda == pytest.approx(0.95)
+    assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
+    assert args.critic_gae_lambda == pytest.approx(1.0)
     assert not hasattr(args, "gae_lambda")
     assert args.target_kl == PpoConfig.target_kl
     assert args.checkpoint_seconds == 420.0
@@ -164,10 +167,10 @@ def test_recovery_checkpoint_timer_uses_injected_monotonic_clock() -> None:
 
 
 def test_population_defaults_drop_the_frozen_lane(monkeypatch, tmp_path) -> None:
-    """`--population 4` must not inherit the single-learner's 112+96 mix.
+    """`--population 4` must not inherit the single-learner's 128+64 mix.
 
-    That mix is not a valid population wave (112 is not a multiple of 12, and
-    96 frozen games are a league the collector refuses), so leaving those
+    That mix is not a valid population wave (128 is not a multiple of 12, and
+    64 frozen games are a league the collector refuses), so leaving those
     defaults implicit would make every unflagged population launch fail.
     """
     module = _training_script()
@@ -581,8 +584,8 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
 
     config = module._training_data_config(args, module._device("cpu"))
 
-    assert config["games"] == 112
-    assert config["league_games"] == 96
+    assert config["games"] == 128
+    assert config["league_games"] == 64
     assert config["update_compile_mode"] == "default"
     assert config["device_type"] == "cpu"
     # Measurement selected inductor + bf16 for collection, so an unflagged run
