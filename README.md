@@ -3,7 +3,7 @@
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
 The learner is direct, from-scratch self-play PPO with DAPO's asymmetric clip
-band, an undiscounted finite-horizon objective, and GAE lambda 0.95. Training
+band, discount-correct potential shaping, and VAPO's decoupled GAE. Training
 does not currently depend on expert demonstrations, distillation, behavior
 cloning, or value pretraining. An exact
 batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
@@ -71,7 +71,7 @@ benchmark() {
     --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
     --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
     "$repo/.venv/bin/python" scripts/benchmark_ppo_iteration.py \
-    --games 112 --repeats 6 "$@" \
+    --games 128 --repeats 6 "$@" \
     --output "$repo/artifacts/benchmarks/$name-ppo.jsonl"
 }
 
@@ -174,7 +174,7 @@ third knob: three reports attribute two knobs because each step moves exactly
 one, and the precision's answer is settled by measurement outside the chain.
 
 All three reports time the production batch and nothing else, because the
-decision reads the steady medians at 112 games and nothing from the other
+decision reads the steady medians at 128 games and nothing from the other
 sizes. Sweeping four batch sizes to produce them cost about four times the
 calibration. Shorten all three rather than some of them -- the launcher
 compares the sweeps, so an uneven set would differ in protocol as well as in
@@ -230,11 +230,13 @@ reported training gate rather than a hidden reward transform. Rust supplies
 binary32 potentials and terminal utility; one Python reward implementation
 applies the same configurable gamma to native and interpreted rollouts.
 
-GAE lambda remains `0.95`; it controls the sampled advantage horizon while the
-critic supplies the continuation estimate. Actor advantages, critic targets,
-and collection shaping all use the same gamma. Critic targets are
-`advantage + value`; targets beyond categorical support saturate at the outer
-atom and the saturated fraction is reported.
+GAE follows VAPO's decoupled schedule, not CleanRL's shared lambda. Policy
+advantages use ``lambda = 1 - 1/(0.05 * 719)`` -- VAPO's length-adaptive
+formula evaluated at the known 719-action horizon, not per sequence. Critic
+targets use lambda 1, the unbiased discounted suffix return. Actor advantages,
+critic targets, and collection shaping all use the same gamma. Targets beyond
+categorical support saturate at the outer atom and the saturated fraction is
+reported.
 
 The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
 population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
