@@ -221,6 +221,32 @@ def test_league_mix_is_distinct_reproducible_and_separates_age_windows(tmp_path)
     assert historical == sorted(historical)
 
 
+def test_league_mix_fills_every_log_age_rung_of_a_deep_archive(tmp_path) -> None:
+    """Six historical seats are the production count: one per occupied log2 rung.
+
+    At iteration 500 the active window is 484-499. Historical ages 17-499 occupy
+    five rungs; six seats take all five plus one PFSP refill. Two seats would
+    leave the older rungs unused.
+    """
+    refs = _snapshot_refs(tmp_path, range(1, 500))
+    selected = select_league_mix(
+        refs,
+        current_iteration=500,
+        active_count=2,
+        historical_count=6,
+        active_pool_size=16,
+        generator=np.random.default_rng(7),
+    )
+    historical = [row.ref.iteration for row in selected if row.category == "historical"]
+    ages = [500 - iteration for iteration in historical]
+    buckets = {(age.bit_length() - 1) for age in ages}
+
+    assert len(historical) == 6
+    assert buckets == {4, 5, 6, 7, 8}
+    assert max(ages) >= 256
+    assert min(ages) >= 17
+
+
 def _snapshot_refs(tmp_path, iterations) -> list[SnapshotRef]:
     return [
         SnapshotRef(iteration, tmp_path / f"league-actor-{iteration:08d}.pt")
