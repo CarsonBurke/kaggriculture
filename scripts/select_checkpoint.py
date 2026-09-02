@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from evaluate_checkpoint import _opponent_identity, evaluate, render_json
+from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.provenance import file_sha256
 
@@ -91,6 +92,41 @@ def _ranking_key(candidate: dict[str, Any]) -> tuple[float, float, float, int]:
     )
 
 
+def _tensorboard_component(value: str) -> str:
+    component = "".join(character if character.isalnum() else "_" for character in value)
+    return component.strip("_") or "opponent"
+
+
+def _record_tensorboard_candidate(
+    writer: SummaryWriter,
+    candidate: dict[str, Any],
+    *,
+    completed: int,
+    total: int,
+    elapsed_seconds: float,
+) -> None:
+    iteration = int(candidate["iteration"])
+    panel = candidate["panel"]
+    scalars = {
+        "selection/panel_score_rate": panel["panel_score_rate"],
+        "selection/panel_score_rate_lower_bound": panel["panel_score_rate_95ci"][0],
+        "selection/panel_mean_margin": panel["panel_mean_margin"],
+        "selection/panel_margin_lower_bound": panel["panel_margin_95ci"][0],
+        "selection/worst_opponent_score_rate": panel["worst_opponent_score_rate"],
+        "progress/completed_checkpoints": completed,
+        "progress/completion_fraction": completed / total,
+        "progress/elapsed_seconds": elapsed_seconds,
+    }
+    for tag, value in scalars.items():
+        writer.add_scalar(tag, float(value), iteration)
+    for index, opponent in enumerate(panel["opponent_summaries"]):
+        component = _tensorboard_component(str(opponent["opponent_label"]))
+        prefix = f"opponents/{index:02d}_{component}"
+        writer.add_scalar(f"{prefix}/score_rate", float(opponent["score_rate"]), iteration)
+        writer.add_scalar(f"{prefix}/mean_margin", float(opponent["mean_margin"]), iteration)
+    writer.flush()
+
+
 def _write_atomic(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -159,6 +195,14 @@ def parse_args() -> argparse.Namespace:
             "candidates whose bound tree has moved without changing inference"
         ),
     )
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=Path,
+        help=(
+            "live TensorBoard run directory; defaults under the evaluated run's "
+            "tensorboard/evaluations directory"
+        ),
+    )
     parser.add_argument("--best-output", type=Path)
     return parser.parse_args()
 
@@ -176,38 +220,56 @@ def main() -> None:
     if not checkpoints:
         raise FileNotFoundError(f"no checkpoints match {args.pattern!r} under {run_directory}")
     opponents = args.opponents or ["v27"]
+    tensorboard_directory = (
+        run_directory / "tensorboard" / "evaluations" / args.output.stem
+        if args.tensorboard_dir is None
+        else args.tensorboard_dir.expanduser().resolve()
+    )
     candidates = []
     started = time.perf_counter()
-    for checkpoint in checkpoints:
-        evaluations = [
-            evaluate(
-                SimpleNamespace(
-                    artifact=checkpoint,
-                    agent=args.agent,
-                    opponent=opponent,
-                    seeds=args.seeds,
-                    seed_start=args.seed_start,
-                    workers=args.workers,
-                    torch_threads=args.torch_threads,
-                    device=args.device,
-                    inference_equivalence=args.inference_equivalence,
+    writer = SummaryWriter(tensorboard_directory)
+    try:
+        writer.add_scalar("progress/completed_checkpoints", 0.0, 0)
+        writer.flush()
+        for completed, checkpoint in enumerate(checkpoints, start=1):
+            evaluations = [
+                evaluate(
+                    SimpleNamespace(
+                        artifact=checkpoint,
+                        agent=args.agent,
+                        opponent=opponent,
+                        seeds=args.seeds,
+                        seed_start=args.seed_start,
+                        workers=args.workers,
+                        torch_threads=args.torch_threads,
+                        device=args.device,
+                        inference_equivalence=args.inference_equivalence,
+                    )
                 )
-
-            )
-            for opponent in opponents
-        ]
-        provenance = evaluations[0]["artifact_provenance"]
-        if any(evaluation["artifact_provenance"] != provenance for evaluation in evaluations[1:]):
-            raise ValueError("checkpoint changed between fixed-panel opponent evaluations")
-        candidates.append(
-            {
+                for opponent in opponents
+            ]
+            provenance = evaluations[0]["artifact_provenance"]
+            if any(
+                evaluation["artifact_provenance"] != provenance for evaluation in evaluations[1:]
+            ):
+                raise ValueError("checkpoint changed between fixed-panel opponent evaluations")
+            candidate = {
                 "checkpoint": str(checkpoint),
                 "iteration": int(provenance["iteration"]),
                 "artifact_provenance": provenance,
                 "panel": summarize_panel(evaluations),
                 "evaluations": evaluations,
             }
-        )
+            candidates.append(candidate)
+            _record_tensorboard_candidate(
+                writer,
+                candidate,
+                completed=completed,
+                total=len(checkpoints),
+                elapsed_seconds=time.perf_counter() - started,
+            )
+    finally:
+        writer.close()
 
     ranked = sorted(candidates, key=_ranking_key, reverse=True)
     for rank, candidate in enumerate(ranked, start=1):
@@ -266,6 +328,7 @@ def main() -> None:
         "run_provenance": run_provenance,
         "opponent_provenance": opponent_provenance,
         "candidates": ranked,
+        "tensorboard_dir": str(tensorboard_directory),
     }
     rendered = render_json(payload)
     print(rendered)
