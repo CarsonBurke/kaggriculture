@@ -21,6 +21,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
 from kaggriculture.constants import BOARD_SIZE, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
@@ -61,7 +62,8 @@ class StructuredConfig:
 
     model_dim: int = 128
     attention_heads: int = 4
-    ffn_multiplier: int = 4
+    attention_kv_heads: int = 2
+    ffn_multiplier: int = 2
     farm_blocks: int = 2
     opponent_latents: int = 8
     latents: int = 32
@@ -95,6 +97,12 @@ class StructuredConfig:
             raise ValueError("attention_heads must evenly divide model_dim")
         if (self.model_dim // self.attention_heads) % 4:
             raise ValueError("attention head width must be divisible by 4 for axial RoPE")
+        if (
+            self.attention_kv_heads <= 0
+            or self.attention_kv_heads > self.attention_heads
+            or self.attention_heads % self.attention_kv_heads
+        ):
+            raise ValueError("attention KV heads must positively divide query heads")
         if self.ffn_multiplier <= 0:
             raise ValueError("ffn_multiplier must be positive")
         if self.fused_mlp and (self.model_dim % 128 or self.model_dim * self.ffn_multiplier % 256):
@@ -236,15 +244,159 @@ class GatedResidual(nn.Module):
         return residual.to(compute_dtype) + self.gate.to(compute_dtype) * branch
 
 
+#: Score elements -- batch * heads * query_tokens * key_tokens -- at or above
+#: which attention runs through a fused SDPA kernel rather than an explicit
+#: matmul/softmax/matmul the surrounding Inductor graph can fuse.
+#:
+#: The shipped path sent every attention to `scaled_dot_product_attention`, and
+#: at this architecture's shapes that was the update's single largest kernel.
+#: A compiled production minibatch (4040 rows) spent 32.9 ms of its 87.4 ms
+#: actor forward+backward inside `_flash_attention_backward` against a 3.0 ms
+#: forward: an 11x backward-to-forward ratio, where 2-3x is ordinary. Flash
+#: amortizes its fixed cost over long sequences, and the longest context here
+#: is 141 tokens.
+#:
+#: Isolated compiled forward+backward, bf16, RTX 5090, median of 15, at the
+#: geometries the trunk and decoders actually run (`probe_attention*`):
+#:
+#:     geometry      batch  scores      flash   cuDNN(pad)   explicit
+#:     core 32x32      4040   16.5M   1.735 ms    1.026 ms   0.793 ms
+#:     core 32x32      8080   33.1M   3.855 ms    2.061 ms   2.040 ms
+#:     latent 32x141   4040   72.9M   3.553 ms    2.564 ms   4.670 ms
+#:     farm 100x100    2048   81.9M   1.622 ms    1.483 ms   1.868 ms
+#:     farm 100x100    8080  323.2M  10.091 ms    7.010 ms  20.117 ms
+#:
+#: Flash is never the fastest cell. Explicit attention wins below roughly 32M
+#: score elements and loses above it, because its cost is the materialized
+#: score matrix while a fused kernel's is the fixed per-launch overhead. 32M
+#: sits between the last cell explicit wins (33.1M, a tie) and the first it
+#: clearly loses (72.9M), and it also bounds the materialized softmax.
+#:
+#: Both branches are exact rewrites of the same function, not approximations:
+#: the explicit path is the algorithm SDPA implements, and the fused path zero-
+#: pads the head width, which contributes nothing to QK^T and returns zeros in
+#: the padded output channels that are then sliced away. Neither is bitwise
+#: identical to the other -- `update_replay_parity` bounds that drift, and both
+#: collection and update read this one implementation, so they move together.
+#: Measured, the drift is nowhere near the bound: `update_replay_max_kl` moves
+#: 3.12e-7 to 3.14e-7 against a 5e-3 gate, with every tail fraction still zero.
+#:
+#: End to end at production settings (`scripts/benchmark_ppo_iteration.py`,
+#: 128 self-play + 64 league games, 2 epochs, 4 critic epochs, minibatch 4096,
+#: median of five steady repeats, `artifacts/benchmarks/attn-*.jsonl`):
+#:
+#:                       rollout    update     total   iterations/hour
+#:     before             18.540    41.617    60.272        59.73
+#:     after              19.479    36.181    55.911        64.39
+#:
+#: The update, which is entirely compiled, takes the whole 13.1% the isolated
+#: measurement predicted. The rollout runs eager and gives 5.1% back, which is
+#: the same finding read from the other side: unfused, the explicit path is six
+#: kernel launches where flash is one. The two do not cancel -- collection is
+#: under a third of an iteration -- but they are why this is written as a
+#: property of the geometry rather than of the model.
+EXPLICIT_ATTENTION_SCORE_LIMIT = 32 << 20
+
+#: Fused SDPA kernels reject a head width that is not a multiple of eight:
+#: cuDNN and the memory-efficient backend refuse outright, and a masked call at
+#: such a width has no fused kernel at all and silently decomposes to the math
+#: backend. Production runs `model_dim` 80 over four heads, so its 20-wide
+#: heads take exactly that decomposition today. Padding is a no-op for an
+#: already-aligned width.
+_FUSED_ATTENTION_HEAD_MULTIPLE = 8
+
+#: cuDNN first: it is the fastest admissible backend at every measured geometry
+#: above, and the only fused one that accepts a mask at these head widths.
+#: Flash and math follow so an unsupported shape degrades instead of raising.
+_FUSED_ATTENTION_BACKENDS = (
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.MATH,
+)
+
+
+def _expand_key_value(key: Tensor, value: Tensor, repeats: int) -> tuple[Tensor, Tensor]:
+    """Materialize grouped-query key/value heads for explicit attention."""
+    if repeats == 1:
+        return key, value
+    return key.repeat_interleave(repeats, dim=1), value.repeat_interleave(repeats, dim=1)
+
+
+def _explicit_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+    *,
+    repeats: int,
+    scale: float,
+) -> Tensor:
+    """Attention as an explicit matmul/softmax/matmul, fusable by Inductor.
+
+    The softmax reduces in fp32 exactly as every fused backend does
+    internally, so this trades no precision for its speed.
+    """
+    key, value = _expand_key_value(key, value, repeats)
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if attention_mask is not None:
+        valid_rows = attention_mask.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~attention_mask, -torch.inf)
+        # Avoid NaN softmax inputs for query rows whose entire context is
+        # masked. SDPA defines both their output and gradient as zero.
+        scores = torch.where(valid_rows, scores, 0.0)
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    if attention_mask is not None:
+        probabilities = torch.where(attention_mask, probabilities, 0.0)
+    return torch.matmul(probabilities.to(value.dtype), value)
+
+
+def _pad_head_width(tensor: Tensor, width: int) -> Tensor:
+    extra = width - tensor.shape[-1]
+    return tensor if extra == 0 else nn.functional.pad(tensor, (0, extra))
+
+
+def _fused_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+    *,
+    enable_gqa: bool,
+    scale: float,
+) -> Tensor:
+    """One fused SDPA call, with the head width padded into kernel support.
+
+    `scale` is stated rather than defaulted: SDPA derives its default from the
+    padded width, which is not the width this attention is defined over.
+    """
+    head_dim = query.shape[-1]
+    remainder = head_dim % _FUSED_ATTENTION_HEAD_MULTIPLE
+    if remainder:
+        width = head_dim + _FUSED_ATTENTION_HEAD_MULTIPLE - remainder
+        query, key, value = (_pad_head_width(t, width) for t in (query, key, value))
+    with sdpa_kernel(list(_FUSED_ATTENTION_BACKENDS), set_priority=True):
+        attended = nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+    return attended[..., :head_dim] if remainder else attended
+
+
 class Attention(nn.Module):
     """QK-normalized attention over an explicit context (self or cross)."""
 
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
         self.heads = config.attention_heads
+        self.kv_heads = config.attention_kv_heads
         self.head_dim = config.model_dim // self.heads
         self.query = nn.Linear(config.model_dim, config.model_dim, bias=False)
-        self.key_value = nn.Linear(config.model_dim, 2 * config.model_dim, bias=False)
+        self.key_value = nn.Linear(config.model_dim, 2 * self.kv_heads * self.head_dim, bias=False)
         self.query_norm = RMSNorm(self.head_dim)
         self.key_norm = RMSNorm(self.head_dim)
         self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
@@ -267,7 +419,7 @@ class Attention(nn.Module):
         )
         key, value = (
             self.key_value(context)
-            .view(batch, key_tokens, 2, self.heads, self.head_dim)
+            .view(batch, key_tokens, 2, self.kv_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
             .unbind(dim=0)
         )
@@ -287,23 +439,25 @@ class Attention(nn.Module):
         if context_valid is not None:
             attention_mask = context_valid.view(batch, 1, 1, key_tokens)
         query, key, value = _sdpa_inputs(query, key, value)
-        # Efficient SDPA's backward reserves multi-GB workspace when a large
-        # flattened batch attends from one query to a handful of local slots.
-        if query.device.type == "cuda" and query_tokens == 1 and key_tokens <= 8:
-            scores = torch.matmul(query, key.transpose(-2, -1)) * (self.head_dim**-0.5)
-            if attention_mask is not None:
-                valid_rows = attention_mask.any(dim=-1, keepdim=True)
-                scores = scores.masked_fill(~attention_mask, -torch.inf)
-                # Avoid NaN softmax inputs for inactive units whose entire local
-                # context is masked. SDPA defines both their output and gradient as zero.
-                scores = torch.where(valid_rows, scores, 0.0)
-            probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-            if attention_mask is not None:
-                probabilities = torch.where(attention_mask, probabilities, 0.0)
-            attended = torch.matmul(probabilities.to(value.dtype), value)
+        scale = self.head_dim**-0.5
+        scores = batch * self.heads * query_tokens * key_tokens
+        if scores < EXPLICIT_ATTENTION_SCORE_LIMIT:
+            attended = _explicit_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                repeats=self.heads // self.kv_heads,
+                scale=scale,
+            )
         else:
-            attended = nn.functional.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask, dropout_p=0.0
+            attended = _fused_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                enable_gqa=self.heads != self.kv_heads,
+                scale=scale,
             )
         attended = attended.to(dtype=queries.dtype)
         return self.output(attended.transpose(1, 2).reshape(batch, query_tokens, width))

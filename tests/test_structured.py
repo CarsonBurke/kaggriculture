@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import argparse
 import copy
+import unittest.mock
 from dataclasses import replace
 
 import pytest
 import torch
 from kaggle_environments import make
 
+from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
-from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.model import FarmActor, ModelConfig, ReluSquared
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import _StackedActorEnsemble
 from kaggriculture.structured import (
     Attention,
+    FeedForward,
     FusedFeedForward,
     StructuredActor,
     StructuredConfig,
@@ -167,6 +170,80 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
             rtol=3e-2,
             atol=3e-2,
         )
+
+
+@pytest.mark.parametrize("model_dim,heads", [(80, 4), (128, 4)])
+def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -> None:
+    """Both attention branches compute the same function at the same shape.
+
+    `EXPLICIT_ATTENTION_SCORE_LIMIT` selects between an explicit
+    matmul/softmax/matmul and a fused SDPA kernel purely on measured cost, so
+    the two must be interchangeable at any shape. `model_dim` 80 over four
+    heads is production's 20-wide head, which no fused kernel accepts
+    unpadded; 128 over four is already aligned, so its fused branch pads
+    nothing and the same equality must still hold.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("attention branch selection is a CUDA decision")
+    torch.manual_seed(0)
+    config = replace(
+        _tiny_config(),
+        model_dim=model_dim,
+        attention_heads=heads,
+        attention_kv_heads=heads // 2,
+    )
+    module = Attention(config).cuda().train()
+    queries = torch.randn(6, 32, model_dim, device="cuda", requires_grad=True)
+    context = torch.randn(6, 41, model_dim, device="cuda", requires_grad=True)
+    valid = torch.ones(6, 41, dtype=torch.bool, device="cuda")
+    valid[:, 30:] = False
+    valid[0, :] = True
+
+    def run(limit: int) -> tuple[torch.Tensor, ...]:
+        for tensor in (queries, context):
+            tensor.grad = None
+        module.zero_grad(set_to_none=True)
+        with (
+            unittest.mock.patch.object(structured, "EXPLICIT_ATTENTION_SCORE_LIMIT", limit),
+            torch.autocast("cuda", dtype=torch.bfloat16),
+        ):
+            output = module(queries, context, context_valid=valid)
+        output.backward(torch.ones_like(output))
+        assert queries.grad is not None
+        assert context.grad is not None
+        return output.detach(), queries.grad.clone(), context.grad.clone()
+
+    explicit = run(1 << 30)
+    fused = run(0)
+    for left, right in zip(explicit, fused, strict=True):
+        torch.testing.assert_close(left, right, rtol=3e-2, atol=3e-2)
+
+
+def test_fused_attention_head_padding_does_not_change_the_result() -> None:
+    """Zero-padding the head width is exact, not an approximation.
+
+    Padded head channels contribute nothing to QK^T and produce zeros in the
+    padded output channels, which are sliced away -- provided the scale stays
+    the one the unpadded width defines. Comparing the padded fused call to an
+    explicit reference at the same width is what proves the scale was not
+    silently taken from the padded width, which would rescale every logit.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("fused attention kernels are CUDA-only")
+    torch.manual_seed(0)
+    heads, kv_heads, head_dim = 4, 2, 20
+    query = torch.randn(4, heads, 12, head_dim, dtype=torch.bfloat16, device="cuda")
+    key = torch.randn(4, kv_heads, 17, head_dim, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn(4, kv_heads, 17, head_dim, dtype=torch.bfloat16, device="cuda")
+    assert head_dim % 8, "this test only means something for an unaligned head width"
+    fused = structured._fused_attention(
+        query, key, value, None, enable_gqa=True, scale=head_dim**-0.5
+    )
+    explicit = structured._explicit_attention(
+        query, key, value, None, repeats=heads // kv_heads, scale=head_dim**-0.5
+    )
+    assert fused.shape == explicit.shape
+    torch.testing.assert_close(fused, explicit, rtol=2e-2, atol=2e-2)
 
 
 def test_hardware_native_mlp_rejects_cpu_execution() -> None:
@@ -420,6 +497,10 @@ def test_structured_model_arguments_parse_typed_regression_fields() -> None:
     add_model_config_arguments(parser)
     args = parser.parse_args(
         [
+            "--attention-kv-heads",
+            "2",
+            "--ffn-multiplier",
+            "2",
             "--global-refresh-layers",
             "2,5",
             "--global-refresh-context",
@@ -431,6 +512,8 @@ def test_structured_model_arguments_parse_typed_regression_fields() -> None:
 
     config = model_config_from_args(resolve_architecture("structured"), args)
 
+    assert config.attention_kv_heads == 2
+    assert config.ffn_multiplier == 2
     assert config.global_refresh_layers == (2, 5)
     assert config.global_refresh_context == "all"
     assert config.zero_init_branches is True
@@ -564,9 +647,23 @@ def test_structured_critic_reads_both_private_states(
     assert gate is not None and gate[1].abs().sum() > 0
 
 
+def test_structured_config_uses_two_head_gqa_and_two_x_squared_relu() -> None:
+    config = StructuredConfig()
+    attention = Attention(config)
+    feed_forward = FeedForward(config)
+
+    assert config.attention_kv_heads == 2
+    assert attention.key_value.out_features == 2 * config.attention_kv_heads * attention.head_dim
+    assert isinstance(feed_forward.activation, ReluSquared)
+    assert feed_forward.input.out_features == 2 * config.model_dim
+
+
 def test_structured_config_validation() -> None:
     with pytest.raises(ValueError, match="attention head width"):
         StructuredConfig(model_dim=24, attention_heads=4)
+    for kv_heads in (0, 3, 8):
+        with pytest.raises(ValueError, match="attention KV heads"):
+            StructuredConfig(attention_heads=4, attention_kv_heads=kv_heads)
     with pytest.raises(ValueError, match="latents"):
         StructuredConfig(latents=0)
     round_trip = StructuredConfig(**StructuredConfig().to_dict())
