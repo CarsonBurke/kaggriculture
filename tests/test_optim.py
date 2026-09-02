@@ -516,3 +516,72 @@ def test_an_unusable_weight_decay_is_rejected(value: float) -> None:
             adam_learning_rate=1e-3,
             weight_decay=value,
         )
+
+
+@pytest.mark.parametrize("shape", [(24, 24), (48, 16), (16, 48)])
+def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
+    shape: tuple[int, int],
+) -> None:
+    """One optimizer over many same-shaped matrices must not couple them.
+
+    The matrix half stacks every matrix of one shape into a single Polar
+    Express and a single variance reduction, which is only legitimate because
+    both reduce over the trailing two dimensions alone. If either ever grew a
+    reduction across the batch, the step a matrix takes would start depending
+    on which other parameters happened to share its shape -- so compare a group
+    of five against five optimizers holding one matrix each.
+    """
+
+    torch.manual_seed(11)
+    count = 5
+    together = [torch.nn.Parameter(torch.randn(shape)) for _ in range(count)]
+    apart = [torch.nn.Parameter(parameter.detach().clone()) for parameter in together]
+    grouped = NorMuon(together, [], learning_rate=1e-2, adam_learning_rate=1e-2)
+    separate = [
+        NorMuon([parameter], [], learning_rate=1e-2, adam_learning_rate=1e-2) for parameter in apart
+    ]
+
+    generator = torch.Generator().manual_seed(12)
+    for _ in range(3):
+        for index in range(count):
+            gradient = torch.randn(shape, generator=generator)
+            together[index].grad = gradient
+            apart[index].grad = gradient.clone()
+        grouped.step()
+        for optimizer in separate:
+            optimizer.step()
+
+    for index in range(count):
+        torch.testing.assert_close(together[index], apart[index], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            grouped.state[together[index]]["second_moment"],
+            separate[index].state[apart[index]]["second_moment"],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+def test_a_mixed_shape_group_batches_only_what_shares_a_shape() -> None:
+    """Shapes that appear once still step, and identically to a lone optimizer."""
+
+    torch.manual_seed(13)
+    shapes = [(24, 24), (24, 24), (32, 8), (8, 32)]
+    together = [torch.nn.Parameter(torch.randn(shape)) for shape in shapes]
+    apart = [torch.nn.Parameter(parameter.detach().clone()) for parameter in together]
+    grouped = NorMuon(together, [], learning_rate=1e-2, adam_learning_rate=1e-2)
+    separate = [
+        NorMuon([parameter], [], learning_rate=1e-2, adam_learning_rate=1e-2) for parameter in apart
+    ]
+
+    generator = torch.Generator().manual_seed(14)
+    for _ in range(2):
+        for index, shape in enumerate(shapes):
+            gradient = torch.randn(shape, generator=generator)
+            together[index].grad = gradient
+            apart[index].grad = gradient.clone()
+        grouped.step()
+        for optimizer in separate:
+            optimizer.step()
+
+    for index in range(len(shapes)):
+        torch.testing.assert_close(together[index], apart[index], rtol=1e-5, atol=1e-6)

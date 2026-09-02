@@ -329,17 +329,58 @@ class NorMuon(torch.optim.Optimizer):
         return loss
 
     def _normuon_group(self, group: dict[str, Any], found_inf: Tensor | None) -> None:
+        """Step every matrix in the group in as few launches as its shapes allow.
+
+        The arithmetic is exactly the per-parameter form this replaces; only the
+        launch structure differs, and it has to. The model's matrices are tiny --
+        the largest is 320x80 -- so the ~28 kernels one `polar_express` call
+        issues each spend longer being launched than doing work, and a
+        parameter-at-a-time loop over the actor's 110 matrices costs roughly
+        4800 launches for a step the optimizer takes 342 times an iteration.
+        Nothing had ever measured that: the update profilers time fused AdamW,
+        while production runs this. It was 12.24 s of a 38.9 s update, the
+        single largest line item after the forward and backward themselves.
+
+        The shapes are what make it collapse. The production actor's 110
+        matrices occupy 19 distinct shapes, 85 of them in four groups, so one
+        batched Polar Express per shape replaces up to 47 sequential ones. On an
+        RTX 5090, production actor and critic (`probe_optimizer_ab`):
+
+            step        reference    batched   speedup   per iteration
+            actor       34.087 ms   6.582 ms     5.18x   3.886 -> 0.750 s
+            critic      36.650 ms   8.850 ms     4.14x   8.356 -> 2.018 s
+
+        The critic trails the actor despite holding fewer parameters because it
+        is the half that carries a device-side `found_inf` on every step, and
+        selecting the gradient is the one thing below that no shape grouping
+        removes.
+
+        Two properties make the batching exact rather than approximate.
+        `polar_express` normalizes and iterates per matrix over the trailing two
+        dimensions, so stacking same-shaped matrices into a leading batch
+        dimension computes each one's polar factor independently.
+        `_reduce_variance` reduces over `reduced_dimension` with `keepdim` and
+        sums only over the trailing two, so it is batch-safe for the same
+        reason -- and `reduced_dimension` follows from the shape, so it is
+        necessarily uniform within a shape group.
+        """
+
         momentum = float(group["momentum"])
         beta2 = float(group["beta2"])
         learning_rate = float(group["lr"])
         weight_decay = float(group["weight_decay"])
+
+        flat_parameters: list[Tensor] = []
+        gradients: list[Tensor] = []
+        buffers: list[Tensor] = []
+        second_moments: list[Tensor] = []
+        reduced_dimensions: list[int] = []
         for parameter in group["params"]:
             gradient = parameter.grad
             if gradient is None:
                 continue
             rows = parameter.shape[0]
             flat_parameter = parameter.view(rows, -1)
-            flat_gradient = gradient.view(rows, -1).float()
             columns = flat_parameter.shape[1]
             state = self.state[parameter]
             if not state:
@@ -348,39 +389,90 @@ class NorMuon(torch.optim.Optimizer):
                 second_shape = (rows, 1) if reduced_dimension == -1 else (1, columns)
                 state["second_moment"] = flat_parameter.new_zeros(second_shape, dtype=torch.float32)
                 state["reduced_dimension"] = reduced_dimension
-            buffer = state["momentum"]
-            reduced_dimension = state["reduced_dimension"]
+            flat_parameters.append(flat_parameter)
+            gradients.append(gradient.view(rows, -1).float())
+            buffers.append(state["momentum"])
+            second_moments.append(state["second_moment"])
+            reduced_dimensions.append(state["reduced_dimension"])
+        if not flat_parameters:
+            return
 
-            if found_inf is None:
-                blend = 1.0 - momentum
-                safe_gradient = flat_gradient
-            else:
-                # A skipped minibatch must not move the buffer at all, and its
-                # gradient may be non-finite, so select rather than scale.
-                applied = found_inf == 0
-                safe_gradient = torch.where(applied, flat_gradient, 0.0)
-                blend = torch.where(applied, 1.0 - momentum, 0.0)
-            buffer.lerp_(safe_gradient, blend)
-            nesterov = safe_gradient.lerp(buffer, momentum)
+        if found_inf is None:
+            blend: Tensor | float = 1.0 - momentum
+            safe_gradients = gradients
+        else:
+            # A skipped minibatch must not move the buffer at all, and its
+            # gradient may be non-finite, so select rather than scale: scaling
+            # would turn an infinity into a NaN the buffer then keeps forever.
+            applied = found_inf == 0
+            safe_gradients = [torch.where(applied, g, 0.0) for g in gradients]
+            blend = torch.where(applied, 1.0 - momentum, 0.0)
+            # This is the one per-parameter launch left, and it stays: there is
+            # no foreach select, and the batched alternative -- scrub the
+            # non-finite values, then scale by the gate -- would quietly start
+            # tolerating a non-finite gradient under a finite loss, which the
+            # current form propagates and a run would notice.
+        torch._foreach_lerp_(buffers, safe_gradients, blend)
+        nesterovs = torch._foreach_lerp(safe_gradients, buffers, momentum)
 
-            direction = polar_express(nesterov)
-            direction = self._reduce_variance(
-                direction, state["second_moment"], beta2, reduced_dimension, found_inf
+        shape_groups: dict[tuple[int, int], list[int]] = {}
+        for index, flat_parameter in enumerate(flat_parameters):
+            key = (flat_parameter.shape[0], flat_parameter.shape[1])
+            shape_groups.setdefault(key, []).append(index)
+        reduced: dict[int, Tensor] = {}
+        for members in shape_groups.values():
+            reduced_dimension = reduced_dimensions[members[0]]
+            if len(members) == 1:
+                index = members[0]
+                reduced[index] = self._reduce_variance(
+                    polar_express(nesterovs[index]),
+                    second_moments[index],
+                    beta2,
+                    reduced_dimension,
+                    found_inf,
+                )
+                continue
+            # `_reduce_variance` advances `second_moment` in place, so the
+            # stacked copy has to be written back; one `_foreach_copy_` returns
+            # the whole group's running estimates to their own state entries.
+            stacked_second = torch.stack([second_moments[index] for index in members])
+            group_directions = self._reduce_variance(
+                polar_express(torch.stack([nesterovs[index] for index in members])),
+                stacked_second,
+                beta2,
+                reduced_dimension,
+                found_inf,
             )
-            step = learning_rate * _shape_learning_rate_multiplier(rows, columns)
-            if found_inf is not None:
-                step = torch.where(found_inf == 0, step, 0.0)
-            if not weight_decay:
-                flat_parameter.add_(direction.to(flat_parameter.dtype) * -step)
-            else:
-                # `step` carries both the shape multiplier and the skip gate, so
-                # the reference's `lr^2 * lr_mul * wd` and its "a skipped
-                # minibatch changes nothing" both follow from writing the decay
-                # against it rather than against the bare rate.
+            torch._foreach_copy_(
+                [second_moments[index] for index in members], list(stacked_second.unbind(0))
+            )
+            for offset, index in enumerate(members):
+                reduced[index] = group_directions[offset]
+        directions = [reduced[index] for index in range(len(flat_parameters))]
+
+        steps = [
+            learning_rate * _shape_learning_rate_multiplier(*flat_parameter.shape)
+            for flat_parameter in flat_parameters
+        ]
+        updates = torch._foreach_mul(directions, steps)
+        if weight_decay:
+            for flat_parameter, direction, update, step in zip(
+                flat_parameters, directions, updates, steps, strict=True
+            ):
+                # `step` carries the shape multiplier, and the skip gate below
+                # scales the finished update, so the reference's
+                # `lr^2 * lr_mul * wd` and its "a skipped minibatch changes
+                # nothing" both still follow from the decay written against it.
                 decay = weight_decay * learning_rate * step
                 shrinking = (direction * flat_parameter) >= 0
-                update = direction * step + flat_parameter * shrinking * decay
-                flat_parameter.sub_(update.to(flat_parameter.dtype))
+                update.add_(flat_parameter * shrinking * decay)
+        if found_inf is not None:
+            # Gating the finished update rather than each shape's step keeps the
+            # skip one launch instead of one per parameter, and it is exact:
+            # every term here is finite even on a skipped step, because the
+            # direction descends from the untouched buffer, not the gradient.
+            torch._foreach_mul_(updates, (found_inf == 0).to(updates[0].dtype))
+        torch._foreach_sub_(flat_parameters, updates)
 
     @staticmethod
     def _reduce_variance(
@@ -414,10 +506,35 @@ class NorMuon(torch.optim.Optimizer):
         return direction * (scale * (norm_before / norm_after.clamp_min(1e-10))).type_as(direction)
 
     def _adam_group(self, group: dict[str, Any], found_inf: Tensor | None) -> None:
+        """Step every vector in the group in a fixed number of launches.
+
+        `torch._foreach_*` takes heterogeneous shapes in one multi-tensor kernel,
+        so unlike the matrix path this needs no shape grouping: the actor's ~150
+        vectors move in about a dozen launches instead of the ~2200 a
+        parameter-at-a-time loop issued.
+
+        The one op that cannot collapse is dividing each moment by its own
+        `step`-derived bias correction, because those live as separate
+        zero-dimensional tensors and a foreach kernel needs matching shapes.
+        Reading them to the host would turn them into a scalar list -- which is
+        what `torch.optim.Adam` does when it is not capturable -- but that is
+        exactly the synchronization the device-side step counter exists to
+        avoid, so the broadcast stays. `_foreach_addcdiv_` would take them as a
+        tensor of scalars and collapse the whole tail into one kernel, but it
+        requires that tensor on the CPU, which is the same synchronization
+        wearing a different hat.
+        """
+
         beta1, beta2 = group["betas"]
         epsilon = float(group["eps"])
         learning_rate = float(group["lr"])
         weight_decay = float(group["weight_decay"])
+
+        parameters: list[Tensor] = []
+        gradients: list[Tensor] = []
+        counts: list[Tensor] = []
+        firsts: list[Tensor] = []
+        seconds: list[Tensor] = []
         for parameter in group["params"]:
             gradient = parameter.grad
             if gradient is None:
@@ -427,36 +544,65 @@ class NorMuon(torch.optim.Optimizer):
                 state["step"] = torch.zeros((), dtype=torch.float32, device=parameter.device)
                 state["exp_avg"] = torch.zeros_like(parameter, dtype=torch.float32)
                 state["exp_avg_sq"] = torch.zeros_like(parameter, dtype=torch.float32)
-            if found_inf is None:
-                applied_scalar: Tensor | float = 1.0
-                safe_gradient = gradient.float()
-            else:
-                applied = found_inf == 0
-                applied_scalar = applied.to(state["step"].dtype)
-                safe_gradient = torch.where(applied, gradient.float(), 0.0)
-            # The step counter is device-side so a skipped minibatch leaves
-            # bias correction where it was without a host read.
-            state["step"] += applied_scalar
-            count = state["step"]
-            first, second = state["exp_avg"], state["exp_avg_sq"]
-            blend1 = (1.0 - beta1) * applied_scalar
-            blend2 = (1.0 - beta2) * applied_scalar
-            first.lerp_(safe_gradient, blend1)
-            second.lerp_(safe_gradient.square(), blend2)
-            bias1 = 1.0 - beta1**count
-            bias2 = 1.0 - beta2**count
-            # A never-stepped parameter has zero moments and zero corrections;
-            # clamping the denominators keeps that case at an exact no-op.
-            update = (first / bias1.clamp_min(1e-12)) / (
-                (second / bias2.clamp_min(1e-12)).sqrt() + epsilon
-            )
-            step = learning_rate if found_inf is None else learning_rate * applied_scalar
-            if not weight_decay:
-                parameter.add_((update * -step).to(parameter.dtype))
-            else:
-                # Quadratic in the rate here too, which is why the reference's
-                # 0.005 bites only on the tables it gives a large `lr_mul`.
-                decay = weight_decay * learning_rate * step
-                shrinking = (update * parameter) > 0
-                decayed = update * step + parameter * shrinking * decay
-                parameter.sub_(decayed.to(parameter.dtype))
+            parameters.append(parameter)
+            gradients.append(gradient)
+            counts.append(state["step"])
+            firsts.append(state["exp_avg"])
+            seconds.append(state["exp_avg_sq"])
+        if not parameters:
+            return
+
+        if found_inf is None:
+            applied_scalar: Tensor | float = 1.0
+            safe_gradients = [gradient.float() for gradient in gradients]
+        else:
+            applied = found_inf == 0
+            applied_scalar = applied.to(counts[0].dtype)
+            safe_gradients = [torch.where(applied, gradient.float(), 0.0) for gradient in gradients]
+        # The step counter is device-side so a skipped minibatch leaves bias
+        # correction where it was without a host read.
+        torch._foreach_add_(counts, applied_scalar)
+        blend1 = (1.0 - beta1) * applied_scalar
+        blend2 = (1.0 - beta2) * applied_scalar
+        torch._foreach_lerp_(firsts, safe_gradients, blend1)
+        torch._foreach_lerp_(seconds, torch._foreach_mul(safe_gradients, safe_gradients), blend2)
+
+        # Every count is zero-dimensional, so the corrections themselves batch
+        # into single kernels even though applying them to the moments cannot.
+        bias1 = torch._foreach_pow(beta1, counts)
+        torch._foreach_neg_(bias1)
+        torch._foreach_add_(bias1, 1.0)
+        bias2 = torch._foreach_pow(beta2, counts)
+        torch._foreach_neg_(bias2)
+        torch._foreach_add_(bias2, 1.0)
+        # A never-stepped parameter has zero moments and zero corrections;
+        # clamping the denominators keeps that case at an exact no-op.
+        torch._foreach_clamp_min_(bias1, 1e-12)
+        torch._foreach_clamp_min_(bias2, 1e-12)
+        denominators = torch._foreach_div(seconds, bias2)
+        torch._foreach_sqrt_(denominators)
+        torch._foreach_add_(denominators, epsilon)
+
+        updates = torch._foreach_div(firsts, bias1)
+        torch._foreach_div_(updates, denominators)
+        step = learning_rate if found_inf is None else learning_rate * applied_scalar
+        if not weight_decay:
+            torch._foreach_mul_(updates, step)
+            torch._foreach_sub_(parameters, updates)
+            return
+        # Quadratic in the rate here too, which is why the reference's 0.005
+        # bites only on the tables it gives a large `lr_mul`.
+        decay = weight_decay * learning_rate * step
+        # The cautious mask and the decay both read the pre-step parameter and
+        # the unscaled update, so the addends are formed before the scaling.
+        # Adding them as a separate term rather than folding the decay into the
+        # update keeps this branch bit-identical to the one above wherever the
+        # mask is false, which is what makes "cautious decay changes nothing
+        # where it should not" an exact statement rather than an approximate one.
+        addends = [
+            ((update * parameter) > 0) * parameter * decay
+            for parameter, update in zip(parameters, updates, strict=True)
+        ]
+        torch._foreach_mul_(updates, step)
+        torch._foreach_add_(updates, addends)
+        torch._foreach_sub_(parameters, updates)
