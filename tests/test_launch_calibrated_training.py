@@ -320,6 +320,7 @@ def _records(
     game_counts: list[int] | None = None,
 ) -> list[dict[str, object]]:
     game_counts = [64, 112, 128] if game_counts is None else game_counts
+    league_games = module.PRODUCTION_LEAGUE_GAMES
     # Enough repeats that the steady set is a real sample rather than the one
     # iteration a two-repeat run leaves after the cold start is dropped. The
     # per-iteration seconds vary across the steady set so the medians here are
@@ -338,14 +339,15 @@ def _records(
         # attributed to whichever knob its step named.
         "rollout_bfloat16": module.PRODUCTION_ROLLOUT_BFLOAT16,
         "device": "cuda",
+        "deterministic_training": False,
         "hardware": _hardware(),
         "self_play_game_counts": game_counts,
-        "league_games_per_iteration": 96,
-        "league_opponents": 4,
+        "league_games_per_iteration": league_games,
+        "league_opponents": 8,
         "league_active_opponents": 2,
-        "league_historical_opponents": 2,
+        "league_historical_opponents": 6,
         "episode_steps": 720,
-        "physical_games_per_iteration": [games + 96 for games in game_counts],
+        "physical_games_per_iteration": [games + league_games for games in game_counts],
         "repeats": repeats,
         "seed": seed,
         "temperature": 1.0,
@@ -367,7 +369,9 @@ def _records(
     configuration["source_digest"] = identity["sha256"] if source_digest is None else source_digest
     records: list[dict[str, object]] = [configuration]
     for games in game_counts:
-        steady_seconds = seconds if games == 112 else seconds + games / 1000.0
+        steady_seconds = (
+            seconds if games == module.PRODUCTION_SELF_PLAY_GAMES else seconds + games / 1000.0
+        )
         iterations = []
         for repeat in range(repeats):
             # Spread the steady iterations symmetrically about the intended
@@ -389,15 +393,15 @@ def _records(
                 "phase": "cold_start" if repeat == 0 else "steady_state",
                 "repeat": repeat,
                 "self_play_games": games,
-                "league_games": 96,
-                "physical_games": games + 96,
+                "league_games": league_games,
+                "physical_games": games + league_games,
                 "opponent_setup_seconds": setup_seconds,
                 "rollout_seconds": rollout_seconds,
                 "update_replay_parity_seconds": compute_seconds * 0.05,
                 "update_seconds": update_seconds,
                 "total_seconds": total_seconds,
                 "iterations_per_hour": 3600.0 / total_seconds,
-                "physical_games_per_rollout_second": (games + 96) / rollout_seconds,
+                "physical_games_per_rollout_second": (games + league_games) / rollout_seconds,
                 "critic_replayed_states_per_second": 1000.0 / update_seconds,
                 "actor_updates": 1,
             }
@@ -407,8 +411,8 @@ def _records(
             {
                 "event": "batch_summary",
                 "self_play_games": games,
-                "league_games": 96,
-                "physical_games": games + 96,
+                "league_games": league_games,
+                "physical_games": games + league_games,
                 "cold_total_seconds": iterations[0]["total_seconds"],
                 "cold_iterations_per_hour": iterations[0]["iterations_per_hour"],
                 "cold_physical_games_per_rollout_second": iterations[0][
@@ -492,7 +496,7 @@ def _chain(
 def _set_steady_phases(
     records: list[dict[str, object]],
     phases: list[tuple[float, float, float]],
-    games: int = 112,
+    games: int = 128,
 ) -> list[dict[str, object]]:
     """Rewrite one batch's steady iterations to the given phase seconds.
 
@@ -522,7 +526,7 @@ def _set_steady_phases(
         record["update_seconds"] = update
         record["total_seconds"] = setup + rollout + update
         record["iterations_per_hour"] = 3600.0 / record["total_seconds"]
-        record["physical_games_per_rollout_second"] = (games + 96) / rollout
+        record["physical_games_per_rollout_second"] = (games + 64) / rollout
         record["critic_replayed_states_per_second"] = 1000.0 / update
     summary = next(
         record
@@ -569,7 +573,7 @@ def _production_summary(records: list[dict[str, object]]) -> dict[str, object]:
     return next(
         record
         for record in records
-        if record.get("event") == "batch_summary" and record.get("self_play_games") == 112
+        if record.get("event") == "batch_summary" and record.get("self_play_games") == 128
     )
 
 
@@ -613,8 +617,8 @@ def test_a_chain_whose_every_step_earns_its_keep_compiles_every_knob() -> None:
     )
     assert decision["eager_steady_total_seconds"] == pytest.approx(30.1)
     assert decision["compiled_steady_total_seconds"] == pytest.approx(15.1)
-    assert decision["self_play_games"] == 112
-    assert decision["league_games"] == 96
+    assert decision["self_play_games"] == 128
+    assert decision["league_games"] == 64
     assert decision["validated_evidence"]["eager"][-1]["completed"] is True
     # Both removed keys described a configuration no report measured: the
     # projection interpolated one, and the per-phase ratios it was built from
@@ -1044,7 +1048,7 @@ def test_a_calibration_may_time_only_the_production_batch_on_every_node() -> Non
     """
     module = _script()
 
-    decision = module.choose_compilation(_chain(module, **_EARNED, game_counts=[112]))
+    decision = module.choose_compilation(_chain(module, **_EARNED, game_counts=[128]))
 
     assert decision["rollout_forward_mode"] == "inductor"
     assert decision["update_compile_mode"] == "default"
@@ -1052,12 +1056,12 @@ def test_a_calibration_may_time_only_the_production_batch_on_every_node() -> Non
 
     # Symmetric, and still only accepted for a sweep that contains the batch
     # the decision is read from.
-    with pytest.raises(ValueError, match="including 112"):
-        module.choose_compilation(_chain(module, **_EARNED, game_counts=[64, 128]))
+    with pytest.raises(ValueError, match="including 128"):
+        module.choose_compilation(_chain(module, **_EARNED, game_counts=[64, 112]))
 
     # An asymmetric chain is rejected: the sweep is part of what has to match,
     # so a shortened node cannot be compared against a swept one.
-    asymmetric = _chain(module, **_EARNED, game_counts=[112])
+    asymmetric = _chain(module, **_EARNED, game_counts=[128])
     asymmetric[2] = _chain(module, **_EARNED)[2]
     with pytest.raises(ValueError, match=r"configurations differ.*self_play_game_counts"):
         module.choose_compilation(asymmetric)
@@ -1194,16 +1198,21 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]
     for flag, expected in (
-        ("--games", "112"),
-        ("--league-games", "96"),
+        ("--games", "128"),
+        ("--league-games", "64"),
         ("--league-active-opponents", "2"),
-        ("--league-historical-opponents", "2"),
-        ("--epochs", "1"),
-        ("--minibatch-size", "2048"),
+        ("--league-historical-opponents", "6"),
+        ("--epochs", "2"),
+        ("--critic-epochs", "4"),
+        ("--minibatch-size", "4096"),
         ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
         (
             "--actor-gae-lambda",
             str(module.production_ppo_config(update_compile_mode="eager")["actor_gae_lambda"]),
+        ),
+        (
+            "--critic-gae-lambda",
+            str(module.production_ppo_config(update_compile_mode="eager")["critic_gae_lambda"]),
         ),
         (
             "--target-kl",
@@ -1249,10 +1258,8 @@ def test_direct_launch_compiles_without_calibration_evidence(
 
     launch = json.loads((run_directory / "launch.json").read_text())
     assert launch["event"] == "direct_launch"
-    # The direct launcher carries no measurement, so it takes the standing
-    # per-phase evidence: the update runs the mode production has been running,
-    # and collection runs the mode and precision the rollout sweep and the
-    # parity gate both selected.
+    # The direct launcher carries no bound calibration decision, so it takes the
+    # independently recorded standing mode and precision for each phase.
     assert launch["rollout_forward_mode"] == PRODUCTION_ROLLOUT_FORWARD_MODE
     assert launch["rollout_bfloat16"] is True
     assert launch["update_compile_mode"] == PRODUCTION_UPDATE_COMPILE_MODE

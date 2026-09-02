@@ -11,10 +11,19 @@ from kaggriculture.model import ModelConfig
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import repository_root
 
-PRODUCTION_SELF_PLAY_GAMES = 112
-PRODUCTION_LEAGUE_GAMES = 96
+# A mirror self-play game contributes two current-policy trajectories; a
+# frozen-league game contributes one. 128 * 2 : 64 is therefore the intended
+# 80% current self-play / 20% past-and-reference-opponent training-data split.
+PRODUCTION_SELF_PLAY_GAMES = 128
+PRODUCTION_LEAGUE_GAMES = 64
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
-PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 2
+# Historical lanes are the log-age PFSP draw. `_sample_log_age_strata` takes
+# one opponent per occupied log2 age bucket, then refills leftover seats from
+# remaining members of those buckets. A 500-iteration archive outside the
+# 16-deep active window occupies five rungs (ages 17-31, 32-63, 64-127,
+# 128-255, 256-511). Two seats cover two rungs, so the older archive sits
+# idle. Six seats fill every rung of that ladder plus one PFSP refill.
+PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 6
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
 # Engine reference agents admitted to the TRAINING league, and the lanes
 # reserved for them. They are here because self-play alone never produced an
@@ -44,24 +53,71 @@ PRODUCTION_CHECKPOINT_SECONDS = 420
 # lanes against copies of itself. A knob whose only correct value is the
 # learner's temperature is not a knob.
 PRODUCTION_TEMPERATURE = 1.0
-# The collection forward is ~64% of a wave's wall clock, and measurement picked
-# both of these rather than taste. Production 112-game waves, real BC actor:
-# the rollout sweep moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x,
-# while the shipped 4-wave `scripts/audit_replay_parity.py` gate on the
-# league-mixed path moves worst max_kl 1.9089e-03 -> 2.2786e-04, 8.4x lower
-# drift: the update path is already Inductor + bf16, so matching its backend
-# and precision cancels most of the collect/update gap instead of widening it.
+# The two-shard GQA collector cannot reuse the old single-wave compile decision.
+# The earlier reading of that -- an Inductor benchmark that spent 575.51 s in
+# CPU-side compilation without reaching the first iteration -- was the right
+# observation and the wrong diagnosis. It is not slow compilation. Both the
+# shipped source and the current one stall identically at production shapes:
+# every Inductor compile worker at 0% CPU, no codegen written for minutes,
+# allocated device memory frozen byte-for-byte, and all 58 threads of the
+# process in `futex_wait`. Waiting longer is not the fix, and the 192-game,
+# 230080-state rollout it never reached takes 19.258 s eager.
 #
-# They are not the same kind of setting. The forward mode is the calibrated
-# rollout knob -- the chain varies it and attributes a speedup to it -- so it
-# reaches the command as a parameter, and this constant is only what the
-# uncalibrated direct launch (`scripts/launch_production.py`) states. The
-# precision is not a knob: it is pinned identical on every chain node, so it
-# is fixed configuration and this constant is the value.
-# `ROLLOUT_FORWARD_MODES` owns the valid mode strings; train_ppo.py's
-# `--rollout-forward-mode` choices validate whatever is passed, exercised by
-# the launcher round-trip test.
-PRODUCTION_ROLLOUT_FORWARD_MODE = "inductor"
+# Graph capture is *not* the mechanism, which an intermediate version of this
+# comment asserted. `inductor_default` -- Inductor's fusion with `mode="default"`
+# and no CUDA graphs anywhere -- was measured and hangs the same way: 1107 s in,
+# 54 of 58 threads in `futex_wait`, the subprocess compile pool idle at 0.2% CPU,
+# zero cache files written in the preceding two minutes, and the GPU at 0%
+# rather than the fifth utilization `reduce-overhead` leaves behind. Removing
+# capture removes that difference and nothing else.
+#
+# What both modes share is that `collect_mixed_play_rust` runs its shards on a
+# two-worker `ThreadPoolExecutor`, and `torch.compile` returns a lazy wrapper --
+# so compilation is first entered from inside *both* shard threads at once, on
+# the first step, before either has produced code. Concurrent entry is the
+# common factor; the specific lock cycle is not established here, and the
+# evidence rules capture out rather than ruling a particular lock in.
+#
+# That pointed the fix at ordering rather than at the backend, and ordering was
+# most of it: driving one shard's first step through to completion before the
+# peer's (`_pipeline_ready` / `_pipeline_wait` in `rollout.py`) is what lets
+# `inductor_default` run a full wave at all, which it now does. `reduce-overhead`
+# needed a second, unrelated fix on top -- `cudagraph_trees` keys generations off
+# a process-global counter while keeping a tree manager per thread, so one
+# shard's mark retires the other shard's live outputs and the read raises
+# `accessing tensor output of CUDAGraphs that has been overwritten` --  and after
+# that fix it still wedges, twice, for twenty-five minutes of idle exclusive GPU
+# between them and no stack either time. That mode has had enough of this
+# machine.
+#
+# `graph` is the replacement, and it does not go through `torch.compile` at all.
+# `rollout._CapturedStep` captures one `torch.cuda.CUDAGraph` per shard over the
+# step's forward region and replays it for the remaining 719 steps. That is
+# available because the collector already holds every input at a fixed address
+# for the life of a wave, and because owning the graph removes the entire
+# question of who decides when a recording is retired. It therefore owes bitwise
+# equality with eager rather than the semantic bound the compiled modes settle
+# for, and `test_a_captured_collection_reproduces_the_eager_one_exactly` holds
+# it to exactly that on a wave carrying both self-play and league rows.
+#
+# An end-to-end arm moved it. On one frozen tree at production shapes, against
+# the same-tree eager control, `graph` takes the rollout from 20.383 s to
+# 7.270 s and the iteration from 47.507 s to 33.368 s -- 75.78 to 107.89
+# iterations an hour. Parity is untouched: `update_replay_max_kl` peaks at
+# 7.8e-7 against a 5e-3 gate with every tail fraction zero, which is what a mode
+# that replays the identical kernels should look like.
+#
+# Peak allocation rises 128 MiB an iteration for the first eight collections and
+# is then flat for the rest -- five consecutive repeats at exactly zero. That is
+# the league pool filling to its eight opponents and the allocator reaching
+# steady state, not the capture pool accumulating; the run was carried to 14
+# repeats specifically because four cannot tell those apart, and a leak here
+# would have exhausted this card around iteration 160 of a 500-iteration run.
+#
+# BF16 remains fixed: it matches the update precision and is exercised by the
+# CUDA GQA/pipeline test. `ROLLOUT_FORWARD_MODES` owns the valid mode strings;
+# train_ppo.py validates whatever the calibrated launcher passes.
+PRODUCTION_ROLLOUT_FORWARD_MODE = "graph"
 PRODUCTION_ROLLOUT_BFLOAT16 = True
 # The update knob's counterpart to the mode above, and the same kind of setting:
 # the calibrated knob reaches the command as a parameter, and this constant is
@@ -96,48 +152,21 @@ def production_model_config() -> dict[str, int | float]:
 def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float | bool | str]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    `critic_epochs` is 2 because that is where the measurement leaves it, not
-    because it is the actor count doubled. `scripts/probe_critic_epochs.py`
-    refits the critic on 80% of the GAMES in a production wave and scores the
-    held-out 20%, splitting by `episode_seeds` rather than by state: states along
-    one trajectory are near-duplicates, so a random state split puts copies of
-    fitted states in the holdout and reports memorization as generalization.
-    That distinction is the whole result. Under a state-level reading the critic
-    looks like it reaches 0.86 explained variance; on a game-level holdout it
-    explains 0.5-2% of value variance at EVERY epoch count from 1 to 8.
+    With 230,080 states, a 4096-row ceiling produces 57 balanced minibatches per
+    epoch. Two actor epochs and four critic epochs therefore run 114 actor and
+    228 critic optimizer steps: effectively the same step counts as the former
+    2048-row one-actor/two-critic schedule, while replaying each collected state
+    twice for the actor and four times for the critic.
 
-    So no epoch measurably buys generalization. The remaining holdout explained
-    variance gain after epoch 0 is +0.0017 +/- 0.0021 over five repeats from a
-    fresh critic and -0.0442 +/- 0.0786 over three from a warm one, both inside
-    their own spread, while fit explained variance climbs to 0.87 and the
-    memorization gap to 1.15. A warm critic's holdout explained variance goes
-    from +0.005 to -0.283 across eight epochs -- worse than predicting the
-    holdout mean.
-
-    Two is a DELIBERATE OVERSPEND, not the optimum, and the number it costs is
-    known. On the distributional loss the critic actually optimizes, the marginal
-    per-epoch change in holdout loss is -0.081 +/- 0.049 for epoch 1 and
-    +0.072 +/- 0.021 for epoch 2 once the critic is warm, so epoch 2 gives back
-    slightly more than epoch 1 wins, and epoch 1 is the best epoch in all three
-    warm repeats. A fresh critic wants three epochs (epoch 3 worth -0.087 +/-
-    0.030, epoch 4 break-even at +0.003 +/- 0.018); a warm one wants one. The two
-    regimes have different optima and this constant has to serve both.
-
-    What buys the overspend is the one thing no single-rollout curve can measure:
-    the critic also accumulates fit ACROSS iterations, and the same probe shows
-    data dominating passes -- eight epochs over one wave leaves explained variance
-    at 0.002, while four epochs over each of six disjoint waves reaches 0.54 and
-    0.79 on two of three seeds for the same 24 gradient epochs. A second pass is
-    held as insurance against one pass per iteration failing to keep up over 500
-    of them, at a measured price of 4.6 s per iteration and a small known
-    degradation in the warm-regime holdout fit. Four cost 18.5 s of the 28.0 s
-    update phase; two costs 9.2 s and takes the iteration from 32.5 s to 23.2 s.
+    This deliberately trades the prior throughput optimum for larger device
+    work. The batch sweep found 4096 2.2-4.8% slower than 2048 and 8192 unable
+    to fit. The critic holdout probe also found weak generalization from later
+    passes, so the extra critic reuse must be judged by end-to-end policy
+    evaluation rather than by fit explained variance.
     """
     return asdict(
         PpoConfig(
-            epochs=1,
-            critic_epochs=2,
-            minibatch_size=2048,
+            critic_epochs=4,
             target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
         )
@@ -311,6 +340,8 @@ def build_training_command(
             str(ppo["gamma"]),
             "--actor-gae-lambda",
             str(ppo["actor_gae_lambda"]),
+            "--critic-gae-lambda",
+            str(ppo["critic_gae_lambda"]),
             "--target-kl",
             str(ppo["target_kl"]),
             "--optimizer",

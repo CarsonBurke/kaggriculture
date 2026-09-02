@@ -241,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     # 2.720 ms, inductor bf16 1.626 ms. So `cudagraphs` -- the only mode the
     # old `--compile-rollout` boolean could select -- is slower than not
     # compiling at all, while `inductor` under bf16 is 3.0x faster than eager
-    # and 3.3x faster than cudagraphs. Whole rollout phase at the production
+    # and 3.3x faster than cudagraphs. Whole rollout phase on the measured
     # 112-game wave, with the league ensemble following the mode as it does at
     # the collector call below: eager/fp32 8.91 s, cudagraphs/fp32 8.02 s,
     # eager/bf16 6.82 s, inductor/fp32 5.93 s, inductor/bf16 5.36 s. A boolean

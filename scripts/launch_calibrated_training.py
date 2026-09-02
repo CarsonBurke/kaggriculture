@@ -82,7 +82,10 @@ KNOB_PHASE_MEDIANS = {
 # isolated forward, median of 60: eager fp32 4.907 ms, cudagraphs fp32
 # 5.309 ms, inductor fp32 2.720 ms, inductor bf16 1.626 ms -- so a boolean
 # whose "on" value is `cudagraphs` selects the one mode slower than eager,
-# which is what this launcher must not be able to certify.
+# which is what this launcher must not be able to certify. `graph`, the
+# collector's own per-shard capture, was added after that ranking and is not in
+# it; a chain that wants it has to measure it, which is the point of the knob
+# being mode-valued.
 
 #: Every steady median an iteration's total is made of. Opponent reconstruction
 #: is compile-invariant by construction and belongs to no knob, which is

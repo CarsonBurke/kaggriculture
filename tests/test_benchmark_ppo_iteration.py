@@ -259,6 +259,8 @@ def test_the_report_and_the_collector_agree_on_the_collection_configuration(
         (("--rollout-forward-mode", "eager", "--no-rollout-bfloat16"), "eager", False),
         (("--rollout-forward-mode", "cudagraphs"), "cudagraphs", True),
         (("--rollout-forward-mode", "inductor", "--no-rollout-bfloat16"), "inductor", False),
+        (("--rollout-forward-mode", "inductor_default"), "inductor_default", True),
+        (("--rollout-forward-mode", "graph"), "graph", True),
     )
     # Every mode is evidence here, so adding one to the tuple without measuring
     # it fails rather than passing untested.

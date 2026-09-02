@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Launch production PPO directly, without the pre-flight benchmark ceremony.
 
-Compilation follows standing evidence, which is per phase rather than per run:
-the update is compiled and the rollout is not, because on the conv model
-compiling the collector is a loss -- its per-step graph replay costs more than
-the kernel launches it removes -- while compiling the update is a large win.
-The magnitudes are deliberately not repeated here. They belong to a particular
-calibration, two copies of a measured number drift apart the moment one is
-re-run, and this script binds no calibration decision of its own; read the
-README's summary for the shape and any run's own decision file for its
-numbers. The older "~2.4x across every calibration" was a blended total
-measured on the pre-conv model, whose update was far cheaper, so it neither
-describes this architecture nor separates the two phases. Correctness is guarded by the
-gates train_ppo.py runs
+Execution follows standing per-phase evidence rather than applying one compile
+switch to the whole iteration. The two-shard GQA collector owns an explicit
+CUDA graph per shard: `torch.compile`'s capturing modes route through
+`cudagraph_trees`, whose generation counter is process-global while its tree
+managers are per thread, so one shard retires the other's live outputs. Owning
+the capture removes that question rather than working around it, and buys
+bitwise equality with eager instead of a semantic bound. The update remains
+compiled, where the established gain is large and needs no per-shard graph.
+Exact measurements live beside the production constants and in each run's
+evidence rather than being copied here.
+
+Correctness is guarded by the gates train_ppo.py runs
 inside the production process itself — the per-iteration first-minibatch KL
 gate, and the replay-parity audit, which runs at iteration one and every
 REPLAY_PARITY_AUDIT_INTERVAL iterations thereafter.  A fresh run's first audit
