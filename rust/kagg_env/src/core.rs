@@ -2731,22 +2731,19 @@ enum Shape {
     Square,
     Sqrt,
     Log,
-    Hinge,
 }
 
 const MARKET_PARAMS: [(f64, f64, Shape, f64, Shape, f64); PRODUCTS] = [
     (25.0, 400.0, Shape::Sqrt, 0.80, Shape::Log, 0.20),
-    (35.0, 450.0, Shape::Hinge, 1.00, Shape::Sqrt, 0.70),
-    (60.0, 200.0, Shape::Hinge, 0.40, Shape::Sqrt, 0.60),
+    (35.0, 450.0, Shape::Log, 0.20, Shape::Sqrt, 0.70),
+    (60.0, 200.0, Shape::Linear, 0.40, Shape::Sqrt, 0.60),
     (120.0, 100.0, Shape::Sqrt, 0.70, Shape::Linear, 1.60),
     (250.0, 300.0, Shape::Log, 0.20, Shape::Square, 3.60),
-    (50.0, 332.0, Shape::Hinge, 0.40, Shape::Log, 0.20),
+    (50.0, 332.0, Shape::Linear, 0.40, Shape::Log, 0.20),
     (160.0, 122.0, Shape::Sqrt, 0.60, Shape::Linear, 1.60),
     (200.0, 105.0, Shape::Log, 0.20, Shape::Square, 3.20),
     (100.0, 200.0, Shape::Linear, 0.40, Shape::Linear, 0.40),
 ];
-
-const HINGE_GAIN: f64 = 8.0;
 
 fn money_feature(amount: i64) -> f32 {
     let value = amount as f64;
@@ -2972,20 +2969,12 @@ fn encode_farm_structured(
     }
 }
 
-fn shape(kind: Shape, x: f64, scale: f64) -> f64 {
+fn shape(kind: Shape, x: f64) -> f64 {
     match kind {
         Shape::Linear => x,
         Shape::Square => x * x,
         Shape::Sqrt => x.sqrt(),
         Shape::Log => x.ln_1p(),
-        Shape::Hinge => {
-            if scale <= 0.0 {
-                x
-            } else {
-                let unit = x / scale;
-                unit + HINGE_GAIN * (unit - 1.0).max(0.0).powi(2)
-            }
-        }
     }
 }
 
@@ -3014,8 +3003,8 @@ pub fn market_price(item: usize, inventory: i32) -> i64 {
             -1.0,
         )
     };
-    let amplitude = target * base / shape(kind, scale, scale);
-    round_ties_even(base + sign * amplitude * shape(kind, distance, scale)).max(PRICE_FLOOR)
+    let amplitude = target * base / shape(kind, scale);
+    round_ties_even(base + sign * amplitude * shape(kind, distance)).max(PRICE_FLOOR)
 }
 
 #[inline]
@@ -3230,8 +3219,10 @@ mod tests {
         assert_eq!(market_price(0, 10_000), 25);
         assert_eq!(market_price(0, 9_600), 45);
         assert_eq!(market_price(4, 10_300), 1);
-        // Carrot hinge at the knee: distance == T => f(T) = 1, price = 70.
-        assert_eq!(market_price(1, 9_550), 70);
+        assert_eq!(market_price(1, 9_999), 36);
+        assert_eq!(market_price(1, 9_550), 42);
+        assert_eq!(market_price(2, 9_600), 108);
+        assert_eq!(market_price(5, 9_336), 90);
     }
 
     #[test]
