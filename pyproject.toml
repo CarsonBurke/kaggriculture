@@ -27,6 +27,9 @@ packages = ["src/kaggriculture"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+  "cuda: requires a CUDA device and must run through the machine-wide ML queue",
+]
 
 [tool.ruff]
 line-length = 100

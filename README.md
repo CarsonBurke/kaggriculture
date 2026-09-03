@@ -9,12 +9,19 @@ cloning, or value pretraining. An exact
 batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
 environment remains the parity oracle and final evaluator.
 
-Install both development and training dependencies before running the complete
-test suite:
+Install development and training dependencies, then run the CPU-safe default
+validation path:
 
 ```bash
 uv sync --extra dev --extra train
-uv run pytest
+uv run pytest -m "not cuda"
+```
+
+CUDA tests carry the `cuda` marker and must use the machine-wide ML queue:
+
+```bash
+mlq submit --name kagg-cuda-tests --max-parallel-runs 1 --priority 0 \
+  --time-limit 30m -- uv run pytest -m cuda
 ```
 
 The first Rust-backed rollout automatically builds the native extension with
@@ -26,9 +33,9 @@ Run the complete native correctness gate with:
 ```bash
 cargo test --manifest-path rust/kagg_env/Cargo.toml
 cargo clippy --manifest-path rust/kagg_env/Cargo.toml --all-targets -- -D warnings
-PYTHONPATH=src .venv/bin/python \
-  rust/kagg_env/tests/parity_oracle.py --games 8 --steps 719
-PYTHONPATH=src .venv/bin/python rust/kagg_env/tests/binding_safety.py
+cargo build --manifest-path rust/kagg_env/Cargo.toml --release --lib
+uv run python rust/kagg_env/tests/parity_oracle.py --games 8 --steps 719
+uv run python rust/kagg_env/tests/binding_safety.py
 ```
 
 The parity oracle compares every public and private game field, encoded model
@@ -67,7 +74,7 @@ benchmark() {
   name=$1
   shift
   mlq submit --name "kagg-ppo-$name" --max-parallel-runs 1 \
-    --cwd "$snapshot" \
+    --priority 0 --time-limit 30m --cwd "$snapshot" \
     --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
     --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
     "$repo/.venv/bin/python" scripts/benchmark_ppo_iteration.py \
@@ -77,7 +84,7 @@ benchmark() {
 
 benchmark eager    --rollout-forward-mode eager    --rollout-bfloat16 --update-compile-mode eager
 benchmark mixed    --rollout-forward-mode eager    --rollout-bfloat16 --update-compile-mode default
-benchmark compiled --rollout-forward-mode inductor --rollout-bfloat16 --update-compile-mode default
+benchmark compiled --rollout-forward-mode graph    --rollout-bfloat16 --update-compile-mode default
 ```
 
 All three time the production batch from the same source snapshot and differ
@@ -88,14 +95,18 @@ each step moves one of them to a compiling mode. The collection precision is
 stated on every node rather than left to the default because it is not a knob:
 the launcher requires it to be identical across the chain and equal to
 production's, so a chain measured in fp32 is rejected instead of launched.
-Launch training from the complete set:
+Launch training from the complete set through the same queue and frozen source:
 
 ```bash
-.venv/bin/python scripts/launch_calibrated_training.py \
-  --eager-report artifacts/benchmarks/eager-ppo.jsonl \
-  --mixed-report artifacts/benchmarks/mixed-ppo.jsonl \
-  --compiled-report artifacts/benchmarks/compiled-ppo.jsonl \
-  --run-dir runs/ppo-main
+mlq submit --name kagg-ppo-training --max-parallel-runs 1 --priority 0 \
+  --time-limit 168h --cwd "$snapshot" \
+  --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
+  --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
+  "$repo/.venv/bin/python" scripts/launch_calibrated_training.py \
+  --eager-report "$repo/artifacts/benchmarks/eager-ppo.jsonl" \
+  --mixed-report "$repo/artifacts/benchmarks/mixed-ppo.jsonl" \
+  --compiled-report "$repo/artifacts/benchmarks/compiled-ppo.jsonl" \
+  --run-dir "$repo/runs/ppo-main"
 ```
 
 The launcher rejects partial reports or any mismatch in source, hardware, seed,
@@ -288,14 +299,22 @@ term, and must beat the from-scratch initialization on held-out paired seeds.
 Each full checkpoint binds the immutable `league/` sidecar archive with a
 SHA-256 manifest, the complete source identity, and canonical calibration/run
 provenance. Keep the content-addressed source snapshot and `league/` directory
-beside the run artifacts. A portable resume copies and validates the sidecar
-before taking another step, and rejects changed source, rollout, optimizer, or
-league settings instead of silently forking the data distribution:
+beside the run artifacts. Resume through the launcher, not raw `train_ppo.py`;
+the launcher restores the complete production data, league, evaluation, and
+compile configuration. `--resume` supports a checkpoint outside the target run
+directory, while omitting it still discovers `--run-dir/latest.pt`:
 
 ```bash
-.venv/bin/python scripts/train_ppo.py \
-  --run-dir runs/ppo-resumed \
-  --resume runs/ppo-main/checkpoint-000100.pt
+mlq submit --name kagg-ppo-resume --max-parallel-runs 1 --priority 0 \
+  --time-limit 168h --cwd "$snapshot" \
+  --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
+  --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
+  "$repo/.venv/bin/python" scripts/launch_calibrated_training.py \
+  --eager-report "$repo/artifacts/benchmarks/eager-ppo.jsonl" \
+  --mixed-report "$repo/artifacts/benchmarks/mixed-ppo.jsonl" \
+  --compiled-report "$repo/artifacts/benchmarks/compiled-ppo.jsonl" \
+  --run-dir "$repo/runs/ppo-resumed" \
+  --resume "$repo/runs/ppo-main/checkpoint-000100.pt"
 ```
 
 PPO recovery checkpoints are committed only at completed update boundaries,
@@ -322,54 +341,73 @@ launch failures. Rerunning the calibrated launcher automatically resumes a
 valid atomic `latest.pt` instead of starting over.
 
 Screen a checkpoint on fixed, training-disjoint seeds and both seat
-orientations. The default opponent is the fixed public v27 reference; any
-failed, truncated, or non-finite game invalidates the result instead of being
-silently excluded:
+orientations. GPU screening and selection are throughput work, so both go
+through MLQ. The default opponent is the fixed public v27 reference; any failed,
+truncated, or non-finite game invalidates the result instead of being silently
+excluded:
 
 ```bash
-.venv/bin/python scripts/evaluate_checkpoint.py \
-  --artifact runs/ppo-main/checkpoint-000100.pt \
+mlq submit --name kagg-checkpoint-screen --max-parallel-runs 1 --priority 0 \
+  --time-limit 2h --cwd "$snapshot" \
+  --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
+  --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
+  "$repo/.venv/bin/python" scripts/evaluate_checkpoint.py \
+  --artifact "$repo/runs/ppo-main/checkpoint-000100.pt" \
   --seeds 32 --device cuda \
-  --output evaluations/checkpoint-000100-v27.json
+  --output "$repo/evaluations/checkpoint-000100-v27-screen.json"
 ```
 
 The official 32-seed paired panel is enough to package. Do not re-run 128 seeds
 against an artifact you already screened. Rank that panel, not the symmetric
 self-play score -- a zero-sum population averages 0.5 internally regardless of
-its absolute strength -- or `latest.pt`. If you must evaluate, use `--device cuda`.
-Evaluation takes no
-compilation flag: `--rollout-forward-mode`, `--rollout-bfloat16` and
-`--update-compile-mode` are training knobs, decided by the calibration described
-above, and the evaluation and selection scripts accept none of them.
+its absolute strength -- or `latest.pt`. Evaluation takes no compilation flag:
+`--rollout-forward-mode`, `--rollout-bfloat16` and `--update-compile-mode` are
+training knobs, decided by the calibration described above.
 
 To screen every numbered checkpoint on identical paired seeds and atomically
 promote the strongest lower-confidence-bound result:
 
 ```bash
-.venv/bin/python scripts/select_checkpoint.py \
-  --run-dir runs/ppo-main --seeds 32 --device cuda \
-  --output evaluations/ppo-main-screen.json \
-  --best-output runs/ppo-main/best.pt
-
-.venv/bin/python scripts/evaluate_checkpoint.py \
-  --artifact runs/ppo-main/best.pt \
-  --selection-report evaluations/ppo-main-screen.json \
-  --seeds 32 --device cuda \
-  --output evaluations/ppo-main-finalist-v27.json
+mlq submit --name kagg-checkpoint-select --max-parallel-runs 1 --priority 0 \
+  --time-limit 8h --cwd "$snapshot" \
+  --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
+  --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
+  "$repo/.venv/bin/python" scripts/select_checkpoint.py \
+  --run-dir "$repo/runs/ppo-main" --seeds 32 --device cuda \
+  --output "$repo/evaluations/ppo-main-screen.json" \
+  --best-output "$repo/runs/ppo-main/best.pt"
 ```
 
-Build a submission only from a selected, evaluated checkpoint:
+Package admission is a separate CPU contract matching Kaggle. Run the public
+finalist panel on its default seed range (disjoint from selection's 10,000,000
+range), then the mandatory built-in `starter` gate:
 
 ```bash
-.venv/bin/python scripts/build_submission.py \
-  --checkpoint runs/ppo-main/best.pt \
-  --evaluation-report evaluations/ppo-main-finalist-v27.json \
-  --output artifacts/kaggriculture-ppo.tar.gz
+PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
+  "$snapshot/scripts/evaluate_checkpoint.py" \
+  --artifact "$repo/runs/ppo-main/best.pt" \
+  --selection-report "$repo/evaluations/ppo-main-screen.json" \
+  --seeds 32 --device cpu \
+  --output "$repo/evaluations/ppo-main-finalist-v27.json"
 
-.venv/bin/python scripts/validate_submission.py \
-  --archive artifacts/kaggriculture-ppo.tar.gz \
+PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
+  "$snapshot/scripts/evaluate_checkpoint.py" \
+  --artifact "$repo/runs/ppo-main/best.pt" \
+  --opponent starter --seeds 16 --device cpu \
+  --output "$repo/evaluations/ppo-main-starter.json"
+
+PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
+  "$snapshot/scripts/build_submission.py" \
+  --checkpoint "$repo/runs/ppo-main/best.pt" \
+  --evaluation-report "$repo/evaluations/ppo-main-finalist-v27.json" \
+  --builtin-evaluation-report "$repo/evaluations/ppo-main-starter.json" \
+  --output "$repo/artifacts/kaggriculture-ppo.tar.gz"
+
+PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
+  "$snapshot/scripts/validate_submission.py" \
+  --archive "$repo/artifacts/kaggriculture-ppo.tar.gz" \
   --opponent v27 --seeds 2 \
-  --output evaluations/kaggriculture-ppo-bundle.json
+  --output "$repo/evaluations/kaggriculture-ppo-bundle.json"
 ```
 
 ## Game mechanics

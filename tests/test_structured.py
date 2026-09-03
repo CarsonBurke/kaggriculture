@@ -107,6 +107,7 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
     assert torch.allclose(output.unit_logits[inactive], expanded[inactive])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() -> None:
     torch.manual_seed(0)
@@ -172,8 +173,7 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
         )
 
 
-
-
+@pytest.mark.cuda
 @pytest.mark.parametrize("model_dim,heads", [(80, 4), (128, 4)])
 def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -> None:
     """Both attention branches compute the same function at the same shape.
@@ -221,6 +221,7 @@ def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -
         torch.testing.assert_close(left, right, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.cuda
 def test_fused_attention_head_padding_does_not_change_the_result() -> None:
     """Zero-padding the head width is exact, not an approximation.
 
@@ -263,6 +264,7 @@ def test_hardware_native_mlp_rejects_cpu_execution() -> None:
         module(torch.randn(2, 4, 128, dtype=torch.bfloat16))
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_mlp_compiles_fp8_forward_and_backward() -> None:
     torch.manual_seed(0)
@@ -290,6 +292,7 @@ def test_hardware_native_mlp_compiles_fp8_forward_and_backward() -> None:
     assert not torch.equal(prior, module._up_weight_f8)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_mlp_compiles_bf16_backward() -> None:
     torch.manual_seed(0)
@@ -310,6 +313,7 @@ def test_hardware_native_mlp_compiles_bf16_backward() -> None:
     assert module.down_weight.grad is not None and torch.isfinite(module.down_weight.grad).all()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_actor_runs_autocast_with_fp32_master_weights(
     real_inputs: StructuredInputs,
@@ -348,6 +352,7 @@ def test_hardware_native_actor_runs_autocast_with_fp32_master_weights(
     )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_structured_ensemble_compiles_batched_forward(
     real_inputs: StructuredInputs,
@@ -395,6 +400,7 @@ def test_hardware_native_structured_ensemble_compiles_batched_forward(
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
     torch.manual_seed(0)

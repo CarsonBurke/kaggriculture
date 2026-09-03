@@ -42,7 +42,7 @@ def main() -> None:
     ]
     for environment in official:
         environment.reset(2)
-    native = load_native(release=True).BatchEnv(seeds)
+    native = load_native(build=False, release=True).BatchEnv(seeds)
     encoded_buffers = native.encoded_buffers()
     potentials = np.asarray(
         [
