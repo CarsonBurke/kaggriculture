@@ -11,8 +11,8 @@ answering which part of the network to work on. The kernel view lists the
 costliest individual kernels with launch counts, answering whether the cost is
 bandwidth in a few large kernels or overhead spread across many small ones.
 
-Both fp32 and bfloat16 autocast are profiled, because collection currently runs
-fp32 while the update runs bf16 and the split may differ between them.
+Both fp32 and bfloat16 autocast are profiled, with one scope per forward to
+match the collector call site.
 """
 
 from __future__ import annotations
@@ -73,6 +73,8 @@ def _instrument(actor: FarmActor | StructuredActor) -> None:
         scoped("section::latent_read", trunk.latent_read)
         for index, block in enumerate(trunk.core):
             scoped(f"core_block::{index:02d}", block)
+        for layer, block in actor.trunk.global_refresh.items():
+            scoped(f"refresh_block::{layer}", block)
         for name in (
             "unit_decoder",
             "unit_local_decoder",
@@ -117,6 +119,7 @@ def _profile(actor: FarmActor | StructuredActor, inputs, autocast: bool, args) -
         "block::",
         "cnn::",
         "tokenizer::",
+        "refresh_block::",
         "farm_block::",
         "core_block::",
         "decoder::",

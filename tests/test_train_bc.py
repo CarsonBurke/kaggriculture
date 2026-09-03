@@ -436,6 +436,16 @@ def test_training_improves_and_saves_a_loadable_artifact(dataset_dir: Path, tmp_
         for line in (output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert [record["epoch"] for record in records] == [0, 1]
+    epoch_checkpoints = [
+        output / "bc-actor-epoch-0001.pt",
+        output / "bc-actor-epoch-0002.pt",
+    ]
+    assert all(path.is_file() for path in epoch_checkpoints)
+    assert any((output / "bc-actor.pt").samefile(path) for path in epoch_checkpoints)
+    assert [
+        torch.load(path, map_location="cpu", weights_only=False)["metrics"]["nll"]
+        for path in epoch_checkpoints
+    ] == pytest.approx([record["holdout_nll"] for record in records])
     assert all(np.isfinite(record["train_loss"]) for record in records)
 
     # TensorBoard is written during the run, not by a conversion step someone
@@ -521,6 +531,7 @@ def test_unflagged_clone_builds_the_family_default_configuration(
         ],
     )
     args = trainer.parse_args()
+    assert args.epochs == 2
 
     config = trainer.model_config_from_args(trainer.resolve_architecture(architecture), args)
 

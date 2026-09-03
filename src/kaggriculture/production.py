@@ -153,20 +153,19 @@ def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float 
     """The schedule the calibrated launcher runs and every benchmark measures.
 
     With 230,080 states, a 4096-row ceiling produces 57 balanced minibatches per
-    epoch. Two actor epochs and four critic epochs therefore run 114 actor and
-    228 critic optimizer steps: effectively the same step counts as the former
-    2048-row one-actor/two-critic schedule, while replaying each collected state
-    twice for the actor and four times for the critic.
+    epoch. Two actor and two critic epochs therefore run 114 steps apiece. Their
+    independent CUDA streams overlap each paired actor/critic minibatch instead
+    of spending another two full passes fitting the critic to stale rollout
+    targets.
 
-    This deliberately trades the prior throughput optimum for larger device
-    work. The batch sweep found 4096 2.2-4.8% slower than 2048 and 8192 unable
-    to fit. The critic holdout probe also found weak generalization from later
-    passes, so the extra critic reuse must be judged by end-to-end policy
-    evaluation rather than by fit explained variance.
+    This deliberately trades the prior 2048-row throughput optimum for larger
+    device work. The batch sweep found 4096 2.2-4.8% slower than 2048 and 8192
+    unable to fit; cross-model stream overlap is what recovers otherwise idle
+    execution without changing either objective or minibatch partition.
     """
     return asdict(
         PpoConfig(
-            critic_epochs=4,
+            critic_epochs=PpoConfig.epochs,
             target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
         )

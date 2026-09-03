@@ -1203,7 +1203,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--league-active-opponents", "2"),
         ("--league-historical-opponents", "6"),
         ("--epochs", "2"),
-        ("--critic-epochs", "4"),
+        ("--critic-epochs", "2"),
         ("--minibatch-size", "4096"),
         ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
         (

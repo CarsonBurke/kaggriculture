@@ -32,8 +32,13 @@ import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from kaggriculture.production import PRODUCTION_ROLLOUT_FORWARD_MODE
 from kaggriculture.registry import resolve_architecture
-from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
+from kaggriculture.rollout import (
+    ROLLOUT_FORWARD_MODES,
+    allocate_rollout_storage,
+    collect_mixed_play_rust,
+)
 from kaggriculture.structured import StructuredConfig
 
 
@@ -113,7 +118,11 @@ def main() -> None:
     parser.add_argument("--league-games", type=int, default=64)
     parser.add_argument("--league-opponents", type=int, default=8)
     parser.add_argument("--episode-steps", type=int, default=720)
-    parser.add_argument("--forward-mode", default="eager")
+    parser.add_argument(
+        "--forward-mode",
+        choices=ROLLOUT_FORWARD_MODES,
+        default=PRODUCTION_ROLLOUT_FORWARD_MODE,
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument(
         "--profile",
@@ -155,14 +164,7 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
 
     architecture = resolve_architecture("structured")
-    config = StructuredConfig(
-        model_dim=80,
-        attention_heads=4,
-        attention_kv_heads=2,
-        ffn_multiplier=2,
-        global_modulation=True,
-        fuse_market_decoder=True,
-    )
+    config = StructuredConfig()
     actor = architecture.actor_class(config).to(device)
     frozen = {k: v.detach().cpu().clone() for k, v in actor.state_dict().items()}
     opponents = []

@@ -918,6 +918,30 @@ def _gpu_preferences_to_host(
     )
 
 
+@dataclass(frozen=True)
+class _GpuStatisticsTransfer:
+    """Persistent pinned staging for sampled policy statistics."""
+
+    device: torch.Tensor
+    host: torch.Tensor
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ready: torch.cuda.Event
+    inputs: tuple[torch.Tensor, ...]
+
+
+_GPU_STATISTIC_INPUT_NAMES = (
+    "unit_actions",
+    "market_kinds",
+    "market_quantities",
+    "unit_masks",
+    "market_kind_masks",
+    "market_quantity_masks",
+    "unit_active",
+    "market_active",
+    "market_quantity_active",
+)
+
+
 def _fill_gpu_policy_statistics(
     sampled: dict[str, np.ndarray],
     output: ActorOutput,
@@ -925,14 +949,67 @@ def _fill_gpu_policy_statistics(
     head_ids: torch.Tensor,
     builtin_agents: torch.Tensor,
     temperatures: torch.Tensor,
-) -> None:
+    transfer: _GpuStatisticsTransfer | None = None,
+    *,
+    synchronize: bool = True,
+) -> _GpuStatisticsTransfer | None:
     device = output.unit_logits.device
-    unit_actions = torch.as_tensor(sampled["unit_actions"], device=device)
-    market_kinds = torch.as_tensor(sampled["market_kinds"], device=device)
-    market_quantities = torch.as_tensor(sampled["market_quantities"], device=device)
-    unit_masks = torch.as_tensor(sampled["unit_masks"], device=device)
-    kind_masks = torch.as_tensor(sampled["market_kind_masks"], device=device)
-    quantity_masks = torch.as_tensor(sampled["market_quantity_masks"], device=device)
+    if device.type == "cpu":
+        input_tensors = tuple(
+            torch.as_tensor(sampled[name]) for name in _GPU_STATISTIC_INPUT_NAMES
+        )
+    else:
+        host_inputs = tuple(
+            torch.from_numpy(np.asarray(sampled[name])) for name in _GPU_STATISTIC_INPUT_NAMES
+        )
+        statistic_shapes = (
+            tuple(host_inputs[0].shape),
+            tuple(host_inputs[1].shape),
+            tuple(host_inputs[2].shape),
+            (host_inputs[0].shape[0],),
+        )
+        total = sum(int(np.prod(shape)) for shape in statistic_shapes)
+        if (
+            transfer is None
+            or transfer.device.numel() != total
+            or tuple(array.shape for array in transfer.arrays) != statistic_shapes
+            or tuple(tensor.shape for tensor in transfer.inputs)
+            != tuple(tensor.shape for tensor in host_inputs)
+        ):
+            device_buffer = torch.empty(total, dtype=torch.float32, device=device)
+            host_buffer = torch.empty(
+                total, dtype=torch.float32, device="cpu", pin_memory=True
+            )
+            flat = host_buffer.numpy()
+            cursor = 0
+            arrays: list[np.ndarray] = []
+            for shape in statistic_shapes:
+                size = int(np.prod(shape))
+                arrays.append(flat[cursor : cursor + size].reshape(shape))
+                cursor += size
+            transfer = _GpuStatisticsTransfer(
+                device=device_buffer,
+                host=host_buffer,
+                arrays=tuple(arrays),
+                ready=torch.cuda.Event(),
+                inputs=tuple(
+                    torch.empty_like(tensor, device=device) for tensor in host_inputs
+                ),
+            )
+        for target, source in zip(transfer.inputs, host_inputs, strict=True):
+            target.copy_(source, non_blocking=True)
+        input_tensors = transfer.inputs
+    (
+        unit_actions,
+        market_kinds,
+        market_quantities,
+        unit_masks,
+        kind_masks,
+        quantity_masks,
+        unit_active,
+        kind_active,
+        quantity_active,
+    ) = input_tensors
     scale = temperatures[:, None, None]
     unit_logits = output.unit_logits / scale
     kind_logits = output.market_kind_logits / scale
@@ -955,22 +1032,36 @@ def _fill_gpu_policy_statistics(
         quantity_entropy,
     ):
         values.mul_(learned[:, None])
-    unit_active = torch.as_tensor(sampled["unit_active"], device=device)
-    kind_active = torch.as_tensor(sampled["market_active"], device=device)
-    quantity_active = torch.as_tensor(sampled["market_quantity_active"], device=device)
     counts = unit_active.sum(1) + kind_active.sum(1) + quantity_active.sum(1)
     entropy = (
         (unit_entropy * unit_active).sum(1)
         + (kind_entropy * kind_active).sum(1)
         + (quantity_entropy * quantity_active).sum(1)
     ) / counts.clamp_min(1)
-    for name, values in (
+    statistics = (
         ("unit_logprobs", unit_logprob),
         ("market_kind_logprobs", kind_logprob),
         ("market_quantity_logprobs", quantity_logprob),
         ("entropy", entropy),
-    ):
-        np.copyto(np.asarray(sampled[name]), values.float().cpu().numpy())
+    )
+    if device.type == "cpu":
+        for name, values in statistics:
+            np.copyto(np.asarray(sampled[name]), values.float().numpy())
+        return transfer
+
+    assert transfer is not None
+    cursor = 0
+    for _, values in statistics:
+        size = values.numel()
+        transfer.device[cursor : cursor + size].view(values.shape).copy_(values)
+        cursor += size
+    transfer.host.copy_(transfer.device, non_blocking=True)
+    transfer.ready.record()
+    if synchronize:
+        transfer.ready.synchronize()
+        for (name, _), values in zip(statistics, transfer.arrays, strict=True):
+            np.copyto(np.asarray(sampled[name]), values)
+    return transfer
 
 
 #: Execution mode for the collection forward. Collection spends roughly two
@@ -1453,6 +1544,8 @@ _SAMPLED_FIELD_SOURCES = {
     "unit_active": "unit_active",
     "market_active": "market_active",
     "market_quantity_active": "market_quantity_active",
+}
+_POLICY_STATISTIC_FIELD_SOURCES = {
     "old_unit_logprobs": "unit_logprobs",
     "old_market_kind_logprobs": "market_kind_logprobs",
     "old_market_quantity_logprobs": "market_quantity_logprobs",
@@ -1482,6 +1575,8 @@ def _store_native_wave(
     rewards: np.ndarray,
     rows: np.ndarray | slice,
     pair_rows: np.ndarray,
+    *,
+    store_policy_statistics: bool = True,
 ) -> None:
     if architecture == CONV_ENTITY:
         for name in _CONV_ENCODED_FIELDS:
@@ -1506,6 +1601,9 @@ def _store_native_wave(
         ]
     for destination, source in _SAMPLED_FIELD_SOURCES.items():
         fields[destination][:, step] = np.asarray(sampled[source])[rows]
+    if store_policy_statistics:
+        for destination, source in _POLICY_STATISTIC_FIELD_SOURCES.items():
+            fields[destination][:, step] = np.asarray(sampled[source])[rows]
     fields["rewards"][:, step] = rewards
 
 
@@ -1674,7 +1772,11 @@ def _collect_mixed_play_rust_wave(
     encoded_wave = _native_wave(architecture, environment, device)
     wave_inputs = encoded_wave.inputs()
     encoded = encoded_wave.arrays
+    gpu_sampling = device.type == "cuda"
     sampled = environment.sample_buffers()
+    if gpu_sampling:
+        for name in _GPU_STATISTIC_INPUT_NAMES:
+            sampled[name] = torch.from_numpy(np.asarray(sampled[name])).pin_memory().numpy()
 
     league_seats = (seeds[self_play_games:] % 2).astype(np.int64)
     league_game_rows = self_play_rows + 2 * np.arange(league_games, dtype=np.int64)
@@ -1684,7 +1786,6 @@ def _collect_mixed_play_rust_wave(
     generator = np.random.default_rng(sampling_seed)
     frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
     kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
-    gpu_sampling = device.type == "cuda"
     gpu_heads = _quantity_head_tensors((actor, *opponents)) if gpu_sampling else None
     # Per-lane decode of everything a frozen row needs. A built-in lane has no
     # network, so it borrows the learner's quantity head and neutral sampling
@@ -1718,6 +1819,8 @@ def _collect_mixed_play_rust_wave(
     gpu_head_ids: torch.Tensor | None = None
     gpu_deterministic_rows: torch.Tensor | None = None
     gpu_temperatures: torch.Tensor | None = None
+    statistics_transfer: _GpuStatisticsTransfer | None = None
+    pending_statistics: tuple[int, np.ndarray] | None = None
     gpu_builtin_agents: torch.Tensor | None = None
     if gpu_sampling:
         gpu_current_generator = torch.Generator(device=device)
@@ -1975,18 +2078,30 @@ def _collect_mixed_play_rust_wave(
                 pipeline_started = True
                 if _pipeline_wait is not None:
                     _pipeline_wait()
+            if pending_statistics is not None:
+                pending_step, pending_counts = pending_statistics
+                assert statistics_transfer is not None
+                statistics_transfer.ready.synchronize()
+                for destination, values in zip(
+                    _POLICY_STATISTIC_FIELD_SOURCES, statistics_transfer.arrays[:3], strict=True
+                ):
+                    fields[destination][:, pending_step] = values[store_rows]
+                entropy_sums += statistics_transfer.arrays[3][store_rows] * pending_counts
+                pending_statistics = None
             environment.select_and_step_into(
                 *preferences,
                 builtin_agents,
                 sampled,
             )
-            _fill_gpu_policy_statistics(
+            statistics_transfer = _fill_gpu_policy_statistics(
                 sampled,
                 full_output,
                 gpu_heads,
                 gpu_head_ids,
                 gpu_builtin_agents,
                 gpu_temperatures,
+                statistics_transfer,
+                synchronize=False,
             )
         else:
             if not league_games:
@@ -2044,19 +2159,33 @@ def _collect_mixed_play_rust_wave(
             rewards[store_rows],
             store_rows,
             stored_pair_rows,
+            store_policy_statistics=not gpu_sampling,
         )
         counts = (
             np.asarray(sampled["unit_active"])[store_rows].sum(axis=1)
             + np.asarray(sampled["market_active"])[store_rows].sum(axis=1)
             + np.asarray(sampled["market_quantity_active"])[store_rows].sum(axis=1)
         )
-        entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
+        if gpu_sampling:
+            pending_statistics = (step, counts)
+        else:
+            entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
         dones = np.asarray(sampled["dones"], dtype=np.bool_)
         if step + 1 < horizon and dones.any():
             raise RuntimeError("native rollout terminated before the competition horizon")
         if step + 1 == horizon and not dones.all():
             raise RuntimeError("native rollout did not terminate at the competition horizon")
         final = np.asarray(sampled["final_money"], dtype=np.float32)
+
+    if pending_statistics is not None:
+        pending_step, pending_counts = pending_statistics
+        assert statistics_transfer is not None
+        statistics_transfer.ready.synchronize()
+        for destination, values in zip(
+            _POLICY_STATISTIC_FIELD_SOURCES, statistics_transfer.arrays[:3], strict=True
+        ):
+            fields[destination][:, pending_step] = values[store_rows]
+        entropy_sums += statistics_transfer.arrays[3][store_rows] * pending_counts
 
     if step_graph is not None:
         step_graph.close()

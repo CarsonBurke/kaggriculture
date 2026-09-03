@@ -172,6 +172,8 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
         )
 
 
+
+
 @pytest.mark.parametrize("model_dim,heads", [(80, 4), (128, 4)])
 def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -> None:
     """Both attention branches compute the same function at the same shape.
@@ -436,8 +438,6 @@ def test_structured_actor_exposes_typed_training_belief(
 @pytest.mark.parametrize(
     "changes",
     [
-        {"global_refresh_layers": (1,), "global_refresh_context": "economy"},
-        {"global_refresh_layers": (1,), "global_refresh_context": "all"},
         {"input_reinject_layers": (1,)},
         {"core_skip_source": 1, "core_skip_target": 2},
         {"global_modulation": True},
@@ -656,6 +656,38 @@ def test_structured_config_uses_two_head_gqa_and_two_x_squared_relu() -> None:
     assert attention.key_value.out_features == 2 * config.attention_kv_heads * attention.head_dim
     assert isinstance(feed_forward.activation, ReluSquared)
     assert feed_forward.input.out_features == 2 * config.model_dim
+
+
+def test_default_core_interleaves_full_entity_refreshes(
+    real_inputs: StructuredInputs,
+) -> None:
+    config = replace(_tiny_config(), core_layers=8, global_refresh_context="all")
+    actor = StructuredActor(config)
+    context_lengths: list[int] = []
+
+    def capture_context(_module, arguments) -> None:
+        context_lengths.append(arguments[1].shape[1])
+
+    modules = [
+        actor.trunk.latent_read.attention,
+        *(block.attention for block in actor.trunk.global_refresh.values()),
+    ]
+    handles = [module.register_forward_pre_hook(capture_context) for module in modules]
+    try:
+        actor(real_inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert config.global_refresh_layers == (3, 6)
+    assert config.global_refresh_context == "all"
+    assert context_lengths == [context_lengths[0]] * 3
+    assert context_lengths[0] > 100
+    for block in actor.trunk.global_refresh.values():
+        torch.testing.assert_close(
+            block.attention_gate.gate,
+            torch.full_like(block.attention_gate.gate, 0.1),
+        )
 
 
 def test_structured_config_validation() -> None:

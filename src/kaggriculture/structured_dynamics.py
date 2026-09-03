@@ -161,6 +161,9 @@ class StructuredDynamicsTerms(NamedTuple):
     economy: Tensor
     opponent_summary: Tensor
     opponent_patches: Tensor
+    opponent_patch_all: Tensor
+    opponent_patch_changed: Tensor
+    opponent_patch_unchanged: Tensor
     eligible: Tensor
     residual_ratio: Tensor
     residual_own_patches: Tensor
@@ -246,6 +249,18 @@ def _patch_losses(
     return 0.5 * (all_loss + changed_loss), all_loss, changed_loss, unchanged_loss
 
 
+def _tile_changes(
+    source_categorical: Tensor,
+    target_categorical: Tensor,
+    source_continuous: Tensor,
+    target_continuous: Tensor,
+) -> Tensor:
+    """Exact per-tile semantic or continuous transition mask."""
+    return (source_categorical != target_categorical).any(dim=-1) | (
+        source_continuous != target_continuous
+    ).any(dim=-1)
+
+
 def _active_belief_fields(
     *,
     decision_horizon: int,
@@ -296,7 +311,7 @@ def structured_horizon_loss(
     targets = belief if target_belief is None else target_belief
     predicted = belief
     zero = belief.central_latents.new_zeros((), dtype=torch.float32)
-    sums = [zero for _ in range(13)]
+    sums = [zero for _ in range(16)]
     eligible_sum = zero
     decision_steps = 0
     patch_steps = 0
@@ -398,9 +413,12 @@ def structured_horizon_loss(
                 target_categorical = inputs.tile_categorical[target_index, :TILE_COUNT]
                 source_continuous = inputs.tile_continuous[:, :TILE_COUNT]
                 target_continuous = inputs.tile_continuous[target_index, :TILE_COUNT]
-                changed = (source_categorical != target_categorical).any(dim=-1) | (
-                    source_continuous != target_continuous
-                ).any(dim=-1)
+                changed = _tile_changes(
+                    source_categorical,
+                    target_categorical,
+                    source_continuous,
+                    target_continuous,
+                )
                 patch_terms = _patch_losses(
                     predicted.own_patches,
                     targets.own_patches[target_index],
@@ -428,11 +446,22 @@ def structured_horizon_loss(
                     eligible,
                 )
             if opponent_patches_active:
-                sums[10] = sums[10] + _feature_l1(
+                opponent_slice = slice(TILE_COUNT, 2 * TILE_COUNT)
+                changed = _tile_changes(
+                    inputs.tile_categorical[:, opponent_slice],
+                    inputs.tile_categorical[target_index, opponent_slice],
+                    inputs.tile_continuous[:, opponent_slice],
+                    inputs.tile_continuous[target_index, opponent_slice],
+                )
+                opponent_patch_terms = _patch_losses(
                     predicted.opponent_patches,
                     targets.opponent_patches[target_index],
                     eligible,
+                    changed,
                 )
+                sums[10] = sums[10] + opponent_patch_terms[0]
+                for position, value in enumerate(opponent_patch_terms[1:], start=13):
+                    sums[position] = sums[position] + value
             state_steps += 1
         eligible_sum = eligible_sum + eligible.float().sum()
 
@@ -456,6 +485,9 @@ def structured_horizon_loss(
         economy=sums[8] / state_divisor,
         opponent_summary=sums[9] / state_divisor,
         opponent_patches=sums[10] / state_divisor,
+        opponent_patch_all=sums[13] / state_divisor,
+        opponent_patch_changed=sums[14] / state_divisor,
+        opponent_patch_unchanged=sums[15] / state_divisor,
         eligible=eligible_sum / max_horizon,
         residual_ratio=sums[11] / max_horizon,
         residual_own_patches=residual_sums[0] / max_horizon,
@@ -511,7 +543,7 @@ def structured_window_loss(
         if name not in {"episode_index", "step"}
     }
     zero = belief.own_patches.new_zeros(())
-    sums = [zero for _ in range(12)]
+    sums = [zero for _ in range(15)]
     eligible_sum = zero
     decision_steps = 0
     patch_steps = 0
@@ -621,9 +653,12 @@ def structured_window_loss(
                 target_continuous = windowed_inputs.tile_continuous[
                     :, target_slice, :TILE_COUNT
                 ].flatten(0, 1)
-                changed = (source_categorical != target_categorical).any(dim=-1) | (
-                    source_continuous != target_continuous
-                ).any(dim=-1)
+                changed = _tile_changes(
+                    source_categorical,
+                    target_categorical,
+                    source_continuous,
+                    target_continuous,
+                )
                 patch_terms = _patch_losses(
                     current.own_patches,
                     targets.own_patches,
@@ -651,11 +686,34 @@ def structured_window_loss(
                     eligible,
                 )
             if opponent_patches_active:
-                sums[10] = sums[10] + _feature_l1(
+                opponent_slice = slice(TILE_COUNT, 2 * TILE_COUNT)
+                source_categorical = windowed_inputs.tile_categorical[
+                    :, :source_positions, opponent_slice
+                ].flatten(0, 1)
+                target_categorical = windowed_inputs.tile_categorical[
+                    :, target_slice, opponent_slice
+                ].flatten(0, 1)
+                source_continuous = windowed_inputs.tile_continuous[
+                    :, :source_positions, opponent_slice
+                ].flatten(0, 1)
+                target_continuous = windowed_inputs.tile_continuous[
+                    :, target_slice, opponent_slice
+                ].flatten(0, 1)
+                changed = _tile_changes(
+                    source_categorical,
+                    target_categorical,
+                    source_continuous,
+                    target_continuous,
+                )
+                opponent_patch_terms = _patch_losses(
                     current.opponent_patches,
                     targets.opponent_patches,
                     eligible,
+                    changed,
                 )
+                sums[10] = sums[10] + opponent_patch_terms[0]
+                for position, value in enumerate(opponent_patch_terms[1:], start=12):
+                    sums[position] = sums[position] + value
             state_steps += 1
         eligible_sum = eligible_sum + eligible.float().sum()
 
@@ -679,6 +737,9 @@ def structured_window_loss(
         economy=sums[8] / state_divisor,
         opponent_summary=sums[9] / state_divisor,
         opponent_patches=sums[10] / state_divisor,
+        opponent_patch_all=sums[12] / state_divisor,
+        opponent_patch_changed=sums[13] / state_divisor,
+        opponent_patch_unchanged=sums[14] / state_divisor,
         eligible=eligible_sum / max_horizon,
         residual_ratio=sums[11] / max_horizon,
         residual_own_patches=residual_sums[0] / max_horizon,

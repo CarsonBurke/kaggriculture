@@ -240,10 +240,8 @@ def test_the_report_and_the_collector_agree_on_the_collection_configuration(
     monkeypatch, tmp_path: Path
 ) -> None:
     """The collection mode and precision decide what the rollout phase median
-    means -- eager/fp32 measures 8.91 s against inductor/bf16's 5.36 s on the
-    production wave -- and that median is what selects the shipped
-    configuration. So a report has to name the configuration it timed, and it
-    has to be the one the collector was actually given.
+    means. The benchmark defaults to the production explicit CUDA graph path;
+    reports must name the exact configuration passed to the collector.
 
     The knob is the mode alone. No boolean projection of it is recorded, because
     the launcher requires every configuration key it does not strip to be
@@ -255,7 +253,7 @@ def test_the_report_and_the_collector_agree_on_the_collection_configuration(
     from kaggriculture.rollout import ROLLOUT_FORWARD_MODES
 
     cases = (
-        ((), "inductor", True),
+        ((), "graph", True),
         (("--rollout-forward-mode", "eager", "--no-rollout-bfloat16"), "eager", False),
         (("--rollout-forward-mode", "cudagraphs"), "cudagraphs", True),
         (("--rollout-forward-mode", "inductor", "--no-rollout-bfloat16"), "inductor", False),

@@ -975,6 +975,61 @@ def test_one_ppo_update_is_finite() -> None:
     assert not unfiled, unfiled
 
 
+def test_policy_and_critic_head_are_excluded_from_global_gradient_clipping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(
+        actor,
+        games=1,
+        seed_start=94,
+        episode_steps=4,
+        sampling_seed=10,
+    )
+    rollout.rewards[:] = np.random.default_rng(12).normal(0.0, 0.05, size=rollout.rewards.shape)
+    config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=1 << 12,
+        max_gradient_norm=1.0e-8,
+        use_bfloat16=False,
+    )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    original_clip = torch.nn.utils.clip_grad_norm_
+    clipped_parameter_sets: list[set[int]] = []
+
+    def recording_clip(parameters, *args, **kwargs):
+        materialized = tuple(parameters)
+        clipped_parameter_sets.append({id(parameter) for parameter in materialized})
+        return original_clip(materialized, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", recording_clip)
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(13),
+    )
+
+    actor_parameters = {id(parameter) for parameter in actor.parameters()}
+    critic_head = {id(parameter) for parameter in critic.value_head.parameters()}
+    critic_trunk = {id(parameter) for parameter in critic.parameters()} - critic_head
+    assert clipped_parameter_sets
+    assert all(parameters <= critic_trunk for parameters in clipped_parameter_sets)
+    assert all(not (parameters & actor_parameters) for parameters in clipped_parameter_sets)
+    assert all(not (parameters & critic_head) for parameters in clipped_parameter_sets)
+    assert metrics["actor_gradient_norm"] > config.max_gradient_norm
+    assert metrics["critic_gradient_norm"] == pytest.approx(
+        math.hypot(
+            metrics["critic_trunk_gradient_norm"],
+            metrics["critic_head_gradient_norm"],
+        )
+    )
+
+
 def test_a_critic_only_refit_aborts_on_a_non_finite_loss(monkeypatch: pytest.MonkeyPatch) -> None:
     """A poisoned critic loss must still stop the run when no actor is present.
 
@@ -1409,7 +1464,7 @@ def test_structured_window_loss_matches_generic_masked_unroll() -> None:
         use_bfloat16=False,
         structured_decision_coefficient=0.5,
         structured_opponent_summary_coefficient=0.5,
-        structured_opponent_patch_coefficient=0.0,
+        structured_opponent_patch_coefficient=0.5,
         structured_decision_horizon=2,
         structured_patch_horizon=1,
     )
@@ -1547,6 +1602,7 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
         structured_decision_horizon=2,
         structured_patch_horizon=1,
         structured_actor_gradient_ratio=0.1,
+        max_gradient_norm=1.0e-4,
     )
     dynamics = StructuredDynamics(_small_structured_config())
     control_optimizers = make_optimizers(control_actor, control_critic, control_config)
@@ -1605,6 +1661,9 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
         "structured_preupdate_decision",
         "structured_predictor_opponent_summary",
         "structured_predictor_opponent_patches",
+        "structured_predictor_opponent_patch_all",
+        "structured_predictor_opponent_patch_changed",
+        "structured_predictor_opponent_patch_unchanged",
         "structured_actor_decision",
         "structured_actor_residual_ratio",
     ):
@@ -1612,6 +1671,17 @@ def test_active_structured_auxiliary_updates_actor_and_predictor_without_using_p
     assert active_metrics["structured_preupdate_decision"] > 0.0
     assert active_metrics["structured_preupdate_opponent_summary"] > 0.0
     assert active_metrics["structured_preupdate_opponent_patches"] > 0.0
+    assert active_metrics["structured_actor_auxiliary_applied_gradient_norm"] <= (
+        active_config.max_gradient_norm + 1e-7
+    )
+    assert active_metrics["structured_predictor_opponent_patches"] == pytest.approx(
+        0.5
+        * (
+            active_metrics["structured_predictor_opponent_patch_all"]
+            + active_metrics["structured_predictor_opponent_patch_changed"]
+        )
+    )
+    assert active_metrics["structured_predictor_opponent_patch_unchanged"] > 0.0
     assert any(
         not torch.equal(value, actor_before[name])
         for name, value in active_actor.named_parameters()
@@ -1665,7 +1735,8 @@ def test_structured_predictor_trains_during_critic_only_warmup_without_actor_gra
     assert all(parameter.grad is None for parameter in actor.parameters())
 
 
-def test_ppo_adamw_optimizers_never_apply_weight_decay() -> None:
+@pytest.mark.parametrize("optimizer", ["adamw", "normuon"])
+def test_ppo_optimizers_never_apply_weight_decay(optimizer: str) -> None:
     model_config = ModelConfig(
         cnn_width=8,
         cnn_blocks=1,
@@ -1676,7 +1747,7 @@ def test_ppo_adamw_optimizers_never_apply_weight_decay() -> None:
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     dynamics = StructuredDynamics(_small_structured_config())
-    config = PpoConfig(optimizer="adamw")
+    config = PpoConfig(optimizer=optimizer)
 
     optimizers = (
         *make_optimizers(actor, critic, config),

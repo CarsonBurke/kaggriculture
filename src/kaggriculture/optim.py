@@ -57,11 +57,11 @@ What is deliberately NOT ported:
 
 An important interaction with the rest of this trainer: Polar Express opens by
 dividing its input by that input's Frobenius norm, so a NorMuon step is
-invariant to any uniform rescaling of the gradient.  `max_gradient_norm` is
-documented in `ppo.py` as clipping on 100% of updates, which makes Adam's
-applied step `lr * g / ||g||` and its effective learning rate vary about
-tenfold between minibatches.  For matrices under NorMuon that variation is
-gone -- not clipped, but algebraically absent.
+invariant to any uniform rescaling of the gradient. PPO therefore leaves the
+policy gradient unclipped and applies `max_gradient_norm` only to actor-side
+NextLat and the critic trunk. The categorical value head is excluded as well;
+NorMuon's matrix directions would be scale-invariant, while Adam-managed gains,
+biases, and heads would otherwise inherit a variable effective rate.
 """
 
 from __future__ import annotations
@@ -156,6 +156,17 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = (
 )
 
 
+def _polar_express_wide_batch(matrices: Tensor) -> Tensor:
+    """Evaluate the fixed polynomial for a rank-3 batch in wide orientation."""
+    x = matrices.float()
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) * (1.0 + 2e-2) + 1e-6)
+    for a, b, c in POLAR_EXPRESS_COEFFICIENTS:
+        gram = torch.bmm(x, x.mT)
+        combined = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        x = a * x + torch.bmm(combined, x)
+    return x
+
+
 def polar_express(matrices: Tensor) -> Tensor:
     """Approximate the polar factor of each matrix in a batch.
 
@@ -189,16 +200,34 @@ def polar_express(matrices: Tensor) -> Tensor:
     if matrices.ndim < 2:
         raise ValueError("polar_express needs at least two dimensions")
     transposed = matrices.size(-2) > matrices.size(-1)
-    x = matrices.mT if transposed else matrices
-    x = x.float()
-    x = x / (x.norm(dim=(-2, -1), keepdim=True) * (1.0 + 2e-2) + 1e-6)
-    for a, b, c in POLAR_EXPRESS_COEFFICIENTS:
-        gram = x @ x.mT
-        # b*A + c*A@A, the odd polynomial's inner term.
-        inner = torch.addmm if gram.ndim == 2 else torch.baddbmm
-        combined = inner(gram, gram, gram, beta=b, alpha=c)
-        x = a * x + combined @ x
-    return x.mT if transposed else x
+    oriented = matrices.mT if transposed else matrices
+    leading_shape = oriented.shape[:-2]
+    rows, columns = oriented.shape[-2:]
+    batched = oriented.reshape(-1, rows, columns)
+    result = _polar_express_wide_batch(batched).reshape(*leading_shape, rows, columns)
+    return result.mT if transposed else result
+
+
+# The optimizer owns many distinct matrix shapes. Compile one rank-3,
+# dynamically-shaped wide-orientation kernel rather than specializing the public
+# wrapper: static specialization exhausted Dynamo's eight-entry recompile cache
+# on the production actor before its first optimizer step. Keeping rank and
+# orientation outside the graph leaves only matrix extents dynamic.
+_polar_express_compiled = torch.compile(_polar_express_wide_batch, dynamic=True, fullgraph=True)
+
+
+def _polar_factor(matrices: Tensor) -> Tensor:
+    if not matrices.is_cuda:
+        return polar_express(matrices)
+    if matrices.ndim < 2:
+        raise ValueError("polar_express needs at least two dimensions")
+    transposed = matrices.size(-2) > matrices.size(-1)
+    oriented = matrices.mT if transposed else matrices
+    leading_shape = oriented.shape[:-2]
+    rows, columns = oriented.shape[-2:]
+    batched = oriented.reshape(-1, rows, columns)
+    result = _polar_express_compiled(batched).reshape(*leading_shape, rows, columns)
+    return result.mT if transposed else result
 
 
 def _shape_learning_rate_multiplier(rows: int, columns: int) -> float:
@@ -425,7 +454,7 @@ class NorMuon(torch.optim.Optimizer):
             if len(members) == 1:
                 index = members[0]
                 reduced[index] = self._reduce_variance(
-                    polar_express(nesterovs[index]),
+                    _polar_factor(nesterovs[index]),
                     second_moments[index],
                     beta2,
                     reduced_dimension,
@@ -437,7 +466,7 @@ class NorMuon(torch.optim.Optimizer):
             # the whole group's running estimates to their own state entries.
             stacked_second = torch.stack([second_moments[index] for index in members])
             group_directions = self._reduce_variance(
-                polar_express(torch.stack([nesterovs[index] for index in members])),
+                _polar_factor(torch.stack([nesterovs[index] for index in members])),
                 stacked_second,
                 beta2,
                 reduced_dimension,

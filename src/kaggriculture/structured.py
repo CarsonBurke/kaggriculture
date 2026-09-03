@@ -69,8 +69,11 @@ class StructuredConfig:
     latents: int = 32
     core_layers: int = 8
     quantity_rank: int = 32
+    # Empty + "all" selects the canonical 8-layer schedule: read all entities
+    # initially, refresh after layers 3 and 6, then finish layers 7-8. Shallower
+    # research variants retain every third-layer refresh that fits.
     global_refresh_layers: tuple[int, ...] = ()
-    global_refresh_context: str = "none"
+    global_refresh_context: str = "all"
     input_reinject_layers: tuple[int, ...] = ()
     core_skip_source: int = 0
     core_skip_target: int = 0
@@ -89,7 +92,14 @@ class StructuredConfig:
     value_sigma_ratio: float = 0.75
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "global_refresh_layers", tuple(self.global_refresh_layers))
+        refresh_layers = tuple(self.global_refresh_layers)
+        refresh_context = self.global_refresh_context
+        if not refresh_layers and refresh_context == "all":
+            refresh_layers = tuple(range(3, self.core_layers, 3))
+            if not refresh_layers:
+                refresh_context = "none"
+        object.__setattr__(self, "global_refresh_layers", refresh_layers)
+        object.__setattr__(self, "global_refresh_context", refresh_context)
         object.__setattr__(self, "input_reinject_layers", tuple(self.input_reinject_layers))
         if self.model_dim <= 0:
             raise ValueError("model_dim must be positive")
@@ -281,9 +291,10 @@ class GatedResidual(nn.Module):
 #: Measured, the drift is nowhere near the bound: `update_replay_max_kl` moves
 #: 3.12e-7 to 3.14e-7 against a 5e-3 gate, with every tail fraction still zero.
 #:
-#: End to end at production settings (`scripts/benchmark_ppo_iteration.py`,
-#: 128 self-play + 64 league games, 2 epochs, 4 critic epochs, minibatch 4096,
-#: median of five steady repeats, `artifacts/benchmarks/attn-*.jsonl`):
+#: End to end on the then-production 2-actor/4-critic schedule
+#: (`scripts/benchmark_ppo_iteration.py`, 128 self-play + 64 league games,
+#: minibatch 4096, median of five steady repeats,
+#: `artifacts/benchmarks/attn-*.jsonl`):
 #:
 #:                       rollout    update     total   iterations/hour
 #:     before             18.540    41.617    60.272        59.73
@@ -896,10 +907,7 @@ class StructuredTrunk(nn.Module):
         )
         self.core_norm = RMSNorm(config.model_dim)
         self.global_refresh = nn.ModuleDict(
-            {
-                str(layer): Block(config, residual_initial=0.0)
-                for layer in config.global_refresh_layers
-            }
+            {str(layer): Block(config) for layer in config.global_refresh_layers}
         )
         self.global_context_norm = (
             RMSNorm(config.model_dim) if config.global_refresh_layers else None
@@ -987,20 +995,12 @@ class StructuredTrunk(nn.Module):
                 batch, economy_tokens.shape[1], dtype=torch.bool, device=tiles.device
             )
         elif self.config.global_refresh_context == "all":
-            global_context = torch.cat((summary, unit_tokens, economy_tokens), dim=1)
-            global_valid = torch.cat(
-                (
-                    torch.ones(batch, summary.shape[1], dtype=torch.bool, device=tiles.device),
-                    inputs.unit_active,
-                    torch.ones(
-                        batch,
-                        economy_tokens.shape[1],
-                        dtype=torch.bool,
-                        device=tiles.device,
-                    ),
-                ),
-                dim=1,
-            )
+            # Reuse the exact entity memory and mask from the initial read. This
+            # includes own patches and critic-only opponent units; rebuilding a
+            # narrower context here silently turned "all" into only summary,
+            # own units, and economy, and paid for two extra concatenations.
+            global_context = context
+            global_valid = context_valid
         else:
             global_context = global_valid = None
         conditioning = economy_tokens.mean(dim=1) if self.config.global_modulation else None

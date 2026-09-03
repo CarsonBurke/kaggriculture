@@ -80,7 +80,7 @@ from kaggriculture.structured import (
 from kaggriculture.structured_dynamics import StructuredDynamics, structured_horizon_loss
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.tokens import encode_structured_observation
-from kaggriculture.training import write_checkpoint
+from kaggriculture.training import replace_checkpoint_alias, write_immutable_checkpoint
 
 SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1,))
 BC_ENCODING_CACHE_FORMAT_VERSION = 1
@@ -168,18 +168,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=12,
-        # 12 is a budget, not a plateau. The plateau reading was measured on the
-        # v27 corpora (holdout 0.00188 at epoch 9, 0.00182 at 10) and the v16
-        # corpora refute it: there holdout fell 0.000516 -> 0.000133 over epochs
-        # 10-19, a 4x gain, while unit accuracy sat at 0.99996 the whole way. What
-        # justifies the cap is that those gains arrive WITH THE DECAY, and the
-        # rate schedule is a fraction of this number rather than a fixed step
-        # count: at `--epochs 12` the final epoch runs at 1.13e-3, where a
-        # 20-epoch schedule is still at 3.31e-3 on the same epoch. A 12-epoch run
-        # is therefore not the first 12 epochs of a 20-epoch run -- it is the same
-        # trapezoid compressed, tail included. The residual NLL it gives up is
-        # confidence on decisions that were already correct.
+        default=2,
         help=(
             "passes over the corpus; an epoch is a pass, not a fixed step count, "
             "so a larger corpus needs fewer of them, not more"
@@ -901,6 +890,9 @@ class StructuredCloneTerms(NamedTuple):
     economy: torch.Tensor
     opponent_summary: torch.Tensor
     opponent_patches: torch.Tensor
+    opponent_patch_all: torch.Tensor
+    opponent_patch_changed: torch.Tensor
+    opponent_patch_unchanged: torch.Tensor
     eligible: torch.Tensor
     residual_ratio: torch.Tensor
     residual_own_patches: torch.Tensor
@@ -1138,6 +1130,9 @@ _STRUCTURED_FIELDS = (
     "structured_economy",
     "structured_opponent_summary",
     "structured_opponent_patches",
+    "structured_opponent_patch_all",
+    "structured_opponent_patch_changed",
+    "structured_opponent_patch_unchanged",
     "structured_eligible",
     "structured_residual_ratio",
     "structured_residual_own_patches",
@@ -1375,6 +1370,7 @@ def train(
         )
     artifact_path = output_dir / "bc-actor.pt"
     metrics_path = output_dir / "metrics.jsonl"
+    epoch_checkpoint_pattern = "bc-actor-epoch-{epoch:04d}.pt"
     # A second clone into a populated directory would overwrite an artifact
     # that may be better than anything this run produces, and truncate the
     # journal that is the only record of how it was produced.
@@ -1657,6 +1653,15 @@ def train(
                     diagnostic_sums["structured_opponent_patches"] += float(
                         terms.opponent_patches.detach()
                     )
+                    diagnostic_sums["structured_opponent_patch_all"] += float(
+                        terms.opponent_patch_all.detach()
+                    )
+                    diagnostic_sums["structured_opponent_patch_changed"] += float(
+                        terms.opponent_patch_changed.detach()
+                    )
+                    diagnostic_sums["structured_opponent_patch_unchanged"] += float(
+                        terms.opponent_patch_unchanged.detach()
+                    )
                     diagnostic_sums["structured_eligible"] += float(terms.eligible.detach())
                     diagnostic_sums["structured_residual_ratio"] += float(
                         terms.residual_ratio.detach()
@@ -1741,16 +1746,17 @@ def train(
                 f"quantity {holdout['quantity_accuracy']:.3f}",
                 flush=True,
             )
+            checkpoint_path = output_dir / epoch_checkpoint_pattern.format(epoch=epoch + 1)
+            payload = _artifact_payload(
+                architecture, actor, config, holdout, bc_provenance, identity
+            )
+            # Serialize once. The durable epoch history is immutable, while
+            # bc-actor.pt is an atomic hard-link alias for the best holdout
+            # checkpoint and remains the artifact every consumer already reads.
+            write_immutable_checkpoint(checkpoint_path, payload)
             if holdout["nll"] < best:
                 best, best_metrics, stale = holdout["nll"], holdout, 0
-                # Atomic: a kill mid-save must not destroy the best artifact so
-                # far, which the rerun guard would then refuse to replace.
-                write_checkpoint(
-                    artifact_path,
-                    _artifact_payload(
-                        architecture, actor, config, holdout, bc_provenance, identity
-                    ),
-                )
+                replace_checkpoint_alias(checkpoint_path, artifact_path)
             else:
                 stale += 1
                 if stale >= patience:

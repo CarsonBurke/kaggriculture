@@ -39,6 +39,7 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
+    PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_TEMPERATURE,
     production_ppo_config,
 )
@@ -259,9 +260,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout-forward-mode",
         choices=ROLLOUT_FORWARD_MODES,
-        default="inductor",
-        help="execution mode of the collection forward; `eager` is one of the modes, so this "
-        "alone decides whether the collector compiles",
+        default=PRODUCTION_ROLLOUT_FORWARD_MODE,
+        help="execution mode of the collection forward; defaults to the production "
+        "explicit CUDA graph path, while `eager` provides the uncompiled control",
     )
     parser.add_argument(
         "--rollout-bfloat16",

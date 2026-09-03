@@ -63,7 +63,11 @@ from kaggriculture.ppo import (
     update_ppo,
     update_replay_parity,
 )
-from kaggriculture.production import PRODUCTION_LEAGUE_GAMES, PRODUCTION_SELF_PLAY_GAMES
+from kaggriculture.production import (
+    PRODUCTION_LEAGUE_GAMES,
+    PRODUCTION_ROLLOUT_FORWARD_MODE,
+    PRODUCTION_SELF_PLAY_GAMES,
+)
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
     file_sha256,
@@ -110,7 +114,7 @@ from kaggriculture.training import (
 MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
-DEFAULT_CRITIC_EPOCHS = 4
+DEFAULT_CRITIC_EPOCHS = PpoConfig.epochs
 DEFAULT_CRITIC_WARMUP_ITERATIONS = 5
 
 
@@ -226,7 +230,7 @@ def parse_args() -> argparse.Namespace:
         "--critic-epochs",
         type=int,
         default=DEFAULT_CRITIC_EPOCHS,
-        help="total critic epochs (>= --epochs; the excess are critic-only refits)",
+        help="total critic epochs (>= --epochs; defaults to the same two passes)",
     )
     parser.add_argument("--minibatch-size", type=int, default=PpoConfig.minibatch_size)
     parser.add_argument("--clip-low", type=float, default=0.80)
@@ -305,9 +309,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout-forward-mode",
         choices=ROLLOUT_FORWARD_MODES,
-        default="inductor",
-        help="collection forward backend, and the whole compile decision for "
-        "collection: eager does not compile; default inductor",
+        default=PRODUCTION_ROLLOUT_FORWARD_MODE,
+        help="collection forward backend; defaults to the measured explicit CUDA graph "
+        "path, which avoids TorchInductor's threaded cold-start deadlock",
     )
     parser.add_argument(
         "--rollout-bfloat16",

@@ -509,6 +509,8 @@ _TRAINING_TAGS = {
     "monte_carlo_explained_variance": "critic/monte_carlo_explained_variance",
     "value_target_correlation": "critic/target_correlation",
     "critic_gradient_norm": "critic/gradient_norm",
+    "critic_trunk_gradient_norm": "critic-clip/trunk_gradient_norm",
+    "critic_head_gradient_norm": "critic-clip/head_gradient_norm",
     "value_target_mean": "value/target_mean",
     "value_target_std": "value/target_std",
     "value_target_min": "value/target_min",

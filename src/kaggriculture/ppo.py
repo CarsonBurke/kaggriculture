@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -587,22 +588,12 @@ class PpoConfig:
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     critic_gae_lambda: float = DEFAULT_CRITIC_GAE_LAMBDA
     gamma: float = DEFAULT_REWARD_GAMMA
-    # Measured to bind on EVERY minibatch, which makes this the step-size
-    # control and not a safety valve. `scripts/probe_gradient_spectrum.py` over
-    # 1264 production-shaped minibatches in four configurations -- BC actor with
-    # a fresh critic, BC actor with a trained critic, the iteration-12 actor and
-    # critic together, and a doubled 224-game wave -- reports
-    # `minibatch_fraction_above_clip` of 1.000 in every partition of every one.
-    # Norm medians are 3.81-4.24 with a per-minibatch range of 2.22 to 21.37.
-    #
-    # So the applied step is `lr * g / ||g||` rather than `lr * g`: the effective
-    # learning rate is about a quarter of `actor_learning_rate` and varies about
-    # tenfold between minibatches, and `lr_warmup_steps` warms a quantity that
-    # clipping then overrides. Whether 1.0 is the right value is a learning
-    # question that only a training run answers, so it is left at the value every
-    # measurement above was taken under rather than tuned against a proxy. What
-    # is recorded here is that the constant is load-bearing: raising it changes
-    # the step size on 100% of updates, not on the tail it reads as bounding.
+    # This bound is deliberately not a global policy-gradient throttle. PPO's
+    # trust region controls policy movement; clipping that gradient on every
+    # minibatch silently turns the nominal learning rate into lr / ||g||.
+    # The bound applies only to the actor-side NextLat contribution and to the
+    # critic trunk. The critic's categorical head is excluded so a saturated
+    # support edge can learn directly instead of shrinking the entire network.
     max_gradient_norm: float = 1.0
     # Restored to 0.03, the CleanRL-adjacent trust region this pipeline shipped
     # from scratch, on the population runs' own telemetry: four members at
@@ -639,8 +630,9 @@ class PpoConfig:
     # The predictor learns on every rollout, including critic-only warmup. It
     # owns an optimizer so its warmup cannot advance the actor optimizer's
     # schedule. The actor sees the auxiliary objective only after the trainer's
-    # held-out gate opens, and even then this ratio caps the auxiliary gradient
-    # against the PPO gradient before the ordinary global actor clip.
+    # held-out gate opens; its gradient is clipped independently by both this
+    # ratio against PPO and max_gradient_norm before it joins the unclipped
+    # policy gradient.
     structured_learning_rate: float | None = None
     structured_predictor_minibatch_size: int | None = None
     structured_actor_gradient_ratio: float = 0.0
@@ -2245,6 +2237,9 @@ _STRUCTURED_AUXILIARY_METRICS = (
     "economy",
     "opponent_summary",
     "opponent_patches",
+    "opponent_patch_all",
+    "opponent_patch_changed",
+    "opponent_patch_unchanged",
     "eligible",
     "residual_ratio",
     "residual_own_patches",
@@ -2800,6 +2795,8 @@ def update_ppo(
             "clip_fraction",
             "actor_gradient_norm",
             "critic_gradient_norm",
+            "critic_trunk_gradient_norm",
+            "critic_head_gradient_norm",
         )
     }
     # Streamed moments of the scoring critic epochs' targets and residuals.
@@ -2850,20 +2847,23 @@ def update_ppo(
         compile_mode,
     )
     stop_for_kl = False
-    # Guard scalars leave the device through one pinned async copy per ACTOR
-    # minibatch. A CUDA event scopes the host wait to that tiny copy, so the
-    # KL/finiteness decisions overlap the already-queued critic backward
-    # instead of serializing the stream after every actor forward.
-    #
-    # Critic-only minibatches take no such wait. The host wait exists to enforce
-    # the actor's trust region inside the epoch that produced it. On the current
-    # 230,080-state schedule (epochs=2, critic_epochs=4, minibatch_size=4096),
-    # two of four epochs have no actor -- 114 of 228 minibatches need no host
-    # decision. Those gate the critic step with the fused optimizer's own
-    # device-side skip and report finiteness at the epoch boundary, which is the
-    # first point the outcome can change what runs next.
+    critic_head_parameters = tuple(critic.value_head.parameters())
+    critic_head_parameter_ids = {id(parameter) for parameter in critic_head_parameters}
+    critic_clip_parameters = tuple(
+        parameter
+        for parameter in critic.parameters()
+        if id(parameter) not in critic_head_parameter_ids
+    )
+    # Actor and critic graphs have no parameter or activation dependency. Queue
+    # them on independent CUDA streams after the shared batch gathers so their
+    # forwards, backwards, norm reductions, and optimizer work can overlap.
+    # CPU keeps the same ordered path through nullcontext.
+    update_stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    actor_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    critic_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    batch_ready_event = torch.cuda.Event() if device.type == "cuda" else None
     guard_host = torch.empty(
-        4 if actor_auxiliary_active else 3,
+        3 if actor_auxiliary_active else 2,
         dtype=torch.float64,
         pin_memory=device.type == "cuda",
     )
@@ -2911,6 +2911,13 @@ def update_ppo(
             critic_args = _critic_batch_args(architecture, staged, indices, actor_args=actor_args)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
             states = indices.numel()
+            if batch_ready_event is not None:
+                assert update_stream is not None
+                assert actor_stream is not None
+                assert critic_stream is not None
+                batch_ready_event.record(update_stream)
+                actor_stream.wait_event(batch_ready_event)
+                critic_stream.wait_event(batch_ready_event)
             component_count = 0
             batch_kl = actor_zero
             policy_loss = actor_zero
@@ -2927,198 +2934,217 @@ def update_ppo(
             auxiliary_started = 0.0
             auxiliary_start_event: torch.cuda.Event | None = None
             auxiliary_end_event: torch.cuda.Event | None = None
-            if run_actor:
-                assert actor_args is not None
-                # Component activity is immutable rollout metadata. Reducing it
-                # on the host avoids a CUDA synchronization in every minibatch
-                # merely to recover a denominator already known before staging.
-                component_count = max(1, int(flat_component_counts[host_indices].sum()))
-                unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
-                market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
-                market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
-                unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
-                kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
-                quantity_masks = _batch_tensor(staged["market_quantity_masks"], indices, torch.bool)
-                unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
-                kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
-                quantity_active = _batch_tensor(
-                    staged["market_quantity_active"], indices, torch.float32
-                )
-                old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
-                old_kind = _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32)
-                old_quantity = _batch_tensor(
-                    staged["old_market_quantity_logprobs"], indices, torch.float32
-                )
-                advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
+            with torch.cuda.stream(actor_stream) if actor_stream is not None else nullcontext():
+                if run_actor:
+                    assert actor_args is not None
+                    # Component activity is immutable rollout metadata. Reducing it
+                    # on the host avoids a CUDA synchronization in every minibatch
+                    # merely to recover a denominator already known before staging.
+                    component_count = max(1, int(flat_component_counts[host_indices].sum()))
+                    unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
+                    market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
+                    market_quantities = _batch_tensor(
+                        staged["market_quantities"], indices, torch.long
+                    )
+                    unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
+                    kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
+                    quantity_masks = _batch_tensor(
+                        staged["market_quantity_masks"], indices, torch.bool
+                    )
+                    unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
+                    kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
+                    quantity_active = _batch_tensor(
+                        staged["market_quantity_active"], indices, torch.float32
+                    )
+                    old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
+                    old_kind = _batch_tensor(
+                        staged["old_market_kind_logprobs"], indices, torch.float32
+                    )
+                    old_quantity = _batch_tensor(
+                        staged["old_market_quantity_logprobs"], indices, torch.float32
+                    )
+                    advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
-                actor_optimizer.zero_grad(set_to_none=True)
-                # Behavior likelihoods were replayed above at unchanged weights
-                # with this exact partition and the same initial FP8 activation
-                # scales. The first-minibatch metric observes only the remaining
-                # inference-versus-training graph residual.
-                policy_sum, entropy_sum, kl_sum, clipped_sum = actor_terms(
-                    actor,
-                    unit_actions,
-                    market_kinds,
-                    market_quantities,
-                    unit_masks,
-                    kind_masks,
-                    quantity_masks,
-                    unit_active,
-                    kind_active,
-                    quantity_active,
-                    old_unit,
-                    old_kind,
-                    old_quantity,
-                    advantages,
-                    config.clip_low,
-                    config.clip_high,
-                    autocast_enabled,
-                    *actor_args,
-                )
-                batch_kl = kl_sum.detach().double() / component_count
-                policy_loss = -policy_sum / component_count
-                entropy_mean = entropy_sum / component_count
-                # Release the PPO forward graph before building the predictor
-                # graph. Gradients remain in the actor buffers, while peak
-                # memory stays near one actor forward.
-                policy_loss.backward()
-                if actor_auxiliary_active:
-                    ppo_gradients = [
+                    actor_optimizer.zero_grad(set_to_none=True)
+                    # Behavior likelihoods were replayed above at unchanged weights
+                    # with this exact partition and the same initial FP8 activation
+                    # scales. The first-minibatch metric observes only the remaining
+                    # inference-versus-training graph residual.
+                    policy_sum, entropy_sum, kl_sum, clipped_sum = actor_terms(
+                        actor,
+                        unit_actions,
+                        market_kinds,
+                        market_quantities,
+                        unit_masks,
+                        kind_masks,
+                        quantity_masks,
+                        unit_active,
+                        kind_active,
+                        quantity_active,
+                        old_unit,
+                        old_kind,
+                        old_quantity,
+                        advantages,
+                        config.clip_low,
+                        config.clip_high,
+                        autocast_enabled,
+                        *actor_args,
+                    )
+                    batch_kl = kl_sum.detach().double() / component_count
+                    policy_loss = -policy_sum / component_count
+                    entropy_mean = entropy_sum / component_count
+                    # Release the PPO forward graph before building the predictor
+                    # graph. Gradients remain in the actor buffers, while peak
+                    # memory stays near one actor forward.
+                    policy_loss.backward()
+                    if actor_auxiliary_active:
+                        ppo_gradients = [
+                            parameter.grad
+                            for parameter in actor.parameters()
+                            if parameter.grad is not None
+                        ]
+                        ppo_gradient_norm = torch.nn.utils.get_total_norm(ppo_gradients).detach()
+                        assert isinstance(actor, StructuredActor)
+                        assert structured_dynamics is not None
+                        assert auxiliary_windows is not None
+                        window_count = max(
+                            1,
+                            math.ceil(states / auxiliary_windows.shape[1]),
+                        )
+                        selected_windows = (
+                            np.arange(window_count, dtype=np.int64) + auxiliary_cursor
+                        ) % auxiliary_windows.shape[0]
+                        auxiliary_cursor = (
+                            auxiliary_cursor + window_count
+                        ) % auxiliary_windows.shape[0]
+                        auxiliary_host_indices = auxiliary_windows[selected_windows].reshape(-1)
+                        auxiliary_indices = torch.from_numpy(auxiliary_host_indices).to(
+                            device=device
+                        )
+                        if device.type == "cuda":
+                            auxiliary_start_event = torch.cuda.Event(enable_timing=True)
+                            auxiliary_end_event = torch.cuda.Event(enable_timing=True)
+                            auxiliary_start_event.record()
+                        else:
+                            auxiliary_started = time.perf_counter()
+                        assert structured_terms_fn is not None
+                        auxiliary_loss, auxiliary_terms = structured_terms_fn(
+                            actor,
+                            structured_dynamics,
+                            staged,
+                            auxiliary_indices,
+                            steps_per_trajectory=rollout.valid.shape[1],
+                            config=config,
+                            autocast_enabled=autocast_enabled,
+                            actor_grad=True,
+                            complete_windows=True,
+                        )
+                        actor_parameters = tuple(actor.parameters())
+                        auxiliary_gradients = torch.autograd.grad(
+                            auxiliary_loss,
+                            actor_parameters,
+                            allow_unused=True,
+                        )
+                        present_auxiliary_gradients = [
+                            gradient for gradient in auxiliary_gradients if gradient is not None
+                        ]
+                        actor_auxiliary_raw_norm = torch.nn.utils.get_total_norm(
+                            present_auxiliary_gradients
+                        ).detach()
+                        ratio_scale = (
+                            config.structured_actor_gradient_ratio
+                            * ppo_gradient_norm
+                            / actor_auxiliary_raw_norm.clamp_min(torch.finfo(torch.float32).tiny)
+                        )
+                        norm_scale = config.max_gradient_norm / actor_auxiliary_raw_norm.clamp_min(
+                            torch.finfo(torch.float32).tiny
+                        )
+                        actor_auxiliary_scale = torch.minimum(ratio_scale, norm_scale).clamp(
+                            max=1.0
+                        )
+                        if not torch.isfinite(actor_auxiliary_raw_norm):
+                            actor_auxiliary_scale = torch.zeros_like(actor_auxiliary_scale)
+                        actor_auxiliary_applied_norm = (
+                            actor_auxiliary_raw_norm * actor_auxiliary_scale
+                        )
+                        for parameter, gradient in zip(
+                            actor_parameters, auxiliary_gradients, strict=True
+                        ):
+                            if gradient is None:
+                                continue
+                            scaled_gradient = gradient * actor_auxiliary_scale
+                            if parameter.grad is None:
+                                parameter.grad = scaled_gradient
+                            else:
+                                parameter.grad.add_(scaled_gradient)
+                        if auxiliary_end_event is not None:
+                            auxiliary_end_event.record()
+                        else:
+                            auxiliary_seconds += time.perf_counter() - auxiliary_started
+                    combined_actor_loss = policy_loss.detach() + auxiliary_loss.detach()
+                    actor_gradients = [
                         parameter.grad
                         for parameter in actor.parameters()
                         if parameter.grad is not None
                     ]
-                    ppo_gradient_norm = torch.nn.utils.get_total_norm(ppo_gradients).detach()
-                    assert isinstance(actor, StructuredActor)
-                    assert structured_dynamics is not None
-                    assert auxiliary_windows is not None
-                    window_count = max(
-                        1,
-                        math.ceil(states / auxiliary_windows.shape[1]),
-                    )
-                    selected_windows = (
-                        np.arange(window_count, dtype=np.int64) + auxiliary_cursor
-                    ) % auxiliary_windows.shape[0]
-                    auxiliary_cursor = (auxiliary_cursor + window_count) % auxiliary_windows.shape[
-                        0
-                    ]
-                    auxiliary_host_indices = auxiliary_windows[selected_windows].reshape(-1)
-                    auxiliary_indices = torch.from_numpy(auxiliary_host_indices).to(device=device)
-                    if device.type == "cuda":
-                        auxiliary_start_event = torch.cuda.Event(enable_timing=True)
-                        auxiliary_end_event = torch.cuda.Event(enable_timing=True)
-                        auxiliary_start_event.record()
-                    else:
-                        auxiliary_started = time.perf_counter()
-                    assert structured_terms_fn is not None
-                    auxiliary_loss, auxiliary_terms = structured_terms_fn(
-                        actor,
-                        structured_dynamics,
-                        staged,
-                        auxiliary_indices,
-                        steps_per_trajectory=rollout.valid.shape[1],
-                        config=config,
-                        autocast_enabled=autocast_enabled,
-                        actor_grad=True,
-                        complete_windows=True,
-                    )
-                    actor_parameters = tuple(actor.parameters())
-                    auxiliary_gradients = torch.autograd.grad(
-                        auxiliary_loss,
-                        actor_parameters,
-                        allow_unused=True,
-                    )
-                    present_auxiliary_gradients = [
-                        gradient for gradient in auxiliary_gradients if gradient is not None
-                    ]
-                    actor_auxiliary_raw_norm = torch.nn.utils.get_total_norm(
-                        present_auxiliary_gradients
-                    ).detach()
-                    actor_auxiliary_scale = torch.clamp(
-                        (
-                            config.structured_actor_gradient_ratio
-                            * ppo_gradient_norm
-                            / actor_auxiliary_raw_norm.clamp_min(torch.finfo(torch.float32).tiny)
-                        ),
-                        max=1.0,
-                    )
-                    if not torch.isfinite(actor_auxiliary_raw_norm):
-                        actor_auxiliary_scale = torch.zeros_like(actor_auxiliary_scale)
-                    actor_auxiliary_applied_norm = actor_auxiliary_raw_norm * actor_auxiliary_scale
-                    for parameter, gradient in zip(
-                        actor_parameters, auxiliary_gradients, strict=True
-                    ):
-                        if gradient is None:
-                            continue
-                        scaled_gradient = gradient * actor_auxiliary_scale
-                        if parameter.grad is None:
-                            parameter.grad = scaled_gradient
-                        else:
-                            parameter.grad.add_(scaled_gradient)
-                    if auxiliary_end_event is not None:
-                        auxiliary_end_event.record()
-                    else:
-                        auxiliary_seconds += time.perf_counter() - auxiliary_started
-                combined_actor_loss = policy_loss.detach() + auxiliary_loss.detach()
-                actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    actor.parameters(), config.max_gradient_norm
-                ).detach()
-                if not actor_auxiliary_active:
-                    # `clip_grad_norm_` returns the same pre-clip total norm. In
-                    # the ordinary PPO path, reuse it instead of launching a
-                    # second complete parameter-gradient reduction solely for
-                    # telemetry that is not even emitted without a predictor.
-                    ppo_gradient_norm = actor_gradient_norm
+                    actor_gradient_norm = torch.nn.utils.get_total_norm(actor_gradients).detach()
+                    if not actor_auxiliary_active:
+                        ppo_gradient_norm = actor_gradient_norm
+                    guard_values = [batch_kl, policy_loss.detach().double()]
+                    if actor_auxiliary_active:
+                        guard_values.append(combined_actor_loss.detach().double())
+                    guard_host.copy_(torch.stack(guard_values), non_blocking=True)
+                    if guard_event is not None:
+                        guard_event.record()
 
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch even after policy replay is frozen.
-            critic_optimizer.zero_grad(set_to_none=True)
-            # Only the first and last epochs score the critic's regression.
-            # Middle epochs need the distributional objective alone; asking
-            # `critic.value` for predictions that are immediately discarded
-            # would add an fp32 softmax, support multiply, and reduction over
-            # every state in those epochs.
-            if epoch_index == 0 or epoch_index == critic_epochs - 1:
-                value_loss, fit_moments = critic_fit_terms_fn(
-                    critic, value_targets, autocast_enabled, *critic_args
+            with torch.cuda.stream(critic_stream) if critic_stream is not None else nullcontext():
+                critic_optimizer.zero_grad(set_to_none=True)
+                # Only the first and last epochs score the critic's regression.
+                # Middle epochs need the distributional objective alone; asking
+                # `critic.value` for predictions that are immediately discarded
+                # would add an fp32 softmax, support multiply, and reduction over
+                # every state in those epochs.
+                if epoch_index == 0 or epoch_index == critic_epochs - 1:
+                    value_loss, fit_moments = critic_fit_terms_fn(
+                        critic, value_targets, autocast_enabled, *critic_args
+                    )
+                    if epoch_index == 0:
+                        first_fit_sums += fit_moments
+                        first_fit_states += states
+                    if epoch_index == critic_epochs - 1:
+                        last_fit_sums += fit_moments
+                        last_fit_states += states
+                else:
+                    value_loss = critic_objective_fn(
+                        critic, value_targets, autocast_enabled, *critic_args
+                    )
+                value_loss.backward()
+                critic_trunk_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    critic_clip_parameters, config.max_gradient_norm
+                ).detach()
+                critic_head_gradient_norm = torch.nn.utils.get_total_norm(
+                    [
+                        parameter.grad
+                        for parameter in critic_head_parameters
+                        if parameter.grad is not None
+                    ]
+                ).detach()
+                critic_gradient_norm = torch.linalg.vector_norm(
+                    torch.stack((critic_trunk_gradient_norm, critic_head_gradient_norm))
                 )
-                if epoch_index == 0:
-                    first_fit_sums += fit_moments
-                    first_fit_states += states
-                if epoch_index == critic_epochs - 1:
-                    last_fit_sums += fit_moments
-                    last_fit_states += states
-            else:
-                value_loss = critic_objective_fn(
-                    critic, value_targets, autocast_enabled, *critic_args
-                )
-            if run_actor:
-                guard_values = [
-                    batch_kl,
-                    policy_loss.detach().double(),
-                    value_loss.detach().double(),
-                ]
-                if actor_auxiliary_active:
-                    guard_values.append(combined_actor_loss.detach().double())
-                guard_values_tensor = torch.stack(guard_values)
-                guard_host.copy_(guard_values_tensor, non_blocking=True)
-                if guard_event is not None:
-                    guard_event.record()
-            value_loss.backward()
-            critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                critic.parameters(), config.max_gradient_norm
-            ).detach()
 
             if run_actor:
-                # The event covers only the three-scalar copy, so this wait
-                # overlaps the critic backward still executing on the stream.
+                # The event covers only actor scalars. Synchronizing it does not
+                # wait for the critic stream, which continues its independent
+                # forward and backward while the host enforces the trust region.
                 if guard_event is not None:
                     guard_event.synchronize()
                 guard_values_list = guard_host.tolist()
-                batch_kl_value, policy_loss_value, value_loss_value = guard_values_list[:3]
+                batch_kl_value, policy_loss_value = guard_values_list[:2]
                 combined_actor_loss_value = (
-                    guard_values_list[3] if actor_auxiliary_active else policy_loss_value
+                    guard_values_list[2] if actor_auxiliary_active else policy_loss_value
                 )
                 if auxiliary_start_event is not None and auxiliary_end_event is not None:
                     auxiliary_seconds += (
@@ -3159,63 +3185,72 @@ def update_ppo(
                 if updates > 0 and batch_kl_value > config.target_kl:
                     stop_for_kl = True
                 else:
-                    _optimizer_step(
-                        actor_optimizer,
-                        config.actor_learning_rate,
-                        config.lr_warmup_steps,
-                    )
-                    totals["policy_loss"] += policy_loss.detach().double() * component_count
-                    totals["entropy"] += entropy_mean.detach().double() * component_count
-                    totals["approx_kl"] += batch_kl * component_count
-                    totals["clip_fraction"] += clipped_sum.detach().double()
-                    totals["actor_gradient_norm"] += actor_gradient_norm * states
-                    total_components += component_count
-                    if predictor_active:
-                        assert run_actor
-                        ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
-                    actor_states += states
-                    actor_updates += 1
-                    if auxiliary_terms is not None:
-                        for name in _STRUCTURED_AUXILIARY_METRICS:
-                            auxiliary_totals[name] += (
-                                getattr(auxiliary_terms, name).detach().double()
-                            )
-                        actor_auxiliary_raw_norm_total += actor_auxiliary_raw_norm.double() * states
-                        actor_auxiliary_applied_norm_total += (
-                            actor_auxiliary_applied_norm.double() * states
+                    with (
+                        torch.cuda.stream(actor_stream)
+                        if actor_stream is not None
+                        else nullcontext()
+                    ):
+                        _optimizer_step(
+                            actor_optimizer,
+                            config.actor_learning_rate,
+                            config.lr_warmup_steps,
                         )
-                        actor_auxiliary_scale_total += actor_auxiliary_scale.double() * states
-                        auxiliary_updates += 1
-                if not math.isfinite(value_loss_value):
-                    raise FloatingPointError("non-finite critic loss")
-                critic_skip = None
-            elif not critic_step_is_gateable:
-                # Nothing to defer for: an unfused step cannot be skipped on the
-                # device, and without a stream to stall the read costs nothing.
-                if not math.isfinite(float(value_loss.detach())):
-                    raise FloatingPointError("non-finite critic loss")
-                critic_skip = None
-            else:
-                # The only decision this minibatch can inform is whether to abort,
-                # and aborting cannot come sooner than the epoch boundary without
-                # a host wait. Gate the step instead: a poisoned minibatch leaves
-                # the critic, its moments, and its step counter untouched.
-                # fp32, which is the only dtype the fused optimizer's skip accepts.
-                critic_skip = (~torch.isfinite(value_loss.detach())).float()
-                critic_nonfinite += critic_skip
-                deferred_critic_finiteness = True
-            _optimizer_step(
-                critic_optimizer,
-                config.critic_learning_rate,
-                config.lr_warmup_steps,
-                found_inf=critic_skip,
-            )
-            refresh_fused_mlp_fp8(critic, bootstrap_down=False)
-
-            totals["value_loss"] += value_loss.detach().double() * states
-            totals["critic_gradient_norm"] += critic_gradient_norm * states
+                        totals["policy_loss"] += policy_loss.detach().double() * component_count
+                        totals["entropy"] += entropy_mean.detach().double() * component_count
+                        totals["approx_kl"] += batch_kl * component_count
+                        totals["clip_fraction"] += clipped_sum.detach().double()
+                        totals["actor_gradient_norm"] += actor_gradient_norm * states
+                        total_components += component_count
+                        if predictor_active:
+                            assert run_actor
+                            ppo_actor_gradient_norm_total += ppo_gradient_norm.double() * states
+                        actor_states += states
+                        actor_updates += 1
+                        if auxiliary_terms is not None:
+                            for name in _STRUCTURED_AUXILIARY_METRICS:
+                                auxiliary_totals[name] += (
+                                    getattr(auxiliary_terms, name).detach().double()
+                                )
+                            actor_auxiliary_raw_norm_total += (
+                                actor_auxiliary_raw_norm.double() * states
+                            )
+                            actor_auxiliary_applied_norm_total += (
+                                actor_auxiliary_applied_norm.double() * states
+                            )
+                            actor_auxiliary_scale_total += actor_auxiliary_scale.double() * states
+                            auxiliary_updates += 1
+            with torch.cuda.stream(critic_stream) if critic_stream is not None else nullcontext():
+                if not critic_step_is_gateable:
+                    # CPU and unfused optimizers cannot consume a device-side
+                    # skip, so check before stepping.
+                    if not math.isfinite(float(value_loss.detach())):
+                        raise FloatingPointError("non-finite critic loss")
+                    critic_skip = None
+                else:
+                    # A poisoned minibatch leaves the critic, its moments, and
+                    # its step counter untouched. Read the accumulated signal
+                    # once at the epoch boundary instead of synchronizing here.
+                    critic_skip = (~torch.isfinite(value_loss.detach())).float()
+                    critic_nonfinite += critic_skip
+                    deferred_critic_finiteness = True
+                _optimizer_step(
+                    critic_optimizer,
+                    config.critic_learning_rate,
+                    config.lr_warmup_steps,
+                    found_inf=critic_skip,
+                )
+                refresh_fused_mlp_fp8(critic, bootstrap_down=False)
+                totals["value_loss"] += value_loss.detach().double() * states
+                totals["critic_gradient_norm"] += critic_gradient_norm * states
+                totals["critic_trunk_gradient_norm"] += critic_trunk_gradient_norm * states
+                totals["critic_head_gradient_norm"] += critic_head_gradient_norm * states
             total_states += states
             updates += 1
+            if update_stream is not None:
+                assert actor_stream is not None
+                assert critic_stream is not None
+                update_stream.wait_stream(actor_stream)
+                update_stream.wait_stream(critic_stream)
         epoch_marks.append((totals["value_loss"].clone(), total_states))
         # Their steps were already gated on the device, so the critic reaching
         # this line has never absorbed a non-finite loss. If every minibatch was
@@ -3246,6 +3281,12 @@ def update_ppo(
         "clip_fraction": float(totals["clip_fraction"] / max(1, total_components)),
         "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, actor_states)),
         "critic_gradient_norm": float(totals["critic_gradient_norm"] / max(1, total_states)),
+        "critic_trunk_gradient_norm": float(
+            totals["critic_trunk_gradient_norm"] / max(1, total_states)
+        ),
+        "critic_head_gradient_norm": float(
+            totals["critic_head_gradient_norm"] / max(1, total_states)
+        ),
         "advantage_mean": prepared.raw_advantage_mean,
         "advantage_std": prepared.raw_advantage_std,
         "value_target_mean": float(prepared.value_targets[owned_valid].mean()),

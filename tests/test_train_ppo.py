@@ -48,7 +48,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert (args.league_active_opponents, args.league_historical_opponents) == (2, 6)
     assert args.league_active_pool_size == 16
     assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
-    assert (args.epochs, args.critic_epochs) == (2, 4)
+    assert (args.epochs, args.critic_epochs) == (2, 2)
     assert args.critic_lr == pytest.approx(2.5e-4)
     assert args.minibatch_size == 4096
     # An unflagged run is exactly the family's dataclass configuration, which
@@ -588,11 +588,9 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
     assert config["league_games"] == 64
     assert config["update_compile_mode"] == "default"
     assert config["device_type"] == "cpu"
-    # Measurement selected inductor + bf16 for collection, so an unflagged run
-    # is the configuration the parity gate was measured on, and the record says
-    # which one it was.
-    assert config["rollout_forward_mode"] == "inductor"
-    assert config["rollout_bfloat16"] is True
+    # The explicit CUDA graph path is faster than eager without entering
+    # TorchInductor from the collector's worker threads.
+    assert config["rollout_forward_mode"] == "graph"
     # All three move what a resume would produce -- the collection pair moves the
     # sampled behavior policy and the update mode moves the graphs that consume
     # it -- so a resume that changes any of them is a different data generator
@@ -609,13 +607,9 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
 
 
 def test_collection_forward_defaults_to_the_measured_configuration(monkeypatch, tmp_path) -> None:
-    """Collection is ~64% of a wave and inductor + bf16 is what measurement
-    selected on both axes: the rollout sweep moves 8.91 s -> 5.36 s (1.66x) and
-    the 4-wave parity gate moves worst max_kl 1.9089e-03 -> 2.2786e-04 (8.4x
-    lower drift), because it matches the update path's backend and precision.
-    The mode is the whole collection compile decision -- there is no separate
-    boolean that could disagree with it -- and the precision is decided
-    independently of it."""
+    """The explicit CUDA graph path avoids Inductor's worker-thread cold-start
+    deadlock, preserves bitwise eager parity, and measured 7.270 s against
+    eager's 20.383 s on a production rollout."""
     module = _training_script()
 
     def parsed(*flags: str):
@@ -623,7 +617,7 @@ def test_collection_forward_defaults_to_the_measured_configuration(monkeypatch, 
         return module.parse_args()
 
     default = parsed()
-    assert default.rollout_forward_mode == "inductor"
+    assert default.rollout_forward_mode == "graph"
     assert default.rollout_bfloat16 is True
     module._validate_args(default)
     assert not hasattr(default, "compile_rollout")
