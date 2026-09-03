@@ -40,6 +40,7 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
+    PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
     production_ppo_config,
 )
@@ -134,8 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--games",
-        default="64,112,128,256",
-        help="comma-separated self-play games per iteration (each yields two trajectories)",
+        default=str(PRODUCTION_SELF_PLAY_GAMES),
+        help=(
+            "comma-separated self-play games per iteration; defaults to the production "
+            "batch (each game yields two trajectories). Pass multiple sizes only for a "
+            "capacity sweep"
+        ),
     )
     parser.add_argument(
         "--league-games",
@@ -228,35 +233,17 @@ def parse_args() -> argparse.Namespace:
             "where the critic has collapsed onto the outermost atom"
         ),
     )
-    # Two phases, decided separately, because the answers differ in sign. The
-    # collector and the update share model weights and nothing else: the
-    # collector runs an inference forward under its own backend and precision,
-    # the update compiles its own forward and backward, and a device
-    # synchronization separates the phases so their timings add exactly. A
-    # single flag would force the losing phase to ride along with the winning
-    # one.
+    # Collection and update are separate execution decisions. The collector
+    # owns a whole-wave CUDA graph over fixed-address inputs; the update uses
+    # its own compiled forward/backward. Synchronization at each phase boundary
+    # keeps their timings attributable.
     #
-    # The collection knob is a mode rather than a boolean because the measured
-    # ranking is not binary. Isolated learner forward on this box, median of
-    # 60: eager fp32 4.907 ms, cudagraphs fp32 5.309 ms, inductor fp32
-    # 2.720 ms, inductor bf16 1.626 ms. So `cudagraphs` -- the only mode the
-    # old `--compile-rollout` boolean could select -- is slower than not
-    # compiling at all, while `inductor` under bf16 is 3.0x faster than eager
-    # and 3.3x faster than cudagraphs. Whole rollout phase on the measured
-    # 112-game wave, with the league ensemble following the mode as it does at
-    # the collector call below: eager/fp32 8.91 s, cudagraphs/fp32 8.02 s,
-    # eager/bf16 6.82 s, inductor/fp32 5.93 s, inductor/bf16 5.36 s. A boolean
-    # cannot pick a winner out of a ranking that puts its own "on" value
-    # fourth of five.
-    #
-    # The defaults are that winner, and it is not a speed-against-correctness
-    # trade. The collection forward's drift from the update-path replay is
-    # dominated by systematic differences between the two paths rather than by
-    # rounding, and the update path is already Inductor plus bf16, so matching
-    # it cancels most of the difference: the shipped parity gate over four
-    # production waves measures worst max_kl 2.2786e-04 under inductor/bf16
-    # against 1.9089e-03 under eager/fp32, on a bound of 5e-3. Faster by 1.66x
-    # and 8.4x further inside the gate.
+    # The rollout knob is mode-valued because eager, compiled, and explicit
+    # graph execution have different launch, warmup, and replay-parity behavior.
+    # The default comes from the shared production constant rather than from an
+    # old isolated-forward ranking. Precision is held separately: structured
+    # collection uses a native-BF16 inference replica, matching the BF16 update
+    # while retaining FP32 trainable weights and quantity heads.
     parser.add_argument(
         "--rollout-forward-mode",
         choices=ROLLOUT_FORWARD_MODES,
@@ -268,8 +255,9 @@ def parse_args() -> argparse.Namespace:
         "--rollout-bfloat16",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="run the collection forward under bf16 autocast; the update path is bf16 "
-        "regardless, so an fp32 collection is a second precision rather than a safer one",
+        help="run structured collection with a native bf16 inference replica; the update "
+        "path is bf16 regardless, so fp32 collection is a second precision rather than "
+        "a safer one",
     )
     # `--compile-rollout` and `--compile-update` are both gone rather than kept
     # as their modes' projections: the calibration chain identifies each phase's

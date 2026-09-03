@@ -68,6 +68,22 @@ def test_resume_detection_accepts_only_a_regular_latest_checkpoint(tmp_path: Pat
         resolve_resume_checkpoint(tmp_path)
 
 
+def test_resume_detection_accepts_an_explicit_external_checkpoint(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-000100.pt"
+    checkpoint.write_bytes(b"portable checkpoint")
+    new_run = tmp_path / "resumed-run"
+
+    assert resolve_resume_checkpoint(new_run, checkpoint) == checkpoint.resolve()
+
+    with pytest.raises(FileNotFoundError):
+        resolve_resume_checkpoint(new_run, tmp_path / "missing.pt")
+
+    link = tmp_path / "checkpoint-link.pt"
+    link.symlink_to(checkpoint)
+    with pytest.raises(ValueError, match="regular file"):
+        resolve_resume_checkpoint(new_run, link)
+
+
 def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -> None:
     latest = tmp_path / "run" / "latest.pt"
     command = build_training_command(
@@ -1229,8 +1245,8 @@ def test_direct_launch_compiles_without_calibration_evidence(
     module = _script("launch_production.py")
     run_directory = tmp_path / "run"
     run_directory.mkdir()
-    latest_checkpoint = run_directory / "latest.pt"
-    latest_checkpoint.write_bytes(b"atomic checkpoint")
+    resume_checkpoint = tmp_path / "checkpoint-000100.pt"
+    resume_checkpoint.write_bytes(b"portable checkpoint")
     invocation: dict[str, object] = {}
 
     class Executed(Exception):
@@ -1248,6 +1264,8 @@ def test_direct_launch_compiles_without_calibration_evidence(
             "launch_production.py",
             "--run-dir",
             str(run_directory),
+            "--resume",
+            str(resume_checkpoint),
             "--iterations",
             "17",
         ],
@@ -1264,7 +1282,7 @@ def test_direct_launch_compiles_without_calibration_evidence(
     assert launch["rollout_bfloat16"] is True
     assert launch["update_compile_mode"] == PRODUCTION_UPDATE_COMPILE_MODE
     assert launch["iterations"] == 17
-    assert launch["resume_checkpoint"] == str(latest_checkpoint)
+    assert launch["resume_checkpoint"] == str(resume_checkpoint.resolve())
     assert launch["source_identity"] == module.source_identity()
     assert invocation["executable"] == sys.executable
     assert invocation["command"] == launch["training_command"]
@@ -1281,21 +1299,18 @@ def test_direct_launch_compiles_without_calibration_evidence(
     )
     assert "--expected-source-digest" not in launch["training_command"]
     assert "--calibration-decision" not in launch["training_command"]
-    assert launch["training_command"][-2:] == ["--resume", str(latest_checkpoint)]
+    assert launch["training_command"][-2:] == ["--resume", str(resume_checkpoint.resolve())]
 
 
 def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resubmitting the identical launch command is how a killed run continues.
+    """In-place and portable resumes preserve the original warm-start record.
 
-    The warm start belongs to the run, not to the relaunch: once a checkpoint
-    exists the actor and the remaining critic warmup both come from it, which
-    is why train_ppo refuses to have them restated. The launcher therefore
-    has to drop the flags itself rather than fail, and it has to carry the
-    recorded warm start forward -- it rewrites the decision file in place, so
-    restating the now-empty flags would leave the run's own launch record
-    claiming it started from scratch.
+    Once a checkpoint exists, the actor and remaining critic warmup come from
+    it, so train_ppo rejects restating the initialization flags. The launcher
+    must carry the recorded clone forward both when rewriting the source run's
+    decision and when an explicit checkpoint resumes into a new run directory.
     """
     module = _script()
     paths = {name: tmp_path / f"{name}.jsonl" for name in ("eager", "mixed", "compiled")}
@@ -1369,6 +1384,32 @@ def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
     assert arguments.resume == latest_checkpoint
     assert arguments.init_actor_from is None
     assert arguments.critic_warmup_iterations is None
+
+    portable_run = tmp_path / "portable-run"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            *argv[:7],
+            "--run-dir",
+            str(portable_run),
+            "--iterations",
+            "500",
+            "--resume",
+            str(latest_checkpoint),
+        ],
+    )
+    with pytest.raises(Executed):
+        module.main()
+
+    portable = json.loads((portable_run / "calibration-decision.json").read_text())
+    assert portable["resume_checkpoint"] == str(latest_checkpoint.resolve())
+    assert portable["initial_actor"] == str(artifact)
+    assert portable["critic_warmup_iterations"] == 15
+    portable_command = portable["training_command"]
+    assert "--init-actor-from" not in portable_command
+    assert "--critic-warmup-iterations" not in portable_command
+    assert portable_command[-2:] == ["--resume", str(latest_checkpoint.resolve())]
 
 
 def test_a_warmup_that_outlasts_the_run_is_rejected(tmp_path: Path) -> None:

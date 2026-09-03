@@ -25,6 +25,7 @@ def _load_evaluator():
     spec.loader.exec_module(module)
     return module
 
+
 def test_artifact_snapshot_survives_atomic_latest_replacement(tmp_path: Path) -> None:
     evaluator = _load_evaluator()
     latest = tmp_path / "latest.pt"
@@ -81,6 +82,23 @@ def test_summary_clusters_confidence_intervals_by_seed_pair() -> None:
     assert summary["score_rate_95ci"] == [0.0, 1.0]
     assert summary["margin_95ci"] == pytest.approx([-19.6, 19.6])
     assert [row["seed"] for row in summary["seed_cluster_statistics"]] == [1, 2]
+
+
+def test_cli_defaults_to_the_cpu_submission_backend(monkeypatch) -> None:
+    evaluator = _load_evaluator()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_checkpoint.py",
+            "--artifact",
+            "checkpoint.pt",
+            "--output",
+            "evaluation.json",
+        ],
+    )
+
+    assert evaluator.parse_args().device == "cpu"
 
 
 def test_programmatic_evaluation_defaults_to_serial_batch_size(tmp_path: Path) -> None:

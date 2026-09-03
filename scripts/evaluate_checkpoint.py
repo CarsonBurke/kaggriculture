@@ -710,7 +710,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="official environments advanced in lockstep through one batched model",
     )
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="inference device; defaults to CPU because submission admission must match Kaggle",
+    )
     parser.add_argument(
         "--selection-report",
         type=Path,

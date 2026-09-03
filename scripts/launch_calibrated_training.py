@@ -83,7 +83,7 @@ KNOB_PHASE_MEDIANS = {
 # 5.309 ms, inductor fp32 2.720 ms, inductor bf16 1.626 ms -- so a boolean
 # whose "on" value is `cudagraphs` selects the one mode slower than eager,
 # which is what this launcher must not be able to certify. `graph`, the
-# collector's own per-shard capture, was added after that ranking and is not in
+# collector's own whole-wave capture, was added after that ranking and is not in
 # it; a chain that wants it has to measure it, which is the point of the knob
 # being mode-valued.
 
@@ -881,12 +881,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--max-hours", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260812)
-    parser.add_argument(
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument(
         "--init-actor-from",
         type=Path,
         help=(
             "behavior-cloned actor artifact to initialize iteration zero from; "
             "the critic and both optimizers still start fresh"
+        ),
+    )
+    initialization.add_argument(
+        "--resume",
+        type=Path,
+        help=(
+            "checkpoint to resume into --run-dir; when omitted, an existing "
+            "--run-dir/latest.pt is resumed automatically"
         ),
     )
     parser.add_argument(
@@ -940,21 +949,27 @@ def main() -> None:
             f"{benchmark_identity['sha256']} != {identity['sha256']}"
         )
     run_directory = args.run_dir.expanduser().resolve()
-    resume_checkpoint = resolve_resume_checkpoint(run_directory)
+    resume_checkpoint = resolve_resume_checkpoint(run_directory, args.resume)
     decision_path = run_directory / "calibration-decision.json"
     # Relaunching the identical command is how a killed run continues, so the
-    # warm-start flags must not turn that into an error. Once the run exists
-    # its actor and its remaining critic warmup both come from the checkpoint,
-    # which is why train_ppo rejects restating them; the launch record still
-    # has to name the clone the weights came from, so it is carried forward
-    # from the decision this run was started with rather than dropped.
+    # warm-start flags must not turn that into an error. Once the run exists,
+    # its actor and remaining critic warmup come from the checkpoint. Preserve
+    # the launch-side clone record from the target decision on an in-place
+    # resume, or from the checkpoint's source run on a portable resume.
     warm_start = _warm_start_record(requested_actor, args.critic_warmup_iterations)
     initial_actor = None if resume_checkpoint is not None else requested_actor
     critic_warmup_iterations = (
         None if resume_checkpoint is not None else args.critic_warmup_iterations
     )
     if resume_checkpoint is not None:
-        warm_start = _recorded_warm_start(decision_path) or warm_start
+        source_decision_path = resume_checkpoint.parent / "calibration-decision.json"
+        if args.resume is None:
+            recorded_warm_start = _recorded_warm_start(decision_path)
+        else:
+            recorded_warm_start = _recorded_warm_start(
+                source_decision_path
+            ) or _recorded_warm_start(decision_path)
+        warm_start = recorded_warm_start or warm_start
     evidence_directory = run_directory / "provenance"
     retained = {name: evidence_directory / f"{name}-ppo.jsonl" for name in documents}
     for name, document in documents.items():

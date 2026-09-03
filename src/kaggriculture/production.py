@@ -7,8 +7,6 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
-from kaggriculture.model import ModelConfig
-from kaggriculture.ppo import PpoConfig
 from kaggriculture.provenance import repository_root
 
 # A mirror self-play game contributes two current-policy trajectories; a
@@ -53,70 +51,35 @@ PRODUCTION_CHECKPOINT_SECONDS = 420
 # lanes against copies of itself. A knob whose only correct value is the
 # learner's temperature is not a knob.
 PRODUCTION_TEMPERATURE = 1.0
-# The two-shard GQA collector cannot reuse the old single-wave compile decision.
-# The earlier reading of that -- an Inductor benchmark that spent 575.51 s in
-# CPU-side compilation without reaching the first iteration -- was the right
-# observation and the wrong diagnosis. It is not slow compilation. Both the
-# shipped source and the current one stall identically at production shapes:
-# every Inductor compile worker at 0% CPU, no codegen written for minutes,
-# allocated device memory frozen byte-for-byte, and all 58 threads of the
-# process in `futex_wait`. Waiting longer is not the fix, and the 192-game,
-# 230080-state rollout it never reached takes 19.258 s eager.
+# Collection uses one physical-game shard: all 192 games enter one `BatchEnv`,
+# one whole-wave actor/league graph, and one Rayon game-parallel native step.
+# There is no Python thread split, no duplicated first-step compilation, and no
+# shard join. The 719 environment transitions remain causally sequential, but
+# every game's work within each transition is parallel.
 #
-# Graph capture is *not* the mechanism, which an intermediate version of this
-# comment asserted. `inductor_default` -- Inductor's fusion with `mode="default"`
-# and no CUDA graphs anywhere -- was measured and hangs the same way: 1107 s in,
-# 54 of 58 threads in `futex_wait`, the subprocess compile pool idle at 0.2% CPU,
-# zero cache files written in the preceding two minutes, and the GPU at 0%
-# rather than the fifth utilization `reduce-overhead` leaves behind. Removing
-# capture removes that difference and nothing else.
+# `graph` is the collector-owned `torch.cuda.CUDAGraph`, not a
+# `torch.compile` mode. The collector holds its packed inputs at fixed device
+# addresses for the wave, captures the complete actor/league forward once, and
+# replays it thereafter. Owning the graph avoids Inductor cudagraph-tree
+# generation bookkeeping and preserves eager kernel identity.
 #
-# What both modes share is that `collect_mixed_play_rust` runs its shards on a
-# two-worker `ThreadPoolExecutor`, and `torch.compile` returns a lazy wrapper --
-# so compilation is first entered from inside *both* shard threads at once, on
-# the first step, before either has produced code. Concurrent entry is the
-# common factor; the specific lock cycle is not established here, and the
-# evidence rules capture out rather than ruling a particular lock in.
+# Structured BF16 collection uses a native-BF16 inference replica while the
+# trainable actor remains FP32. Quantity heads stay FP32. The GPU/native action
+# boundary transfers only unit/kind utilities, low-rank quantity context, and
+# one scalar quantity draw per slot. At production shape the quantity part is
+# 506,880 bytes per step instead of the former 8,448,000-byte all-kind prefix
+# table, a 16.67x reduction. Two pinned host encodings share one fixed device
+# input block, so encoding and the next H2D submission happen before CPU
+# trajectory storage without changing graph addresses.
+# The learner and frozen-opponent forwards use independent CUDA streams inside
+# that single graph and rejoin before sampling. At 192 physical games, a matched
+# four-repeat MLQ run reduced the three-post-cold steady rollout median from
+# 9.0817 s with sequential forwards to 8.2462 s (9.2%); maximum update-replay KL
+# was 1.612e-5 and the tail fraction was zero.
 #
-# That pointed the fix at ordering rather than at the backend, and ordering was
-# most of it: driving one shard's first step through to completion before the
-# peer's (`_pipeline_ready` / `_pipeline_wait` in `rollout.py`) is what lets
-# `inductor_default` run a full wave at all, which it now does. `reduce-overhead`
-# needed a second, unrelated fix on top -- `cudagraph_trees` keys generations off
-# a process-global counter while keeping a tree manager per thread, so one
-# shard's mark retires the other shard's live outputs and the read raises
-# `accessing tensor output of CUDAGraphs that has been overwritten` --  and after
-# that fix it still wedges, twice, for twenty-five minutes of idle exclusive GPU
-# between them and no stack either time. That mode has had enough of this
-# machine.
-#
-# `graph` is the replacement, and it does not go through `torch.compile` at all.
-# `rollout._CapturedStep` captures one `torch.cuda.CUDAGraph` per shard over the
-# step's forward region and replays it for the remaining 719 steps. That is
-# available because the collector already holds every input at a fixed address
-# for the life of a wave, and because owning the graph removes the entire
-# question of who decides when a recording is retired. It therefore owes bitwise
-# equality with eager rather than the semantic bound the compiled modes settle
-# for, and `test_a_captured_collection_reproduces_the_eager_one_exactly` holds
-# it to exactly that on a wave carrying both self-play and league rows.
-#
-# An end-to-end arm moved it. On one frozen tree at production shapes, against
-# the same-tree eager control, `graph` takes the rollout from 20.383 s to
-# 7.270 s and the iteration from 47.507 s to 33.368 s -- 75.78 to 107.89
-# iterations an hour. Parity is untouched: `update_replay_max_kl` peaks at
-# 7.8e-7 against a 5e-3 gate with every tail fraction zero, which is what a mode
-# that replays the identical kernels should look like.
-#
-# Peak allocation rises 128 MiB an iteration for the first eight collections and
-# is then flat for the rest -- five consecutive repeats at exactly zero. That is
-# the league pool filling to its eight opponents and the allocator reaching
-# steady state, not the capture pool accumulating; the run was carried to 14
-# repeats specifically because four cannot tell those apart, and a leak here
-# would have exhausted this card around iteration 160 of a 500-iteration run.
-#
-# BF16 remains fixed: it matches the update precision and is exercised by the
-# CUDA GQA/pipeline test. `ROLLOUT_FORWARD_MODES` owns the valid mode strings;
-# train_ppo.py validates whatever the calibrated launcher passes.
+# BF16 matches the update precision and is guarded by replay-parity KL and tail
+# gates. `ROLLOUT_FORWARD_MODES` owns the valid mode strings; train_ppo.py
+# validates the configured mode.
 PRODUCTION_ROLLOUT_FORWARD_MODE = "graph"
 PRODUCTION_ROLLOUT_BFLOAT16 = True
 # The update knob's counterpart to the mode above, and the same kind of setting:
@@ -146,6 +109,8 @@ PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
 
 
 def production_model_config() -> dict[str, int | float]:
+    from kaggriculture.model import ModelConfig
+
     return ModelConfig().to_dict()
 
 
@@ -163,6 +128,8 @@ def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float 
     unable to fit; cross-model stream overlap is what recovers otherwise idle
     execution without changing either objective or minibatch partition.
     """
+    from kaggriculture.ppo import PpoConfig
+
     return asdict(
         PpoConfig(
             critic_epochs=PpoConfig.epochs,
@@ -188,14 +155,23 @@ def require_repository_launcher(script_file: Path) -> None:
         )
 
 
-def resolve_resume_checkpoint(run_directory: Path) -> Path | None:
-    """Return the run's atomic latest checkpoint, or None for a fresh start."""
-    latest_checkpoint = run_directory / "latest.pt"
-    if latest_checkpoint.is_symlink() or (
-        latest_checkpoint.exists() and not latest_checkpoint.is_file()
-    ):
-        raise ValueError(f"training resume checkpoint is not a regular file: {latest_checkpoint}")
-    return latest_checkpoint if latest_checkpoint.is_file() else None
+def resolve_resume_checkpoint(
+    run_directory: Path,
+    requested_checkpoint: Path | None = None,
+) -> Path | None:
+    """Resolve an explicit checkpoint or the run's atomic latest checkpoint."""
+    checkpoint = (
+        run_directory / "latest.pt"
+        if requested_checkpoint is None
+        else requested_checkpoint.expanduser()
+    )
+    if checkpoint.is_symlink() or (checkpoint.exists() and not checkpoint.is_file()):
+        raise ValueError(f"training resume checkpoint is not a regular file: {checkpoint}")
+    if checkpoint.is_file():
+        return checkpoint.resolve() if requested_checkpoint is not None else checkpoint
+    if requested_checkpoint is not None:
+        raise FileNotFoundError(checkpoint)
+    return None
 
 
 def build_training_command(

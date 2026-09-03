@@ -2,15 +2,13 @@
 """Launch production PPO directly, without the pre-flight benchmark ceremony.
 
 Execution follows standing per-phase evidence rather than applying one compile
-switch to the whole iteration. The two-shard GQA collector owns an explicit
-CUDA graph per shard: `torch.compile`'s capturing modes route through
-`cudagraph_trees`, whose generation counter is process-global while its tree
-managers are per thread, so one shard retires the other's live outputs. Owning
-the capture removes that question rather than working around it, and buys
-bitwise equality with eager instead of a semantic bound. The update remains
-compiled, where the established gain is large and needs no per-shard graph.
-Exact measurements live beside the production constants and in each run's
-evidence rather than being copied here.
+switch to the whole iteration. The collector advances every physical game in
+one native batch and owns one explicit whole-wave CUDA graph. This bypasses
+`torch.compile`'s `cudagraph_trees` bookkeeping and keeps the forward's input
+addresses fixed while the host-side engine runs all games through Rayon. The
+update remains compiled, where the established gain is large. Exact
+measurements live beside the production constants and in each run's evidence
+rather than being copied here.
 
 Correctness is guarded by the gates train_ppo.py runs
 inside the production process itself — the per-iteration first-minibatch KL
@@ -40,20 +38,25 @@ import sys
 import tempfile
 from pathlib import Path
 
-from kaggriculture.production import (
-    PRODUCTION_ROLLOUT_BFLOAT16,
-    PRODUCTION_ROLLOUT_FORWARD_MODE,
-    PRODUCTION_UPDATE_COMPILE_MODE,
-    build_training_command,
-    require_repository_launcher,
-    resolve_resume_checkpoint,
-)
-from kaggriculture.provenance import source_identity
+
+def source_identity() -> dict[str, object]:
+    """Load provenance only when launch work needs it."""
+    from kaggriculture.provenance import source_identity as calculate
+
+    return calculate()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help=(
+            "checkpoint to resume into --run-dir; when omitted, an existing "
+            "--run-dir/latest.pt is resumed automatically"
+        ),
+    )
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--max-hours", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260812)
@@ -76,7 +79,6 @@ def _write_atomic(path: Path, rendered: str) -> None:
 
 
 def main() -> None:
-    require_repository_launcher(Path(__file__))
     args = parse_args()
     if args.iterations < 1:
         raise ValueError("iterations must be positive")
@@ -84,8 +86,22 @@ def main() -> None:
         raise ValueError("max hours must be finite and non-negative")
     if args.seed < 0:
         raise ValueError("seed cannot be negative")
+
+    # Keep `--help` on the standard-library-only path. Production configuration
+    # reaches PyTorch through the model/PPO modules and otherwise makes a parser
+    # query pay the entire training import cost.
+    from kaggriculture.production import (
+        PRODUCTION_ROLLOUT_BFLOAT16,
+        PRODUCTION_ROLLOUT_FORWARD_MODE,
+        PRODUCTION_UPDATE_COMPILE_MODE,
+        build_training_command,
+        require_repository_launcher,
+        resolve_resume_checkpoint,
+    )
+
+    require_repository_launcher(Path(__file__))
     run_directory = args.run_dir.expanduser().resolve()
-    resume_checkpoint = resolve_resume_checkpoint(run_directory)
+    resume_checkpoint = resolve_resume_checkpoint(run_directory, args.resume)
     command = build_training_command(
         run_directory,
         iterations=args.iterations,

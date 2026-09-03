@@ -377,7 +377,12 @@ def test_a_measurement_that_raises_still_leaves_the_completed_ones_on_disk(
 
     _configuration, *records = _report_records(report)
     assert [record["seed"] for record in records] == module._seeds(
-        SimpleNamespace(base_seed=20260812, measurements=2, self_play_games=112, league_games=96)
+        SimpleNamespace(
+            base_seed=20260812,
+            measurements=2,
+            self_play_games=module.PRODUCTION_SELF_PLAY_GAMES,
+            league_games=module.PRODUCTION_LEAGUE_GAMES,
+        )
     )
 
 

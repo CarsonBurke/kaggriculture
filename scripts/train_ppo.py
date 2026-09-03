@@ -294,18 +294,11 @@ def parse_args() -> argparse.Namespace:
         "fusion without CUDA graph capture",
     )
     parser.add_argument("--no-bfloat16", action="store_true")
-    # The collection forward is ~64% of a wave's wall clock, and these two
-    # defaults are where the measurement landed on both axes rather than a
-    # preference. Measured 112-game waves with a real BC actor: the rollout sweep
-    # moves 8.91 s (eager/fp32) -> 5.36 s (inductor/bf16), 1.66x, and the
-    # shipped 4-wave `scripts/audit_replay_parity.py` gate on the league-mixed
-    # path moves worst max_kl 1.9089e-03 -> 2.2786e-04, 8.4x lower drift.
-    # Faster and closer to parity at once: the update path is already Inductor
-    # + bf16, so most of the collect/update gap is a systematic backend and
-    # precision difference, and matching the update path's backend and
-    # precision cancels it instead of adding to it. `--rollout-bfloat16` is the
-    # collection precision; `--no-bfloat16` above is the update's, and they are
-    # decided separately.
+    # Collection execution and precision are explicit and independent of the
+    # update backend. Production uses a collector-owned whole-wave CUDA graph
+    # and a native-BF16 structured inference replica; the trainable actor and
+    # quantity heads remain FP32. Replay-parity gates enforce the numerical
+    # contract rather than assuming an execution backend is equivalent.
     parser.add_argument(
         "--rollout-forward-mode",
         choices=ROLLOUT_FORWARD_MODES,
@@ -317,7 +310,7 @@ def parse_args() -> argparse.Namespace:
         "--rollout-bfloat16",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="run the collection forward under bf16 autocast; default enabled",
+        help="run structured collection with a native bf16 inference replica; default enabled",
     )
     parser.add_argument(
         "--deterministic-training",

@@ -46,7 +46,7 @@ def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> No
     import sys
 
     from kaggriculture.modelargs import model_config_from_args
-    from kaggriculture.production import production_model_config
+    from kaggriculture.production import PRODUCTION_SELF_PLAY_GAMES, production_model_config
     from kaggriculture.registry import CONV_ENTITY, resolve_architecture
 
     module = _script()
@@ -56,6 +56,7 @@ def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> No
     config = model_config_from_args(resolve_architecture(CONV_ENTITY), args)
 
     assert not args.deterministic_training
+    assert args.games == str(PRODUCTION_SELF_PLAY_GAMES)
     assert config.to_dict() == production_model_config()
 
 
