@@ -11,8 +11,8 @@ answering which part of the network to work on. The kernel view lists the
 costliest individual kernels with launch counts, answering whether the cost is
 bandwidth in a few large kernels or overhead spread across many small ones.
 
-Both fp32 and bfloat16 autocast are profiled, with one scope per forward to
-match the collector call site.
+FP32 and BF16 autocast are always profiled with one scope per forward. The
+optional native-BF16 replica quantifies the cost of repeated autocast conversion.
 """
 
 from __future__ import annotations
@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     )
     add_model_config_arguments(parser)
     parser.add_argument("--top-kernels", type=int, default=14)
+    parser.add_argument(
+        "--native-bfloat16",
+        action="store_true",
+        help="also profile a replica whose floating parameters and inputs are bfloat16",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -179,6 +184,20 @@ def main() -> None:
         inputs = wave.inputs()
         for label, autocast in (("float32", False), ("bfloat16", True)):
             report[label] = _profile(actor, inputs, autocast, args)
+        if args.native_bfloat16:
+            native_actor = (
+                architecture.build_actor(config.to_dict())
+                .to(device=device, dtype=torch.bfloat16)
+                .eval()
+            )
+            native_actor.load_state_dict(actor.state_dict())
+            native_inputs = torch.utils._pytree.tree_map_only(
+                torch.Tensor,
+                lambda tensor: tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor,
+                inputs,
+            )
+            _instrument(native_actor)
+            report["native_bfloat16"] = _profile(native_actor, native_inputs, False, args)
 
     report["autocast_device_speedup"] = (
         report["float32"]["total_device_milliseconds"]

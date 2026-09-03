@@ -11,8 +11,8 @@ use half::f16;
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadwriteArray1, PyReadwriteArray2,
-    PyReadwriteArray3, PyUntypedArrayMethods,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
+    PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -571,25 +571,29 @@ impl BatchEnv {
                     });
             });
         }
-        fill_sample_step_output(
-            &self.games,
-            &self.sampled_scratch,
-            &self.results_scratch,
-            &mut self.potential_cache,
-            &mut output_slices,
-        );
+        py.detach(|| {
+            fill_sample_step_output(
+                &self.games,
+                &self.sampled_scratch,
+                &self.results_scratch,
+                &mut self.potential_cache,
+                &mut output_slices,
+            );
+        });
         Ok(())
     }
 
     /// Apply GPU-produced categorical random utilities under exact engine
     /// legality, then advance every game.
     ///
-    /// The output carries actions and masks immediately. Policy statistics are
-    /// zeroed for learned rows so the CUDA caller can fill them from the logits
-    /// and exact masks without transferring policy heads to the host.
+    /// Unit and market-kind utilities already contain temperature scaling and
+    /// Gumbel noise. Quantity logits remain low rank until the selected kind is
+    /// known. Learned-row policy statistics stay zero for GPU reconstruction.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
-        unit_utilities, market_kind_utilities, market_quantity_prefix_choices,
+        unit_utilities, market_kind_utilities, market_quantity_context,
+        quantity_kind_gate, quantity_values, quantity_bias, head_ids,
+        market_quantity_draws, deterministic_rows, temperatures,
         builtin_agents, output
     ))]
     fn select_and_step_into<'py>(
@@ -597,11 +601,28 @@ impl BatchEnv {
         py: Python<'py>,
         unit_utilities: PyReadonlyArray3<'py, f32>,
         market_kind_utilities: PyReadonlyArray3<'py, f32>,
-        market_quantity_prefix_choices: PyReadonlyArray4<'py, u8>,
+        market_quantity_context: PyReadonlyArray3<'py, f32>,
+        quantity_kind_gate: PyReadonlyArray3<'py, f32>,
+        quantity_values: PyReadonlyArray3<'py, f32>,
+        quantity_bias: PyReadonlyArray3<'py, f32>,
+        head_ids: PyReadonlyArray1<'py, u16>,
+        market_quantity_draws: PyReadonlyArray2<'py, f32>,
+        deterministic_rows: PyReadonlyArray1<'py, bool>,
+        temperatures: PyReadonlyArray1<'py, f32>,
         builtin_agents: PyReadonlyArray1<'py, u8>,
         output: &Bound<'py, PyDict>,
     ) -> PyResult<()> {
         let rows = self.games.len() * PLAYERS;
+        macro_rules! require_c_input {
+            ($array:ident, $name:literal) => {
+                if !$array.is_c_contiguous() {
+                    return Err(PyValueError::new_err(concat!(
+                        $name,
+                        " must be C-contiguous"
+                    )));
+                }
+            };
+        }
         ensure_shape(
             unit_utilities.shape(),
             &[rows, MAX_UNITS, UNIT_ACTIONS],
@@ -612,50 +633,126 @@ impl BatchEnv {
             &[rows, MAX_MARKET_ORDERS, MARKET_KINDS],
             "market_kind_utilities",
         )?;
+        let context_shape = market_quantity_context.shape();
+        if context_shape.len() != 3
+            || context_shape[0] != rows
+            || context_shape[1] != MAX_MARKET_ORDERS
+        {
+            return Err(PyValueError::new_err(format!(
+                "market_quantity_context shape {context_shape:?}, expected [{rows}, {MAX_MARKET_ORDERS}, rank]"
+            )));
+        }
+        let rank = context_shape[2];
+        let head_shape = quantity_kind_gate.shape();
+        if head_shape.len() != 3
+            || head_shape[1] != MARKET_KINDS
+            || head_shape[2] != rank
+            || head_shape[0] == 0
+        {
+            return Err(PyValueError::new_err(format!(
+                "quantity_kind_gate shape {head_shape:?}, expected [heads, {MARKET_KINDS}, {rank}]"
+            )));
+        }
+        let heads = head_shape[0];
         ensure_shape(
-            market_quantity_prefix_choices.shape(),
-            &[rows, MAX_MARKET_ORDERS, MARKET_KINDS, MARKET_QUANTITIES],
-            "market_quantity_prefix_choices",
+            quantity_values.shape(),
+            &[heads, MARKET_QUANTITIES, rank],
+            "quantity_values",
         )?;
+        ensure_shape(
+            quantity_bias.shape(),
+            &[heads, MARKET_KINDS, MARKET_QUANTITIES],
+            "quantity_bias",
+        )?;
+        ensure_shape(head_ids.shape(), &[rows], "head_ids")?;
+        ensure_shape(
+            market_quantity_draws.shape(),
+            &[rows, MAX_MARKET_ORDERS],
+            "market_quantity_draws",
+        )?;
+        ensure_shape(deterministic_rows.shape(), &[rows], "deterministic_rows")?;
+        ensure_shape(temperatures.shape(), &[rows], "temperatures")?;
         ensure_shape(builtin_agents.shape(), &[rows], "builtin_agents")?;
-        for (contiguous, name) in [
-            (unit_utilities.is_c_contiguous(), "unit_utilities"),
-            (
-                market_kind_utilities.is_c_contiguous(),
-                "market_kind_utilities",
-            ),
-            (
-                market_quantity_prefix_choices.is_c_contiguous(),
-                "market_quantity_prefix_choices",
-            ),
-            (builtin_agents.is_c_contiguous(), "builtin_agents"),
+
+        require_c_input!(unit_utilities, "unit_utilities");
+        require_c_input!(market_kind_utilities, "market_kind_utilities");
+        require_c_input!(market_quantity_context, "market_quantity_context");
+        require_c_input!(quantity_kind_gate, "quantity_kind_gate");
+        require_c_input!(quantity_values, "quantity_values");
+        require_c_input!(quantity_bias, "quantity_bias");
+        require_c_input!(head_ids, "head_ids");
+        require_c_input!(market_quantity_draws, "market_quantity_draws");
+        require_c_input!(deterministic_rows, "deterministic_rows");
+        require_c_input!(temperatures, "temperatures");
+        require_c_input!(builtin_agents, "builtin_agents");
+
+        let unit_utilities = unit_utilities.as_slice()?;
+        let kind_utilities = market_kind_utilities.as_slice()?;
+        let quantity_context = market_quantity_context.as_slice()?;
+        let kind_gate = quantity_kind_gate.as_slice()?;
+        let quantity_values = quantity_values.as_slice()?;
+        let quantity_bias = quantity_bias.as_slice()?;
+        let head_ids = head_ids.as_slice()?;
+        let quantity_draws = market_quantity_draws.as_slice()?;
+        let deterministic_rows = deterministic_rows.as_slice()?;
+        let temperatures = temperatures.as_slice()?;
+        let builtin_agents = builtin_agents.as_slice()?;
+        validate_builtin_agents(builtin_agents)?;
+        if head_ids.iter().any(|&head| usize::from(head) >= heads) {
+            return Err(PyValueError::new_err(
+                "head_ids contains an out-of-range head",
+            ));
+        }
+        if quantity_draws
+            .iter()
+            .any(|&draw| !draw.is_finite() || !(0.0..1.0).contains(&draw))
+        {
+            return Err(PyValueError::new_err(
+                "market_quantity_draws must contain finite values in [0, 1)",
+            ));
+        }
+        if temperatures
+            .iter()
+            .any(|&temperature| !temperature.is_finite() || temperature <= 0.0)
+        {
+            return Err(PyValueError::new_err(
+                "temperatures must contain finite positive values",
+            ));
+        }
+        for (name, values) in [
+            ("unit_utilities", unit_utilities.iter()),
+            ("market_kind_utilities", kind_utilities.iter()),
+            ("market_quantity_context", quantity_context.iter()),
+            ("quantity_kind_gate", kind_gate.iter()),
+            ("quantity_values", quantity_values.iter()),
+            ("quantity_bias", quantity_bias.iter()),
         ] {
-            if !contiguous {
+            if values.clone().any(|value| !value.is_finite()) {
                 return Err(PyValueError::new_err(format!(
-                    "{name} must be C-contiguous"
+                    "{name} must contain finite values"
                 )));
             }
         }
-        let unit_utilities = unit_utilities.as_slice()?;
-        let kind_utilities = market_kind_utilities.as_slice()?;
-        let quantity_prefix_choices = market_quantity_prefix_choices.as_slice()?;
-        let builtin_agents = builtin_agents.as_slice()?;
-        validate_builtin_agents(builtin_agents)?;
 
         let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
         let mut output_slices = output_arrays.slices()?;
-        {
-            let games = &self.games;
-            let sampled = &mut self.sampled_scratch;
-            let v27_states = &mut self.v27_states;
-            py.detach(|| {
-                sampled
-                    .par_iter_mut()
-                    .zip(v27_states.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(row, (output, v27_state))| {
-                        let game = &games[row / PLAYERS];
-                        let player = row % PLAYERS;
+        let games = &mut self.games;
+        let sampled = &mut self.sampled_scratch;
+        let results = &mut self.results_scratch;
+        let potential_cache = &mut self.potential_cache;
+        let v27_states = &mut self.v27_states;
+        py.detach(|| {
+            games
+                .par_iter_mut()
+                .zip(sampled.par_chunks_mut(PLAYERS))
+                .zip(v27_states.par_chunks_mut(PLAYERS))
+                .zip(results.par_iter_mut())
+                .enumerate()
+                .for_each(|(game_index, (((game, sampled_rows), v27_rows), result))| {
+                    let first_row = game_index * PLAYERS;
+                    for player in 0..PLAYERS {
+                        let row = first_row + player;
+                        let sampled_row = &mut sampled_rows[player];
                         let builtin = BuiltinAgent::from_code(builtin_agents[row])
                             .expect("codes are validated above");
                         if let Some(agent) = builtin {
@@ -663,55 +760,54 @@ impl BatchEnv {
                                 player,
                                 agent,
                                 &mut builtin_rng(game, player),
-                                v27_state,
+                                &mut v27_rows[player],
                             );
-                            output.masks = game.factor_masks(player, &action);
-                            output.action = action;
-                            output.unit_logprobs.fill(0.0);
-                            output.market_kind_logprobs.fill(0.0);
-                            output.market_quantity_logprobs.fill(0.0);
-                            output.unit_entropies.fill(0.0);
-                            output.market_kind_entropies.fill(0.0);
-                            output.market_quantity_entropies.fill(0.0);
-                            output.mean_entropy = 0.0;
-                            return;
+                            sampled_row.masks = game.factor_masks(player, &action);
+                            sampled_row.action = action;
+                            sampled_row.unit_logprobs.fill(0.0);
+                            sampled_row.market_kind_logprobs.fill(0.0);
+                            sampled_row.market_quantity_logprobs.fill(0.0);
+                            sampled_row.unit_entropies.fill(0.0);
+                            sampled_row.market_kind_entropies.fill(0.0);
+                            sampled_row.market_quantity_entropies.fill(0.0);
+                            sampled_row.mean_entropy = 0.0;
+                            continue;
                         }
+
+                        let head_id = usize::from(head_ids[row]);
+                        let gate_offset = head_id * MARKET_KINDS * rank;
+                        let values_offset = head_id * MARKET_QUANTITIES * rank;
+                        let bias_offset = head_id * MARKET_KINDS * MARKET_QUANTITIES;
+                        let head = crate::core::QuantityHead {
+                            rank,
+                            kind_gate: &kind_gate[gate_offset..gate_offset + MARKET_KINDS * rank],
+                            values: &quantity_values
+                                [values_offset..values_offset + MARKET_QUANTITIES * rank],
+                            bias: &quantity_bias
+                                [bias_offset..bias_offset + MARKET_KINDS * MARKET_QUANTITIES],
+                        };
                         let unit_offset = row * MAX_UNITS * UNIT_ACTIONS;
                         let kind_offset = row * MAX_MARKET_ORDERS * MARKET_KINDS;
-                        let quantity_offset =
-                            row * MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES;
-                        *output = game.select_factors(
+                        let context_offset = row * MAX_MARKET_ORDERS * rank;
+                        let quantity_draw_offset = row * MAX_MARKET_ORDERS;
+                        *sampled_row = game.select_factors(
                             player,
                             &unit_utilities[unit_offset..unit_offset + MAX_UNITS * UNIT_ACTIONS],
                             &kind_utilities
                                 [kind_offset..kind_offset + MAX_MARKET_ORDERS * MARKET_KINDS],
-                            &quantity_prefix_choices[quantity_offset
-                                ..quantity_offset
-                                    + MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES],
+                            &quantity_context
+                                [context_offset..context_offset + MAX_MARKET_ORDERS * rank],
+                            &head,
+                            &quantity_draws
+                                [quantity_draw_offset..quantity_draw_offset + MAX_MARKET_ORDERS],
+                            deterministic_rows[row],
+                            temperatures[row],
                         );
-                    });
-            });
-        }
-        {
-            let sampled = &self.sampled_scratch;
-            py.detach(|| {
-                self.games
-                    .par_iter_mut()
-                    .zip(self.results_scratch.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(game_index, (game, result))| {
-                        let row = game_index * PLAYERS;
-                        *result = game.step(&[sampled[row].action, sampled[row + 1].action]);
-                    });
-            });
-        }
-        fill_sample_step_output(
-            &self.games,
-            &self.sampled_scratch,
-            &self.results_scratch,
-            &mut self.potential_cache,
-            &mut output_slices,
-        );
+                    }
+                    *result = game.step(&[sampled_rows[0].action, sampled_rows[1].action]);
+                });
+            fill_sample_step_output(games, sampled, results, potential_cache, &mut output_slices);
+        });
         Ok(())
     }
 
@@ -1511,54 +1607,78 @@ fn fill_sample_step_output(
         utilities,
     } = output;
 
-    for (row_index, row) in sampled.iter().enumerate() {
-        let unit_offset = row_index * MAX_UNITS;
-        let market_offset = row_index * MAX_MARKET_ORDERS;
-        let unit_mask_offset = row_index * MAX_UNITS * UNIT_ACTIONS;
-        let kind_mask_offset = row_index * MAX_MARKET_ORDERS * MARKET_KINDS;
-        let quantity_mask_offset = row_index * MAX_MARKET_ORDERS * MARKET_QUANTITIES;
-        unit_actions[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.action.units);
-        market_kinds[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.action.market_kinds);
-        market_quantities[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.action.market_quantities);
-        unit_masks[unit_mask_offset..unit_mask_offset + row.masks.unit.len()]
-            .copy_from_slice(&row.masks.unit);
-        market_kind_masks[kind_mask_offset..kind_mask_offset + row.masks.market_kind.len()]
-            .copy_from_slice(&row.masks.market_kind);
-        market_quantity_masks
-            [quantity_mask_offset..quantity_mask_offset + row.masks.market_quantity.len()]
-            .copy_from_slice(&row.masks.market_quantity);
-        unit_active[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.masks.unit_active);
-        market_active[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.masks.market_active);
-        market_quantity_active[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.masks.market_quantity_active);
-        unit_logprobs[unit_offset..unit_offset + MAX_UNITS].copy_from_slice(&row.unit_logprobs);
-        market_kind_logprobs[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.market_kind_logprobs);
-        market_quantity_logprobs[market_offset..market_offset + MAX_MARKET_ORDERS]
-            .copy_from_slice(&row.market_quantity_logprobs);
-        entropy[row_index] = row.mean_entropy;
-    }
-    for (game_index, ((game, result), cached)) in
-        games.iter().zip(results).zip(potential_cache).enumerate()
-    {
-        let offset = game_index * PLAYERS;
-        rewards[offset..offset + PLAYERS].copy_from_slice(&result.rewards);
-        money[offset..offset + PLAYERS].copy_from_slice(&result.money);
-        dones[game_index] = result.done;
-        let pre = *cached;
-        previous[game_index] = pre;
-        let post = game.post_step_potential();
-        potentials[game_index] = post;
-        utilities[game_index] = if result.done {
-            game.terminal_pair_utility()
-        } else {
-            0.0
-        };
-        *cached = post;
-    }
+    sampled
+        .par_iter()
+        .zip(unit_actions.par_chunks_mut(MAX_UNITS))
+        .zip(market_kinds.par_chunks_mut(MAX_MARKET_ORDERS))
+        .zip(market_quantities.par_chunks_mut(MAX_MARKET_ORDERS))
+        .for_each(|(((row, units), kinds), quantities)| {
+            units.copy_from_slice(&row.action.units);
+            kinds.copy_from_slice(&row.action.market_kinds);
+            quantities.copy_from_slice(&row.action.market_quantities);
+        });
+    sampled
+        .par_iter()
+        .zip(unit_masks.par_chunks_mut(MAX_UNITS * UNIT_ACTIONS))
+        .zip(market_kind_masks.par_chunks_mut(MAX_MARKET_ORDERS * MARKET_KINDS))
+        .zip(market_quantity_masks.par_chunks_mut(MAX_MARKET_ORDERS * MARKET_QUANTITIES))
+        .for_each(|(((row, unit), kinds), quantities)| {
+            unit.copy_from_slice(&row.masks.unit);
+            kinds.copy_from_slice(&row.masks.market_kind);
+            quantities.copy_from_slice(&row.masks.market_quantity);
+        });
+    sampled
+        .par_iter()
+        .zip(unit_active.par_chunks_mut(MAX_UNITS))
+        .zip(market_active.par_chunks_mut(MAX_MARKET_ORDERS))
+        .zip(market_quantity_active.par_chunks_mut(MAX_MARKET_ORDERS))
+        .for_each(|(((row, units), markets), quantities)| {
+            units.copy_from_slice(&row.masks.unit_active);
+            markets.copy_from_slice(&row.masks.market_active);
+            quantities.copy_from_slice(&row.masks.market_quantity_active);
+        });
+    sampled
+        .par_iter()
+        .zip(unit_logprobs.par_chunks_mut(MAX_UNITS))
+        .zip(market_kind_logprobs.par_chunks_mut(MAX_MARKET_ORDERS))
+        .zip(market_quantity_logprobs.par_chunks_mut(MAX_MARKET_ORDERS))
+        .zip(entropy.par_iter_mut())
+        .for_each(|((((row, units), kinds), quantities), entropy)| {
+            units.copy_from_slice(&row.unit_logprobs);
+            kinds.copy_from_slice(&row.market_kind_logprobs);
+            quantities.copy_from_slice(&row.market_quantity_logprobs);
+            *entropy = row.mean_entropy;
+        });
+
+    games
+        .par_iter()
+        .zip(results.par_iter())
+        .zip(potential_cache.par_iter_mut())
+        .zip(rewards.par_chunks_mut(PLAYERS))
+        .zip(money.par_chunks_mut(PLAYERS))
+        .zip(dones.par_iter_mut())
+        .zip(previous.par_iter_mut())
+        .zip(potentials.par_iter_mut())
+        .zip(utilities.par_iter_mut())
+        .for_each(
+            |(
+                (((((((game, result), cached), rewards), money), done), previous), potential),
+                utility,
+            )| {
+                rewards.copy_from_slice(&result.rewards);
+                money.copy_from_slice(&result.money);
+                *done = result.done;
+                *previous = *cached;
+                let post = game.post_step_potential();
+                *potential = post;
+                *utility = if result.done {
+                    game.terminal_pair_utility()
+                } else {
+                    0.0
+                };
+                *cached = post;
+            },
+        );
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

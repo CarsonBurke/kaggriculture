@@ -40,6 +40,11 @@ def sampler_inputs() -> list[np.ndarray]:
     ]
 
 
+def selector_inputs() -> list[np.ndarray]:
+    sampled = sampler_inputs()
+    return [*sampled[:7], *sampled[9:]]
+
+
 def strided_like(array: np.ndarray) -> np.ndarray:
     shape = (*array.shape[:-1], array.shape[-1] * 2)
     result = np.zeros(shape, dtype=array.dtype)[..., ::2]
@@ -53,7 +58,7 @@ def step_of(environment: object) -> int:
 
 
 def child_noncontiguous_inputs() -> None:
-    native = load_native(release=True)
+    native = load_native(build=False, release=True)
     seeds = np.arange(BATCH, dtype=np.uint64)
     names = (
         "unit_logits",
@@ -82,10 +87,35 @@ def child_noncontiguous_inputs() -> None:
         else:
             raise AssertionError(f"strided {name} was accepted")
         assert step_of(environment) == before, name
+    selector_names = (
+        "unit_utilities",
+        "market_kind_utilities",
+        "market_quantity_context",
+        "quantity_kind_gate",
+        "quantity_values",
+        "quantity_bias",
+        "head_ids",
+        "market_quantity_draws",
+        "deterministic_rows",
+        "temperatures",
+        "builtin_agents",
+    )
+    for index, name in enumerate(selector_names):
+        environment = native.BatchEnv(seeds)
+        inputs = selector_inputs()
+        inputs[index] = strided_like(inputs[index])
+        before = step_of(environment)
+        try:
+            environment.select_and_step_into(*inputs, environment.sample_buffers())
+        except ValueError as error:
+            assert "C-contiguous" in str(error), (name, error)
+        else:
+            raise AssertionError(f"strided {name} was accepted")
+        assert step_of(environment) == before, name
 
 
 def assert_unknown_builtin_code_rejected() -> None:
-    native = load_native(release=True)
+    native = load_native(build=False, release=True)
     environment = native.BatchEnv(np.arange(BATCH, dtype=np.uint64))
     inputs = sampler_inputs()
     inputs[-1] = np.full(ROWS, np.iinfo(np.uint8).max, dtype=np.uint8)
@@ -102,7 +132,7 @@ def assert_unknown_builtin_code_rejected() -> None:
 def assert_output_rejected_without_step(
     mutate: Callable[[dict[str, np.ndarray]], None],
 ) -> None:
-    native = load_native(release=True)
+    native = load_native(build=False, release=True)
     environment = native.BatchEnv(np.arange(BATCH, dtype=np.uint64))
     output = environment.sample_buffers()
     mutate(output)
@@ -155,7 +185,7 @@ def main() -> None:
         lambda output: output.__setitem__("market_quantities", output["market_kinds"])
     )
     assert_unknown_builtin_code_rejected()
-    print("binding safety: 13 strided inputs + 6 malformed/aliased outputs rejected pre-step")
+    print("binding safety: 24 strided inputs + 6 malformed/aliased outputs rejected pre-step")
 
 
 if __name__ == "__main__":

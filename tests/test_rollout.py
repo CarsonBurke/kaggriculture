@@ -36,9 +36,10 @@ from kaggriculture.rollout import (
     _categorical_draws,
     _cuda_graph_generation,
     _fill_gpu_policy_statistics,
-    _gumbel_preference_order,
-    _gumbel_prefix_choices,
+    _gumbel_utilities,
     _native_pair_rewards,
+    _pipeline_replica,
+    _stacked_actor_ensemble,
     _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
@@ -96,11 +97,11 @@ def test_native_categorical_draw_transport_stays_strictly_below_one() -> None:
         assert (component == np.nextafter(np.float32(1.0), np.float32(0.0))).all()
 
 
-def test_gumbel_preferences_follow_categorical_probabilities() -> None:
+def test_gumbel_utilities_follow_categorical_probabilities() -> None:
     rows = 60_000
     logits = torch.tensor([0.0, np.log(2.0), np.log(3.0)]).expand(rows, -1)
     generator = torch.Generator().manual_seed(41)
-    order = _gumbel_preference_order(
+    utilities = _gumbel_utilities(
         logits,
         torch.ones(rows),
         torch.zeros(rows, dtype=torch.bool),
@@ -110,7 +111,8 @@ def test_gumbel_preferences_follow_categorical_probabilities() -> None:
         torch.Generator().manual_seed(99),
     )
 
-    frequencies = torch.bincount(order[:, 0].long(), minlength=3).float() / rows
+    choices = utilities.argmax(dim=-1)
+    frequencies = torch.bincount(choices, minlength=3).float() / rows
     torch.testing.assert_close(
         frequencies,
         torch.tensor([1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0]),
@@ -118,7 +120,7 @@ def test_gumbel_preferences_follow_categorical_probabilities() -> None:
         rtol=0.0,
     )
 
-    tied_prefix = _gumbel_prefix_choices(
+    tied = _gumbel_utilities(
         torch.tensor([[1.0, 1.0, 0.0]]),
         torch.ones(1),
         torch.ones(1, dtype=torch.bool),
@@ -127,7 +129,7 @@ def test_gumbel_preferences_follow_categorical_probabilities() -> None:
         torch.Generator().manual_seed(1),
         torch.Generator().manual_seed(2),
     )
-    torch.testing.assert_close(tied_prefix, torch.zeros_like(tied_prefix))
+    assert tied.argmax(dim=-1).item() == 0
 
 
 def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
@@ -142,21 +144,8 @@ def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
     kind_gate = generator.standard_normal((1, N_MARKET_KINDS, rank), dtype=np.float32)
     quantity_values = generator.standard_normal((1, N_QUANTITIES, rank), dtype=np.float32)
     quantity_bias = generator.standard_normal((1, N_MARKET_KINDS, N_QUANTITIES), dtype=np.float32)
-    all_quantity_logits = (
-        np.einsum(
-            "bskr,qr->bskq",
-            quantity_context[:, :, None] * (1.0 + kind_gate[0, None]),
-            quantity_values[0],
-        )
-        + quantity_bias[0, None]
-    )
     unit_utilities = unit_logits.copy()
     kind_utilities = kind_logits.copy()
-    quantity_prefix_choices = np.empty_like(all_quantity_logits, dtype=np.uint8)
-    for maximum in range(N_QUANTITIES):
-        quantity_prefix_choices[..., maximum] = np.argmax(
-            all_quantity_logits[..., : maximum + 1], axis=-1
-        )
     zeros = np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.float32)
     temperatures = np.asarray([0.7, 1.3], dtype=np.float32)
     native = load_native()
@@ -184,7 +173,14 @@ def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
     selected_environment.select_and_step_into(
         unit_utilities,
         kind_utilities,
-        quantity_prefix_choices,
+        quantity_context,
+        kind_gate,
+        quantity_values,
+        quantity_bias,
+        np.zeros(rows, dtype=np.uint16),
+        zeros,
+        np.ones(rows, dtype=np.bool_),
+        temperatures,
         np.zeros(rows, dtype=np.uint8),
         selected,
     )
@@ -231,8 +227,52 @@ def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
         )
 
 
+def test_bfloat16_pipeline_replica_preserves_fp32_quantity_heads() -> None:
+    actor = StructuredActor(
+        StructuredConfig(
+            model_dim=32,
+            attention_heads=4,
+            attention_kv_heads=2,
+            ffn_multiplier=2,
+            farm_blocks=1,
+            opponent_latents=2,
+            latents=4,
+            core_layers=1,
+        )
+    )
+
+    replica = _pipeline_replica(actor, dtype=torch.bfloat16, namespace=7)
+
+    assert {
+        name for name, parameter in replica.named_parameters() if parameter.dtype == torch.float32
+    } == {
+        "market_quantity_bias",
+        "market_quantity_kind_gate.weight",
+        "market_quantity_value.weight",
+    }
+    assert replica.market_quantity_kind_gate.weight.dtype == torch.float32
+    assert replica.market_quantity_value.weight.dtype == torch.float32
+    assert replica.market_quantity_bias.dtype == torch.float32
+    torch.testing.assert_close(
+        replica.market_quantity_value.weight, actor.market_quantity_value.weight
+    )
+
+    with torch.no_grad():
+        actor.market_quantity_value.weight.add_(1.0)
+    refreshed = _pipeline_replica(actor, dtype=torch.bfloat16, namespace=7)
+    assert refreshed is replica
+    torch.testing.assert_close(
+        refreshed.market_quantity_value.weight, actor.market_quantity_value.weight
+    )
+    fp32_ensemble = _stacked_actor_ensemble((actor,), namespace=1_000_007)
+    bf16_ensemble = _stacked_actor_ensemble((replica,), namespace=1_000_007)
+    assert bf16_ensemble is not fp32_ensemble
+    assert _stacked_actor_ensemble((replica,), namespace=1_000_007) is bf16_ensemble
+
+
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cuda_sampler_pipelines_two_shards_in_seed_order() -> None:
+def test_cuda_sampler_runs_one_full_batch_in_seed_order() -> None:
     actor = StructuredActor(
         StructuredConfig(
             model_dim=32,
@@ -252,7 +292,7 @@ def test_cuda_sampler_pipelines_two_shards_in_seed_order() -> None:
         seed_start=31,
         sampling_seed=13,
         forward_mode="eager",
-        forward_autocast=True,
+        forward_autocast=False,
     )
 
     np.testing.assert_array_equal(rollout.episode_seeds, [31, 31, 32, 32])
@@ -1414,6 +1454,7 @@ def _generation_counter() -> int:
     return int(MarkStepBox.mark_step_counter)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("mode", "peer_is_held_out"),
@@ -1422,18 +1463,15 @@ def _generation_counter() -> int:
 def test_the_generation_guard_pins_the_counter_for_exactly_the_capturing_modes(
     mode: str, peer_is_held_out: bool
 ) -> None:
-    """A shard's step must see one generation, and only capture may pay for it.
+    """A compiled step must see one generation; only capture may pay for it.
 
     `cudagraph_trees` gives every thread its own tree manager but reads a single
     process-global counter to decide when a generation -- and so the lifetime of
-    the previous forward's output buffers -- has ended. A peer shard marking
-    inside this shard's step is therefore what retires an output the step has
-    not consumed yet. The guard has to make that impossible under capture, and
-    has to stay out of the way otherwise: for `inductor_default` the compiled
-    region is the whole launch sequence the two shards exist to overlap. Only
-    the compiled modes appear here: `eager` and `graph` never enter
-    `cudagraph_trees` at all, so they have no generation to pin, and that they
-    never mark is the next test.
+    the previous forward's output buffers -- has ended. A concurrent collector
+    marking inside this collector's step can therefore retire an output that has
+    not been consumed yet. The guard prevents that under capture and stays out
+    of the way otherwise. `eager` and explicit `graph` never enter
+    `cudagraph_trees`, so they have no generation to pin.
     """
     device = torch.device("cuda")
     peer_entered = threading.Event()
@@ -1448,8 +1486,8 @@ def test_the_generation_guard_pins_the_counter_for_exactly_the_capturing_modes(
         inside = _generation_counter()
         thread = threading.Thread(target=peer)
         thread.start()
-        # A blocked peer never reaches its own mark, so the counter this shard
-        # read at entry is still the one its manager will compare against.
+        # A blocked peer never reaches its own mark, so this collector still
+        # observes the counter it read at entry.
         assert peer_entered.wait(timeout=2.0) is not peer_is_held_out
         assert (_generation_counter() == inside) is peer_is_held_out
     assert peer_left.wait(timeout=10.0)
@@ -1457,6 +1495,7 @@ def test_the_generation_guard_pins_the_counter_for_exactly_the_capturing_modes(
     assert not thread.is_alive()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_the_generation_guard_marks_the_compiled_modes_and_only_those() -> None:
     """Only a forward that goes through `cudagraph_trees` has a generation.
@@ -1474,6 +1513,7 @@ def test_the_generation_guard_marks_the_compiled_modes_and_only_those() -> None:
         assert moved is (mode in COMPILED_ROLLOUT_FORWARD_MODES), mode
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
     """`graph` must be the same wave as `eager`, not merely a similar one.

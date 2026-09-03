@@ -1662,19 +1662,22 @@ impl Game {
         }
     }
 
-    /// Select masked factors from GPU-produced random utilities.
+    /// Select masked factors from GPU-produced unit and market-kind utilities.
     ///
-    /// Unit and market-kind rows carry one Gumbel utility per action.
-    /// Quantity rows store the preferred action for every valid-prefix length,
-    /// exploiting the quantity mask's prefix invariant without sorting 100
-    /// values per kind. Legality remains owned by the engine while it evolves
-    /// the same unit and market ledgers used by `sample_factors`.
+    /// Unit and market-kind utilities already include temperature scaling and
+    /// Gumbel noise. Quantity logits stay in their low-rank representation
+    /// until the sequential market ledger identifies the selected kind.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_factors(
         &self,
         player: usize,
         unit_utilities: &[f32],
         market_kind_utilities: &[f32],
-        market_quantity_prefix_choices: &[u8],
+        market_quantity_context: &[f32],
+        quantity_head: &QuantityHead<'_>,
+        market_quantity_draws: &[f32],
+        deterministic: bool,
+        temperature: f32,
     ) -> SampledFactors {
         debug_assert_eq!(unit_utilities.len(), MAX_UNITS * UNIT_ACTIONS);
         debug_assert_eq!(
@@ -1682,9 +1685,19 @@ impl Game {
             MAX_MARKET_ORDERS * MARKET_KINDS
         );
         debug_assert_eq!(
-            market_quantity_prefix_choices.len(),
-            MAX_MARKET_ORDERS * MARKET_KINDS * MARKET_QUANTITIES
+            market_quantity_context.len(),
+            MAX_MARKET_ORDERS * quantity_head.rank
         );
+        debug_assert_eq!(
+            quantity_head.kind_gate.len(),
+            MARKET_KINDS * quantity_head.rank
+        );
+        debug_assert_eq!(
+            quantity_head.values.len(),
+            MARKET_QUANTITIES * quantity_head.rank
+        );
+        debug_assert_eq!(quantity_head.bias.len(), MARKET_KINDS * MARKET_QUANTITIES);
+        debug_assert_eq!(market_quantity_draws.len(), MAX_MARKET_ORDERS);
         let select = |utilities: &[f32], mask: &[bool]| {
             let mut selected = None;
             for (candidate, (&utility, &valid)) in utilities.iter().zip(mask).enumerate() {
@@ -1701,22 +1714,29 @@ impl Game {
         };
 
         let mut action = CompactAction::default();
+        let mut unit_masks = [false; UNIT_MASK_VALUES];
+        let mut market_kind_masks = [false; MARKET_KIND_MASK_VALUES];
+        let mut market_quantity_masks = [false; MARKET_QUANTITY_MASK_VALUES];
+        let mut unit_active = [false; MAX_UNITS];
+        let mut market_active = [false; MAX_MARKET_ORDERS];
+        let mut market_quantity_active = [false; MAX_MARKET_ORDERS];
         let day = self.step / self.config.turns_per_day;
         let mut unit_ledger = UnitLedger::from_game(self, player);
         let active_units = usize::from(self.farms[player].units);
         for unit in 0..MAX_UNITS {
-            let mut mask = [false; UNIT_ACTIONS];
+            let mask = &mut unit_masks[unit * UNIT_ACTIONS..(unit + 1) * UNIT_ACTIONS];
             if unit >= active_units {
                 mask[0] = true;
             } else {
+                unit_active[unit] = true;
                 for (candidate, valid) in mask.iter_mut().enumerate() {
                     *valid = unit_ledger.action_valid(unit, candidate as u8, day);
                 }
             }
             let offset = unit * UNIT_ACTIONS;
-            let selected = select(&unit_utilities[offset..offset + UNIT_ACTIONS], &mask);
+            let selected = select(&unit_utilities[offset..offset + UNIT_ACTIONS], mask);
             action.units[unit] = selected as u8;
-            if unit < active_units {
+            if unit_active[unit] {
                 unit_ledger.apply_action(unit, selected as u8, day);
             }
         }
@@ -1732,42 +1752,49 @@ impl Game {
             inventory: self.market_inventory,
         };
         let mut still_active = true;
+        let mut quantity_logits = [0.0f32; MARKET_QUANTITIES];
         for slot in 0..MAX_MARKET_ORDERS {
-            let mut kind_mask = [false; MARKET_KINDS];
+            let kind_mask = &mut market_kind_masks[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            let quantity_mask = &mut market_quantity_masks
+                [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
             if still_active {
-                fill_market_kind_mask(&unit_ledger.config, &ledger, &mut kind_mask);
+                market_active[slot] = true;
+                fill_market_kind_mask(&unit_ledger.config, &ledger, kind_mask);
             } else {
                 kind_mask[0] = true;
             }
             let kind_offset = slot * MARKET_KINDS;
             let kind = select(
                 &market_kind_utilities[kind_offset..kind_offset + MARKET_KINDS],
-                &kind_mask,
+                kind_mask,
             );
             action.market_kinds[slot] = kind as u8;
             if !still_active || kind == 0 {
+                quantity_mask[0] = true;
                 still_active = false;
                 continue;
             }
 
-            let mut quantity_mask = [false; MARKET_QUANTITIES];
-            fill_market_quantity_mask(&unit_ledger.config, &ledger, kind as u8, &mut quantity_mask);
+            fill_market_quantity_mask(&unit_ledger.config, &ledger, kind as u8, quantity_mask);
             if kind < 3 {
                 apply_policy_market_order(&unit_ledger.config, &mut ledger, kind as u8, 1);
                 continue;
             }
-            let quantity_offset = (slot * MARKET_KINDS + kind) * MARKET_QUANTITIES;
-            let max_valid = quantity_mask
-                .iter()
-                .rposition(|&valid| valid)
-                .expect("quantity masks always contain a valid action");
-            let candidate =
-                usize::from(market_quantity_prefix_choices[quantity_offset + max_valid]);
-            let quantity = if candidate <= max_valid && quantity_mask[candidate] {
-                candidate
-            } else {
-                max_valid
-            };
+            market_quantity_active[slot] = true;
+            score_quantities(
+                &market_quantity_context
+                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+                kind,
+                quantity_head,
+                &mut quantity_logits,
+            );
+            let (quantity, _, _) = sample_categorical(
+                &quantity_logits,
+                quantity_mask,
+                deterministic,
+                temperature,
+                market_quantity_draws[slot],
+            );
             action.market_quantities[slot] = quantity as u8;
             apply_policy_market_order(
                 &unit_ledger.config,
@@ -1778,7 +1805,14 @@ impl Game {
         }
 
         SampledFactors {
-            masks: self.factor_masks(player, &action),
+            masks: FactorMasks {
+                unit: unit_masks,
+                market_kind: market_kind_masks,
+                market_quantity: market_quantity_masks,
+                unit_active,
+                market_active,
+                market_quantity_active,
+            },
             action,
             unit_logprobs: [0.0; MAX_UNITS],
             market_kind_logprobs: [0.0; MAX_MARKET_ORDERS],
@@ -2568,7 +2602,7 @@ fn sample_categorical(
                 continue;
             }
             cumulative += *probability / total;
-            if draw <= cumulative {
+            if draw < cumulative {
                 selected = index;
                 break;
             }
@@ -3627,6 +3661,13 @@ mod tests {
     fn categorical_zero_draw_never_selects_a_masked_prefix() {
         let logits = [100.0, 0.0, 1.0];
         let mask = [false, true, true];
+        assert_eq!(sample_categorical(&logits, &mask, false, 1.0, 0.0).0, 1);
+    }
+
+    #[test]
+    fn categorical_zero_draw_skips_zero_mass_category() {
+        let logits = [-200.0, 0.0];
+        let mask = [true, true];
         assert_eq!(sample_categorical(&logits, &mask, false, 1.0, 0.0).0, 1);
     }
 

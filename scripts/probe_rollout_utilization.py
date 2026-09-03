@@ -3,18 +3,15 @@
 The iteration benchmark reports one rollout number and `nvidia-smi` reports a
 duty cycle averaged over a sampling window that is longer than most of our
 kernels. Neither says whether the device is idle because the host cannot launch
-fast enough or because the host is off doing Rust work. This unions the
-the device time the profiler attributes to CUDA kernels against the wall time
-of the same wave. Two shard streams mean overlapped kernels are counted twice,
-so the reported busy fraction is an upper bound: the device cannot have been
-busier than that, which is what makes a low number decisive.
+fast enough or because the host is off doing Rust work. The default profile sums
+kernel device time; concurrent kernels are counted twice, so its busy fraction
+is an upper bound. `--gaps` additionally computes the exact interval union when
+the much larger trace export is acceptable.
 
-The native simulator only accepts the competition horizon, so this is the
-full 720-step production wave -- no shortened proxy. Only GPU activities are
+The native simulator only accepts the competition horizon, so this is the full
+720-step production wave -- no shortened proxy. Only GPU activities are
 recorded, which keeps the trace to the kernels themselves instead of the far
-larger set of host-side operator events. Busy time is reported per CUDA stream
-as well as unioned, because the collector runs two shards on two side streams
-and the gap between those two numbers is exactly how much the pipelining wins.
+larger set of host-side operator events.
 """
 
 from __future__ import annotations
@@ -46,15 +43,11 @@ from kaggriculture.structured import StructuredConfig
 def _stall_guard(seconds: float, what: str) -> Iterator[None]:
     """Abort with every thread's stack if one rollout takes longer than `seconds`.
 
-    A compiled collection can wedge rather than fail -- the shard threads park
-    on a futex and the process sits at a few percent CPU until the queue's time
-    limit kills it, holding the GPU lease the whole time and leaving nothing
-    behind to read. `mlq`'s own limit cannot do better than that because it can
-    only send a signal from outside. This can: the stall is bounded by the work
-    itself rather than by the whole run, and the dump names the line each thread
-    is stuck on, which is the one thing a hang has to tell us. Elevated
-    permissions would be needed to attach a sampling profiler to a queued job
-    after the fact, so arming the dump in advance is also the only way to get it.
+    A compiled collection can wedge rather than fail, leaving the process parked
+    on a futex until the queue's time limit kills it while holding the GPU lease.
+    `mlq` can only signal from outside. This guard bounds the individual rollout
+    and dumps the exact Python stacks from inside the process, avoiding a
+    privileged profiler attach after the fact.
     """
     if seconds <= 0:
         yield
@@ -239,11 +232,11 @@ def main() -> None:
     wall_seconds = start_event.elapsed_time(end_event) / 1e3
 
     # A 720-step wave produces enough kernel events that exporting and reparsing
-    # a chrome trace OOM-killed this probe once.  aggregates in
-    # place instead, which costs nothing and answers the question: it sums each
-    # kernel's device time, so with two shard streams that sum counts overlapped
-    # work twice and is therefore an UPPER BOUND on how busy the device was.
-    # A low upper bound is decisive -- the GPU cannot have been busier than it.
+    # a chrome trace OOM-killed this probe once. Aggregate in place instead,
+    # which costs nothing and answers the question. Summed kernel device time
+    # counts any overlap between independent forward streams twice and is
+    # therefore an UPPER BOUND on how busy the device was. A low upper bound is
+    # decisive -- the GPU cannot have been busier than it.
     gap_report: dict[str, float] = {}
     busy = 0.0
     launches = 0

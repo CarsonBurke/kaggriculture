@@ -23,11 +23,10 @@ replaying a graph. Both landing near `eager` means the forward is limited by
 kernel latency and only fusion or a smaller network will help.
 
 That is what happened, and it is why the collection backend is now a named mode
-rather than a flag. At a median of 60 waves, `eager` measures 4.907 ms and
-`cudagraphs` 5.309 ms in fp32 -- compiling lost -- while Inductor with
-`reduce-overhead` measures 2.720 ms in fp32 and 1.626 ms under bf16 autocast.
-`PRODUCTION_ROLLOUT_FORWARD_MODE` is `inductor` and
-`PRODUCTION_ROLLOUT_BFLOAT16` is true because of these numbers.
+rather than a flag. The isolated historical ranking remains useful for backend
+diagnosis, but production now selects the collector-owned whole-wave `graph`
+mode from end-to-end mixed-rollout evidence. Native BF16 replicas are measured
+separately by `profile_actor_forward.py`.
 """
 
 from __future__ import annotations

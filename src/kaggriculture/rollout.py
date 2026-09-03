@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -454,21 +453,12 @@ class _NativeEncodedWave:
     unit_positions: torch.Tensor
 
     def copy_to_device(self) -> None:
-        """Upload the encoded block, then widen it in a separate device kernel.
+        """Upload the encoded block, then convert it in a separate device kernel.
 
-        The Rust encoder emits fp16 and the model consumes fp32. A single
-        cross-dtype `copy_` does not transfer fp32 across the bus: ATen's
-        `copy_requires_temporaries` sends a CPU-to-CUDA copy with mismatched
-        dtypes down a staged path that allocates a device temporary, transfers at
-        the source dtype, then widens on the device. This spells that out with a
-        buffer owned by the wave, so the temporary is allocated once at
-        construction instead of per step, and both destinations are persistent,
-        which keeps the captured rollout graph's input addresses static.
-
-        The two steps are therefore value-identical to the one they replace. The
-        matched-dtype transfer is measurably cheaper than the mismatched one on
-        this box, but that gap is not yet attributed to a mechanism, so treat the
-        split as a clarification whose payoff is still being measured.
+        The Rust encoder emits fp16 and the model consumes its inference dtype. A
+        single cross-dtype `copy_` uses a same-dtype device temporary before the
+        conversion. This spells out both buffers so they are allocated once and
+        their addresses remain static for CUDA graph capture.
         """
         non_blocking = self.device_features.device.type == "cuda"
         self.staged_features.copy_(self.host_features, non_blocking=non_blocking)
@@ -482,15 +472,28 @@ class _NativeEncodedWave:
         return (self.board, self.global_features, self.units, self.unit_positions)
 
 
-def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncodedWave:
+def _native_encoded_wave(
+    environment: Any,
+    device: torch.device,
+    floating_dtype: torch.dtype = torch.float32,
+    device_wave: _NativeEncodedWave | None = None,
+) -> _NativeEncodedWave:
     """Build reusable Rust output plus packed, optionally pinned model input buffers."""
     arrays = {name: np.asarray(value) for name, value in environment.encoded_buffers().items()}
     feature_names = ("board", "global_features", "critic_features", "units")
     feature_sizes = [arrays[name].size for name in feature_names]
     pin_memory = device.type == "cuda"
     host_features = torch.empty(sum(feature_sizes), dtype=torch.float16, pin_memory=pin_memory)
-    staged_features = torch.empty(sum(feature_sizes), dtype=host_features.dtype, device=device)
-    device_features = torch.empty(sum(feature_sizes), dtype=torch.float32, device=device)
+    staged_features = (
+        torch.empty(sum(feature_sizes), dtype=host_features.dtype, device=device)
+        if device_wave is None
+        else device_wave.staged_features
+    )
+    device_features = (
+        torch.empty(sum(feature_sizes), dtype=floating_dtype, device=device)
+        if device_wave is None
+        else device_wave.device_features
+    )
     device_views: dict[str, torch.Tensor] = {}
     cursor = 0
     for name, size in zip(feature_names, feature_sizes, strict=True):
@@ -506,7 +509,11 @@ def _native_encoded_wave(environment: Any, device: torch.device) -> _NativeEncod
         pin_memory=pin_memory,
     )
     arrays["unit_positions"] = host_positions.numpy()
-    unit_positions = torch.empty(host_positions.shape, dtype=torch.long, device=device)
+    unit_positions = (
+        torch.empty(host_positions.shape, dtype=torch.long, device=device)
+        if device_wave is None
+        else device_wave.unit_positions
+    )
     return _NativeEncodedWave(
         arrays=arrays,
         host_features=host_features,
@@ -548,13 +555,11 @@ class _NativeStructuredWave:
     device_inputs: StructuredInputs
 
     def copy_to_device(self) -> None:
-        """Upload once, then widen the two model-input groups in place.
+        """Upload once, then convert the two model-input groups in place.
 
-        Direct CPU-to-CUDA copies between different dtypes make ATen allocate a
-        same-dtype device temporary for every call. Keeping that temporary in
-        the wave removes the two per-step allocations. Packing flags into the
-        same byte transport also removes two H2D launches and the separate flag
-        copy; the model reads its bool views directly from the staged block.
+        Keeping the same-dtype transport and final model-input buffers removes
+        per-step temporaries. Packing flags into the byte transport also removes
+        two H2D launches; the model reads bool views directly from that block.
         """
         non_blocking = self.device_continuous.device.type == "cuda"
         self.staged_transport.copy_(self.host_transport, non_blocking=non_blocking)
@@ -568,7 +573,12 @@ class _NativeStructuredWave:
         return (self.device_inputs,)
 
 
-def _native_structured_wave(environment: Any, device: torch.device) -> _NativeStructuredWave:
+def _native_structured_wave(
+    environment: Any,
+    device: torch.device,
+    floating_dtype: torch.dtype = torch.float32,
+    device_wave: _NativeStructuredWave | None = None,
+) -> _NativeStructuredWave:
     """Build reusable structured Rust output plus packed device token tensors."""
     arrays = {name: np.asarray(value) for name, value in environment.structured_buffers().items()}
     continuous_elements = sum(arrays[name].size for name in _STRUCTURED_CONTINUOUS_BUFFERS)
@@ -583,15 +593,20 @@ def _native_structured_wave(environment: Any, device: torch.device) -> _NativeSt
         dtype=torch.uint8,
         pin_memory=device.type == "cuda",
     )
-    staged_transport = torch.empty(transport_bytes, dtype=torch.uint8, device=device)
     host_continuous = host_transport[:continuous_bytes].view(torch.float16)
     host_categorical = host_transport[continuous_bytes:categorical_end].view(torch.int8)
     host_flags = host_transport[categorical_end:].view(torch.bool)
+    if device_wave is None:
+        staged_transport = torch.empty(transport_bytes, dtype=torch.uint8, device=device)
+        device_continuous = torch.empty(continuous_elements, dtype=floating_dtype, device=device)
+        device_categorical = torch.empty(categorical_elements, dtype=torch.int64, device=device)
+    else:
+        staged_transport = device_wave.staged_transport
+        device_continuous = device_wave.device_continuous
+        device_categorical = device_wave.device_categorical
     staged_continuous = staged_transport[:continuous_bytes].view(torch.float16)
     staged_categorical = staged_transport[continuous_bytes:categorical_end].view(torch.int8)
     staged_flags = staged_transport[categorical_end:].view(torch.bool)
-    device_continuous = torch.empty(continuous_elements, dtype=torch.float32, device=device)
-    device_categorical = torch.empty(categorical_elements, dtype=torch.int64, device=device)
     views: dict[str, torch.Tensor] = {}
 
     def map_group(names: tuple[str, ...], host: torch.Tensor, destination: torch.Tensor) -> None:
@@ -614,16 +629,26 @@ def _native_structured_wave(environment: Any, device: torch.device) -> _NativeSt
         staged_categorical=staged_categorical,
         device_continuous=device_continuous,
         device_categorical=device_categorical,
-        device_inputs=StructuredInputs(**{name: views[name] for name in StructuredInputs._fields}),
+        device_inputs=(
+            StructuredInputs(**{name: views[name] for name in StructuredInputs._fields})
+            if device_wave is None
+            else device_wave.device_inputs
+        ),
     )
 
 
 def _native_wave(
-    architecture: str, environment: Any, device: torch.device
+    architecture: str,
+    environment: Any,
+    device: torch.device,
+    floating_dtype: torch.dtype = torch.float32,
+    device_wave: _NativeEncodedWave | _NativeStructuredWave | None = None,
 ) -> _NativeEncodedWave | _NativeStructuredWave:
     if architecture == CONV_ENTITY:
-        return _native_encoded_wave(environment, device)
-    return _native_structured_wave(environment, device)
+        assert device_wave is None or isinstance(device_wave, _NativeEncodedWave)
+        return _native_encoded_wave(environment, device, floating_dtype, device_wave)
+    assert device_wave is None or isinstance(device_wave, _NativeStructuredWave)
+    return _native_structured_wave(environment, device, floating_dtype, device_wave)
 
 
 @dataclass(frozen=True)
@@ -717,11 +742,13 @@ def _packed_outputs_to_host(
 
 @dataclass(frozen=True)
 class _GpuPreferenceTransfer:
-    """Pinned mirrors for GPU-produced categorical preference permutations."""
+    """Persistent conversion buffer and pinned compact native inputs."""
 
+    device_quantity_context: torch.Tensor | None
     units: torch.Tensor
     kinds: torch.Tensor
-    quantities: torch.Tensor
+    quantity_context: torch.Tensor
+    quantity_draws: torch.Tensor
 
 
 def _quantity_head_tensors(
@@ -732,21 +759,6 @@ def _quantity_head_tensors(
         torch.stack([actor.market_quantity_value.weight for actor in actors]),
         torch.stack([actor.market_quantity_bias for actor in actors]),
     )
-
-
-def _all_quantity_logits(
-    context: torch.Tensor,
-    head_ids: torch.Tensor,
-    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    kind_gate, values, bias = heads
-    row_gate = kind_gate[head_ids]
-    row_values = values[head_ids]
-    row_bias = bias[head_ids]
-    features = context.float().unsqueeze(2) * (1.0 + row_gate.float().unsqueeze(1))
-    return torch.einsum(
-        "bskr,bqr->bskq", features, row_values.float()
-    ) + row_bias.float().unsqueeze(1)
 
 
 def _selected_quantity_logits(
@@ -766,6 +778,31 @@ def _selected_quantity_logits(
     return torch.einsum("bsr,bqr->bsq", features, values[head_ids].float()) + selected_bias.float()
 
 
+def _row_random(
+    shape: tuple[int, ...],
+    current_rows: torch.Tensor,
+    frozen_rows: torch.Tensor,
+    current_generator: torch.Generator,
+    frozen_generator: torch.Generator,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Draw independent current/frozen streams into their physical row order."""
+    values = torch.empty(shape, dtype=torch.float32, device=device)
+    for rows, generator in (
+        (current_rows, current_generator),
+        (frozen_rows, frozen_generator),
+    ):
+        if rows.numel():
+            values[rows] = torch.rand(
+                (rows.numel(), *shape[1:]),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+    return values
+
+
 def _gumbel_utilities(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -778,22 +815,19 @@ def _gumbel_utilities(
     scores = logits.float() / temperatures.reshape(
         temperatures.shape[0], *((1,) * (logits.ndim - 1))
     )
-    noise = torch.empty_like(scores)
-    for rows, generator in (
-        (current_rows, current_generator),
-        (frozen_rows, frozen_generator),
-    ):
-        if rows.numel():
-            uniforms = torch.rand(
-                (rows.numel(), *scores.shape[1:]),
-                dtype=torch.float32,
-                device=scores.device,
-                generator=generator,
-            )
-            uniforms.clamp_(
-                min=torch.finfo(torch.float32).tiny, max=1.0 - torch.finfo(torch.float32).eps
-            )
-            noise[rows] = -torch.log(-torch.log(uniforms))
+    uniforms = _row_random(
+        tuple(scores.shape),
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
+        device=scores.device,
+    )
+    uniforms.clamp_(
+        min=torch.finfo(torch.float32).tiny,
+        max=1.0 - torch.finfo(torch.float32).eps,
+    )
+    noise = -torch.log(-torch.log(uniforms))
     return torch.where(
         deterministic_rows.reshape(deterministic_rows.shape[0], *((1,) * (logits.ndim - 1))),
         scores,
@@ -801,59 +835,8 @@ def _gumbel_utilities(
     )
 
 
-def _gumbel_preference_order(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    deterministic_rows: torch.Tensor,
-    current_rows: torch.Tensor,
-    frozen_rows: torch.Tensor,
-    current_generator: torch.Generator,
-    frozen_generator: torch.Generator,
-) -> torch.Tensor:
-    """Rank GPU-side Gumbel utilities for exact native masked selection."""
-    scores = _gumbel_utilities(
-        logits,
-        temperatures,
-        deterministic_rows,
-        current_rows,
-        frozen_rows,
-        current_generator,
-        frozen_generator,
-    )
-    return scores.argsort(dim=-1, descending=True, stable=True).to(torch.uint8)
-
-
-def _gumbel_prefix_choices(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    deterministic_rows: torch.Tensor,
-    current_rows: torch.Tensor,
-    frozen_rows: torch.Tensor,
-    current_generator: torch.Generator,
-    frozen_generator: torch.Generator,
-) -> torch.Tensor:
-    """Return the best Gumbel utility for every legal quantity prefix."""
-    scores = _gumbel_utilities(
-        logits,
-        temperatures,
-        deterministic_rows,
-        current_rows,
-        frozen_rows,
-        current_generator,
-        frozen_generator,
-    )
-    running_max = scores.cummax(dim=-1).values
-    previous_max = torch.cat(
-        (torch.full_like(running_max[..., :1], -torch.inf), running_max[..., :-1]), dim=-1
-    )
-    indices = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int64)
-    records = torch.where(scores > previous_max, indices, 0)
-    return records.cummax(dim=-1).values.to(torch.uint8)
-
-
 def _gpu_preferences_to_host(
     output: ActorOutput,
-    all_quantity_logits: torch.Tensor,
     temperatures: torch.Tensor,
     deterministic_rows: torch.Tensor,
     current_rows: torch.Tensor,
@@ -861,61 +844,106 @@ def _gpu_preferences_to_host(
     current_generator: torch.Generator,
     frozen_generator: torch.Generator,
     transfer: _GpuPreferenceTransfer | None,
-) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], _GpuPreferenceTransfer]:
-    preferences = (
-        _gumbel_utilities(
-            output.unit_logits,
-            temperatures,
-            deterministic_rows,
-            current_rows,
-            frozen_rows,
-            current_generator,
-            frozen_generator,
-        ),
-        _gumbel_utilities(
-            output.market_kind_logits,
-            temperatures,
-            deterministic_rows,
-            current_rows,
-            frozen_rows,
-            current_generator,
-            frozen_generator,
-        ),
-        _gumbel_prefix_choices(
-            all_quantity_logits,
-            temperatures,
-            deterministic_rows,
-            current_rows,
-            frozen_rows,
-            current_generator,
-            frozen_generator,
-        ),
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], _GpuPreferenceTransfer]:
+    unit_utilities = _gumbel_utilities(
+        output.unit_logits,
+        temperatures,
+        deterministic_rows,
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
     )
-    if transfer is None or any(
-        host.shape != preference.shape or host.dtype != preference.dtype
-        for host, preference in zip(
-            (transfer.units, transfer.kinds, transfer.quantities), preferences, strict=True
+    kind_utilities = _gumbel_utilities(
+        output.market_kind_logits,
+        temperatures,
+        deterministic_rows,
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
+    )
+    quantity_draws = _row_random(
+        (output.market_quantity_context.shape[0], MAX_MARKET_ORDERS),
+        current_rows,
+        frozen_rows,
+        current_generator,
+        frozen_generator,
+        device=output.market_quantity_context.device,
+    )
+    device_preferences = (unit_utilities, kind_utilities, quantity_draws)
+    if (
+        transfer is None
+        or transfer.quantity_context.shape != output.market_quantity_context.shape
+        or (transfer.device_quantity_context is None)
+        != (output.market_quantity_context.dtype == torch.float32)
+        or any(
+            host.shape != preference.shape or host.dtype != preference.dtype
+            for host, preference in zip(
+                (transfer.units, transfer.kinds, transfer.quantity_draws),
+                device_preferences,
+                strict=True,
+            )
         )
     ):
         transfer = _GpuPreferenceTransfer(
-            *(
-                torch.empty(
-                    preference.shape,
-                    dtype=preference.dtype,
-                    device="cpu",
-                    pin_memory=True,
+            device_quantity_context=(
+                None
+                if output.market_quantity_context.dtype == torch.float32
+                else torch.empty(
+                    output.market_quantity_context.shape,
+                    dtype=torch.float32,
+                    device=output.market_quantity_context.device,
                 )
-                for preference in preferences
-            )
+            ),
+            units=torch.empty(
+                unit_utilities.shape,
+                dtype=unit_utilities.dtype,
+                device="cpu",
+                pin_memory=True,
+            ),
+            kinds=torch.empty(
+                kind_utilities.shape,
+                dtype=kind_utilities.dtype,
+                device="cpu",
+                pin_memory=True,
+            ),
+            quantity_context=torch.empty(
+                output.market_quantity_context.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            ),
+            quantity_draws=torch.empty(
+                quantity_draws.shape,
+                dtype=quantity_draws.dtype,
+                device="cpu",
+                pin_memory=True,
+            ),
         )
-    host_tensors = (transfer.units, transfer.kinds, transfer.quantities)
+    if output.market_quantity_context.dtype == torch.float32:
+        device_quantity_context = output.market_quantity_context
+    else:
+        assert transfer.device_quantity_context is not None
+        transfer.device_quantity_context.copy_(output.market_quantity_context)
+        device_quantity_context = transfer.device_quantity_context
+    host_tensors = (
+        transfer.units,
+        transfer.kinds,
+        transfer.quantity_context,
+        transfer.quantity_draws,
+    )
+    preferences = (
+        unit_utilities,
+        kind_utilities,
+        device_quantity_context,
+        quantity_draws,
+    )
     for host, preference in zip(host_tensors, preferences, strict=True):
         host.copy_(preference, non_blocking=True)
     torch.cuda.current_stream(output.unit_logits.device).synchronize()
-    return (
-        (host_tensors[0].numpy(), host_tensors[1].numpy(), host_tensors[2].numpy()),
-        transfer,
-    )
+    arrays = tuple(host.numpy() for host in host_tensors)
+    return (arrays[0], arrays[1], arrays[2], arrays[3]), transfer
 
 
 @dataclass(frozen=True)
@@ -955,9 +983,7 @@ def _fill_gpu_policy_statistics(
 ) -> _GpuStatisticsTransfer | None:
     device = output.unit_logits.device
     if device.type == "cpu":
-        input_tensors = tuple(
-            torch.as_tensor(sampled[name]) for name in _GPU_STATISTIC_INPUT_NAMES
-        )
+        input_tensors = tuple(torch.as_tensor(sampled[name]) for name in _GPU_STATISTIC_INPUT_NAMES)
     else:
         host_inputs = tuple(
             torch.from_numpy(np.asarray(sampled[name])) for name in _GPU_STATISTIC_INPUT_NAMES
@@ -977,9 +1003,7 @@ def _fill_gpu_policy_statistics(
             != tuple(tensor.shape for tensor in host_inputs)
         ):
             device_buffer = torch.empty(total, dtype=torch.float32, device=device)
-            host_buffer = torch.empty(
-                total, dtype=torch.float32, device="cpu", pin_memory=True
-            )
+            host_buffer = torch.empty(total, dtype=torch.float32, device="cpu", pin_memory=True)
             flat = host_buffer.numpy()
             cursor = 0
             arrays: list[np.ndarray] = []
@@ -992,9 +1016,7 @@ def _fill_gpu_policy_statistics(
                 host=host_buffer,
                 arrays=tuple(arrays),
                 ready=torch.cuda.Event(),
-                inputs=tuple(
-                    torch.empty_like(tensor, device=device) for tensor in host_inputs
-                ),
+                inputs=tuple(torch.empty_like(tensor, device=device) for tensor in host_inputs),
             )
         for target, source in zip(transfer.inputs, host_inputs, strict=True):
             target.copy_(source, non_blocking=True)
@@ -1105,16 +1127,14 @@ def _fill_gpu_policy_statistics(
 #: entrypoints state the measured decision explicitly.
 ROLLOUT_FORWARD_MODES = ("eager", "graph", "cudagraphs", "inductor", "inductor_default")
 
+
 #: Modes that reach the device through `torch.compile`, and so through
 #: `torch._inductor.cudagraph_trees`' generation bookkeeping.
 COMPILED_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor", "inductor_default")
 
 #: The subset of those that lets `cudagraph_trees` capture rather than only
 #: fuse. Capture is what makes a forward's outputs live in a reused private
-#: pool, so it is what `_cuda_graph_generation` has to serialise; fusion alone
-#: owns its outputs normally and must stay unserialised, because for
-#: `inductor_default` the compiled region is the whole launch sequence the two
-#: shards exist to overlap.
+#: pool, so it is what `_cuda_graph_generation` has to serialize.
 CAPTURING_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor")
 
 
@@ -1127,27 +1147,11 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
     semantically rather than bitwise, by `update_replay_parity`.
 
     `inductor` is `reduce-overhead`, which adds CUDA graphs to the fusion, and
-    `inductor_default` is the fusion alone. Both used to hang at the first
-    compiled collection, and the split was introduced expecting them to hang for
-    different reasons. They did not. The hang was one bug and it was neither
-    fusion nor capture: `torch.compile` returns a lazy wrapper, so caching it
-    here compiles nothing, the first *call* does, and under the two-shard
-    pipeline both first calls entered the compiler from two shard threads at
-    once. The collector now drives one shard's first step through to completion
-    before the peer's (`_pipeline_ready` / `_pipeline_wait` in
-    `_collect_mixed_play_rust_wave`), which is enough for both modes.
-
-    Capture then has a second and unrelated problem that fusion does not have,
-    and it is the one the split was originally guessing at: see
-    `_cuda_graph_generation`, which has to serialise each shard's mark and
-    forwards because `cudagraph_trees` keys generations off a process-global
-    counter while holding the tree managers that read it per thread.
+    `inductor_default` is the fusion alone. Compilation is lazy: the first call,
+    not this cache lookup, pays the compile cost.
 
     One compiled callable is cached per mode so a parity audit can measure
-    several in one process without recompiling -- but note the cache itself is
-    written from both shard threads and is not synchronized, which is harmless
-    only because a duplicate wrapper is equivalent, not because the race cannot
-    happen.
+    several in one process without recompiling.
     """
     if mode not in ROLLOUT_FORWARD_MODES:
         raise ValueError(f"unknown rollout forward mode {mode!r}")
@@ -1327,6 +1331,8 @@ def _stacked_actor_ensemble(
         models[0].config,
         len(models),
         next(models[0].parameters()).device,
+        tuple(parameter.dtype for parameter in models[0].parameters()),
+        tuple(buffer.dtype for buffer in models[0].buffers()),
     )
     ensemble = _STACKED_ENSEMBLE_CACHE.get(key)
     if ensemble is None:
@@ -1351,20 +1357,13 @@ def _mark_cuda_graph_step(device: torch.device, enabled: bool) -> None:
 # through `get_curr_generation`. A manager concludes that a new generation has
 # begun -- and so that the previous generation's output buffers may be reused --
 # by seeing that counter differ from the value it recorded on its own last
-# compiled call. Two shard threads each marking once per step break that: the
-# peer's mark lands between this shard's actor forward and its ensemble
-# forward, the manager retires the actor output the ensemble step has not
-# consumed yet, and the `index_copy_` that reads it raises "accessing tensor
-# output of CUDAGraphs that has been overwritten by a subsequent run".
+# compiled call. Concurrent collectors can otherwise let one thread's mark land
+# between another thread's actor and ensemble forwards, retiring an output that
+# its `index_copy_` has not consumed yet.
 #
-# Holding this across a shard's mark and every compiled forward of one step
-# restores the invariant the counter is meant to carry -- it changes between
-# our steps and never inside one -- which both keeps outputs alive for the
-# whole step and makes every generation the same node sequence, so the tree
-# records once instead of branching on whichever interleaving occurred. Only
-# capture pays for it, and under capture the protected region is a mark plus a
-# graph launch, so the shards still overlap on all of the native stepping,
-# sampling, and storage that the pipeline exists to hide.
+# Holding this across a collector's mark and every compiled forward of one step
+# restores the intended invariant: the counter changes between steps and never
+# inside one. Only cudagraph-tree capture pays for the lock.
 _CUDA_GRAPH_GENERATION = threading.Lock()
 
 
@@ -1378,36 +1377,30 @@ _StepOutputs = tuple["ActorOutput | None", "ActorOutput | None", "ActorOutput | 
 _Captured = TypeVar("_Captured")
 
 
-# Capture switches the caching allocator to a private pool and is a
-# once-per-collection event, so the two shards take it in turns. The shard
-# barrier already orders the first step, but capture is too easy to get subtly
-# wrong under concurrency for that to be the only thing holding it.
+# Capture switches the caching allocator to a private pool. Serialize this
+# once-per-collection operation against any other collector in the process.
 _CUDA_GRAPH_CAPTURE = threading.Lock()
 
 
 class _CapturedStep(Generic[_Captured]):
-    """One CUDA graph over a shard's whole per-step forward region.
+    """One CUDA graph over the whole per-step forward region.
 
-    The collector is launch-bound rather than compute-bound -- a production step
-    issues about 1,669 kernels for 4.7 ms of device work and spends the rest of
-    its 30 ms in the gaps between launches -- so the win is in replacing a step's
-    launch sequence with a single graph launch, not in making any kernel faster.
+    The graph is deliberately bounded before sampling and storage, which
+    round-trip through native host code. Capturing only the forward still
+    removes its Python launch overhead while preserving that boundary.
 
     This is deliberately not `torch.compile(mode="reduce-overhead")`, which
-    reaches the same idea through `torch._inductor.cudagraph_trees`. That layer
-    keeps a tree manager per thread but decides generation boundaries from a
-    process-global counter, so two shard threads invalidate each other's live
-    outputs; `_cuda_graph_generation` repairs that particular race and the mode
-    still wedges. Owning the graph directly removes the entire question: nothing
-    decides on our behalf when a recording is retired or reused.
+    reaches the same idea through `torch._inductor.cudagraph_trees` and its
+    process-global generation bookkeeping. Owning the graph directly makes the
+    recording lifetime explicit.
 
-    What makes it safe here is that the collector already holds every input at a
-    fixed address for the life of the wave. `_NativeStructuredWave.copy_to_device`
-    refreshes persistent device buffers in place, `_select_inputs` and
-    `_lane_view_inputs` gather into persistent `out=` storage, every row-index
-    tensor is built once before the step loop, and `_pipeline_replica` refills
-    the peer shard's weights through `load_state_dict` rather than rebuilding the
-    module. A replay therefore reads exactly what the step just uploaded.
+    The collector holds every input at a fixed address for the life of the
+    wave. `_NativeStructuredWave.copy_to_device` refreshes persistent device
+    buffers in place, `_select_inputs` and `_lane_view_inputs` gather into
+    persistent `out=` storage, every row-index tensor is built once before the
+    step loop, and `_pipeline_replica` refreshes weights through
+    `load_state_dict` rather than rebuilding the module. A replay therefore
+    reads exactly what the step just uploaded.
 
     Outputs live in the graph's private pool and are overwritten by the next
     replay, which is the same contract the step already honours: it consumes
@@ -1426,9 +1419,8 @@ class _CapturedStep(Generic[_Captured]):
                     run()
             torch.cuda.current_stream().wait_stream(side)
             self._graph = torch.cuda.CUDAGraph()
-            # `thread_local` scopes the capture to this thread, so the peer
-            # shard issuing on its own stream cannot abort it. The default
-            # ("global") treats any other thread's CUDA work as an error.
+            # Thread-local capture remains robust if an unrelated CUDA-using
+            # thread exists in the embedding process.
             with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):
                 self._outputs = run()
 
@@ -1665,9 +1657,6 @@ def _collect_mixed_play_rust_wave(
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
-    _ensemble_namespace: int = 0,
-    _pipeline_ready: Callable[[], None] | None = None,
-    _pipeline_wait: Callable[[], None] | None = None,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect self-play and frozen-league games in one native wave.
@@ -1769,9 +1758,22 @@ def _collect_mixed_play_rust_wave(
     self_play_rows = self_play_games * 2
     trajectories = self_play_rows + league_games
     fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
-    encoded_wave = _native_wave(architecture, environment, device)
+    floating_dtype = (
+        next(actor.trunk.parameters()).dtype
+        if isinstance(actor, StructuredActor)
+        else next(actor.parameters()).dtype
+    )
+    encoded_wave = _native_wave(architecture, environment, device, floating_dtype)
+    next_encoded_wave = _native_wave(
+        architecture,
+        environment,
+        device,
+        floating_dtype,
+        device_wave=encoded_wave,
+    )
+    encoded_wave.refresh(environment)
+    encoded_wave.copy_to_device()
     wave_inputs = encoded_wave.inputs()
-    encoded = encoded_wave.arrays
     gpu_sampling = device.type == "cuda"
     sampled = environment.sample_buffers()
     if gpu_sampling:
@@ -1877,13 +1879,12 @@ def _collect_mixed_play_rust_wave(
         frozen_store_tensor = torch.as_tensor(frozen_store_rows, device=device)
         lane_valid_tensor = torch.as_tensor(lane_valid_flat, device=device)
         # Built-in lanes keep their slot in the stack, borrowing the last
-        # frozen opponent's weights, so the ensemble's batch shape follows the
-        # captured CUDA graph survives the next draw. Their logits are never
-        # read. A wave with no frozen network at all runs no ensemble.
+        # frozen opponent's weights. The ensemble batch shape therefore follows
+        # total lane count, so a captured CUDA graph survives the next mix.
+        # Their logits are never read. A wave with no frozen network runs none.
         ensemble = (
             _stacked_actor_ensemble(
-                [opponents[min(index, len(opponents) - 1)] for index in active_indices],
-                _ensemble_namespace,
+                [opponents[min(index, len(opponents) - 1)] for index in active_indices]
             )
             if opponents
             else None
@@ -1900,7 +1901,7 @@ def _collect_mixed_play_rust_wave(
         # into the frozen rows, and handing the sampler uninitialized memory --
         # even in rows it is contracted to ignore -- is not worth the page.
         if gpu_sampling:
-            output_dtype = torch.bfloat16 if forward_autocast else torch.float32
+            output_dtype = torch.bfloat16 if forward_autocast else floating_dtype
             unit_logits = torch.zeros(
                 (rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=output_dtype, device=device
             )
@@ -1932,6 +1933,26 @@ def _collect_mixed_play_rust_wave(
         assert isinstance(output, ActorOutput)
         return output
 
+    # The learner and frozen-opponent forwards read disjoint gathered buffers.
+    # Schedule them on separate streams while keeping one physical-game wave;
+    # both streams join before sampling, so every game still advances together.
+    frozen_forward_stream = (
+        torch.cuda.Stream(device=device)
+        if league_games and ensemble is not None and device.type == "cuda"
+        else None
+    )
+
+    def run_frozen() -> ActorOutput | None:
+        if ensemble is None:
+            return None
+        assert frozen_tensor is not None
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
+            lane_output = ensemble(
+                *_lane_view_inputs(wave_inputs, frozen_tensor, lanes, lane_width, lane_gather),
+                mode=forward_mode,
+            )
+        return ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+
     def step_forwards() -> _StepOutputs:
         """Every device-side forward of one step, and nothing else.
 
@@ -1942,29 +1963,25 @@ def _collect_mixed_play_rust_wave(
         if not league_games:
             return run_actor(*wave_inputs), None, None
         assert current_tensor is not None
+        if frozen_forward_stream is None:
+            current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
+            return None, current, run_frozen()
+
+        current_stream = torch.cuda.current_stream(device)
+        frozen_forward_stream.wait_stream(current_stream)
+        with torch.cuda.stream(frozen_forward_stream):
+            frozen = run_frozen()
         current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
-        frozen = None
-        if ensemble is not None:
-            assert frozen_tensor is not None
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast_forward):
-                lane_output = ensemble(
-                    *_lane_view_inputs(wave_inputs, frozen_tensor, lanes, lane_width, lane_gather),
-                    mode=forward_mode,
-                )
-            frozen = ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
+        current_stream.wait_stream(frozen_forward_stream)
         return None, current, frozen
 
     graphed = forward_mode == "graph" and device.type == "cuda"
     step_graph: _CapturedStep[_StepOutputs] | None = None
-    pipeline_started = False
+
     for step in range(horizon):
-        encoded_wave.refresh(environment)
-        encoded_wave.copy_to_device()
         if graphed and step_graph is None:
-            # Captured on the first step, once the wave holds real uploaded
-            # values, and replayed for the remaining 719. The shard barrier
-            # below already keeps the peer out of its own first step until this
-            # one is through, so the two captures cannot overlap.
+            # Capture on the first real uploaded wave and replay the static
+            # forward region for the remaining steps.
             step_graph = _CapturedStep(step_forwards)
         if step_graph is not None:
             full_output, current_output, frozen_output = step_graph()
@@ -2048,12 +2065,8 @@ def _collect_mixed_play_rust_wave(
             assert gpu_current_generator is not None
             assert gpu_frozen_generator is not None
             assert gpu_builtin_agents is not None
-            quantity_logits = _all_quantity_logits(
-                full_output.market_quantity_context, gpu_head_ids, gpu_heads
-            )
             preferences, preference_transfer = _gpu_preferences_to_host(
                 full_output,
-                quantity_logits,
                 gpu_temperatures,
                 gpu_deterministic_rows,
                 gpu_current_rows,
@@ -2062,22 +2075,12 @@ def _collect_mixed_play_rust_wave(
                 gpu_frozen_generator,
                 preference_transfer,
             )
-            if not pipeline_started:
-                # Compilation is entered lazily by the first call, so under any
-                # `forward_mode` that compiles, this is the step that runs the
-                # compiler -- and it runs it inside a shard thread. Announcing
-                # readiness here and then waiting for the peer shard to reach
-                # the same point keeps exactly one thread inside the compiler at
-                # a time: shard 0 compiles while shard 1 is still parked on the
-                # stagger, then shard 0 parks here while shard 1 compiles, and
-                # only then do both run pipelined. Serialising one step of 720
-                # costs a seventh of a percent of the overlap and is what lets a
-                # compiled collection start at all.
-                if _pipeline_ready is not None:
-                    _pipeline_ready()
-                pipeline_started = True
-                if _pipeline_wait is not None:
-                    _pipeline_wait()
+            (
+                unit_utilities,
+                kind_utilities,
+                step_quantity_context,
+                quantity_draws,
+            ) = preferences
             if pending_statistics is not None:
                 pending_step, pending_counts = pending_statistics
                 assert statistics_transfer is not None
@@ -2089,7 +2092,16 @@ def _collect_mixed_play_rust_wave(
                 entropy_sums += statistics_transfer.arrays[3][store_rows] * pending_counts
                 pending_statistics = None
             environment.select_and_step_into(
-                *preferences,
+                unit_utilities,
+                kind_utilities,
+                step_quantity_context,
+                kind_gate,
+                quantity_values,
+                quantity_bias,
+                head_ids,
+                quantity_draws,
+                deterministic_rows,
+                temperatures,
                 builtin_agents,
                 sampled,
             )
@@ -2149,12 +2161,19 @@ def _collect_mixed_play_rust_wave(
                 builtin_agents,
                 sampled,
             )
+        if step + 1 < horizon:
+            # Encode and submit the next state before copying this step into the
+            # trajectory arena. Both host waves share fixed device destinations,
+            # so the H2D transfer overlaps CPU storage without invalidating a
+            # captured forward's input addresses.
+            next_encoded_wave.refresh(environment)
+            next_encoded_wave.copy_to_device()
         rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
         _store_native_wave(
             architecture,
             fields,
             step,
-            encoded,
+            encoded_wave.arrays,
             sampled,
             rewards[store_rows],
             store_rows,
@@ -2176,6 +2195,8 @@ def _collect_mixed_play_rust_wave(
         if step + 1 == horizon and not dones.all():
             raise RuntimeError("native rollout did not terminate at the competition horizon")
         final = np.asarray(sampled["final_money"], dtype=np.float32)
+        if step + 1 < horizon:
+            encoded_wave, next_encoded_wave = next_encoded_wave, encoded_wave
 
     if pending_statistics is not None:
         pending_step, pending_counts = pending_statistics
@@ -2223,15 +2244,32 @@ def _collect_mixed_play_rust_wave(
 
 def _pipeline_replica(
     model: FarmActor | StructuredActor,
+    *,
+    dtype: torch.dtype | None = None,
+    namespace: int = 0,
 ) -> FarmActor | StructuredActor:
-    replica = getattr(model, "_kaggriculture_pipeline_replica", None)
+    device = next(model.parameters()).device
+    replica_dtype = dtype or next(model.parameters()).dtype
+    replicas = getattr(model, "_kaggriculture_pipeline_replicas", None)
+    if replicas is None:
+        replicas = {}
+        object.__setattr__(model, "_kaggriculture_pipeline_replicas", replicas)
+    key = (device, replica_dtype, namespace)
+    replica = replicas.get(key)
     if replica is None or type(replica) is not type(model) or replica.config != model.config:
         replica = (
             StructuredActor(model.config)
             if isinstance(model, StructuredActor)
             else FarmActor(model.config)
-        ).to(next(model.parameters()).device)
-        object.__setattr__(model, "_kaggriculture_pipeline_replica", replica)
+        ).to(device=device, dtype=replica_dtype)
+        if replica_dtype == torch.bfloat16:
+            # These heads are outside actor.forward: GPU factor sampling uses
+            # them in fp32, so keeping them unquantized preserves the current
+            # behavior policy while the expensive forward runs natively BF16.
+            replica.market_quantity_kind_gate.float()
+            replica.market_quantity_value.float()
+            replica.market_quantity_bias.data = replica.market_quantity_bias.data.float()
+        replicas[key] = replica
     replica.load_state_dict(model.state_dict())
     replica.eval()
     return replica
@@ -2260,153 +2298,40 @@ def collect_mixed_play_rust(
     forward_autocast: bool = False,
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
-    """Collect two independent CUDA waves concurrently into one ordered batch.
-
-    The split occurs only at game boundaries and each shard writes a contiguous
-    slice of the caller's rollout arena, so scheduling cannot reorder seeds or
-    trajectories. Each shard owns its BatchEnv, CUDA stream, actor replica, and
-    Gumbel generators. The fixed shard-derived seeds make stochastic actions
-    independent of thread scheduling; current and frozen policy streams remain
-    separate within each shard.
-    """
-    games = self_play_games + league_games
-    device = next(actor.parameters()).device
-    if device.type != "cuda" or games < 2:
-        return _collect_mixed_play_rust_wave(
-            actor,
-            opponents,
-            self_play_games=self_play_games,
-            league_games=league_games,
-            opponent_indices=opponent_indices,
-            builtin_lanes=builtin_lanes,
-            seed_start=seed_start,
-            episode_steps=episode_steps,
-            deterministic=deterministic,
-            temperature=temperature,
-            gamma=gamma,
-            opponent_temperature=opponent_temperature,
-            opponent_temperatures=opponent_temperatures,
-            deterministic_opponent=deterministic_opponent,
-            deterministic_opponents=deterministic_opponents,
-            sampling_seed=sampling_seed,
-            forward_mode=forward_mode,
-            forward_autocast=forward_autocast,
-            storage=storage,
-        )
-    if self_play_games < 0 or league_games < 0:
-        raise ValueError("game counts cannot be negative")
-    if episode_steps != 720:
-        raise ValueError("the native simulator currently supports the competition horizon 720")
-
-    started = time.perf_counter()
-    architecture = architecture_of(actor).name
-    horizon = episode_steps - 1
-    trajectories = 2 * self_play_games + league_games
-    fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
-    game_cut = games // 2
-    left_self_play = min(self_play_games, game_cut)
-    left_league = game_cut - left_self_play
-    right_self_play = self_play_games - left_self_play
-    right_league = league_games - left_league
-    trajectory_cut = 2 * left_self_play + left_league
-    field_views = (
-        {name: values[:trajectory_cut] for name, values in fields.items()},
-        {name: values[trajectory_cut:] for name, values in fields.items()},
+    """Collect every game in one native wave and preserve trajectory order."""
+    native_bfloat16 = (
+        forward_autocast
+        and next(actor.parameters()).device.type == "cuda"
+        and isinstance(actor, StructuredActor)
     )
-    if opponent_indices is None:
-        assignment_slices: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
+    if native_bfloat16:
+        rollout_actor = _pipeline_replica(actor, dtype=torch.bfloat16)
+        rollout_opponents = tuple(
+            _pipeline_replica(opponent, dtype=torch.bfloat16) for opponent in opponents
+        )
     else:
-        assignments = np.asarray(opponent_indices)
-        assignment_slices = (
-            assignments[:left_league],
-            assignments[left_league:],
-        )
-    actor_replica = _pipeline_replica(actor)
-    opponent_replicas = tuple(_pipeline_replica(opponent) for opponent in opponents)
-    streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=device))
-    first_forward = (threading.Event(), threading.Event())
-
-    def collect_shard(
-        shard: int,
-        shard_actor: FarmActor | StructuredActor,
-        shard_opponents: Sequence[FarmActor | StructuredActor],
-        shard_self_play: int,
-        shard_league: int,
-        shard_seed_start: int,
-    ) -> RolloutBatch:
-        if shard:
-            first_forward[0].wait()
-        with torch.cuda.device(device), torch.cuda.stream(streams[shard]):
-            try:
-                return _collect_mixed_play_rust_wave(
-                    shard_actor,
-                    shard_opponents if shard_league else (),
-                    self_play_games=shard_self_play,
-                    league_games=shard_league,
-                    opponent_indices=assignment_slices[shard],
-                    builtin_lanes=builtin_lanes if shard_league else (),
-                    seed_start=shard_seed_start,
-                    episode_steps=episode_steps,
-                    deterministic=deterministic,
-                    temperature=temperature,
-                    gamma=gamma,
-                    opponent_temperature=opponent_temperature,
-                    opponent_temperatures=opponent_temperatures if shard_league else None,
-                    deterministic_opponent=deterministic_opponent,
-                    deterministic_opponents=deterministic_opponents if shard_league else None,
-                    sampling_seed=(
-                        sampling_seed if shard == 0 else (sampling_seed ^ 0x51ED_5EED_71CE_DA7A)
-                    ),
-                    forward_mode=forward_mode,
-                    forward_autocast=forward_autocast,
-                    storage=field_views[shard],
-                    _ensemble_namespace=shard,
-                    _pipeline_ready=first_forward[shard].set,
-                    _pipeline_wait=first_forward[1].wait if shard == 0 else None,
-                )
-            finally:
-                # Both, unconditionally: shard 0 unblocks a peer waiting to
-                # start, and shard 1 unblocks a peer waiting to resume.
-                first_forward[0].set()
-                first_forward[1].set()
-
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rollout-shard") as executor:
-        futures = (
-            executor.submit(
-                collect_shard,
-                0,
-                actor,
-                opponents,
-                left_self_play,
-                left_league,
-                seed_start,
-            ),
-            executor.submit(
-                collect_shard,
-                1,
-                actor_replica,
-                opponent_replicas,
-                right_self_play,
-                right_league,
-                seed_start + game_cut,
-            ),
-        )
-        shards = tuple(future.result() for future in futures)
-
-    def joined(name: str) -> np.ndarray:
-        return np.concatenate([getattr(shard, name) for shard in shards])
-
-    return _native_batch(
-        architecture,
-        fields,
-        episode_seeds=joined("episode_seeds"),
-        final_money=joined("final_money"),
-        opponent_money=joined("opponent_money"),
-        seats=joined("seats"),
-        agents=joined("agents"),
-        orientations=joined("orientations"),
-        entropy_sums=joined("entropy_sums"),
-        started=started,
+        rollout_actor = actor
+        rollout_opponents = tuple(opponents)
+    return _collect_mixed_play_rust_wave(
+        rollout_actor,
+        rollout_opponents,
+        self_play_games=self_play_games,
+        league_games=league_games,
+        opponent_indices=opponent_indices,
+        builtin_lanes=builtin_lanes,
+        seed_start=seed_start,
+        episode_steps=episode_steps,
+        deterministic=deterministic,
+        temperature=temperature,
+        gamma=gamma,
+        opponent_temperature=opponent_temperature,
+        opponent_temperatures=opponent_temperatures,
+        deterministic_opponent=deterministic_opponent,
+        deterministic_opponents=deterministic_opponents,
+        sampling_seed=sampling_seed,
+        forward_mode=forward_mode,
+        forward_autocast=False if native_bfloat16 else forward_autocast,
+        storage=storage,
     )
 
 
