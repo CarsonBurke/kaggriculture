@@ -28,10 +28,11 @@ gradient steps. Explained variance uses the same four target/residual moments
 and `_fit_explained_variance` definition as run telemetry; the probe computes
 those moments outside the timed path.
 
-The curve runs past the production four epochs (default eight) so its shape is
-measured rather than extrapolated, and over several repeats with different
-rollout seeds and different critic initializations, because one curve cannot
-separate a plateau from noise.
+The curve runs past the production schedule so its shape is measured rather
+than extrapolated, and over several repeats with different rollout seeds.
+With ``--actor`` those repeats use different fresh critic initializations;
+with ``--checkpoint`` they clone the same real critic and optimizer state so
+the only between-repeat variation is the rollout and game split.
 
 FALSIFICATION. The hypothesis "later epochs are wasted" is falsified if the
 holdout explained variance still gained from epoch 2 onwards -- differenced per
@@ -48,18 +49,19 @@ actor and critic are separate modules with separate optimizers, the value
 targets are fixed before the update begins, and so an actor epoch cannot change
 what the critic fits.
 
-The critic is FRESH -- randomly initialized, zero-initialized value head. That
-is the pipeline's own starting point, since the critic is trained from scratch
-during the warmup, and it is the honest one for a from-scratch measurement, but
-it is not a warm mid-run critic: a fresh critic is far from converged, so this
-setup is biased *towards* finding later epochs useful. `--warmup-iterations`
-fits disjoint waves first to approach the warm regime. A value-fit curve is also
-not end-to-end policy improvement; the report records these caveats explicitly.
+The default ``--actor`` mode uses a fresh critic with a zero-initialized value
+head. That is the pipeline's starting point, but it is biased towards finding
+later epochs useful. ``--warmup-iterations`` fits disjoint waves first to
+approach the warm regime. ``--checkpoint`` is the preferred steady-state test:
+it restores both critic weights and optimizer moments before every repeat and
+does not permit synthetic warmup. A value-fit curve is not end-to-end policy
+improvement; the report records that caveat explicitly.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import statistics
@@ -127,11 +129,10 @@ def _production_critic_minibatches_per_epoch(minibatch_size: int) -> int:
     return math.ceil(trajectories * (PRODUCTION_EPISODE_STEPS - 1) / minibatch_size)
 
 
-#: Rollout state fields the critic reads, plus the one field
-#: `replay_behavior_values` measures the row count from. The action, mask and
-#: behavior-likelihood arrays are staged by `update_ppo` for the actor and for
-#: `_validate_staged_action_masks`; no critic epoch touches them.
-_ROW_COUNT_FIELD = "unit_actions"
+#: Rollout fields outside ``states`` that critic replay needs. ``unit_active``
+#: is a structured actor input reused by the centralized critic; unit actions
+#: supply only the flattened row count used while constructing value targets.
+_CRITIC_SHARED_FIELDS = ("unit_actions", "unit_active")
 
 
 def _synchronize(device: torch.device) -> None:
@@ -147,7 +148,9 @@ def _spread(values: list[float]) -> float:
 def _stage_rollout(rollout: RolloutBatch, device: torch.device) -> dict[str, Tensor]:
     """Stage every critic-visible rollout array once, exactly as `update_ppo` does."""
     staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
-    staged[_ROW_COUNT_FIELD] = _stage_tensor(getattr(rollout, _ROW_COUNT_FIELD), device)
+    staged |= {
+        name: _stage_tensor(getattr(rollout, name), device) for name in _CRITIC_SHARED_FIELDS
+    }
     return staged
 
 
@@ -431,12 +434,33 @@ def _warm_critic(
     return records
 
 
+def _build_critic(
+    actor: torch.nn.Module,
+    architecture: str,
+    model_config: dict[str, Any],
+    config: PpoConfig,
+    checkpoint_state: dict[str, Any] | None,
+    device: torch.device,
+) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
+    """Construct one isolated critic/optimizer pair, optionally from a checkpoint."""
+    critic = resolve_architecture(architecture).build_critic(model_config).to(device)
+    _, critic_optimizer = make_optimizers(actor, critic, config)
+    if checkpoint_state is not None:
+        critic.load_state_dict(checkpoint_state["critic"], strict=True)
+        # Optimizer.load_state_dict may retain same-device tensor objects. A
+        # private copy keeps one repeat's in-place moments from changing the
+        # immutable starting point used by every later repeat.
+        critic_optimizer.load_state_dict(copy.deepcopy(checkpoint_state["critic_optimizer"]))
+    return critic, critic_optimizer
+
+
 def _run_repeat(
     actor: torch.nn.Module,
     architecture: str,
     model_config: dict[str, Any],
     args: argparse.Namespace,
     config: PpoConfig,
+    checkpoint_state: dict[str, Any] | None,
     *,
     repeat: int,
     arena: dict[str, np.ndarray],
@@ -444,7 +468,7 @@ def _run_repeat(
     autocast_enabled: bool,
     device: torch.device,
 ) -> dict[str, Any]:
-    """One independent curve: fresh critic, fresh rollout, fresh game split."""
+    """One independent rollout curve from an identical critic starting state."""
     repeat_seed = args.base_seed + repeat * 65536
     # A fresh Dynamo state per repeat. The update path compiles with
     # dynamic=False and guards on the critic instance, so without this the
@@ -455,10 +479,9 @@ def _run_repeat(
         torch.cuda.manual_seed_all(repeat_seed)
         torch.cuda.empty_cache()
     generator = np.random.default_rng(repeat_seed ^ 0xC0FFEE)
-    critic = resolve_architecture(architecture).build_critic(model_config).to(device)
-    # The production construction, so the learning rate, epsilon, fused kernel
-    # and warmup schedule are the ones the run uses rather than a restatement.
-    _, critic_optimizer = make_optimizers(actor, critic, config)
+    critic, critic_optimizer = _build_critic(
+        actor, architecture, model_config, config, checkpoint_state, device
+    )
     warmup = _warm_critic(
         actor,
         critic,
@@ -698,15 +721,26 @@ def _decision(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--actor", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--actor", type=Path)
+    source.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="single-learner checkpoint whose critic and optimizer start every repeat",
+    )
     parser.add_argument("--games", type=int, default=PRODUCTION_SELF_PLAY_GAMES)
     parser.add_argument("--episode-steps", type=int, default=PRODUCTION_EPISODE_STEPS)
     parser.add_argument("--critic-epochs", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--holdout-fraction", type=float, default=0.2)
-    parser.add_argument("--minibatch-size", type=int, default=2048)
+    parser.add_argument(
+        "--minibatch-size",
+        type=int,
+        default=None,
+        help="defaults to the checkpoint schedule, or 2048 with --actor",
+    )
     parser.add_argument(
         "--update-compile-mode",
         choices=UPDATE_COMPILE_MODES,
@@ -725,7 +759,7 @@ def parse_args() -> argparse.Namespace:
         "--warmup-iterations",
         type=int,
         default=0,
-        help="disjoint waves fitted before the measured one, to leave the fresh-critic regime",
+        help="disjoint waves fitted before the measured one; incompatible with --checkpoint",
     )
     parser.add_argument("--warmup-epochs", type=int, default=4)
     parser.add_argument(
@@ -736,7 +770,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base-seed", type=int, default=20260817)
     parser.add_argument("--output", type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def _load_checkpoint_state(path: Path) -> dict[str, Any]:
+    """Load and validate the single-learner state required by checkpoint mode."""
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload.get("agents"), list):
+        raise ValueError("--checkpoint requires a single-learner checkpoint, not a population")
+    missing = [key for key in ("critic", "critic_optimizer", "ppo_config") if key not in payload]
+    if missing:
+        raise ValueError(f"checkpoint is missing required state: {', '.join(missing)}")
+    return payload
 
 
 def main() -> None:
@@ -749,22 +794,35 @@ def main() -> None:
         raise SystemExit("--holdout-fraction must lie strictly between zero and one")
     if args.warmup_iterations < 0 or args.warmup_epochs < 1:
         raise SystemExit("warmup iterations cannot be negative and warmup epochs must be positive")
+    if args.checkpoint is not None and args.warmup_iterations:
+        raise SystemExit(
+            "--checkpoint already supplies warm state and cannot use --warmup-iterations"
+        )
+
+    checkpoint_state = (
+        _load_checkpoint_state(args.checkpoint) if args.checkpoint is not None else None
+    )
     device = torch.device("cuda")
     if not torch.cuda.is_available():
         raise SystemExit("this probe measures the CUDA update path and needs a GPU")
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
-    actor, payload = load_actor_artifact(args.actor, device=device)
+    source_path = args.checkpoint if args.checkpoint is not None else args.actor
+    assert source_path is not None
+    actor, payload = load_actor_artifact(source_path, device=device)
     actor.eval()
     architecture = resolve_architecture(payload)
-    config = PpoConfig(
+    schedule = dict(checkpoint_state["ppo_config"]) if checkpoint_state is not None else {}
+    minibatch_size = args.minibatch_size or int(schedule.get("minibatch_size", 2048))
+    schedule.update(
         epochs=1,
         critic_epochs=args.critic_epochs,
-        minibatch_size=args.minibatch_size,
+        minibatch_size=minibatch_size,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,
     )
+    config = PpoConfig(**schedule)
     autocast_enabled = config.use_bfloat16 and device.type == "cuda"
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
     arena = allocate_rollout_storage(
@@ -781,6 +839,7 @@ def main() -> None:
             payload["model_config"],
             args,
             config,
+            checkpoint_state,
             repeat=repeat,
             arena=arena,
             compile_mode=compile_mode,
@@ -791,12 +850,31 @@ def main() -> None:
     ]
     production_minibatches = (
         args.production_minibatches_per_epoch
-        or _production_critic_minibatches_per_epoch(args.minibatch_size)
+        or _production_critic_minibatches_per_epoch(config.minibatch_size)
     )
     table = _per_epoch_table(records, args.critic_epochs)
     decision = _decision(records, table, args.critic_epochs, production_minibatches)
+    checkpoint_mode = checkpoint_state is not None
+    caveats = [
+        "One operating point: the loaded actor's rollout distribution at temperature 1.0.",
+        "Self-play collection only, not the production league-mixed wave.",
+        "A value-fit curve is not end-to-end policy improvement; fewer critic epochs could "
+        "still change learning through the advantages of later iterations.",
+        "Per-epoch seconds are measured on this probe's smaller fit set and rescaled to the "
+        "production minibatch count; the first epoch of each repeat also pays compilation.",
+    ]
+    if not checkpoint_mode:
+        caveats.insert(
+            0,
+            "The critic is fresh per repeat, not a warm mid-run critic; this favours later "
+            "epochs looking useful.",
+        )
     report = {
-        "actor": str(args.actor),
+        "actor": str(source_path),
+        "checkpoint": str(args.checkpoint) if checkpoint_mode else None,
+        "checkpoint_iteration": (
+            int(checkpoint_state.get("iteration", 0)) if checkpoint_state is not None else None
+        ),
         "architecture": architecture.name,
         "device": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
@@ -808,7 +886,7 @@ def main() -> None:
             "repeats": args.repeats,
             "holdout_fraction": args.holdout_fraction,
             "holdout_split_by": "game (episode_seeds), never by state",
-            "minibatch_size": args.minibatch_size,
+            "minibatch_size": config.minibatch_size,
             "update_compile_mode": config.update_compile_mode,
             "use_bfloat16": config.use_bfloat16,
             "rollout_forward_mode": args.rollout_forward_mode,
@@ -816,18 +894,14 @@ def main() -> None:
             "warmup_iterations": args.warmup_iterations,
             "warmup_epochs": args.warmup_epochs,
             "base_seed": args.base_seed,
-            "critic_initialization": "fresh per repeat (zero-initialized value head)",
+            "critic_initialization": (
+                "checkpoint weights and optimizer restored identically per repeat"
+                if checkpoint_mode
+                else "fresh per repeat (zero-initialized value head)"
+            ),
+            "critic_optimizer_restored": checkpoint_mode,
         },
-        "caveats": [
-            "The critic is fresh per repeat, not a warm mid-run critic; a fresh critic is far "
-            "from converged, so this setup favours later epochs looking useful.",
-            "One operating point: the BC actor's rollout distribution at temperature 1.0.",
-            "Self-play collection only, not the production league-mixed wave.",
-            "A value-fit curve is not end-to-end policy improvement; fewer critic epochs could "
-            "still change learning through the advantages of later iterations.",
-            "Per-epoch seconds are measured on this probe's smaller fit set and rescaled to the "
-            "production minibatch count; the first epoch of each repeat also pays compilation.",
-        ],
+        "caveats": caveats,
         "repeats": records,
         "per_epoch": table,
         "decision": decision,

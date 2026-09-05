@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +57,12 @@ import torch
 
 from kaggriculture.league import load_actor_snapshot
 from kaggriculture.opponents import BUILTIN_OPPONENTS
-from kaggriculture.ppo import PpoConfig, make_optimizers, update_ppo
+from kaggriculture.ppo import (
+    PpoConfig,
+    make_optimizers,
+    make_structured_dynamics_optimizer,
+    update_ppo,
+)
 from kaggriculture.production import (
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_GAMES,
@@ -68,6 +74,8 @@ from kaggriculture.production import (
 )
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, slice_trajectories
+from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 #: Update metrics worth a column. The pair `actor_updates` /
 #: `actor_minibatches_intended` is the one that says whether the trust region
@@ -84,6 +92,23 @@ REPORTED = (
     "actor_gradient_norm",
     "critic_fit_explained_variance_last_epoch",
 )
+
+
+def _optimizer_uses_normuon(value: object, name: str) -> bool:
+    """Read the optimizer family from a checkpoint state without guessing."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"checkpoint {name} state is incomplete")
+    groups = value.get("param_groups")
+    if (
+        not isinstance(groups, list)
+        or not groups
+        or any(not isinstance(group, Mapping) for group in groups)
+    ):
+        raise ValueError(f"checkpoint {name} parameter groups are incomplete")
+    group_kinds = ["kind" in group for group in groups]
+    if any(group_kinds) != all(group_kinds):
+        raise ValueError(f"checkpoint {name} mixes optimizer parameter-group formats")
+    return all(group_kinds)
 
 
 def _lane_statistics(
@@ -168,13 +193,77 @@ def main() -> None:
 
     device = torch.device("cuda")
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    require_checkpoint_format(state)
+    member_state = checkpoint_agent_states(state)[0]
+    required_auxiliary_state = {
+        "structured_dynamics",
+        "structured_dynamics_optimizer",
+        "structured_critic_dynamics",
+        "structured_critic_dynamics_optimizer",
+    }
+    missing_auxiliary_state = sorted(required_auxiliary_state - member_state.keys())
+    if "structured_auxiliary_rng" not in state:
+        missing_auxiliary_state.append("structured_auxiliary_rng")
+    if missing_auxiliary_state:
+        raise ValueError(
+            "checkpoint is missing production structured auxiliary recovery state: "
+            + ", ".join(missing_auxiliary_state)
+        )
+
+    gate_record = state.get("structured_gate_state")
+    if (
+        not isinstance(gate_record, Mapping)
+        or gate_record.get("version") != 2
+        or set(gate_record) != {"version", "agents"}
+    ):
+        raise ValueError("checkpoint structured predictor gate state is not version 2")
+    gate_agents = gate_record["agents"]
+    if not isinstance(gate_agents, list) or not gate_agents:
+        raise ValueError("checkpoint has no structured predictor gate state for member zero")
+    gate_member = gate_agents[0]
+    if not isinstance(gate_member, Mapping) or set(gate_member) != {"actor", "critic"}:
+        raise ValueError("checkpoint member-zero structured predictor gate state is incomplete")
+    enabled: dict[str, bool] = {}
+    for kind in ("actor", "critic"):
+        gate = gate_member[kind]
+        if not isinstance(gate, Mapping) or not isinstance(gate.get("enabled"), bool):
+            raise ValueError(f"checkpoint member-zero structured {kind} gate is incomplete")
+        enabled[kind] = gate["enabled"]
+
+    saved_auxiliary_rng = copy.deepcopy(state["structured_auxiliary_rng"])
+    recovered_auxiliary_generator = np.random.default_rng()
+    try:
+        recovered_auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint structured auxiliary RNG state is invalid") from error
+    saved_auxiliary_rng = copy.deepcopy(recovered_auxiliary_generator.bit_generator.state)
+
+    optimizer_state_names = (
+        "actor_optimizer",
+        "critic_optimizer",
+        "structured_dynamics_optimizer",
+        "structured_critic_dynamics_optimizer",
+    )
+    saved_optimizer_families = {
+        _optimizer_uses_normuon(member_state[name], name) for name in optimizer_state_names
+    }
+    if len(saved_optimizer_families) != 1:
+        raise ValueError("checkpoint member-zero optimizer families are inconsistent")
+    saved_is_normuon = saved_optimizer_families.pop()
+
     entry = resolve_architecture(state["architecture"])
-    model_config = entry.config_class(**state["model_config"])
+    model_config = entry.build_config(state["model_config"])
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
-    actor.load_state_dict(state["actor"])
-    critic.load_state_dict(state["critic"])
+    actor.load_state_dict(member_state["actor"])
+    critic.load_state_dict(member_state["critic"])
     schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
+    production_config = PpoConfig(**schedule)
+    if not (
+        production_config.structured_actor_auxiliary_active
+        and production_config.structured_critic_auxiliary_active
+    ):
+        raise RuntimeError("production PPO config must enable actor and critic NextLat")
 
     opponents = []
     if args.snapshot_lanes:
@@ -216,39 +305,51 @@ def main() -> None:
         candidate_actor = copy.deepcopy(actor)
         candidate_critic = copy.deepcopy(critic)
         config = PpoConfig(**{**schedule, **overrides})
+        if not (
+            config.structured_actor_auxiliary_active and config.structured_critic_auxiliary_active
+        ):
+            raise ValueError(f"schedule candidate {label!r} must keep actor and critic NextLat")
+
+        candidate_dynamics = StructuredDynamics(model_config).to(device)
+        candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
+        candidate_dynamics.load_state_dict(member_state["structured_dynamics"])
+        candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config
         )
-        # Both optimizers are restored so every candidate starts from the moments
-        # the checkpoint reached, rather than from a cold second moment that
-        # would make each candidate's first steps incomparable. A candidate that
-        # changes the OPTIMIZER cannot inherit them -- NorMuon keeps a momentum
-        # buffer and a low-rank second moment where AdamW keeps two full ones --
-        # so it starts cold, and the report says which candidates did.
-        # Read the saved state's own shape rather than the checkpoint's config:
-        # checkpoints written before `PpoConfig.optimizer` existed carry no such
-        # field, and defaulting it would claim AdamW moments are loadable into a
-        # NorMuon. Only NorMuon's groups carry a `kind`.
-        saved_is_normuon = any(
-            "kind" in group for group in state["actor_optimizer"]["param_groups"]
+        dynamics_optimizer = make_structured_dynamics_optimizer(candidate_dynamics, config)
+        critic_dynamics_optimizer = make_structured_dynamics_optimizer(
+            candidate_critic_dynamics, config
         )
+        auxiliary_generator = np.random.default_rng()
+        auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
+
+        # All optimizer moments are inherited when their representation is
+        # compatible. Switching optimizer families cold-starts all four
+        # optimizers while retaining every network's checkpoint weights.
         restored = saved_is_normuon == (config.optimizer == "normuon")
         if restored:
-            actor_optimizer.load_state_dict(state["actor_optimizer"])
-            critic_optimizer.load_state_dict(state["critic_optimizer"])
-        # `load_state_dict` restores `param_groups`, and `_optimizer_step` reads
-        # the rate from `group["base_lr"]` in preference to its argument, so a
-        # restore puts the checkpoint's rate back and a swept rate would never
-        # reach a step. Re-stamping the groups is what makes the sweep measure
-        # its own variable; an earlier probe omitted it and reported five
-        # identical configurations as though they were five learning rates.
-        for group in actor_optimizer.param_groups:
-            rate = config.actor_learning_rate
-            if group.get("kind") == "adam":
-                rate *= config.adam_learning_rate_ratio
-            group["base_lr"] = rate
-            group["warmup_step"] = 0
-            group["lr"] = rate
+            actor_optimizer.load_state_dict(member_state["actor_optimizer"])
+            critic_optimizer.load_state_dict(member_state["critic_optimizer"])
+            dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
+            critic_dynamics_optimizer.load_state_dict(
+                member_state["structured_critic_dynamics_optimizer"]
+            )
+        # Restoring param groups also restores their checkpoint rates. Re-stamp
+        # the swept actor and predictor rates, and restart their short-probe
+        # warmup clocks, so candidate overrides reach every intended step.
+        for optimizer, base_rate in (
+            (actor_optimizer, config.actor_learning_rate),
+            (dynamics_optimizer, config.resolved_structured_learning_rate),
+            (critic_dynamics_optimizer, config.resolved_structured_learning_rate),
+        ):
+            for group in optimizer.param_groups:
+                rate = base_rate
+                if group.get("kind") == "adam":
+                    rate *= config.adam_learning_rate_ratio
+                group["base_lr"] = rate
+                group["warmup_step"] = 0
+                group["lr"] = rate
         history: list[dict[str, Any]] = []
         for iteration in range(args.iterations):
             candidate_actor.eval()
@@ -279,6 +380,13 @@ def main() -> None:
                 rollout,
                 config,
                 generator=np.random.default_rng(seed),
+                structured_dynamics=candidate_dynamics,
+                structured_dynamics_optimizer=dynamics_optimizer,
+                structured_actor_auxiliary=enabled["actor"],
+                structured_critic_dynamics=candidate_critic_dynamics,
+                structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
+                structured_critic_auxiliary=enabled["critic"],
+                auxiliary_generator=auxiliary_generator,
             )
             league_part = slice_trajectories(rollout, args.games * 2, rollout.trajectories)
             row: dict[str, Any] = {"config": label, "iteration": iteration}

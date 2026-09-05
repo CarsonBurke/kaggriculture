@@ -13,7 +13,7 @@ from kaggriculture.optim import (
     route_parameters,
 )
 from kaggriculture.ppo import PpoConfig, make_optimizers
-from kaggriculture.production import production_model_config
+from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredDynamics
@@ -301,7 +301,7 @@ def test_an_optimizer_needs_at_least_one_parameter() -> None:
 
 def _production_modules() -> tuple[torch.nn.Module, torch.nn.Module]:
     payload = production_model_config()
-    architecture = resolve_architecture(payload)
+    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
     config = architecture.config_class(**payload)
     return architecture.actor_class(config), architecture.critic_class(config)
 
@@ -335,14 +335,13 @@ def test_heads_and_embeddings_stay_on_adam_while_hidden_matrices_do_not() -> Non
                 assert id(parameter) in vector_ids, name
             else:
                 assert id(parameter) in matrix_ids, name
-        # Convolution kernels are matrices under the standard Muon convention,
-        # flattened to (out_channels, -1) rather than excluded for being 4-D.
-        convolutions = [
-            name
-            for name, parameter in module.named_parameters()
-            if parameter.ndim == 4 and id(parameter) in matrix_ids
-        ]
-        assert convolutions
+    # Production is structured and currently has no convolution. Pin the
+    # standard Muon flattening convention independently so a later CNN route
+    # cannot regress when the production architecture changes.
+    convolution = torch.nn.Conv2d(2, 3, kernel_size=3)
+    matrices, vectors = route_parameters(convolution)
+    assert any(parameter is convolution.weight for parameter in matrices)
+    assert any(parameter is convolution.bias for parameter in vectors)
 
 
 def test_structured_transition_lookup_tables_stay_on_adam() -> None:
@@ -358,10 +357,13 @@ def test_structured_transition_lookup_tables_stay_on_adam() -> None:
 
 def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
     actor, critic = _production_modules()
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, PpoConfig())
+    config = PpoConfig()
+    assert config.optimizer == "normuon"
+    assert config.actor_learning_rate == 3.0e-5
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     for optimizer, learning_rate in (
-        (actor_optimizer, PpoConfig().actor_learning_rate),
-        (critic_optimizer, PpoConfig().critic_learning_rate),
+        (actor_optimizer, 3.0e-5),
+        (critic_optimizer, 2.5e-4),
     ):
         assert isinstance(optimizer, NorMuon)
         kinds = {group["kind"]: group for group in optimizer.param_groups}

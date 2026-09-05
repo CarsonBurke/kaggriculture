@@ -6,8 +6,15 @@ import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
+from kaggriculture.evaluation import DEVELOPMENT_SEED_START
 from kaggriculture.provenance import repository_root
+from kaggriculture.registry import STRUCTURED
+
+PRODUCTION_ARCHITECTURE = STRUCTURED
+PRODUCTION_CRITIC_WARMUP_ITERATIONS = 5
+PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 
 # A mirror self-play game contributes two current-policy trajectories; a
 # frozen-league game contributes one. 128 * 2 : 64 is therefore the intended
@@ -108,13 +115,49 @@ PRODUCTION_UPDATE_COMPILE_MODE = "default"
 PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
 
 
-def production_model_config() -> dict[str, int | float]:
-    from kaggriculture.model import ModelConfig
+def production_model_config() -> dict[str, Any]:
+    """Return the complete JSON-persisted structured production model contract."""
+    from kaggriculture.structured import StructuredConfig
 
-    return ModelConfig().to_dict()
+    config = StructuredConfig(
+        model_dim=80,
+        attention_heads=4,
+        attention_kv_heads=2,
+        ffn_multiplier=2,
+        farm_blocks=2,
+        opponent_latents=8,
+        latents=32,
+        core_layers=8,
+        quantity_rank=32,
+        global_refresh_layers=(),
+        global_refresh_context="none",
+        input_reinject_layers=(),
+        core_skip_source=0,
+        core_skip_target=0,
+        zero_init_branches=False,
+        mudd_lite=False,
+        fuse_market_decoder=True,
+        fuse_unit_decoder=False,
+        split_clock_token=False,
+        global_modulation=True,
+        fused_mlp=False,
+        critic_core_layers=0,
+        critic_latents=0,
+        value_atoms=101,
+        value_min=-2.2,
+        value_max=2.2,
+        value_sigma_ratio=0.75,
+    ).to_dict()
+    # Benchmark reports pass through JSON before the calibrated launcher reads
+    # them, so tuple-valued layer schedules are lists in the persisted contract.
+    return {
+        name: list(value) if isinstance(value, tuple) else value for name, value in config.items()
+    }
 
 
-def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float | bool | str]:
+def production_ppo_config(
+    *, update_compile_mode: str
+) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
     With 230,080 states, a 4096-row ceiling produces 57 balanced minibatches per
@@ -135,6 +178,18 @@ def production_ppo_config(*, update_compile_mode: str) -> dict[str, int | float 
             critic_epochs=PpoConfig.epochs,
             target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
+            # The actor predicts future policy distributions. The critic uses
+            # both latent regression and decoded categorical-value matching.
+            structured_decision_coefficient=1.0,
+            structured_patch_coefficient=0.0,
+            structured_economy_coefficient=0.0,
+            structured_opponent_summary_coefficient=0.0,
+            structured_opponent_patch_coefficient=0.0,
+            structured_decision_horizon=1,
+            structured_patch_horizon=1,
+            structured_critic_latent_coefficient=1.0,
+            structured_critic_value_coefficient=1.0,
+            structured_critic_horizon=1,
         )
     )
 
@@ -199,8 +254,18 @@ def build_training_command(
     # rather than after the launcher has already rewritten the run's evidence.
     if initial_actors and resume_checkpoint is not None:
         raise ValueError("a resumed run already has an actor; --init-actor-from initializes one")
+    if initial_actors and critic_warmup_iterations is None:
+        critic_warmup_iterations = PRODUCTION_CRITIC_WARMUP_ITERATIONS
     if critic_warmup_iterations is not None and not initial_actors:
         raise ValueError("critic warmup applies only to a warm-started run")
+    if (
+        critic_warmup_iterations is not None
+        and critic_warmup_iterations > PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS
+    ):
+        raise ValueError(
+            "critic warmup cannot exceed the "
+            f"{PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS}-iteration readiness deadline"
+        )
     if critic_warmup_iterations is not None and not 0 < critic_warmup_iterations < iterations:
         raise ValueError("critic warmup must be positive and leave iterations for the actor")
     if population < 1:
@@ -223,6 +288,13 @@ def build_training_command(
         )
     if len({artifact.expanduser().resolve() for artifact in initial_actors}) != len(initial_actors):
         raise ValueError("each member needs its own initial actor; identical members score 0.5")
+    if resume_checkpoint is None and len(initial_actors) != population:
+        if population == 1:
+            raise ValueError("a fresh production run requires exactly one BC actor or --resume")
+        raise ValueError(
+            f"a fresh production population needs one BC actor per member; "
+            f"{len(initial_actors)} were given for {population} members"
+        )
     model = production_model_config()
     ppo = production_ppo_config(update_compile_mode=update_compile_mode)
     command = [
@@ -281,20 +353,56 @@ def build_training_command(
             "--external-eval",
             "--external-eval-opponents",
             PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
-            "--cnn-width",
-            str(model["cnn_width"]),
-            "--cnn-blocks",
-            str(model["cnn_blocks"]),
+            "--external-eval-seed-start",
+            str(DEVELOPMENT_SEED_START),
+            "--architecture",
+            PRODUCTION_ARCHITECTURE,
             "--model-dim",
             str(model["model_dim"]),
-            "--transformer-layers",
-            str(model["transformer_layers"]),
             "--attention-heads",
             str(model["attention_heads"]),
+            "--attention-kv-heads",
+            str(model["attention_kv_heads"]),
             "--ffn-multiplier",
             str(model["ffn_multiplier"]),
+            "--farm-blocks",
+            str(model["farm_blocks"]),
+            "--opponent-latents",
+            str(model["opponent_latents"]),
+            "--latents",
+            str(model["latents"]),
+            "--core-layers",
+            str(model["core_layers"]),
             "--quantity-rank",
             str(model["quantity_rank"]),
+            "--global-refresh-layers",
+            ",".join(str(layer) for layer in model["global_refresh_layers"]),
+            "--global-refresh-context",
+            str(model["global_refresh_context"]),
+            "--input-reinject-layers",
+            ",".join(str(layer) for layer in model["input_reinject_layers"]),
+            "--core-skip-source",
+            str(model["core_skip_source"]),
+            "--core-skip-target",
+            str(model["core_skip_target"]),
+            "--zero-init-branches",
+            str(model["zero_init_branches"]).lower(),
+            "--mudd-lite",
+            str(model["mudd_lite"]).lower(),
+            "--fuse-market-decoder",
+            str(model["fuse_market_decoder"]).lower(),
+            "--fuse-unit-decoder",
+            str(model["fuse_unit_decoder"]).lower(),
+            "--split-clock-token",
+            str(model["split_clock_token"]).lower(),
+            "--global-modulation",
+            str(model["global_modulation"]).lower(),
+            "--fused-mlp",
+            str(model["fused_mlp"]).lower(),
+            "--critic-core-layers",
+            str(model["critic_core_layers"]),
+            "--critic-latents",
+            str(model["critic_latents"]),
             "--actor-lr",
             str(ppo["actor_learning_rate"]),
             "--critic-lr",
@@ -323,6 +431,26 @@ def build_training_command(
             str(ppo["optimizer"]),
             "--max-gradient-norm",
             str(ppo["max_gradient_norm"]),
+            "--structured-decision-coefficient",
+            str(ppo["structured_decision_coefficient"]),
+            "--structured-patch-coefficient",
+            str(ppo["structured_patch_coefficient"]),
+            "--structured-economy-coefficient",
+            str(ppo["structured_economy_coefficient"]),
+            "--structured-opponent-summary-coefficient",
+            str(ppo["structured_opponent_summary_coefficient"]),
+            "--structured-opponent-patch-coefficient",
+            str(ppo["structured_opponent_patch_coefficient"]),
+            "--structured-decision-horizon",
+            str(ppo["structured_decision_horizon"]),
+            "--structured-patch-horizon",
+            str(ppo["structured_patch_horizon"]),
+            "--structured-critic-latent-coefficient",
+            str(ppo["structured_critic_latent_coefficient"]),
+            "--structured-critic-value-coefficient",
+            str(ppo["structured_critic_value_coefficient"]),
+            "--structured-critic-horizon",
+            str(ppo["structured_critic_horizon"]),
         )
     )
     # Stated unconditionally, all three: the collection backend and precision

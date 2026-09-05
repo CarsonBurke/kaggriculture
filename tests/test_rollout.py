@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 from dataclasses import replace
 
 import numpy as np
@@ -22,10 +24,12 @@ from kaggriculture.constants import (
 )
 from kaggriculture.encoding import pair_potential, terminal_pair_utility
 from kaggriculture.model import ActorOutput, FarmActor, ModelConfig
-from kaggriculture.policy import component_logprobs
+from kaggriculture.policy import _sample_numpy_categorical, component_logprobs
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
+    _ANIMAL_STOCK_COLUMNS,
     _CROP_SEED_COLUMNS,
+    _POPULATION_PAIRING_SEED_SALT,
     _PRODUCT_STOCK_COLUMNS,
     CAPTURING_ROLLOUT_FORWARD_MODES,
     COMPILED_ROLLOUT_FORWARD_MODES,
@@ -130,6 +134,97 @@ def test_gumbel_utilities_follow_categorical_probabilities() -> None:
         torch.Generator().manual_seed(2),
     )
     assert tied.argmax(dim=-1).item() == 0
+
+
+def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor() -> None:
+    logits = np.asarray([[0.0, 1.0e-4, 2.0e-4]], dtype=np.float32)
+    mask = np.ones_like(logits, dtype=np.bool_)
+    _, cpu_logprob, cpu_entropy = _sample_numpy_categorical(
+        logits,
+        mask,
+        deterministic=True,
+        temperature=1.0e-8,
+        generator=np.random.default_rng(1),
+    )
+
+    def utilities(temperature: float) -> torch.Tensor:
+        return _gumbel_utilities(
+            torch.from_numpy(logits),
+            torch.asarray([temperature]),
+            torch.ones(1, dtype=torch.bool),
+            torch.arange(1),
+            torch.empty(0, dtype=torch.long),
+            torch.Generator().manual_seed(2),
+            torch.Generator().manual_seed(3),
+        )
+
+    subfloor_scores = utilities(1.0e-8)
+    floor_scores = utilities(1.0e-4)
+    torch.testing.assert_close(subfloor_scores, floor_scores, rtol=0.0, atol=0.0)
+    gpu_logprobabilities = subfloor_scores.log_softmax(dim=-1)
+    gpu_probabilities = gpu_logprobabilities.exp()
+    gpu_entropy = -(gpu_probabilities * gpu_logprobabilities).sum(dim=-1)
+    np.testing.assert_allclose(
+        gpu_logprobabilities[:, -1].numpy(), cpu_logprob, rtol=0.0, atol=2.0e-7
+    )
+    np.testing.assert_allclose(gpu_entropy.numpy(), cpu_entropy, rtol=0.0, atol=2.0e-7)
+
+    rows = 2
+    rank = 1
+    output = ActorOutput(
+        torch.linspace(-2.0e-4, 2.0e-4, N_UNIT_ACTIONS)
+        .reshape(1, 1, -1)
+        .expand(rows, MAX_UNITS, -1),
+        torch.linspace(-2.0e-4, 2.0e-4, N_MARKET_KINDS)
+        .reshape(1, 1, -1)
+        .expand(rows, MAX_MARKET_ORDERS, -1),
+        torch.zeros(rows, MAX_MARKET_ORDERS, rank),
+    )
+    heads = (
+        torch.zeros(1, N_MARKET_KINDS, rank),
+        torch.zeros(1, N_QUANTITIES, rank),
+        torch.linspace(-2.0e-4, 2.0e-4, N_QUANTITIES)
+        .reshape(1, 1, -1)
+        .expand(1, N_MARKET_KINDS, -1),
+    )
+
+    def statistics(temperature: float) -> dict[str, np.ndarray]:
+        sampled = {
+            "unit_actions": np.zeros((rows, MAX_UNITS), dtype=np.uint8),
+            "market_kinds": np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.uint8),
+            "market_quantities": np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.uint8),
+            "unit_masks": np.ones((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.bool_),
+            "market_kind_masks": np.ones((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.bool_),
+            "market_quantity_masks": np.ones(
+                (rows, MAX_MARKET_ORDERS, N_QUANTITIES), dtype=np.bool_
+            ),
+            "unit_active": np.ones((rows, MAX_UNITS), dtype=np.bool_),
+            "market_active": np.ones((rows, MAX_MARKET_ORDERS), dtype=np.bool_),
+            "market_quantity_active": np.ones((rows, MAX_MARKET_ORDERS), dtype=np.bool_),
+            "unit_logprobs": np.empty((rows, MAX_UNITS), dtype=np.float32),
+            "market_kind_logprobs": np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32),
+            "market_quantity_logprobs": np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32),
+            "entropy": np.empty(rows, dtype=np.float32),
+        }
+        _fill_gpu_policy_statistics(
+            sampled,
+            output,
+            heads,
+            torch.zeros(rows, dtype=torch.long),
+            torch.zeros(rows, dtype=torch.uint8),
+            torch.full((rows,), temperature),
+        )
+        return sampled
+
+    subfloor_statistics = statistics(1.0e-8)
+    floor_statistics = statistics(1.0e-4)
+    for name in (
+        "unit_logprobs",
+        "market_kind_logprobs",
+        "market_quantity_logprobs",
+        "entropy",
+    ):
+        np.testing.assert_array_equal(subfloor_statistics[name], floor_statistics[name])
 
 
 def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
@@ -270,6 +365,56 @@ def test_bfloat16_pipeline_replica_preserves_fp32_quantity_heads() -> None:
     assert _stacked_actor_ensemble((replica,), namespace=1_000_007) is bf16_ensemble
 
 
+def test_distinct_actor_tuples_have_isolated_mutable_ensemble_state() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    first_models = (FarmActor(config), FarmActor(config))
+    second_models = (FarmActor(config), FarmActor(config))
+    barrier = threading.Barrier(2)
+    ensembles: list[object] = []
+
+    def build(models) -> None:
+        barrier.wait()
+        ensembles.append(_stacked_actor_ensemble(models, namespace=1_000_009))
+
+    threads = [
+        threading.Thread(target=build, args=(models,)) for models in (first_models, second_models)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+        assert not thread.is_alive()
+
+    assert len(ensembles) == 2
+    assert ensembles[0] is not ensembles[1]
+    first_ensemble = _stacked_actor_ensemble(first_models, namespace=1_000_009)
+    second_ensemble = _stacked_actor_ensemble(second_models, namespace=1_000_009)
+    assert first_ensemble in ensembles
+    assert second_ensemble in ensembles
+    parameter_name = next(iter(first_ensemble.params))
+    first_state = first_ensemble.params[parameter_name].clone()
+    with torch.no_grad():
+        dict(second_models[0].named_parameters())[parameter_name].add_(1.0)
+    _stacked_actor_ensemble(second_models, namespace=1_000_009)
+    torch.testing.assert_close(first_ensemble.params[parameter_name], first_state)
+
+
+def test_stacked_ensemble_cache_does_not_retain_source_models() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    models = (FarmActor(config), FarmActor(config))
+    references = tuple(weakref.ref(model) for model in models)
+    _stacked_actor_ensemble(models, namespace=1_000_011)
+
+    del models
+    gc.collect()
+
+    assert all(reference() is None for reference in references)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_sampler_runs_one_full_batch_in_seed_order() -> None:
@@ -326,6 +471,83 @@ def test_on_policy_collectors_reject_nonunit_temperature(collector, temperature:
             seed_start=1,
             temperature=temperature,
         )
+
+
+def test_deterministic_learner_rollouts_record_nonstochastic_provenance() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(config)
+    opponent = FarmActor(config)
+
+    deterministic_self_play = collect_self_play(
+        actor, games=1, seed_start=1, episode_steps=3, deterministic=True
+    )
+    deterministic_league = collect_frozen_opponent_play(
+        actor,
+        opponent,
+        games=1,
+        seed_start=2,
+        episode_steps=3,
+        deterministic=True,
+        deterministic_opponent=True,
+    )
+    stochastic_league = collect_frozen_opponent_play(
+        actor,
+        opponent,
+        games=1,
+        seed_start=3,
+        episode_steps=3,
+        deterministic_opponent=True,
+    )
+
+    assert deterministic_self_play.learner_stochastic is False
+    assert deterministic_league.learner_stochastic is False
+    assert stochastic_league.learner_stochastic is True
+
+
+def test_native_deterministic_learner_rollout_records_nonstochastic_provenance() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+
+    rollout = collect_self_play_rust(FarmActor(config), games=1, seed_start=4, deterministic=True)
+
+    assert rollout.learner_stochastic is False
+
+
+def test_rollout_composition_preserves_and_checks_learner_sampling_provenance() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    rollout = collect_self_play(FarmActor(config), games=1, seed_start=5, episode_steps=3)
+    deterministic = replace(rollout, learner_stochastic=False)
+
+    assert slice_trajectories(deterministic, 0, 1).learner_stochastic is False
+    assert concatenate_rollouts([rollout, rollout]).learner_stochastic is True
+    with pytest.raises(ValueError, match="learner sampling provenance must match"):
+        concatenate_rollouts([rollout, deterministic])
+
+
+def test_every_public_native_collector_rejects_an_unknown_forward_mode_immediately() -> None:
+    bad_mode = "not-a-rollout-mode"
+    calls = (
+        lambda: collect_mixed_play_rust(
+            object(), self_play_games=1, seed_start=1, forward_mode=bad_mode
+        ),
+        lambda: collect_population_play_rust((), games=0, seed_start=1, forward_mode=bad_mode),
+        lambda: collect_self_play_rust(object(), games=1, seed_start=1, forward_mode=bad_mode),
+        lambda: collect_frozen_opponents_play_rust(
+            object(), (), games=1, seed_start=1, forward_mode=bad_mode
+        ),
+        lambda: collect_frozen_opponent_play_rust(
+            object(), object(), games=1, seed_start=1, forward_mode=bad_mode
+        ),
+    )
+
+    for collect in calls:
+        with pytest.raises(ValueError, match=r"unknown rollout forward mode 'not-a-rollout-mode'"):
+            collect()
 
 
 @pytest.mark.parametrize("collector", (collect_self_play, collect_self_play_rust))
@@ -973,6 +1195,7 @@ def _structured_replay_inputs(rollout) -> StructuredInputs:
         unit_tile_gather=_flatten_states(states["unit_tile_gather"]).long(),
         unit_tile_gather_valid=_flatten_states(states["unit_tile_gather_valid"]).bool(),
         products=_flatten_states(states["products"]).float(),
+        animals=_flatten_states(states["animals"]).float(),
         crops=_flatten_states(states["crops"]).float(),
         farms=_flatten_states(states["farms"]).float(),
         town=_flatten_states(states["town"]).float(),
@@ -1127,6 +1350,10 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     np.testing.assert_array_equal(
         rollout.states["critic_products"][:, 0],
         np.asarray(initial["products"])[pair_rows][:, :, _PRODUCT_STOCK_COLUMNS],
+    )
+    np.testing.assert_array_equal(
+        rollout.states["critic_animals"][:, 0],
+        np.asarray(initial["animals"])[pair_rows][:, :, _ANIMAL_STOCK_COLUMNS],
     )
     np.testing.assert_array_equal(
         rollout.states["critic_crops"][:, 0],
@@ -1320,6 +1547,19 @@ def test_population_pairings_balance_every_ordered_pair_over_both_seats() -> Non
     assert np.bincount(pairings[:, 1], minlength=4).tolist() == [39] * 4
 
 
+@pytest.mark.parametrize(("population", "games"), ((2, 8), (3, 24), (4, 48)))
+def test_population_pairings_stratify_each_pair_across_orientation_indices(
+    population: int, games: int
+) -> None:
+    pairings = population_pairings(population, games, sampling_seed=0)
+
+    np.testing.assert_array_equal(pairings, population_pairings(population, games, sampling_seed=0))
+    assert not np.array_equal(pairings, population_pairings(population, games, sampling_seed=3))
+    for pair in np.unique(pairings, axis=0):
+        game_indices = np.flatnonzero((pairings == pair).all(axis=1))
+        assert sorted(set((game_indices % 4).tolist())) == [0, 1, 2, 3]
+
+
 @pytest.mark.parametrize("games", (150, 12 * 13 + 1, 0, -12))
 def test_population_pairings_refuse_a_wave_size_that_cannot_balance(games: int) -> None:
     with pytest.raises(ValueError, match="positive multiple of 12"):
@@ -1346,7 +1586,7 @@ def test_population_wave_refuses_a_schedule_that_starves_a_member(monkeypatch) -
     # Four rows for member 0, five for member 1 and three for member 2: still
     # twelve rows over three members, so only the counts give it away.
     starved = np.asarray([[0, 1], [0, 1], [0, 1], [0, 2], [1, 2], [2, 1]], dtype=np.int64)
-    monkeypatch.setattr("kaggriculture.rollout.population_pairings", lambda *_: starved)
+    monkeypatch.setattr("kaggriculture.rollout.population_pairings", lambda *_, **__: starved)
 
     with pytest.raises(ValueError, match="same row count for every member"):
         collect_population_play_rust([FarmActor(config) for _ in range(3)], games=6, seed_start=170)
@@ -1354,7 +1594,11 @@ def test_population_wave_refuses_a_schedule_that_starves_a_member(monkeypatch) -
 
 def test_population_wave_stores_both_seats_in_pairing_order(population_wave) -> None:
     actors, arena, rollout = population_wave
-    pairings = population_pairings(len(actors), _POPULATION_GAMES)
+    pairings = population_pairings(
+        len(actors),
+        _POPULATION_GAMES,
+        sampling_seed=4 ^ _POPULATION_PAIRING_SEED_SALT,
+    )
 
     # Both seats are learners, so a game yields two trajectories, game-major
     # and seat-minor against the schedule.

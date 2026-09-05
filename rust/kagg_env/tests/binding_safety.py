@@ -146,6 +146,25 @@ def assert_output_rejected_without_step(
     assert step_of(environment) == before
 
 
+def assert_structured_schema_buffers_rejected() -> None:
+    native = load_native(build=False, release=True)
+    environment = native.BatchEnv(np.arange(BATCH, dtype=np.uint64))
+    for name, malformed in (
+        ("tile_continuous", np.zeros((ROWS, 200, 18), dtype=np.float16)),
+        ("animals", np.zeros((ROWS, 3, 2), dtype=np.float16)),
+        ("animals", np.zeros((ROWS, 3, 3), dtype=np.float32)),
+        ("animals", np.zeros((ROWS, 3, 6), dtype=np.float16)[..., ::2]),
+    ):
+        output = environment.structured_buffers()
+        output[name] = malformed
+        try:
+            environment.structured_into(output)
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"malformed structured {name} accepted")
+
+
 def main() -> None:
     if len(sys.argv) == 2 and sys.argv[1] == "--child-noncontiguous":
         child_noncontiguous_inputs()
@@ -185,7 +204,11 @@ def main() -> None:
         lambda output: output.__setitem__("market_quantities", output["market_kinds"])
     )
     assert_unknown_builtin_code_rejected()
-    print("binding safety: 24 strided inputs + 6 malformed/aliased outputs rejected pre-step")
+    assert_structured_schema_buffers_rejected()
+    print(
+        "binding safety: strided inputs, malformed/aliased outputs, "
+        "and stale structured schemas rejected"
+    )
 
 
 if __name__ == "__main__":

@@ -9,7 +9,14 @@ import torch
 from torch import Tensor, nn
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
-from kaggriculture.constants import BOARD_SIZE, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.constants import (
+    ANIMALS,
+    BOARD_SIZE,
+    CROPS,
+    MAX_MARKET_ORDERS,
+    MAX_UNITS,
+    PRODUCTS,
+)
 from kaggriculture.latent_dynamics import (
     DecodeContext,
     DecodeMasks,
@@ -20,9 +27,53 @@ from kaggriculture.structured import (
     Block,
     StructuredBelief,
     StructuredConfig,
+    StructuredCriticBelief,
     StructuredInputs,
 )
 from kaggriculture.tokens import TILE_COUNT
+
+
+class PersistenceDynamics(nn.Module):
+    """Metric-only no-change transition, with identical recursive horizons."""
+
+    def forward(
+        self,
+        belief: StructuredBelief | StructuredCriticBelief,
+        *actions: Tensor,
+        active_fields: tuple[bool, ...] | None = None,
+    ) -> StructuredBelief | StructuredCriticBelief:
+        return belief
+
+
+class ShuffledActionDynamics(nn.Module):
+    """Metric-only cyclic action permutation; never touches a training RNG.
+
+    Move complete action rows together so market kinds and quantities stay
+    paired. Entity identities, masks, targets and decoder context stay fixed.
+    """
+
+    def __init__(self, dynamics: nn.Module) -> None:
+        super().__init__()
+        self.dynamics = dynamics
+
+    def forward(
+        self,
+        belief: StructuredBelief | StructuredCriticBelief,
+        unit_actions: Tensor,
+        market_kinds: Tensor,
+        market_quantities: Tensor,
+        *context: Tensor,
+        active_fields: tuple[bool, ...] | None = None,
+    ) -> StructuredBelief | StructuredCriticBelief:
+        arguments = {} if active_fields is None else {"active_fields": active_fields}
+        return self.dynamics(
+            belief,
+            unit_actions.roll(1, dims=0),
+            market_kinds.roll(1, dims=0),
+            market_quantities.roll(1, dims=0),
+            *context,
+            **arguments,
+        )
 
 
 class StructuredActionEncoder(nn.Module):
@@ -79,7 +130,9 @@ class StructuredDynamics(nn.Module):
         self.width = width
         self.action = StructuredActionEncoder(width)
         self.type_identity = nn.Embedding(self._TYPE_COUNT, width)
-        economy_tokens = len(PRODUCTS) + len(CROPS) + 2 + (2 if config.split_clock_token else 1)
+        economy_tokens = (
+            len(PRODUCTS) + len(ANIMALS) + len(CROPS) + 2 + (2 if config.split_clock_token else 1)
+        )
         counts = (
             TILE_COUNT,
             TILE_COUNT,
@@ -142,6 +195,79 @@ class StructuredDynamics(nn.Module):
         for (kind, value), delta in zip(selected, deltas, strict=True):
             outputs[kind] = value + delta
         return StructuredBelief(*outputs)
+
+
+class StructuredCriticDynamics(nn.Module):
+    """Action-conditioned residual transition over every typed critic belief."""
+
+    _TYPE_COUNT = 6
+
+    def __init__(self, config: StructuredConfig) -> None:
+        super().__init__()
+        width = config.model_dim
+        predictor_config = replace(config, zero_init_branches=False, global_modulation=False)
+        critic_latents = config.critic_latents or config.latents
+        economy_tokens = (
+            len(PRODUCTS) + len(ANIMALS) + len(CROPS) + 2 + (2 if config.split_clock_token else 1)
+        )
+        counts = (
+            TILE_COUNT,
+            TILE_COUNT,
+            config.opponent_latents,
+            economy_tokens,
+            critic_latents,
+            1,
+        )
+        self.action = StructuredActionEncoder(width)
+        self.type_identity = nn.Embedding(self._TYPE_COUNT, width)
+        self.position_identity = nn.ModuleList(nn.Embedding(count, width) for count in counts)
+        self.context_norm = RMSNorm(width)
+        self.transition = Block(predictor_config)
+
+    def _query(self, value: Tensor, kind: int) -> Tensor:
+        tokens = value.shape[1]
+        identity = self.position_identity[kind]
+        assert isinstance(identity, nn.Embedding)
+        if tokens > identity.num_embeddings:
+            raise ValueError(
+                f"critic belief type {kind} has more tokens than its configured identity table"
+            )
+        return value + identity.weight[:tokens] + self.type_identity.weight[kind]
+
+    def forward(
+        self,
+        belief: StructuredCriticBelief,
+        unit_actions: Tensor,
+        market_kinds: Tensor,
+        market_quantities: Tensor,
+        unit_categorical: Tensor,
+        unit_active: Tensor,
+    ) -> StructuredCriticBelief:
+        values = tuple(belief)
+        joined = torch.cat(
+            [self._query(value, kind) for kind, value in enumerate(values)],
+            dim=1,
+        )
+        unit_action, market_action = self.action(
+            unit_actions,
+            market_kinds,
+            market_quantities,
+            unit_categorical,
+            unit_active,
+        )
+        context = torch.cat((belief.central_latents, unit_action, market_action), dim=1)
+        transitioned = self.transition(joined, context, context_norm=self.context_norm)
+        deltas = (transitioned - joined).split([value.shape[1] for value in values], dim=1)
+        return StructuredCriticBelief(
+            *(value + delta for value, delta in zip(values, deltas, strict=True))
+        )
+
+
+class StructuredCriticDynamicsTerms(NamedTuple):
+    latent: Tensor
+    value: Tensor
+    eligible: Tensor
+    residual_ratio: Tensor
 
 
 class StructuredDynamicsTerms(NamedTuple):
@@ -749,4 +875,129 @@ def structured_window_loss(
         residual_central_latents=residual_sums[4] / max_horizon,
         residual_unit_decisions=residual_sums[5] / max_horizon,
         residual_market_decisions=residual_sums[6] / max_horizon,
+    )
+
+
+def _critic_value_kl(
+    predicted: Tensor,
+    target: Tensor,
+    value_head: nn.Linear,
+) -> Tensor:
+    """Teacher-to-student categorical KL without auxiliary head gradients."""
+    weight = value_head.weight.detach()
+    bias = None if value_head.bias is None else value_head.bias.detach()
+    student_logits = nn.functional.linear(predicted, weight, bias).float()
+    teacher_logits = nn.functional.linear(target.detach(), weight, bias).float().detach()
+    teacher_log_probabilities = teacher_logits.log_softmax(dim=-1)
+    teacher_probabilities = teacher_log_probabilities.exp()
+    return (
+        (teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1)))
+        .sum(dim=-1)
+        .mean()
+    )
+
+
+def structured_critic_window_loss(
+    dynamics: StructuredCriticDynamics,
+    belief: StructuredCriticBelief,
+    inputs: StructuredInputs,
+    factors: dict[str, Tensor],
+    *,
+    value_head: nn.Linear,
+    horizon: int,
+) -> StructuredCriticDynamicsTerms:
+    """Average recursive critic-belief losses over complete transition windows."""
+    if horizon < 1:
+        raise ValueError("structured critic horizon must be positive")
+    width = horizon + 1
+    rows = belief.own_patches.shape[0]
+    if rows == 0 or rows % width:
+        raise ValueError("structured critic rows do not contain complete windows")
+    for value in belief:
+        if value.shape[0] != rows:
+            raise ValueError("structured critic belief families must have matching rows")
+    for value in inputs:
+        if value.shape[0] != rows:
+            raise ValueError("structured critic inputs must match belief rows")
+    for name in ("unit_actions", "market_kinds", "market_quantities"):
+        if factors[name].shape[0] != rows:
+            raise ValueError(f"structured critic factor {name} must match belief rows")
+
+    windows = rows // width
+
+    def window(value: Tensor) -> Tensor:
+        return value.reshape(windows, width, *value.shape[1:])
+
+    windowed_belief = StructuredCriticBelief(*(window(value) for value in belief))
+    windowed_inputs = StructuredInputs(*(window(value) for value in inputs))
+    windowed_factors = {
+        name: window(factors[name])
+        for name in ("unit_actions", "market_kinds", "market_quantities")
+    }
+    zero = belief.central_latents.new_zeros((), dtype=torch.float32)
+    latent_sum = zero
+    value_sum = zero
+    eligible_sum = zero
+    residual_sum = zero
+    predicted: StructuredCriticBelief | None = None
+
+    for offset in range(1, horizon + 1):
+        source_positions = width - offset
+        if predicted is None:
+            previous = StructuredCriticBelief(
+                *(value[:, :source_positions].flatten(0, 1) for value in windowed_belief)
+            )
+        else:
+            previous = StructuredCriticBelief(
+                *(
+                    value.reshape(windows, source_positions + 1, *value.shape[1:])[
+                        :, :source_positions
+                    ].flatten(0, 1)
+                    for value in predicted
+                )
+            )
+        action_slice = slice(offset - 1, offset - 1 + source_positions)
+        current = dynamics(
+            previous,
+            windowed_factors["unit_actions"][:, action_slice].flatten(0, 1),
+            windowed_factors["market_kinds"][:, action_slice].flatten(0, 1),
+            windowed_factors["market_quantities"][:, action_slice].flatten(0, 1),
+            windowed_inputs.unit_categorical[:, action_slice].flatten(0, 1),
+            windowed_inputs.unit_active[:, action_slice].flatten(0, 1),
+        )
+        predicted = current
+        target_slice = slice(offset, offset + source_positions)
+        target = StructuredCriticBelief(
+            *(value[:, target_slice].flatten(0, 1) for value in windowed_belief)
+        )
+        eligible = torch.ones(
+            windows * source_positions,
+            dtype=torch.bool,
+            device=belief.own_patches.device,
+        )
+        joined_current = torch.cat(tuple(current), dim=1)
+        joined_target = torch.cat(tuple(target), dim=1)
+        joined_previous = torch.cat(tuple(previous), dim=1)
+        latent_sum = latent_sum + _latent_smooth_l1(
+            joined_current,
+            joined_target,
+            eligible,
+        )
+        value_sum = value_sum + _critic_value_kl(
+            current.value_decision,
+            target.value_decision,
+            value_head,
+        )
+        residual_sum = residual_sum + _eligible_rms_ratio(
+            joined_current,
+            joined_previous,
+            eligible,
+        )
+        eligible_sum = eligible_sum + eligible.float().sum()
+
+    return StructuredCriticDynamicsTerms(
+        latent=latent_sum / horizon,
+        value=value_sum / horizon,
+        eligible=eligible_sum / horizon,
+        residual_ratio=residual_sum / horizon,
     )

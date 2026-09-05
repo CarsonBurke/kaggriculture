@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from kaggriculture.evaluation import artifact_seed_usage, validate_finalist_protocol
 from kaggriculture.provenance import (
     file_sha256,
     validate_inference_equivalence,
@@ -36,6 +37,7 @@ REQUIRED_MEMBERS = frozenset(
         "kaggriculture/constants.py",
         "kaggriculture/encoding.py",
         "kaggriculture/inference.py",
+        "kaggriculture/evaluation.py",
         "kaggriculture/model.py",
         "kaggriculture/orientation.py",
         "kaggriculture/policy.py",
@@ -189,7 +191,7 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
     }
     if not isinstance(manifest, dict) or not required_keys <= set(manifest) <= allowed_keys:
         raise ValueError("submission manifest has an invalid schema")
-    if manifest["format_version"] != 1:
+    if manifest["format_version"] != 2:
         raise ValueError(f"unsupported submission manifest: {manifest['format_version']}")
     source = validate_source_identity(manifest["source_identity"])
     # The archive already hashed its payload against this identity. The live
@@ -243,6 +245,13 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
     if evaluation.get("paired_seats") is not True or evaluation.get("seed_count", 0) < 32:
         raise ValueError("submission finalist evaluation is too small or not paired by seat")
     selection = evaluation.get("selection_provenance")
+    validate_finalist_protocol(evaluation)
+    if (
+        evaluation_binding.get("seed_protocol") != evaluation["seed_protocol"]
+        or evaluation_binding.get("statistical_selection") != selection["statistical_selection"]
+        or evaluation_binding.get("score_confidence") != evaluation["summary"]["score_confidence"]
+    ):
+        raise ValueError("submission statistical protocol binding is inconsistent")
     if selection is not None:
         if (
             not isinstance(selection, dict)
@@ -276,6 +285,8 @@ def _extract(archive_path: Path, destination: Path) -> tuple[list[str], dict[str
     elif finalist_opponent.get("sha256") != evaluation_binding["opponent_sha256"]:
         raise ValueError("submission public v27 provenance chain is inconsistent")
     artifact = torch.load(destination / "model.pt", map_location="cpu", weights_only=False)
+    if provenance.get("seed_usage") != artifact_seed_usage(artifact):
+        raise ValueError("submission model seed exposure differs from finalist evidence")
     artifact_source = validate_source_identity(artifact.get("source_identity"))
     witness = manifest.get("inference_equivalence")
     validated_witness = None if witness is None else validate_inference_equivalence(witness)

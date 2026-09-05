@@ -15,7 +15,7 @@ from kaggriculture.ppo import (
 )
 from kaggriculture.provenance import source_identity
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.structured_dynamics import StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
 from kaggriculture.training import (
     CHECKPOINT_FORMAT_VERSION,
     TrainingAgent,
@@ -99,15 +99,25 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
     actor = StructuredActor(model_config)
     critic = StructuredCritic(model_config)
     dynamics = StructuredDynamics(model_config)
+    critic_dynamics = StructuredCriticDynamics(model_config)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
     dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, ppo_config)
-    dynamics_optimizer.zero_grad(set_to_none=True)
-    sum(parameter.square().mean() for parameter in dynamics.parameters()).backward()
-    _optimizer_step(
-        dynamics_optimizer,
-        ppo_config.resolved_structured_learning_rate,
-        ppo_config.lr_warmup_steps,
+    critic_dynamics_optimizer = make_structured_dynamics_optimizer(
+        critic_dynamics,
+        ppo_config,
     )
+    for predictor, optimizer, steps in (
+        (dynamics, dynamics_optimizer, 1),
+        (critic_dynamics, critic_dynamics_optimizer, 2),
+    ):
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            sum(parameter.square().mean() for parameter in predictor.parameters()).backward()
+            _optimizer_step(
+                optimizer,
+                ppo_config.resolved_structured_learning_rate,
+                ppo_config.lr_warmup_steps,
+            )
     auxiliary_generator = np.random.default_rng(43)
     auxiliary_state = auxiliary_generator.bit_generator.state
     expected = auxiliary_generator.random(5)
@@ -121,8 +131,10 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
                 critic,
                 actor_optimizer,
                 critic_optimizer,
-                dynamics,
-                dynamics_optimizer,
+                structured_dynamics=dynamics,
+                structured_dynamics_optimizer=dynamics_optimizer,
+                structured_critic_dynamics=critic_dynamics,
+                structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
             )
         ],
         model_config=model_config,
@@ -132,12 +144,22 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         metrics={},
         source_identity=source_identity(),
         auxiliary_rng_state=auxiliary_state,
-        structured_gate_state={"agents": [{"reference": None, "streak": 0, "enabled": False}]},
+        structured_gate_state={
+            "version": 3,
+            "agents": [
+                {
+                    "actor": {"streak": 0, "enabled": False},
+                    "critic": {"streak": 0, "enabled": False},
+                }
+            ],
+        },
+        seed_usage=[{"domain": "online_rl", "start": 20_000_000, "count": 100}],
     )
 
     restored_actor = StructuredActor(model_config)
     restored_critic = StructuredCritic(model_config)
     restored_dynamics = StructuredDynamics(model_config)
+    restored_critic_dynamics = StructuredCriticDynamics(model_config)
     restored_actor_optimizer, restored_critic_optimizer = make_optimizers(
         restored_actor,
         restored_critic,
@@ -147,30 +169,48 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         restored_dynamics,
         ppo_config,
     )
+    restored_critic_dynamics_optimizer = make_structured_dynamics_optimizer(
+        restored_critic_dynamics,
+        ppo_config,
+    )
     restored_agent = TrainingAgent(
         restored_actor,
         restored_critic,
         restored_actor_optimizer,
         restored_critic_optimizer,
-        restored_dynamics,
-        restored_dynamics_optimizer,
+        structured_dynamics=restored_dynamics,
+        structured_dynamics_optimizer=restored_dynamics_optimizer,
+        structured_critic_dynamics=restored_critic_dynamics,
+        structured_critic_dynamics_optimizer=restored_critic_dynamics_optimizer,
     )
     payload = load_checkpoint(path, [restored_agent], device=torch.device("cpu"))
     restored_generator = np.random.default_rng()
     restored_generator.bit_generator.state = payload["structured_auxiliary_rng"]
 
     assert payload["structured_gate_state"] == {
-        "agents": [{"reference": None, "streak": 0, "enabled": False}]
+        "version": 3,
+        "agents": [
+            {"actor": {"streak": 0, "enabled": False}, "critic": {"streak": 0, "enabled": False}}
+        ],
     }
+    assert payload["seed_usage"] == [{"domain": "online_rl", "start": 20_000_000, "count": 100}]
     for name, value in dynamics.state_dict().items():
         torch.testing.assert_close(restored_dynamics.state_dict()[name], value)
+    for name, value in critic_dynamics.state_dict().items():
+        torch.testing.assert_close(restored_critic_dynamics.state_dict()[name], value)
     assert restored_generator.random(5).tolist() == expected.tolist()
-    assert restored_dynamics_optimizer.state_dict()["state"]
-    assert len(restored_dynamics_optimizer.state_dict()["state"]) == len(
-        dynamics_optimizer.state_dict()["state"]
+    torch.testing.assert_close(
+        restored_dynamics_optimizer.state_dict(),
+        dynamics_optimizer.state_dict(),
+    )
+    torch.testing.assert_close(
+        restored_critic_dynamics_optimizer.state_dict(),
+        critic_dynamics_optimizer.state_dict(),
     )
     assert dynamics_optimizer.param_groups[0]["warmup_step"] == 1
     assert restored_dynamics_optimizer.param_groups[0]["warmup_step"] == 1
+    assert critic_dynamics_optimizer.param_groups[0]["warmup_step"] == 2
+    assert restored_critic_dynamics_optimizer.param_groups[0]["warmup_step"] == 2
     assert actor_optimizer.param_groups[0]["warmup_step"] == 0
     assert restored_actor_optimizer.param_groups[0]["warmup_step"] == 0
 
@@ -196,15 +236,54 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
 
     missing_path = tmp_path / "missing-structured.pt"
     missing_payload = torch.load(path, weights_only=False)
-    missing_payload.pop("structured_dynamics")
-    missing_payload.pop("structured_auxiliary_rng")
+    missing_payload.pop("structured_critic_dynamics_optimizer")
     torch.save(missing_payload, missing_path)
-    with pytest.raises(ValueError, match="auxiliary RNG presence"):
+    with torch.no_grad():
+        next(restored_actor.parameters()).add_(1.0)
+    before_rejected_load = {
+        name: value.clone() for name, value in restored_actor.state_dict().items()
+    }
+    with pytest.raises(ValueError, match="incomplete single-learner training state"):
         load_checkpoint(
             missing_path,
             [restored_agent],
             device=torch.device("cpu"),
         )
+    assert all(
+        torch.equal(value, before_rejected_load[name])
+        for name, value in restored_actor.state_dict().items()
+    )
+
+    incomplete_agent = TrainingAgent(
+        restored_actor,
+        restored_critic,
+        restored_actor_optimizer,
+        restored_critic_optimizer,
+        structured_dynamics=restored_dynamics,
+        structured_dynamics_optimizer=restored_dynamics_optimizer,
+        structured_critic_dynamics=restored_critic_dynamics,
+    )
+    with pytest.raises(ValueError, match="must be provided together"):
+        load_checkpoint(path, [incomplete_agent], device=torch.device("cpu"))
+    assert all(
+        torch.equal(value, before_rejected_load[name])
+        for name, value in restored_actor.state_dict().items()
+    )
+
+    critic_mismatch_agent = TrainingAgent(
+        restored_actor,
+        restored_critic,
+        restored_actor_optimizer,
+        restored_critic_optimizer,
+        structured_dynamics=restored_dynamics,
+        structured_dynamics_optimizer=restored_dynamics_optimizer,
+    )
+    with pytest.raises(ValueError, match="structured critic dynamics optimizer presence"):
+        load_checkpoint(path, [critic_mismatch_agent], device=torch.device("cpu"))
+    assert all(
+        torch.equal(value, before_rejected_load[name])
+        for name, value in restored_actor.state_dict().items()
+    )
 
 
 def test_zero_auxiliary_checkpoint_keeps_the_historical_state_shape(tmp_path) -> None:
@@ -229,8 +308,78 @@ def test_zero_auxiliary_checkpoint_keeps_the_historical_state_shape(tmp_path) ->
     )
     payload = torch.load(path, weights_only=False)
 
-    assert "structured_dynamics" not in payload
-    assert "structured_auxiliary_rng" not in payload
+    for key in (
+        "structured_dynamics",
+        "structured_dynamics_optimizer",
+        "structured_critic_dynamics",
+        "structured_critic_dynamics_optimizer",
+        "structured_auxiliary_rng",
+    ):
+        assert key not in payload
+
+
+@pytest.mark.parametrize(
+    ("predictor_key", "optimizer_key", "predictor_type"),
+    [
+        ("structured_dynamics", "structured_dynamics_optimizer", StructuredDynamics),
+        (
+            "structured_critic_dynamics",
+            "structured_critic_dynamics_optimizer",
+            StructuredCriticDynamics,
+        ),
+    ],
+)
+def test_checkpoint_population_requires_homogeneous_predictor_presence(
+    tmp_path,
+    predictor_key,
+    optimizer_key,
+    predictor_type,
+) -> None:
+    model_config = StructuredConfig(
+        model_dim=16,
+        attention_heads=2,
+        ffn_multiplier=1,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+        quantity_rank=4,
+    )
+    ppo_config = PpoConfig(epochs=1, minibatch_size=4, use_bfloat16=False)
+    agents = []
+    for index in range(2):
+        actor = StructuredActor(model_config)
+        critic = StructuredCritic(model_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
+        predictor_kwargs = {}
+        if index == 1:
+            predictor = predictor_type(model_config)
+            predictor_kwargs = {
+                predictor_key: predictor,
+                optimizer_key: make_structured_dynamics_optimizer(predictor, ppo_config),
+            }
+        agents.append(
+            TrainingAgent(
+                actor,
+                critic,
+                actor_optimizer,
+                critic_optimizer,
+                **predictor_kwargs,
+            )
+        )
+
+    expected_message = f"cannot mix {predictor_key.replace('_', ' ')} presence"
+    with pytest.raises(ValueError, match=expected_message):
+        save_checkpoint(
+            tmp_path / "mixed.pt",
+            agents=agents,
+            model_config=model_config,
+            ppo_config=ppo_config,
+            iteration=0,
+            next_seed=0,
+            metrics={},
+            source_identity=source_identity(),
+        )
 
 
 def test_latest_alias_atomically_tracks_immutable_regular_checkpoints(tmp_path) -> None:
@@ -253,7 +402,7 @@ def test_latest_alias_atomically_tracks_immutable_regular_checkpoints(tmp_path) 
         write_immutable_checkpoint(first, {"iteration": 99})
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)

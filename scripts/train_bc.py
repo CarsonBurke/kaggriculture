@@ -48,6 +48,7 @@ import numpy as np
 import torch
 
 from kaggriculture.encoding import encode_observation
+from kaggriculture.evaluation import validate_seed_interval
 from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
 from kaggriculture.latent_dynamics import (
     DecodeContext,
@@ -63,6 +64,7 @@ from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.orientation import ORIENTATION_CYCLE, augment_demonstration_rows
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.ppo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
+from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
     ARCHITECTURES,
@@ -71,6 +73,7 @@ from kaggriculture.registry import (
     architecture_of_config,
     resolve_architecture,
 )
+from kaggriculture.rollout import _state_field_specs
 from kaggriculture.structured import (
     StructuredActor,
     StructuredBelief,
@@ -83,7 +86,7 @@ from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.training import replace_checkpoint_alias, write_immutable_checkpoint
 
 SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1,))
-BC_ENCODING_CACHE_FORMAT_VERSION = 1
+BC_ENCODING_CACHE_FORMAT_VERSION = 2
 _ENCODING_SOURCE_FILES = frozenset(
     {
         "src/kaggriculture/actions.py",
@@ -115,14 +118,46 @@ _STRUCTURED_STATE_FIELDS = (
     "unit_tile_gather",
     "unit_tile_gather_valid",
     "products",
+    "animals",
     "crops",
     "farms",
     "town",
 )
 
 
+def _apply_production_model_defaults(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> argparse.Namespace:
+    """Make a production-compatible clone a named, drift-proof CLI choice."""
+    if not args.production_model:
+        args.architecture = args.architecture or CONV_ENTITY
+        return args
+
+    if args.architecture not in (None, PRODUCTION_ARCHITECTURE):
+        parser.error(f"--production-model requires --architecture {PRODUCTION_ARCHITECTURE!r}")
+    args.architecture = PRODUCTION_ARCHITECTURE
+    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
+    expected = architecture.config_class(**production_model_config()).to_dict()
+    conflicts = []
+    for name, value in expected.items():
+        if not hasattr(args, name):
+            continue
+        supplied = getattr(args, name)
+        if supplied is not None and supplied != value:
+            conflicts.append("--" + name.replace("_", "-"))
+        setattr(args, name, value)
+    if conflicts:
+        parser.error(
+            "--production-model owns the production architecture; remove conflicting "
+            + ", ".join(conflicts)
+        )
+    return args
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument(
         "--dataset",
         type=Path,
@@ -145,10 +180,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--production-model",
+        action="store_true",
+        help=(
+            "use the exact production actor architecture and model configuration; "
+            "rejects conflicting model flags so the artifact is always a valid PPO warm start"
+        ),
+    )
+    parser.add_argument(
         "--architecture",
         choices=sorted(ARCHITECTURES),
-        default=CONV_ENTITY,
-        help="actor family to clone; the same episodes are retokenized per family",
+        default=None,
+        help=(
+            f"actor family to clone (default {CONV_ENTITY}); "
+            "--production-model selects the production family"
+        ),
     )
     add_model_config_arguments(parser)
     parser.add_argument(
@@ -345,7 +391,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="intra-op threads for the parent and each encode worker",
     )
-    return parser.parse_args()
+    return _apply_production_model_defaults(parser, parser.parse_args())
 
 
 def _pin_host_threads(threads: int = 1) -> None:
@@ -446,6 +492,13 @@ def _encode_episode_file(
     if cache is not None:
         cached = _cached_episode_arrays(cache, expected)
         if cached is not None:
+            specs = _state_field_specs(architecture_name)
+            for name in state_fields:
+                shape, dtype = specs[name]
+                if cached[name].shape != (len(cached["unit_active"]), *shape) or cached[
+                    name
+                ].dtype != np.dtype(dtype):
+                    raise ValueError(f"{cache}: stale encoded cache shape or dtype for {name}")
             return cached
 
     with np.load(path_text) as archive:
@@ -632,6 +685,9 @@ def load_dataset(
                 f"{directory}: holdout of {holdout_seeds} seeds needs "
                 f"1..{len(seeds) - 1} with {len(seeds)} seeds"
             )
+        records[index]["train_seeds"] = seeds[:-holdout_seeds]
+        records[index]["holdout_seeds"] = seeds[-holdout_seeds:]
+        validate_seed_interval("bc", seeds[0], seeds[-1] - seeds[0] + 1)
         held_out.update((index, seed) for seed in seeds[-holdout_seeds:])
         entries.extend((index, directory, entry) for entry in episodes)
 
@@ -1092,6 +1148,7 @@ def _artifact_payload(
         "source_identity": identity,
         "run_provenance": None,
         "bc_provenance": bc_provenance,
+        "seed_usage": [],
     }
 
 

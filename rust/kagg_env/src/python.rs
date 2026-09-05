@@ -1,10 +1,10 @@
 use crate::core::{
-    BOARD_CHANNELS, BOARD_SIZE, BuiltinAgent, CRITIC_FEATURES, CROP_TOKEN_FIELDS, CROPS,
-    CompactAction, FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig, MARKET_KINDS,
-    MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, PLAYERS, PRODUCT_TOKEN_FIELDS,
-    PRODUCTS, PyRandom, SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS,
-    TOWN_TOKEN_FIELDS, UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES,
-    UNIT_GATHERS, V27State,
+    ANIMAL_TOKEN_FIELDS, ANIMALS, BOARD_CHANNELS, BOARD_SIZE, BuiltinAgent, CRITIC_FEATURES,
+    CROP_TOKEN_FIELDS, CROPS, CompactAction, FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig,
+    MARKET_KINDS, MARKET_QUANTITIES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS,
+    OBSERVATION_SCHEMA_VERSION, PLAYERS, PRODUCT_TOKEN_FIELDS, PRODUCTS, PyRandom, SampledFactors,
+    StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS, UNIT_ACTIONS,
+    UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS, V27State,
 };
 use crate::v27_script::{V27_SOURCE_NAME, V27_SOURCE_SHA256, V27_STEPS};
 use half::f16;
@@ -841,55 +841,107 @@ impl BatchEnv {
                 .map(|(game, actions)| game.step(actions))
                 .collect::<Vec<_>>()
         });
-        let mut rewards = Vec::with_capacity(results.len() * PLAYERS);
-        let mut money = Vec::with_capacity(results.len() * PLAYERS);
-        let mut dones = Vec::with_capacity(results.len());
-        for result in results {
-            rewards.extend(result.rewards);
-            money.extend(result.money);
-            dones.push(result.done);
-        }
-        let output = PyDict::new(py);
-        output.set_item(
-            "rewards",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), rewards)
-                .expect("step reward shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item(
-            "final_money",
-            Array2::from_shape_vec((self.games.len(), PLAYERS), money)
-                .expect("step money shape is internal")
-                .into_pyarray(py),
-        )?;
-        output.set_item("dones", dones.into_pyarray(py))?;
-        let post_potentials: Vec<f32> = self.games.iter().map(Game::post_step_potential).collect();
-        self.potential_cache.copy_from_slice(&post_potentials);
-        let terminal_utilities: Vec<f32> = self
-            .games
-            .iter()
-            .map(|game| {
-                if game.done {
-                    game.terminal_pair_utility()
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        output.set_item(
-            "previous_potentials",
-            Array1::from_vec(previous_potentials).into_pyarray(py),
-        )?;
-        output.set_item(
-            "potentials",
-            Array1::from_vec(post_potentials).into_pyarray(py),
-        )?;
-        output.set_item(
-            "terminal_utilities",
-            Array1::from_vec(terminal_utilities).into_pyarray(py),
-        )?;
-        Ok(output)
+        build_step_output(
+            py,
+            &self.games,
+            results,
+            previous_potentials,
+            &mut self.potential_cache,
+        )
     }
+
+    /// Advance every game with variable-length official submitted-dict unit rows.
+    ///
+    /// Unit rows are ragged `[game][player][submitted unit command]` Python
+    /// lists. They may omit live hands or include commands for nonexistent hands,
+    /// matching the official dict interpreter. Market factors retain the fixed
+    /// policy tensor shape because the engine's unit count, not its market queue,
+    /// is the dimension that can exceed the model.
+    #[pyo3(signature = (unit_actions, market_kinds, market_quantities))]
+    fn step_submitted<'py>(
+        &mut self,
+        py: Python<'py>,
+        unit_actions: Vec<Vec<Vec<u8>>>,
+        market_kinds: PyReadonlyArray3<'py, u8>,
+        market_quantities: PyReadonlyArray3<'py, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (submitted_units, market_actions) =
+            extract_submitted_actions(&self.games, unit_actions, market_kinds, market_quantities)?;
+        let previous_potentials = self.potential_cache.clone();
+        let results = py.detach(|| {
+            self.games
+                .par_iter_mut()
+                .zip(submitted_units.par_iter())
+                .zip(market_actions.par_iter())
+                .map(|((game, units), market)| {
+                    game.step_submitted(market, [units[0].as_slice(), units[1].as_slice()])
+                })
+                .collect::<Vec<_>>()
+        });
+        build_step_output(
+            py,
+            &self.games,
+            results,
+            previous_potentials,
+            &mut self.potential_cache,
+        )
+    }
+}
+
+fn build_step_output<'py>(
+    py: Python<'py>,
+    games: &[Game],
+    results: Vec<StepResult>,
+    previous_potentials: Vec<f32>,
+    potential_cache: &mut [f32],
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut rewards = Vec::with_capacity(results.len() * PLAYERS);
+    let mut money = Vec::with_capacity(results.len() * PLAYERS);
+    let mut dones = Vec::with_capacity(results.len());
+    for result in results {
+        rewards.extend(result.rewards);
+        money.extend(result.money);
+        dones.push(result.done);
+    }
+    let output = PyDict::new(py);
+    output.set_item(
+        "rewards",
+        Array2::from_shape_vec((games.len(), PLAYERS), rewards)
+            .expect("step reward shape is internal")
+            .into_pyarray(py),
+    )?;
+    output.set_item(
+        "final_money",
+        Array2::from_shape_vec((games.len(), PLAYERS), money)
+            .expect("step money shape is internal")
+            .into_pyarray(py),
+    )?;
+    output.set_item("dones", dones.into_pyarray(py))?;
+    let post_potentials: Vec<f32> = games.iter().map(Game::post_step_potential).collect();
+    potential_cache.copy_from_slice(&post_potentials);
+    let terminal_utilities: Vec<f32> = games
+        .iter()
+        .map(|game| {
+            if game.done {
+                game.terminal_pair_utility()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    output.set_item(
+        "previous_potentials",
+        Array1::from_vec(previous_potentials).into_pyarray(py),
+    )?;
+    output.set_item(
+        "potentials",
+        Array1::from_vec(post_potentials).into_pyarray(py),
+    )?;
+    output.set_item(
+        "terminal_utilities",
+        Array1::from_vec(terminal_utilities).into_pyarray(py),
+    )?;
+    Ok(output)
 }
 
 fn allocate_encoded_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
@@ -958,6 +1010,10 @@ fn allocate_structured_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<B
         PyArray3::<f16>::zeros(py, [rows, PRODUCTS, PRODUCT_TOKEN_FIELDS], false),
     )?;
     output.set_item(
+        "animals",
+        PyArray3::<f16>::zeros(py, [rows, ANIMALS, ANIMAL_TOKEN_FIELDS], false),
+    )?;
+    output.set_item(
         "crops",
         PyArray3::<f16>::zeros(py, [rows, CROPS, CROP_TOKEN_FIELDS], false),
     )?;
@@ -1024,6 +1080,11 @@ fn fill_structured_output(
         PyArray3<f16>,
         [rows, PRODUCTS, PRODUCT_TOKEN_FIELDS]
     );
+    let mut animals = output_array!(
+        "animals",
+        PyArray3<f16>,
+        [rows, ANIMALS, ANIMAL_TOKEN_FIELDS]
+    );
     let mut crops = output_array!("crops", PyArray3<f16>, [rows, CROPS, CROP_TOKEN_FIELDS]);
     let mut farms = output_array!("farms", PyArray3<f16>, [rows, PLAYERS, FARM_TOKEN_FIELDS]);
     let mut town = output_array!("town", PyArray2<f16>, [rows, TOWN_TOKEN_FIELDS]);
@@ -1052,6 +1113,9 @@ fn fill_structured_output(
     let products = products
         .as_slice_mut()
         .map_err(|_| non_contiguous("products"))?;
+    let animals = animals
+        .as_slice_mut()
+        .map_err(|_| non_contiguous("animals"))?;
     let crops = crops.as_slice_mut().map_err(|_| non_contiguous("crops"))?;
     let farms = farms.as_slice_mut().map_err(|_| non_contiguous("farms"))?;
     let town = town.as_slice_mut().map_err(|_| non_contiguous("town"))?;
@@ -1062,6 +1126,7 @@ fn fill_structured_output(
     const UNIT_CONTINUOUS_VALUES: usize = MAX_UNITS * UNIT_CONTINUOUS;
     const UNIT_GATHER_VALUES: usize = MAX_UNITS * UNIT_GATHERS;
     const PRODUCT_VALUES: usize = PRODUCTS * PRODUCT_TOKEN_FIELDS;
+    const ANIMAL_VALUES: usize = ANIMALS * ANIMAL_TOKEN_FIELDS;
     const CROP_VALUES: usize = CROPS * CROP_TOKEN_FIELDS;
     const FARM_VALUES: usize = PLAYERS * FARM_TOKEN_FIELDS;
     py.detach(|| {
@@ -1076,7 +1141,10 @@ fn fill_structured_output(
             .zip(products.par_chunks_mut(PRODUCT_VALUES))
             .zip(crops.par_chunks_mut(CROP_VALUES))
             .zip(farms.par_chunks_mut(FARM_VALUES))
-            .zip(town.par_chunks_mut(TOWN_TOKEN_FIELDS))
+            .zip(
+                town.par_chunks_mut(TOWN_TOKEN_FIELDS)
+                    .zip(animals.par_chunks_mut(ANIMAL_VALUES)),
+            )
             .enumerate()
             .for_each(
                 |(
@@ -1107,12 +1175,13 @@ fn fill_structured_output(
                             ),
                             farms,
                         ),
-                        town,
+                        (town, animals),
                     ),
                 )| {
                     let mut tile_continuous_f32 = [0.0f32; TILE_CONTINUOUS_VALUES];
                     let mut unit_continuous_f32 = [0.0f32; UNIT_CONTINUOUS_VALUES];
                     let mut products_f32 = [0.0f32; PRODUCT_VALUES];
+                    let mut animals_f32 = [0.0f32; ANIMAL_VALUES];
                     let mut crops_f32 = [0.0f32; CROP_VALUES];
                     let mut farms_f32 = [0.0f32; FARM_VALUES];
                     let mut town_f32 = [0.0f32; TOWN_TOKEN_FIELDS];
@@ -1126,6 +1195,7 @@ fn fill_structured_output(
                         unit_tile_gather,
                         unit_tile_gather_valid,
                         &mut products_f32,
+                        &mut animals_f32,
                         &mut crops_f32,
                         &mut farms_f32,
                         &mut town_f32,
@@ -1137,6 +1207,9 @@ fn fill_structured_output(
                         *target = f16::from_f32(value);
                     }
                     for (target, value) in products.iter_mut().zip(products_f32) {
+                        *target = f16::from_f32(value);
+                    }
+                    for (target, value) in animals.iter_mut().zip(animals_f32) {
                         *target = f16::from_f32(value);
                     }
                     for (target, value) in crops.iter_mut().zip(crops_f32) {
@@ -1541,6 +1614,99 @@ fn builtin_rng(game: &Game, player: usize) -> PyRandom {
     )
 }
 
+fn validate_submitted_unit_actions(
+    games: &[Game],
+    unit_actions: &[Vec<Vec<u8>>],
+) -> Result<(), String> {
+    if unit_actions.len() != games.len() {
+        return Err(format!(
+            "unit_actions has {} games, expected {}",
+            unit_actions.len(),
+            games.len()
+        ));
+    }
+    for (game_index, players) in unit_actions.iter().enumerate() {
+        if players.len() != PLAYERS {
+            return Err(format!(
+                "unit_actions[{game_index}] has {} player rows, expected {PLAYERS}",
+                players.len()
+            ));
+        }
+        for (player, actions) in players.iter().enumerate() {
+            if let Some((unit, action)) = actions
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, action)| usize::from(*action) >= UNIT_ACTIONS)
+            {
+                return Err(format!(
+                    "unit_actions[{game_index}][{player}][{unit}] is {action}, expected 0..{}",
+                    UNIT_ACTIONS - 1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+type SubmittedActions = (Vec<[Vec<u8>; PLAYERS]>, Vec<[CompactAction; PLAYERS]>);
+
+fn extract_submitted_actions(
+    games: &[Game],
+    unit_actions: Vec<Vec<Vec<u8>>>,
+    market_kinds: PyReadonlyArray3<'_, u8>,
+    market_quantities: PyReadonlyArray3<'_, u8>,
+) -> PyResult<SubmittedActions> {
+    validate_submitted_unit_actions(games, &unit_actions).map_err(PyValueError::new_err)?;
+    let expected_market = [games.len(), PLAYERS, MAX_MARKET_ORDERS];
+    if market_kinds.shape() != expected_market || market_quantities.shape() != expected_market {
+        return Err(PyValueError::new_err(format!(
+            "market factor shapes {:?}/{:?}, expected {expected_market:?}",
+            market_kinds.shape(),
+            market_quantities.shape()
+        )));
+    }
+
+    let submitted = unit_actions
+        .into_iter()
+        .map(|players| {
+            players
+                .try_into()
+                .expect("submitted unit rows were validated above")
+        })
+        .collect();
+
+    let kinds = market_kinds.as_array();
+    let quantities = market_quantities.as_array();
+    let mut market_actions = Vec::with_capacity(games.len());
+    for game in 0..games.len() {
+        let mut rows = [CompactAction::default(); PLAYERS];
+        for player in 0..PLAYERS {
+            rows[player].external = true;
+            for slot in 0..MAX_MARKET_ORDERS {
+                let kind = kinds[[game, player, slot]];
+                let quantity = quantities[[game, player, slot]];
+                if usize::from(kind) >= MARKET_KINDS {
+                    return Err(PyValueError::new_err(format!(
+                        "market_kinds[{game}][{player}][{slot}] is {kind}, expected 0..{}",
+                        MARKET_KINDS - 1
+                    )));
+                }
+                if usize::from(quantity) >= MARKET_QUANTITIES {
+                    return Err(PyValueError::new_err(format!(
+                        "market_quantities[{game}][{player}][{slot}] is {quantity}, expected 0..{}",
+                        MARKET_QUANTITIES - 1
+                    )));
+                }
+                rows[player].market_kinds[slot] = kind;
+                rows[player].market_quantities[slot] = quantity;
+            }
+        }
+        market_actions.push(rows);
+    }
+    Ok((submitted, market_actions))
+}
+
 fn extract_compact_actions(
     games: usize,
     unit_actions: PyReadonlyArray3<'_, u8>,
@@ -1683,6 +1849,7 @@ fn fill_sample_step_output(
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<BatchEnv>()?;
+    module.add("OBSERVATION_SCHEMA_VERSION", OBSERVATION_SCHEMA_VERSION)?;
     module.add("MAX_UNITS", MAX_UNITS)?;
     module.add("MAX_MARKET_ORDERS", MAX_MARKET_ORDERS)?;
     module.add("N_UNIT_ACTIONS", UNIT_ACTIONS)?;
@@ -1696,4 +1863,30 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("V27_SOURCE_NAME", V27_SOURCE_NAME)?;
     module.add("V27_STEPS", V27_STEPS)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submitted_unit_rows_accept_omitted_and_excess_hand_commands() {
+        let game = Game::new(0, GameConfig::default());
+        let actions = vec![vec![vec![], vec![0, 45]]];
+
+        assert_eq!(validate_submitted_unit_actions(&[game], &actions), Ok(()));
+    }
+
+    #[test]
+    fn submitted_unit_rows_reject_shape_and_action_range_errors() {
+        let game = Game::new(0, GameConfig::default());
+        assert!(validate_submitted_unit_actions(std::slice::from_ref(&game), &[]).is_err());
+        assert!(
+            validate_submitted_unit_actions(std::slice::from_ref(&game), &[vec![vec![0]]]).is_err()
+        );
+        assert!(
+            validate_submitted_unit_actions(&[game], &[vec![vec![UNIT_ACTIONS as u8], vec![0]]],)
+                .is_err()
+        );
+    }
 }

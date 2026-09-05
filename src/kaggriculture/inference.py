@@ -20,6 +20,11 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 13 adds a critic-side structured dynamics predictor and its optimizer
+# to full recovery checkpoints. Both dynamics modules remain training-only, so
+# actor export can still read version 12 as well as the new format without
+# carrying either predictor forward.
+#
 # Version 12 records each member's `orientation`: the grid symmetry its
 # observations were rendered through during training. Acting under anything
 # else shows the weights a world they never saw, so evaluation and submission
@@ -54,12 +59,11 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 12
-# Versions before 12 carry no orientation code. On the actor-only read path
-# their payloads are otherwise unchanged, so the legacy versions stay readable
-# with orientation defaulting to IDENTITY -- which is what those runs played
-# under -- while resume above refuses them.
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11))
+CHECKPOINT_FORMAT_VERSION = 13
+# Versions before 13 remain readable on the actor-only path because the recovery
+# additions do not change actor weights or model configuration. Resume demands
+# the current version exactly and never guesses absent training state.
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
@@ -181,6 +185,11 @@ def actor_artifact_from_checkpoint(
         "metrics": checkpoint.get("metrics", {}),
         "source_identity": identity,
         "run_provenance": run_provenance,
+        **{
+            key: checkpoint[key]
+            for key in ("seed_usage", "bc_provenance", "initial_actor")
+            if key in checkpoint
+        },
         # Evaluation is the real board. A stored member code is history.
         "orientation": int(Orientation.IDENTITY),
     }
@@ -378,50 +387,7 @@ class CheckpointAgent:
                 orientation=self.orientation,
                 quantity_heads=self.quantity_heads,
             ).actions
-        return [
-            clear_standing_weeds(observation, action)
-            for observation, action in zip(observations, actions, strict=True)
-        ]
+        return actions
 
     def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
         return self.act_many([observation])[0]
-
-
-def _tile_at(farm: dict[str, Any], position: Any) -> Any:
-    if not isinstance(position, (list, tuple)) or len(position) < 2:
-        return None
-    tiles = farm.get("tiles") or []
-    y = int(position[1])
-    x = int(position[0])
-    if y < 0 or y >= len(tiles) or x < 0 or x >= len(tiles[y]):
-        return None
-    return tiles[y][x]
-
-
-def _is_weed(tile: Any) -> bool:
-    return isinstance(tile, dict) and tile.get("kind") == "WEED"
-
-
-def clear_standing_weeds(observation: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
-    """Force DIG for every live unit standing on a weed.
-
-    Mutates and returns ``action``. Units the engine will not execute this
-    turn are left alone: a leftover hand command on a missing unit is not
-    a standing tile.
-    """
-    player = int(observation.get("player", 0) or 0)
-    farms = observation.get("farms") or []
-    if player >= len(farms) or not isinstance(action, dict):
-        return action
-    farm = farms[player]
-    if _is_weed(_tile_at(farm, farm.get("farmer"))):
-        action["farmer"] = ["DIG"]
-    hands = list(action.get("hands") or [])
-    positions = list(farm.get("hands") or [])
-    for index, position in enumerate(positions):
-        if index >= len(hands):
-            break
-        if _is_weed(_tile_at(farm, position)):
-            hands[index] = ["DIG"]
-    action["hands"] = hands
-    return action

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pytest
 from kaggle_environments import make
 
 from kaggriculture.constants import (
+    ANIMAL_COST,
+    ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
     MAX_UNITS,
     PRIVATE_ITEMS,
     PRODUCTS,
+    SHED_CAPACITY,
     TURNS_PER_DAY,
     shed_access_tiles,
 )
 from kaggriculture.encoding import encode_observation
 from kaggriculture.tokens import (
+    ANIMAL_TOKEN_FIELDS,
     FARM_IDENTITIES,
     N_TILE_CATEGORICAL,
     N_TILE_CONTINUOUS,
@@ -28,6 +34,7 @@ from kaggriculture.tokens import (
     TILE_OCCUPANTS,
     UNIT_TILE_GATHERS,
     clock_features,
+    encode_structured_observation,
     tokenize_economy,
     tokenize_farm_tiles,
     tokenize_units,
@@ -323,3 +330,56 @@ def test_clock_features_are_bounded_and_phase_consistent() -> None:
     assert np.isclose(features[2] + features[3], 1.0)
     start = clock_features({"day": 0, "hour": 0, "step": 0})
     assert start[2] == 0.0 and start[3] == 1.0
+
+
+def test_animal_stock_and_public_units_preserve_actor_critic_information_boundary() -> None:
+    observation = {
+        "player": 0,
+        "farms": [
+            {"tiles": [], "farmer": [4, 4], "hands": []},
+            {"tiles": [], "farmer": [5, 5], "hands": [[3, 3], [3, 3]]},
+        ],
+        "private": {"shed": {}, "inventories": [{}]},
+    }
+    hidden = {"shed": {}, "inventories": [{}, {}, {}]}
+    baseline = encode_structured_observation(observation, hidden)
+    own = deepcopy(observation)
+    own["private"]["shed"]["GOOSE"] = 3
+    own["private"]["inventories"][0]["COW"] = 2
+    changed = encode_structured_observation(own, hidden)
+    assert changed.animals.shape == (len(ANIMALS), len(ANIMAL_TOKEN_FIELDS))
+    assert changed.animals[ANIMALS.index("GOOSE"), 1] == np.float16(3 / SHED_CAPACITY)
+    assert changed.animals[ANIMALS.index("COW"), 2] == np.float16(2 / SHED_CAPACITY)
+    assert not np.array_equal(changed.animals, baseline.animals)
+    np.testing.assert_array_equal(changed.products, baseline.products)
+    np.testing.assert_array_equal(
+        changed.animals[:, 0],
+        np.asarray(
+            [ANIMAL_COST[item] / max(ANIMAL_COST.values()) for item in ANIMALS], dtype=np.float16
+        ),
+    )
+
+    moved = deepcopy(observation)
+    moved["farms"][1]["farmer"] = [5, 4]
+    moved["farms"][1]["hands"][0] = [3, 4]
+    public = encode_structured_observation(moved, hidden)
+    assert not np.array_equal(public.tile_continuous, baseline.tile_continuous)
+    tiles = baseline.tile_continuous[TILE_COUNT:]
+    assert tiles[5 * BOARD_SIZE + 5, _FIELD["farmer_present"]] == 1
+    assert tiles[3 * BOARD_SIZE + 3, _FIELD["hand_count"]] == np.float16(2 / (MAX_UNITS - 1))
+    assert public.tile_continuous[
+        TILE_COUNT + 3 * BOARD_SIZE + 3, _FIELD["hand_count"]
+    ] == np.float16(1 / (MAX_UNITS - 1))
+
+    hidden["shed"]["GOOSE"] = 5
+    hidden["inventories"][1]["SHEEP"] = 2
+    private_changed = encode_structured_observation(observation, hidden)
+    for name in baseline.__dataclass_fields__:
+        if not name.startswith(("critic_", "opponent_")):
+            np.testing.assert_array_equal(getattr(private_changed, name), getattr(baseline, name))
+    assert private_changed.critic_animals[ANIMALS.index("GOOSE"), 0] == np.float16(
+        5 / SHED_CAPACITY
+    )
+    assert private_changed.critic_animals[ANIMALS.index("SHEEP"), 1] == np.float16(
+        2 / SHED_CAPACITY
+    )

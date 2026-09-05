@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Append diagnostic external-opponent evaluations of one league snapshot.
+"""Append diagnostic external-opponent evaluations of one provenance-bound actor.
 
-The training loop launches this worker on CPU after freezing a league
-snapshot, so the learner's absolute strength against public reference
+The training loop launches this worker after committing a full checkpoint,
+so the learner's absolute strength against public reference
 agents lands in the run's journal without stalling the GPU. Records are
 diagnostics for steering training; they are never selection or calibration
 evidence — finalist evaluation stays with evaluate_checkpoint.py and its
@@ -15,8 +15,9 @@ import argparse
 import io
 import json
 import math
+import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,17 +25,20 @@ from typing import Any
 
 import torch
 
+from kaggriculture.evaluation import (
+    DEVELOPMENT_SEED_START,
+    SCORE_CONFIDENCE,
+    artifact_seed_usage,
+    bounded_mean_interval,
+    seed_protocol,
+)
 from kaggriculture.inference import (
     actor_artifact_from_checkpoint,
     checkpoint_orientation,
     cpu_portable_actor,
     load_actor_artifact,
 )
-from kaggriculture.league import (
-    load_actor_snapshot,
-    load_actor_snapshot_payload,
-    snapshot_sha256,
-)
+from kaggriculture.league import snapshot_sha256
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch
@@ -72,8 +76,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help=(
-            "immutable actor source to evaluate: a league snapshot for a single-learner "
-            "run, or a durable training checkpoint when --agents names members"
+            "provenance-bound BC/exported actor or durable training checkpoint; "
+            "--agents selects population members. Bare league snapshots are not evidence"
         ),
     )
     parser.add_argument("--iteration", type=int, required=True)
@@ -94,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         help="comma-separated built-in names, v27 aliases, or agent file paths",
     )
     parser.add_argument("--seeds", type=int, default=2, help="seed pairs per opponent")
-    parser.add_argument("--seed-start", type=int, default=0)
+    parser.add_argument("--seed-start", type=int, default=DEVELOPMENT_SEED_START)
     parser.add_argument("--episode-steps", type=int, default=720)
     parser.add_argument("--torch-threads", type=int, default=2)
     return parser.parse_args()
@@ -190,6 +194,21 @@ def evaluate_opponent(
         "deterministic": True,
         "episode_steps": episode_steps,
         "seed_start": seeds.start,
+        "seed_count": len(seeds),
+        "seed_clusters": len(seeds) if len(completed) == len(outcomes) else 0,
+        "score_confidence": SCORE_CONFIDENCE,
+        "score_rate_95ci": (
+            list(
+                bounded_mean_interval(
+                    [
+                        (outcomes[index].score + outcomes[index + 1].score) / 2
+                        for index in range(0, len(outcomes), 2)
+                    ]
+                )
+            )
+            if len(completed) == len(outcomes)
+            else None
+        ),
         "games": len(outcomes),
         "completed_games": len(completed),
         "money_mean": (
@@ -214,18 +233,45 @@ def evaluate_opponent(
 
 
 def append_record(output: Path, record: dict[str, Any]) -> str:
-    """Append one JSONL line to the diagnostics journal.
+    """Atomically append and durably flush one JSONL journal record.
 
-    The launcher runs at most one worker per training process, but a
-    crash-and-resume can replay a probe and an orphaned worker from a killed
-    run may still be appending. Readers must deduplicate last-wins on
-    ``(iteration, opponent)`` and tolerate a torn trailing line.
+    A crash-and-resume can replay a probe while an orphaned worker is still
+    exiting. ``O_APPEND`` plus one ``write`` keeps each row indivisible across
+    those processes; fsync makes the terminal completion row a durable
+    acknowledgement of all rows written before it.
     """
     rendered = json.dumps(record, sort_keys=True, allow_nan=False)
+    payload = (rendered + "\n").encode()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("a", encoding="utf-8") as stream:
-        stream.write(rendered + "\n")
+    descriptor = os.open(output, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise OSError(f"short external-eval journal write: {written} of {len(payload)} bytes")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return rendered
+
+
+def completion_record(
+    *,
+    iteration: int,
+    artifact_name: str,
+    artifact_digest: str,
+    members: Sequence[int | None],
+    opponents: Sequence[str],
+) -> dict[str, Any]:
+    """Describe the exact Cartesian probe set committed by this worker."""
+    return {
+        "event": "external_eval_complete",
+        "iteration": iteration,
+        "artifact": artifact_name,
+        "artifact_sha256": artifact_digest,
+        "members": list(members),
+        "opponents": list(opponents),
+        "records": len(members) * len(opponents),
+    }
 
 
 def _members(spec: str) -> list[int | None]:
@@ -249,37 +295,15 @@ def _members(spec: str) -> list[int | None]:
 
 
 def _load_member(artifact: Path, member: int | None) -> tuple[Any, Orientation]:
-    """Load one actor and the orientation it must play under.
+    """Load a provenance-bound actor in its recorded board orientation.
 
-    A population checkpoint holds a list of members and cannot answer "the
-    actor" at all, which is why an index is demanded rather than defaulted --
-    silently evaluating member 0 and reporting it as the run's strength is the
-    failure that refuses. Without an index the file is either a league snapshot
-    or an exported actor artifact, and the two are told apart by the snapshot's
-    own closed key set rather than by a filename or a caller's promise: a
-    snapshot carries exactly `format_version`/`iteration`/`model_config`/`actor`
-    plus an optional `architecture`, while a BC or submission artifact adds
-    provenance and metrics. Both must load here, because the A/B this probe
-    measures compares a BC artifact against a trained snapshot. Every shape
-    reads its member's recorded orientation -- a member trained under a mirror
-    scores differently when probed upright, and the difference would look like
-    drift in the weights rather than a rendering mismatch.
+    Population checkpoints require a member index. Bare league snapshots carry
+    no training-map exposure and are training opponents, not evaluation inputs.
     """
     payload = torch.load(artifact, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"actor file is not a dictionary: {artifact}")
-    snapshot_keys = {"format_version", "iteration", "model_config", "actor"}
-    is_snapshot = snapshot_keys <= set(payload) and not set(payload) - snapshot_keys - {
-        "architecture"
-    }
-    if is_snapshot:
-        validated = load_actor_snapshot_payload(artifact)
-        if member is not None:
-            raise ValueError("league snapshot holds a single actor and cannot select a member")
-        snapshot_config = validated["model_config"]
-        if isinstance(snapshot_config, Mapping) and snapshot_config.get("fused_mlp", False):
-            return cpu_portable_actor(validated), Orientation.IDENTITY
-        return load_actor_snapshot(artifact), Orientation.IDENTITY
+    artifact_seed_usage(payload)
     model_config = payload.get("model_config")
     if isinstance(model_config, Mapping) and model_config.get("fused_mlp", False):
         orientation = checkpoint_orientation(payload, agent=member)
@@ -330,13 +354,22 @@ def main() -> None:
     opponents = [normalize_opponent(spec) for spec in args.opponents.split(",") if spec]
     if not opponents:
         raise ValueError("at least one opponent is required")
+    labels = [label for label, _runnable in opponents]
+    if len(set(labels)) != len(labels):
+        raise ValueError("external evaluation opponents must have distinct journal labels")
     members = _members(args.agents)
     digest = snapshot_sha256(args.artifact)
+    payload = torch.load(args.artifact, map_location="cpu", weights_only=False, mmap=True)
+    protocol = seed_protocol(
+        "development",
+        args.seed_start,
+        args.seeds,
+        usage=artifact_seed_usage(payload),
+    )
 
     for member in members:
         actor, orientation = _load_member(args.artifact, member)
         actor = actor.eval()
-
         agent = _agent_for(actor, orientation)
 
         for label, runnable in opponents:
@@ -351,7 +384,22 @@ def main() -> None:
                 seeds=range(args.seed_start, args.seed_start + args.seeds),
                 episode_steps=args.episode_steps,
             )
+            record["seed_protocol"] = protocol
             print(append_record(args.output, record), flush=True)
+            if record["completed_games"] != record["games"]:
+                raise RuntimeError(
+                    f"external evaluation incomplete for member {member}, opponent {label}: "
+                    f"{record['completed_games']} of {record['games']} games completed"
+                )
+
+    completed = completion_record(
+        iteration=args.iteration,
+        artifact_name=args.artifact.name,
+        artifact_digest=digest,
+        members=members,
+        opponents=labels,
+    )
+    print(append_record(args.output, completed), flush=True)
 
 
 if __name__ == "__main__":

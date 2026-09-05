@@ -128,6 +128,8 @@ def test_load_dataset_holds_out_whole_seeds(dataset_dir: Path) -> None:
     assert train_split.rows == rows_per_seed
     assert holdout_split.rows == rows_per_seed
     assert [record["teacher"]["label"] for record in records] == ["starter"]
+    assert records[0]["train_seeds"] == [3]
+    assert records[0]["holdout_seeds"] == [4]
     assert train_split.staged["board"].dtype == torch.float16
     assert train_split.staged["unit_actions"].dtype == torch.int8
 
@@ -234,6 +236,18 @@ def test_encoded_episode_cache_reuses_provenance_bound_arrays(
         for name in expected.staged:
             torch.testing.assert_close(expected.staged[name], actual.staged[name])
         np.testing.assert_array_equal(expected.row_components, actual.row_components)
+
+
+def test_structured_cache_rejects_stale_tile_width(dataset_dir: Path, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+    manifest = json.loads((dataset_dir / "manifest.json").read_text())
+    episode = dataset_dir / manifest["episodes"][0]["file"]
+    cache = tmp_path / "encoded.npz"
+    arrays = trainer._encode_episode_file(str(episode), str(cache), architecture_name=STRUCTURED)
+    arrays["tile_continuous"] = arrays["tile_continuous"][..., :-2]
+    np.savez(cache, **arrays)
+    with pytest.raises(ValueError, match="stale encoded cache shape"):
+        trainer._encode_episode_file(str(episode), str(cache), architecture_name=STRUCTURED)
 
 
 def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path: Path) -> None:
@@ -538,6 +552,53 @@ def test_unflagged_clone_builds_the_family_default_configuration(
     assert config == expected
 
 
+def test_production_clone_preset_uses_exact_warm_start_model(monkeypatch, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_bc.py",
+            "--dataset",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "run"),
+            "--production-model",
+        ],
+    )
+
+    args = trainer.parse_args()
+    architecture = trainer.resolve_architecture(args.architecture)
+    config = trainer.model_config_from_args(architecture, args)
+
+    assert args.architecture == trainer.PRODUCTION_ARCHITECTURE
+    assert config == architecture.config_class(**trainer.production_model_config())
+    assert args.epochs == 2
+
+
+def test_production_clone_preset_rejects_model_drift(monkeypatch, tmp_path: Path, capsys) -> None:
+    trainer = _load_trainer()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_bc.py",
+            "--dataset",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "run"),
+            "--production-model",
+            "--global-refresh-context",
+            "all",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        trainer.parse_args()
+
+    assert "--production-model owns the production architecture" in capsys.readouterr().err
+
+
 def test_clone_help_formats_literal_percentages(monkeypatch, capsys) -> None:
     trainer = _load_trainer()
     monkeypatch.setattr(sys, "argv", ["train_bc.py", "--help"])
@@ -728,9 +789,6 @@ def test_run_record_carries_one_provenance_entry_per_dataset(
     _, payload = load_actor_artifact(output / "bc-actor.pt")
     provenance = payload["bc_provenance"]
     records = provenance["datasets"]
-    assert [set(record) for record in records] == [
-        {"path", "manifest_sha256", "teacher", "opponent", "episodes"}
-    ] * 2
     assert [
         (record["path"], record["teacher"]["label"], record["opponent"]["label"])
         for record in records

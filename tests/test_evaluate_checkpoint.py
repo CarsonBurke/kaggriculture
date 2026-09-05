@@ -341,6 +341,7 @@ def test_artifact_validation_accepts_saved_training_checkpoint(tmp_path: Path) -
             "critic": {"ignored_by_evaluation": torch.tensor(1.0)},
             "iteration": 17,
             "source_identity": source_identity(),
+            "seed_usage": [],
         },
         checkpoint,
     )
@@ -356,6 +357,8 @@ def test_artifact_validation_accepts_saved_training_checkpoint(tmp_path: Path) -
 
 def test_finalist_selection_evidence_binds_exact_promoted_bytes(tmp_path: Path) -> None:
     evaluator = _load_evaluator()
+    from kaggriculture.evaluation import seed_protocol
+
     artifact = tmp_path / "best.pt"
     artifact.write_bytes(b"checkpoint")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -372,10 +375,18 @@ def test_finalist_selection_evidence_binds_exact_promoted_bytes(tmp_path: Path) 
                 "valid_for_selection": True,
                 "best_output": "/a/different/machine/best.pt",
                 "best_output_sha256": digest,
+                "best_agent": None,
                 "source_identity": source_identity(),
                 "run_provenance": None,
                 "seed_start": 10_000_000,
                 "seed_count": 32,
+                "seed_protocol": seed_protocol("screening", 10_000_000, 32, usage=[]),
+                "statistical_selection": {
+                    "protocol": "archive_screening_then_untouched_finalist",
+                    "candidate_count": 2,
+                    "finalist_required": True,
+                    "candidate_frozen_before_finalist": True,
+                },
                 "opponent_provenance": {
                     "public-v27": {
                         "kind": "python_file",
@@ -397,6 +408,16 @@ def test_finalist_selection_evidence_binds_exact_promoted_bytes(tmp_path: Path) 
     with pytest.raises(ValueError, match="bytes"):
         evaluator._selection_provenance(report, provenance | {"sha256": "0" * 64})
 
+    population_report = json.loads(report.read_text(encoding="utf-8"))
+    population_report["best_agent"] = 0
+    report.write_text(json.dumps(population_report), encoding="utf-8")
+    member_zero = provenance | {"agent": 0}
+    binding = evaluator._selection_provenance(report, member_zero)
+    assert binding["best_agent"] == 0
+    assert evaluator._selection_agent(report) == 0
+    with pytest.raises(ValueError, match="different population member"):
+        evaluator._selection_provenance(report, provenance | {"agent": 1})
+
 
 def test_json_rendering_is_strict_finite_and_accepts_numpy_scalars() -> None:
     evaluator = _load_evaluator()
@@ -417,3 +438,13 @@ def test_game_payload_preserves_original_field_names() -> None:
     assert payload["seat"] == payload["candidate_seat"] == 1
     assert payload["reward"] == payload["candidate_reward"] == 17.0
     assert payload["status"] == payload["candidate_status"] == "DONE"
+
+
+def test_unanimous_panel_has_nonzero_seed_cluster_uncertainty() -> None:
+    evaluator = _load_evaluator()
+    rows = [_result(evaluator, seed, seat, 10.0, 0.0) for seed in range(32) for seat in (0, 1)]
+    summary = evaluator.summarize(rows, 32)
+    assert summary["seed_clusters"] == 32
+    low, high = summary["score_rate_95ci"]
+    assert 0 < low < high == 1
+    assert low == pytest.approx(1 - (np.log(40) / 64) ** 0.5)

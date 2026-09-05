@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from kaggriculture.constants import (
+    ANIMAL_COST,
     ANIMAL_FIRST_YIELD_DAY,
     ANIMAL_MAX_HELD,
     ANIMALS,
@@ -42,6 +43,7 @@ from kaggriculture.constants import (
 )
 
 TILE_COUNT = BOARD_SIZE * BOARD_SIZE
+OBSERVATION_SCHEMA_VERSION = 2
 
 # Categorical vocabularies. Index 0 of the occupant vocabulary is the "no
 # occupant" value so embeddings for absent fields are learned, not
@@ -84,6 +86,8 @@ TILE_CONTINUOUS_FIELDS = (
     "corner",
     "shed_distance",  # Manhattan distance to nearest shed-access tile / max
     "shed_access",  # exactly on a shed-access tile
+    "farmer_present",  # public farmer position, for both farms
+    "hand_count",  # public hands on this tile / (MAX_UNITS - 1)
 )
 N_TILE_CATEGORICAL = len(TILE_CATEGORICAL_FIELDS)
 N_TILE_CONTINUOUS = len(TILE_CONTINUOUS_FIELDS)
@@ -136,6 +140,14 @@ def tokenize_farm_tiles(farm: dict, day: int, step: int, *, opponent: bool) -> T
     categorical = np.zeros((TILE_COUNT, N_TILE_CATEGORICAL), dtype=np.int64)
     continuous = np.zeros((TILE_COUNT, N_TILE_CONTINUOUS), dtype=np.float32)
     farm_identity = int(opponent)
+    farmer = farm.get("farmer")
+    if farmer is not None:
+        x, y = map(int, farmer)
+        continuous[y * BOARD_SIZE + x, _FIELD["farmer_present"]] = 1.0
+    hand_counts = np.zeros(TILE_COUNT, dtype=np.int32)
+    for x, y in farm.get("hands") or []:
+        hand_counts[int(y) * BOARD_SIZE + int(x)] += 1
+    continuous[:, _FIELD["hand_count"]] = hand_counts / float(MAX_UNITS - 1)
 
     for y in range(BOARD_SIZE):
         for x in range(BOARD_SIZE):
@@ -336,6 +348,11 @@ PRODUCT_TOKEN_FIELDS = (
     "shed_stock",  # own shed count / SHED_CAPACITY
     "carried_stock",  # summed across own units / SHED_CAPACITY
 )
+ANIMAL_TOKEN_FIELDS = (
+    "purchase_price",  # ANIMAL_COST / max ANIMAL_COST; animals have no market quote
+    "shed_stock",  # own shed count / SHED_CAPACITY
+    "carried_stock",  # summed across own units / SHED_CAPACITY
+)
 CROP_TOKEN_FIELDS = (
     "seed_cost",  # SEED_COST / max SEED_COST
     "seeds_held",  # own private seed count / SHED_CAPACITY
@@ -367,6 +384,10 @@ PRODUCT_PRIVATE_FIELDS = (
     "opponent_shed_stock",  # opponent shed count / SHED_CAPACITY
     "opponent_carried_stock",  # summed across opponent units / SHED_CAPACITY
 )
+ANIMAL_PRIVATE_FIELDS = (
+    "opponent_shed_stock",
+    "opponent_carried_stock",
+)
 CROP_PRIVATE_FIELDS = ("opponent_seeds_held",)  # opponent seeds / SHED_CAPACITY
 
 
@@ -375,6 +396,7 @@ class EconomyTokens:
     """Market, crop, farm-summary, and town/clock tokens for one viewpoint."""
 
     products: np.ndarray  # [len(PRODUCTS), len(PRODUCT_TOKEN_FIELDS)] float32
+    animals: np.ndarray  # [len(ANIMALS), len(ANIMAL_TOKEN_FIELDS)] float32
     crops: np.ndarray  # [len(CROPS), len(CROP_TOKEN_FIELDS)] float32
     farms: np.ndarray  # [2, len(FARM_TOKEN_FIELDS)] float32, own farm first
     town: np.ndarray  # [len(TOWN_TOKEN_FIELDS)] float32
@@ -399,7 +421,7 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
     seeds = private.get("seeds") or {}
     carried = {
         item: sum(int(unit.get(item, 0) or 0) for unit in private.get("inventories") or [])
-        for item in PRODUCTS
+        for item in (*PRODUCTS, *ANIMALS)
     }
     max_base_price = float(max(BASE_PRICE.values()))
 
@@ -413,6 +435,18 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 carried[item] / SHED_CAPACITY,
             )
             for item in PRODUCTS
+        ],
+        dtype=np.float32,
+    )
+    max_animal_cost = float(max(ANIMAL_COST.values()))
+    animals = np.asarray(
+        [
+            (
+                ANIMAL_COST[animal] / max_animal_cost,
+                float(shed.get(animal, 0) or 0) / SHED_CAPACITY,
+                carried[animal] / SHED_CAPACITY,
+            )
+            for animal in ANIMALS
         ],
         dtype=np.float32,
     )
@@ -453,19 +487,22 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
     )
     return EconomyTokens(
         products=products,
+        animals=animals,
         crops=crops,
         farms=np.asarray(farm_rows, dtype=np.float32),
         town=town,
     )
 
 
-def opponent_economy_columns(opponent_private: dict) -> tuple[np.ndarray, np.ndarray]:
+def opponent_economy_columns(
+    opponent_private: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Critic-only columns from the opponent's private shed, hands, and seeds."""
     shed = opponent_private.get("shed") or {}
     seeds = opponent_private.get("seeds") or {}
     carried = {
         item: sum(int(unit.get(item, 0) or 0) for unit in opponent_private.get("inventories") or [])
-        for item in PRODUCTS
+        for item in (*PRODUCTS, *ANIMALS)
     }
     products = np.asarray(
         [
@@ -474,11 +511,18 @@ def opponent_economy_columns(opponent_private: dict) -> tuple[np.ndarray, np.nda
         ],
         dtype=np.float32,
     )
+    animals = np.asarray(
+        [
+            (float(shed.get(item, 0) or 0) / SHED_CAPACITY, carried[item] / SHED_CAPACITY)
+            for item in ANIMALS
+        ],
+        dtype=np.float32,
+    )
     crops = np.asarray(
         [(float(seeds.get(crop, 0) or 0) / SHED_CAPACITY,) for crop in CROPS],
         dtype=np.float32,
     )
-    return products, crops
+    return products, animals, crops
 
 
 @dataclass(frozen=True)
@@ -499,10 +543,12 @@ class StructuredObservation:
     unit_tile_gather: np.ndarray  # [MAX_UNITS, 5] int8
     unit_tile_gather_valid: np.ndarray  # [MAX_UNITS, 5] bool
     products: np.ndarray  # [len(PRODUCTS), len(PRODUCT_TOKEN_FIELDS)] float16
+    animals: np.ndarray  # [len(ANIMALS), len(ANIMAL_TOKEN_FIELDS)] float16
     crops: np.ndarray  # [len(CROPS), len(CROP_TOKEN_FIELDS)] float16
     farms: np.ndarray  # [2, len(FARM_TOKEN_FIELDS)] float16
     town: np.ndarray  # [len(TOWN_TOKEN_FIELDS)] float16
     critic_products: np.ndarray | None  # [len(PRODUCTS), 2] float16
+    critic_animals: np.ndarray | None  # [len(ANIMALS), 2] float16
     critic_crops: np.ndarray | None  # [len(CROPS), 1] float16
     opponent_unit_categorical: np.ndarray | None  # [MAX_UNITS, 4] int8
     opponent_unit_continuous: np.ndarray | None  # [MAX_UNITS, ...] float16
@@ -527,11 +573,12 @@ def encode_structured_observation(
     units = tokenize_units(farms[player], observation.get("private") or {})
     economy = tokenize_economy(observation)
 
-    critic_products = critic_crops = None
+    critic_products = critic_animals = critic_crops = None
     opponent_categorical = opponent_continuous = opponent_active = None
     if opponent_private is not None:
-        critic_products, critic_crops = opponent_economy_columns(opponent_private)
+        critic_products, critic_animals, critic_crops = opponent_economy_columns(opponent_private)
         critic_products = critic_products.astype(np.float16)
+        critic_animals = critic_animals.astype(np.float16)
         critic_crops = critic_crops.astype(np.float16)
         opponent_units = tokenize_units(farms[1 - player], opponent_private)
         opponent_categorical = opponent_units.categorical.astype(np.int8)
@@ -547,10 +594,12 @@ def encode_structured_observation(
         unit_tile_gather=units.tile_gather.astype(np.int8),
         unit_tile_gather_valid=units.tile_gather_valid,
         products=economy.products.astype(np.float16),
+        animals=economy.animals.astype(np.float16),
         crops=economy.crops.astype(np.float16),
         farms=economy.farms.astype(np.float16),
         town=economy.town.astype(np.float16),
         critic_products=critic_products,
+        critic_animals=critic_animals,
         critic_crops=critic_crops,
         opponent_unit_categorical=opponent_categorical,
         opponent_unit_continuous=opponent_continuous,
@@ -578,6 +627,8 @@ def clock_features(observation: dict) -> np.ndarray:
 
 
 __all__ = [
+    "ANIMAL_PRIVATE_FIELDS",
+    "ANIMAL_TOKEN_FIELDS",
     "CROP_PRIVATE_FIELDS",
     "CROP_TOKEN_FIELDS",
     "FARM_IDENTITIES",
@@ -586,6 +637,7 @@ __all__ = [
     "N_TILE_CONTINUOUS",
     "N_UNIT_CATEGORICAL",
     "N_UNIT_CONTINUOUS",
+    "OBSERVATION_SCHEMA_VERSION",
     "PRODUCT_PRIVATE_FIELDS",
     "PRODUCT_TOKEN_FIELDS",
     "QUADRANT_COUNT",

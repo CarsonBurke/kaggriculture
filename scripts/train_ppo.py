@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -27,6 +28,12 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from kaggriculture.evaluation import (
+    DEVELOPMENT_SEED_START,
+    ONLINE_RL_SEED_START,
+    artifact_seed_usage,
+    validate_seed_interval,
+)
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.league import (
     PFSP_UNMEASURED_SCORE_RATE,
@@ -64,6 +71,8 @@ from kaggriculture.ppo import (
     update_replay_parity,
 )
 from kaggriculture.production import (
+    PRODUCTION_CRITIC_WARMUP_ITERATIONS,
+    PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
@@ -87,7 +96,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.structured_dynamics import StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
 from kaggriculture.telemetry import (
     TensorboardMirror,
     population_agent_field,
@@ -115,7 +124,9 @@ MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
 DEFAULT_CRITIC_EPOCHS = PpoConfig.epochs
-DEFAULT_CRITIC_WARMUP_ITERATIONS = 5
+DEFAULT_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_ITERATIONS
+CRITIC_WARMUP_READY_MONTE_CARLO_EV = 0.10
+MAX_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS
 
 
 class RecoveryCheckpointTimer:
@@ -201,8 +212,9 @@ def parse_args() -> argparse.Namespace:
         help="comma-separated opponents forwarded to external_eval_worker.py",
     )
     parser.add_argument("--external-eval-seeds", type=int, default=2)
+    parser.add_argument("--external-eval-seed-start", type=int, default=DEVELOPMENT_SEED_START)
     parser.add_argument("--episode-steps", type=int, default=720)
-    parser.add_argument("--seed", type=int, default=20260812)
+    parser.add_argument("--seed", type=int, default=ONLINE_RL_SEED_START)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
@@ -352,6 +364,18 @@ def parse_args() -> argparse.Namespace:
         help="weight on normalized future opponent-patch feature L1",
     )
     parser.add_argument(
+        "--structured-critic-latent-coefficient",
+        type=float,
+        default=PpoConfig.structured_critic_latent_coefficient,
+        help="weight on critic-belief NextLat latent prediction",
+    )
+    parser.add_argument(
+        "--structured-critic-value-coefficient",
+        type=float,
+        default=PpoConfig.structured_critic_value_coefficient,
+        help="weight on decoded future-value prediction from critic NextLat",
+    )
+    parser.add_argument(
         "--structured-decision-horizon",
         type=int,
         default=PpoConfig.structured_decision_horizon,
@@ -360,6 +384,11 @@ def parse_args() -> argparse.Namespace:
         "--structured-patch-horizon",
         type=int,
         default=PpoConfig.structured_patch_horizon,
+    )
+    parser.add_argument(
+        "--structured-critic-horizon",
+        type=int,
+        default=PpoConfig.structured_critic_horizon,
     )
     parser.add_argument(
         "--structured-learning-rate",
@@ -372,12 +401,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=PpoConfig.structured_predictor_minibatch_size,
         help="predictor-only flattened-state minibatch; defaults to --minibatch-size",
-    )
-    parser.add_argument(
-        "--structured-actor-gradient-ratio",
-        type=float,
-        default=PpoConfig.structured_actor_gradient_ratio,
-        help="maximum actor-side NextLat gradient norm as a fraction of PPO's",
     )
     parser.add_argument(
         "--structured-gate-evaluation-windows",
@@ -430,9 +453,10 @@ def parse_args() -> argparse.Namespace:
         "--critic-warmup-iterations",
         type=int,
         help=(
-            "iterations of critic-only updates before the actor participates; "
-            f"defaults to {DEFAULT_CRITIC_WARMUP_ITERATIONS} for a fresh warm start, "
-            "belongs to the warm start, and a resumed run restores it from its checkpoint"
+            "minimum critic-only iterations before actor release; after this floor, "
+            "the actor remains frozen until the previous fresh-wave pre-update Monte "
+            f"Carlo-return EV reaches {CRITIC_WARMUP_READY_MONTE_CARLO_EV:.2f}; "
+            f"defaults to {DEFAULT_CRITIC_WARMUP_ITERATIONS} for a fresh warm start"
         ),
     )
     args = parser.parse_args()
@@ -470,18 +494,6 @@ def _initial_actor_paths(args: argparse.Namespace) -> list[Path]:
     return list(args.init_actor_from or ())
 
 
-def _structured_auxiliary_active(args: argparse.Namespace) -> bool:
-    return any(
-        (
-            args.structured_decision_coefficient,
-            args.structured_patch_coefficient,
-            args.structured_economy_coefficient,
-            args.structured_opponent_summary_coefficient,
-            args.structured_opponent_patch_coefficient,
-        )
-    )
-
-
 def _validate_population(args: argparse.Namespace) -> None:
     """Refuse a population whose members cannot produce a usable gradient.
 
@@ -504,8 +516,6 @@ def _validate_population(args: argparse.Namespace) -> None:
                 "a single learner has one actor to initialize; --population admits more"
             )
         return
-    if _structured_auxiliary_active(args):
-        raise ValueError("structured PPO auxiliary currently supports population 1 only")
     pairings = args.population * (args.population - 1)
     if args.games % pairings:
         raise ValueError(
@@ -561,25 +571,39 @@ def _validate_args(args: argparse.Namespace) -> None:
     # the update to near-zero optimizer steps silently rather than erroring.
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
-    structured_coefficients = (
+    structured_actor_coefficients = (
         args.structured_decision_coefficient,
         args.structured_patch_coefficient,
         args.structured_economy_coefficient,
         args.structured_opponent_summary_coefficient,
         args.structured_opponent_patch_coefficient,
     )
+    structured_critic_coefficients = (
+        args.structured_critic_latent_coefficient,
+        args.structured_critic_value_coefficient,
+    )
+    structured_coefficients = structured_actor_coefficients + structured_critic_coefficients
     if not all(math.isfinite(value) and value >= 0.0 for value in structured_coefficients):
         raise ValueError("structured auxiliary coefficients must be finite and nonnegative")
     structured_active = any(structured_coefficients)
     if structured_active and args.architecture != STRUCTURED:
         raise ValueError("structured auxiliary coefficients require --architecture structured")
-    if args.structured_decision_horizon < 0 or args.structured_patch_horizon < 0:
+    structured_horizons = (
+        args.structured_decision_horizon,
+        args.structured_patch_horizon,
+        args.structured_critic_horizon,
+    )
+    if any(horizon < 0 for horizon in structured_horizons):
         raise ValueError("structured auxiliary horizons cannot be negative")
     if args.structured_decision_coefficient and args.structured_decision_horizon < 1:
         raise ValueError("structured decision horizon must be positive when decision KL is active")
-    if any(structured_coefficients[1:]) and args.structured_patch_horizon < 1:
+    if any(structured_actor_coefficients[1:]) and args.structured_patch_horizon < 1:
         raise ValueError(
             "structured patch horizon must be positive when feature prediction is active"
+        )
+    if any(structured_critic_coefficients) and args.structured_critic_horizon < 1:
+        raise ValueError(
+            "structured critic horizon must be positive when critic auxiliary is active"
         )
     if args.structured_learning_rate is not None and (
         not math.isfinite(args.structured_learning_rate) or args.structured_learning_rate <= 0.0
@@ -590,13 +614,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.structured_predictor_minibatch_size < 1
     ):
         raise ValueError("structured predictor minibatch size must be positive")
-    if (
-        not math.isfinite(args.structured_actor_gradient_ratio)
-        or args.structured_actor_gradient_ratio < 0.0
-    ):
-        raise ValueError("structured actor gradient ratio must be finite and nonnegative")
-    if args.structured_actor_gradient_ratio and not structured_active:
-        raise ValueError("structured actor gradient ratio requires active auxiliary coefficients")
     if args.structured_gate_evaluation_windows < 1 or args.structured_gate_patience < 1:
         raise ValueError("structured gate evaluation windows and patience must be positive")
     if args.league_games < 0:
@@ -635,6 +652,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("league games require at least one active, historical, or built-in lane")
     if args.external_eval and args.external_eval_seeds < 1:
         raise ValueError("external evaluation needs positive seeds")
+    if args.external_eval:
+        validate_seed_interval(
+            "development", args.external_eval_seed_start, args.external_eval_seeds
+        )
     if args.league_games and args.league_games < configured_opponents:
         raise ValueError(
             "league games must cover the initial anchor and every configured "
@@ -669,6 +690,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.critic_warmup_iterations >= args.iterations
     ):
         raise ValueError("critic warmup must leave iterations for the actor to train in")
+    if (
+        args.critic_warmup_iterations is not None
+        and args.critic_warmup_iterations > MAX_CRITIC_WARMUP_ITERATIONS
+    ):
+        raise ValueError(
+            f"critic warmup minimum cannot exceed the {MAX_CRITIC_WARMUP_ITERATIONS}-iteration "
+            "readiness deadline"
+        )
     if not 0 < args.clip_low < 1 < args.clip_high:
         raise ValueError("clip interval must straddle one")
     if args.lr_warmup_steps < 0:
@@ -683,6 +712,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max hours must be finite and non-negative")
     if args.seed < 0:
         raise ValueError("seed cannot be negative")
+    validate_seed_interval(
+        "online_rl",
+        args.seed,
+        max(1, (args.games + (args.league_games if args.population == 1 else 0)) * args.iterations),
+    )
     if args.temperature != 1.0:
         raise ValueError("on-policy PPO currently requires --temperature 1.0")
     if args.expected_source_digest is not None and (
@@ -715,7 +749,7 @@ def _load_initial_actor(
     artifact_architecture = resolve_architecture(payload)
     if artifact_architecture.name != architecture_name:
         raise ValueError("initial actor artifact architecture does not match arguments")
-    artifact_config = artifact_architecture.config_class(**payload["model_config"]).to_dict()
+    artifact_config = artifact_architecture.build_config(payload["model_config"]).to_dict()
     if artifact_config != model_config.to_dict():
         raise ValueError("initial actor artifact model configuration does not match arguments")
     actor.load_state_dict(pretrained.state_dict())
@@ -725,6 +759,7 @@ def _load_initial_actor(
         "format_version": payload["format_version"],
         "iteration": int(payload.get("iteration", 0)),
         "bc_provenance": payload.get("bc_provenance"),
+        "seed_usage": artifact_seed_usage(payload),
         # Equality with the current tree would be unusable here -- any edit
         # changes it, and the clone is deliberately produced before the run.
         # Recording which tree tokenized the demonstrations is free, and
@@ -765,12 +800,33 @@ def _load_run_provenance(
     return run_provenance_from_decision(decision)
 
 
-def _balanced_assignments(games: int, opponents: int, generator: np.random.Generator) -> np.ndarray:
-    """Assign nearly equal game counts to each selected opponent."""
+def _balanced_assignments(
+    games: int,
+    opponents: int,
+    generator: np.random.Generator,
+    *,
+    seed_start: int = 0,
+) -> np.ndarray:
+    """Balance total games and seed-determined seats for every opponent."""
     if games < 1 or opponents < 1:
         raise ValueError("balanced assignments require positive games and opponents")
-    assignments = np.arange(games, dtype=np.int64) % opponents
-    generator.shuffle(assignments)
+
+    totals = np.bincount(np.arange(games, dtype=np.int64) % opponents, minlength=opponents)
+    seat_zero_games = (games + (seed_start % 2 == 0)) // 2
+    seat_zero_counts = totals // 2
+    odd_opponents = np.flatnonzero(totals % 2)
+    extras = seat_zero_games - int(seat_zero_counts.sum())
+    if extras:
+        odd_opponents = generator.permutation(odd_opponents)
+        seat_zero_counts[odd_opponents[:extras]] += 1
+    seat_one_counts = totals - seat_zero_counts
+
+    assignments = np.empty(games, dtype=np.int64)
+    seats = (seed_start + np.arange(games, dtype=np.int64)) % 2
+    for seat, counts in ((0, seat_zero_counts), (1, seat_one_counts)):
+        values = np.repeat(np.arange(opponents, dtype=np.int64), counts)
+        generator.shuffle(values)
+        assignments[seats == seat] = values
     return assignments
 
 
@@ -780,9 +836,10 @@ def _balanced_assignments(games: int, opponents: int, generator: np.random.Gener
 # quickly. The prior seeds the blend, so a single clean sweep can never pin
 # an estimate at exactly 1.0 and permanently retire an opponent.
 LEAGUE_SCORE_RATE_EMA = 0.5
-# Unsampled estimates decay toward the unmeasured prior each iteration.
-# A stale estimate is most wrong exactly when the learner has changed the
-# most, and the decay guarantees every opponent is eventually re-measured.
+# Unsampled snapshot estimates decay toward the unmeasured prior because an
+# increasingly stale frozen policy may no longer represent its last result.
+# Built-ins never change, so their retirement evidence remains authoritative
+# until they are sampled again.
 LEAGUE_SCORE_RATE_DECAY = 0.05
 # Iterations between sampling-vs-update replay audits. The divergence this
 # audits is a function of how sharp the policy has become -- a randomly
@@ -1173,6 +1230,67 @@ def _validate_parity_baselines(
     return [_validate_parity_baseline(entry, ceilings) for entry in record]
 
 
+def _validate_critic_warmup_state(
+    initial_actor: object,
+    *,
+    population: int,
+) -> tuple[int, bool, list[float | None]]:
+    """Restore the adaptive actor-release gate from warm-start provenance."""
+    if initial_actor is None:
+        return 0, True, []
+    if not isinstance(initial_actor, dict):
+        raise ValueError("resume checkpoint has invalid initial-actor provenance")
+    minimum = initial_actor.get("critic_warmup_iterations")
+    state = initial_actor.get("critic_warmup_state")
+    if type(minimum) is not int or minimum < 0 or minimum > MAX_CRITIC_WARMUP_ITERATIONS:
+        raise ValueError("resume checkpoint has an invalid critic warmup minimum")
+    if not isinstance(state, dict) or set(state) != {
+        "complete",
+        "last_monte_carlo_explained_variance",
+    }:
+        raise ValueError("resume checkpoint has no valid adaptive critic warmup state")
+    complete = state["complete"]
+    values = state["last_monte_carlo_explained_variance"]
+    if type(complete) is not bool or not isinstance(values, list) or len(values) != population:
+        raise ValueError("resume checkpoint has no valid adaptive critic warmup state")
+    validated: list[float | None] = []
+    for value in values:
+        if value is None:
+            validated.append(None)
+        elif type(value) is float and math.isfinite(value):
+            validated.append(value)
+        else:
+            raise ValueError("resume checkpoint has an invalid critic warmup EV")
+    return minimum, complete, validated
+
+
+def _critic_warmup_decision(
+    *,
+    iteration: int,
+    minimum: int,
+    complete: bool,
+    previous_evs: Sequence[float | None],
+) -> tuple[bool, str]:
+    """Decide actor release from only prior-wave evidence."""
+    if complete:
+        return False, "complete"
+    if iteration < minimum:
+        return True, "minimum_iterations"
+    ready = bool(previous_evs) and all(
+        value is not None and math.isfinite(value) and value >= CRITIC_WARMUP_READY_MONTE_CARLO_EV
+        for value in previous_evs
+    )
+    if ready:
+        return False, "monte_carlo_ev_ready"
+    if iteration >= MAX_CRITIC_WARMUP_ITERATIONS:
+        raise RuntimeError(
+            "critic warmup failed to reach Monte Carlo-return explained variance "
+            f"{CRITIC_WARMUP_READY_MONTE_CARLO_EV:.2f} within "
+            f"{MAX_CRITIC_WARMUP_ITERATIONS} iterations; previous member EVs={list(previous_evs)}"
+        )
+    return True, "waiting_for_monte_carlo_ev"
+
+
 def _validate_league_score_rates(rates: object) -> dict[str, float]:
     if not isinstance(rates, dict):
         raise ValueError("resume checkpoint has no valid league score-rate state")
@@ -1281,34 +1399,100 @@ def _external_eval_pending(args: argparse.Namespace) -> list[tuple[Path, int]]:
     return pending
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Persist a directory entry change before acknowledging queue mutation."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _persist_external_eval_pending(
     args: argparse.Namespace,
     pending: Sequence[tuple[Path, int]],
 ) -> None:
     events = tuple(pending)
-    args._kaggriculture_pending_evals = events
     path = args.run_dir / _EXTERNAL_EVAL_PENDING
     if not events:
         path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        args._kaggriculture_pending_evals = events
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(
                 [
                     {"checkpoint": str(checkpoint), "iteration": iteration}
                     for checkpoint, iteration in events
                 ],
+                stream,
                 indent=2,
                 sort_keys=True,
             )
-            + "\n",
-            encoding="utf-8",
-        )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
+        args._kaggriculture_pending_evals = events
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _external_eval_complete(
+    args: argparse.Namespace,
+    checkpoint: Path,
+    iteration: int,
+) -> bool:
+    """Return whether the journal durably commits this event's full probe matrix."""
+    if not checkpoint.is_file():
+        return False
+    members: list[int | None] = [None] if args.population < 2 else list(range(args.population))
+    opponents = [
+        normalize_opponent(spec)[0] for spec in args.external_eval_opponents.split(",") if spec
+    ]
+    if len(set(opponents)) != len(opponents):
+        return False
+    digest = file_sha256(checkpoint)
+    records = read_jsonl_snapshot(args.run_dir / "metrics-external.jsonl").records
+    for marker_index in range(len(records) - 1, -1, -1):
+        marker = records[marker_index]
+        if not (
+            marker.get("event") == "external_eval_complete"
+            and marker.get("iteration") == iteration
+            and marker.get("artifact") == checkpoint.name
+            and marker.get("artifact_sha256") == digest
+            and marker.get("members") == members
+            and marker.get("opponents") == opponents
+            and marker.get("records") == len(members) * len(opponents)
+        ):
+            continue
+        completed_rows: dict[tuple[int | None, str], Mapping[str, Any]] = {}
+        for record in records[:marker_index]:
+            key = (record.get("agent"), record.get("opponent"))
+            if (
+                record.get("event") == "external_eval"
+                and record.get("iteration") == iteration
+                and record.get("artifact") == checkpoint.name
+                and record.get("artifact_sha256") == digest
+                and key[0] in members
+                and key[1] in opponents
+            ):
+                completed_rows[key] = record
+        return all(
+            (row := completed_rows.get((member, opponent))) is not None
+            and type(row.get("games")) is int
+            and row["games"] == args.external_eval_seeds * 2
+            and row.get("seed_start") == args.external_eval_seed_start
+            and row.get("seed_count") == args.external_eval_seeds
+            and row.get("completed_games") == row["games"]
+            for member in members
+            for opponent in opponents
+        )
+    return False
 
 
 def _maybe_launch_external_eval(
@@ -1319,7 +1503,7 @@ def _maybe_launch_external_eval(
     *,
     wait_for_slot: bool = False,
 ) -> subprocess.Popen | None:
-    """Launch committed checkpoints in FIFO order without stacking CPU workers."""
+    """Run the durable FIFO, acknowledging only exited and journaled workers."""
     if not args.external_eval:
         return process
     pending = _external_eval_pending(args)
@@ -1329,24 +1513,45 @@ def _maybe_launch_external_eval(
         _persist_external_eval_pending(args, pending)
     if not pending:
         return process
-    if process is not None and process.poll() is None:
-        if not wait_for_slot:
-            return process
-        process.wait()
 
     members = (
         "" if args.population < 2 else ",".join(str(member) for member in range(args.population))
     )
     log_path = args.run_dir / "external-eval.log"
     while pending:
-        if process is not None and process.returncode:
+        head_checkpoint, head_iteration = pending[0]
+        if process is not None:
+            returncode = process.poll()
+            if returncode is None:
+                if not wait_for_slot:
+                    return process
+                returncode = process.wait()
+            if returncode == 0 and _external_eval_complete(args, head_checkpoint, head_iteration):
+                pending.pop(0)
+                _persist_external_eval_pending(args, pending)
+                process = None
+                continue
+
+            reason = (
+                f"exited with code {returncode}"
+                if returncode != 0
+                else "exited without a matching completion record"
+            )
             print(
-                f"external eval worker exited with code {process.returncode}; "
-                "see external-eval.log",
+                f"external eval worker {reason}; see external-eval.log",
                 file=sys.stderr,
                 flush=True,
             )
-        next_checkpoint, next_iteration = pending.pop(0)
+            process = None
+            if wait_for_slot:
+                raise RuntimeError(f"final external evaluation {reason}")
+        elif _external_eval_complete(args, head_checkpoint, head_iteration):
+            # The prior process may have been interrupted after its fsynced
+            # completion row but before the queue file was acknowledged.
+            pending.pop(0)
+            _persist_external_eval_pending(args, pending)
+            continue
+
         try:
             with log_path.open("ab") as log:
                 process = subprocess.Popen(
@@ -1354,17 +1559,19 @@ def _maybe_launch_external_eval(
                         sys.executable,
                         str(Path(__file__).resolve().parent / "external_eval_worker.py"),
                         "--artifact",
-                        str(next_checkpoint),
+                        str(head_checkpoint),
                         "--agents",
                         members,
                         "--iteration",
-                        str(next_iteration),
+                        str(head_iteration),
                         "--output",
                         str(args.run_dir / "metrics-external.jsonl"),
                         "--opponents",
                         args.external_eval_opponents,
                         "--seeds",
                         str(args.external_eval_seeds),
+                        "--seed-start",
+                        str(args.external_eval_seed_start),
                         "--episode-steps",
                         str(args.episode_steps),
                     ],
@@ -1373,15 +1580,13 @@ def _maybe_launch_external_eval(
                     start_new_session=True,
                 )
         except OSError as error:
-            pending.insert(0, (next_checkpoint, next_iteration))
-            _persist_external_eval_pending(args, pending)
             print(f"external eval launch failed: {error}", file=sys.stderr, flush=True)
+            if wait_for_slot:
+                raise RuntimeError("final external evaluation could not launch") from error
+            return None
+        if not wait_for_slot:
             return process
-        _persist_external_eval_pending(args, pending)
-        if not wait_for_slot or not pending:
-            return process
-        process.wait()
-    return process
+    return None
 
 
 def _league_builtin_opponents(args: argparse.Namespace) -> list[str]:
@@ -1728,9 +1933,12 @@ def _validate_policy_entropy_reference(value: object) -> float:
     return float(value)
 
 
-_STRUCTURED_GATE_FIELDS = (
+_STRUCTURED_GATE_FORMAT_VERSION = 3
+_STRUCTURED_ACTOR_GATE_FIELDS = (
     ("combined", "structured_gate_combined_ratio", None),
     ("decision", "structured_gate_decision_ratio", "structured_decision_coefficient"),
+    ("patch", "structured_gate_combined_ratio", "structured_patch_coefficient"),
+    ("economy", "structured_gate_combined_ratio", "structured_economy_coefficient"),
     (
         "opponent_summary",
         "structured_gate_opponent_summary_ratio",
@@ -1742,59 +1950,105 @@ _STRUCTURED_GATE_FIELDS = (
         "structured_opponent_patch_coefficient",
     ),
 )
+# The critic predictor has no independently calibrated per-term thresholds.
+# Apply the configured combined-loss improvement requirement to its latent and
+# decoded-value terms too, so a falling weighted sum cannot hide a regressing
+# constituent.
+_STRUCTURED_CRITIC_GATE_FIELDS = (
+    ("combined", "structured_gate_combined_ratio", None),
+    ("latent", "structured_gate_combined_ratio", "structured_critic_latent_coefficient"),
+    ("value", "structured_gate_combined_ratio", "structured_critic_value_coefficient"),
+)
 
 
-def _new_structured_gate_states(population: int) -> list[dict[str, Any]]:
-    return [{"reference": None, "streak": 0, "enabled": False} for _ in range(population)]
+def _new_structured_gate_state() -> dict[str, Any]:
+    return {"streak": 0, "enabled": False}
+
+
+def _new_structured_gate_states(population: int, config: PpoConfig) -> list[dict[str, Any]]:
+    return [
+        {
+            "actor": (
+                _new_structured_gate_state() if config.structured_actor_auxiliary_active else None
+            ),
+            "critic": (
+                _new_structured_gate_state() if config.structured_critic_auxiliary_active else None
+            ),
+        }
+        for _ in range(population)
+    ]
 
 
 def _structured_gate_record(states: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"agents": [dict(state) for state in states]}
+    return {
+        "version": _STRUCTURED_GATE_FORMAT_VERSION,
+        "agents": copy.deepcopy(states),
+    }
+
+
+def _validate_structured_gate_state(
+    value: object,
+    *,
+    kind: str,
+    config: PpoConfig,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"streak", "enabled"}:
+        raise ValueError(f"structured {kind} predictor gate state is incomplete")
+    streak = value["streak"]
+    enabled = value["enabled"]
+    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
+        raise ValueError(f"structured {kind} predictor gate streak is invalid")
+    if not isinstance(enabled, bool):
+        raise ValueError(f"structured {kind} predictor gate enabled state is invalid")
+    should_be_enabled = streak >= config.structured_gate_patience
+    if enabled != should_be_enabled:
+        raise ValueError(f"structured {kind} predictor gate enabled state is inconsistent")
+    return {
+        "streak": streak,
+        "enabled": enabled,
+    }
 
 
 def _validate_structured_gate_states(
     record: object,
     population: int,
+    config: PpoConfig,
 ) -> list[dict[str, Any]]:
     if not isinstance(record, Mapping):
         raise ValueError("resume checkpoint is missing structured predictor gate state")
-    agents = record.get("agents")
+    if record.get("version") != _STRUCTURED_GATE_FORMAT_VERSION:
+        raise ValueError(
+            "resume checkpoint structured predictor gate state has an unsupported "
+            "format; fresh-wave persistence gate state is required"
+        )
+    if set(record) != {"version", "agents"}:
+        raise ValueError("resume checkpoint structured predictor gate state is incomplete")
+    agents = record["agents"]
     if not isinstance(agents, list) or len(agents) != population:
         raise ValueError("resume checkpoint structured predictor gate state has wrong population")
     states: list[dict[str, Any]] = []
-    expected_reference = {name for name, _, _ in _STRUCTURED_GATE_FIELDS}
     for entry in agents:
-        if not isinstance(entry, Mapping):
-            raise ValueError("structured predictor gate agent state must be a mapping")
-        reference = entry.get("reference")
-        if reference is not None and (
-            not isinstance(reference, Mapping)
-            or set(reference) != expected_reference
-            or any(
-                not isinstance(value, int | float)
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-                for value in reference.values()
-            )
+        if not isinstance(entry, Mapping) or set(entry) != {"actor", "critic"}:
+            raise ValueError("structured predictor gate agent state is incomplete")
+        state: dict[str, Any] = {}
+        for kind, active in (
+            ("actor", config.structured_actor_auxiliary_active),
+            ("critic", config.structured_critic_auxiliary_active),
         ):
-            raise ValueError("structured predictor gate reference is invalid")
-        streak = entry.get("streak")
-        enabled = entry.get("enabled")
-        if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
-            raise ValueError("structured predictor gate streak is invalid")
-        if not isinstance(enabled, bool):
-            raise ValueError("structured predictor gate enabled state is invalid")
-        states.append(
-            {
-                "reference": (
-                    None
-                    if reference is None
-                    else {name: float(reference[name]) for name in expected_reference}
-                ),
-                "streak": streak,
-                "enabled": enabled,
-            }
-        )
+            value = entry[kind]
+            if not active:
+                if value is not None:
+                    raise ValueError(
+                        f"inactive structured {kind} auxiliary has predictor gate state"
+                    )
+                state[kind] = None
+                continue
+            state[kind] = _validate_structured_gate_state(
+                value,
+                kind=kind,
+                config=config,
+            )
+        states.append(state)
     return states
 
 
@@ -1802,46 +2056,73 @@ def _advance_structured_gate(
     state: dict[str, Any],
     update_metrics: Mapping[str, float | int],
     config: PpoConfig,
+    *,
+    kind: str,
 ) -> dict[str, float | int]:
-    """Advance the revocable held-out gate for the next PPO iteration."""
-    measured = {
-        name: float(update_metrics[f"structured_preupdate_{name}"])
-        for name, _, _ in _STRUCTURED_GATE_FIELDS
-    }
-    reference = state["reference"]
-    if reference is None:
-        state["reference"] = dict(measured)
-        ratios = {name: 1.0 for name in measured}
-        passed = False
+    """Advance one predictor's revocable held-out gate for the next iteration."""
+    if kind == "actor":
+        fields = _STRUCTURED_ACTOR_GATE_FIELDS
+        metric_prefix = "structured_preupdate_"
+        telemetry_prefix = "structured_gate_"
+        enabled_metric = "structured_gate_actor_enabled_next"
+    elif kind == "critic":
+        fields = _STRUCTURED_CRITIC_GATE_FIELDS
+        metric_prefix = "structured_critic_preupdate_"
+        telemetry_prefix = "structured_critic_gate_"
+        enabled_metric = "structured_critic_gate_enabled_next"
     else:
-        ratios = {
-            name: (
-                measured[name] / float(reference[name])
-                if float(reference[name]) > 0.0
-                else 1.0
-                if measured[name] == 0.0
-                else math.inf
-            )
-            for name in measured
-        }
-        passed = all(
-            ratios[name] <= float(getattr(config, threshold))
-            for name, threshold, coefficient in _STRUCTURED_GATE_FIELDS
-            if coefficient is None or float(getattr(config, coefficient)) > 0.0
-        )
-    state["streak"] = int(state["streak"]) + 1 if passed else 0
-    state["enabled"] = bool(
-        config.structured_actor_gradient_ratio > 0.0
-        and passed
-        and state["streak"] >= config.structured_gate_patience
-    )
-    telemetry: dict[str, float | int] = {
-        f"structured_gate_{name}_ratio": ratio for name, ratio in ratios.items()
+        raise ValueError(f"unknown structured predictor gate kind: {kind}")
+    measured = {name: float(update_metrics[f"{metric_prefix}{name}"]) for name, _, _ in fields}
+    # Compare the current predictor with persistence on this exact fresh wave,
+    # through the same fixed source encoder and decoder. Historical teacher
+    # losses are incomparable as those representations and heads evolve.
+    reference = {
+        name: float(update_metrics[f"{metric_prefix}persistence_{name}"]) for name, _, _ in fields
     }
-    telemetry["structured_gate_passed"] = int(passed)
-    telemetry["structured_gate_streak"] = int(state["streak"])
-    telemetry["structured_gate_actor_enabled_next"] = int(state["enabled"])
+    if any(not math.isfinite(value) for value in (*measured.values(), *reference.values())):
+        raise FloatingPointError(f"non-finite structured {kind} gate loss")
+    # A zero persistence loss provides no prediction task for that decoder.
+    # Reconsider every fresh wave, once PPO makes the decoder informative.
+    informative = {name: reference[name] > 0.0 for name in measured}
+    ratios = {
+        name: max(0.0, measured[name]) / reference[name] if informative[name] else 1.0
+        for name in measured
+    }
+    passed = all(
+        informative[name] and ratios[name] <= float(getattr(config, threshold))
+        for name, threshold, coefficient in fields
+        if coefficient is None or float(getattr(config, coefficient)) > 0.0
+    )
+    state["streak"] = int(state["streak"]) + 1 if passed else 0
+    state["enabled"] = bool(passed and state["streak"] >= config.structured_gate_patience)
+    telemetry: dict[str, float | int] = {
+        f"{telemetry_prefix}{name}_ratio": ratio for name, ratio in ratios.items()
+    }
+    telemetry.update(
+        {
+            f"{telemetry_prefix}{name}_informative": int(active)
+            for name, active in informative.items()
+        }
+    )
+    telemetry[f"{telemetry_prefix}passed"] = int(passed)
+    telemetry[f"{telemetry_prefix}streak"] = int(state["streak"])
+    telemetry[enabled_metric] = int(state["enabled"])
     return telemetry
+
+
+def _structured_auxiliary_gate_decisions(
+    gate_state: Mapping[str, Any] | None,
+    *,
+    warmup_active: bool,
+) -> tuple[bool, bool]:
+    if gate_state is None:
+        return False, False
+    actor_gate = gate_state["actor"]
+    critic_gate = gate_state["critic"]
+    return (
+        bool(not warmup_active and actor_gate is not None and actor_gate["enabled"]),
+        bool(critic_gate is not None and critic_gate["enabled"]),
+    )
 
 
 def _entropy_reference_record(
@@ -2191,9 +2472,11 @@ def main() -> None:
         structured_opponent_patch_coefficient=(args.structured_opponent_patch_coefficient),
         structured_decision_horizon=args.structured_decision_horizon,
         structured_patch_horizon=args.structured_patch_horizon,
+        structured_critic_latent_coefficient=args.structured_critic_latent_coefficient,
+        structured_critic_value_coefficient=args.structured_critic_value_coefficient,
+        structured_critic_horizon=args.structured_critic_horizon,
         structured_learning_rate=args.structured_learning_rate,
         structured_predictor_minibatch_size=args.structured_predictor_minibatch_size,
-        structured_actor_gradient_ratio=args.structured_actor_gradient_ratio,
         structured_gate_evaluation_windows=args.structured_gate_evaluation_windows,
         structured_gate_combined_ratio=args.structured_gate_combined_ratio,
         structured_gate_decision_ratio=args.structured_gate_decision_ratio,
@@ -2216,12 +2499,19 @@ def main() -> None:
     for _ in range(population):
         member_actor = architecture.actor_class(model_config).to(device)
         # Preserve the historical actor/critic initialization stream. The
-        # training-only predictor is constructed afterward, so enabling NextLat
-        # cannot silently change the critic seed it is compared against.
+        # training-only predictors are constructed afterward, so enabling
+        # NextLat cannot silently change the critic seed it is compared against.
         member_critic = architecture.critic_class(model_config).to(device)
         member_dynamics = (
             StructuredDynamics(model_config).to(device)
-            if ppo_config.structured_auxiliary_active and isinstance(model_config, StructuredConfig)
+            if ppo_config.structured_actor_auxiliary_active
+            and isinstance(model_config, StructuredConfig)
+            else None
+        )
+        member_critic_dynamics = (
+            StructuredCriticDynamics(model_config).to(device)
+            if ppo_config.structured_critic_auxiliary_active
+            and isinstance(model_config, StructuredConfig)
             else None
         )
         actor_optimizer, critic_optimizer = make_optimizers(
@@ -2234,14 +2524,21 @@ def main() -> None:
             if member_dynamics is not None
             else None
         )
+        critic_dynamics_optimizer = (
+            make_structured_dynamics_optimizer(member_critic_dynamics, ppo_config)
+            if member_critic_dynamics is not None
+            else None
+        )
         members.append(
             TrainingAgent(
-                member_actor,
-                member_critic,
-                actor_optimizer,
-                critic_optimizer,
-                member_dynamics,
-                dynamics_optimizer,
+                actor=member_actor,
+                critic=member_critic,
+                actor_optimizer=actor_optimizer,
+                critic_optimizer=critic_optimizer,
+                structured_dynamics=member_dynamics,
+                structured_dynamics_optimizer=dynamics_optimizer,
+                structured_critic_dynamics=member_critic_dynamics,
+                structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
             )
         )
     # Member 0's networks are aliased for the single-learner code below; its
@@ -2250,11 +2547,15 @@ def main() -> None:
     # were the run's optimizer.
     actor = members[0].actor
     structured_gate_states = (
-        _new_structured_gate_states(population) if ppo_config.structured_auxiliary_active else []
+        _new_structured_gate_states(population, ppo_config)
+        if ppo_config.structured_auxiliary_active
+        else []
     )
     critic = members[0].critic
     initial_actor_provenance: dict[str, Any] | None = None
     critic_warmup_iterations = 0
+    critic_warmup_complete = True
+    critic_warmup_previous_evs: list[float | None] = []
     initial_actors = _initial_actor_paths(args)
     if initial_actors:
         records = [
@@ -2272,9 +2573,15 @@ def main() -> None:
             )
         initial_actor_provenance = records[0] if population == 1 else {"agents": records}
         critic_warmup_iterations = args.critic_warmup_iterations or 0
-        # The count travels inside the warm-start record so it survives a
-        # resume; validation already guarantees the two arrive together.
+        critic_warmup_complete = False
+        critic_warmup_previous_evs = [None for _ in members]
+        # The release gate travels inside the warm-start record so a crash
+        # resumes with the exact prior-wave evidence and latch state.
         initial_actor_provenance["critic_warmup_iterations"] = critic_warmup_iterations
+        initial_actor_provenance["critic_warmup_state"] = {
+            "complete": critic_warmup_complete,
+            "last_monte_carlo_explained_variance": list(critic_warmup_previous_evs),
+        }
     generator = np.random.default_rng(args.seed + 1)
     auxiliary_generator = (
         np.random.default_rng(args.seed + 2) if ppo_config.structured_auxiliary_active else None
@@ -2298,6 +2605,7 @@ def main() -> None:
             structured_gate_states = _validate_structured_gate_states(
                 resume_payload.get("structured_gate_state"),
                 population,
+                ppo_config,
             )
         # The same attributed knobs as the launch-time check above, compared the
         # same way. Collection precision is again left out; the
@@ -2322,9 +2630,54 @@ def main() -> None:
         # the iteration-0 league snapshot as a pretrained baseline, and must
         # keep freezing the actor for whatever remains of the critic warmup.
         initial_actor_provenance = resume_payload.get("initial_actor")
-        critic_warmup_iterations = int(
-            (initial_actor_provenance or {}).get("critic_warmup_iterations", 0)
+        (
+            critic_warmup_iterations,
+            critic_warmup_complete,
+            critic_warmup_previous_evs,
+        ) = _validate_critic_warmup_state(
+            initial_actor_provenance,
+            population=population,
         )
+
+    seed_usage = (
+        artifact_seed_usage(resume_payload)
+        if resume_payload is not None
+        else [
+            row
+            for record in (
+                initial_actor_provenance.get("agents", [initial_actor_provenance])
+                if initial_actor_provenance is not None
+                else []
+            )
+            for row in record["seed_usage"]
+        ]
+    )
+    planned_games = (args.games + (args.league_games if population == 1 else 0)) * max(
+        0, args.iterations - iteration
+    )
+    if planned_games:
+        online_interval = validate_seed_interval(
+            "online_rl",
+            next_seed,
+            planned_games,
+            usage=seed_usage,
+        )
+        if not any(
+            row["domain"] == "online_rl"
+            and row["start"] <= next_seed
+            and row["start"] + row["count"] >= next_seed + planned_games
+            for row in seed_usage
+        ):
+            seed_usage.append(online_interval)
+    if args.external_eval:
+        development_interval = validate_seed_interval(
+            "development",
+            args.external_eval_seed_start,
+            args.external_eval_seeds,
+            usage=seed_usage,
+        )
+        if development_interval not in seed_usage:
+            seed_usage.append(development_interval)
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
     journal_path = args.run_dir / "metrics.jsonl"
@@ -2428,6 +2781,7 @@ def main() -> None:
         "source_identity": current_source_identity,
         "run_provenance": run_provenance,
         "initial_actor": initial_actor_provenance,
+        "seed_usage": seed_usage,
     }
     (args.run_dir / "config.json").write_text(
         json.dumps(configuration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -2474,8 +2828,8 @@ def main() -> None:
             next_seed=next_seed,
             metrics=metrics,
             source_identity=current_source_identity,
-            rng_states=training_rng_states(),
             run_provenance=run_provenance,
+            rng_states=training_rng_states(),
             training_rng_state=dict(generator.bit_generator.state),
             training_data_config=training_data_config,
             auxiliary_rng_state=(
@@ -2488,7 +2842,8 @@ def main() -> None:
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
             population_disagreement_reference=population_reference,
             policy_entropy_reference=_entropy_reference_record(entropy_references, population),
-            initial_actor=initial_actor_provenance,
+            initial_actor=copy.deepcopy(initial_actor_provenance),
+            seed_usage=seed_usage,
             structured_gate_state=(
                 _structured_gate_record(structured_gate_states) if structured_gate_states else None
             ),
@@ -2532,7 +2887,7 @@ def main() -> None:
 
     started = time.monotonic()
 
-    if population == 1 and (iteration == 0 or iteration > critic_warmup_iterations):
+    if population == 1 and (iteration == 0 or critic_warmup_complete):
         # Warmup checkpoints intentionally carry a sparse league manifest: the
         # frozen actor already exists at iteration zero, so serializing it under
         # every warmup iteration would create byte-identical archive churn.
@@ -2584,6 +2939,7 @@ def main() -> None:
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
+            seed_usage=seed_usage,
             structured_gate_state=(
                 _structured_gate_record(structured_gate_states) if structured_gate_states else None
             ),
@@ -2617,6 +2973,37 @@ def main() -> None:
                 )
         if args.max_hours and (time.monotonic() - started) / 3600.0 >= args.max_hours:
             break
+        warmup_active, warmup_reason = _critic_warmup_decision(
+            iteration=iteration,
+            minimum=critic_warmup_iterations,
+            complete=critic_warmup_complete,
+            previous_evs=critic_warmup_previous_evs,
+        )
+        if initial_actor_provenance is not None and not warmup_active:
+            critic_warmup_complete = True
+            initial_actor_provenance["critic_warmup_state"]["complete"] = True
+        warmup_diagnostics: dict[str, Any] = {}
+        if initial_actor_provenance is not None:
+            ready_members = sum(
+                value is not None
+                and math.isfinite(value)
+                and value >= CRITIC_WARMUP_READY_MONTE_CARLO_EV
+                for value in critic_warmup_previous_evs
+            )
+            warmup_diagnostics = {
+                "critic_warmup_active": int(warmup_active),
+                "critic_warmup_reason": warmup_reason,
+                "critic_warmup_minimum_iterations": critic_warmup_iterations,
+                "critic_warmup_max_iterations": MAX_CRITIC_WARMUP_ITERATIONS,
+                "critic_warmup_readiness_threshold": CRITIC_WARMUP_READY_MONTE_CARLO_EV,
+                "critic_warmup_ready_members": ready_members,
+                "critic_warmup_required_members": population,
+            }
+            for agent, value in enumerate(critic_warmup_previous_evs):
+                name = "critic_warmup_previous_monte_carlo_explained_variance"
+                if population > 1:
+                    name = population_agent_field(agent, name)
+                warmup_diagnostics[name] = value
         iteration_started = time.monotonic()
         sampling_seed = int(generator.integers(0, np.iinfo(np.int64).max))
         opponent_checkpoint = ""
@@ -2644,6 +3031,7 @@ def main() -> None:
                 forward_autocast=args.rollout_bfloat16,
                 storage=rollout_arena,
             )
+            diagnostic_groups = {"self_play": np.ones(rollout.trajectories, dtype=bool)}
             next_seed += args.games
             agent_rows: list[np.ndarray | None] = list(
                 _population_row_partition(np.asarray(rollout.agents), population)
@@ -2704,6 +3092,7 @@ def main() -> None:
                     league_games,
                     len(selections),
                     generator,
+                    seed_start=next_seed + args.games,
                 )
                 opponent_checkpoint = ",".join(row.label for row in selections)
             # Self-play and league games advance in one native wave, so the
@@ -2744,6 +3133,18 @@ def main() -> None:
                 forward_autocast=args.rollout_bfloat16,
                 storage=rollout_arena if league_games else self_play_storage,
             )
+            diagnostic_groups = {
+                "self_play": np.arange(rollout.trajectories) < self_play_rows,
+                "league": np.arange(rollout.trajectories) >= self_play_rows,
+            }
+            if assignments is not None:
+                for selection_index, selection in enumerate(selections):
+                    diagnostic_groups[f"opponent_{selection.key}"] = np.concatenate(
+                        (
+                            np.zeros(self_play_rows, dtype=bool),
+                            assignments == selection_index,
+                        )
+                    )
             next_seed += args.games + league_games
             self_play_diagnostics = {
                 f"self_play_{name}": value
@@ -2752,6 +3153,7 @@ def main() -> None:
                 ).items()
                 if name not in indivisible_timings
             }
+            measured_rates: dict[str, float] = {}
             if league_games:
                 league_part = slice_trajectories(rollout, self_play_rows, rollout.trajectories)
                 league_diagnostics = {
@@ -2764,7 +3166,7 @@ def main() -> None:
                     league_part, assignments, selections
                 )
                 league_diagnostics.update(opponent_diagnostics)
-                _blend_league_score_rates(league_score_rates, measured_rates)
+            _blend_league_score_rates(league_score_rates, measured_rates)
         # The audit is per member, on that member's own rows: in a population wave
         # every row was sampled by its own policy, so a whole-wave replay through
         # one of them measures a policy difference and calls it a staging defect.
@@ -2787,27 +3189,42 @@ def main() -> None:
                 replay_parity_metrics.update(_agent_fields(measured, agent, population))
             last_parity_audit[audited_staging] = iteration
         update_started = time.monotonic()
-        # Critic-first warm start: a freshly initialized critic must fit before
-        # its advantages may push a pretrained actor. The predictor still fits
-        # every warmup rollout, but its actor-side gradient remains disabled.
-        warmup_active = iteration < critic_warmup_iterations
+        # Actor release is decided above from the previous fresh wave. The
+        # current rollout's pre-update EV becomes evidence for the next wave.
         # Once per member, over that member's rows. Partitioning first is not
         # cosmetic: `prepare_advantages` normalizes by the batch's own advantage
         # standard deviation, so a pooled update would divide each member's
         # advantages by the population's spread and leak one member's return scale
         # into another's step size.
         update_metrics: dict[str, float | int] = {}
+        current_warmup_evs: list[float] = []
         for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):
             if member.actor_optimizer is None or member.critic_optimizer is None:
                 raise RuntimeError("training member has no optimizer")
-            if (member.structured_dynamics is None) != (
-                member.structured_dynamics_optimizer is None
+            for name, predictor, optimizer in (
+                (
+                    "actor",
+                    member.structured_dynamics,
+                    member.structured_dynamics_optimizer,
+                ),
+                (
+                    "critic",
+                    member.structured_critic_dynamics,
+                    member.structured_critic_dynamics_optimizer,
+                ),
             ):
-                raise RuntimeError("training member has incomplete structured predictor state")
-            actor_auxiliary_enabled = bool(
-                not warmup_active
-                and structured_gate_states
-                and structured_gate_states[agent]["enabled"]
+                if (predictor is None) != (optimizer is None):
+                    raise RuntimeError(
+                        f"training member has incomplete structured {name} predictor state"
+                    )
+            gate_state = structured_gate_states[agent] if structured_gate_states else None
+            actor_gate = gate_state["actor"] if gate_state is not None else None
+            critic_gate = gate_state["critic"] if gate_state is not None else None
+            actor_auxiliary_enabled, critic_auxiliary_enabled = (
+                _structured_auxiliary_gate_decisions(
+                    gate_state,
+                    warmup_active=warmup_active,
+                )
             )
             measured = update_ppo(
                 member.actor,
@@ -2822,14 +3239,29 @@ def main() -> None:
                 structured_dynamics=member.structured_dynamics,
                 structured_dynamics_optimizer=member.structured_dynamics_optimizer,
                 structured_actor_auxiliary=actor_auxiliary_enabled,
+                structured_critic_dynamics=member.structured_critic_dynamics,
+                structured_critic_dynamics_optimizer=(member.structured_critic_dynamics_optimizer),
+                structured_critic_auxiliary=critic_auxiliary_enabled,
                 auxiliary_generator=auxiliary_generator,
+                diagnostic_groups=diagnostic_groups,
+                diagnostic_gradients=iteration % 25 == 0,
             )
-            if structured_gate_states:
+            if actor_gate is not None:
                 measured.update(
                     _advance_structured_gate(
-                        structured_gate_states[agent],
+                        actor_gate,
                         measured,
                         ppo_config,
+                        kind="actor",
+                    )
+                )
+            if critic_gate is not None:
+                measured.update(
+                    _advance_structured_gate(
+                        critic_gate,
+                        measured,
+                        ppo_config,
+                        kind="critic",
                     )
                 )
             # Per member, so one collapsed member stops the run as itself rather
@@ -2847,6 +3279,13 @@ def main() -> None:
                 agent=None if population == 1 else agent,
             )
             update_metrics.update(_agent_fields(measured, agent, population))
+            if initial_actor_provenance is not None:
+                current_warmup_evs.append(float(measured["monte_carlo_explained_variance"]))
+        if initial_actor_provenance is not None:
+            critic_warmup_previous_evs = current_warmup_evs
+            initial_actor_provenance["critic_warmup_state"][
+                "last_monte_carlo_explained_variance"
+            ] = list(critic_warmup_previous_evs)
         update_seconds = time.monotonic() - update_started
         iteration += 1
         metrics = {
@@ -2871,6 +3310,7 @@ def main() -> None:
             **population_metrics,
             **replay_parity_metrics,
             **update_metrics,
+            **warmup_diagnostics,
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
@@ -2910,6 +3350,17 @@ def main() -> None:
     completed_checkpoint, completed_snapshot = completed_commit
     if completed_snapshot is not None:
         league_snapshot_refs.append(completed_snapshot)
+    if (
+        initial_actor_provenance is not None
+        and iteration >= args.iterations
+        and not critic_warmup_complete
+    ):
+        commit_executor.shutdown(wait=True)
+        writer.close()
+        raise RuntimeError(
+            "training reached its final iteration before the critic satisfied the "
+            "Monte Carlo-return explained-variance actor-release gate"
+        )
     # The max-hours boundary can become true while the last asynchronous
     # journal/snapshot commit finishes. Force that clean terminal state once,
     # but never rewrite an iteration already committed as periodic or final.

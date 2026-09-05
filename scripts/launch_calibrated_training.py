@@ -26,6 +26,9 @@ from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
 )
 from kaggriculture.production import (
+    PRODUCTION_ARCHITECTURE,
+    PRODUCTION_CRITIC_WARMUP_ITERATIONS,
+    PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS,
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
@@ -247,6 +250,8 @@ def _validate_configuration(
 ) -> tuple[list[int], int]:
     expected = {
         "event": "configuration",
+        "architecture": PRODUCTION_ARCHITECTURE,
+        "auxiliary_mode": "enabled",
         ROLLOUT_FORWARD_MODE_KNOB: knobs[ROLLOUT_FORWARD_MODE_KNOB],
         # Fixed across the chain rather than decided by it. Three reports
         # attribute two knobs because each step moves exactly one, so a third
@@ -901,7 +906,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--critic-warmup-iterations",
         type=int,
-        help="iterations spent fitting the critic to the warm-started policy before it is trusted",
+        default=PRODUCTION_CRITIC_WARMUP_ITERATIONS,
+        help="minimum critic-only iterations before the adaptive readiness gate "
+        f"(default: {PRODUCTION_CRITIC_WARMUP_ITERATIONS}; "
+        f"maximum: {PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS})",
     )
     return parser.parse_args()
 
@@ -922,16 +930,14 @@ def main() -> None:
         raise FileNotFoundError(requested_actor)
     if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 1:
         raise ValueError("critic warmup iterations must be positive")
-    if args.critic_warmup_iterations is not None and args.init_actor_from is None:
-        raise ValueError("critic warmup applies only to a warm-started run")
-    # A warmup that outlives the run never lets the actor take a step, and the
-    # stalled-actor guard inside training is suppressed for exactly those
-    # iterations, so the run would finish silently identical to its clone.
-    if (
-        args.critic_warmup_iterations is not None
-        and args.critic_warmup_iterations >= args.iterations
-    ):
-        raise ValueError("critic warmup must leave iterations for the actor to train in")
+    if args.critic_warmup_iterations > PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS:
+        raise ValueError(
+            "critic warmup cannot exceed the "
+            f"{PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS}-iteration readiness deadline"
+        )
+    # Whether this is fresh is known only after atomic latest-checkpoint
+    # discovery. Resumes already carry an actor and any remaining warmup state;
+    # fresh production is fail-closed around the measured BC initialization.
     documents = {
         "eager": _read_report(args.eager_report),
         "mixed": _read_report(args.mixed_report),
@@ -950,13 +956,20 @@ def main() -> None:
         )
     run_directory = args.run_dir.expanduser().resolve()
     resume_checkpoint = resolve_resume_checkpoint(run_directory, args.resume)
+    if resume_checkpoint is None and requested_actor is None:
+        raise ValueError("a fresh production run requires --init-actor-from or --resume")
+    if resume_checkpoint is None and args.critic_warmup_iterations >= args.iterations:
+        raise ValueError("critic warmup must leave iterations for the actor to train in")
     decision_path = run_directory / "calibration-decision.json"
     # Relaunching the identical command is how a killed run continues, so the
     # warm-start flags must not turn that into an error. Once the run exists,
     # its actor and remaining critic warmup come from the checkpoint. Preserve
     # the launch-side clone record from the target decision on an in-place
     # resume, or from the checkpoint's source run on a portable resume.
-    warm_start = _warm_start_record(requested_actor, args.critic_warmup_iterations)
+    warm_start = _warm_start_record(
+        requested_actor,
+        args.critic_warmup_iterations if requested_actor is not None else None,
+    )
     initial_actor = None if resume_checkpoint is not None else requested_actor
     critic_warmup_iterations = (
         None if resume_checkpoint is not None else args.critic_warmup_iterations
@@ -999,6 +1012,8 @@ def main() -> None:
                     (f"{name}_report_size_bytes", document.size_bytes),
                 )
             },
+            "architecture": PRODUCTION_ARCHITECTURE,
+            "model": production_model_config(),
             "iterations": args.iterations,
             "max_hours": args.max_hours,
             "seed": args.seed,

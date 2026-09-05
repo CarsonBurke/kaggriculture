@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import fields
 
 import numpy as np
-import pytest
 import torch
 from test_rollout import _assert_stored_rows_replay_from_current_actor
 
@@ -217,14 +216,8 @@ def test_both_seats_of_a_game_share_one_orientation() -> None:
     assert set(int(agent) for agent in rollout.agents[2:4]) == {0, 1}
 
 
-def test_structured_wave_refuses_non_identity_frames() -> None:
-    """The structured token encoding has no flip, so the collector refuses it.
-
-    Fires before any simulator state exists: a structured population that
-    would cycle non-identity games would otherwise silently feed unflipped
-    boards to a policy trained on flipped ones.
-    """
-
+def test_structured_population_wave_uses_identity_frames() -> None:
+    """Structured production remains runnable without an unimplemented token flip."""
     config = StructuredConfig(
         model_dim=16,
         attention_heads=2,
@@ -235,9 +228,12 @@ def test_structured_wave_refuses_non_identity_frames() -> None:
         core_layers=1,
         quantity_rank=4,
     )
-    with pytest.raises(ValueError, match="structured encoding"):
-        collect_population_play_rust(
-            [StructuredActor(config), StructuredActor(config)],
-            games=_GAMES,
-            seed_start=_SEED_START,
-        )
+    rollout = collect_population_play_rust(
+        [StructuredActor(config), StructuredActor(config)],
+        games=_GAMES,
+        seed_start=_SEED_START,
+    )
+    np.testing.assert_array_equal(
+        rollout.orientations,
+        np.full(2 * _GAMES, int(Orientation.IDENTITY), dtype=np.int8),
+    )

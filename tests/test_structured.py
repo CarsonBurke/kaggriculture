@@ -11,7 +11,7 @@ from kaggle_environments import make
 
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import ANIMALS, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
 from kaggriculture.model import FarmActor, ModelConfig, ReluSquared
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
@@ -23,11 +23,16 @@ from kaggriculture.structured import (
     StructuredActor,
     StructuredConfig,
     StructuredCritic,
+    StructuredCriticBelief,
     StructuredInputs,
     refresh_fused_mlp_fp8,
     stack_structured,
 )
-from kaggriculture.structured_dynamics import _latent_smooth_l1
+from kaggriculture.structured_dynamics import (
+    StructuredCriticDynamics,
+    _latent_smooth_l1,
+    structured_critic_window_loss,
+)
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
 
@@ -608,6 +613,7 @@ def test_structured_actor_gradients_reach_every_input_family(
         "tile_kind": actor.trunk.tiles.kind.weight.grad,
         "units": actor.trunk.units.continuous[0].weight.grad,
         "economy": actor.trunk.economy.product_projection.weight.grad,
+        "animals": actor.trunk.economy.animal_projection.weight.grad,
         "town": actor.trunk.economy.town_projection.weight.grad,
         "opponent": actor.trunk.opponent_queries.grad,
         "latents": actor.trunk.latent_queries.grad,
@@ -617,11 +623,11 @@ def test_structured_actor_gradients_reach_every_input_family(
         assert gradient is not None and gradient.abs().sum() > 0, f"no gradient into {name}"
 
 
-def test_structured_critic_reads_both_private_states(
+def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits(
     real_pairs: list[tuple[dict, dict]],
 ) -> None:
     torch.manual_seed(0)
-    config = _tiny_config()
+    config = replace(_tiny_config(), critic_latents=5)
     critic = StructuredCritic(config)
 
     rows = [
@@ -634,23 +640,192 @@ def test_structured_critic_reads_both_private_states(
     batch = stacked.tile_categorical.shape[0]
     inputs = stacked._replace(
         products=torch.cat((stacked.products, extras.products), dim=-1),
+        animals=torch.cat((stacked.animals, extras.animals), dim=-1),
         crops=torch.cat((stacked.crops, extras.crops), dim=-1),
     )
 
-    logits = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
-
-    assert logits.shape == (batch, config.value_atoms)
-    assert torch.isfinite(logits).all()
+    initial = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
+    assert initial.shape == (batch, config.value_atoms)
+    assert torch.isfinite(initial).all()
     # Zero-initialized head starts at the uniform distribution: value 0.
-    assert float(critic.value(logits).detach().abs().max()) == pytest.approx(0.0, abs=1e-5)
+    assert float(critic.value(initial).detach().abs().max()) == pytest.approx(0.0, abs=1e-5)
 
-    # Opponent private inputs must actually reach the value estimate. The
-    # zero-initialized head blocks trunk gradients at init, so perturb it.
     torch.nn.init.normal_(critic.value_head.weight, std=0.01)
-    second = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
-    second.sum().backward()
+    expected = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
+    actual, belief = critic.forward_with_belief(
+        inputs,
+        extras.unit_categorical,
+        extras.unit_continuous,
+        extras.unit_active,
+    )
+    assert torch.equal(actual, expected)
+    assert belief.own_patches.shape == (batch, 100, config.model_dim)
+    assert belief.opponent_patches.shape == belief.own_patches.shape
+    assert belief.opponent_summary.shape == (batch, config.opponent_latents, config.model_dim)
+    assert belief.economy_entities.shape == (
+        batch,
+        len(PRODUCTS) + len(ANIMALS) + len(CROPS) + 3,
+        config.model_dim,
+    )
+    assert belief.central_latents.shape == (batch, config.critic_latents, config.model_dim)
+    assert belief.value_decision.shape == (batch, 1, config.model_dim)
+
+    product_values = inputs.products.clone()
+    product_values[..., -1] += 0.25
+    _, product_belief = critic.forward_with_belief(
+        inputs._replace(products=product_values),
+        extras.unit_categorical,
+        extras.unit_continuous,
+        extras.unit_active,
+    )
+    assert not torch.equal(product_belief.economy_entities, belief.economy_entities)
+
+    animal_values = inputs.animals.clone()
+    animal_values[..., -1] += 0.25
+    _, animal_belief = critic.forward_with_belief(
+        inputs._replace(animals=animal_values),
+        extras.unit_categorical,
+        extras.unit_continuous,
+        extras.unit_active,
+    )
+    assert not torch.equal(animal_belief.central_latents, belief.central_latents)
+
+    crop_values = inputs.crops.clone()
+    crop_values[..., -1] += 0.25
+    _, crop_belief = critic.forward_with_belief(
+        inputs._replace(crops=crop_values),
+        extras.unit_categorical,
+        extras.unit_continuous,
+        extras.unit_active,
+    )
+    assert not torch.equal(crop_belief.economy_entities, belief.economy_entities)
+
+    assert extras.unit_active.any()
+    opponent_unit_continuous = extras.unit_continuous.clone()
+    opponent_unit_continuous[extras.unit_active] += 0.25
+    _, unit_belief = critic.forward_with_belief(
+        inputs,
+        extras.unit_categorical,
+        opponent_unit_continuous,
+        extras.unit_active,
+    )
+    assert not torch.equal(unit_belief.central_latents, belief.central_latents)
+
+    expected.sum().backward()
     gate = critic.trunk.units.farm.weight.grad
     assert gate is not None and gate[1].abs().sum() > 0
+
+
+def test_structured_critic_dynamics_loss_is_recursive_and_detached(
+    real_inputs: StructuredInputs,
+) -> None:
+    torch.manual_seed(13)
+    config = replace(_tiny_config(), critic_latents=5)
+    dynamics = StructuredCriticDynamics(config)
+    rows = 3
+    inputs = StructuredInputs(*(value[:rows] for value in real_inputs))
+    belief = StructuredCriticBelief(
+        *(
+            torch.randn(
+                rows,
+                identity.num_embeddings,
+                config.model_dim,
+                requires_grad=True,
+            )
+            for identity in dynamics.position_identity
+        )
+    )
+    factors = {
+        "unit_actions": torch.zeros(rows, MAX_UNITS, dtype=torch.long),
+        "market_kinds": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long),
+        "market_quantities": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long),
+    }
+    value_head = torch.nn.Linear(config.model_dim, config.value_atoms)
+
+    terms = structured_critic_window_loss(
+        dynamics,
+        belief,
+        inputs,
+        factors,
+        value_head=value_head,
+        horizon=2,
+    )
+
+    assert terms.eligible.item() == pytest.approx(1.5)
+    assert all(torch.isfinite(term) for term in terms)
+    (terms.latent + terms.value).backward()
+    for value in belief:
+        assert value.grad is not None
+        assert value.grad[0].abs().sum() > 0
+        assert value.grad[-1].count_nonzero() == 0
+    predictor_gradients = [parameter.grad for parameter in dynamics.parameters()]
+    assert all(gradient is not None for gradient in predictor_gradients)
+    assert sum(gradient.abs().sum() for gradient in predictor_gradients) > 0
+    assert dynamics.action.unit_action.weight.grad is not None
+    assert dynamics.action.market_kind.weight.grad is not None
+    assert value_head.weight.grad is None
+    assert value_head.bias.grad is None
+
+    source = StructuredCriticBelief(*(value[:1].detach() for value in belief))
+    unit_actions = factors["unit_actions"][:1]
+    market_kinds = factors["market_kinds"][:1]
+    market_quantities = factors["market_quantities"][:1]
+    baseline = dynamics(
+        source,
+        unit_actions,
+        market_kinds,
+        market_quantities,
+        inputs.unit_categorical[:1],
+        inputs.unit_active[:1],
+    )
+    changed_unit_actions = unit_actions.clone()
+    changed_unit_actions[:, 0] = 1
+    unit_conditioned = dynamics(
+        source,
+        changed_unit_actions,
+        market_kinds,
+        market_quantities,
+        inputs.unit_categorical[:1],
+        inputs.unit_active[:1],
+    )
+    changed_market_kinds = market_kinds.clone()
+    changed_market_quantities = market_quantities.clone()
+    changed_market_kinds[:, 0] = 1
+    changed_market_quantities[:, 0] = 1
+    market_conditioned = dynamics(
+        source,
+        unit_actions,
+        changed_market_kinds,
+        changed_market_quantities,
+        inputs.unit_categorical[:1],
+        inputs.unit_active[:1],
+    )
+    assert any(
+        not torch.equal(left, right) for left, right in zip(baseline, unit_conditioned, strict=True)
+    )
+    assert any(
+        not torch.equal(left, right)
+        for left, right in zip(baseline, market_conditioned, strict=True)
+    )
+
+    with pytest.raises(ValueError, match="horizon must be positive"):
+        structured_critic_window_loss(
+            dynamics,
+            belief,
+            inputs,
+            factors,
+            value_head=value_head,
+            horizon=0,
+        )
+    with pytest.raises(ValueError, match="complete windows"):
+        structured_critic_window_loss(
+            dynamics,
+            belief,
+            inputs,
+            factors,
+            value_head=value_head,
+            horizon=3,
+        )
 
 
 def test_structured_config_uses_two_head_gqa_and_two_x_squared_relu() -> None:
@@ -662,6 +837,13 @@ def test_structured_config_uses_two_head_gqa_and_two_x_squared_relu() -> None:
     assert attention.key_value.out_features == 2 * config.attention_kv_heads * attention.head_dim
     assert isinstance(feed_forward.activation, ReluSquared)
     assert feed_forward.input.out_features == 2 * config.model_dim
+
+
+def test_structured_defaults_do_not_silently_enable_global_refresh() -> None:
+    config = StructuredConfig()
+
+    assert config.global_refresh_layers == ()
+    assert config.global_refresh_context == "none"
 
 
 def test_default_core_interleaves_full_entity_refreshes(

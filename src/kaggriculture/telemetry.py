@@ -54,7 +54,16 @@ from typing import Any, Protocol
 #: 9: VAPO decoupled GAE adds `schedule/critic_gae_lambda` beside the actor
 #: lambda. The fingerprint would already rebuild, but an epoch bump keeps the
 #: human ledger in the same file as the tables.
-_LAYOUT_EPOCH = 9
+#: 10: actor and critic NextLat predictors gained independent held-out, fitting,
+#: gate, and representation-loss categories. Prefix placement is logic as well
+#: as data, so the epoch and fingerprint both change.
+#: 11: per-head abort thresholds (`*_fatal_at`) are no longer plotted -- they
+#: are flat configuration bounds, one chart per head, and the bound they guard
+#: keeps its own curve -- and behavior cloning's per-module representation
+#: diagnostics moved out of `misc` into `representation-<module>/`. Both are
+#: placement logic the table values do not express, so the epoch moves with the
+#: fingerprint.
+_LAYOUT_EPOCH = 11
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -525,6 +534,8 @@ _TRAINING_TAGS = {
     "gamma": "schedule/gamma",
     "epochs": "schedule/epochs",
     "updates": "schedule/updates",
+    "structured_learning_rate": "nextlat-schedule/actor_learning_rate",
+    "structured_critic_learning_rate": "nextlat-schedule/critic_learning_rate",
     # Beside `actor/updates` in meaning but a schedule quantity, not an outcome:
     # it is what a complete epoch would have applied, so the pair reads as a
     # fraction. Only the numerator was ever recorded, which is why 1 of 113
@@ -546,7 +557,6 @@ _TRAINING_TAGS = {
     "learner_states_per_rollout_second": "throughput/learner_states_per_rollout_second",
     "physical_games_per_rollout_second": "throughput/physical_games_per_rollout_second",
     "iterations_per_hour": "throughput/iterations_per_hour",
-    "states": "throughput/states",
     # What one benchmark iteration was asked to do, and what it cost the
     # machine to do it. Neither is a curve over training -- the benchmark holds
     # them fixed per batch -- but both are what a batch-size sweep is read for.
@@ -607,8 +617,32 @@ _TRAINING_TAGS = {
 }
 
 #: Fields that are bookkeeping rather than a curve. A resume token plotted over
-#: time says nothing about training and costs a chart to say it.
-_UNPLOTTED = frozenset(("next_seed",))
+#: time says nothing about training and costs a chart to say it. The schedule
+#: hyperparameters join it for the same reason: each is flat within a run --
+#: `epochs`, `gamma` and both GAE lambdas never move inside one journal -- and
+#: the values they hold belong to the configuration record, not to a curve.
+#: The learning rates stay plotted because warmup and decay do move them.
+_UNPLOTTED = frozenset(
+    (
+        "next_seed",
+        "epochs",
+        "gamma",
+        "actor_gae_lambda",
+        "critic_gae_lambda",
+        # Not bookkeeping but an exact duplicate: the wave cohort's
+        # `rollout_states` is the same total by construction, and without this
+        # the field would fall through to `misc/states` instead of going away.
+        "states",
+    )
+)
+
+#: Per-head abort thresholds are flat configuration bounds, not measurements:
+#: one constant chart per head for each of `kl` and `tail_fraction`. The
+#: curves they bound keep their own tags, and the bound values stay in the
+#: journal, so plotting them costs charts and says nothing. Matched as a
+#: suffix because the heads are an open set -- a new parity component would
+#: otherwise arrive with two new flat charts before anyone files it.
+_FATAL_AT_SUFFIX = "_fatal_at"
 
 #: Statistics measured once per policy head, as (field prefix, tag category).
 #: The head is the tag's last segment, so unit, kind and quantity land as
@@ -620,6 +654,102 @@ _PER_HEAD_PREFIXES: tuple[tuple[str, str], ...] = (
     ("update_replay_", "parity"),
     ("holdout_", "holdout"),
 )
+#: Actor and critic NextLat measurements are intentionally separate categories:
+#: held-out pre-update loss decides the gate, predictor loss fits only the
+#: training-only transition module, and auxiliary loss is the representation
+#: gradient reaching the policy/value model. Combining any two would make a
+#: healthy predictor look like a healthy representation update.
+_STRUCTURED_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("structured_critic_preupdate_", "nextlat-critic-holdout"),
+    ("structured_critic_predictor_", "nextlat-critic-predictor"),
+    ("structured_critic_gate_", "nextlat-critic-gate"),
+    ("structured_critic_gradient_", "nextlat-critic-gradients"),
+    ("structured_critic_", "nextlat-critic-auxiliary"),
+    ("structured_preupdate_", "nextlat-actor-holdout"),
+    ("structured_predictor_", "nextlat-actor-predictor"),
+    ("structured_gate_", "nextlat-actor-gate"),
+    ("structured_gradient_", "nextlat-actor-gradients"),
+    ("structured_actor_", "nextlat-actor-auxiliary"),
+)
+_CREDIT_PREFIX = "credit_preupdate_"
+_CREDIT_HORIZONS = ("all", "ttg_1_32", "ttg_33_128", "ttg_129_512", "ttg_513_plus")
+_STRUCTURED_ACTOR_TERM_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "decision",
+        (
+            "decision",
+            "decision_one",
+            "decision_final",
+            "decision_unit",
+            "decision_market_kind",
+            "decision_market_quantity",
+        ),
+    ),
+    (
+        "patch",
+        (
+            "patch",
+            "patch_one",
+            "patch_final",
+            "patch_all",
+            "patch_changed",
+            "patch_unchanged",
+        ),
+    ),
+    (
+        "opponent-patch",
+        (
+            "opponent_patches",
+            "opponent_patch_all",
+            "opponent_patch_changed",
+            "opponent_patch_unchanged",
+        ),
+    ),
+    (
+        "residual",
+        (
+            "residual_own_patches",
+            "residual_opponent_patches",
+            "residual_opponent_summary",
+            "residual_economy_entities",
+            "residual_central_latents",
+            "residual_unit_decisions",
+            "residual_market_decisions",
+        ),
+    ),
+    ("belief", ("latent", "economy", "opponent_summary")),
+)
+_STRUCTURED_CRITIC_LOSS_TERMS = ("latent", "value")
+
+#: Behavior cloning's per-module representation diagnostics, as
+#: `structured_<module>_<statistic>`. They match no NextLat prefix -- those all
+#: name a gate, predictor, or holdout role this journal never writes -- so they
+#: fell through to `misc`, twenty-eight charts in the drawer for unfiled
+#: metrics. Each module is one accordion of four charts, following the same
+#: facet-joins-category convention as the per-head rules: overlaying the seven
+#: modules on four shared charts would read representation collapse in one
+#: module as noise in all of them.
+#:
+#: Written out rather than derived from `StructuredBelief._fields` because the
+#: mirror must keep plotting journals whose source revision it can no longer
+#: import; a module the game grows later still lands in `misc`, visible, until
+#: it is filed here deliberately.
+_STRUCTURED_REPRESENTATION_MODULES = (
+    "own_patches",
+    "opponent_patches",
+    "opponent_summary",
+    "economy_entities",
+    "central_latents",
+    "unit_decisions",
+    "market_decisions",
+)
+_STRUCTURED_REPRESENTATION_STATISTICS = (
+    "variance",
+    "effective_rank",
+    "cosine",
+    "dispersion",
+)
+_STRUCTURED_REPRESENTATION_PREFIX = "structured_"
 
 _OPPONENT_PREFIX = "league_opponent_"
 
@@ -778,6 +908,16 @@ def _layout_fingerprint() -> str:
             "families": _BEHAVIOR_FAMILIES,
             "behavior": _BEHAVIOR_CATEGORIES,
             "per_head": _PER_HEAD_PREFIXES,
+            "structured_actor_terms": _STRUCTURED_ACTOR_TERM_FAMILIES,
+            "structured_critic_losses": _STRUCTURED_CRITIC_LOSS_TERMS,
+            "structured": _STRUCTURED_PREFIXES,
+            "representation": {
+                "prefix": _STRUCTURED_REPRESENTATION_PREFIX,
+                "modules": _STRUCTURED_REPRESENTATION_MODULES,
+                "statistics": _STRUCTURED_REPRESENTATION_STATISTICS,
+            },
+            "fatal_at": _FATAL_AT_SUFFIX,
+            "credit": {"prefix": _CREDIT_PREFIX, "horizons": _CREDIT_HORIZONS},
             "unplotted": sorted(_UNPLOTTED),
             "opponents": {
                 "prefix": _OPPONENT_PREFIX,
@@ -829,6 +969,43 @@ def _population_category(matrix: str) -> str:
     return f"{_POPULATION_CATEGORY}-{matrix.replace('_', '-')}"
 
 
+def _structured_placement(name: str) -> tuple[str, str] | None:
+    for prefix, category in _STRUCTURED_PREFIXES:
+        if not name.startswith(prefix):
+            continue
+        statistic = name[len(prefix) :]
+        if not statistic:
+            return None
+        if category.startswith("nextlat-critic") and statistic in _STRUCTURED_CRITIC_LOSS_TERMS:
+            category = f"{category}-loss"
+        elif category.startswith("nextlat-actor"):
+            for family, terms in _STRUCTURED_ACTOR_TERM_FAMILIES:
+                if statistic in terms:
+                    category = f"{category}-{family}"
+                    break
+        return "", f"{category}/{statistic}"
+    return None
+
+
+def _representation_placement(name: str) -> tuple[str, str] | None:
+    """Place a per-module representation diagnostic, or None if it is not one.
+
+    Checked after the NextLat prefixes, which all name a role these journals
+    never write, so a fitting loss that happens to end in one of the four
+    statistic names cannot be claimed here first. A module the game grows
+    later matches no entry and keeps falling through to `misc`, where its
+    arrival is visible instead of silently joining a module it is not.
+    """
+    if not name.startswith(_STRUCTURED_REPRESENTATION_PREFIX):
+        return None
+    rest = name[len(_STRUCTURED_REPRESENTATION_PREFIX) :]
+    for module in _STRUCTURED_REPRESENTATION_MODULES:
+        statistic = rest[len(module) + 1 :] if rest.startswith(module + "_") else ""
+        if statistic in _STRUCTURED_REPRESENTATION_STATISTICS:
+            return "", f"representation-{module.replace('_', '-')}/{statistic}"
+    return None
+
+
 def _population_placement(statistic: str) -> tuple[str, str]:
     """Place a population reading, faceting each matrix by the agent whose row it is.
 
@@ -868,11 +1045,17 @@ def _agentless_placement(name: str) -> tuple[str, str] | None:
     sort adjacently, which is as close to the old overlaid series as a single run
     can get.
     """
-    if name in _UNPLOTTED:
+    if name in _UNPLOTTED or name.endswith(_FATAL_AT_SUFFIX):
         return None
     tag = _TRAINING_TAGS.get(name)
     if tag is not None:
         return "", tag
+    if name.startswith(_CREDIT_PREFIX):
+        statistic = name[len(_CREDIT_PREFIX) :]
+        for horizon in _CREDIT_HORIZONS:
+            group, separator, metric = statistic.partition(f"_{horizon}_")
+            if group and separator and metric:
+                return "", f"credit-{group.replace('_', '-')}-{horizon.replace('_', '-')}/{metric}"
     if name.startswith(_POPULATION_PREFIX):
         # Ahead of the cohort loop below, whose empty prefix matches everything:
         # it would file the whole matrix in `misc`, one chart per ordered pair.
@@ -883,6 +1066,12 @@ def _agentless_placement(name: str) -> tuple[str, str] | None:
         head, _, statistic = name[len(prefix) :].partition("_")
         if statistic:
             return "", f"{category}-{head}/{statistic}"
+    structured = _structured_placement(name)
+    if structured is not None:
+        return structured
+    representation = _representation_placement(name)
+    if representation is not None:
+        return representation
     for prefix, cohort in _COHORT_RUNS:
         if not name.startswith(prefix):
             continue

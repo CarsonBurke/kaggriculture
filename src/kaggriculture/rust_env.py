@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -32,13 +33,44 @@ def _profile_name(release: bool) -> str:
     return "release" if release else "debug"
 
 
+def _cargo_cache_key(root: Path) -> str:
+    """Key frozen builds by Rust inputs, not by unrelated Python edits."""
+    identity_path = root / ".source-identity.json"
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        files = identity["files"]
+        rust_inputs = {
+            name: digest
+            for name, digest in files.items()
+            if name == "rust-toolchain.toml" or name.startswith("rust/")
+        }
+        if rust_inputs:
+            encoded = json.dumps(rust_inputs, sort_keys=True, separators=(",", ":")).encode()
+            return hashlib.sha256(encoded).hexdigest()[:16]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+
+
+def _cargo_target_dir(crate: Path) -> Path:
+    """Resolve a writable Cargo cache without mutating frozen source trees."""
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    if configured:
+        target = Path(configured).expanduser()
+        return target if target.is_absolute() else crate / target
+
+    root = _repository_root()
+    if not (root / ".source-identity.json").is_file() and os.access(crate, os.W_OK):
+        return crate / "target"
+
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser()
+    return cache_root / "kaggriculture" / "cargo-target" / _cargo_cache_key(root)
+
+
 def _fallback_artifacts(crate: Path, release: bool) -> list[Path]:
     """Return likely artifacts without invoking Cargo, for ``build=False``."""
     profile = _profile_name(release)
-    configured = os.environ.get("CARGO_TARGET_DIR")
-    target = Path(configured).expanduser() if configured else crate / "target"
-    if not target.is_absolute():
-        target = crate / target
+    target = _cargo_target_dir(crate)
     names = ("lib_kagg_env.so", "lib_kagg_env.dylib", "_kagg_env.dll", "_kagg_env.pyd")
     direct = [target / profile / name for name in names]
     cross_compiled = [path for name in names for path in target.glob(f"*/{profile}/{name}")]
@@ -131,6 +163,8 @@ def _build_native(crate: Path, release: bool) -> Path:
         str(manifest),
         "--lib",
         "--message-format=json-render-diagnostics",
+        "--target-dir",
+        str(_cargo_target_dir(crate)),
     ]
     if release:
         command.append("--release")
@@ -250,6 +284,12 @@ def toolchain_identity() -> str | None:
 def _validate_module(module: ModuleType, origin: str) -> ModuleType:
     if getattr(module, "BatchEnv", None) is None:
         raise ImportError(f"native extension loaded from {origin} does not expose BatchEnv")
+    from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
+
+    if getattr(module, "OBSERVATION_SCHEMA_VERSION", None) != OBSERVATION_SCHEMA_VERSION:
+        raise ImportError(
+            f"native extension loaded from {origin} has stale observation schema; rebuild required"
+        )
     return module
 
 

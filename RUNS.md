@@ -15,89 +15,106 @@ The loop is:
 
 All accelerator jobs must be submitted through `mlq`.
 
-## Current champion
+## Production contract
 
-`V0` is the selected structured configuration:
+Executable defaults are authoritative. Production architecture and PPO settings
+live in `src/kaggriculture/production.py`; BC settings live in
+`scripts/train_bc.py`. Use the entrypoints' defaults, selecting
+`--production-model` for a production-compatible BC initializer.
 
-```text
-architecture       structured
-model_dim          80
-attention_heads    4
-ffn_multiplier     4
-farm_blocks        2
-opponent_latents   8
-latents            32
-core_layers        8
-quantity_rank      32
-actor parameters   1,319,225
-critic parameters  1,078,701
-```
+This ledger records experiments and measured results, not an alternative
+configuration. Explicit overrides belong to named experiments and must be
+recorded with their artifacts; historical recipes must not become launch defaults.
 
-Evidence anchors:
+Historical schema-v1 BC evidence (not a valid schema-v2 initializer):
 
-- BC actor: `runs/ab-structured-s1/bc-actor.pt`
+- BC actor: `runs/vit-gqa-ffn2/n16/bc-actor.pt`
+- BC terminal NLL: 0.0007995702
+
+The following PPO and throughput measurements belong to the retired V0
+configuration with FFN multiplier 4. They remain historical comparison anchors,
+not evidence for the production contract above:
+
 - PPO run: `runs/econ-pastself-100-structured/checkpoint-000100.pt`
-- BC holdout NLL: 0.0008223874
 - PPO intra-league score: 0.51736
 - PPO public-v16 score rate: 0.84375
 - BC steady epoch median: 8.86 seconds
 - PPO actor-active median iteration: 27.98 seconds
 - PPO actor-active rollout median: 40,910 states/second
 - PPO actor-active update median: 21.96 seconds
+- Entity-CNN BC steady epoch median: 7.82 seconds
+- Entity-CNN PPO actor-active median iteration: 21.25 seconds
+- Entity-CNN PPO actor-active rollout median: 55,156 states/second
+- Entity-CNN PPO actor-active update median: 16.85 seconds
 
-The entity-CNN remains the speed reference, not the quality champion:
+Every benchmark must be rerun on one frozen source revision after the exact
+systems work; historical measurements are anchors, not substitutes.
 
-- BC steady epoch median: 7.82 seconds
-- PPO actor-active median iteration: 21.25 seconds
-- PPO actor-active rollout median: 55,156 states/second
-- PPO actor-active update median: 16.85 seconds
+## Schema-v2 RL repair verification
 
-Every benchmark must be rerun on one frozen source revision after the exact systems work; historical measurements are anchors, not substitutes.
+The clean cutover uses predictor gate v3 and observation schema v2. Deployment
+executes sampled/selected actions verbatim; no standing-weed rewrite remains.
+Seed-domain and finite-sample evaluation rules are documented in `README.md`.
+
+Verification:
+
+- CPU suite: 956 passed, 16 CUDA tests deselected.
+- CUDA suite: 16 passed in queued job 4874.
+- Rust suites: 42 passed; Clippy passes with warnings denied.
+- Native oracle: exact state, structured/conv encoding, potential, utility and
+  reward parity over 8 full games / 5,752 joint transitions.
+- Native binding safety rejects malformed, aliased and stale-schema buffers.
+- Task-scoped Python lint passes. Independent static reviews covered learning
+  math, gradients, schema privacy/parity, inference and evaluation admission.
+
+Queued source: `b11fce311ed34b6e68ffca2fe31c7513c027b81ae2600669f086e0edf2564590`.
+All jobs use normal priority and `maxParallelRuns=1`; unrelated workloads are
+not preempted. Queued work is not yet learning or throughput evidence:
+
+| MLQ job | Workload | Output |
+| --- | --- | --- |
+| 4874 | Full CUDA regression selection, 45-minute deadline — passed | MLQ logs |
+| 4875 | Completed 12-epoch BC exception, retained for this RL run | `runs/rl-repair-schema2-bc/` |
+| 4876–4878 | Aux off/predictor/enabled, 128+64 games, 11 repeats each, 2-hour deadlines | `artifacts/benchmarks/rl-repair-schema2-*.jsonl` |
+| 4879 | Standard P100, seed 20260812, production gates, 8-hour deadline | `runs/rl-repair-schema2-p100/` |
+| 4880–4881 | Matched 32-map development panels, both seats, public v27, 2-hour deadlines | `evaluations/rl-repair-schema2-*-development.json` |
+| 4884 | Standard P100 retry, seed 20260812, production gates, 8-hour deadline, gated on 4880 success (bypasses OOM-failed bench 4878 that skipped 4879) — failed: mixed-tree launch (snapshot script + live package refused by launcher guard) | MLQ logs |
+| 4886 | Standard P100 retry of 4884 with `PYTHONPATH` pinned to the frozen snapshot `src` so launcher and package agree | `runs/rl-repair-schema2-p100/` |
+| 4890 | Screening 32-cluster panel of frozen `checkpoint-000079.pt` vs public v27 (selection evidence for the finalist) | `evaluations/rl-repair-schema2-p100-ckpt79-screening.json` |
+| 4891 | Finalist panel of `checkpoint-000079.pt` vs public v27, gated on 4890 | `evaluations/rl-repair-schema2-p100-ckpt79-finalist-v27.json` |
+| 4892 | Builtin 16-cluster panel of `checkpoint-000079.pt` vs starter, gated on 4890 | `evaluations/rl-repair-schema2-p100-ckpt79-starter.json` |
+
+BC uses the four current v16 64-seed corpora, an 8-seed holdout per corpus,
+batch 2,048, run length 4, compiled BF16 and the complete standard optimizer
+schedule. PPO keeps the production critic-readiness deadline; an unready critic
+fails rather than relaxing the gate. Development panels are diagnostics, not
+screening/finalist certification. The benchmark forces enabled auxiliaries only
+to measure their cost; production still requires readiness.
+
+The completed 12-epoch job 4875 is a one-off retained initializer for this campaign
+by explicit user decision. Future BC runs inherit the CLI epoch default; do not
+repeat this job's override or retrain it for this RL run.
 
 ## Standard budgets
 
 ### B0: exact systems benchmark
 
-No retraining. Measure both eager and compiled execution at:
-
-- actor forward batch 1;
-- actor forward/backward batch 2,048;
-- complete BC epoch after compilation;
-- complete mixed PPO iteration;
-- complete candidate action path in official evaluation.
-
-Record cold compilation, steady median, p95, peak allocated/reserved CUDA memory, and action parity. Use at least 10 steady samples after warmup. An exact change is accepted only when eager and compiled outputs remain within the established BF16 tolerance, fixed-RNG legal actions are identical, and complete wall time improves.
+Use `scripts/benchmark_ppo_iteration.py` with its production defaults. Override
+only the execution mode being compared; hold the remaining settings fixed.
+Record cold compilation, steady timings, memory and action parity from the
+complete workload, not an isolated forward pass.
 
 ### B1: fast learning regression
 
-Use the existing complete BC schedule, never a shortened epoch count:
-
-```text
-datasets           bc-v16-mirror-512
-                   bc-v16-vs-starter-512
-                   bc-v16-vs-pass-256
-                   bc-v16-vs-random-256
-seeds/dataset      64
-holdout seeds      8
-epochs             12
-batch size         2048
-run length         4
-matrix LR          4.2e-3
-matrix WD          1.2
-Adam WD            0.005
-compile             default
-architecture       structured
-model dim          80
-```
-
-Initial architecture screens use training seeds `1,2,3,4`. NextLat screens use the same four first and extend finalists to `1..8`; a promoted NextLat recipe receives a final 16-seed BC replication because its prior effect was basin-dependent.
-
-Evaluate every artifact in the official engine on the screening block `10000..10015`, both seats, against public-v27 and public-v16. Use starter/pass/random only as collapse diagnostics. This is 32 complete 720-step games per principal opponent and seed.
+Run `scripts/train_bc.py --production-model` with the selected input corpora and
+output directory. Inherit the training defaults rather than copying hyperparameters
+from this ledger. Compare candidate and champion with the same seed and data.
+Evaluation domains and panel defaults come from the evaluator; choose the
+screening role explicitly when selecting candidates.
 
 A B1 arm advances when:
 
-- at least half of matched seeds improve public-v27 margin;
-- median public-v27 margin improves;
+- matched public-v27 play improves;
 - public-v16 behavior and strategy coverage do not collapse;
 - holdout NLL remains finite and within 5% of the champion unless play improves materially;
 - steady BC time is reported, including auxiliary overhead;
@@ -107,40 +124,25 @@ B1 is a screening gate, not final evidence.
 
 ### B2: confirmation BC and disjoint play
 
-For a B1 finalist:
-
-- extend architecture arms to eight training seeds when variance warrants it;
-- extend the selected NextLat recipe to 16 seeds;
-- evaluate on `20000..20031`, both seats, against public-v27, public-v16, and the current champion;
-- select any best-of-K artifact only on the screening block and report its result on this untouched confirmation block.
-
-Promotion requires a replicated play improvement or a clear speed-quality Pareto improvement. A lucky screening seed that fails the confirmation block is rejected.
+Freeze the screening-selected artifact before evaluating with
+`scripts/evaluate_checkpoint.py --seed-domain finalist --selection-report ...`.
+Use the evaluator's reserved domain and panel defaults, not a separate seed range
+from this ledger. Reusing screening maps is not confirmation.
 
 ### P100: PPO gate
 
-Run training seeds `20260813, 20260814, 20260815` with matched rollout/environment seeds:
-
-```text
-iterations                    100
-critic-only warmup            20
-actor epochs                  1
-critic epochs                 champion setting
-self-play games/iteration     144
-league games/iteration        36
-minibatch size                2048
-episode steps                 720
-optimizer                     NorMuon
-rollout compile               default
-update compile                default
-```
-
-Use identical BC-selection rules for candidate and champion. Evaluate checkpoint 100 on `30000..30031`, both seats, against public-v27, public-v16, all matched champion seeds, and all matched candidate seeds.
+P100 is the named 100-iteration experiment: use
+`scripts/launch_production.py --iterations 100` and inherit all other production
+defaults. Reuse the chosen BC artifact. Compare candidate and champion with
+matched rollout seeds and the evaluator's development panel.
 
 Report score, mean/median margin, paired intervals, seat split, strategy coverage, total wall time, rollout throughput, update throughput, and time-to-score. Promote on aggregate matched evidence, not the best individual run.
 
 ### P500: finalist continuation
 
-Continue the exact P100 checkpoints to iteration 500. Do not restart them. Final evaluation uses `40000..40127`, both seats, against the full fixed panel and cross-play population.
+Continue the exact P100 checkpoint through `scripts/launch_production.py --resume`.
+Inherit its continuation budget and production defaults. Do not restart or invent
+a separate evaluation seed range; use the screening/finalist workflow above.
 
 ## Phase S: exact performance work
 

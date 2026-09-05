@@ -4,12 +4,12 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
-from kaggriculture.league import LEAGUE_SNAPSHOT_FORMAT_VERSION
 from kaggriculture.opponents import normalize_opponent
 from kaggriculture.orientation import Orientation
 from kaggriculture.provenance import source_identity
@@ -121,7 +121,7 @@ def test_members_refuses_a_spec_a_reader_could_not_deduplicate() -> None:
         module._members(",")
 
 
-def test_fused_structured_snapshot_is_evaluated_through_cpu_submission_layout(
+def test_fused_structured_checkpoint_is_evaluated_through_cpu_submission_layout(
     tmp_path: Path,
 ) -> None:
     module = _script()
@@ -136,14 +136,17 @@ def test_fused_structured_snapshot_is_evaluated_through_cpu_submission_layout(
         fused_mlp=True,
     )
     fused = StructuredActor(config)
-    artifact = tmp_path / "league-actor-00000012.pt"
+    artifact = tmp_path / "checkpoint-000012.pt"
     torch.save(
         {
-            "format_version": LEAGUE_SNAPSHOT_FORMAT_VERSION,
+            "format_version": CHECKPOINT_FORMAT_VERSION,
             "architecture": "structured",
             "iteration": 12,
             "model_config": config.to_dict(),
             "actor": fused.state_dict(),
+            "seed_usage": [],
+            "source_identity": source_identity(),
+            "run_provenance": None,
         },
         artifact,
     )
@@ -154,9 +157,6 @@ def test_fused_structured_snapshot_is_evaluated_through_cpu_submission_layout(
     assert portable.config.fused_mlp is False
     assert next(portable.parameters()).device.type == "cpu"
     assert orientation is Orientation.IDENTITY
-
-    with pytest.raises(ValueError, match="single actor"):
-        module._load_member(artifact, 0)
 
 
 def test_fused_population_member_preserves_selected_weights_and_orientation(
@@ -196,6 +196,7 @@ def test_fused_population_member_preserves_selected_weights_and_orientation(
             ],
             "source_identity": source_identity(),
             "run_provenance": None,
+            "seed_usage": [],
         },
         artifact,
     )
@@ -257,6 +258,117 @@ def test_append_record_produces_one_json_line_per_call(tmp_path: Path) -> None:
     assert [json.loads(line)["iteration"] for line in lines] == [1, 2]
 
 
+def test_worker_writes_completion_only_after_every_expected_probe(monkeypatch, tmp_path) -> None:
+    module = _script()
+    artifact = tmp_path / "population.pt"
+    torch.save({"seed_usage": []}, artifact)
+    output = tmp_path / "metrics-external.jsonl"
+    args = SimpleNamespace(
+        seeds=2,
+        episode_steps=720,
+        torch_threads=1,
+        opponents="starter,pass",
+        agents="0,1",
+        artifact=artifact,
+        iteration=40,
+        output=output,
+        seed_start=4_000_000,
+    )
+
+    class Actor:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(module, "parse_args", lambda: args)
+    monkeypatch.setattr(module, "normalize_opponent", lambda spec: (spec, spec))
+    monkeypatch.setattr(module, "snapshot_sha256", lambda _path: "ab" * 32)
+    monkeypatch.setattr(
+        module, "_load_member", lambda _artifact, _member: (Actor(), Orientation.IDENTITY)
+    )
+    monkeypatch.setattr(
+        module,
+        "evaluate_opponent",
+        lambda _agent, label, _runnable, **keywords: {
+            "event": "external_eval",
+            "iteration": keywords["iteration"],
+            "artifact": keywords["artifact_name"],
+            "artifact_sha256": keywords["artifact_digest"],
+            "agent": keywords["member"],
+            "opponent": label,
+            "games": 4,
+            "completed_games": 4,
+        },
+    )
+
+    module.main()
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [(row["agent"], row["opponent"]) for row in rows[:-1]] == [
+        (0, "starter"),
+        (0, "pass"),
+        (1, "starter"),
+        (1, "pass"),
+    ]
+    assert rows[-1] == {
+        "event": "external_eval_complete",
+        "iteration": 40,
+        "artifact": "population.pt",
+        "artifact_sha256": "ab" * 32,
+        "members": [0, 1],
+        "opponents": ["starter", "pass"],
+        "records": 4,
+    }
+
+
+def test_worker_failure_leaves_rows_without_a_completion_marker(monkeypatch, tmp_path) -> None:
+    module = _script()
+    artifact = tmp_path / "actor.pt"
+    torch.save({"seed_usage": []}, artifact)
+    output = tmp_path / "metrics-external.jsonl"
+    args = SimpleNamespace(
+        seeds=2,
+        episode_steps=720,
+        torch_threads=1,
+        opponents="starter",
+        agents="",
+        artifact=artifact,
+        iteration=9,
+        output=output,
+        seed_start=4_000_000,
+    )
+
+    class Actor:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(module, "parse_args", lambda: args)
+    monkeypatch.setattr(module, "normalize_opponent", lambda spec: (spec, spec))
+    monkeypatch.setattr(module, "snapshot_sha256", lambda _path: "cd" * 32)
+    monkeypatch.setattr(
+        module, "_load_member", lambda _artifact, _member: (Actor(), Orientation.IDENTITY)
+    )
+    monkeypatch.setattr(
+        module,
+        "evaluate_opponent",
+        lambda *_arguments, **keywords: {
+            "event": "external_eval",
+            "iteration": keywords["iteration"],
+            "artifact": keywords["artifact_name"],
+            "artifact_sha256": keywords["artifact_digest"],
+            "agent": keywords["member"],
+            "opponent": "starter",
+            "games": 4,
+            "completed_games": 3,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="3 of 4 games"):
+        module.main()
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["external_eval"]
+
+
 def test_the_agent_callable_takes_exactly_the_one_argument_the_engine_passes() -> None:
     """`kaggle_environments` decides the call shape by introspection.
 
@@ -301,12 +413,8 @@ def test_each_member_gets_its_own_actor_rather_than_the_loops_last() -> None:
     assert calls == ["first", "second", "third"]
 
 
-def test_an_exported_artifact_and_a_league_snapshot_both_load_without_a_hint(tmp_path) -> None:
-    """The A/B compares a BC artifact against a trained snapshot.
-
-    Routing on the payload's own closed key set is what lets one flag accept
-    both; routing on the filename or the caller's promise would not.
-    """
+def test_external_evaluation_requires_provenance_bound_actor_not_bare_snapshot(tmp_path) -> None:
+    """Training opponents lack exposure provenance; evaluate full checkpoints or BC exports."""
     import torch
 
     from kaggriculture.league import save_actor_snapshot
@@ -318,9 +426,8 @@ def test_an_exported_artifact_and_a_league_snapshot_both_load_without_a_hint(tmp
     actor = FarmActor(config)
 
     snapshot = save_actor_snapshot(tmp_path / "league", actor, 3)
-    loaded, snapshot_orientation = module._load_member(snapshot.path, None)
-    assert isinstance(loaded, FarmActor)
-    assert snapshot_orientation == Orientation.IDENTITY
+    with pytest.raises(ValueError, match="seed_usage"):
+        module._load_member(snapshot.path, None)
 
     artifact = tmp_path / "bc-actor.pt"
     # Built by the trainer's own writer rather than a hand-rolled dict, so this
@@ -333,7 +440,12 @@ def test_an_exported_artifact_and_a_league_snapshot_both_load_without_a_hint(tmp
     trainer_spec.loader.exec_module(trainer)
     torch.save(
         trainer._artifact_payload(
-            "entity-cnn", actor, config, {"nll": 0.5}, {"datasets": []}, source_identity()
+            "entity-cnn",
+            actor,
+            config,
+            {"nll": 0.5},
+            {"datasets": [{"train_seeds": [0], "holdout_seeds": [1]}]},
+            source_identity(),
         ),
         artifact,
     )

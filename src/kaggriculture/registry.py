@@ -16,6 +16,7 @@ from torch import nn
 
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
 
 CONV_ENTITY = "entity-cnn"
 STRUCTURED = "structured"
@@ -32,10 +33,20 @@ class Architecture:
     critic_class: type
 
     def build_actor(self, model_config: dict[str, Any]) -> nn.Module:
-        return self.actor_class(self.config_class(**model_config))
+        return self.actor_class(self.build_config(model_config))
 
     def build_critic(self, model_config: dict[str, Any]) -> nn.Module:
-        return self.critic_class(self.config_class(**model_config))
+        return self.critic_class(self.build_config(model_config))
+
+    def build_config(self, model_config: dict[str, Any]) -> Any:
+        """Decode a saved model configuration, rejecting stale observation schemas."""
+        if self.name == STRUCTURED and (
+            model_config.get("observation_schema_version") != OBSERVATION_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "stale structured observation schema; fresh encoding and training required"
+            )
+        return self.config_class(**model_config)
 
 
 ARCHITECTURES: dict[str, Architecture] = {

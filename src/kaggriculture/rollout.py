@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from kaggle_environments import make
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
 from kaggriculture.constants import (
+    ANIMALS,
     BOARD_SIZE,
     CROPS,
     DEFAULT_REWARD_GAMMA,
@@ -35,7 +37,6 @@ from kaggriculture.encoding import (
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
 from kaggriculture.orientation import (
-    Orientation,
     orient_boards,
     orient_unit_actions,
     orient_unit_features,
@@ -48,6 +49,8 @@ from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredInputs
 from kaggriculture.tokens import (
+    ANIMAL_PRIVATE_FIELDS,
+    ANIMAL_TOKEN_FIELDS,
     CROP_PRIVATE_FIELDS,
     CROP_TOKEN_FIELDS,
     FARM_TOKEN_FIELDS,
@@ -63,6 +66,8 @@ from kaggriculture.tokens import (
 )
 
 _MAX_FLOAT32_CATEGORICAL_DRAW = np.nextafter(np.float32(1.0), np.float32(0.0))
+_NATIVE_TEMPERATURE_FLOOR = 1e-4
+_POPULATION_PAIRING_SEED_SALT = 0x5041_4952
 
 # Per-row codes for the wave's `builtin_agents` argument: 0 samples the row
 # from the network, anything else hands the row to the named engine reference
@@ -103,6 +108,9 @@ class RolloutBatch:
     # games cycle identity / mirror-x / mirror-y / rotate-180. Mixed and
     # Python collectors store zeros (identity).
     orientations: np.ndarray
+    # True only when every stored learner action was sampled from the behavior
+    # distribution rather than selected by argmax. PPO rejects false batches.
+    learner_stochastic: bool
     entropy_sums: np.ndarray
     elapsed_seconds: float
 
@@ -171,6 +179,7 @@ def _state_field_specs(architecture: str) -> dict[str, tuple[tuple[int, ...], ty
             "unit_tile_gather": ((MAX_UNITS, gathers), np.int8),
             "unit_tile_gather_valid": ((MAX_UNITS, gathers), np.bool_),
             "products": ((len(PRODUCTS), len(PRODUCT_TOKEN_FIELDS)), np.float16),
+            "animals": ((len(ANIMALS), len(ANIMAL_TOKEN_FIELDS)), np.float16),
             "crops": ((len(CROPS), len(CROP_TOKEN_FIELDS)), np.float16),
             "farms": ((2, len(FARM_TOKEN_FIELDS)), np.float16),
             "town": ((len(TOWN_TOKEN_FIELDS),), np.float16),
@@ -178,6 +187,7 @@ def _state_field_specs(architecture: str) -> dict[str, tuple[tuple[int, ...], ty
             "opponent_unit_continuous": ((MAX_UNITS, N_UNIT_CONTINUOUS), np.float16),
             "opponent_unit_active": ((MAX_UNITS,), np.bool_),
             "critic_products": ((len(PRODUCTS), len(PRODUCT_PRIVATE_FIELDS)), np.float16),
+            "critic_animals": ((len(ANIMALS), len(ANIMAL_PRIVATE_FIELDS)), np.float16),
             "critic_crops": ((len(CROPS), len(CROP_PRIVATE_FIELDS)), np.float16),
         }
     raise ValueError(f"unknown rollout architecture {architecture!r}")
@@ -206,6 +216,9 @@ _SHARED_ROLLOUT_FIELDS = tuple(_SHARED_FIELD_SPECS)
 # row's economy tokens: their own shed/carried product stock and seed counts.
 _PRODUCT_STOCK_COLUMNS = slice(
     PRODUCT_TOKEN_FIELDS.index("shed_stock"), PRODUCT_TOKEN_FIELDS.index("carried_stock") + 1
+)
+_ANIMAL_STOCK_COLUMNS = slice(
+    ANIMAL_TOKEN_FIELDS.index("shed_stock"), ANIMAL_TOKEN_FIELDS.index("carried_stock") + 1
 )
 _CROP_SEED_COLUMNS = slice(
     CROP_TOKEN_FIELDS.index("seeds_held"), CROP_TOKEN_FIELDS.index("seeds_held") + 1
@@ -253,6 +266,7 @@ def _finish_rollout(
     seats: np.ndarray,
     agents: np.ndarray,
     entropy_sums: np.ndarray,
+    learner_stochastic: bool,
     started: float,
 ) -> RolloutBatch:
     return RolloutBatch(
@@ -268,6 +282,7 @@ def _finish_rollout(
         seats=seats,
         agents=agents,
         orientations=np.zeros(agents.shape[0], dtype=np.int8),
+        learner_stochastic=learner_stochastic,
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -535,6 +550,7 @@ _STRUCTURED_CONTINUOUS_BUFFERS = (
     "tile_continuous",
     "unit_continuous",
     "products",
+    "animals",
     "crops",
     "farms",
     "town",
@@ -812,8 +828,9 @@ def _gumbel_utilities(
     current_generator: torch.Generator,
     frozen_generator: torch.Generator,
 ) -> torch.Tensor:
-    scores = logits.float() / temperatures.reshape(
-        temperatures.shape[0], *((1,) * (logits.ndim - 1))
+    effective_temperatures = temperatures.clamp_min(_NATIVE_TEMPERATURE_FLOOR)
+    scores = logits.float() / effective_temperatures.reshape(
+        effective_temperatures.shape[0], *((1,) * (logits.ndim - 1))
     )
     uniforms = _row_random(
         tuple(scores.shape),
@@ -1032,7 +1049,7 @@ def _fill_gpu_policy_statistics(
         kind_active,
         quantity_active,
     ) = input_tensors
-    scale = temperatures[:, None, None]
+    scale = temperatures.clamp_min(_NATIVE_TEMPERATURE_FLOOR)[:, None, None]
     unit_logits = output.unit_logits / scale
     kind_logits = output.market_kind_logits / scale
     quantity_logits = (
@@ -1128,6 +1145,11 @@ def _fill_gpu_policy_statistics(
 ROLLOUT_FORWARD_MODES = ("eager", "graph", "cudagraphs", "inductor", "inductor_default")
 
 
+def _validate_forward_mode(mode: str) -> None:
+    if mode not in ROLLOUT_FORWARD_MODES:
+        raise ValueError(f"unknown rollout forward mode {mode!r}")
+
+
 #: Modes that reach the device through `torch.compile`, and so through
 #: `torch._inductor.cudagraph_trees`' generation bookkeeping.
 COMPILED_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor", "inductor_default")
@@ -1153,8 +1175,7 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
     One compiled callable is cached per mode so a parity audit can measure
     several in one process without recompiling.
     """
-    if mode not in ROLLOUT_FORWARD_MODES:
-        raise ValueError(f"unknown rollout forward mode {mode!r}")
+    _validate_forward_mode(mode)
     cache = getattr(model, "_kaggriculture_rollout_forwards", None)
     if cache is None:
         cache = {}
@@ -1193,6 +1214,7 @@ def _rollout_model_forward(
     absence of a flag. The stacked ensemble takes the same mode, so a wave
     cannot end up compiling one of its two forwards and not the other.
     """
+    _validate_forward_mode(mode)
     if mode not in COMPILED_ROLLOUT_FORWARD_MODES or _leading_tensor(inputs).device.type != "cuda":
         return model(*inputs)
     return _cached_compiled_forward(model, mode)(*inputs)
@@ -1292,6 +1314,7 @@ class _StackedActorEnsemble:
         forbidden: it raises `cudaErrorStreamCaptureUnsupported` and invalidates
         the capture in progress.
         """
+        _validate_forward_mode(mode)
         leading = _leading_tensor(inputs)
         if mode not in COMPILED_ROLLOUT_FORWARD_MODES or leading.device.type != "cuda":
             return self._forward(*inputs)
@@ -1325,7 +1348,9 @@ def _stacked_actor_ensemble(
     namespace: int = 0,
 ) -> _StackedActorEnsemble:
     """Fetch or build the persistent stacked ensemble for these lanes."""
-    key = (
+    model_references = tuple(weakref.ref(model) for model in models)
+    cache_key = (
+        model_references,
         namespace,
         type(models[0]),
         models[0].config,
@@ -1334,10 +1359,16 @@ def _stacked_actor_ensemble(
         tuple(parameter.dtype for parameter in models[0].parameters()),
         tuple(buffer.dtype for buffer in models[0].buffers()),
     )
-    ensemble = _STACKED_ENSEMBLE_CACHE.get(key)
+    ensemble = _STACKED_ENSEMBLE_CACHE.get(cache_key)
     if ensemble is None:
+
+        def evict(_reference: weakref.ReferenceType[FarmActor | StructuredActor]) -> None:
+            _STACKED_ENSEMBLE_CACHE.pop(cache_key, None)
+
+        model_references = tuple(weakref.ref(model, evict) for model in models)
+        cache_key = (model_references, *cache_key[1:])
         ensemble = _StackedActorEnsemble(models)
-        _STACKED_ENSEMBLE_CACHE[key] = ensemble
+        _STACKED_ENSEMBLE_CACHE[cache_key] = ensemble
     else:
         ensemble.load(models)
     return ensemble
@@ -1552,6 +1583,7 @@ _STRUCTURED_ENCODED_FIELDS = (
     "unit_tile_gather",
     "unit_tile_gather_valid",
     "products",
+    "animals",
     "crops",
     "farms",
     "town",
@@ -1588,6 +1620,9 @@ def _store_native_wave(
         fields["critic_products"][:, step] = np.asarray(encoded["products"])[pair_rows][
             :, :, _PRODUCT_STOCK_COLUMNS
         ]
+        fields["critic_animals"][:, step] = np.asarray(encoded["animals"])[pair_rows][
+            :, :, _ANIMAL_STOCK_COLUMNS
+        ]
         fields["critic_crops"][:, step] = np.asarray(encoded["crops"])[pair_rows][
             :, :, _CROP_SEED_COLUMNS
         ]
@@ -1609,6 +1644,7 @@ def _native_batch(
     seats: np.ndarray,
     agents: np.ndarray,
     entropy_sums: np.ndarray,
+    learner_stochastic: bool,
     started: float,
     orientations: np.ndarray | None = None,
 ) -> RolloutBatch:
@@ -1626,6 +1662,7 @@ def _native_batch(
         seats=seats,
         agents=agents,
         orientations=orientations,
+        learner_stochastic=learner_stochastic,
         entropy_sums=entropy_sums,
         elapsed_seconds=time.perf_counter() - started,
     )
@@ -1684,6 +1721,7 @@ def _collect_mixed_play_rust_wave(
     at update time, where the critic weights are still exactly the behavior
     weights, instead of paying a small synchronous forward every step.
     """
+    _validate_forward_mode(forward_mode)
     if self_play_games < 0 or league_games < 0:
         raise ValueError("game counts cannot be negative")
     if self_play_games + league_games < 1:
@@ -2238,6 +2276,7 @@ def _collect_mixed_play_rust_wave(
         ),
         agents=np.zeros(trajectories, dtype=np.int64),
         entropy_sums=entropy_sums,
+        learner_stochastic=not deterministic,
         started=started,
     )
 
@@ -2299,6 +2338,7 @@ def collect_mixed_play_rust(
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect every game in one native wave and preserve trajectory order."""
+    _validate_forward_mode(forward_mode)
     native_bfloat16 = (
         forward_autocast
         and next(actor.parameters()).device.type == "cuda"
@@ -2335,27 +2375,22 @@ def collect_mixed_play_rust(
     )
 
 
-def population_pairings(population: int, games: int) -> np.ndarray:
-    """Enumerate the balanced round-robin seating of a concurrent population.
+def population_pairings(population: int, games: int, *, sampling_seed: int = 0) -> np.ndarray:
+    """Enumerate a seeded, balanced round-robin population schedule.
 
     Row ``g`` is ``(seat 0 agent, seat 1 agent)`` for game ``g``. Every ordered
     pair of distinct members appears the same number of times, so each member
     meets every opponent equally often on both seats and the seat *counts*
-    cancel exactly rather than in expectation -- which is why the schedule is
-    enumerated instead of sampled, and why `games` must be a positive multiple
-    of `population * (population - 1)`. No row ever seats a member against
-    itself: `_relative_score` is identically zero for equal banks, so a mirror
-    game cannot move the objective at all.
+    cancel exactly rather than in expectation -- which is why `games` must be
+    a positive multiple of `population * (population - 1)`. No row ever seats
+    a member against itself.
 
-    The map behind a pairing does not cancel with the counts. Game ``g`` takes
-    seed ``seed_start + g`` and `games` is a multiple of the pair count, so a
-    caller advancing `seed_start` by a wave keeps every ordered pair on one
-    fixed residue class of seeds forever, and (i, j) is compared with (j, i)
-    across disjoint seed streams. Both seats of a game start from identical
-    farms and banks, so this is a difference in maps drawn, not in advantage.
-
-    This is the only place the schedule is decided. The wave, the per-agent
-    update partition and the head-to-head telemetry all read the same rows.
+    ``sampling_seed`` permutes the base ordered-pair list, then stratifies each
+    complete repetition over game-index orientations. Every pair cycles through
+    all four frames in four repetitions, including when the pair count is only
+    two modulo four. This keeps exact pair and seat counts while breaking the
+    permanent pair-to-map coupling. The one wave, per-agent update partition,
+    and head-to-head telemetry all consume these same rows.
     """
     if population < 2:
         raise ValueError("a population wave needs at least two agents")
@@ -2373,7 +2408,19 @@ def population_pairings(population: int, games: int) -> np.ndarray:
         ],
         dtype=np.int64,
     )
-    return np.tile(ordered, (games // orderings, 1))
+    shuffled = ordered[np.random.default_rng(sampling_seed).permutation(orderings)]
+    repetitions = games // orderings
+    source_orientations = np.arange(orderings) % 4
+    orientation_strata = np.asarray(((0, 1, 2, 3), (2, 3, 0, 1), (1, 0, 3, 2), (3, 2, 1, 0)))
+    pairings = np.empty((games, 2), dtype=np.int64)
+    positions = np.arange(orderings)
+    for repetition in range(repetitions):
+        desired = orientation_strata[repetition % 4, source_orientations]
+        available = (repetition * orderings + positions) % 4
+        block = pairings[repetition * orderings : (repetition + 1) * orderings]
+        for orientation in range(4):
+            block[available == orientation] = shuffled[desired == orientation]
+    return pairings
 
 
 @torch.inference_mode()
@@ -2406,22 +2453,22 @@ def collect_population_play_rust(
     The balanced schedule gives every member exactly the same number of rows,
     so the lanes need none of the padding an uneven league mix needs.
 
-    Each game plays under one board symmetry, cycling identity / mirror-x /
-    mirror-y / rotate-180, and both seats share that game's frame. Every
-    step the encoder output is flipped into the game's frame before the
-    forward, and the oriented movement logits are restriped back to
-    real-action columns for the native sampler. Storage keeps the unit
-    factors in the oriented label space, so a row's stored features, masks
-    and actions replay consistently through whichever member collected
-    them. Only the convolutional entity encoding has an orientation
-    mapping; a structured population that would cycle non-identity frames
-    is refused up front.
+    Convolutional games cycle identity / mirror-x / mirror-y / rotate-180,
+    with both seats sharing one frame. Every step the encoder output is flipped
+    into the game's frame before the forward, and oriented movement logits are
+    restriped back to real-action columns for the native sampler. Storage keeps
+    the unit factors in the oriented label space, so a row's stored features,
+    masks and actions replay consistently through whichever member collected
+    them. The structured encoding has no orientation mapping yet, so structured
+    population games use the identity frame; their seeded pairing permutation
+    still prevents a fixed ordered pair from remaining tied to one map stratum.
 
 
     Rollouts capture only behavior policy state. Value predictions for GAE are
     replayed from the stored features at update time, where the critic weights
     are still exactly the behavior weights.
     """
+    _validate_forward_mode(forward_mode)
     actors = tuple(actors)
     population = len(actors)
     if games < 1:
@@ -2430,7 +2477,11 @@ def collect_population_play_rust(
         raise ValueError("the native simulator currently supports the competition horizon 720")
     _validate_learner_temperature(temperature)
     _validate_reward_gamma(gamma)
-    pairings = population_pairings(population, games)
+    pairings = population_pairings(
+        population,
+        games,
+        sampling_seed=sampling_seed ^ _POPULATION_PAIRING_SEED_SALT,
+    )
     started = time.perf_counter()
     for member in actors:
         member.eval()
@@ -2446,16 +2497,14 @@ def collect_population_play_rust(
 
     # The native wave is already game-major and seat-minor, so the schedule
     # flattens straight into the per-row agent index the sampler wants as its
-    # lane. One symmetry per game, both seats sharing it, cycling all four
-    # frames so every member sees every rendering.
+    # lane. The convolutional encoding can cycle symmetries; structured waves
+    # remain in the identity frame until that encoding has an equivalent map.
     agents = pairings.reshape(-1)
-    codes = seat_orientations(games)
-    if architecture != CONV_ENTITY and (codes != int(Orientation.IDENTITY)).any():
-        raise ValueError(
-            "game orientations have no mapping in the structured encoding yet; "
-            "a population that cycles non-identity frames needs the convolutional "
-            "entity architecture"
-        )
+    codes = (
+        seat_orientations(games)
+        if architecture == CONV_ENTITY
+        else np.zeros(games * 2, dtype=np.int8)
+    )
 
     seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
@@ -2511,13 +2560,12 @@ def collect_population_play_rust(
     step_graph: _CapturedStep[ActorOutput] | None = None
     for step in range(horizon):
         encoded_wave.refresh(environment)
-        # refresh() re-encodes every array straight from the simulator, so the
-        # game's orientation has to be re-applied every step before anything
-        # reads it: this one pass feeds the device upload, hence the forward,
-        # and _store_native_wave below copies these same oriented rows into
-        # storage.
-        orient_boards(encoded["board"], codes)
-        orient_unit_features(encoded["units"], encoded["unit_positions"], codes)
+        # Convolutional rows are re-encoded in the native frame every step, so
+        # apply their selected symmetry before upload. Structured rows use the
+        # identity frame and expose different field names.
+        if architecture == CONV_ENTITY:
+            orient_boards(encoded["board"], codes)
+            orient_unit_features(encoded["units"], encoded["unit_positions"], codes)
         encoded_wave.copy_to_device()
         if graphed and step_graph is None:
             step_graph = _CapturedStep(step_forward)
@@ -2535,10 +2583,10 @@ def collect_population_play_rust(
         ):
             destination[lane_rows] = values
         unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
-        # The forward consumed oriented features and therefore emitted oriented
-        # movement logits, while Rust masks and samples real-action columns;
-        # restriping here hands it logits whose column j describes real action j.
-        orient_unit_logits(unit_logits, codes)
+        # Only convolutional forwards can emit symmetry-oriented movement
+        # logits. Structured logits already use native action columns.
+        if architecture == CONV_ENTITY:
+            orient_unit_logits(unit_logits, codes)
         environment.sample_and_step_into(
             unit_logits,
             kind_logits,
@@ -2602,6 +2650,7 @@ def collect_population_play_rust(
         seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
         agents=agents,
         orientations=codes,
+        learner_stochastic=True,
         entropy_sums=entropy_sums,
         started=started,
     )
@@ -2622,6 +2671,7 @@ def collect_self_play_rust(
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect both on-policy seats through the exact batched Rust simulator."""
+    _validate_forward_mode(forward_mode)
     if games < 1:
         raise ValueError("games must be positive")
     return collect_mixed_play_rust(
@@ -2660,6 +2710,7 @@ def collect_frozen_opponents_play_rust(
     storage: dict[str, np.ndarray] | None = None,
 ) -> RolloutBatch:
     """Collect one current-policy seat per native game against assigned frozen actors."""
+    _validate_forward_mode(forward_mode)
     if games < 1:
         raise ValueError("games must be positive")
     return collect_mixed_play_rust(
@@ -2700,6 +2751,7 @@ def collect_frozen_opponent_play_rust(
     forward_autocast: bool = False,
 ) -> RolloutBatch:
     """Collect one current-policy seat per native game against one frozen actor."""
+    _validate_forward_mode(forward_mode)
     return collect_frozen_opponents_play_rust(
         actor,
         (opponent,),
@@ -2819,6 +2871,7 @@ def collect_self_play(
         final_money=final_money,
         opponent_money=opponent_money,
         seats=np.tile(np.asarray([0, 1], dtype=np.int8), games),
+        learner_stochastic=not deterministic,
         agents=np.zeros(trajectories, dtype=np.int64),
         entropy_sums=entropy_sums,
         started=started,
@@ -2905,7 +2958,7 @@ def collect_frozen_opponent_play(
         next_states = []
         step_rewards = np.zeros(games, dtype=np.float32)
         for game, (environment, seat) in enumerate(zip(environments, seats, strict=True)):
-            actions = [None, None]
+            actions: list[dict[str, Any] | None] = [None, None]
             actions[int(seat)] = current_step.actions[game]
             actions[1 - int(seat)] = frozen_step.actions[game]
             next_state = environment.step(actions)
@@ -2948,6 +3001,7 @@ def collect_frozen_opponent_play(
         seats=seats,
         agents=np.zeros(games, dtype=np.int64),
         entropy_sums=entropy_sums,
+        learner_stochastic=not deterministic,
         started=started,
     )
 
@@ -2965,11 +3019,15 @@ _TRAJECTORY_METADATA_FIELDS = (
 
 def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:
     """Concatenate per-trajectory metadata across compatible batches."""
+    provenance = {batch.learner_stochastic for batch in batches}
+    if len(provenance) != 1:
+        raise ValueError("rollout learner sampling provenance must match")
     combined: dict[str, Any] = {
         field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
         for field in _TRAJECTORY_METADATA_FIELDS
     }
     combined["elapsed_seconds"] = sum(batch.elapsed_seconds for batch in batches)
+    combined["learner_stochastic"] = batches[0].learner_stochastic
     return combined
 
 
@@ -2987,6 +3045,7 @@ def slice_trajectories(batch: RolloutBatch, start: int, stop: int) -> RolloutBat
         states={name: array[start:stop] for name, array in batch.states.items()},
         **{field: getattr(batch, field)[start:stop] for field in _SHARED_ROLLOUT_FIELDS},
         **{field: getattr(batch, field)[start:stop] for field in _TRAJECTORY_METADATA_FIELDS},
+        learner_stochastic=batch.learner_stochastic,
         elapsed_seconds=batch.elapsed_seconds,
     )
 

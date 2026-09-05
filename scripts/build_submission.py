@@ -29,6 +29,12 @@ from typing import Any
 
 import torch
 
+from kaggriculture.evaluation import (
+    artifact_seed_usage,
+    validate_finalist_protocol,
+    validate_score_evidence,
+    validate_seed_protocol,
+)
 from kaggriculture.inference import actor_artifact_from_checkpoint
 from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.provenance import file_sha256, require_source_identity, validate_run_provenance
@@ -43,6 +49,7 @@ PACKAGE_FILES = (
     "constants.py",
     "encoding.py",
     "inference.py",
+    "evaluation.py",
     "model.py",
     "orientation.py",
     "policy.py",
@@ -196,6 +203,14 @@ def _load_builtin_evaluation(
             f"{label} evaluation has {seed_count} seed clusters, below the required "
             f"{minimum_seed_count}"
         )
+    protocol = payload.get("seed_protocol", {})
+    domain = protocol.get("evaluation", {}).get("domain")
+    if domain not in {"development", "finalist"}:
+        raise ValueError("built-in admission requires development or finalist evidence")
+    validate_seed_protocol(
+        protocol, domain=domain, start=payload.get("seed_start"), count=seed_count
+    )
+    validate_score_evidence(payload)
     rate = _score_rate(payload, label)
     if rate < minimum_score_rate:
         raise ValueError(
@@ -231,6 +246,7 @@ def _load_evaluation(
     if payload.get("paired_seats") is not True or payload.get("seed_count", 0) < 32:
         raise ValueError("submission requires at least 32 paired-seat official-panel seed clusters")
     selection = payload.get("selection_provenance")
+    validate_finalist_protocol(payload)
     if selection is not None:
         if (
             not isinstance(selection, dict)
@@ -369,6 +385,18 @@ def _smoke_test(root: Path) -> dict[str, Any]:
     return result
 
 
+def _evaluation_agent(contents: bytes) -> int | None:
+    """Recover the population member already bound by finalist evaluation."""
+    payload = json.loads(contents.decode("utf-8"))
+    provenance = payload.get("artifact_provenance") if isinstance(payload, dict) else None
+    if not isinstance(provenance, dict):
+        raise ValueError("finalist evaluation has no artifact provenance")
+    agent = provenance.get("agent")
+    if agent is not None and (type(agent) is not int or agent < 0):
+        raise ValueError("finalist evaluation population member is invalid")
+    return agent
+
+
 def build(
     checkpoint_path: Path,
     evaluation_report: Path,
@@ -394,6 +422,9 @@ def build(
             raise FileNotFoundError(path)
     checkpoint_contents = checkpoint_path.read_bytes()
     checkpoint_digest = hashlib.sha256(checkpoint_contents).hexdigest()
+    evaluation_contents = evaluation_report.read_bytes()
+    if agent is None:
+        agent = _evaluation_agent(evaluation_contents)
     checkpoint = torch.load(io.BytesIO(checkpoint_contents), map_location="cpu", weights_only=False)
     artifact = actor_artifact_from_checkpoint(checkpoint, agent=agent)
     # Evaluation reports bind the bytes that were evaluated and therefore carry
@@ -430,7 +461,6 @@ def build(
         raise ValueError(
             f"submission requires an evaluation against the built-in {_REQUIRED_BUILTIN}"
         )
-    evaluation_contents = evaluation_report.read_bytes()
     evaluation = _load_evaluation(
         evaluation_contents,
         checkpoint_digest,
@@ -440,13 +470,12 @@ def build(
     )
     if evaluation["artifact_provenance"].get("run_provenance") != run_provenance:
         raise ValueError("finalist evaluation run provenance does not match the checkpoint")
-    selection = evaluation.get("selection_provenance")
-    if isinstance(selection, dict):
-        if selection.get("run_provenance") != run_provenance:
-            raise ValueError("checkpoint-selection run provenance does not match the checkpoint")
-        selection_report_sha256 = selection["sha256"]
-    else:
-        selection_report_sha256 = None
+    if evaluation["artifact_provenance"].get("seed_usage") != artifact_seed_usage(artifact):
+        raise ValueError("finalist evaluation seed exposure does not match the checkpoint")
+    selection = evaluation["selection_provenance"]
+    if selection.get("run_provenance") != run_provenance:
+        raise ValueError("checkpoint-selection run provenance does not match the checkpoint")
+    selection_report_sha256 = selection["sha256"]
     evaluation_digest = hashlib.sha256(evaluation_contents).hexdigest()
     artifact["training_checkpoint_sha256"] = checkpoint_digest
     run_provenance_sha256 = None if run_provenance is None else run_provenance["sha256"]
@@ -480,7 +509,7 @@ def build(
         # scores is this directory, so it is the thing that has to be seen playing.
         smoke = _smoke_test(root)
         manifest = {
-            "format_version": 1,
+            "format_version": 2,
             "source_identity": source,
             # Recorded beside the identity, never inside it: a reader who sees a
             # shipped tree that differs from the checkpoint's own needs the
@@ -497,6 +526,9 @@ def build(
             "evaluation": {
                 "sha256": evaluation_digest,
                 "selection_report_sha256": selection_report_sha256,
+                "seed_protocol": evaluation["seed_protocol"],
+                "statistical_selection": selection["statistical_selection"],
+                "score_confidence": evaluation["summary"]["score_confidence"],
                 "opponent": evaluation.get("opponent_label"),
                 "seed_count": evaluation.get("seed_count"),
                 "opponent_sha256": evaluation.get("opponent_provenance", {}).get("sha256"),

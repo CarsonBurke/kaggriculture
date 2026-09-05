@@ -14,9 +14,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import torch
 from evaluate_checkpoint import _opponent_identity, evaluate, render_json
 from torch.utils.tensorboard import SummaryWriter
 
+from kaggriculture.evaluation import (
+    SCORE_CONFIDENCE,
+    SCREENING_SEED_START,
+    bounded_mean_interval,
+    paired_score_comparison,
+    validate_score_evidence,
+)
+from kaggriculture.inference import POPULATION_CHECKPOINT_KEY, checkpoint_agent_count
 from kaggriculture.provenance import file_sha256
 
 
@@ -39,6 +48,7 @@ def summarize_panel(evaluations: list[dict[str, Any]]) -> dict[str, Any]:
     seed_maps = []
     opponent_summaries = []
     for evaluation in evaluations:
+        validate_score_evidence(evaluation)
         clusters = evaluation["summary"]["seed_cluster_statistics"]
         seed_map = {
             int(row["seed"]): (float(row["score_rate"]), float(row["mean_margin"]))
@@ -67,13 +77,17 @@ def summarize_panel(evaluations: list[dict[str, Any]]) -> dict[str, Any]:
     panel_margins = [
         statistics.fmean(seed_map[seed][1] for seed_map in seed_maps) for seed in sorted(seeds)
     ]
-    score_ci = _mean_confidence_interval(panel_scores)
+    score_ci = bounded_mean_interval(panel_scores)
     margin_ci = _mean_confidence_interval(panel_margins)
     return {
         "valid_for_selection": True,
         "opponents": len(evaluations),
         "paired_seed_clusters": len(seeds),
         "panel_score_rate": statistics.fmean(panel_scores),
+        "score_confidence": SCORE_CONFIDENCE,
+        "seed_scores": {
+            str(seed): score for seed, score in zip(sorted(seeds), panel_scores, strict=True)
+        },
         "panel_score_rate_95ci": [max(0.0, score_ci[0]), min(1.0, score_ci[1])],
         "panel_mean_margin": statistics.fmean(panel_margins),
         "panel_margin_95ci": list(margin_ci),
@@ -165,16 +179,20 @@ def _copy_atomic(source: Path, destination: Path, expected_sha256: str) -> str:
         temporary.unlink(missing_ok=True)
 
 
+def _checkpoint_agents(path: Path) -> tuple[int | None, ...]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    count = checkpoint_agent_count(checkpoint)
+    if count < 1:
+        raise ValueError(f"checkpoint population is empty: {path}")
+    if isinstance(checkpoint.get(POPULATION_CHECKPOINT_KEY), list):
+        return tuple(range(count))
+    return (None,)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--pattern", default="checkpoint-*.pt")
-    parser.add_argument(
-        "--agent",
-        type=int,
-        default=None,
-        help="population member to screen; required for multi-member checkpoints",
-    )
     parser.add_argument(
         "--opponent",
         action="append",
@@ -182,7 +200,7 @@ def parse_args() -> argparse.Namespace:
         help="repeat for a fixed panel; defaults to public v27",
     )
     parser.add_argument("--seeds", type=int, default=32)
-    parser.add_argument("--seed-start", type=int, default=10_000_000)
+    parser.add_argument("--seed-start", type=int, default=SCREENING_SEED_START)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--device", default="cuda")
@@ -225,21 +243,27 @@ def main() -> None:
         if args.tensorboard_dir is None
         else args.tensorboard_dir.expanduser().resolve()
     )
+    checkpoint_members = [
+        (checkpoint, member)
+        for checkpoint in checkpoints
+        for member in _checkpoint_agents(checkpoint)
+    ]
     candidates = []
     started = time.perf_counter()
     writer = SummaryWriter(tensorboard_directory)
     try:
         writer.add_scalar("progress/completed_checkpoints", 0.0, 0)
         writer.flush()
-        for completed, checkpoint in enumerate(checkpoints, start=1):
+        for completed, (checkpoint, member) in enumerate(checkpoint_members, start=1):
             evaluations = [
                 evaluate(
                     SimpleNamespace(
                         artifact=checkpoint,
-                        agent=args.agent,
+                        agent=member,
                         opponent=opponent,
                         seeds=args.seeds,
                         seed_start=args.seed_start,
+                        seed_domain="screening",
                         workers=args.workers,
                         torch_threads=args.torch_threads,
                         device=args.device,
@@ -255,6 +279,7 @@ def main() -> None:
                 raise ValueError("checkpoint changed between fixed-panel opponent evaluations")
             candidate = {
                 "checkpoint": str(checkpoint),
+                "agent": member,
                 "iteration": int(provenance["iteration"]),
                 "artifact_provenance": provenance,
                 "panel": summarize_panel(evaluations),
@@ -265,7 +290,7 @@ def main() -> None:
                 writer,
                 candidate,
                 completed=completed,
-                total=len(checkpoints),
+                total=len(checkpoint_members),
                 elapsed_seconds=time.perf_counter() - started,
             )
     finally:
@@ -275,6 +300,17 @@ def main() -> None:
     for rank, candidate in enumerate(ranked, start=1):
         candidate["rank"] = rank
     best = ranked[0]
+    comparisons = [
+        {
+            "checkpoint": candidate["checkpoint"],
+            "agent": candidate["agent"],
+            **paired_score_comparison(
+                {int(seed): score for seed, score in best["panel"]["seed_scores"].items()},
+                {int(seed): score for seed, score in candidate["panel"]["seed_scores"].items()},
+            ),
+        }
+        for candidate in ranked[1:]
+    ]
     source_identity = best["artifact_provenance"]["source_identity"]
     if any(
         candidate["artifact_provenance"]["source_identity"] != source_identity
@@ -317,10 +353,21 @@ def main() -> None:
         "opponents": opponents,
         "seed_start": args.seed_start,
         "seed_count": args.seeds,
+        "seed_protocol": best["evaluations"][0]["seed_protocol"],
+        "paired_comparisons_to_selected": comparisons,
+        "statistical_selection": {
+            "protocol": "archive_screening_then_untouched_finalist",
+            "candidate_count": len(candidates),
+            "screening_intervals_are_post_selection": True,
+            "finalist_required": True,
+            "candidate_frozen_before_finalist": True,
+            "finalist_reuse_policy": "do_not_adapt_or_reselect_after_inspecting_finalist_results",
+        },
         "ranking": "panel score lower 95% bound, worst-opponent score, margin lower bound",
         "elapsed_seconds": time.perf_counter() - started,
         "best_checkpoint": best["checkpoint"],
         "best_iteration": best["iteration"],
+        "best_agent": best["agent"],
         "best_checkpoint_sha256": best["artifact_provenance"]["sha256"],
         "best_output": None if best_output is None else str(best_output),
         "best_output_sha256": best_output_sha256,

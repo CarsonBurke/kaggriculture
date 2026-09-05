@@ -71,8 +71,11 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
             args.structured_economy_coefficient,
             args.structured_opponent_summary_coefficient,
             args.structured_opponent_patch_coefficient,
+            args.structured_critic_latent_coefficient,
+            args.structured_critic_value_coefficient,
         )
     )
+    assert not hasattr(args, "structured_actor_gradient_ratio")
     module._validate_args(args)
     for rejected in (299.0, 601.0, float("nan")):
         args.checkpoint_seconds = rejected
@@ -98,7 +101,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
             module._validate_args(args)
 
 
-def test_structured_auxiliary_cli_is_typed_population_one_and_resume_bound(
+def test_structured_auxiliary_cli_is_typed_population_safe_and_resume_bound(
     monkeypatch, tmp_path
 ) -> None:
     module = _training_script()
@@ -111,12 +114,24 @@ def test_structured_auxiliary_cli_is_typed_population_one_and_resume_bound(
             str(tmp_path),
             "--architecture",
             "structured",
+            "--population",
+            "2",
+            "--games",
+            "2",
+            "--league-games",
+            "0",
             "--structured-decision-coefficient",
             "0.5",
             "--structured-opponent-summary-coefficient",
             "0.5",
             "--structured-opponent-patch-coefficient",
             "0.5",
+            "--structured-critic-latent-coefficient",
+            "0.75",
+            "--structured-critic-value-coefficient",
+            "0.25",
+            "--structured-critic-horizon",
+            "3",
             "--deterministic-training",
         ],
     )
@@ -125,15 +140,17 @@ def test_structured_auxiliary_cli_is_typed_population_one_and_resume_bound(
 
     assert args.structured_decision_horizon == 2
     assert args.structured_patch_horizon == 1
+    assert args.structured_critic_horizon == 3
+    assert args.structured_critic_latent_coefficient == pytest.approx(0.75)
+    assert args.structured_critic_value_coefficient == pytest.approx(0.25)
     assert module._training_data_config(args, torch.device("cpu"))["deterministic_training"]
 
     args.architecture = CONV_ENTITY
     with pytest.raises(ValueError, match="require --architecture structured"):
         module._validate_args(args)
     args.architecture = STRUCTURED
-    args.population = 2
-    args.games = 2
-    with pytest.raises(ValueError, match="supports population 1 only"):
+    args.structured_critic_horizon = 0
+    with pytest.raises(ValueError, match="critic horizon must be positive"):
         module._validate_args(args)
 
 
@@ -311,14 +328,18 @@ def test_training_rejects_a_league_budget_that_drops_opponent_categories(
         module._validate_args(module.parse_args())
 
 
-def test_balanced_opponent_assignments_are_reproducible_and_nearly_equal() -> None:
+def test_balanced_opponent_assignments_are_reproducible_and_seat_balanced() -> None:
     module = _training_script()
-    first = module._balanced_assignments(11, 4, np.random.default_rng(7))
-    second = module._balanced_assignments(11, 4, np.random.default_rng(7))
+    first = module._balanced_assignments(11, 4, np.random.default_rng(7), seed_start=17)
+    second = module._balanced_assignments(11, 4, np.random.default_rng(7), seed_start=17)
 
     np.testing.assert_array_equal(first, second)
     counts = np.bincount(first, minlength=4)
     assert counts.max() - counts.min() == 1
+    seats = (17 + np.arange(11)) % 2
+    for opponent in range(4):
+        opponent_seats = np.bincount(seats[first == opponent], minlength=2)
+        assert abs(int(opponent_seats[0]) - int(opponent_seats[1])) <= 1
     with pytest.raises(ValueError):
         module._balanced_assignments(0, 4, np.random.default_rng(7))
 
@@ -399,25 +420,29 @@ def test_league_score_rate_validation_accepts_only_finite_unit_interval_state() 
             module._validate_league_score_rates(invalid)
 
 
-def test_league_score_rate_blend_seeds_from_prior_and_decays_unmeasured() -> None:
+def test_league_score_rate_blend_decays_all_stale_evidence() -> None:
     module = _training_script()
     rates = {"00000001": 1.0}
 
     module._blend_league_score_rates(rates, {"builtin_starter": 1.0})
 
     # A first measurement blends against the unmeasured prior of 0.5, so one
-    # perfect wave can never pin an estimate at exactly 1.0 and hard-retire a
-    # freshly met opponent.
+    # perfect wave cannot retire a freshly met opponent.
     assert rates["builtin_starter"] == pytest.approx(0.75)
-    # Opponents that were not sampled decay toward the prior, keeping
-    # retirement provisional instead of permanent.
     assert rates["00000001"] == pytest.approx(0.975)
 
-    module._blend_league_score_rates(rates, {"builtin_starter": 0.25})
-    assert rates["builtin_starter"] == pytest.approx(0.5)
+    module._blend_league_score_rates(rates, {"builtin_starter": 1.0})
+    mastered = rates["builtin_starter"]
+    for _ in range(20):
+        module._blend_league_score_rates(rates, {})
+
+    # Learner drift invalidates both immutable built-ins and frozen snapshots.
+    assert 0.5 < rates["builtin_starter"] < mastered
+    assert rates["builtin_starter"] == pytest.approx(0.5 + (mastered - 0.5) * 0.95**20)
+    assert rates["00000001"] < 0.975
 
 
-def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order(
+def test_external_eval_launcher_acknowledges_complete_events_in_fifo_order(
     monkeypatch, tmp_path
 ) -> None:
     module = _training_script()
@@ -425,6 +450,7 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
         external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
+        external_eval_seed_start=4_000_000,
         episode_steps=720,
         run_dir=tmp_path,
         population=1,
@@ -434,12 +460,40 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
     class FakeProcess:
         def __init__(self, command, **_kwargs):
             launched.append(command)
+            self.command = command
             self.returncode: int | None = None
 
         def poll(self) -> int | None:
             return self.returncode
 
         def wait(self) -> int:
+            artifact = Path(self.command[self.command.index("--artifact") + 1])
+            iteration = int(self.command[self.command.index("--iteration") + 1])
+            digest = module.file_sha256(artifact)
+            row = {
+                "event": "external_eval",
+                "iteration": iteration,
+                "artifact": artifact.name,
+                "artifact_sha256": digest,
+                "agent": None,
+                "opponent": "starter",
+                "games": 4,
+                "completed_games": 4,
+                "seed_start": 4_000_000,
+                "seed_count": 2,
+            }
+            marker = {
+                "event": "external_eval_complete",
+                "iteration": iteration,
+                "artifact": artifact.name,
+                "artifact_sha256": digest,
+                "members": [None],
+                "opponents": ["starter"],
+                "records": 1,
+            }
+            with (tmp_path / "metrics-external.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row) + "\n")
+                stream.write(json.dumps(marker) + "\n")
             self.returncode = 0
             return 0
 
@@ -448,46 +502,37 @@ def test_external_eval_launcher_drains_committed_checkpoint_events_in_fifo_order
     assert (
         module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000000.pt", 0, None) is None
     )
-    checkpoint = tmp_path / "checkpoint-000010.pt"
-    process = module._maybe_launch_external_eval(args, checkpoint, 10, None)
+    checkpoints = []
+    for iteration in (10, 20, 30, 40):
+        checkpoint = tmp_path / f"checkpoint-{iteration:06d}.pt"
+        checkpoint.write_bytes(str(iteration).encode())
+        checkpoints.append(checkpoint)
+
+    process = module._maybe_launch_external_eval(args, checkpoints[0], 10, None)
     assert isinstance(process, FakeProcess)
     command = launched[0]
-    assert command[command.index("--artifact") + 1] == str(checkpoint)
+    assert command[command.index("--artifact") + 1] == str(checkpoints[0])
     assert command[command.index("--agents") + 1] == ""
     assert command[command.index("--iteration") + 1] == "10"
     assert command[command.index("--opponents") + 1] == "starter"
     assert command[command.index("--output") + 1] == str(tmp_path / "metrics-external.jsonl")
 
-    assert (
-        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000020.pt", 20, process)
-        is process
+    assert module._maybe_launch_external_eval(args, checkpoints[1], 20, process) is process
+    assert module._maybe_launch_external_eval(args, checkpoints[2], 30, process) is process
+    drained = module._maybe_launch_external_eval(
+        args, checkpoints[3], 40, process, wait_for_slot=True
     )
-    assert len(launched) == 1
-    assert (
-        module._maybe_launch_external_eval(args, tmp_path / "checkpoint-000030.pt", 30, process)
-        is process
-    )
-    assert len(launched) == 1
-    replacement = module._maybe_launch_external_eval(
-        args,
-        tmp_path / "checkpoint-000040.pt",
-        40,
-        process,
-        wait_for_slot=True,
-    )
-    assert isinstance(replacement, FakeProcess) and replacement is not process
+    assert drained is None
     assert [command[command.index("--iteration") + 1] for command in launched] == [
         "10",
         "20",
         "30",
         "40",
     ]
+    assert not (tmp_path / module._EXTERNAL_EVAL_PENDING).exists()
 
     disabled = SimpleNamespace(**{**vars(args), "external_eval": False})
-    assert (
-        module._maybe_launch_external_eval(disabled, tmp_path / "checkpoint-000030.pt", 30, None)
-        is None
-    )
+    assert module._maybe_launch_external_eval(disabled, checkpoints[2], 30, None) is None
 
 
 def test_a_population_is_probed_from_its_committed_checkpoint(monkeypatch, tmp_path) -> None:
@@ -496,6 +541,7 @@ def test_a_population_is_probed_from_its_committed_checkpoint(monkeypatch, tmp_p
         external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
+        external_eval_seed_start=4_000_000,
         episode_steps=720,
         run_dir=tmp_path,
         population=4,
@@ -522,6 +568,7 @@ def test_external_eval_launch_failure_is_retried_from_the_durable_fifo(
         external_eval=True,
         external_eval_opponents="starter",
         external_eval_seeds=2,
+        external_eval_seed_start=4_000_000,
         episode_steps=720,
         run_dir=tmp_path,
         population=1,
@@ -532,6 +579,7 @@ def test_external_eval_launch_failure_is_retried_from_the_durable_fifo(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fork failed")),
     )
     checkpoint = tmp_path / "checkpoint-000010.pt"
+    checkpoint.write_bytes(b"checkpoint")
     assert module._maybe_launch_external_eval(args, checkpoint, 10, None) is None
     pending_path = tmp_path / module._EXTERNAL_EVAL_PENDING
     assert pending_path.is_file()
@@ -545,6 +593,7 @@ def test_external_eval_launch_failure_is_retried_from_the_durable_fifo(
         returncode = None
 
         def __init__(self, command, **_kwargs):
+            self.command = command
             launched.append(command)
 
         def poll(self):
@@ -556,7 +605,47 @@ def test_external_eval_launch_failure_is_retried_from_the_durable_fifo(
     assert isinstance(process, FakeProcess)
     assert launched[0][launched[0].index("--artifact") + 1] == str(checkpoint)
     assert launched[0][launched[0].index("--iteration") + 1] == "10"
-    assert not pending_path.exists()
+    # Launching is not acknowledgement; an interrupted worker remains durable.
+    assert pending_path.is_file()
+    process.returncode = 1
+    replacement = module._maybe_launch_external_eval(resumed, None, 0, process)
+    assert isinstance(replacement, FakeProcess) and replacement is not process
+    assert len(launched) == 2
+    assert pending_path.is_file()
+
+
+def test_final_external_eval_fails_closed_without_completion_record(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    args = SimpleNamespace(
+        external_eval=True,
+        external_eval_opponents="starter",
+        external_eval_seeds=2,
+        external_eval_seed_start=4_000_000,
+        episode_steps=720,
+        run_dir=tmp_path,
+        population=1,
+    )
+    checkpoint = tmp_path / "checkpoint-000010.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    class MissingCompletionProcess:
+        returncode = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            self.returncode = 0
+            return 0
+
+    monkeypatch.setattr(module.subprocess, "Popen", MissingCompletionProcess)
+    process = module._maybe_launch_external_eval(args, checkpoint, 10, None)
+    with pytest.raises(RuntimeError, match="without a matching completion record"):
+        module._maybe_launch_external_eval(args, None, 10, process, wait_for_slot=True)
+    assert (tmp_path / module._EXTERNAL_EVAL_PENDING).is_file()
 
 
 def test_external_eval_opponent_resolution_degrades_instead_of_blocking(capsys, tmp_path) -> None:
@@ -830,6 +919,25 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     tmp_path,
 ) -> None:
     module = _training_script()
+    run_provenance = module.run_provenance_from_decision(
+        {
+            "source_identity": module.source_identity(),
+            "rollout_forward_mode": "graph",
+            "update_compile_mode": "default",
+            "eager_report_sha256": "a" * 64,
+            "eager_report_size_bytes": 100,
+            "mixed_report_sha256": "b" * 64,
+            "mixed_report_size_bytes": 110,
+            "compiled_report_sha256": "c" * 64,
+            "compiled_report_size_bytes": 120,
+            "minimum_compile_speedup": 1.05,
+            "attributed_knob_speedups": {
+                "rollout_forward_mode": 1.1,
+                "update_compile_mode": 1.1,
+            },
+        }
+    )
+    monkeypatch.setattr(module, "_load_run_provenance", lambda *_args, **_kwargs: run_provenance)
 
     class Writer:
         def __init__(self, *args, **kwargs) -> None:
@@ -844,7 +952,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
         def close(self) -> None:
             pass
 
-    rollout = SimpleNamespace(state_count=1)
+    rollout = SimpleNamespace(state_count=1, trajectories=2)
     collected_gammas: list[float] = []
 
     def collect(*args, **kwargs):
@@ -914,6 +1022,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     assert set(initial["league_snapshot_manifest"]) == {0}
     assert set(latest["league_snapshot_manifest"]) == {0, 1}
     assert numbered["league_snapshot_manifest"] == latest["league_snapshot_manifest"]
+    assert numbered["run_provenance"] == run_provenance
     assert not (source_run / "latest.pt").is_symlink()
     assert (source_run / "latest.pt").stat().st_ino == (
         source_run / "checkpoint-000001.pt"
@@ -1293,7 +1402,7 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
     monkeypatch.setattr(
         module,
         "collect_mixed_play_rust",
-        lambda *args, **kwargs: SimpleNamespace(state_count=1),
+        lambda *args, **kwargs: SimpleNamespace(state_count=1, trajectories=2),
     )
     monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
@@ -1481,6 +1590,10 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     with pytest.raises(ValueError, match="leave iterations for the actor"):
         module._validate_args(args)
 
+    args.critic_warmup_iterations = module.MAX_CRITIC_WARMUP_ITERATIONS + 1
+    with pytest.raises(ValueError, match="readiness deadline"):
+        module._validate_args(args)
+
     args.critic_warmup_iterations = 0
     args.resume = tmp_path / "latest.pt"
     with pytest.raises(ValueError, match="fresh run"):
@@ -1500,6 +1613,48 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     defaulted = module.parse_args()
     module._validate_args(defaulted)
     assert defaulted.critic_warmup_iterations == module.DEFAULT_CRITIC_WARMUP_ITERATIONS == 5
+
+
+def test_adaptive_critic_warmup_uses_prior_wave_ev_and_has_a_hard_deadline() -> None:
+    module = _training_script()
+
+    active, reason = module._critic_warmup_decision(
+        iteration=4,
+        minimum=5,
+        complete=False,
+        previous_evs=[0.9],
+    )
+    assert active and reason == "minimum_iterations"
+
+    active, reason = module._critic_warmup_decision(
+        iteration=5,
+        minimum=5,
+        complete=False,
+        previous_evs=[0.09],
+    )
+    assert active and reason == "waiting_for_monte_carlo_ev"
+
+    active, reason = module._critic_warmup_decision(
+        iteration=6,
+        minimum=5,
+        complete=False,
+        previous_evs=[0.10, 0.35],
+    )
+    assert not active and reason == "monte_carlo_ev_ready"
+    assert module._critic_warmup_decision(
+        iteration=20,
+        minimum=5,
+        complete=True,
+        previous_evs=[-1.0],
+    ) == (False, "complete")
+
+    with pytest.raises(RuntimeError, match="within 40 iterations"):
+        module._critic_warmup_decision(
+            iteration=module.MAX_CRITIC_WARMUP_ITERATIONS,
+            minimum=5,
+            complete=False,
+            previous_evs=[0.099],
+        )
 
 
 def test_critic_warmup_cannot_be_restated_on_a_resume(monkeypatch, tmp_path) -> None:
@@ -1551,7 +1706,11 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
             "metrics": {},
             "source_identity": identity,
             "run_provenance": None,
-            "bc_provenance": {"teacher": {"label": "public-v27"}},
+            "bc_provenance": {
+                "teacher": {"label": "public-v27"},
+                "datasets": [{"train_seeds": [1, 2], "holdout_seeds": [3]}],
+            },
+            "seed_usage": [{"domain": "bc", "start": 1, "count": 3}],
         },
         artifact,
     )
@@ -1560,6 +1719,10 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
         artifact, FarmActor(config), CONV_ENTITY, config, torch.device("cpu")
     )
     record["critic_warmup_iterations"] = 15
+    record["critic_warmup_state"] = {
+        "complete": False,
+        "last_monte_carlo_explained_variance": [0.04],
+    }
 
     payload = checkpoint_payload(
         agents=[
@@ -1582,6 +1745,15 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
 
     assert payload["format_version"] == CHECKPOINT_FORMAT_VERSION
     assert payload["initial_actor"]["critic_warmup_iterations"] == 15
+    assert payload["initial_actor"]["critic_warmup_state"] == {
+        "complete": False,
+        "last_monte_carlo_explained_variance": [0.04],
+    }
+    assert module._validate_critic_warmup_state(payload["initial_actor"], population=1) == (
+        15,
+        False,
+        [0.04],
+    )
     assert payload["initial_actor"]["source_identity"] == identity
     # This is what the resume branch reads; iteration 3 of a 15-iteration
     # warmup must still be inside it.
@@ -1608,7 +1780,11 @@ def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -
             "metrics": {},
             "source_identity": source_identity(),
             "run_provenance": None,
-            "bc_provenance": {"teacher": {"label": "public-v27"}},
+            "bc_provenance": {
+                "teacher": {"label": "public-v27"},
+                "datasets": [{"train_seeds": [1, 2], "holdout_seeds": [3]}],
+            },
+            "seed_usage": [{"domain": "bc", "start": 1, "count": 3}],
         },
         artifact,
     )
@@ -1623,6 +1799,7 @@ def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -
         for name, value in actor.state_dict().items()
     )
     assert provenance["bc_provenance"]["teacher"]["label"] == "public-v27"
+    assert any(row["domain"] == "bc" and row["start"] == 1 for row in provenance["seed_usage"])
     assert len(provenance["sha256"]) == 64
 
     other = ModelConfig(
@@ -1743,54 +1920,144 @@ def test_the_entropy_reference_is_persisted_per_population_member() -> None:
         module._validate_entropy_references([-0.1, None, 0.29], population=3)
 
 
-def test_structured_predictor_gate_is_persisted_consecutive_and_revocable() -> None:
+def test_structured_predictor_gates_are_independent_and_recovery_safe() -> None:
     module = _training_script()
     config = PpoConfig(
-        structured_actor_gradient_ratio=0.1,
         structured_decision_coefficient=0.5,
         structured_opponent_summary_coefficient=0.5,
         structured_opponent_patch_coefficient=0.5,
+        structured_critic_latent_coefficient=1.0,
+        structured_critic_value_coefficient=1.0,
     )
-    state = module._new_structured_gate_states(1)[0]
+    states = module._new_structured_gate_states(2, config)
+    actor_state = states[0]["actor"]
+    critic_state = states[0]["critic"]
+    assert actor_state is not None and critic_state is not None
     reference_metrics = {
         "structured_preupdate_combined": 2.0,
         "structured_preupdate_decision": 4.0,
+        "structured_preupdate_patch": 0.5,
+        "structured_preupdate_economy": 0.5,
         "structured_preupdate_opponent_summary": 0.06,
         "structured_preupdate_opponent_patches": 0.03,
+        "structured_critic_preupdate_combined": 3.0,
+        "structured_critic_preupdate_latent": 2.0,
+        "structured_critic_preupdate_value": 1.0,
+    }
+    reference_metrics.update(
+        {
+            name.replace("preupdate_", "preupdate_persistence_"): value
+            for name, value in tuple(reference_metrics.items())
+        }
+    )
+
+    actor_first = module._advance_structured_gate(
+        actor_state, reference_metrics, config, kind="actor"
+    )
+    critic_first = module._advance_structured_gate(
+        critic_state, reference_metrics, config, kind="critic"
+    )
+    assert actor_first["structured_gate_passed"] == 0
+    assert critic_first["structured_critic_gate_passed"] == 0
+    assert states[1] == {
+        "actor": {"streak": 0, "enabled": False},
+        "critic": {"streak": 0, "enabled": False},
     }
 
-    first = module._advance_structured_gate(state, reference_metrics, config)
-    assert first["structured_gate_passed"] == 0
-    assert state == {
-        "reference": {
-            "combined": 2.0,
-            "decision": 4.0,
-            "opponent_summary": 0.06,
-            "opponent_patches": 0.03,
-        },
-        "streak": 0,
-        "enabled": False,
+    qualified = {
+        name: value if "_persistence_" in name else value * 0.8
+        for name, value in reference_metrics.items()
     }
+    module._advance_structured_gate(actor_state, qualified, config, kind="actor")
+    actor_third = module._advance_structured_gate(actor_state, qualified, config, kind="actor")
+    critic_second = module._advance_structured_gate(critic_state, qualified, config, kind="critic")
+    assert actor_third["structured_gate_actor_enabled_next"] == 1
+    assert critic_second["structured_critic_gate_enabled_next"] == 0
+    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=True) == (
+        False,
+        False,
+    )
 
-    qualified = {name: value * 0.8 for name, value in reference_metrics.items()}
-    second = module._advance_structured_gate(state, qualified, config)
-    assert second["structured_gate_streak"] == 1
-    assert second["structured_gate_actor_enabled_next"] == 0
-    third = module._advance_structured_gate(state, qualified, config)
-    assert third["structured_gate_streak"] == 2
-    assert third["structured_gate_actor_enabled_next"] == 1
+    critic_third = module._advance_structured_gate(critic_state, qualified, config, kind="critic")
+    assert critic_third["structured_critic_gate_enabled_next"] == 1
+    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=True) == (
+        False,
+        True,
+    )
+    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=False) == (
+        True,
+        True,
+    )
 
     revoked = dict(qualified)
     revoked["structured_preupdate_opponent_patches"] = (
         reference_metrics["structured_preupdate_opponent_patches"] * 0.99
     )
-    fourth = module._advance_structured_gate(state, revoked, config)
-    assert fourth["structured_gate_passed"] == 0
-    assert fourth["structured_gate_actor_enabled_next"] == 0
-    assert state["streak"] == 0
+    actor_fourth = module._advance_structured_gate(actor_state, revoked, config, kind="actor")
+    assert actor_fourth["structured_gate_passed"] == 0
+    assert actor_fourth["structured_gate_actor_enabled_next"] == 0
+    assert critic_state["enabled"]
 
-    record = module._structured_gate_record([state])
-    assert module._validate_structured_gate_states(record, 1) == [state]
+    record = module._structured_gate_record(states)
+    assert module._validate_structured_gate_states(record, 2, config) == states
+    with pytest.raises(ValueError, match="fresh-wave persistence"):
+        module._validate_structured_gate_states({"version": 2, "agents": states}, 2, config)
+    incomplete = {
+        "version": record["version"],
+        "agents": [{"actor": actor_state}] * 2,
+    }
+    with pytest.raises(ValueError, match="incomplete"):
+        module._validate_structured_gate_states(incomplete, 2, config)
+
+    critic_only = PpoConfig(structured_critic_value_coefficient=1.0)
+    critic_only_states = module._new_structured_gate_states(1, critic_only)
+    assert critic_only_states[0]["actor"] is None
+    assert critic_only_states[0]["critic"] is not None
+    assert (
+        module._validate_structured_gate_states(
+            module._structured_gate_record(critic_only_states),
+            1,
+            critic_only,
+        )
+        == critic_only_states
+    )
+
+
+def test_zero_decoder_defers_then_qualifies_on_fresh_informative_waves() -> None:
+    module = _training_script()
+    config = PpoConfig(
+        structured_critic_latent_coefficient=1.0,
+        structured_critic_value_coefficient=1.0,
+        structured_gate_patience=2,
+    )
+    state = module._new_structured_gate_states(1, config)[0]["critic"]
+
+    def wave(value: float, baseline: float) -> dict[str, float]:
+        return {
+            "structured_critic_preupdate_combined": 0.5 + value,
+            "structured_critic_preupdate_latent": 0.5,
+            "structured_critic_preupdate_value": value,
+            "structured_critic_preupdate_persistence_combined": 1.0 + baseline,
+            "structured_critic_preupdate_persistence_latent": 1.0,
+            "structured_critic_preupdate_persistence_value": baseline,
+        }
+
+    for value in (0.0, 0.01, 0.0):
+        measured = module._advance_structured_gate(state, wave(value, 0.0), config, kind="critic")
+        assert not state["enabled"]
+        assert not measured["structured_critic_gate_value_informative"]
+        json.dumps(measured, allow_nan=False)
+    # A small but genuinely positive baseline is meaningful; no arbitrary
+    # loss-scale floor can permanently prevent the decoder becoming ready.
+    for _ in range(2):
+        measured = module._advance_structured_gate(state, wave(1e-9, 2e-9), config, kind="critic")
+        json.dumps(measured, allow_nan=False)
+    assert state["enabled"]
+    # A different scale/head next wave must be compared with its own baseline,
+    # and a regressing decoder revokes even when the combined loss improves.
+    module._advance_structured_gate(state, wave(0.1, 0.09), config, kind="critic")
+    assert not state["enabled"]
+    assert state["streak"] == 0
 
 
 def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
@@ -1863,6 +2130,7 @@ def _actor_artifact(path: Path, actor: FarmActor, config: ModelConfig) -> Path:
             "actor": actor.state_dict(),
             "iteration": 0,
             "source_identity": source_identity(),
+            "seed_usage": [],
         },
         path,
     )
@@ -1874,8 +2142,14 @@ _TINY_CONFIG = ModelConfig(
 )
 
 
-def _population_arguments(run_dir: Path, *, population: int, games: int, iterations: int = 1):
-    return [
+def _population_arguments(
+    run_dir: Path,
+    *,
+    population: int,
+    games: int,
+    iterations: int = 1,
+):
+    arguments = [
         "train_ppo.py",
         "--run-dir",
         str(run_dir),
@@ -1893,18 +2167,19 @@ def _population_arguments(run_dir: Path, *, population: int, games: int, iterati
         "0",
         "--device",
         "cpu",
+        "--model-dim",
+        "16",
+        "--attention-heads",
+        "2",
         "--cnn-width",
         "8",
         "--cnn-blocks",
         "1",
-        "--model-dim",
-        "16",
         "--transformer-layers",
         "3",
-        "--attention-heads",
-        "2",
         "--no-bfloat16",
     ]
+    return arguments
 
 
 def _run_population_main(
@@ -1949,6 +2224,7 @@ def _run_population_main(
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
+            "monte_carlo_explained_variance": 0.2,
         }
 
     wave = _population_wave(module, games=games, population=max(population, 2))
@@ -1967,7 +2243,10 @@ def _run_population_main(
     monkeypatch.setattr(module, "update_replay_parity", lambda *a, **k: _parity_metrics(module))
     monkeypatch.setattr(module, "update_ppo", update)
     arguments = _population_arguments(
-        run_dir, population=population, games=games, iterations=iterations
+        run_dir,
+        population=population,
+        games=games,
+        iterations=iterations,
     )
     for artifact in initial_actors:
         arguments.extend(("--init-actor-from", str(artifact)))
@@ -2106,6 +2385,34 @@ def test_members_starting_from_the_same_weights_are_rejected(monkeypatch, tmp_pa
         module.main()
 
 
+def test_finite_warm_start_cannot_exit_before_actor_release(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    artifact = _actor_artifact(
+        tmp_path / "bc-actor.pt",
+        _distinct_actors(_TINY_CONFIG, 1)[0],
+        _TINY_CONFIG,
+    )
+    run_dir = tmp_path / "short"
+
+    with pytest.raises(RuntimeError, match="final iteration before the critic satisfied"):
+        _run_population_main(
+            module,
+            monkeypatch,
+            run_dir,
+            population=1,
+            games=2,
+            iterations=1,
+            initial_actors=(artifact,),
+        )
+
+    checkpoint = torch.load(run_dir / "latest.pt", weights_only=False)
+    assert checkpoint["iteration"] == 1
+    assert checkpoint["initial_actor"]["critic_warmup_state"] == {
+        "complete": False,
+        "last_monte_carlo_explained_variance": [0.2],
+    }
+
+
 def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     monkeypatch, tmp_path
 ) -> None:
@@ -2132,10 +2439,12 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
         population=population,
         games=games,
         initial_actors=artifacts,
+        iterations=2,
     )
 
-    assert len(seen) == population
-    assert sorted(np.concatenate(seen).tolist()) == list(range(2 * games))
+    assert len(seen) == 2 * population
+    for wave_rows in (seen[:population], seen[population:]):
+        assert sorted(np.concatenate(wave_rows).tolist()) == list(range(2 * games))
     # Per member, so one collapsed member is visible as itself rather than as a
     # third of an average that still reads healthy.
     assert {record[f"agent{agent}_entropy"] for agent in range(population)} == {0.2}
@@ -2163,12 +2472,18 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
         for _ in range(population)
     ]
     reloaded = load_checkpoint(run_dir / "latest.pt", restored, device=torch.device("cpu"))
-    assert reloaded["iteration"] == 1
+    assert reloaded["iteration"] == 2
     assert reloaded["population_disagreement_reference"] == record["population_disagreement_floor"]
-    # Measured at the first actor-active iteration and carried, so a resume
-    # judges the members against where they started rather than against however
-    # far they have already sharpened.
+    assert record["critic_warmup_active"] == 0
+    assert record["critic_warmup_reason"] == "monte_carlo_ev_ready"
+    assert record["critic_warmup_ready_members"] == population
+    # The first wave is critic-only even with a zero configured minimum; the
+    # second uses that fresh-wave EV to release every actor.
     assert reloaded["policy_entropy_reference"] == [0.2] * population
+    assert reloaded["initial_actor"]["critic_warmup_state"] == {
+        "complete": True,
+        "last_monte_carlo_explained_variance": [0.2] * population,
+    }
     for member, stored in zip(restored, members, strict=True):
         assert all(
             torch.equal(value, stored["actor"][name])
@@ -2193,15 +2508,21 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
         resumed_dir,
         population=population,
         games=games,
-        iterations=2,
+        iterations=3,
         resume=run_dir / "latest.pt",
     )
     assert len(resumed_rows) == population
-    assert resumed_record["iteration"] == 2
+    assert resumed_record["iteration"] == 3
     assert (
         resumed_record["population_disagreement_floor"] == record["population_disagreement_floor"]
     )
-    assert (resumed_dir / "checkpoint-000002.pt").is_file()
+    assert (resumed_dir / "checkpoint-000003.pt").is_file()
+    resumed_payload = torch.load(resumed_dir / "latest.pt", weights_only=False)
+    assert resumed_payload["policy_entropy_reference"] == [0.2] * population
+    assert resumed_payload["initial_actor"]["critic_warmup_state"]["complete"] is True
+    assert resumed_record["critic_warmup_active"] == 0
+    assert resumed_record["critic_warmup_reason"] == "complete"
+    assert resumed_record["critic_warmup_ready_members"] == population
 
     stale = tmp_path / "stale.pt"
     torch.save({**payload, "format_version": CHECKPOINT_FORMAT_VERSION - 1}, stale)

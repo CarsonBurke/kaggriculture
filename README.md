@@ -2,12 +2,14 @@
 
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
-The learner is direct, from-scratch self-play PPO with DAPO's asymmetric clip
-band, discount-correct potential shaping, and VAPO's decoupled GAE. Training
-does not currently depend on expert demonstrations, distillation, behavior
-cloning, or value pretraining. An exact
-batched Rust simulator supplies high-throughput rollouts; the pinned Kaggle
-environment remains the parity oracle and final evaluator.
+Production training is BC-initialized self-play PPO with DAPO's asymmetric clip
+band, discount-correct potential shaping, and VAPO's decoupled GAE. A fresh
+production run must load one behavior-cloned actor, then fits its fresh critic
+for at least five iterations and until every member's previous fresh-wave
+pre-update Monte Carlo-return explained variance reaches 0.10. Only an existing
+checkpoint can bypass that initialization. An exact batched Rust simulator supplies
+high-throughput rollouts; the pinned Kaggle environment remains the parity
+oracle and final evaluator.
 
 Install development and training dependencies, then run the CPU-safe default
 validation path:
@@ -56,6 +58,12 @@ ML queue so they do not contend with another experiment. Freeze the complete
 Python/Rust/build input tree first; all DAG nodes must use that read-only tree,
 the frozen `src` on `PYTHONPATH`, and a writable digest-keyed Cargo target:
 
+Executable defaults are the configuration guide. Use each entrypoint's `--help`
+and inherit its settings; `src/kaggriculture/production.py` owns production model
+and PPO defaults. For BC, select `--production-model` and provide the corpora and
+output directory without copying an epoch or optimizer recipe from `RUNS.md`.
+That file records experiments and historical evidence, not competing defaults.
+
 Every path below is anchored to the repository root rather than to `$PWD`, so
 the recipe does the same thing from any working directory. That is not
 cosmetic: with `$PWD`, running it from inside the crate points
@@ -78,7 +86,7 @@ benchmark() {
     --env PYTHONPATH="$snapshot/src" --env PYTHONDONTWRITEBYTECODE=1 \
     --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
     "$repo/.venv/bin/python" scripts/benchmark_ppo_iteration.py \
-    --games 128 --repeats 6 "$@" \
+    "$@" \
     --output "$repo/artifacts/benchmarks/$name-ppo.jsonl"
 }
 
@@ -106,11 +114,13 @@ mlq submit --name kagg-ppo-training --max-parallel-runs 1 --priority 0 \
   --eager-report "$repo/artifacts/benchmarks/eager-ppo.jsonl" \
   --mixed-report "$repo/artifacts/benchmarks/mixed-ppo.jsonl" \
   --compiled-report "$repo/artifacts/benchmarks/compiled-ppo.jsonl" \
+  --init-actor-from "$repo/runs/rl-repair-schema2-bc/bc-actor.pt" \
   --run-dir "$repo/runs/ppo-main"
 ```
 
 The launcher rejects partial reports or any mismatch in source, hardware, seed,
-precision, model, PPO, or data-generation settings.
+precision, architecture, model, PPO, or data-generation settings. An unflagged
+benchmark uses the exact structured production model.
 
 Compilation is decided per knob, not per run. The rollout collector and the
 update are timed separately and a device synchronization ends each, so the
@@ -253,48 +263,60 @@ The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
 population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
 rarely binds.
 
-Entropy is measured for collapse detection but never optimized: `PpoConfig` and
-the training CLI expose no entropy coefficient, and the actor loss is exactly
-the clipped PPO surrogate. Population training uses four independently
-initialized live learners, uniform ordered round-robin pairings, and both seats'
-trajectories. `--population 4` requires `--league-games 0`; validation rejects
-frozen snapshots and built-in opponents in the wave. External opponents are
-evaluation-only diagnostics and never affect training gradients.
+Entropy is measured but not optimized. The main actor objective is clipped PPO;
+production additionally gates a one-step future-policy KL auxiliary. The critic
+has separate one-step latent and decoded-value prediction auxiliaries. Production
+uses one learner with 128 self-play games and 64 league games per wave (320
+learner trajectories). Stale matchup evidence for built-ins and snapshots decays
+toward 0.5 alike, so formerly easy opponents can become contested again.
 
-Members are kept far from duplicates in the states they receive. Every game in
-a wave has its own seed (`seed_start + g`), so a member's 78 games per wave are
-distinct maps, and two members share only their direct head-to-heads. On top of
-that each member trains under its own fixed board orientation
-(`MEMBER_ORIENTATIONS[member % 4]`): identity, horizontal mirror, vertical
-mirror, or a 180-degree rotation. The orientation transforms the encoded board,
-the unit positions, and the movement actions consistently -- what the oriented
-view calls EAST executes as the real direction the map sends it -- so every
-member acts legally in the shared environment while receiving genuinely
-different state streams. Checkpoints record each member's orientation and
-evaluation and submission replay it; the structured (non-conv) encoding does
-not yet carry an orientation mapping and rejects non-identity populations.
+Optional population training uses uniform ordered round-robin pairings and both
+seats' trajectories. `--population 4` requires `--league-games 0`; frozen
+snapshots and built-ins are excluded from population waves.
+Population members receive distinct game seeds (`seed_start + g`), so each
+member's games within a wave cover different maps except for direct
+head-to-heads. The seeded pairing permutation changes which ordered pair owns
+each map stratum across waves. Convolutional populations additionally cycle
+identity, horizontal mirror, vertical mirror, and 180-degree frames; the
+orientation transforms the encoded board, unit positions, and movement actions
+consistently. The structured encoding used by production has no equivalent
+orientation transform yet, so structured population waves use identity frames
+rather than rejecting an otherwise valid run. Rollout batches retain row
+orientations only for PPO replay; evaluation and submission use the real-board
+identity frame.
 
-The actor and critic have separate spatial U-Nets and fixed-token entity
-transformers. The actor attends over one state token, 100 board cells, 16 unit
-slots, and 10 autoregressive market slots using pre-normalization, ReLU-squared
-feed-forwards, normalized queries/keys, axial RoPE, long U-shaped residual skips,
-and PyTorch scaled-dot-product attention (Flash Attention on eligible CUDA
-inputs). Inactive unit slots are zeroed after every block; legality is enforced
-by the exact sequential action ledger, not leaked into attention. All game
-actions are discrete. Market quantities use a state- and order-conditioned
-masked categorical over every integer from 1 through 100, which preserves exact
-PPO likelihoods and multimodal quantity choices; a continuous Beta density would
-not be a valid likelihood for these integer actions. The centralized critic uses
-HL-Gauss labels on a bounded categorical support; target saturation is measured
-and gated because the log-relative economic return itself is not clipped.
+Production architecture and PPO settings are selected explicitly by the shared
+factories in `src/kaggriculture/production.py`. Production launchers serialize the
+resolved configuration into each run's provenance; those records describe what
+ran, while the executable defaults determine future launches.
 
-Future ablation, intentionally not implemented yet: actor-only pretraining on
-the public v27 route. Demonstrations must first be projected through the exact
-sequential legality ledger (invalid unit actions become PASS, invalid market
-orders are removed and compacted rather than converted to STOP, and excessive
-quantities are clamped to the largest legal integer). Any pretrained actor must
-then enter RL with a fresh critic and optimizer, with no persistent BC or KL
-term, and must beat the from-scratch initialization on held-out paired seeds.
+Structured observation schema v2 includes separate goose/cow/sheep purchase,
+shed and carried-stock tokens, and public farmer/hand occupancy on both farms.
+Opponent private stocks remain critic-only. Rebuild native encoding and BC caches
+and train fresh actors: old structured model artifacts are rejected, not migrated.
+
+Predictor gate v3 compares each active loss against persistence on the same fresh
+wave with fixed encoder/readout weights. A zero persistence loss is uninformative,
+not a success or an infinite ratio; later waves are reconsidered. Readiness needs
+the configured consecutive passes and is revoked on failure. Preupdate telemetry
+also compares shuffled learner actions. Predictor fitting and these diagnostics
+have separate synchronized timings.
+
+`credit_preupdate_*` reports critic error against terminal utility after removing
+the shaping potential, including a potential-only baseline, grouped by opponent
+and time-to-go. High shaped-return explained variance alone is not evidence of
+long-horizon prediction. Every 25 iterations, bounded gradient diagnostics report
+main/auxiliary norms and cosine without changing the optimizer update.
+
+Fresh production training must be initialized from a BC actor through
+`--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no
+persistent BC or KL term, and a critic-only warmup lasting at least five
+iterations. Actor updates begin only after every member's previous fresh-wave
+pre-update Monte Carlo-return explained variance reaches 0.10; failure to reach
+that gate by iteration 40 stops the run instead of training against an unready
+baseline. Both production launchers reject a fresh random actor; `--resume`
+remains valid for continuing a checkpoint. Raw `train_ppo.py` remains available
+for controlled from-scratch experiments.
 
 Each full checkpoint binds the immutable `league/` sidecar archive with a
 SHA-256 manifest, the complete source identity, and canonical calibration/run
@@ -353,16 +375,23 @@ mlq submit --name kagg-checkpoint-screen --max-parallel-runs 1 --priority 0 \
   --env CARGO_TARGET_DIR="$repo/artifacts/cargo-target/$digest" -- \
   "$repo/.venv/bin/python" scripts/evaluate_checkpoint.py \
   --artifact "$repo/runs/ppo-main/checkpoint-000100.pt" \
-  --seeds 32 --device cuda \
+  --seed-domain screening --seeds 32 --device cuda \
   --output "$repo/evaluations/checkpoint-000100-v27-screen.json"
 ```
 
-The official 32-seed paired panel is enough to package. Do not re-run 128 seeds
-against an artifact you already screened. Rank that panel, not the symmetric
-self-play score -- a zero-sum population averages 0.5 internally regardless of
-its absolute strength -- or `latest.pt`. Evaluation takes no compilation flag:
-`--rollout-forward-mode`, `--rollout-bfloat16` and `--update-compile-mode` are
-training knobs, decided by the calibration described above.
+The 32-seed screening panel ranks candidates; it is not final admission evidence.
+Freeze the selected checkpoint before running the untouched finalist panel.
+Both seats and all opponents on one map form one independent seed cluster.
+Score intervals use bounded Hoeffding uncertainty, including unanimous outcomes;
+selection reports also retain paired candidate differences. The bounds are
+conservative and do not turn adaptive screening into held-out evidence.
+
+Reserved map domains are BC `[0,4000000)`, development `[4000000,8000000)`,
+screening `[10000000,11000000)`, finalist `[12000000,13000000)`, and online RL
+`[20000000,2**32)`. Artifacts bind actual BC train/holdout seeds and planned
+training/development exposure. Explicit seed overrides must stay in their domain.
+Reports validate recorded exposure; maintaining untouched finalist maps across
+separate invocations remains a procedural requirement, not a global ledger.
 
 To screen every numbered checkpoint on identical paired seeds and atomically
 promote the strongest lower-confidence-bound result:
@@ -378,22 +407,26 @@ mlq submit --name kagg-checkpoint-select --max-parallel-runs 1 --priority 0 \
   --best-output "$repo/runs/ppo-main/best.pt"
 ```
 
-Package admission is a separate CPU contract matching Kaggle. Run the public
-finalist panel on its default seed range (disjoint from selection's 10,000,000
-range), then the mandatory built-in `starter` gate:
+Package admission uses the CPU execution contract matching Kaggle. Queue this
+work too. The public finalist report requires the selection report and its frozen
+artifact identity; a standalone evaluation cannot bypass selection provenance.
+Then run the mandatory built-in `starter` gate:
 
 ```bash
-PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
-  "$snapshot/scripts/evaluate_checkpoint.py" \
+mlq submit --name kagg-finalist --max-parallel-runs 1 --time-limit 2h \
+  --cwd "$snapshot" --env PYTHONPATH="$snapshot/src" -- \
+  "$repo/.venv/bin/python" scripts/evaluate_checkpoint.py \
   --artifact "$repo/runs/ppo-main/best.pt" \
   --selection-report "$repo/evaluations/ppo-main-screen.json" \
-  --seeds 32 --device cpu \
+  --seed-domain finalist --seeds 32 --device cpu \
   --output "$repo/evaluations/ppo-main-finalist-v27.json"
 
-PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
-  "$snapshot/scripts/evaluate_checkpoint.py" \
+mlq submit --name kagg-starter-admission --max-parallel-runs 1 --time-limit 2h \
+  --cwd "$snapshot" --env PYTHONPATH="$snapshot/src" -- \
+  "$repo/.venv/bin/python" scripts/evaluate_checkpoint.py \
   --artifact "$repo/runs/ppo-main/best.pt" \
-  --opponent starter --seeds 16 --device cpu \
+  --opponent starter --seed-domain finalist --seeds 16 --device cpu \
+  --selection-report "$repo/evaluations/ppo-main-screen.json" \
   --output "$repo/evaluations/ppo-main-starter.json"
 
 PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
@@ -403,8 +436,9 @@ PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
   --builtin-evaluation-report "$repo/evaluations/ppo-main-starter.json" \
   --output "$repo/artifacts/kaggriculture-ppo.tar.gz"
 
-PYTHONPATH="$snapshot/src" "$repo/.venv/bin/python" \
-  "$snapshot/scripts/validate_submission.py" \
+mlq submit --name kagg-bundle-validation --max-parallel-runs 1 --time-limit 2h \
+  --cwd "$snapshot" --env PYTHONPATH="$snapshot/src" -- \
+  "$repo/.venv/bin/python" scripts/validate_submission.py \
   --archive "$repo/artifacts/kaggriculture-ppo.tar.gz" \
   --opponent v27 --seeds 2 \
   --output "$repo/evaluations/kaggriculture-ppo-bundle.json"

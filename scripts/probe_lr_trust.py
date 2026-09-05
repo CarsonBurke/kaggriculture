@@ -24,14 +24,22 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
+from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
 from kaggriculture.league import load_actor_snapshot
-from kaggriculture.ppo import PpoConfig, make_optimizers, update_ppo, update_replay_parity
+from kaggriculture.ppo import (
+    PpoConfig,
+    make_optimizers,
+    make_structured_dynamics_optimizer,
+    update_ppo,
+    update_replay_parity,
+)
 from kaggriculture.production import (
     PRODUCTION_ROLLOUT_BFLOAT16,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
@@ -41,6 +49,9 @@ from kaggriculture.production import (
 )
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, collect_self_play_rust
+from kaggriculture.structured import StructuredConfig
+from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 REPORTED = (
     "actor_updates",
@@ -53,6 +64,72 @@ REPORTED = (
     "actor_gradient_norm",
     "policy_loss",
 )
+
+
+def _auxiliary_recovery(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
+    version = state.get("format_version")
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            "learning-rate probe requires a complete v13 checkpoint; "
+            f"got format version {version!r}"
+        )
+    require_checkpoint_format(state)
+    member_states = checkpoint_agent_states(state)
+    member = member_states[0]
+    required = {
+        "structured_dynamics",
+        "structured_dynamics_optimizer",
+        "structured_critic_dynamics",
+        "structured_critic_dynamics_optimizer",
+    }
+    missing = sorted(required - set(member))
+    if missing:
+        raise ValueError(
+            "v13 checkpoint member zero has incomplete actor/critic predictor recovery: "
+            + ", ".join(missing)
+        )
+
+    auxiliary_rng = state.get("structured_auxiliary_rng")
+    if not isinstance(auxiliary_rng, Mapping):
+        raise ValueError("v13 checkpoint is missing a valid structured auxiliary RNG state")
+    saved_auxiliary_rng = copy.deepcopy(dict(auxiliary_rng))
+    try:
+        validation_generator = np.random.default_rng()
+        validation_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("v13 checkpoint structured auxiliary RNG state is invalid") from error
+
+    gate_record = state.get("structured_gate_state")
+    if (
+        not isinstance(gate_record, Mapping)
+        or set(gate_record) != {"version", "agents"}
+        or gate_record.get("version") != 2
+    ):
+        raise ValueError(
+            "v13 checkpoint requires structured gate state version 2 for actor and critic"
+        )
+    gate_agents = gate_record["agents"]
+    if not isinstance(gate_agents, list) or len(gate_agents) != len(member_states):
+        raise ValueError("v13 checkpoint structured gate state has the wrong population")
+    member_gate = gate_agents[0]
+    if not isinstance(member_gate, Mapping) or set(member_gate) != {"actor", "critic"}:
+        raise ValueError("v13 checkpoint member-zero structured gate state is incomplete")
+
+    enabled: dict[str, bool] = {}
+    for side in ("actor", "critic"):
+        gate = member_gate[side]
+        if not isinstance(gate, Mapping) or set(gate) != {
+            "reference",
+            "streak",
+            "enabled",
+        }:
+            raise ValueError(f"v13 checkpoint member-zero {side} gate state is incomplete")
+        if not isinstance(gate["enabled"], bool):
+            raise ValueError(f"v13 checkpoint member-zero {side} gate enabled state is invalid")
+        enabled[side] = gate["enabled"]
+    return member, saved_auxiliary_rng, enabled["actor"], enabled["critic"]
 
 
 def main() -> None:
@@ -79,13 +156,29 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if not isinstance(state, dict):
+        raise ValueError("learning-rate probe checkpoint payload must be a mapping")
+    (
+        member_state,
+        saved_auxiliary_rng,
+        structured_actor_auxiliary,
+        structured_critic_auxiliary,
+    ) = _auxiliary_recovery(state)
     entry = resolve_architecture(state["architecture"])
-    model_config = entry.config_class(**state["model_config"])
+    model_config = entry.build_config(state["model_config"])
+    if not isinstance(model_config, StructuredConfig):
+        raise ValueError("v13 production auxiliary recovery requires a structured model")
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
-    actor.load_state_dict(state["actor"])
-    critic.load_state_dict(state["critic"])
+    actor.load_state_dict(member_state["actor"])
+    critic.load_state_dict(member_state["critic"])
     schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
+    production_config = PpoConfig(**schedule)
+    if not (
+        production_config.structured_actor_auxiliary_active
+        and production_config.structured_critic_auxiliary_active
+    ):
+        raise RuntimeError("production PPO config must enable both structured auxiliaries")
 
     actor.eval()
     if args.league_games:
@@ -155,6 +248,10 @@ def main() -> None:
     for rate in args.learning_rates:
         candidate_actor = copy.deepcopy(actor)
         candidate_critic = copy.deepcopy(critic)
+        candidate_dynamics = StructuredDynamics(model_config).to(device)
+        candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
+        candidate_dynamics.load_state_dict(member_state["structured_dynamics"])
+        candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         # lr_warmup_steps is zeroed so the measured rate is the rate applied on
         # every one of the 113 steps. With warmup left on, the early steps run
         # below the candidate and the epoch would clear a bound the shipped
@@ -165,19 +262,34 @@ def main() -> None:
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config
         )
-        actor_optimizer.load_state_dict(state["actor_optimizer"])
-        critic_optimizer.load_state_dict(state["critic_optimizer"])
-        # `load_state_dict` restores `param_groups`, and `_optimizer_step` reads
-        # the rate from `group["base_lr"]` in preference to its argument, so
-        # restoring the checkpoint puts the checkpoint's 2.5e-4 back and the
-        # swept rate never reaches a single step. Re-stamping the groups after
-        # the restore is what makes this sweep measure its own variable. The
-        # first attempt at this probe omitted it and reported five identical
-        # configurations as though they were five learning rates.
-        for group in actor_optimizer.param_groups:
-            group["base_lr"] = rate
-            group["warmup_step"] = 0
-            group["lr"] = rate
+        dynamics_optimizer = make_structured_dynamics_optimizer(candidate_dynamics, config)
+        critic_dynamics_optimizer = make_structured_dynamics_optimizer(
+            candidate_critic_dynamics, config
+        )
+        actor_optimizer.load_state_dict(member_state["actor_optimizer"])
+        critic_optimizer.load_state_dict(member_state["critic_optimizer"])
+        dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
+        critic_dynamics_optimizer.load_state_dict(
+            member_state["structured_critic_dynamics_optimizer"]
+        )
+        # Restoring param groups also restores their checkpoint rates. Re-stamp
+        # the swept actor and predictor rates, and restart their short-probe
+        # warmup clocks, so candidate overrides reach every intended step. The
+        # critic keeps its checkpoint rate because this probe does not sweep it.
+        for optimizer, base_rate in (
+            (actor_optimizer, config.actor_learning_rate),
+            (dynamics_optimizer, config.resolved_structured_learning_rate),
+            (critic_dynamics_optimizer, config.resolved_structured_learning_rate),
+        ):
+            for group in optimizer.param_groups:
+                candidate_rate = base_rate
+                if group.get("kind") == "adam":
+                    candidate_rate *= config.adam_learning_rate_ratio
+                group["base_lr"] = candidate_rate
+                group["warmup_step"] = 0
+                group["lr"] = candidate_rate
+        auxiliary_generator = np.random.default_rng()
+        auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
         metrics = update_ppo(
             candidate_actor,
             candidate_critic,
@@ -186,6 +298,13 @@ def main() -> None:
             rollout,
             config,
             generator=np.random.default_rng(args.seed),
+            structured_dynamics=candidate_dynamics,
+            structured_dynamics_optimizer=dynamics_optimizer,
+            structured_actor_auxiliary=structured_actor_auxiliary,
+            structured_critic_dynamics=candidate_critic_dynamics,
+            structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
+            structured_critic_auxiliary=structured_critic_auxiliary,
+            auxiliary_generator=auxiliary_generator,
         )
         row = {"actor_learning_rate": rate}
         row.update({k: float(metrics[k]) for k in REPORTED if k in metrics})

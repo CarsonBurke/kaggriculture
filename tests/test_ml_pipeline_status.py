@@ -85,3 +85,90 @@ def test_status_queries_each_unchanged_job_once(monkeypatch) -> None:
     module.main()
 
     assert calls == 1
+
+
+def test_watch_succeeds_after_rendering_success(monkeypatch, capsys) -> None:
+    module = _script()
+    monkeypatch.setattr(
+        module,
+        "_job",
+        lambda job_id: {"id": job_id, "name": "pipeline", "state": "succeeded"},
+    )
+    monkeypatch.setattr(sys, "argv", ["ml_pipeline_status.py", "--watch", "7"])
+
+    assert module.main() == 0
+    assert capsys.readouterr().out == "job 7 pipeline: succeeded\n"
+
+
+def test_watch_fails_after_rendering_failure(monkeypatch, capsys) -> None:
+    module = _script()
+    monkeypatch.setattr(
+        module,
+        "_job",
+        lambda job_id: {
+            "id": job_id,
+            "name": "pipeline",
+            "state": "failed",
+            "stateReason": "command exited with code 1",
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["ml_pipeline_status.py", "--watch", "7"])
+
+    assert module.main() == 1
+    assert capsys.readouterr().out == "job 7 pipeline: failed (command exited with code 1)\n"
+
+
+def test_watch_fails_after_rendering_cancellation(monkeypatch, capsys) -> None:
+    module = _script()
+    monkeypatch.setattr(
+        module,
+        "_job",
+        lambda job_id: {"id": job_id, "name": "pipeline", "state": "cancelled"},
+    )
+    monkeypatch.setattr(sys, "argv", ["ml_pipeline_status.py", "--watch", "7"])
+
+    assert module.main() == 1
+    assert capsys.readouterr().out == "job 7 pipeline: cancelled\n"
+
+
+def test_watch_retries_until_healing_is_exhausted(monkeypatch, capsys) -> None:
+    module = _script()
+    retry_calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        module,
+        "_job",
+        lambda job_id: {
+            "id": job_id,
+            "name": "pipeline",
+            "state": "failed",
+            "stateReason": "runner lost",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_command",
+        lambda *arguments: retry_calls.append(arguments) or {},
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ml_pipeline_status.py",
+            "--watch",
+            "--heal",
+            "--max-heals",
+            "2",
+            "--interval",
+            "0.01",
+            "7",
+        ],
+    )
+
+    assert module.main() == 1
+    assert retry_calls == [
+        ("mlq", "retry", "7", "--json"),
+        ("mlq", "retry", "7", "--json"),
+    ]
+    assert capsys.readouterr().out == "job 7 pipeline: failed (runner lost)\n"

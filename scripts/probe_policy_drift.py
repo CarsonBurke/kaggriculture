@@ -65,7 +65,7 @@ def _load(path: Path, device: torch.device) -> tuple[FarmActor, str]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "actor" in payload and "architecture" in payload:
         entry = resolve_architecture(payload["architecture"])
-        actor = entry.actor_class(entry.config_class(**payload["model_config"]))
+        actor = entry.build_actor(payload["model_config"])
         actor.load_state_dict(payload["actor"])
         architecture = payload["architecture"]
     else:

@@ -11,12 +11,14 @@ from pathlib import Path
 
 import pytest
 import torch
+from kaggle_environments import make
 
-from kaggriculture.actions import MarketKind
+from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.inference import (
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
     LEGACY_CHECKPOINT_FORMAT_VERSIONS,
+    CheckpointAgent,
     _cpu_portable_structured_state,
     actor_artifact_from_checkpoint,
     cpu_portable_actor_artifact,
@@ -63,6 +65,146 @@ def test_actor_artifact_round_trip(tmp_path: Path, checkpoint_version: int) -> N
     assert metadata["format_version"] == ACTOR_ARTIFACT_FORMAT_VERSION
     for expected, actual in zip(actor.parameters(), restored.parameters(), strict=True):
         assert torch.equal(expected, actual)
+
+
+def _checkpoint_agent_with_ranked_actions(
+    tmp_path: Path, priorities: tuple[UnitAction, ...]
+) -> CheckpointAgent:
+    config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
+    actor = FarmActor(config)
+    with torch.no_grad():
+        actor.unit_head[-1].weight.zero_()
+        actor.unit_head[-1].bias.fill_(-100.0)
+        for rank, action in enumerate(priorities):
+            actor.unit_head[-1].bias[action] = 10.0 * (len(priorities) - rank)
+        actor.market_kind.weight.zero_()
+        actor.market_kind.bias.fill_(-100.0)
+        actor.market_kind.bias[MarketKind.STOP] = 10.0
+    artifact = actor_artifact_from_checkpoint(
+        {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "source_identity": source_identity(),
+        }
+    )
+    path = tmp_path / "model.pt"
+    torch.save(artifact, path)
+    return CheckpointAgent(path)
+
+
+def test_checkpoint_agent_preserves_same_tile_dig_then_plant(tmp_path: Path) -> None:
+    agent = _checkpoint_agent_with_ranked_actions(
+        tmp_path, (UnitAction.PLANT_WHEAT, UnitAction.DIG)
+    )
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    observation = environment.reset(2)[0].observation
+    farm = observation["farms"][0]
+    x, y = farm["farmer"]
+    farm["tiles"][y][x] = {"kind": "WEED"}
+    farm["hands"] = [[x, y]]
+    observation["private"]["inventories"].append({})
+    observation["private"]["seeds"]["WHEAT"] = 1
+
+    action = agent(observation)
+    following = environment.step([action, {}])[0].observation
+
+    assert action["farmer"] == ["DIG"]
+    assert action["hands"] == [["PLANT", "WHEAT"]]
+    planted = following["farms"][0]["tiles"][y][x]
+    assert planted["kind"] == "PLANT"
+    assert planted["crop"] == "WHEAT"
+    assert following["private"]["seeds"]["WHEAT"] == 0
+
+
+@pytest.mark.parametrize(
+    ("choice", "command", "position", "carried_wheat"),
+    [
+        (UnitAction.NORTH, ["NORTH"], [4, 3], 0),
+        (UnitAction.PICKUP_WHEAT_1, ["PICKUP", "WHEAT", 1], [4, 4], 1),
+    ],
+)
+def test_checkpoint_agent_can_move_or_use_shed_while_standing_on_weeds(
+    tmp_path: Path,
+    choice: UnitAction,
+    command: list,
+    position: list[int],
+    carried_wheat: int,
+) -> None:
+    agent = _checkpoint_agent_with_ranked_actions(tmp_path, (choice, UnitAction.DIG))
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 13})
+    observation = environment.reset(2)[0].observation
+    observation["farms"][0]["farmer"] = [4, 4]
+    observation["farms"][0]["tiles"][4][4] = {"kind": "WEED"}
+    observation["private"]["shed"]["WHEAT"] = 1
+    observation["private"]["inventories"][0] = {}
+
+    action = agent.act_many([observation])[0]
+    following = environment.step([action, {}])[0].observation
+
+    assert action["farmer"] == command
+    assert following["farms"][0]["farmer"] == position
+    assert following["farms"][0]["tiles"][4][4]["kind"] == "WEED"
+    assert following["private"]["inventories"][0].get("WHEAT", 0) == carried_wheat
+    assert following["private"]["shed"]["WHEAT"] == 1 - carried_wheat
+
+
+def test_actor_export_strips_all_critic_and_predictor_recovery_state() -> None:
+    config = ModelConfig(
+        cnn_width=8,
+        cnn_blocks=1,
+        model_dim=16,
+        transformer_layers=3,
+        attention_heads=2,
+    )
+    actor = FarmActor(config)
+    training_only = {
+        "critic",
+        "actor_optimizer",
+        "critic_optimizer",
+        "structured_dynamics",
+        "structured_dynamics_optimizer",
+        "structured_critic_dynamics",
+        "structured_critic_dynamics_optimizer",
+    }
+    training_state = {key: {"training_only": torch.tensor(1.0)} for key in training_only}
+    metadata = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model_config": config.to_dict(),
+        "source_identity": source_identity(),
+    }
+    checkpoints = (
+        ({**metadata, "actor": actor.state_dict(), **training_state}, None),
+        (
+            {
+                **metadata,
+                "agents": [
+                    {"actor": actor.state_dict(), **training_state},
+                    {"actor": actor.state_dict(), **training_state},
+                ],
+            },
+            0,
+        ),
+    )
+
+    assert CHECKPOINT_FORMAT_VERSION == 13
+    assert 12 in LEGACY_CHECKPOINT_FORMAT_VERSIONS
+    for checkpoint, agent in checkpoints:
+        artifact = actor_artifact_from_checkpoint(checkpoint, agent=agent)
+        assert training_only.isdisjoint(artifact)
+        assert set(artifact) == {
+            "format_version",
+            "architecture",
+            "model_config",
+            "actor",
+            "iteration",
+            "metrics",
+            "source_identity",
+            "run_provenance",
+            "orientation",
+        }
 
 
 def test_fused_structured_artifact_rejects_cpu_inference(tmp_path: Path) -> None:
@@ -247,6 +389,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
             "iteration": 17,
             "source_identity": source_identity(),
             "run_provenance": run_provenance,
+            "seed_usage": [],
         },
         checkpoint,
     )
@@ -261,54 +404,58 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
     }
     evaluation.write_text(
         json.dumps(
-            {
-                "valid_for_selection": True,
-                "device": "cpu",
-                "opponent_label": "public-v27",
-                "seed_count": 128,
-                "seed_start": 20_000_000,
-                "paired_seats": True,
-                "summary": {"score_rate": 0.75},
-                "selection_provenance": {
-                    "best_output_sha256": checkpoint_digest,
-                    "sha256": "d" * 64,
-                    "run_provenance": run_provenance,
-                    "screening_seed_start": 10_000_000,
-                    "screening_seed_count": 32,
-                    "opponent_provenance": {
-                        "public-v27": {
-                            "kind": "python_file",
-                            "sha256": "c" * 64,
-                            "size_bytes": 100,
-                        }
+            _evaluation_protocol(
+                {
+                    "valid_for_selection": True,
+                    "device": "cpu",
+                    "opponent_label": "public-v27",
+                    "seed_count": 128,
+                    "seed_start": 12_000_000,
+                    "paired_seats": True,
+                    "summary": {"score_rate": 0.75},
+                    "selection_provenance": {
+                        "best_output_sha256": checkpoint_digest,
+                        "sha256": "d" * 64,
+                        "run_provenance": run_provenance,
+                        "screening_seed_start": 10_000_000,
+                        "screening_seed_count": 32,
+                        "opponent_provenance": {
+                            "public-v27": {
+                                "kind": "python_file",
+                                "sha256": "c" * 64,
+                                "size_bytes": 100,
+                            }
+                        },
                     },
-                },
-                "opponent_provenance": opponent_provenance,
-                "artifact_provenance": {
-                    "sha256": checkpoint_digest,
-                    "source_identity": source_identity(),
-                    "run_provenance": run_provenance,
-                },
-            }
+                    "opponent_provenance": opponent_provenance,
+                    "artifact_provenance": {
+                        "sha256": checkpoint_digest,
+                        "source_identity": source_identity(),
+                        "run_provenance": run_provenance,
+                    },
+                }
+            )
         ),
         encoding="utf-8",
     )
     starter_evaluation = tmp_path / "starter.json"
     starter_evaluation.write_text(
         json.dumps(
-            {
-                "valid_for_selection": True,
-                "device": "cpu",
-                "opponent_label": "starter",
-                "seed_count": 64,
-                "paired_seats": True,
-                "summary": {"score_rate": 1.0},
-                "artifact_provenance": {
-                    "sha256": checkpoint_digest,
-                    "source_identity": source_identity(),
-                    "run_provenance": run_provenance,
-                },
-            }
+            _evaluation_protocol(
+                {
+                    "valid_for_selection": True,
+                    "device": "cpu",
+                    "opponent_label": "starter",
+                    "seed_count": 64,
+                    "paired_seats": True,
+                    "summary": {"score_rate": 1.0},
+                    "artifact_provenance": {
+                        "sha256": checkpoint_digest,
+                        "source_identity": source_identity(),
+                        "run_provenance": run_provenance,
+                    },
+                }
+            )
         ),
         encoding="utf-8",
     )
@@ -341,6 +488,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/constants.py",
         "kaggriculture/encoding.py",
         "kaggriculture/inference.py",
+        "kaggriculture/evaluation.py",
         "kaggriculture/model.py",
         "kaggriculture/orientation.py",
         "kaggriculture/policy.py",
@@ -423,6 +571,53 @@ def _validate_submission_module():
     return module
 
 
+def _score_summary(start: int, count: int, score: float) -> dict:
+    from kaggriculture.evaluation import SCORE_CONFIDENCE, bounded_mean_interval
+
+    return {
+        "score_rate": score,
+        "score_rate_95ci": list(bounded_mean_interval([score] * count)),
+        "score_confidence": SCORE_CONFIDENCE,
+        "seed_cluster_statistics": [
+            {"seed": seed, "score_rate": score, "mean_margin": 0.0}
+            for seed in range(start, start + count)
+        ],
+    }
+
+
+def _evaluation_protocol(payload: dict) -> dict:
+    from kaggriculture.evaluation import seed_protocol
+
+    payload["artifact_provenance"]["seed_usage"] = []
+    finalist = payload["opponent_label"] == "public-v27"
+    start = payload.setdefault("seed_start", 12_000_000 if finalist else 4_000_000)
+    count = payload["seed_count"]
+    payload["summary"] = _score_summary(start, count, payload["summary"]["score_rate"])
+    usage = []
+    if finalist:
+        selection = payload["selection_provenance"]
+        selection["statistical_selection"] = {
+            "protocol": "archive_screening_then_untouched_finalist",
+            "candidate_count": 2,
+            "finalist_required": True,
+            "candidate_frozen_before_finalist": True,
+        }
+        selection["seed_protocol"] = seed_protocol(
+            "screening",
+            selection["screening_seed_start"],
+            selection["screening_seed_count"],
+            usage=[],
+        )
+        usage.append(selection["seed_protocol"]["evaluation"])
+    payload["seed_protocol"] = seed_protocol(
+        "finalist" if finalist else "development",
+        start,
+        count,
+        usage=usage,
+    )
+    return payload
+
+
 def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
     """A checkpoint and the two reports a submission needs, all mutually bound."""
     config = ModelConfig()
@@ -435,6 +630,7 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
             "iteration": 5,
             "source_identity": source_identity(),
             "run_provenance": None,
+            "seed_usage": [],
         },
         checkpoint,
     )
@@ -449,7 +645,7 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
         "device": "cpu",
         "opponent_label": "public-v27",
         "seed_count": 128,
-        "seed_start": 20_000_000,
+        "seed_start": 12_000_000,
         "paired_seats": True,
         "summary": {"score_rate": 0.75},
         "selection_provenance": {
@@ -479,7 +675,7 @@ def _submission_inputs(tmp_path: Path) -> tuple[Path, dict, dict]:
         "summary": {"score_rate": 1.0},
         "artifact_provenance": provenance,
     }
-    return checkpoint, finalist, starter
+    return checkpoint, _evaluation_protocol(finalist), _evaluation_protocol(starter)
 
 
 def test_submission_reports_bind_the_exported_population_member(tmp_path: Path) -> None:
@@ -487,6 +683,7 @@ def test_submission_reports_bind_the_exported_population_member(tmp_path: Path) 
     checkpoint, finalist, starter = _submission_inputs(tmp_path)
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     finalist["artifact_provenance"]["agent"] = 0
+    assert builder._evaluation_agent(json.dumps(finalist).encode()) == 0
 
     with pytest.raises(ValueError, match="different population member"):
         builder._load_evaluation(
@@ -550,13 +747,13 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
         attempt()
 
     # The exact historical failure: every seat lost, provenance immaculate.
-    write({**finalist, "summary": {"score_rate": 0.0}}, starter)
+    write({**finalist, "summary": _score_summary(finalist["seed_start"], 128, 0.0)}, starter)
     with pytest.raises(ValueError, match="below the required"):
         attempt()
 
     # Losing to the carrot-loop heuristic must block a submission on its own,
     # even when the public-v27 number is healthy.
-    write(finalist, {**starter, "summary": {"score_rate": 0.4}})
+    write(finalist, {**starter, "summary": _score_summary(starter["seed_start"], 64, 0.4)})
     with pytest.raises(ValueError, match="against the built-in starter"):
         attempt()
 
@@ -567,7 +764,7 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
 
     # An aborted evaluation writes a null rate, which must not read as zero or crash.
     write({**finalist, "summary": {"score_rate": None}}, starter)
-    with pytest.raises(ValueError, match="no finite score rate"):
+    with pytest.raises(ValueError, match="complete seed-cluster panel"):
         attempt()
 
     write(finalist, starter)
@@ -581,39 +778,18 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
         )
 
 
-def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
-    tmp_path: Path,
-) -> None:
-    build_submission = _build_submission_module()
-    checkpoint, finalist, starter = _submission_inputs(tmp_path)
-    finalist["seed_count"] = 32
-    finalist["seed_start"] = 10_000_000
+def test_submission_rejects_a_finalist_without_selection_provenance(tmp_path: Path) -> None:
+    builder = _build_submission_module()
+    checkpoint, finalist, _starter = _submission_inputs(tmp_path)
     finalist["selection_provenance"] = None
-    starter["seed_count"] = 16
-    finalist_path = tmp_path / "finalist.json"
-    starter_path = tmp_path / "starter.json"
-    finalist_path.write_text(json.dumps(finalist), encoding="utf-8")
-    starter_path.write_text(json.dumps(starter), encoding="utf-8")
-    manifest = build_submission.build(
-        checkpoint,
-        finalist_path,
-        tmp_path / "submission.tar.gz",
-        builtin_evaluation_reports=[starter_path],
-        minimum_score_rate=0.5,
-        minimum_builtin_score_rate=0.9,
-        minimum_builtin_seed_count=16,
-    )
-    assert manifest["evaluation"]["seed_count"] == 32
-    assert manifest["evaluation"]["selection_report_sha256"] is None
-    assert manifest["evaluation"]["score_rate"] == 0.75
-    extracted = tmp_path / "validated"
-    extracted.mkdir()
-    names, validated_manifest = _validate_submission_module()._extract(
-        tmp_path / "submission.tar.gz",
-        extracted,
-    )
-    assert "manifest.json" in names
-    assert validated_manifest == manifest
+    with pytest.raises(ValueError, match="checkpoint-selection provenance"):
+        builder._load_evaluation(
+            json.dumps(finalist).encode(),
+            hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            source_identity(),
+            0.0,
+            None,
+        )
 
 
 def test_submission_validator_rejects_internally_consistent_cuda_evaluation(

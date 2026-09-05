@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -40,24 +41,35 @@ def test_completion_record_covers_the_exact_cartesian_product() -> None:
     }
 
 
-def test_unflagged_conv_benchmark_builds_the_production_model(monkeypatch) -> None:
-    """A calibration report is only launch evidence when its model matches
-    production exactly, and launch_calibrated_training rejects it otherwise."""
-    import sys
-
+def test_unflagged_benchmark_builds_the_exact_structured_production_model(monkeypatch) -> None:
+    """A calibration report is launch evidence only for the shipped architecture
+    and exact production model configuration."""
     from kaggriculture.modelargs import model_config_from_args
-    from kaggriculture.production import PRODUCTION_SELF_PLAY_GAMES, production_model_config
-    from kaggriculture.registry import CONV_ENTITY, resolve_architecture
+    from kaggriculture.production import (
+        PRODUCTION_ARCHITECTURE,
+        PRODUCTION_SELF_PLAY_GAMES,
+        production_model_config,
+    )
+    from kaggriculture.registry import STRUCTURED, resolve_architecture
+    from kaggriculture.structured import StructuredConfig
 
     module = _script()
     monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py"])
 
     args = module.parse_args()
-    config = model_config_from_args(resolve_architecture(CONV_ENTITY), args)
+    config = model_config_from_args(resolve_architecture(args.architecture), args)
 
     assert not args.deterministic_training
     assert args.games == str(PRODUCTION_SELF_PLAY_GAMES)
-    assert config.to_dict() == production_model_config()
+    assert args.architecture == STRUCTURED == PRODUCTION_ARCHITECTURE
+    assert config == StructuredConfig(**production_model_config())
+    assert config.model_dim == 80
+    assert config.ffn_multiplier == 2
+    assert config.global_refresh_layers == ()
+    assert config.fuse_market_decoder is True
+    assert config.fuse_unit_decoder is False
+    assert config.fused_mlp is False
+    assert config.global_modulation is True
 
 
 def test_benchmark_can_measure_the_deterministic_training_contract(monkeypatch) -> None:
@@ -69,6 +81,144 @@ def test_benchmark_can_measure_the_deterministic_training_contract(monkeypatch) 
     )
 
     assert module.parse_args().deterministic_training
+
+
+def test_structured_benchmark_keeps_nextlat_state_and_rngs_per_batch_case(
+    monkeypatch,
+) -> None:
+    from dataclasses import asdict
+
+    from kaggriculture.production import production_ppo_config
+    from kaggriculture.structured_dynamics import (
+        StructuredCriticDynamics,
+        StructuredDynamics,
+    )
+
+    module = _script()
+    calls: list[dict[str, object]] = []
+
+    def collect(*_arguments: object, **_keywords: object) -> SimpleNamespace:
+        return SimpleNamespace(trajectories=2, state_count=4)
+
+    parity = {
+        "update_replay_unit_active_count": 1,
+        "update_replay_kind_active_count": 1,
+        "update_replay_quantity_active_count": 1,
+        "update_replay_max_kl": 0.0,
+        "update_replay_max_tail_fraction": 0.0,
+    }
+
+    def update(*arguments: object, **keywords: object) -> dict[str, float | int]:
+        actor_dynamics = keywords["structured_dynamics"]
+        critic_dynamics = keywords["structured_critic_dynamics"]
+        generator = keywords["generator"]
+        auxiliary_generator = keywords["auxiliary_generator"]
+        assert isinstance(actor_dynamics, StructuredDynamics)
+        assert isinstance(critic_dynamics, StructuredCriticDynamics)
+        assert isinstance(generator, np.random.Generator)
+        assert isinstance(auxiliary_generator, np.random.Generator)
+        calls.append(
+            {
+                "actor": arguments[0],
+                "critic": arguments[1],
+                "config": arguments[5],
+                "actor_dynamics": actor_dynamics,
+                "critic_dynamics": critic_dynamics,
+                "actor_optimizer": keywords["structured_dynamics_optimizer"],
+                "critic_optimizer": keywords["structured_critic_dynamics_optimizer"],
+                "actor_gate": keywords["structured_actor_auxiliary"],
+                "critic_gate": keywords["structured_critic_auxiliary"],
+                "generator": generator,
+                "auxiliary_generator": auxiliary_generator,
+                "rollout_draw": int(generator.integers(0, 1 << 62)),
+                "auxiliary_draw": int(auxiliary_generator.integers(0, 1 << 62)),
+            }
+        )
+        return {
+            "first_minibatch_approx_kl": 0.0,
+            "value_target_saturated_fraction": 0.0,
+            "actor_updates": 1,
+        }
+
+    monkeypatch.setattr(
+        module,
+        "allocate_rollout_storage",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(module, "collect_mixed_play_rust", collect)
+    monkeypatch.setattr(
+        module,
+        "update_replay_parity",
+        lambda *_args, **_kwargs: parity,
+    )
+    monkeypatch.setattr(module, "_verify_first_step_critic_state", lambda *_args: None)
+    monkeypatch.setattr(module, "update_ppo", update)
+    monkeypatch.setattr(
+        module,
+        "rollout_diagnostics",
+        lambda _rollout: {"money_mean": 0.0, "tie_fraction": 0.0, "score_rate": 0.5},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_ppo_iteration.py",
+            "--device",
+            "cpu",
+            "--games",
+            "1,2",
+            "--league-games",
+            "0",
+            "--repeats",
+            "2",
+            "--model-dim",
+            "16",
+            "--attention-heads",
+            "2",
+            "--ffn-multiplier",
+            "1",
+            "--farm-blocks",
+            "1",
+            "--opponent-latents",
+            "2",
+            "--latents",
+            "4",
+            "--core-layers",
+            "1",
+            "--quantity-rank",
+            "4",
+        ],
+    )
+
+    module.main()
+
+    assert len(calls) == 4
+    expected_ppo = production_ppo_config(update_compile_mode="default")
+    assert all(asdict(call["config"]) == expected_ppo for call in calls)
+    for call in calls:
+        assert call["actor_gate"] is True
+        assert call["critic_gate"] is True
+        assert call["actor_optimizer"] is not call["critic_optimizer"]
+        assert call["generator"] is not call["auxiliary_generator"]
+    for first, second in ((calls[0], calls[1]), (calls[2], calls[3])):
+        assert first["actor"] is second["actor"]
+        assert first["critic"] is second["critic"]
+        assert first["actor_dynamics"] is second["actor_dynamics"]
+        assert first["critic_dynamics"] is second["critic_dynamics"]
+        assert first["actor_optimizer"] is second["actor_optimizer"]
+        assert first["critic_optimizer"] is second["critic_optimizer"]
+        assert first["generator"] is second["generator"]
+        assert first["auxiliary_generator"] is second["auxiliary_generator"]
+    assert calls[0]["actor"] is not calls[2]["actor"]
+    assert calls[0]["critic"] is not calls[2]["critic"]
+    assert calls[0]["actor_dynamics"] is not calls[2]["actor_dynamics"]
+    assert calls[0]["critic_dynamics"] is not calls[2]["critic_dynamics"]
+    assert calls[0]["generator"] is not calls[2]["generator"]
+    assert calls[0]["auxiliary_generator"] is not calls[2]["auxiliary_generator"]
+    assert calls[0]["rollout_draw"] == calls[2]["rollout_draw"]
+    assert calls[1]["rollout_draw"] == calls[3]["rollout_draw"]
+    assert calls[0]["auxiliary_draw"] == calls[2]["auxiliary_draw"]
+    assert calls[1]["auxiliary_draw"] == calls[3]["auxiliary_draw"]
 
 
 def test_hardware_identity_records_common_cpu_metadata() -> None:
@@ -121,7 +271,6 @@ def test_emit_rejects_nonfinite_values_without_extending_report(tmp_path: Path) 
 def test_first_step_critic_state_verification_covers_both_families() -> None:
     """The pre-update integrity gate must pass on a genuine mixed wave and
     fail once a stored critic-only value is corrupted, for each family."""
-    import numpy as np
 
     from kaggriculture.model import FarmActor, ModelConfig
     from kaggriculture.registry import CONV_ENTITY, STRUCTURED
@@ -212,6 +361,8 @@ _SMALL_WAVE = (
     "2",
     "--repeats",
     "2",
+    "--architecture",
+    "entity-cnn",
     "--cnn-width",
     "8",
     "--cnn-blocks",

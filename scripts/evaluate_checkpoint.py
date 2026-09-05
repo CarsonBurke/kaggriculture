@@ -29,6 +29,14 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import torch
 
+from kaggriculture.evaluation import (
+    SCORE_CONFIDENCE,
+    SEED_DOMAINS,
+    artifact_seed_usage,
+    bounded_mean_interval,
+    seed_protocol,
+    validate_seed_protocol,
+)
 from kaggriculture.inference import CheckpointAgent, load_actor_artifact
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.provenance import file_sha256, require_source_identity
@@ -157,6 +165,7 @@ def _artifact_provenance(
         "source_identity": identity,
         "run_provenance": metadata.get("run_provenance"),
         "agent": agent,
+        "seed_usage": artifact_seed_usage(metadata),
     }
 
 
@@ -206,20 +215,37 @@ def _opponent_identity(provenance: object) -> dict[str, Any]:
     raise ValueError("opponent provenance kind is invalid")
 
 
-def _selection_provenance(path: Path, artifact: dict[str, Any]) -> dict[str, Any]:
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    contents = path.read_bytes()
+def _selection_document(path: Path) -> tuple[Path, bytes, dict[str, Any]]:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    contents = resolved.read_bytes()
     payload = json.loads(contents.decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("valid_for_selection") is not True:
         raise ValueError("selection report is not valid for finalist evaluation")
+    return resolved, contents, payload
+
+
+def _selection_agent(path: Path) -> int | None:
+    """Return the member selected for the checkpoint bytes named by a report."""
+    payload = _selection_document(path)[2]
+    selected = payload.get("best_agent")
+    if selected is not None and (type(selected) is not int or selected < 0):
+        raise ValueError("selection report best population member is invalid")
+    return selected
+
+
+def _selection_provenance(path: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+    path, contents, payload = _selection_document(path)
     if payload.get("best_output_sha256") != artifact["sha256"]:
         raise ValueError("selection report does not bind the finalist checkpoint bytes")
     if payload.get("source_identity") != artifact["source_identity"]:
         raise ValueError("selection report source identity does not match the finalist checkpoint")
     if payload.get("run_provenance") != artifact.get("run_provenance"):
         raise ValueError("selection report run provenance does not match the finalist checkpoint")
+    selected_agent = _selection_agent(path)
+    if selected_agent != artifact.get("agent"):
+        raise ValueError("selection report binds a different population member than the finalist")
     opponents = payload.get("opponent_provenance")
     if not isinstance(opponents, dict) or not opponents:
         raise ValueError("selection report has no opponent provenance")
@@ -235,14 +261,29 @@ def _selection_provenance(path: Path, artifact: dict[str, Any]) -> dict[str, Any
         or screening_seed_count < 1
     ):
         raise ValueError("selection report screening seed range is invalid")
+    protocol = validate_seed_protocol(
+        payload.get("seed_protocol"),
+        domain="screening",
+        start=screening_seed_start,
+        count=screening_seed_count,
+    )
+    design = payload.get("statistical_selection")
+    if (
+        not isinstance(design, dict)
+        or design.get("protocol") != "archive_screening_then_untouched_finalist"
+    ):
+        raise ValueError("selection report lacks statistical selection provenance")
     return {
         "path": str(path),
         "sha256": hashlib.sha256(contents).hexdigest(),
         "best_output_sha256": artifact["sha256"],
+        "best_agent": selected_agent,
         "run_provenance": artifact.get("run_provenance"),
         "opponent_provenance": normalized_opponents,
         "screening_seed_start": screening_seed_start,
         "screening_seed_count": screening_seed_count,
+        "seed_protocol": protocol,
+        "statistical_selection": design,
     }
 
 
@@ -589,7 +630,7 @@ def summarize(results: list[GameResult], seed_count: int) -> dict[str, Any]:
         statistics.fmean(float(row.outcome) for row in rows) for rows in complete_pairs
     ]
     seed_margins = [statistics.fmean(float(row.margin) for row in rows) for rows in complete_pairs]
-    score_ci = _mean_confidence_interval(seed_outcomes)
+    score_ci = bounded_mean_interval(seed_outcomes)
     margin_ci = _mean_confidence_interval(seed_margins)
     seat_summaries = {}
     for seat in (0, 1):
@@ -605,6 +646,7 @@ def summarize(results: list[GameResult], seed_count: int) -> dict[str, Any]:
             "ties": sum(outcome == 0.5 for outcome in outcomes),
             "losses": sum(outcome == 0.0 for outcome in outcomes),
             "score_rate": statistics.fmean(seed_outcomes),
+            "score_confidence": SCORE_CONFIDENCE,
             "score_rate_95ci": [max(0.0, score_ci[0]), min(1.0, score_ci[1])],
             "mean_reward": statistics.fmean(rewards),
             "median_reward": statistics.median(rewards),
@@ -701,7 +743,10 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SEED_CLUSTERS,
         help="seed clusters; both seats run. The official 32-seed panel is enough to package",
     )
-    parser.add_argument("--seed-start", type=int, default=0)
+    parser.add_argument(
+        "--seed-domain", choices=("development", "screening", "finalist"), default="development"
+    )
+    parser.add_argument("--seed-start", type=int, default=None)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument(
@@ -718,7 +763,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--selection-report",
         type=Path,
-        help="optional checkpoint-selection evidence required by finalist packaging",
+        help="checkpoint-selection evidence; mandatory for --seed-domain finalist",
     )
     parser.add_argument(
         "--inference-equivalence",
@@ -744,6 +789,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--workers and --batch-size cannot both exceed one")
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be positive")
+    domain = getattr(args, "seed_domain", "development")
+    if getattr(args, "seed_start", None) is None:
+        args.seed_start = SEED_DOMAINS[domain][0]
+    if domain == "finalist" and getattr(args, "selection_report", None) is None:
+        raise ValueError("finalist evaluation requires checkpoint-selection provenance")
     artifact = args.artifact.expanduser().resolve()
     if not artifact.is_file():
         raise FileNotFoundError(artifact)
@@ -755,10 +805,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_root = Path(name)
         artifact_snapshot = snapshot_root / "artifact.pt"
         _snapshot_file(artifact, artifact_snapshot)
-        # `getattr`, matching `selection_report` below: `select_checkpoint` calls
-        # this with a hand-built namespace carrying only the fields it sets.
+        # `getattr` supports select_checkpoint's hand-built namespace.
         witness_path = getattr(args, "inference_equivalence", None)
+        selection = getattr(args, "selection_report", None)
         member = getattr(args, "agent", None)
+        if member is None and selection is not None:
+            member = _selection_agent(selection)
         artifact_provenance = _artifact_provenance(
             artifact_snapshot,
             None if witness_path is None else json.loads(witness_path.read_text(encoding="utf-8")),
@@ -767,7 +819,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         artifact_provenance["path"] = str(artifact)
-        selection = getattr(args, "selection_report", None)
         selection_provenance = (
             None if selection is None else _selection_provenance(selection, artifact_provenance)
         )
@@ -777,6 +828,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             finalist_end = args.seed_start + args.seeds
             if max(screening_start, args.seed_start) < min(screening_end, finalist_end):
                 raise ValueError("finalist seeds overlap checkpoint-selection screening seeds")
+        usage = list(artifact_provenance["seed_usage"])
+        if selection_provenance is not None:
+            usage.extend(selection_provenance["seed_protocol"]["prior_usage"])
+            usage.append(selection_provenance["seed_protocol"]["evaluation"])
+        protocol = seed_protocol(domain, args.seed_start, args.seeds, usage=usage)
         worker_opponent = opponent
         if opponent_label in BUILTIN_OPPONENTS:
             opponent_provenance = _opponent_provenance(opponent_label, opponent)
@@ -848,6 +904,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "selection_provenance": selection_provenance,
         "seed_start": args.seed_start,
         "seed_count": args.seeds,
+        "seed_protocol": protocol,
         "paired_seats": True,
         "workers": args.workers,
         "batch_size": batch_size,

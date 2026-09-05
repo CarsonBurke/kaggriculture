@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch._dynamo
 
+from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.ppo import (
@@ -31,10 +32,12 @@ from kaggriculture.ppo import (
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
     make_optimizers,
+    make_structured_dynamics_optimizer,
     update_ppo,
     update_replay_parity,
 )
 from kaggriculture.production import (
+    PRODUCTION_ARCHITECTURE,
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
@@ -42,11 +45,13 @@ from kaggriculture.production import (
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
+    production_model_config,
     production_ppo_config,
 )
-from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, source_identity
+from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, file_sha256, source_identity
 from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
 from kaggriculture.rollout import (
+    _ANIMAL_STOCK_COLUMNS,
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
     ROLLOUT_FORWARD_MODES,
@@ -55,6 +60,10 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredConfig
+from kaggriculture.structured_dynamics import (
+    StructuredCriticDynamics,
+    StructuredDynamics,
+)
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 
@@ -64,9 +73,9 @@ _REPORT_MIRROR: TensorboardMirror | None = None
 _REPORT_TENSORBOARD_DIR: Path | None = None
 
 # Calibration reports are only valid launch evidence when their configuration
-# matches production exactly, so every default derives from the shared source.
-# The model is the exception only in form: production_model_config() *is* the
-# conv dataclass defaults, which is what an unflagged entity-cnn run builds.
+# matches production exactly. The benchmark therefore defaults to the shared
+# structured architecture and fills that family's flags from the complete
+# production contract rather than from the research dataclass defaults.
 _PRODUCTION_PPO = production_ppo_config(update_compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE)
 _PRODUCTION_LEAGUE_OPPONENTS = (
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS
@@ -166,15 +175,25 @@ def parse_args() -> argparse.Namespace:
         help="full rollout+update iterations per size; first is cold, later repeats are steady",
     )
     parser.add_argument("--seed", type=int, default=20260812)
+    parser.add_argument(
+        "--init-actor-from",
+        type=Path,
+        help="benchmark the action distribution of this BC actor instead of random initialization",
+    )
+    parser.add_argument(
+        "--auxiliary-mode",
+        choices=("off", "predictor", "enabled"),
+        default="enabled",
+        help="isolate ordinary PPO, predictor fitting, or predictor plus source updates; "
+        "enabled measures auxiliary-active cost, not production readiness",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--architecture",
         choices=sorted(ARCHITECTURES),
-        default=CONV_ENTITY,
-        help="actor/critic family; each family's structural flags default to that "
-        "family's model configuration and a flag from another family is rejected. "
-        "The conv defaults are exactly the production model, so an unflagged "
-        "entity-cnn run is valid calibration evidence",
+        default=PRODUCTION_ARCHITECTURE,
+        help="actor/critic family; structured defaults to the exact production "
+        "configuration, while other families retain their dataclass defaults",
     )
     add_model_config_arguments(parser)
     parser.add_argument("--epochs", type=int, default=_PRODUCTION_PPO["epochs"])
@@ -192,11 +211,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=MAX_UPDATE_REPLAY_KL,
         help=(
-            "maximum KL divergence between the rollout sampling path and the "
-            "update-path behavior replay; this bounds off-policy sampling bias "
-            "(the importance ratio itself starts at one via "
-            "replay_behavior_logprobs), so its budget is a small fraction of "
-            "the per-iteration trust region --target-kl already allows"
+            "maximum KL divergence between the rollout sampler likelihoods "
+            "stored in the batch and an update-path replay at unchanged weights; "
+            "the PPO denominator remains the actual sampler likelihood, while "
+            "this gate detects execution-path drift before optimization"
         ),
     )
     parser.add_argument(
@@ -216,10 +234,9 @@ def parse_args() -> argparse.Namespace:
         default=MAX_FIRST_MINIBATCH_KL,
         help=(
             "maximum approximate KL of the first actor minibatch at unchanged "
-            "weights; nonzero values are pure numerics between the behavior "
-            "replay and the grad-mode minibatch computation of the same "
-            "forward, so this gates the exactness of the ratio-at-one "
-            "construction"
+            "weights, measured from the rollout sampler likelihood to the "
+            "grad-mode minibatch likelihood; this gates collection-versus-update "
+            "numeric drift before the first optimizer step"
         ),
     )
     parser.add_argument(
@@ -281,7 +298,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tensorboard-dir", type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.architecture == PRODUCTION_ARCHITECTURE:
+        for name, value in production_model_config().items():
+            if hasattr(args, name) and getattr(args, name) is None:
+                setattr(args, name, value)
+    return args
 
 
 def _synchronize(device: torch.device) -> None:
@@ -319,6 +341,7 @@ def _verify_first_step_critic_state(rollout, self_play_games: int, seed_start: i
     expected = {
         "critic_products": np.asarray(fresh["products"])[pair_rows][:, :, _PRODUCT_STOCK_COLUMNS],
         "critic_crops": np.asarray(fresh["crops"])[pair_rows][:, :, _CROP_SEED_COLUMNS],
+        "critic_animals": np.asarray(fresh["animals"])[pair_rows][:, :, _ANIMAL_STOCK_COLUMNS],
         "opponent_unit_categorical": np.asarray(fresh["unit_categorical"])[pair_rows],
         "opponent_unit_continuous": np.asarray(fresh["unit_continuous"])[pair_rows],
         "opponent_unit_active": np.asarray(fresh["unit_active"])[pair_rows],
@@ -451,13 +474,38 @@ def main() -> None:
 
     architecture = resolve_architecture(args.architecture)
     model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
+    # The shipped structured case must inherit every production PPO field,
+    # including both NextLat objectives. Other architecture sweeps cannot admit
+    # typed structured predictors and retain their ordinary PPO schedule.
+    ppo_schedule = (
+        _PRODUCTION_PPO if isinstance(model_config, StructuredConfig) else asdict(PpoConfig())
+    )
     ppo_config = PpoConfig(
-        epochs=args.epochs,
-        critic_epochs=args.critic_epochs,
-        minibatch_size=args.minibatch_size,
-        target_kl=args.target_kl,
-        use_bfloat16=not args.no_bfloat16,
-        update_compile_mode=args.update_compile_mode,
+        **{
+            **ppo_schedule,
+            "epochs": args.epochs,
+            "critic_epochs": args.critic_epochs,
+            "minibatch_size": args.minibatch_size,
+            "target_kl": args.target_kl,
+            "use_bfloat16": not args.no_bfloat16,
+            "update_compile_mode": args.update_compile_mode,
+        }
+    )
+    if args.auxiliary_mode == "off":
+        ppo_config = PpoConfig(
+            **{
+                **asdict(ppo_config),
+                "structured_decision_coefficient": 0.0,
+                "structured_patch_coefficient": 0.0,
+                "structured_economy_coefficient": 0.0,
+                "structured_opponent_summary_coefficient": 0.0,
+                "structured_opponent_patch_coefficient": 0.0,
+                "structured_critic_latent_coefficient": 0.0,
+                "structured_critic_value_coefficient": 0.0,
+            }
+        )
+    initial_actor_digest = (
+        file_sha256(args.init_actor_from) if args.init_actor_from is not None else None
     )
     identity = source_identity()
     emit(
@@ -480,6 +528,8 @@ def main() -> None:
             "physical_games_per_iteration": [games + args.league_games for games in game_counts],
             "repeats": args.repeats,
             "seed": args.seed,
+            "initial_actor_sha256": initial_actor_digest,
+            "auxiliary_mode": args.auxiliary_mode,
             "source_digest": identity["sha256"],
             "source_identity": identity,
             "temperature": args.temperature,
@@ -525,13 +575,48 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
             torch.cuda.empty_cache()
-        actor = architecture.actor_class(model_config).to(device)
+        if args.init_actor_from is None:
+            actor = architecture.actor_class(model_config).to(device)
+        else:
+            actor, _ = load_actor_artifact(args.init_actor_from, device=device)
+            if actor.config.to_dict() != model_config.to_dict():
+                raise ValueError("initial actor model configuration does not match benchmark")
         critic = architecture.critic_class(model_config).to(device)
+        # Match production construction order: predictor initialization must not
+        # perturb the actor/critic parameters a benchmark case starts from.
+        structured_dynamics = (
+            StructuredDynamics(model_config).to(device)
+            if isinstance(model_config, StructuredConfig)
+            and ppo_config.structured_actor_auxiliary_active
+            else None
+        )
+        structured_critic_dynamics = (
+            StructuredCriticDynamics(model_config).to(device)
+            if isinstance(model_config, StructuredConfig)
+            and ppo_config.structured_critic_auxiliary_active
+            else None
+        )
         frozen_opponent_state = {
             name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
         }
         actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
+        structured_dynamics_optimizer = (
+            make_structured_dynamics_optimizer(structured_dynamics, ppo_config)
+            if structured_dynamics is not None
+            else None
+        )
+        structured_critic_dynamics_optimizer = (
+            make_structured_dynamics_optimizer(structured_critic_dynamics, ppo_config)
+            if structured_critic_dynamics is not None
+            else None
+        )
         generator = np.random.default_rng(args.seed)
+        # Predictor window sampling is an independent production RNG stream.
+        # Sharing rollout assignment RNG would make later repeats collect
+        # different games merely because NextLat is enabled.
+        auxiliary_generator = (
+            np.random.default_rng(args.seed + 2) if ppo_config.structured_auxiliary_active else None
+        )
         seed_cursor = args.seed
         physical_games = self_play_games + args.league_games
         # Production collects the whole mixed wave into one reusable pinned
@@ -612,11 +697,9 @@ def main() -> None:
             rollout_seconds = time.perf_counter() - rollout_started
             del opponents
 
-            # Audit the divergence between the sampling-path likelihoods and
-            # the update-path behavior replay before the update mutates the
-            # actor. The importance ratio no longer sees this difference (the
-            # update replays behavior likelihoods through its own forward);
-            # what it bounds is the off-policy sampling bias.
+            # Compare the actual sampler likelihoods against update replay before
+            # weights change. PPO keeps the stored sampler as its denominator;
+            # this separate audit measures numerical execution-path divergence.
             parity_started = time.perf_counter()
             parity = update_replay_parity(
                 actor,
@@ -652,6 +735,22 @@ def main() -> None:
                 rollout,
                 ppo_config,
                 generator=generator,
+                structured_dynamics=structured_dynamics,
+                structured_dynamics_optimizer=structured_dynamics_optimizer,
+                structured_actor_auxiliary=(
+                    structured_dynamics is not None and args.auxiliary_mode == "enabled"
+                ),
+                structured_critic_dynamics=structured_critic_dynamics,
+                structured_critic_dynamics_optimizer=structured_critic_dynamics_optimizer,
+                structured_critic_auxiliary=(
+                    structured_critic_dynamics is not None and args.auxiliary_mode == "enabled"
+                ),
+                auxiliary_generator=auxiliary_generator,
+                diagnostic_groups={
+                    "self_play": np.arange(rollout.trajectories) < self_play_games * 2,
+                    "league": np.arange(rollout.trajectories) >= self_play_games * 2,
+                },
+                diagnostic_gradients=repeat == 1,
             )
             _synchronize(device)
             update_seconds = time.perf_counter() - update_started
@@ -713,6 +812,7 @@ def main() -> None:
                 "actor_parameters": parameter_count(actor),
                 "critic_parameters": parameter_count(critic),
                 "money_mean": diagnostics["money_mean"],
+                "score_rate": diagnostics["score_rate"],
                 "tie_fraction": diagnostics["tie_fraction"],
                 **parity,
                 **update_metrics,
@@ -764,7 +864,18 @@ def main() -> None:
                 ),
             }
         )
-        del actor, critic, actor_optimizer, critic_optimizer, frozen_opponent_state, arena
+        del (
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            structured_dynamics,
+            structured_dynamics_optimizer,
+            structured_critic_dynamics,
+            structured_critic_dynamics_optimizer,
+            frozen_opponent_state,
+            arena,
+        )
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()

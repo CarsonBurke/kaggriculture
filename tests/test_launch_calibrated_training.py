@@ -13,15 +13,19 @@ import pytest
 
 from kaggriculture.ppo import PpoConfig, _validate_config
 from kaggriculture.production import (
+    PRODUCTION_ARCHITECTURE,
     PRODUCTION_CHECKPOINT_SECONDS,
+    PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
+    PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
+    production_model_config,
     production_ppo_config,
     resolve_resume_checkpoint,
 )
-from kaggriculture.registry import CONV_ENTITY
+from kaggriculture.registry import STRUCTURED
 
 
 def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
@@ -35,6 +39,18 @@ def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
     # be silently defaulted here rather than decided, so the keys are pinned too.
     assert set(shipped) == fields
     _validate_config(PpoConfig(**shipped))
+    assert shipped["actor_learning_rate"] == 3.0e-5
+    assert shipped["optimizer"] == "normuon"
+    assert PRODUCTION_LEAGUE_BUILTIN_OPPONENTS == "pass,random,starter,scripted-v27"
+    assert shipped["structured_decision_coefficient"] == 1.0
+    assert shipped["structured_decision_horizon"] == 1
+    assert shipped["structured_patch_coefficient"] == 0.0
+    assert shipped["structured_economy_coefficient"] == 0.0
+    assert shipped["structured_opponent_summary_coefficient"] == 0.0
+    assert shipped["structured_opponent_patch_coefficient"] == 0.0
+    assert shipped["structured_critic_latent_coefficient"] == 1.0
+    assert shipped["structured_critic_value_coefficient"] == 1.0
+    assert shipped["structured_critic_horizon"] == 1
 
     # The pairing this guards: critic epochs are the critic-only refits that run
     # after the actor's epochs, so a schedule asking for fewer of them than actor
@@ -111,26 +127,32 @@ def test_training_command_resumes_the_latest_atomic_checkpoint(tmp_path: Path) -
 def test_training_command_round_trips_through_the_training_parser(monkeypatch, tmp_path) -> None:
     """The command is bound verbatim into run provenance, so its flag list is
     load-bearing: it must parse, validate, and build the production model."""
-    from kaggriculture.model import ModelConfig
     from kaggriculture.modelargs import model_config_from_args
-    from kaggriculture.registry import CONV_ENTITY, resolve_architecture
+    from kaggriculture.registry import resolve_architecture
+    from kaggriculture.structured import StructuredConfig
 
     training = _script("train_ppo.py")
+    actor = tmp_path / "bc-actor.pt"
+    actor.write_bytes(b"actor")
     command = build_training_command(
         tmp_path / "run",
         iterations=500,
         max_hours=0.0,
-        seed=7,
+        seed=20_260_812,
         rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
         update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+        initial_actors=(actor,),
+        critic_warmup_iterations=PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     )
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", *command[2:]])
 
     args = training.parse_args()
     training._validate_args(args)
 
-    assert args.architecture == CONV_ENTITY
-    assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
+    assert args.architecture == STRUCTURED == PRODUCTION_ARCHITECTURE
+    assert model_config_from_args(
+        resolve_architecture(args.architecture), args
+    ) == StructuredConfig(**production_model_config())
     # The collection backend and precision move the sampled behavior policy the
     # parity gate bounds, and the update mode moves the graphs that consume it,
     # so the command must state all three rather than inherit a default. Each
@@ -144,6 +166,25 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     assert args.rollout_bfloat16 is True
     assert args.update_compile_mode == PRODUCTION_UPDATE_COMPILE_MODE
     assert "--compile-update" not in command
+    structured_flags = {
+        "--structured-decision-coefficient": 1.0,
+        "--structured-patch-coefficient": 0.0,
+        "--structured-economy-coefficient": 0.0,
+        "--structured-opponent-summary-coefficient": 0.0,
+        "--structured-opponent-patch-coefficient": 0.0,
+        "--structured-decision-horizon": 1,
+        "--structured-patch-horizon": 1,
+        "--structured-critic-latent-coefficient": 1.0,
+        "--structured-critic-value-coefficient": 1.0,
+        "--structured-critic-horizon": 1,
+    }
+    for flag, expected in structured_flags.items():
+        assert float(command[command.index(flag) + 1]) == expected
+    assert args.structured_decision_coefficient == 1.0
+    assert args.structured_critic_latent_coefficient == 1.0
+    assert args.structured_critic_value_coefficient == 1.0
+    assert "--structured-actor-gradient-ratio" not in command
+    assert not hasattr(args, "structured_actor_gradient_ratio")
 
 
 def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
@@ -163,7 +204,7 @@ def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
         tmp_path / "run",
         iterations=500,
         max_hours=0.0,
-        seed=7,
+        seed=20_260_812,
         rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
         update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
         population=population,
@@ -180,6 +221,9 @@ def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
     assert args.init_actor_from == artifacts
     assert args.league_games == 0
     assert args.league_builtin_lanes == 0
+    assert args.structured_decision_coefficient == 1.0
+    assert args.structured_critic_latent_coefficient == 1.0
+    assert args.structured_critic_value_coefficient == 1.0
     # A population has no built-in lane. Each immutable recovery event triggers
     # external evaluation directly, with no iteration-modulo coupling.
     assert args.external_eval
@@ -225,7 +269,7 @@ def test_warm_started_command_round_trips_through_the_training_parser(monkeypatc
         tmp_path / "run",
         iterations=500,
         max_hours=0.0,
-        seed=7,
+        seed=20_260_812,
         rollout_forward_mode="eager",
         update_compile_mode="eager",
         initial_actors=(artifact,),
@@ -267,6 +311,18 @@ def test_critic_warmup_without_a_warm_start_is_rejected(tmp_path: Path) -> None:
             rollout_forward_mode="eager",
             update_compile_mode="eager",
             critic_warmup_iterations=15,
+        )
+
+
+def test_fresh_production_command_requires_a_bc_actor(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires exactly one BC actor or --resume"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=500,
+            max_hours=0.0,
+            seed=7,
+            rollout_forward_mode="eager",
+            update_compile_mode="eager",
         )
 
 
@@ -348,8 +404,10 @@ def _records(
         # compares all of them across the chain, so a key this fixture omits is
         # a key nothing in this file exercises. The test at the end of this
         # module is what keeps the two in step.
-        "architecture": CONV_ENTITY,
+        "architecture": STRUCTURED,
         "rollout_forward_mode": rollout_forward_mode,
+        "auxiliary_mode": "enabled",
+        "initial_actor_sha256": None,
         # Not a knob: fixed on every node, and the launcher pins it to
         # production's value, so a chain that moved it is rejected rather than
         # attributed to whichever knob its step named.
@@ -1032,10 +1090,15 @@ def test_a_knobs_attribution_is_anchored_on_a_measured_iteration_total() -> None
 def test_compile_decision_rejects_nonproduction_or_mismatched_configuration() -> None:
     module = _script()
     nonproduction_model = _chain(module, **_EARNED)
-    nonproduction_model[2][0]["model"] = dict(nonproduction_model[2][0]["model"], cnn_width=128)
+    nonproduction_model[2][0]["model"] = dict(nonproduction_model[2][0]["model"], model_dim=128)
 
     with pytest.raises(ValueError, match="model"):
         module.choose_compilation(nonproduction_model)
+    nonproduction_architecture = _chain(module, **_EARNED)
+    for records in nonproduction_architecture:
+        records[0]["architecture"] = "entity-cnn"
+    with pytest.raises(ValueError, match=r"architecture.*production"):
+        module.choose_compilation(nonproduction_architecture)
 
     # Two nodes differing in anything but the knobs are not a chain: the step
     # between them changed more than the knob it claims.
@@ -1051,6 +1114,11 @@ def test_compile_decision_rejects_nonproduction_or_mismatched_configuration() ->
         records[0]["ppo"] = dict(records[0]["ppo"], epochs=4)
     with pytest.raises(ValueError, match=r"ppo.*production"):
         module.choose_compilation(nonproduction_ppo)
+    predictor_only = _chain(module, **_EARNED)
+    for records in predictor_only:
+        records[0]["auxiliary_mode"] = "predictor"
+    with pytest.raises(ValueError, match="auxiliary_mode"):
+        module.choose_compilation(predictor_only)
 
 
 def test_a_calibration_may_time_only_the_production_batch_on_every_node() -> None:
@@ -1189,6 +1257,8 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         module.main()
 
     decision = json.loads((run_directory / "calibration-decision.json").read_text())
+    assert decision["architecture"] == "structured"
+    assert decision["model"] == production_model_config()
     # Every node of the chain is retained byte for byte and hashed, not just
     # the two ends: the decision cannot be re-derived from the outer pair.
     for name, blob in contents.items():
@@ -1218,6 +1288,10 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--league-games", "64"),
         ("--league-active-opponents", "2"),
         ("--league-historical-opponents", "6"),
+        ("--league-builtin-opponents", "pass,random,starter,scripted-v27"),
+        ("--architecture", "structured"),
+        ("--actor-lr", "3e-05"),
+        ("--optimizer", "normuon"),
         ("--epochs", "2"),
         ("--critic-epochs", "2"),
         ("--minibatch-size", "4096"),
@@ -1276,6 +1350,8 @@ def test_direct_launch_compiles_without_calibration_evidence(
 
     launch = json.loads((run_directory / "launch.json").read_text())
     assert launch["event"] == "direct_launch"
+    assert launch["architecture"] == "structured"
+    assert launch["model"] == production_model_config()
     # The direct launcher carries no bound calibration decision, so it takes the
     # independently recorded standing mode and precision for each phase.
     assert launch["rollout_forward_mode"] == PRODUCTION_ROLLOUT_FORWARD_MODE
@@ -1300,6 +1376,159 @@ def test_direct_launch_compiles_without_calibration_evidence(
     assert "--expected-source-digest" not in launch["training_command"]
     assert "--calibration-decision" not in launch["training_command"]
     assert launch["training_command"][-2:] == ["--resume", str(resume_checkpoint.resolve())]
+
+
+def test_direct_automatic_resume_preserves_and_validates_the_original_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script("launch_production.py")
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "latest.pt").write_bytes(b"checkpoint")
+    original_actor = tmp_path / "original-bc.pt"
+    conflicting_actor = tmp_path / "other-bc.pt"
+    original_actor.write_bytes(b"original")
+    conflicting_actor.write_bytes(b"other")
+    (run_directory / "launch.json").write_text(
+        json.dumps(
+            {
+                "event": "direct_launch",
+                "initial_actor": str(original_actor),
+                "critic_warmup_iterations": 9,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Executed(Exception):
+        pass
+
+    monkeypatch.setattr(
+        module.os,
+        "execv",
+        lambda _executable, _command: (_ for _ in ()).throw(Executed()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_production.py",
+            "--run-dir",
+            str(run_directory),
+            "--init-actor-from",
+            str(original_actor),
+        ],
+    )
+    with pytest.raises(Executed):
+        module.main()
+
+    launch = json.loads((run_directory / "launch.json").read_text(encoding="utf-8"))
+    assert launch["initial_actor"] == str(original_actor.resolve())
+    assert launch["critic_warmup_iterations"] == 9
+    assert "--init-actor-from" not in launch["training_command"]
+    assert launch["training_command"][-2:] == ["--resume", str(run_directory / "latest.pt")]
+
+    before_conflict = (run_directory / "launch.json").read_bytes()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_production.py",
+            "--run-dir",
+            str(run_directory),
+            "--init-actor-from",
+            str(conflicting_actor),
+        ],
+    )
+    with pytest.raises(ValueError, match="conflicts with the actor recorded"):
+        module.main()
+    assert (run_directory / "launch.json").read_bytes() == before_conflict
+
+
+def test_direct_fresh_launch_requires_a_bc_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script("launch_production.py")
+    run_directory = tmp_path / "run"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["launch_production.py", "--run-dir", str(run_directory)],
+    )
+
+    with pytest.raises(ValueError, match="requires --init-actor-from or --resume"):
+        module.main()
+    assert not (run_directory / "launch.json").exists()
+
+
+def test_direct_fresh_launch_defaults_to_five_critic_warmup_iterations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script("launch_production.py")
+    run_directory = tmp_path / "run"
+    actor = tmp_path / "bc-actor.pt"
+    actor.write_bytes(b"actor")
+
+    class Executed(Exception):
+        pass
+
+    def fake_execv(_executable: str, _command: list[str]) -> None:
+        raise Executed
+
+    monkeypatch.setattr(module.os, "execv", fake_execv)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_production.py",
+            "--run-dir",
+            str(run_directory),
+            "--init-actor-from",
+            str(actor),
+        ],
+    )
+
+    with pytest.raises(Executed):
+        module.main()
+
+    launch = json.loads((run_directory / "launch.json").read_text())
+    command = launch["training_command"]
+    assert launch["architecture"] == "structured"
+    assert launch["model"] == production_model_config()
+    assert launch["initial_actor"] == str(actor)
+    assert launch["critic_warmup_iterations"] == 5
+    assert command[command.index("--init-actor-from") + 1] == str(actor)
+    assert command[command.index("--critic-warmup-iterations") + 1] == "5"
+    assert command[command.index("--architecture") + 1] == "structured"
+
+
+def test_calibrated_fresh_launch_requires_a_bc_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script()
+    paths = {name: tmp_path / f"{name}.jsonl" for name in ("eager", "mixed", "compiled")}
+    for path, records in zip(paths.values(), _chain(module, **_EARNED), strict=True):
+        _write_report(path, records)
+    run_directory = tmp_path / "run"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launch_calibrated_training.py",
+            "--eager-report",
+            str(paths["eager"]),
+            "--mixed-report",
+            str(paths["mixed"]),
+            "--compiled-report",
+            str(paths["compiled"]),
+            "--run-dir",
+            str(run_directory),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --init-actor-from or --resume"):
+        module.main()
+    assert not (run_directory / "calibration-decision.json").exists()
 
 
 def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
@@ -1343,8 +1572,6 @@ def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
         "500",
         "--init-actor-from",
         str(artifact),
-        "--critic-warmup-iterations",
-        "15",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -1354,14 +1581,17 @@ def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
     decision_path = run_directory / "calibration-decision.json"
     first = json.loads(decision_path.read_text())
     assert first["initial_actor"] == str(artifact)
-    assert first["critic_warmup_iterations"] == 15
+    assert first["critic_warmup_iterations"] == PRODUCTION_CRITIC_WARMUP_ITERATIONS
     assert first["resume_checkpoint"] is None
     command = first["training_command"]
     assert command[command.index("--init-actor-from") + 1] == str(artifact)
-    assert command[command.index("--critic-warmup-iterations") + 1] == "15"
+    assert command[command.index("--critic-warmup-iterations") + 1] == str(
+        PRODUCTION_CRITIC_WARMUP_ITERATIONS
+    )
 
     # The run crashed inside the warmup window and left a checkpoint behind.
     latest_checkpoint = run_directory / "latest.pt"
+
     latest_checkpoint.write_bytes(b"atomic checkpoint")
 
     with pytest.raises(Executed):
@@ -1370,7 +1600,7 @@ def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
     second = json.loads(decision_path.read_text())
     assert second["resume_checkpoint"] == str(latest_checkpoint)
     assert second["initial_actor"] == str(artifact)
-    assert second["critic_warmup_iterations"] == 15
+    assert second["critic_warmup_iterations"] == PRODUCTION_CRITIC_WARMUP_ITERATIONS
     resumed = second["training_command"]
     assert invocation["command"] == resumed
     assert "--init-actor-from" not in resumed
@@ -1405,11 +1635,29 @@ def test_relaunching_a_warm_started_run_resumes_and_keeps_naming_the_clone(
     portable = json.loads((portable_run / "calibration-decision.json").read_text())
     assert portable["resume_checkpoint"] == str(latest_checkpoint.resolve())
     assert portable["initial_actor"] == str(artifact)
-    assert portable["critic_warmup_iterations"] == 15
+    assert portable["critic_warmup_iterations"] == PRODUCTION_CRITIC_WARMUP_ITERATIONS
     portable_command = portable["training_command"]
     assert "--init-actor-from" not in portable_command
     assert "--critic-warmup-iterations" not in portable_command
     assert portable_command[-2:] == ["--resume", str(latest_checkpoint.resolve())]
+
+
+def test_production_warmup_cannot_exceed_the_adaptive_readiness_deadline(
+    tmp_path: Path,
+) -> None:
+    actor = tmp_path / "bc-actor.pt"
+    actor.write_bytes(b"actor")
+    with pytest.raises(ValueError, match="40-iteration readiness deadline"):
+        build_training_command(
+            tmp_path / "run",
+            iterations=100,
+            max_hours=0.0,
+            seed=7,
+            rollout_forward_mode="eager",
+            update_compile_mode="eager",
+            initial_actors=(actor,),
+            critic_warmup_iterations=41,
+        )
 
 
 def test_a_warmup_that_outlasts_the_run_is_rejected(tmp_path: Path) -> None:
@@ -1476,6 +1724,8 @@ def test_the_chain_fixture_declares_every_key_a_real_benchmark_emits(
             "2",
             "--repeats",
             "2",
+            "--architecture",
+            "entity-cnn",
             "--cnn-width",
             "8",
             "--cnn-blocks",

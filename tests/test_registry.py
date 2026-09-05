@@ -89,3 +89,15 @@ def test_every_registered_family_round_trips_config() -> None:
         config = architecture.config_class()
         actor = architecture.build_actor(config.to_dict())
         assert type(actor) is architecture.actor_class
+
+
+@pytest.mark.parametrize("builder", ["build_actor", "build_critic"])
+@pytest.mark.parametrize("version", [None, 1])
+def test_structured_artifacts_reject_stale_observation_schema(builder, version) -> None:
+    config = StructuredConfig().to_dict()
+    if version is None:
+        del config["observation_schema_version"]
+    else:
+        config["observation_schema_version"] = version
+    with pytest.raises(ValueError, match="stale structured observation schema"):
+        getattr(resolve_architecture("structured"), builder)(config)

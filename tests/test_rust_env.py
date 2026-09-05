@@ -52,6 +52,9 @@ def test_the_toolchain_is_reported_when_present_and_absent_without_failing(monke
 def fake_module() -> ModuleType:
     module = ModuleType("_kagg_env")
     module.BatchEnv = object  # type: ignore[attr-defined]
+    from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
+
+    module.OBSERVATION_SCHEMA_VERSION = OBSERVATION_SCHEMA_VERSION
     return module
 
 
@@ -149,6 +152,73 @@ def test_build_true_delegates_staleness_and_artifact_location_to_cargo(
     assert "--lib" in seen_command
     assert "--release" in seen_command
     assert "--message-format=json-render-diagnostics" in seen_command
+    target_index = seen_command.index("--target-dir")
+    assert seen_command[target_index + 1] == str(crate / "target")
+
+
+def test_frozen_snapshot_builds_in_writable_user_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crate = local_checkout(tmp_path, monkeypatch)
+    (tmp_path / ".source-identity.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "rust-toolchain.toml": "toolchain",
+                    "rust/kagg_env/Cargo.toml": "manifest",
+                    "rust/kagg_env/src/lib.rs": "source",
+                }
+            }
+        )
+    )
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    target = rust_env._cargo_target_dir(crate)
+    artifact = target / "release" / "lib_kagg_env.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    event = {
+        "reason": "compiler-artifact",
+        "manifest_path": str(crate / "Cargo.toml"),
+        "target": {"name": "_kagg_env", "crate_types": ["cdylib"]},
+        "filenames": [str(artifact)],
+    }
+    seen_command: list[str] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        seen_command.extend(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(event), "")
+
+    monkeypatch.setattr(rust_env.subprocess, "run", with_pinned_rustup(run))
+
+    assert rust_env._build_native(crate, release=True) == artifact
+    target_index = seen_command.index("--target-dir")
+    assert seen_command[target_index + 1] == str(target)
+    assert not target.is_relative_to(tmp_path / "rust")
+
+
+def test_frozen_cargo_cache_is_shared_only_by_identical_rust_inputs(tmp_path: Path) -> None:
+    roots = (tmp_path / "first", tmp_path / "second")
+    for root in roots:
+        root.mkdir()
+    shared = {
+        "rust-toolchain.toml": "toolchain",
+        "rust/kagg_env/Cargo.toml": "manifest",
+        "rust/kagg_env/src/lib.rs": "source",
+    }
+    (roots[0] / ".source-identity.json").write_text(
+        json.dumps({"files": {**shared, "scripts/train_ppo.py": "old"}})
+    )
+    (roots[1] / ".source-identity.json").write_text(
+        json.dumps({"files": {**shared, "scripts/train_ppo.py": "new"}})
+    )
+
+    assert rust_env._cargo_cache_key(roots[0]) == rust_env._cargo_cache_key(roots[1])
+
+    (roots[1] / ".source-identity.json").write_text(
+        json.dumps({"files": {**shared, "rust/kagg_env/src/lib.rs": "changed"}})
+    )
+    assert rust_env._cargo_cache_key(roots[0]) != rust_env._cargo_cache_key(roots[1])
 
 
 def test_cargo_failure_preserves_compiler_and_process_diagnostics(
@@ -347,4 +417,7 @@ def test_corrupt_local_artifact_reports_path_and_original_failure(tmp_path: Path
 def test_module_contract_is_validated() -> None:
     module = ModuleType("_kagg_env")
     with pytest.raises(ImportError, match="does not expose BatchEnv"):
+        rust_env._validate_module(module, "test module")
+    module.BatchEnv = object
+    with pytest.raises(ImportError, match="stale observation schema"):
         rust_env._validate_module(module, "test module")

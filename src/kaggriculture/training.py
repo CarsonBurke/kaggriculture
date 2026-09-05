@@ -31,16 +31,22 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.structured_dynamics import StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
 
 AnyActor = FarmActor | StructuredActor
 AnyCritic = DistributionalCritic | StructuredCritic
 AnyModelConfig = ModelConfig | StructuredConfig
 
-#: The base states every member owns. A structured learner additionally owns a
-#: training-only dynamics module and its independent optimizer.
+#: The base states every member owns. Structured learners may additionally own
+#: independent actor- and critic-side training-only predictors and optimizers.
 AGENT_STATE_KEYS = ("actor", "critic", "actor_optimizer", "critic_optimizer")
-OPTIONAL_AGENT_STATE_KEYS = ("structured_dynamics", "structured_dynamics_optimizer")
+PREDICTOR_STATE_KEY_PAIRS = (
+    ("structured_dynamics", "structured_dynamics_optimizer"),
+    ("structured_critic_dynamics", "structured_critic_dynamics_optimizer"),
+)
+OPTIONAL_AGENT_STATE_KEYS = tuple(
+    key for predictor_pair in PREDICTOR_STATE_KEY_PAIRS for key in predictor_pair
+)
 
 
 def _complete_agent_state(state: object) -> bool:
@@ -52,18 +58,19 @@ def _complete_agent_state(state: object) -> bool:
         *OPTIONAL_AGENT_STATE_KEYS,
         "orientation",
     }
-    return set(AGENT_STATE_KEYS) <= keys <= allowed and ("structured_dynamics" in keys) == (
-        "structured_dynamics_optimizer" in keys
+    return set(AGENT_STATE_KEYS) <= keys <= allowed and all(
+        (predictor in keys) == (optimizer in keys)
+        for predictor, optimizer in PREDICTOR_STATE_KEY_PAIRS
     )
 
 
 @dataclass(frozen=True, slots=True)
 class TrainingAgent:
-    """One population member's live modules and optimizer pair.
+    """One population member's live modules and optimizers.
 
     A single learner is a population of one, so the checkpoint API takes a
     sequence of these rather than a bare actor/critic pair and there is exactly
-    one code path to keep correct. The optimizers are optional only because
+    one code path to keep correct. The base optimizers are optional only because
     evaluation-side readers restore weights without ever stepping them.
     """
 
@@ -73,6 +80,8 @@ class TrainingAgent:
     critic_optimizer: torch.optim.Optimizer | None = None
     structured_dynamics: StructuredDynamics | None = None
     structured_dynamics_optimizer: torch.optim.Optimizer | None = None
+    structured_critic_dynamics: StructuredCriticDynamics | None = None
+    structured_critic_dynamics_optimizer: torch.optim.Optimizer | None = None
 
     def state(self) -> dict[str, Any]:
         """This member's complete recovery state."""
@@ -84,12 +93,16 @@ class TrainingAgent:
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
         }
-        if (self.structured_dynamics is None) != (self.structured_dynamics_optimizer is None):
-            raise ValueError("structured dynamics and its optimizer must be checkpointed together")
-        if self.structured_dynamics is not None:
-            assert self.structured_dynamics_optimizer is not None
-            state["structured_dynamics"] = self.structured_dynamics.state_dict()
-            state["structured_dynamics_optimizer"] = self.structured_dynamics_optimizer.state_dict()
+        for predictor_key, optimizer_key in PREDICTOR_STATE_KEY_PAIRS:
+            predictor = getattr(self, predictor_key)
+            optimizer = getattr(self, optimizer_key)
+            if (predictor is None) != (optimizer is None):
+                label = predictor_key.replace("_", " ")
+                raise ValueError(f"{label} and its optimizer must be checkpointed together")
+            if predictor is not None:
+                assert optimizer is not None
+                state[predictor_key] = predictor.state_dict()
+                state[optimizer_key] = optimizer.state_dict()
         return state
 
 
@@ -126,14 +139,15 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
     """Reject checkpoints from incompatible model and action schemas.
 
     Resume demands the current format exactly — a stale checkpoint must fail
-    with a format error, not a downstream schema error. Actor-only export in
-    inference.py separately accepts the legacy read-compatible versions.
+    with a format error, not a downstream schema error.
     """
     version = payload.get("format_version")
     if version != CHECKPOINT_FORMAT_VERSION:
         raise ValueError(
             f"unsupported checkpoint format: {version}; expected {CHECKPOINT_FORMAT_VERSION}"
         )
+    if not isinstance(payload.get("seed_usage"), list):
+        raise ValueError("checkpoint lacks seed_usage provenance; fresh training is required")
     members = payload.get(POPULATION_CHECKPOINT_KEY)
     if members is not None and (
         not isinstance(members, list)
@@ -141,10 +155,25 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
         or any(not _complete_agent_state(entry) for entry in members)
     ):
         raise ValueError("checkpoint population is not a list of complete agent states")
-    # A single learner keeps the four states at the top level, so a payload with
-    # neither shape is a half-written checkpoint rather than something to resume.
-    if members is None and any(name not in payload for name in AGENT_STATE_KEYS):
-        raise ValueError("checkpoint is missing single-learner training state")
+    # A single learner keeps its states at the top level, so validate the same
+    # required keys and optional-pair integrity as a population member.
+    if members is None and not _complete_agent_state(checkpoint_agent_states(payload)[0]):
+        raise ValueError("checkpoint is missing or has incomplete single-learner training state")
+    if isinstance(members, list):
+        for predictor_key, _ in PREDICTOR_STATE_KEY_PAIRS:
+            presence = [predictor_key in entry for entry in members]
+            if any(presence) != all(presence):
+                label = predictor_key.replace("_", " ")
+                raise ValueError(f"checkpoint population cannot mix {label} presence")
+    states = members if isinstance(members, list) else checkpoint_agent_states(payload)
+    has_predictor = any(
+        any(predictor_key in state for predictor_key, _ in PREDICTOR_STATE_KEY_PAIRS)
+        for state in states
+    )
+    if ("structured_auxiliary_rng" in payload) != has_predictor:
+        raise ValueError("checkpoint structured predictor recovery RNG is incomplete")
+    if (payload.get("structured_gate_state") is not None) != has_predictor:
+        raise ValueError("checkpoint structured predictor gate state is incomplete")
     identity = validate_source_identity(payload.get("source_identity"))
     run_provenance = validate_run_provenance(payload.get("run_provenance"))
     if run_provenance is not None and run_provenance["source_identity"] != identity:
@@ -311,6 +340,7 @@ def checkpoint_payload(
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
     structured_gate_state: Mapping[str, Any] | None = None,
+    seed_usage: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
     normalized_source_identity = validate_source_identity(source_identity)
@@ -349,19 +379,22 @@ def checkpoint_payload(
         raise ValueError("checkpoint RNG capture is incomplete")
     if not agents or any(not _complete_agent_state(agent) for agent in agents):
         raise ValueError(f"every checkpointed agent needs {AGENT_STATE_KEYS}")
+    for predictor_key, _ in PREDICTOR_STATE_KEY_PAIRS:
+        presence = [predictor_key in agent for agent in agents]
+        if any(presence) != all(presence):
+            label = predictor_key.replace("_", " ")
+            raise ValueError(f"checkpoint population cannot mix {label} presence")
     auxiliary_members = [
-        "structured_dynamics" in agent and "structured_dynamics_optimizer" in agent
+        any(predictor_key in agent for predictor_key, _ in PREDICTOR_STATE_KEY_PAIRS)
         for agent in agents
     ]
-    if any(auxiliary_members) != all(auxiliary_members):
-        raise ValueError("checkpoint population cannot mix structured auxiliary presence")
     if any(auxiliary_members) != (auxiliary_rng_state is not None):
         raise ValueError(
-            "structured dynamics, optimizer, and auxiliary RNG must be checkpointed together"
+            "structured predictors, optimizers, and auxiliary RNG must be checkpointed together"
         )
     if any(auxiliary_members) != (structured_gate_state is not None):
         raise ValueError(
-            "structured dynamics and predictor gate state must be checkpointed together"
+            "structured predictors and predictor gate state must be checkpointed together"
         )
     # Evaluation and submission play the real board. Training cycles
     # symmetries per game, so a member has no private frame to record.
@@ -389,6 +422,7 @@ def checkpoint_payload(
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "iteration": iteration,
         "next_seed": next_seed,
+        "seed_usage": [dict(row) for row in seed_usage],
         "architecture": architecture_of_config(model_config).name,
         "model_config": model_config.to_dict(),
         "ppo_config": asdict(ppo_config),
@@ -543,6 +577,7 @@ def save_checkpoint(
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
     structured_gate_state: Mapping[str, Any] | None = None,
+    seed_usage: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     payload = checkpoint_payload(
         agents=[agent.state() for agent in agents],
@@ -564,6 +599,7 @@ def save_checkpoint(
         policy_entropy_reference=policy_entropy_reference,
         initial_actor=initial_actor,
         structured_gate_state=structured_gate_state,
+        seed_usage=seed_usage,
     )
     write_checkpoint(path, payload)
 
@@ -576,6 +612,15 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location=device, weights_only=False)
     require_checkpoint_format(payload)
+    for agent in agents:
+        for predictor_key, optimizer_key in PREDICTOR_STATE_KEY_PAIRS:
+            predictor = getattr(agent, predictor_key)
+            optimizer = getattr(agent, optimizer_key)
+            if (predictor is None) != (optimizer is None):
+                label = predictor_key.replace("_", " ")
+                raise ValueError(
+                    f"constructed learner {label} and optimizer must be provided together"
+                )
     # Validate the model identity before mutating anything: a mismatched
     # checkpoint must fail with these messages, not with a strict-loading
     # key dump halfway through restoring the actor.
@@ -583,7 +628,10 @@ def load_checkpoint(
         raise ValueError("checkpoint architecture does not match the constructed models")
     if payload["model_config"] != agents[0].actor.config.to_dict():
         raise ValueError("checkpoint model configuration does not match the constructed models")
-    expects_auxiliary_rng = any(agent.structured_dynamics is not None for agent in agents)
+    expects_auxiliary_rng = any(
+        agent.structured_dynamics is not None or agent.structured_critic_dynamics is not None
+        for agent in agents
+    )
     if ("structured_auxiliary_rng" in payload) != expects_auxiliary_rng:
         raise ValueError(
             "checkpoint structured auxiliary RNG presence does not match the constructed learner"
@@ -597,25 +645,24 @@ def load_checkpoint(
             f"checkpoint carries {len(states)} agents; this run configures {len(agents)}"
         )
     for agent, state in zip(agents, states, strict=True):
-        has_dynamics = "structured_dynamics" in state and "structured_dynamics_optimizer" in state
-        expects_dynamics = (
-            agent.structured_dynamics is not None
-            and agent.structured_dynamics_optimizer is not None
-        )
-        if has_dynamics != expects_dynamics:
-            raise ValueError(
-                "checkpoint structured dynamics optimizer presence does not match the "
-                "constructed learner"
-            )
+        for predictor_key, _optimizer_key in PREDICTOR_STATE_KEY_PAIRS:
+            has_predictor = predictor_key in state
+            expects_predictor = getattr(agent, predictor_key) is not None
+            if has_predictor != expects_predictor:
+                label = predictor_key.replace("_", " ")
+                raise ValueError(
+                    f"checkpoint {label} optimizer presence does not match the constructed learner"
+                )
     for agent, state in zip(agents, states, strict=True):
         agent.actor.load_state_dict(state["actor"])
         agent.critic.load_state_dict(state["critic"])
-        if agent.structured_dynamics is not None:
-            agent.structured_dynamics.load_state_dict(state["structured_dynamics"])
-            assert agent.structured_dynamics_optimizer is not None
-            agent.structured_dynamics_optimizer.load_state_dict(
-                state["structured_dynamics_optimizer"]
-            )
+        for predictor_key, optimizer_key in PREDICTOR_STATE_KEY_PAIRS:
+            predictor = getattr(agent, predictor_key)
+            optimizer = getattr(agent, optimizer_key)
+            if predictor is not None:
+                assert optimizer is not None
+                predictor.load_state_dict(state[predictor_key])
+                optimizer.load_state_dict(state[optimizer_key])
         if agent.actor_optimizer is not None:
             agent.actor_optimizer.load_state_dict(state["actor_optimizer"])
         if agent.critic_optimizer is not None:

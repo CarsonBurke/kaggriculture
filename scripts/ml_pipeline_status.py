@@ -18,6 +18,7 @@ _TRANSIENT_FAILURE_MARKERS = (
     "broken pipe",
 )
 _TERMINAL_STATES = frozenset(("succeeded", "failed", "cancelled", "canceled"))
+_UNSUCCESSFUL_TERMINAL_STATES = frozenset(("failed", "cancelled", "canceled"))
 
 
 def _command(*arguments: str) -> dict[str, Any]:
@@ -120,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     if args.interval <= 0.0 or args.max_heals < 0:
         raise ValueError("interval must be positive and max-heals non-negative")
@@ -145,10 +146,15 @@ def main() -> None:
         if rendered != previous:
             print(rendered, flush=True)
             previous = rendered
-        if not args.watch or all(job.get("state") in _TERMINAL_STATES for job in jobs):
-            break
+        if not args.watch:
+            return 0
+        healing_remaining = args.heal and any(
+            _is_transient_failure(job) and heals[int(job["id"])] < args.max_heals for job in jobs
+        )
+        if all(job.get("state") in _TERMINAL_STATES for job in jobs) and not healing_remaining:
+            return int(any(job.get("state") in _UNSUCCESSFUL_TERMINAL_STATES for job in jobs))
         time.sleep(args.interval)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

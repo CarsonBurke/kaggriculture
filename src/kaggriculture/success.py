@@ -104,23 +104,31 @@ class IterationSuccess:
 
     iteration: int
     members: tuple[MemberSuccess, ...]
+    complete: bool = True
+
+    @property
+    def valid(self) -> bool:
+        return self.complete and bool(self.members) and all(member.valid for member in self.members)
 
     @property
     def valid_members(self) -> tuple[MemberSuccess, ...]:
-        return tuple(member for member in self.members if member.valid)
+        # A population tick is one indivisible comparison. Selecting from the
+        # members that happened to land before a crash biases success toward a
+        # partial population and disguises the missing work.
+        return self.members if self.valid else ()
 
     @property
     def best(self) -> MemberSuccess:
         valid = self.valid_members
         if not valid:
-            raise ValueError(f"iteration {self.iteration} has no valid v27 probe")
+            raise ValueError(f"iteration {self.iteration} is not a complete valid v27 probe")
         return max(valid, key=lambda member: member.ranking_key)
 
     @property
     def worst(self) -> MemberSuccess:
         valid = self.valid_members
         if not valid:
-            raise ValueError(f"iteration {self.iteration} has no valid v27 probe")
+            raise ValueError(f"iteration {self.iteration} is not a complete valid v27 probe")
         return min(valid, key=lambda member: member.ranking_key)
 
     @property
@@ -174,40 +182,147 @@ def probe_from_record(record: Mapping[str, Any]) -> OpponentProbe | None:
     )
 
 
-def load_external_journal(path: Path) -> tuple[IterationSuccess, ...]:
-    """Fold `metrics-external.jsonl` into per-iteration success snapshots."""
-    grouped: dict[tuple[int, int], dict[str, OpponentProbe]] = {}
-    for record in read_jsonl_snapshot(path).records:
-        probe = probe_from_record(record)
-        if probe is None:
-            continue
-        iteration = int(record["iteration"])
-        agent = record.get("agent")
-        member = 0 if agent is None else int(agent)
-        grouped.setdefault((iteration, member), {})[probe.opponent] = probe
-    iterations: dict[int, list[MemberSuccess]] = {}
-    for (iteration, member), probes in grouped.items():
-        iterations.setdefault(iteration, []).append(
-            MemberSuccess(iteration=iteration, agent=member, probes=probes)
-        )
-    return tuple(
-        IterationSuccess(
-            iteration=iteration,
-            members=tuple(sorted(members, key=lambda member: member.agent)),
-        )
-        for iteration, members in sorted(iterations.items())
+def _external_record_valid(record: Mapping[str, Any]) -> bool:
+    games = record.get("games")
+    return (
+        type(games) is int
+        and games > 0
+        and record.get("completed_games") == games
+        and _finite(record.get("money_mean")) is not None
+        and _finite(record.get("opponent_money_mean")) is not None
+        and _finite(record.get("score_rate")) is not None
     )
 
 
+def load_external_journal(path: Path) -> tuple[IterationSuccess, ...]:
+    """Fold only atomically completed probe matrices into success snapshots."""
+    records = read_jsonl_snapshot(path).records
+    rows: dict[tuple[int, int, str], Mapping[str, Any]] = {}
+    completions: dict[int, Mapping[str, Any]] = {}
+    completion_rows: dict[int, dict[tuple[int, int, str], Mapping[str, Any]]] = {}
+    iterations: set[int] = set()
+    for record in records:
+        event = record.get("event")
+        if event not in {"external_eval", "external_eval_complete"}:
+            continue
+        try:
+            iteration = int(record["iteration"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        iterations.add(iteration)
+        if event == "external_eval_complete":
+            completions[iteration] = record
+            # Bind the marker to exactly the last-wins rows visible when it was
+            # appended. A later interrupted retry or orphan cannot rewrite an
+            # already committed matrix through the shared journal.
+            completion_rows[iteration] = {
+                key: row for key, row in rows.items() if key[0] == iteration
+            }
+            continue
+        agent = record.get("agent")
+        try:
+            member = 0 if agent is None else int(agent)
+        except (TypeError, ValueError):
+            continue
+        label = str(record.get("opponent", ""))
+        rows[(iteration, member, label)] = record
+
+    snapshots: list[IterationSuccess] = []
+    for iteration in sorted(iterations):
+        completion = completions.get(iteration)
+        selected_rows = completion_rows.get(iteration, rows)
+        expected_members: list[int] = []
+        expected_opponents: list[str] = []
+        marker_valid = False
+        if completion is not None:
+            raw_members = completion.get("members")
+            raw_opponents = completion.get("opponents")
+            if (
+                isinstance(raw_members, list)
+                and isinstance(raw_opponents, list)
+                and all(
+                    member is None or (type(member) is int and member >= 0)
+                    for member in raw_members
+                )
+                and all(type(opponent) is str and opponent for opponent in raw_opponents)
+            ):
+                expected_members = [0 if member is None else member for member in raw_members]
+                expected_opponents = list(raw_opponents)
+                marker_valid = bool(
+                    expected_members
+                    and expected_opponents
+                    and len(set(expected_members)) == len(expected_members)
+                    and len(set(expected_opponents)) == len(expected_opponents)
+                    and completion.get("records") == len(expected_members) * len(expected_opponents)
+                )
+        artifact = completion.get("artifact") if marker_valid and completion is not None else None
+        digest = (
+            completion.get("artifact_sha256") if marker_valid and completion is not None else None
+        )
+        marker_valid = bool(
+            marker_valid
+            and type(artifact) is str
+            and artifact
+            and type(digest) is str
+            and digest
+            and all(
+                (row := selected_rows.get((iteration, member, opponent))) is not None
+                and row.get("artifact") == artifact
+                and row.get("artifact_sha256") == digest
+                and _external_record_valid(row)
+                for member in expected_members
+                for opponent in expected_opponents
+            )
+        )
+
+        member_ids = (
+            expected_members
+            if marker_valid
+            else sorted({member for tick, member, _opponent in rows if tick == iteration})
+        )
+        members: list[MemberSuccess] = []
+        for member in member_ids:
+            probes: dict[str, OpponentProbe] = {}
+            labels = (
+                expected_opponents
+                if marker_valid
+                else [
+                    label
+                    for tick, row_member, label in rows
+                    if (tick, row_member) == (iteration, member)
+                ]
+            )
+            for label in labels:
+                record = selected_rows.get((iteration, member, label))
+                if record is None:
+                    continue
+                probe = probe_from_record(record)
+                if probe is not None:
+                    probes[probe.opponent] = probe
+            members.append(MemberSuccess(iteration=iteration, agent=member, probes=probes))
+        snapshots.append(
+            IterationSuccess(
+                iteration=iteration,
+                members=tuple(sorted(members, key=lambda member: member.agent)),
+                complete=marker_valid,
+            )
+        )
+    return tuple(snapshots)
+
+
 def latest_valid(snapshots: Sequence[IterationSuccess]) -> IterationSuccess:
-    valid = [snapshot for snapshot in snapshots if snapshot.valid_members]
-    if not valid:
+    if not snapshots:
         raise ValueError("journal has no valid v27 probe")
-    return valid[-1]
+    latest = snapshots[-1]
+    if not latest.valid:
+        raise ValueError(
+            f"latest external evaluation tick {latest.iteration} is incomplete or invalid"
+        )
+    return latest
 
 
 def peak(snapshots: Sequence[IterationSuccess]) -> IterationSuccess:
-    valid = [snapshot for snapshot in snapshots if snapshot.valid_members]
+    valid = [snapshot for snapshot in snapshots if snapshot.valid]
     if not valid:
         raise ValueError("journal has no valid v27 probe")
     return max(valid, key=lambda snapshot: snapshot.ranking_key)
@@ -221,7 +336,7 @@ def summarize_run(path: Path) -> dict[str, Any]:
     return {
         "journal": str(path),
         "ticks": len(snapshots),
-        "valid_ticks": sum(1 for snapshot in snapshots if snapshot.valid_members),
+        "valid_ticks": sum(1 for snapshot in snapshots if snapshot.valid),
         "latest": _snapshot_record(latest),
         "peak": _snapshot_record(best),
     }

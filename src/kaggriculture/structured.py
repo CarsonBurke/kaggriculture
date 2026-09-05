@@ -24,7 +24,14 @@ from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
-from kaggriculture.constants import BOARD_SIZE, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.constants import (
+    ANIMALS,
+    BOARD_SIZE,
+    CROPS,
+    MAX_MARKET_ORDERS,
+    MAX_UNITS,
+    PRODUCTS,
+)
 from kaggriculture.model import (
     ActorOutput,
     AxialRotaryEmbedding,
@@ -35,11 +42,14 @@ from kaggriculture.model import (
     initialize_policy_heads,
 )
 from kaggriculture.tokens import (
+    ANIMAL_PRIVATE_FIELDS,
+    ANIMAL_TOKEN_FIELDS,
     CROP_PRIVATE_FIELDS,
     CROP_TOKEN_FIELDS,
     FARM_TOKEN_FIELDS,
     N_TILE_CONTINUOUS,
     N_UNIT_CONTINUOUS,
+    OBSERVATION_SCHEMA_VERSION,
     PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
     QUADRANT_COUNT,
@@ -60,6 +70,7 @@ from kaggriculture.triton_mlp import (
 class StructuredConfig:
     """Target-architecture hyperparameters from VIT_PLAN."""
 
+    observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
     model_dim: int = 128
     attention_heads: int = 4
     attention_kv_heads: int = 2
@@ -69,11 +80,11 @@ class StructuredConfig:
     latents: int = 32
     core_layers: int = 8
     quantity_rank: int = 32
-    # Empty + "all" selects the canonical 8-layer schedule: read all entities
-    # initially, refresh after layers 3 and 6, then finish layers 7-8. Shallower
-    # research variants retain every third-layer refresh that fits.
+    # Empty means disabled. Research variants that want the canonical 8-layer
+    # refresh schedule opt into ``global_refresh_context="all"`` explicitly;
+    # an empty layer tuple must not silently enable extra blocks.
     global_refresh_layers: tuple[int, ...] = ()
-    global_refresh_context: str = "all"
+    global_refresh_context: str = "none"
     input_reinject_layers: tuple[int, ...] = ()
     core_skip_source: int = 0
     core_skip_target: int = 0
@@ -92,6 +103,10 @@ class StructuredConfig:
     value_sigma_ratio: float = 0.75
 
     def __post_init__(self) -> None:
+        if self.observation_schema_version != OBSERVATION_SCHEMA_VERSION:
+            raise ValueError(
+                "stale structured observation schema; fresh encoding and training required"
+            )
         refresh_layers = tuple(self.global_refresh_layers)
         refresh_context = self.global_refresh_context
         if not refresh_layers and refresh_context == "all":
@@ -178,6 +193,7 @@ class StructuredInputs(NamedTuple):
     unit_tile_gather: Tensor  # [B, MAX_UNITS, 5] int64 into own-farm tiles
     unit_tile_gather_valid: Tensor  # [B, MAX_UNITS, 5] bool
     products: Tensor  # [B, len(PRODUCTS), product feature width]
+    animals: Tensor  # [B, len(ANIMALS), animal feature width]
     crops: Tensor  # [B, len(CROPS), crop feature width]
     farms: Tensor  # [B, 2, len(FARM_TOKEN_FIELDS)]
     town: Tensor  # [B, len(TOWN_TOKEN_FIELDS)]
@@ -187,6 +203,7 @@ class CriticExtras(NamedTuple):
     """Opponent-side critic tensors stacked alongside StructuredInputs."""
 
     products: Tensor  # [B, len(PRODUCTS), len(PRODUCT_PRIVATE_FIELDS)]
+    animals: Tensor  # [B, len(ANIMALS), len(ANIMAL_PRIVATE_FIELDS)]
     crops: Tensor  # [B, len(CROPS), len(CROP_PRIVATE_FIELDS)]
     unit_categorical: Tensor  # [B, MAX_UNITS, N_UNIT_CATEGORICAL] int64
     unit_continuous: Tensor  # [B, MAX_UNITS, N_UNIT_CONTINUOUS]
@@ -223,6 +240,7 @@ def stack_structured(
         unit_tile_gather=stacked("unit_tile_gather", torch.int64),
         unit_tile_gather_valid=stacked("unit_tile_gather_valid"),
         products=stacked("products"),
+        animals=stacked("animals"),
         crops=stacked("crops"),
         farms=stacked("farms"),
         town=stacked("town"),
@@ -234,6 +252,7 @@ def stack_structured(
         raise ValueError("critic extras must be present on every row or none")
     extras = CriticExtras(
         products=stacked("critic_products"),
+        animals=stacked("critic_animals"),
         crops=stacked("critic_crops"),
         unit_categorical=stacked("opponent_unit_categorical", torch.int64),
         unit_continuous=stacked("opponent_unit_continuous"),
@@ -818,10 +837,15 @@ class EconomyEmbedder(nn.Module):
             len(PRODUCT_PRIVATE_FIELDS) if private_columns else 0
         )
         crop_width = len(CROP_TOKEN_FIELDS) + (len(CROP_PRIVATE_FIELDS) if private_columns else 0)
+        animal_width = len(ANIMAL_TOKEN_FIELDS) + (
+            len(ANIMAL_PRIVATE_FIELDS) if private_columns else 0
+        )
         self.private_columns = private_columns
         self.split_clock = config.split_clock_token
         self.product_identity = nn.Embedding(len(PRODUCTS), width)
         self.product_projection = nn.Linear(product_width, width)
+        self.animal_identity = nn.Embedding(len(ANIMALS), width)
+        self.animal_projection = nn.Linear(animal_width, width)
         self.crop_identity = nn.Embedding(len(CROPS), width)
         self.crop_projection = nn.Linear(crop_width, width)
         self.farm_identity = nn.Embedding(2, width)
@@ -833,10 +857,13 @@ class EconomyEmbedder(nn.Module):
             self.clock_projection = None
             self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS), width)
 
-    def forward(self, products: Tensor, crops: Tensor, farms: Tensor, town: Tensor) -> Tensor:
+    def forward(
+        self, products: Tensor, animals: Tensor, crops: Tensor, farms: Tensor, town: Tensor
+    ) -> Tensor:
         dtype = self.product_projection.weight.dtype
         tokens = [
             self.product_projection(products.to(dtype)) + self.product_identity.weight,
+            self.animal_projection(animals.to(dtype)) + self.animal_identity.weight,
             self.crop_projection(crops.to(dtype)) + self.crop_identity.weight,
             self.farm_projection(farms.to(dtype)) + self.farm_identity.weight,
         ]
@@ -958,7 +985,9 @@ class StructuredTrunk(nn.Module):
             local,
             opponent=False,
         )
-        economy_tokens = self.economy(inputs.products, inputs.crops, inputs.farms, inputs.town)
+        economy_tokens = self.economy(
+            inputs.products, inputs.animals, inputs.crops, inputs.farms, inputs.town
+        )
 
         summary = self.opponent_summary(
             self.opponent_queries.unsqueeze(0).expand(batch, -1, -1),
@@ -1053,6 +1082,17 @@ class StructuredBelief(NamedTuple):
     central_latents: Tensor
     unit_decisions: Tensor
     market_decisions: Tensor
+
+
+class StructuredCriticBelief(NamedTuple):
+    """Typed critic representations exposed only to training auxiliaries."""
+
+    own_patches: Tensor
+    opponent_patches: Tensor
+    opponent_summary: Tensor
+    economy_entities: Tensor
+    central_latents: Tensor
+    value_decision: Tensor
 
 
 class StructuredActor(nn.Module):
@@ -1228,13 +1268,13 @@ class StructuredCritic(nn.Module):
             persistent=True,
         )
 
-    def forward(
+    def forward_with_belief(
         self,
         inputs: StructuredInputs,
         opponent_unit_categorical: Tensor,
         opponent_unit_continuous: Tensor,
         opponent_unit_active: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, StructuredCriticBelief]:
         batch = inputs.tile_categorical.shape[0]
         # Opponent units attend as context only; their local tiles sit on the
         # opponent farm, which the latents already read through its tokens, so
@@ -1258,7 +1298,30 @@ class StructuredCritic(nn.Module):
             self.value_query.unsqueeze(0).expand(batch, -1, -1),
             trunk.latents,
         )
-        return self.value_head(value_hidden[:, 0]).contiguous()
+        logits = self.value_head(value_hidden[:, 0]).contiguous()
+        belief = StructuredCriticBelief(
+            own_patches=trunk.own_patches,
+            opponent_patches=trunk.opponent_patches,
+            opponent_summary=trunk.opponent_summary,
+            economy_entities=trunk.economy_tokens,
+            central_latents=trunk.latents,
+            value_decision=value_hidden,
+        )
+        return logits, belief
+
+    def forward(
+        self,
+        inputs: StructuredInputs,
+        opponent_unit_categorical: Tensor,
+        opponent_unit_continuous: Tensor,
+        opponent_unit_active: Tensor,
+    ) -> Tensor:
+        return self.forward_with_belief(
+            inputs,
+            opponent_unit_categorical,
+            opponent_unit_continuous,
+            opponent_unit_active,
+        )[0]
 
     def value(self, logits: Tensor) -> Tensor:
         return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)

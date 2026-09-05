@@ -24,10 +24,10 @@ What is measured, on the real update path and nothing else:
 
   * `Gstar`, the full-batch policy-loss gradient over one staged rollout,
     accumulated through `_actor_minibatch_terms` at production minibatch size,
-    autocast and compile mode, with behavior likelihoods supplied by
-    `replay_behavior_logprobs` exactly as `update_ppo` supplies them.  This is
-    the best available estimate of the true gradient at this operating point.
-    No optimizer is constructed and no step is ever taken.
+    autocast and compile mode, with the exact likelihoods stored by the rollout
+    sampler as the PPO denominator, matching `update_ppo`. This is the best
+    available estimate of the true gradient at this operating point. No
+    optimizer is constructed and no step is ever taken.
   * `Ghat_n`, the mean gradient over `n` disjoint minibatches, for several
     effective averaging widths `n`.  Width 20 is the reading of Muon's default
     momentum 0.95 as `1 / (1 - 0.95) = 20`; the variance-equivalent sample size
@@ -140,7 +140,6 @@ from kaggriculture.ppo import (
     _stage_tensor,
     _validate_staged_action_masks,
     prepare_advantages,
-    replay_behavior_logprobs,
     replay_behavior_values,
 )
 from kaggriculture.production import (
@@ -341,10 +340,10 @@ class GradientContext:
         """The clipped surrogate sum and its component count for one minibatch.
 
         Identical to `update_ppo`'s actor minibatch: the same compiled callable,
-        the same staged tensors and dtypes, the same host-side component count.
-        Behavior likelihoods come from `replay_behavior_logprobs`, so at
-        unchanged weights the importance ratio starts at one and this is the
-        gradient the update's first actor step would actually see.
+        the same staged tensors and dtypes, the same host-side component count,
+        and the exact collection-time sampler likelihoods. Any execution-path
+        drift therefore appears in the first-step ratio exactly as it does in
+        training.
         """
         staged = self.staged
         policy_sum, _entropy, _kl, _clipped = self.actor_terms(
@@ -929,17 +928,6 @@ def main() -> None:
         .cpu()
         .numpy()
         .reshape(rollout.rewards.shape)
-    )
-    staged.update(
-        replay_behavior_logprobs(
-            actor,
-            architecture.name,
-            staged,
-            valid_indices,
-            minibatch_size=config.minibatch_size,
-            autocast_enabled=autocast_enabled,
-            compile_mode=compile_mode,
-        )
     )
     prepared = prepare_advantages(rollout, behavior_values, config)
     staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)

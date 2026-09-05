@@ -242,7 +242,7 @@ def _validated_snapshot_payload(
         if payload["model_config"] != expected:
             raise ValueError(f"league snapshot model configuration mismatch: {path}")
     try:
-        config = architecture.config_class(**payload["model_config"])
+        config = architecture.build_config(payload["model_config"])
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid league snapshot model configuration: {path}") from error
     return payload, architecture, config

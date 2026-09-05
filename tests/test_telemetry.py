@@ -589,6 +589,36 @@ def test_a_population_reading_nobody_filed_stays_visible() -> None:
     assert telemetry._placement("population_cycle_length") == ("", "population/cycle_length")
 
 
+def test_nextlat_actor_and_critic_metrics_have_deliberate_separate_categories() -> None:
+    expected = {
+        "structured_preupdate_decision": "nextlat-actor-holdout-decision/decision",
+        "structured_predictor_combined": "nextlat-actor-predictor/combined",
+        "structured_gate_passed": "nextlat-actor-gate/passed",
+        "structured_gate_actor_enabled_next": "nextlat-actor-gate/actor_enabled_next",
+        "structured_actor_decision": "nextlat-actor-auxiliary-decision/decision",
+        "structured_critic_preupdate_value": "nextlat-critic-holdout-loss/value",
+        "structured_critic_predictor_latent": "nextlat-critic-predictor-loss/latent",
+        "structured_critic_gate_passed": "nextlat-critic-gate/passed",
+        "structured_critic_gate_enabled_next": "nextlat-critic-gate/enabled_next",
+        "structured_critic_value": "nextlat-critic-auxiliary-loss/value",
+        "structured_learning_rate": "nextlat-schedule/actor_learning_rate",
+        "structured_critic_learning_rate": "nextlat-schedule/critic_learning_rate",
+        "structured_gradient_cosine": "nextlat-actor-gradients/cosine",
+        "structured_critic_gradient_auxiliary_to_main": (
+            "nextlat-critic-gradients/auxiliary_to_main"
+        ),
+        "credit_preupdate_opponent_scripted_v27_ttg_33_128_terminal_residual_mse": (
+            "credit-opponent-scripted-v27-ttg-33-128/terminal_residual_mse"
+        ),
+    }
+    for field, tag in expected.items():
+        assert telemetry._placement(field) == ("", tag)
+        assert telemetry._placement(f"agent3_{field}") == (
+            "",
+            f"{tag.partition('/')[0]}-agent3/{tag.partition('/')[2]}",
+        )
+
+
 def test_a_population_run_facets_every_agent_and_stays_one_event_file(tmp_path: Path) -> None:
     """Four concurrent learners report the same categories four times over.
 
@@ -692,6 +722,92 @@ def test_every_field_is_placed_and_an_unrecognized_one_stays_visible(tmp_path: P
     assert not any("next_seed" in tag for tag in tags)
 
 
+def test_flat_bookkeeping_and_thresholds_are_not_plotted(tmp_path: Path) -> None:
+    """Constants cost charts and say nothing, so the mirror leaves them out.
+
+    Schedule hyperparameters are flat within a run, per-head abort thresholds
+    are flat configuration bounds, and `throughput/states` repeats the wave
+    cohort's `rollout_states` exactly. The journal keeps every one of them --
+    only the TensorBoard rows go away -- so this asserts the tags are absent
+    while their journal values survive a migration round-trip.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    _write_jsonl(
+        journal,
+        [
+            {
+                "iteration": index,
+                "value_loss": 0.25,
+                "epochs": 2,
+                "gamma": 0.997,
+                "actor_gae_lambda": 0.97,
+                "critic_gae_lambda": 1.0,
+                "states": 1000,
+                "rollout_states": 1000,
+                "update_replay_unit_kl_fatal_at": 0.005,
+                "update_replay_unit_tail_fraction_fatal_at": 0.0002,
+            }
+            for index in range(3)
+        ],
+    )
+
+    migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    tags = _tags(log_dir)
+    assert "critic/value_loss" in tags
+    assert "rollout-wave/states" in tags
+    for absent in (
+        "schedule/epochs",
+        "schedule/gamma",
+        "schedule/actor_gae_lambda",
+        "schedule/critic_gae_lambda",
+        "throughput/states",
+        # `states` must not survive as an unfiled leftover either.
+        "misc/states",
+        "parity-unit/kl_fatal_at",
+        "parity-unit/tail_fraction_fatal_at",
+    ):
+        assert absent not in tags
+
+
+def test_representation_diagnostics_file_under_their_own_module(tmp_path: Path) -> None:
+    """Behavior cloning's belief statistics are curves, not unfiled leftovers.
+
+    They match no NextLat prefix, so they used to land in `misc` -- twenty-eight
+    charts in the drawer for metrics nobody filed. Each belief module is now one
+    accordion of its four statistics, and a module the game grows later still
+    lands in `misc`, visible, until it is filed deliberately.
+    """
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    _write_jsonl(
+        journal,
+        [
+            {
+                "epoch": 0,
+                "train_loss": 0.5,
+                "structured_own_patches_variance": 0.1,
+                "structured_own_patches_effective_rank": 3.0,
+                "structured_own_patches_cosine": 0.2,
+                "structured_own_patches_dispersion": 0.3,
+                "structured_future_module_cosine": 0.4,
+            }
+        ],
+    )
+
+    migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    tags = _tags(log_dir)
+    assert "loss/train" in tags
+    for statistic in ("variance", "effective_rank", "cosine", "dispersion"):
+        assert f"representation-own-patches/{statistic}" in tags
+    assert "misc/structured_future_module_cosine" in tags
+    assert not any(
+        tag.startswith("misc/structured_") and "future_module" not in tag for tag in tags
+    )
+
+
 def test_a_mirror_written_under_an_older_layout_is_rebuilt_not_extended(tmp_path: Path) -> None:
     """Two tag schemes in one directory make every chart unreadable.
 
@@ -763,17 +879,21 @@ def _mirrored_field_names() -> list[str]:
             opponent_money=np.zeros(trajectories, dtype=np.float32),
             seats=np.asarray([0, 1], dtype=np.int8),
             agents=np.zeros(trajectories, dtype=np.int64),
+            learner_stochastic=True,
             orientations=np.zeros(trajectories, dtype=np.int8),
             entropy_sums=np.zeros((trajectories, horizon), dtype=np.float32),
             elapsed_seconds=1.0,
         )
     )
     # Everything placed by a prefix rule rather than by the table: the parity
-    # audit's per-head statistics and their per-head abort thresholds, and
-    # behavior cloning's per-head holdout scores. These are the families the
-    # first version of this helper still missed -- 26 parity fields and the
-    # whole holdout set -- so adding two entries to `PARITY_STATISTICS` could
-    # push every `parity/<head>` run over budget with both checks green.
+    # audit's per-head statistics, behavior cloning's per-head holdout scores,
+    # and the per-head abort thresholds. The thresholds are journal fields like
+    # the rest, so they stay in this enumeration; that they are unplotted by
+    # design is asserted by the dedicated test below. These are the families
+    # the first version of this
+    # helper still missed -- 26 parity fields and the whole holdout set -- so
+    # adding two entries to `PARITY_STATISTICS` could push every `parity/<head>`
+    # run over budget with both checks green.
     training = _training_script()
     parity = [
         f"update_replay_{component}_{statistic}{suffix}"

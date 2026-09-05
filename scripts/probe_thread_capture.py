@@ -43,21 +43,24 @@ from pathlib import Path
 
 import torch
 
+from kaggriculture.constants import ANIMALS
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import StructuredConfig, StructuredInputs
+from kaggriculture.tokens import ANIMAL_TOKEN_FIELDS, N_TILE_CONTINUOUS
 
 #: Field dtype and trailing shape, as `allocate_rollout_storage("structured")`
 #: lays them out. The categorical and flag groups arrive from the simulator
 #: narrow and are widened on upload, so the model sees int64 and bool.
 _FIELDS: tuple[tuple[str, torch.dtype, tuple[int, ...]], ...] = (
     ("tile_categorical", torch.int64, (200, 6)),
-    ("tile_continuous", torch.float32, (200, 18)),
+    ("tile_continuous", torch.float32, (200, N_TILE_CONTINUOUS)),
     ("unit_categorical", torch.int64, (16, 4)),
     ("unit_continuous", torch.float32, (16, 14)),
     ("unit_active", torch.bool, (16,)),
     ("unit_tile_gather", torch.int64, (16, 5)),
     ("unit_tile_gather_valid", torch.bool, (16, 5)),
     ("products", torch.float32, (9, 5)),
+    ("animals", torch.float32, (len(ANIMALS), len(ANIMAL_TOKEN_FIELDS))),
     ("crops", torch.float32, (5, 6)),
     ("farms", torch.float32, (2, 4)),
     ("town", torch.float32, (14,)),

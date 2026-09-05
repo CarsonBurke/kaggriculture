@@ -221,7 +221,12 @@ def _difference(
 
 
 def _compare_actions(
-    module: Any, agents: Sequence[Any], args: argparse.Namespace
+    module: Any,
+    agents: Sequence[Any],
+    *,
+    games: int,
+    seed_start: int,
+    steps: int,
 ) -> dict[str, Any]:
     """Step a native wave with both seats scripted, checking every action.
 
@@ -231,13 +236,12 @@ def _compare_actions(
     reports a divergence at a step where the port is in fact exact. Kaggle runs
     one episode per process, so per-game isolation is what faithfulness means.
     """
-    games = args.games
-    seeds = np.arange(args.seed_start, args.seed_start + games, dtype=np.uint64)
+    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = module.BatchEnv(seeds)
     codes = np.full(games * PLAYERS, BUILTIN_CODES["scripted-v27"], dtype=np.uint8)
     compared = 0
     divergences: list[dict[str, Any]] = []
-    for step in range(args.steps):
+    for step in range(steps):
         snapshots = [json.loads(environment.snapshot_json(index, False)) for index in range(games)]
         # One call per step: the scripted agent advances its weed repair here.
         native = environment.builtin_actions(codes)
@@ -306,10 +310,14 @@ def _zero_inputs(games: int, module: Any) -> dict[str, np.ndarray]:
 
 
 def _compare_episodes(
-    module: Any, args: argparse.Namespace, agent_path: Path
+    module: Any,
+    *,
+    episodes: int,
+    seed_start: int,
+    agent_path: Path,
 ) -> list[dict[str, Any]]:
     """Play each pairing natively and through the official engine, comparing banks."""
-    if not args.episodes:
+    if not episodes:
         return []
     # The asymmetric pairings pin the seat index down; scripted against itself
     # puts both agents into one market, which is a different price path and the
@@ -319,15 +327,15 @@ def _compare_episodes(
         ("pass", "scripted-v27"),
         ("scripted-v27", "scripted-v27"),
     )
-    seeds = np.arange(args.seed_start, args.seed_start + args.episodes, dtype=np.uint64)
+    seeds = np.arange(seed_start, seed_start + episodes, dtype=np.uint64)
     official_names = {"scripted-v27": str(agent_path), "pass": "pass"}
     outcomes = []
     for pairing in pairings:
         environment = module.BatchEnv(seeds)
         sampled = environment.sample_buffers()
-        inputs = _zero_inputs(args.episodes, module)
+        inputs = _zero_inputs(episodes, module)
         codes = np.tile(
-            np.array([BUILTIN_CODES[name] for name in pairing], dtype=np.uint8), args.episodes
+            np.array([BUILTIN_CODES[name] for name in pairing], dtype=np.uint8), episodes
         )
         for _ in range(MAX_TRANSITIONS):
             environment.sample_and_step_into(
@@ -367,45 +375,120 @@ def _compare_episodes(
     return outcomes
 
 
-def main() -> int:
-    args = parse_args()
-    agent_path = args.agent.expanduser().resolve()
-    if not agent_path.is_file():
-        raise SystemExit(f"public v27 agent is unavailable: {agent_path}")
-    module = load_native()
-    digest = hashlib.sha256(agent_path.read_bytes()).hexdigest()
+def compare_v27_parity(
+    *,
+    agent_path: Path = PUBLIC_V27_OPPONENT,
+    games: int = 1,
+    episodes: int = 1,
+    seed_start: int = 90_001,
+    steps: int = MAX_TRANSITIONS,
+    build: bool = False,
+    release: bool = True,
+) -> dict[str, Any]:
+    """Run the digest-pinned action and final-bank comparisons."""
+    if games < 1:
+        raise ValueError("games must be positive")
+    if episodes < 0:
+        raise ValueError("episodes must be non-negative")
+    if not 0 <= steps <= MAX_TRANSITIONS:
+        raise ValueError(f"steps must be between 0 and {MAX_TRANSITIONS}")
+
+    resolved_agent = agent_path.expanduser().resolve()
+    if not resolved_agent.is_file():
+        raise FileNotFoundError(f"public v27 agent is unavailable: {resolved_agent}")
+    module = load_native(build=build, release=release)
+    digest = hashlib.sha256(resolved_agent.read_bytes()).hexdigest()
     if digest != module.V27_SOURCE_SHA256:
-        raise SystemExit(
+        raise ValueError(
             "the native table was compiled from different bytes than the agent under "
             f"test: table {module.V27_SOURCE_SHA256} vs file {digest}. Regenerate with "
             "scripts/extract_v27_script.py."
         )
-    agents = [_load_agent(agent_path) for _ in range(args.games)]
-    steps = _compare_actions(module, agents, args)
-    episodes = _compare_episodes(module, args, agent_path)
+
+    agents = [_load_agent(resolved_agent) for _ in range(games)]
+    action_result = _compare_actions(
+        module,
+        agents,
+        games=games,
+        seed_start=seed_start,
+        steps=steps,
+    )
+    episode_result = _compare_episodes(
+        module,
+        episodes=episodes,
+        seed_start=seed_start,
+        agent_path=resolved_agent,
+    )
     money_failures = [
         f"seed {row['seed']} {'/'.join(row['pairing'])}: native {row['native_money']} "
         f"vs official {row['official_money']}"
-        for row in episodes
+        for row in episode_result
         if row["native_money"] != row["official_money"]
     ]
-    report = {
-        "agent": str(agent_path),
+    return {
+        "agent": str(resolved_agent),
         "agent_sha256": digest,
         "scripted_steps": int(module.V27_STEPS),
-        "actions_compared": steps["actions_compared"],
-        "divergences": steps["divergences"],
-        "episodes": episodes,
+        "actions_compared": action_result["actions_compared"],
+        "divergences": action_result["divergences"],
+        "episodes": episode_result,
         "money_failures": money_failures,
     }
+
+
+def _parity_failures(report: dict[str, Any]) -> list[str]:
+    return [f"{row['where']}: {row['reason']}" for row in report["divergences"]] + report[
+        "money_failures"
+    ]
+
+
+def assert_v27_parity(
+    *,
+    agent_path: Path = PUBLIC_V27_OPPONENT,
+    games: int = 1,
+    episodes: int = 1,
+    seed_start: int = 90_001,
+    steps: int = MAX_TRANSITIONS,
+    build: bool = False,
+    release: bool = True,
+) -> dict[str, Any]:
+    """Assert exact scripted-v27 actions and final banks, returning the evidence report."""
+    report = compare_v27_parity(
+        agent_path=agent_path,
+        games=games,
+        episodes=episodes,
+        seed_start=seed_start,
+        steps=steps,
+        build=build,
+        release=release,
+    )
+    failures = _parity_failures(report)
+    if failures:
+        raise AssertionError("scripted v27 parity failed:\n  " + "\n  ".join(failures))
+    return report
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        report = compare_v27_parity(
+            agent_path=args.agent,
+            games=args.games,
+            episodes=args.episodes,
+            seed_start=args.seed_start,
+            steps=args.steps,
+            build=True,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=1, sort_keys=True), encoding="utf-8")
     print(
-        f"compared {steps['actions_compared']} actions over {args.games} seeds; "
-        f"{len(episodes)} official episodes"
+        f"compared {report['actions_compared']} actions over {args.games} seeds; "
+        f"{len(report['episodes'])} official episodes"
     )
-    failures = [f"{row['where']}: {row['reason']}" for row in steps["divergences"]] + money_failures
+    failures = _parity_failures(report)
     if failures:
         raise SystemExit("scripted v27 parity failed:\n  " + "\n  ".join(failures))
     print("exact parity: 0 action divergences, every official bank matched")
