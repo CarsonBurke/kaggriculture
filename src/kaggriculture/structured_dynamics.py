@@ -882,6 +882,7 @@ def _critic_value_kl(
     predicted: Tensor,
     target: Tensor,
     value_head: nn.Linear,
+    eligible: Tensor | None = None,
 ) -> Tensor:
     """Teacher-to-student categorical KL without auxiliary head gradients."""
     weight = value_head.weight.detach()
@@ -890,11 +891,13 @@ def _critic_value_kl(
     teacher_logits = nn.functional.linear(target.detach(), weight, bias).float().detach()
     teacher_log_probabilities = teacher_logits.log_softmax(dim=-1)
     teacher_probabilities = teacher_log_probabilities.exp()
-    return (
-        (teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1)))
-        .sum(dim=-1)
-        .mean()
-    )
+    per_row = (
+        teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1))
+    ).sum(dim=-1)
+    if eligible is None:
+        return per_row.mean()
+    weight_rows = eligible.float()
+    return (per_row * weight_rows).sum() / weight_rows.sum().clamp_min(1.0)
 
 
 def structured_critic_window_loss(
@@ -995,6 +998,67 @@ def structured_critic_window_loss(
         )
         eligible_sum = eligible_sum + eligible.float().sum()
 
+    return StructuredCriticDynamicsTerms(
+        latent=latent_sum / horizon,
+        value=value_sum / horizon,
+        eligible=eligible_sum / horizon,
+        residual_ratio=residual_sum / horizon,
+    )
+
+
+def structured_critic_horizon_loss(
+    dynamics: StructuredCriticDynamics,
+    belief: StructuredCriticBelief,
+    inputs: StructuredInputs,
+    factors: dict[str, Tensor],
+    *,
+    value_head: nn.Linear,
+    horizon: int,
+) -> StructuredCriticDynamicsTerms:
+    """Unroll critic dynamics against in-batch successors, as NextLat shifts h_t.
+
+    Unlike the window path, this accepts a flat run-length minibatch and masks
+    pairs that are not adjacent steps of one trajectory.
+    """
+    if horizon < 1:
+        raise ValueError("structured critic horizon must be positive")
+    predicted = belief
+    zero = belief.central_latents.new_zeros((), dtype=torch.float32)
+    latent_sum = zero
+    value_sum = zero
+    eligible_sum = zero
+    residual_sum = zero
+    rows = torch.arange(
+        factors["episode_index"].shape[0],
+        device=factors["episode_index"].device,
+    )
+    for offset in range(1, horizon + 1):
+        action_index = (rows + offset - 1).clamp_max(rows.shape[0] - 1)
+        previous = predicted
+        predicted = dynamics(
+            predicted,
+            factors["unit_actions"][action_index],
+            factors["market_kinds"][action_index],
+            factors["market_quantities"][action_index],
+            inputs.unit_categorical[action_index],
+            inputs.unit_active[action_index],
+        )
+        target_index, eligible = _target_index(factors["episode_index"], factors["step"], offset)
+        target = StructuredCriticBelief(*(value[target_index] for value in belief))
+        joined_predicted = torch.cat(tuple(predicted), dim=1)
+        joined_target = torch.cat(tuple(target), dim=1)
+        joined_previous = torch.cat(tuple(previous), dim=1)
+        latent_sum = latent_sum + _latent_smooth_l1(joined_predicted, joined_target, eligible)
+        value_sum = value_sum + _critic_value_kl(
+            predicted.value_decision,
+            target.value_decision,
+            value_head,
+            eligible,
+        )
+        residual_sum = residual_sum + _eligible_rms_ratio(
+            joined_predicted, joined_previous, eligible
+        )
+        eligible_sum = eligible_sum + eligible.float().sum()
     return StructuredCriticDynamicsTerms(
         latent=latent_sum / horizon,
         value=value_sum / horizon,

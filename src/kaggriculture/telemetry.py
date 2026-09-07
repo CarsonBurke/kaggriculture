@@ -552,6 +552,15 @@ _TRAINING_TAGS = {
     "elapsed_seconds": "timing/elapsed_seconds",
     "elapsed_hours": "timing/elapsed_hours",
     "update_replay_parity_seconds": "timing/replay_parity_seconds",
+    # Where `update_seconds` goes, phase by phase; a second accordion so the
+    # coarse per-iteration clocks above stay within budget. Every boundary is a
+    # device synchronization, so these are wall-clock attributions.
+    "update_staging_seconds": "update-timing/staging_seconds",
+    "update_predictor_seconds": "update-timing/predictor_seconds",
+    "update_behavior_replay_seconds": "update-timing/behavior_replay_seconds",
+    "update_advantage_seconds": "update-timing/advantage_seconds",
+    "update_minibatch_seconds": "update-timing/minibatch_seconds",
+    "update_finalize_seconds": "update-timing/finalize_seconds",
     "rollout_states_per_second": "throughput/rollout_states_per_second",
     "critic_replayed_states_per_second": "throughput/critic_replayed_states_per_second",
     "learner_states_per_rollout_second": "throughput/learner_states_per_rollout_second",

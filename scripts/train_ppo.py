@@ -23,7 +23,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -242,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         "--critic-epochs",
         type=int,
         default=DEFAULT_CRITIC_EPOCHS,
-        help="total critic epochs (>= --epochs; defaults to the same two passes)",
+        help="total critic epochs (>= --epochs; defaults to the same one pass)",
     )
     parser.add_argument("--minibatch-size", type=int, default=PpoConfig.minibatch_size)
     parser.add_argument("--clip-low", type=float, default=0.80)
@@ -394,18 +394,13 @@ def parse_args() -> argparse.Namespace:
         "--structured-learning-rate",
         type=float,
         default=PpoConfig.structured_learning_rate,
-        help="predictor-only optimizer rate; defaults to --actor-lr",
+        help="actor predictor optimizer rate; defaults to --actor-lr",
     )
     parser.add_argument(
-        "--structured-predictor-minibatch-size",
-        type=int,
-        default=PpoConfig.structured_predictor_minibatch_size,
-        help="predictor-only flattened-state minibatch; defaults to --minibatch-size",
-    )
-    parser.add_argument(
-        "--structured-gate-evaluation-windows",
-        type=int,
-        default=PpoConfig.structured_gate_evaluation_windows,
+        "--structured-critic-learning-rate",
+        type=float,
+        default=PpoConfig.structured_critic_learning_rate,
+        help="critic predictor optimizer rate; defaults to --critic-lr",
     )
     parser.add_argument(
         "--structured-gate-combined-ratio",
@@ -609,13 +604,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         not math.isfinite(args.structured_learning_rate) or args.structured_learning_rate <= 0.0
     ):
         raise ValueError("structured learning rate must be finite and positive")
-    if (
-        args.structured_predictor_minibatch_size is not None
-        and args.structured_predictor_minibatch_size < 1
+    if args.structured_critic_learning_rate is not None and (
+        not math.isfinite(args.structured_critic_learning_rate)
+        or args.structured_critic_learning_rate <= 0.0
     ):
-        raise ValueError("structured predictor minibatch size must be positive")
-    if args.structured_gate_evaluation_windows < 1 or args.structured_gate_patience < 1:
-        raise ValueError("structured gate evaluation windows and patience must be positive")
+        raise ValueError("structured critic learning rate must be finite and positive")
+    if args.structured_gate_patience < 1:
+        raise ValueError("structured gate patience must be positive")
     if args.league_games < 0:
         raise ValueError("league games cannot be negative")
     if args.league_active_opponents < 0 or args.league_historical_opponents < 0:
@@ -2476,8 +2471,7 @@ def main() -> None:
         structured_critic_value_coefficient=args.structured_critic_value_coefficient,
         structured_critic_horizon=args.structured_critic_horizon,
         structured_learning_rate=args.structured_learning_rate,
-        structured_predictor_minibatch_size=args.structured_predictor_minibatch_size,
-        structured_gate_evaluation_windows=args.structured_gate_evaluation_windows,
+        structured_critic_learning_rate=args.structured_critic_learning_rate,
         structured_gate_combined_ratio=args.structured_gate_combined_ratio,
         structured_gate_decision_ratio=args.structured_gate_decision_ratio,
         structured_gate_opponent_summary_ratio=args.structured_gate_opponent_summary_ratio,
@@ -3191,11 +3185,8 @@ def main() -> None:
         update_started = time.monotonic()
         # Actor release is decided above from the previous fresh wave. The
         # current rollout's pre-update EV becomes evidence for the next wave.
-        # Once per member, over that member's rows. Partitioning first is not
-        # cosmetic: `prepare_advantages` normalizes by the batch's own advantage
-        # standard deviation, so a pooled update would divide each member's
-        # advantages by the population's spread and leak one member's return scale
-        # into another's step size.
+        # Once per member, over that member's rows. A game's two seats belong to
+        # two members, so the partition is a row index, not a slice.
         update_metrics: dict[str, float | int] = {}
         current_warmup_evs: list[float] = []
         for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):

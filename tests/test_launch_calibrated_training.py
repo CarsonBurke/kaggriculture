@@ -1292,8 +1292,8 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--architecture", "structured"),
         ("--actor-lr", "3e-05"),
         ("--optimizer", "normuon"),
-        ("--epochs", "2"),
-        ("--critic-epochs", "2"),
+        ("--epochs", "1"),
+        ("--critic-epochs", "1"),
         ("--minibatch-size", "4096"),
         ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
         (

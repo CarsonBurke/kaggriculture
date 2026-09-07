@@ -1142,7 +1142,24 @@ def _fill_gpu_policy_statistics(
 #: preserve the previous behavior so `benchmark_rust_rollout.py` and its
 #: recorded drift artifacts stay comparable; the training and calibration
 #: entrypoints state the measured decision explicitly.
-ROLLOUT_FORWARD_MODES = ("eager", "graph", "cudagraphs", "inductor", "inductor_default")
+#:
+#: `graph` replays the *eager* kernel sequence under one collector-owned CUDA
+#: graph: launch overhead goes, but the ~1,900 eager kernels of a structured
+#: step remain and inside a graph each still costs its own scheduling slot.
+#: `inductor_graph` captures the Inductor-fused forward instead -- the same
+#: `mode="default"` compilation as `inductor_default`, so no cudagraph-tree
+#: bookkeeping -- and replays the fused kernels through the same explicit
+#: `_CapturedStep`. It is fusion and capture together; `_CapturedStep`'s
+#: warmup runs compile before the capture begins, which is what the capture
+#: rules require.
+ROLLOUT_FORWARD_MODES = (
+    "eager",
+    "graph",
+    "cudagraphs",
+    "inductor",
+    "inductor_default",
+    "inductor_graph",
+)
 
 
 def _validate_forward_mode(mode: str) -> None:
@@ -1152,7 +1169,10 @@ def _validate_forward_mode(mode: str) -> None:
 
 #: Modes that reach the device through `torch.compile`, and so through
 #: `torch._inductor.cudagraph_trees`' generation bookkeeping.
-COMPILED_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor", "inductor_default")
+COMPILED_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor", "inductor_default", "inductor_graph")
+
+#: Modes the collector captures itself with `_CapturedStep`.
+CAPTURED_ROLLOUT_FORWARD_MODES = ("graph", "inductor_graph")
 
 #: The subset of those that lets `cudagraph_trees` capture rather than only
 #: fuse. Capture is what makes a forward's outputs live in a reused private
@@ -1191,7 +1211,7 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
         else:
             compiled = torch.compile(
                 model.forward,
-                mode="default" if mode == "inductor_default" else "reduce-overhead",
+                mode="reduce-overhead" if mode == "inductor" else "default",
                 fullgraph=True,
                 dynamic=False,
             )
@@ -1332,7 +1352,7 @@ class _StackedActorEnsemble:
             else:
                 compiled = torch.compile(
                     self._forward,
-                    mode="default" if mode == "inductor_default" else "reduce-overhead",
+                    mode="reduce-overhead" if mode == "inductor" else "default",
                     fullgraph=True,
                     dynamic=False,
                 )
@@ -2013,7 +2033,7 @@ def _collect_mixed_play_rust_wave(
         current_stream.wait_stream(frozen_forward_stream)
         return None, current, frozen
 
-    graphed = forward_mode == "graph" and device.type == "cuda"
+    graphed = forward_mode in CAPTURED_ROLLOUT_FORWARD_MODES and device.type == "cuda"
     step_graph: _CapturedStep[_StepOutputs] | None = None
 
     for step in range(horizon):
@@ -2556,7 +2576,7 @@ def collect_population_play_rust(
             )
         return ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
 
-    graphed = forward_mode == "graph" and device.type == "cuda"
+    graphed = forward_mode in CAPTURED_ROLLOUT_FORWARD_MODES and device.type == "cuda"
     step_graph: _CapturedStep[ActorOutput] | None = None
     for step in range(horizon):
         encoded_wave.refresh(environment)

@@ -187,6 +187,14 @@ def test_structured_benchmark_keeps_nextlat_state_and_rngs_per_batch_case(
             "1",
             "--quantity-rank",
             "4",
+            "--input-reinject-layers",
+            "",
+            "--core-skip-source",
+            "0",
+            "--core-skip-target",
+            "0",
+            "--mudd-lite",
+            "false",
         ],
     )
 
@@ -405,12 +413,13 @@ def test_the_report_and_the_collector_agree_on_the_collection_configuration(
     from kaggriculture.rollout import ROLLOUT_FORWARD_MODES
 
     cases = (
-        ((), "graph", True),
+        ((), "inductor_graph", True),
         (("--rollout-forward-mode", "eager", "--no-rollout-bfloat16"), "eager", False),
         (("--rollout-forward-mode", "cudagraphs"), "cudagraphs", True),
         (("--rollout-forward-mode", "inductor", "--no-rollout-bfloat16"), "inductor", False),
         (("--rollout-forward-mode", "inductor_default"), "inductor_default", True),
         (("--rollout-forward-mode", "graph"), "graph", True),
+        (("--rollout-forward-mode", "inductor_graph"), "inductor_graph", True),
     )
     # Every mode is evidence here, so adding one to the tuple without measuring
     # it fails rather than passing untested.

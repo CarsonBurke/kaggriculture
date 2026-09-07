@@ -64,11 +64,17 @@ PRODUCTION_TEMPERATURE = 1.0
 # shard join. The 719 environment transitions remain causally sequential, but
 # every game's work within each transition is parallel.
 #
-# `graph` is the collector-owned `torch.cuda.CUDAGraph`, not a
-# `torch.compile` mode. The collector holds its packed inputs at fixed device
-# addresses for the wave, captures the complete actor/league forward once, and
-# replays it thereafter. Owning the graph avoids Inductor cudagraph-tree
-# generation bookkeeping and preserves eager kernel identity.
+# `inductor_graph` is the collector-owned `torch.cuda.CUDAGraph` over the
+# Inductor-fused (`mode="default"`) actor/league forward. The collector holds
+# its packed inputs at fixed device addresses for the wave, compiles during the
+# capture warmup, captures the complete fused forward once, and replays it
+# thereafter. Owning the graph avoids Inductor cudagraph-tree generation
+# bookkeeping; fusing first is what removes the ~1,900 eager kernels per step
+# that the plain `graph` mode replays unchanged. Matched six-repeat MLQ runs at
+# production shape (artifacts/benchmarks/rollout-mode-{graph,inductor_graph}
+# .jsonl): steady rollout median 6.72 s -> 3.90 s (42%), and because the fused
+# kernels are the update path's own, the update-replay joint KL fell from
+# 8.3e-5/6.6e-5 to 5.4e-5/3.8e-5 with a zero tail fraction in both.
 #
 # Structured BF16 collection uses a native-BF16 inference replica while the
 # trainable actor remains FP32. Quantity heads stay FP32. The GPU/native action
@@ -87,7 +93,7 @@ PRODUCTION_TEMPERATURE = 1.0
 # BF16 matches the update precision and is guarded by replay-parity KL and tail
 # gates. `ROLLOUT_FORWARD_MODES` owns the valid mode strings; train_ppo.py
 # validates the configured mode.
-PRODUCTION_ROLLOUT_FORWARD_MODE = "graph"
+PRODUCTION_ROLLOUT_FORWARD_MODE = "inductor_graph"
 PRODUCTION_ROLLOUT_BFLOAT16 = True
 # The update knob's counterpart to the mode above, and the same kind of setting:
 # the calibrated knob reaches the command as a parameter, and this constant is
@@ -131,11 +137,13 @@ def production_model_config() -> dict[str, Any]:
         quantity_rank=32,
         global_refresh_layers=(),
         global_refresh_context="none",
-        input_reinject_layers=(),
-        core_skip_source=0,
-        core_skip_target=0,
+        # nanogpt residual transports. Gates start at 0 so they are identity
+        # until trained: x0 into every core layer, U-net skip 3→6, late MUDD.
+        input_reinject_layers=(1, 2, 3, 4, 5, 6, 7, 8),
+        core_skip_source=3,
+        core_skip_target=6,
         zero_init_branches=False,
-        mudd_lite=False,
+        mudd_lite=True,
         fuse_market_decoder=True,
         fuse_unit_decoder=False,
         split_clock_token=False,
@@ -161,15 +169,12 @@ def production_ppo_config(
     """The schedule the calibrated launcher runs and every benchmark measures.
 
     With 230,080 states, a 4096-row ceiling produces 57 balanced minibatches per
-    epoch. Two actor and two critic epochs therefore run 114 steps apiece. Their
-    independent CUDA streams overlap each paired actor/critic minibatch instead
-    of spending another two full passes fitting the critic to stale rollout
-    targets.
-
-    This deliberately trades the prior 2048-row throughput optimum for larger
-    device work. The batch sweep found 4096 2.2-4.8% slower than 2048 and 8192
-    unable to fit; cross-model stream overlap is what recovers otherwise idle
-    execution without changing either objective or minibatch partition.
+    epoch. Production is one actor epoch and one critic epoch on the same wave:
+    a second same-wave critic pass memorized holdout, and a second actor pass
+    is a replay at a KL that does not bind. Independent CUDA streams overlap
+    each paired actor/critic minibatch. NextLat shares that trunk pass: h_t and
+    h_{t+1} come from contiguous episode runs, and p_ψ steps on the same
+    backward as PPO.
     """
     from kaggriculture.ppo import PpoConfig
 

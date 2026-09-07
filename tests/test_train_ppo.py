@@ -48,7 +48,7 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert (args.league_active_opponents, args.league_historical_opponents) == (2, 6)
     assert args.league_active_pool_size == 16
     assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
-    assert (args.epochs, args.critic_epochs) == (2, 2)
+    assert (args.epochs, args.critic_epochs) == (1, 1)
     assert args.critic_lr == pytest.approx(2.5e-4)
     assert args.minibatch_size == 4096
     # An unflagged run is exactly the family's dataclass configuration, which
@@ -677,9 +677,9 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
     assert config["league_games"] == 64
     assert config["update_compile_mode"] == "default"
     assert config["device_type"] == "cpu"
-    # The explicit CUDA graph path is faster than eager without entering
-    # TorchInductor from the collector's worker threads.
-    assert config["rollout_forward_mode"] == "graph"
+    # The collector-owned CUDA graph over the Inductor-fused forward: fusion
+    # removes the eager kernel count, and capture removes the launch overhead.
+    assert config["rollout_forward_mode"] == "inductor_graph"
     # All three move what a resume would produce -- the collection pair moves the
     # sampled behavior policy and the update mode moves the graphs that consume
     # it -- so a resume that changes any of them is a different data generator
@@ -696,9 +696,9 @@ def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) 
 
 
 def test_collection_forward_defaults_to_the_measured_configuration(monkeypatch, tmp_path) -> None:
-    """The explicit CUDA graph path avoids Inductor's worker-thread cold-start
-    deadlock, preserves bitwise eager parity, and measured 7.270 s against
-    eager's 20.383 s on a production rollout."""
+    """The collector-owned CUDA graph over the Inductor-fused forward measured a
+    3.90 s steady rollout median against the eager-kernel graph's 6.72 s at
+    production shape, with lower update-replay drift."""
     module = _training_script()
 
     def parsed(*flags: str):
@@ -706,7 +706,7 @@ def test_collection_forward_defaults_to_the_measured_configuration(monkeypatch, 
         return module.parse_args()
 
     default = parsed()
-    assert default.rollout_forward_mode == "graph"
+    assert default.rollout_forward_mode == "inductor_graph"
     assert default.rollout_bfloat16 is True
     module._validate_args(default)
     assert not hasattr(default, "compile_rollout")
@@ -922,7 +922,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     run_provenance = module.run_provenance_from_decision(
         {
             "source_identity": module.source_identity(),
-            "rollout_forward_mode": "graph",
+            "rollout_forward_mode": "inductor_graph",
             "update_compile_mode": "default",
             "eager_report_sha256": "a" * 64,
             "eager_report_size_bytes": 100,

@@ -1812,3 +1812,56 @@ def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
         "rewards",
     ):
         np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_the_fused_capture_reproduces_the_fused_uncaptured_wave_exactly() -> None:
+    """`inductor_graph` owes `inductor_default` the contract `graph` owes `eager`.
+
+    The capture replays the fused kernels Inductor's default mode compiled, over
+    the same persistent buffers, so the two must agree bitwise. Compiling inside
+    a capture is forbidden by the runtime; the warmup compiles first, and this
+    is what confirms the captured region then replays -- rather than re-derives
+    -- the fused forward.
+    """
+    config = StructuredConfig(
+        model_dim=32,
+        attention_heads=4,
+        attention_kv_heads=2,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        opponent_latents=2,
+        latents=4,
+        core_layers=1,
+    )
+    actor = StructuredActor(config).cuda()
+    opponent = StructuredActor(config).cuda()
+
+    def collect(mode: str):
+        return collect_mixed_play_rust(
+            actor,
+            (opponent,),
+            self_play_games=1,
+            league_games=2,
+            opponent_indices=np.asarray([0, 0]),
+            seed_start=77,
+            sampling_seed=5,
+            forward_mode=mode,
+            forward_autocast=True,
+        )
+
+    reference = collect("inductor_default")
+    captured = collect("inductor_graph")
+
+    np.testing.assert_array_equal(captured.valid, reference.valid)
+    for name in (
+        "unit_actions",
+        "market_kinds",
+        "market_quantities",
+        "old_unit_logprobs",
+        "old_market_kind_logprobs",
+        "old_market_quantity_logprobs",
+        "rewards",
+    ):
+        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))

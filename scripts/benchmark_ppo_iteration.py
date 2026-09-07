@@ -808,6 +808,15 @@ def main() -> None:
                 "peak_cuda_bytes": (
                     torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
                 ),
+                "peak_cuda_reserved_bytes": (
+                    torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
+                ),
+                "current_cuda_allocated_bytes": (
+                    torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
+                ),
+                "current_cuda_reserved_bytes": (
+                    torch.cuda.memory_reserved(device) if device.type == "cuda" else 0
+                ),
                 "process_lifetime_max_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                 "actor_parameters": parameter_count(actor),
                 "critic_parameters": parameter_count(critic),
