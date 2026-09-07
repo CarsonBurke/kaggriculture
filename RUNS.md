@@ -80,9 +80,24 @@ not preempted. Queued work is not yet learning or throughput evidence:
 | 4880–4881 | Matched 32-map development panels, both seats, public v27, 2-hour deadlines | `evaluations/rl-repair-schema2-*-development.json` |
 | 4884 | Standard P100 retry, seed 20260812, production gates, 8-hour deadline, gated on 4880 success (bypasses OOM-failed bench 4878 that skipped 4879) — failed: mixed-tree launch (snapshot script + live package refused by launcher guard) | MLQ logs |
 | 4886 | Standard P100 retry of 4884 with `PYTHONPATH` pinned to the frozen snapshot `src` so launcher and package agree | `runs/rl-repair-schema2-p100/` |
-| 4890 | Screening 32-cluster panel of frozen `checkpoint-000079.pt` vs public v27 (selection evidence for the finalist) | `evaluations/rl-repair-schema2-p100-ckpt79-screening.json` |
-| 4891 | Finalist panel of `checkpoint-000079.pt` vs public v27, gated on 4890 | `evaluations/rl-repair-schema2-p100-ckpt79-finalist-v27.json` |
-| 4892 | Builtin 16-cluster panel of `checkpoint-000079.pt` vs starter, gated on 4890 | `evaluations/rl-repair-schema2-p100-ckpt79-starter.json` |
+| 4890–4892 | Screening/finalist/starter panels of frozen `checkpoint-000079.pt` — 4890 cancelled by request, 4891/4892 skipped; superseded by 4901–4903 | — |
+| 4901 | Screening 32-cluster panel of frozen `checkpoint-000079.pt` vs public v27 (selection evidence for the finalist) | `evaluations/rl-repair-schema2-p100-ckpt79-screening.json` |
+| 4902 | Finalist panel of `checkpoint-000079.pt` vs public v27, gated on 4901 | `evaluations/rl-repair-schema2-p100-ckpt79-finalist-v27.json` |
+| 4903 | Builtin 16-cluster panel of `checkpoint-000079.pt` vs starter, gated on 4901 | `evaluations/rl-repair-schema2-p100-ckpt79-starter.json` |
+| 4901–4903 | Superseded before start by the finished iteration-100 chain below (no attempts ran) — 4901 cancelled, 4902/4903 skipped | — |
+| 4909–4911 | Checkpoint-100 chain without snapshot `PYTHONPATH` — 4909 failed the provenance gate (live workspace tree `64758a2e` vs bound `b11fce31`), 4910/4911 skipped | MLQ logs |
+| 4917 | Screening 32-cluster panel of frozen `checkpoint-000100.pt` vs public v27 with snapshot `PYTHONPATH` — passed, 64/64 games, valid | `evaluations/rl-repair-schema2-p100-ckpt100-screening.json` |
+| 4918/4921 | Finalist attempts with the raw screening report as selection evidence — failed, report carries no `best_output_sha256` binding | MLQ logs |
+| 4919 | Builtin 16-cluster panel of `checkpoint-000100.pt` vs starter (screening domain) — passed, 1.0, valid, but not admissible for packaging | `evaluations/rl-repair-schema2-p100-ckpt100-starter.json` |
+| 4920 | Selection report without `--best-output` — succeeded but unusable (no frozen-bytes attestation); superseded by 4922 | `evaluations/rl-repair-schema2-p100-ckpt100-selection.json` (overwritten) |
+| 4922 | Selection with `--best-output` freezing `ckpt100-selected.pt` (`54681e7b`) — passed, valid | `evaluations/rl-repair-schema2-p100-ckpt100-selection.json` |
+| 4923 | Finalist panel of frozen `ckpt100-selected.pt` vs public v27 — passed, 1.0 over 64 games, valid | `evaluations/rl-repair-schema2-p100-ckpt100-finalist-v27.json` |
+| 4924 | Builtin development-domain panel of frozen bytes vs starter — passed, 1.0, valid | `evaluations/rl-repair-schema2-p100-ckpt100-starter-dev.json` |
+| 4925 | Isolated full-horizon validation of `submission-ckpt100.tar.gz` (`674df801`) — passed | `runs/rl-repair-schema2-p100/submission-ckpt100-validation.json` |
+| — | Kaggle submission of `submission-ckpt100.tar.gz` to `kaggriculture` — accepted | `runs/rl-repair-schema2-p100/submission-ckpt100.tar.gz` |
+| 5038 | P100 from e2 BC — failed: retain-graph NextLat clip OOM, then incomplete CUDA event timing | MLQ logs |
+| 5039 | Retry of 5038 — failed iter 8: CUDA fragmentation OOM during critic persistence diagnostic | `runs/rl-repair-schema2-e2-p100/` |
+| 5041 | Retry: expandable CUDA segments, persistence diagnostic only on `diagnostic_gradients`, snapshot `6eed3b76`, 12-hour deadline | `runs/rl-repair-schema2-e2-p100/` |
 
 BC uses the four current v16 64-seed corpora, an 8-seed holdout per corpus,
 batch 2,048, run length 4, compiled BF16 and the complete standard optimizer
