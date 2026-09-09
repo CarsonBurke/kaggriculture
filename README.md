@@ -212,6 +212,34 @@ the chain.
 Sweep with `--games 64,112,128,256` when the question is scaling or memory
 headroom, which is a separate study from this one.
 
+For VRAM comparisons, read `peak_cuda_reserved_bytes` alongside
+`peak_cuda_bytes` (peak live allocations). The iteration records also expose
+`current_cuda_allocated_bytes` and `current_cuda_reserved_bytes` after the
+update, so retained tensors can be distinguished from allocator caches.
+PPO reuses one actor/critic CUDA stream pair per thread and device: drawing
+fresh streams each iteration strands reusable activation blocks in separate
+stream-local caches. This preserves actor/critic overlap without changing
+precision, batch size, or the training objective; do not replace it with
+per-iteration `empty_cache()`, which discards the working set.
+
+NextLat jointly trains each updating source model and its predictor with one
+combined PPO/value-plus-auxiliary backward. Successor beliefs and auxiliary
+readout weights are stop-gradient; source beliefs remain attached. Actor
+critic-warmup and KL-stop phases still freeze the actor while fitting its
+predictor. Fresh-wave persistence scores are diagnostic only.
+
+CPU-derived successor plans compact prediction to eligible source rows, padded
+into bounded aligned shapes. Padding contributes neither loss nor gradient;
+recursive ancestry and loss denominators are unchanged. Critic value KL masks
+rows after reducing its singleton token dimension, avoiding cross-batch
+broadcasting. Field-wise latent/RMS reductions avoid joined-belief temporaries.
+
+Diagnostic iterations observe auxiliary source-belief cotangents through
+zero-copy branch views during that same backward. There are no extra diagnostic
+backwards or retained-graph compiler variants; ordinary buffer donation remains
+enabled. Captured rollout forwards include fixed-index scatter and are submitted
+before CPU trajectory storage to overlap device work with host copies.
+
 Training uses discount-correct, exactly zero-sum potential shaping. Let `L[i,t]`
 be player `i`'s actual liquid assets: bank money plus the exact proceeds from
 selling every held product at the current market curve. With the game-defined
@@ -264,8 +292,8 @@ population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
 rarely binds.
 
 Entropy is measured but not optimized. The main actor objective is clipped PPO;
-production additionally gates a one-step future-policy KL auxiliary. The critic
-has separate one-step latent and decoded-value prediction auxiliaries. Production
+production jointly optimizes a one-step future-policy KL auxiliary. The critic
+jointly optimizes one-step latent and decoded-value prediction auxiliaries. Production
 uses one learner with 128 self-play games and 64 league games per wave (320
 learner trajectories). Stale matchup evidence for built-ins and snapshots decays
 toward 0.5 alike, so formerly easy opponents can become contested again.
@@ -295,18 +323,20 @@ shed and carried-stock tokens, and public farmer/hand occupancy on both farms.
 Opponent private stocks remain critic-only. Rebuild native encoding and BC caches
 and train fresh actors: old structured model artifacts are rejected, not migrated.
 
-Predictor gate v3 compares each active loss against persistence on the same fresh
-wave with fixed encoder/readout weights. A zero persistence loss is uninformative,
-not a success or an infinite ratio; later waves are reconsidered. Readiness needs
-the configured consecutive passes and is revoked on failure. Preupdate telemetry
-also compares shuffled learner actions. Predictor fitting and these diagnostics
-have separate synchronized timings.
+Fresh-wave persistence diagnostics compare each active loss with no-change
+prediction through the same encoder/readout. A zero baseline is uninformative,
+not evidence of success. Ratios never enable or disable representation learning.
+Predictor fitting and preupdate diagnostics have separate synchronized timings.
+Recovery checkpoint format 14 records the ungated joint-learning contract;
+older checkpoints remain readable for actor extraction, not training resume.
 
 `credit_preupdate_*` reports critic error against terminal utility after removing
 the shaping potential, including a potential-only baseline, grouped by opponent
 and time-to-go. High shaped-return explained variance alone is not evidence of
-long-horizon prediction. Every 25 iterations, bounded gradient diagnostics report
-main/auxiliary norms and cosine without changing the optimizer update.
+long-horizon prediction. Every 25 iterations, gradient diagnostics report
+`structured_gradient_source_norm` and `structured_critic_gradient_source_norm`:
+NextLat's source-belief cotangent norms, not parameter-gradient norms or
+main/auxiliary cosine estimates. Observation does not change optimizer updates.
 
 Fresh production training must be initialized from a BC actor through
 `--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no

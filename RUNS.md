@@ -327,5 +327,39 @@ Append one row immediately when a run family completes.
 | ID | Source revision | Run paths | Seeds | BC NLL | Public-v27 score/margin | Public-v16 score/margin | BC s/epoch | PPO s/iter | Decision | New champion |
 |---|---|---|---:|---:|---|---|---:|---:|---|---|
 | V0 | Recorded in artifacts | `runs/ab-structured-s1`, `runs/econ-pastself-100-structured` | 1 / 20260813 | 0.0008224 | Recorded external panel | 0.84375 score rate after PPO | 8.86 steady | 27.98 steady | Current anchor | V0 |
+| VRAM-20260908 | BC `1a92bd83`; RL `2f669120` | `runs/production-vram-bc-20260908`, `runs/production-vram-p100-20260908-r3` | BC default / 20260812 | 0.00178258 | Not evaluated | Not evaluated | 222.02 cold; 26.36 second | Not a matched throughput comparison | BC complete; P100 interrupted by kernel global OOM after iteration 56, recovery at 39; no promotion | — |
 
 Promotion decisions must name the evidence and the rejected tradeoff. “Lower loss” or “faster” alone is not a decision.
+
+### VRAM run recovery, 2026-09-08
+
+Current production residual transports required a new compatible BC artifact
+(MLQ 5636, two default epochs over the four current v16 corpora). The CUDA-stream
+reuse change itself did not require BC. PPO kept the production 4096-row
+minibatch ceiling, BF16, compiled collection/update, learning gates and seed.
+The CPU-only external evaluation sidecar was disabled; no play-strength claim
+is made from self-play metrics.
+
+Real runs exposed two repaired update blockers: fresh-wave persistence scores
+were incorrectly restricted to gradient-diagnostic iterations, and retained
+gradient diagnostics were incompatible with donating compiled backward graphs.
+The final diagnostic-only compiler variants disable both AOT donation and
+Inductor in-place reuse; ordinary minibatches retain their existing policy.
+MLQ 5654 passed 138 tests, and 5655 passed the fresh-process repeated-backward
+cache regression. Independent review found no remaining actionable issue.
+
+MLQ 5656 passed real diagnostic iterations 26 and 51 and completed iteration 56
+before the kernel killed its process in a global host-memory OOM. The workstation
+had exhausted approximately 60 GiB RAM and 60 GiB swap, with active swapping
+and 10–15% CPU I/O wait; browser/Orca processes were also OOM-killed. This is
+not a completed P100 or a clean throughput measurement. The last reported
+Monte Carlo-return explained variance was 0.8452.
+
+Verified recovery artifact:
+`runs/production-vram-p100-20260908-r3/checkpoint-000039.pt`
+(SHA-256 `97d41d8dd5c6746beaae303e103efb96db04db0dfacd7365ba454920dda631e4`).
+Resume it under the original frozen `2f669120` source after sustained host-memory
+headroom is available; do not retrain BC or bypass checkpoint source identity.
+There are 61 iterations remaining from that durable checkpoint. The full
+source digest, job chain, validation, and exact continuation command are in
+`artifacts/probes/vram-20260907/training-run.json`. No automatic retry remains queued.
