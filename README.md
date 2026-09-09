@@ -222,17 +222,29 @@ stream-local caches. This preserves actor/critic overlap without changing
 precision, batch size, or the training objective; do not replace it with
 per-iteration `empty_cache()`, which discards the working set.
 
-NextLat jointly trains each updating source model and its predictor with one
-combined PPO/value-plus-auxiliary backward. Successor beliefs and auxiliary
-readout weights are stop-gradient; source beliefs remain attached. Actor
-critic-warmup and KL-stop phases still freeze the actor while fitting its
+NextLat jointly trains each updating source model and its independent predictor
+with one combined PPO/value-plus-auxiliary backward. Production uses coefficient
+1 for both SmoothL1 and decoded KL, at horizon 1, on each model's normalized
+head inputs: actor unit/market decision tokens and the critic's single value
+token. Successor representations and auxiliary readout weights are stop-gradient;
+source representations remain attached. The actor's exposed unit belief is
+already normalized, so its frozen decoder does not normalize it again.
+
+PPO has no patch, economy, or opponent-state prediction objectives. Its actor
+predictor reads decision representations and actions; its critic predictor reads
+the value representation and actions. Existing BC-only world-feature experiments
+remain separate from this PPO contract; they are not evidence for a world model.
+Actor critic-warmup and KL-stop phases still freeze the actor while fitting its
 predictor. Fresh-wave persistence scores are diagnostic only.
 
-CPU-derived successor plans compact prediction to eligible source rows, padded
-into bounded aligned shapes. Padding contributes neither loss nor gradient;
-recursive ancestry and loss denominators are unchanged. Critic value KL masks
-rows after reducing its singleton token dimension, avoiding cross-batch
-broadcasting. Field-wise latent/RMS reductions avoid joined-belief temporaries.
+Contiguous validity segments receive independent random partition phases before
+their bounded runs are shuffled. Every valid state appears once in the primary
+epoch; auxiliary transition subsampling no longer aliases daily rollovers.
+CPU-derived successor plans require every intervening step to belong to the
+same contiguous trajectory, then compact eligible sources into bounded aligned
+shapes. Padding contributes neither loss nor gradient. Critic value KL reduces
+its singleton token dimension before masking rows, avoiding cross-batch
+broadcasting.
 
 Diagnostic iterations observe auxiliary source-belief cotangents through
 zero-copy branch views during that same backward. Ordinary and observed calls
@@ -335,8 +347,9 @@ Fresh-wave persistence diagnostics compare each active loss with no-change
 prediction through the same encoder/readout. A zero baseline is uninformative,
 not evidence of success. Ratios never enable or disable representation learning.
 Predictor fitting and preupdate diagnostics have separate synchronized timings.
-Recovery checkpoint format 14 records the ungated joint-learning contract;
-older checkpoints remain readable for actor extraction, not training resume.
+Recovery checkpoint format 15 records head-only NextLat and the critic's final
+value normalization. Older checkpoints remain readable for actor extraction,
+not training resume; old critic/predictor states are not migrated.
 
 `credit_preupdate_*` reports critic error against terminal utility after removing
 the shaping potential, including a potential-only baseline, grouped by opponent
