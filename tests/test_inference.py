@@ -189,8 +189,6 @@ def test_actor_export_strips_all_critic_and_predictor_recovery_state() -> None:
         ),
     )
 
-    assert CHECKPOINT_FORMAT_VERSION == 13
-    assert 12 in LEGACY_CHECKPOINT_FORMAT_VERSIONS
     for checkpoint, agent in checkpoints:
         artifact = actor_artifact_from_checkpoint(checkpoint, agent=agent)
         assert training_only.isdisjoint(artifact)

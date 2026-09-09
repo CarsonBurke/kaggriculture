@@ -102,10 +102,10 @@ historical reward used `gamma = 1.0`. Current training uses discount-correct
 potential shaping at `gamma = 0.997`; the old probe remains evidence about
 optimizer scale, not a measurement of the new return distribution.
 
-A side measurement that does not concern Muon: `partitions[*].
-minibatch_fraction_above_clip` is 1.000 in all 1264 minibatches, so
-`PpoConfig.max_gradient_norm` binds on every step.  See its comment in
-`kaggriculture.ppo`.
+The update path leaves the policy and critic gradients unclipped. This probe
+therefore reports raw minibatch gradient norms without a clip-pressure metric.
+`PpoConfig.nextlat_max_gradient_norm` applies only to standalone NextLat
+predictors, which this policy-only measurement does not construct.
 
 What this CANNOT tell you: it measures the PREMISE of Muon on one operating
 point's gradients, not the end-to-end effect of training with Muon.  It says
@@ -391,14 +391,9 @@ def full_batch_gradient(context: GradientContext, order: np.ndarray) -> Tensor:
 def minibatch_gradients(
     context: GradientContext, order: np.ndarray
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Per-minibatch policy gradients over one partition of the rollout.
-
-    Each row is `grad(-policy_sum / component_count)` for one minibatch: the
-    quantity a Muon momentum buffer would accumulate, one optimizer step's worth
-    of gradient. Returned unclipped; `update_ppo` renormalizes each minibatch by
-    `clip_grad_norm_`, which is a per-minibatch rescale that would change the
-    direction of an average of several, so the norms are reported alongside for
-    the reader to judge how much of the batch that bound would have touched.
+    """Each row is `grad(-policy_sum / component_count)` for one minibatch. The
+    returned gradients are the raw optimizer inputs; `update_ppo` does not
+    rescale PPO actor gradients before the optimizer step.
     """
     device = context.staged["unit_actions"].device
     ordered = torch.from_numpy(order).to(device=device)
@@ -976,9 +971,7 @@ def main() -> None:
                 "minibatch_gradient_norm_median": float(norms.median()),
                 "minibatch_gradient_norm_min": float(norms.min()),
                 "minibatch_gradient_norm_max": float(norms.max()),
-                "minibatch_fraction_above_clip": float(
-                    (norms > config.max_gradient_norm).double().mean()
-                ),
+                "minibatch_gradient_norm_rms": float(norms.square().mean().sqrt()),
             }
         )
         for accumulator in accumulators:
@@ -1044,7 +1037,7 @@ def main() -> None:
             "rollout_bfloat16": args.rollout_bfloat16,
             "clip_low": config.clip_low,
             "clip_high": config.clip_high,
-            "max_gradient_norm": config.max_gradient_norm,
+            "nextlat_max_gradient_norm": config.nextlat_max_gradient_norm,
             "actor_gae_lambda": config.actor_gae_lambda,
             "gamma": config.gamma,
             "device": torch.cuda.get_device_name(device),

@@ -20,6 +20,8 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 14 makes NextLat joint and ungated and removes predictor gate recovery
+# state. Old checkpoints remain exportable as actors, not resumable training.
 # Version 13 adds a critic-side structured dynamics predictor and its optimizer
 # to full recovery checkpoints. Both dynamics modules remain training-only, so
 # actor export can still read version 12 as well as the new format without
@@ -59,11 +61,11 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 13
-# Versions before 13 remain readable on the actor-only path because the recovery
+CHECKPOINT_FORMAT_VERSION = 14
+# Versions before 14 remain readable on the actor-only path because the recovery
 # additions do not change actor weights or model configuration. Resume demands
 # the current version exactly and never guesses absent training state.
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12))
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12, 13))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,

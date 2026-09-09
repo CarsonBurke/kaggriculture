@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch._functorch.config
 
 import kaggriculture.ppo
 from kaggriculture import telemetry
@@ -24,13 +25,14 @@ from kaggriculture.ppo import (
     PpoConfig,
     _actor_batch_args,
     _balanced_minibatch_slices,
+    _cached_update_callable,
     _clipped_surrogate_sums,
     _contiguous_run_indices,
     _credit_quality_metrics,
     _epoch_value_losses,
     _explained_variance,
     _fit_explained_variance,
-    _gradient_contributions,
+    _observe_auxiliary_gradient,
     _stage_tensor,
     _structured_auxiliary_terms,
     _structured_critic_auxiliary_terms,
@@ -65,6 +67,7 @@ from kaggriculture.structured_dynamics import (
     StructuredCriticDynamics,
     StructuredDynamics,
     _active_belief_fields,
+    structured_horizon_plan,
 )
 
 
@@ -1164,7 +1167,7 @@ def test_one_ppo_update_is_finite() -> None:
     assert not unfiled, unfiled
 
 
-def test_policy_and_critic_head_are_excluded_from_global_gradient_clipping(
+def test_policy_and_critic_gradients_are_not_clipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor, critic = _small_update_models()
@@ -1180,7 +1183,7 @@ def test_policy_and_critic_head_are_excluded_from_global_gradient_clipping(
         optimizer="adamw",
         epochs=1,
         minibatch_size=1 << 12,
-        max_gradient_norm=1.0e-8,
+        nextlat_max_gradient_norm=1.0e-8,
         use_bfloat16=False,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
@@ -1203,14 +1206,8 @@ def test_policy_and_critic_head_are_excluded_from_global_gradient_clipping(
         generator=np.random.default_rng(13),
     )
 
-    actor_parameters = {id(parameter) for parameter in actor.parameters()}
-    critic_head = {id(parameter) for parameter in critic.value_head.parameters()}
-    critic_trunk = {id(parameter) for parameter in critic.parameters()} - critic_head
-    assert clipped_parameter_sets
-    assert all(parameters <= critic_trunk for parameters in clipped_parameter_sets)
-    assert all(not (parameters & actor_parameters) for parameters in clipped_parameter_sets)
-    assert all(not (parameters & critic_head) for parameters in clipped_parameter_sets)
-    assert metrics["actor_gradient_norm"] > config.max_gradient_norm
+    assert clipped_parameter_sets == []
+    assert metrics["actor_gradient_norm"] > config.nextlat_max_gradient_norm
     assert metrics["critic_gradient_norm"] == pytest.approx(
         math.hypot(
             metrics["critic_trunk_gradient_norm"],
@@ -1332,11 +1329,18 @@ def test_nonfinite_critic_gradient_uses_found_inf_without_committing(
         name: parameter.detach().clone() for name, parameter in critic.named_parameters()
     }
 
-    def inject_critic_inf(parameters, *_args, **_kwargs):
-        materialized = tuple(parameters)
-        return materialized[0].new_tensor(float("inf"))
+    original_norm = torch.nn.utils.get_total_norm
+    norm_calls = 0
 
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", inject_critic_inf)
+    def inject_critic_inf(parameters, *args, **kwargs):
+        nonlocal norm_calls
+        norm_calls += 1
+        materialized = tuple(parameters)
+        if norm_calls == 2:
+            return materialized[0].new_tensor(float("inf"))
+        return original_norm(materialized, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "get_total_norm", inject_critic_inf)
 
     with pytest.raises(FloatingPointError, match="non-finite critic loss or gradient norm"):
         update_ppo(
@@ -1885,6 +1889,8 @@ def test_structured_window_loss_matches_generic_masked_unroll() -> None:
         minibatch_size=1 << 12,
         use_bfloat16=False,
         structured_decision_coefficient=0.5,
+        structured_patch_coefficient=0.5,
+        structured_economy_coefficient=0.5,
         structured_opponent_summary_coefficient=0.5,
         structured_opponent_patch_coefficient=0.5,
         structured_decision_horizon=2,
@@ -1940,10 +1946,26 @@ def test_structured_window_loss_matches_generic_masked_unroll() -> None:
             belief_indices=belief_indices,
             belief_inverse=belief_inverse,
         )
+        episodes, steps = np.divmod(indices.numpy(), rollout.valid.shape[1])
+        compact_loss, compact = _structured_auxiliary_terms(
+            actor,
+            dynamics,
+            staged,
+            indices,
+            steps_per_trajectory=rollout.valid.shape[1],
+            config=config,
+            autocast_enabled=False,
+            model_grad=False,
+            complete_windows=False,
+            plan=structured_horizon_plan(episodes, steps, 2),
+        )
 
     torch.testing.assert_close(window_loss, generic_loss)
     for window_value, generic_value in zip(windowed, generic, strict=True):
         torch.testing.assert_close(window_value, generic_value)
+    torch.testing.assert_close(compact_loss, generic_loss)
+    for compact_value, generic_value in zip(compact, generic, strict=True):
+        torch.testing.assert_close(compact_value, generic_value)
 
 
 def test_multistep_structured_dynamics_activates_central_workspace() -> None:
@@ -2025,7 +2047,7 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy(
         structured_opponent_patch_coefficient=0.5,
         structured_decision_horizon=2,
         structured_patch_horizon=1,
-        max_gradient_norm=1.0e-4,
+        nextlat_max_gradient_norm=1.0e-4,
     )
     dynamics = StructuredDynamics(_small_structured_config())
     control_optimizers = make_optimizers(control_actor, control_critic, control_config)
@@ -2093,7 +2115,7 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy(
         + active_metrics["actor_updates"]
         + active_metrics["updates"]
     )
-    assert active_metrics["actor_gradient_norm"] > active_config.max_gradient_norm
+    assert active_metrics["actor_gradient_norm"] > active_config.nextlat_max_gradient_norm
     assert predictor_requires_grad
     assert all(predictor_requires_grad)
     assert all(parameter.requires_grad for parameter in dynamics.parameters())
@@ -2103,6 +2125,12 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy(
     for name in (
         "structured_preupdate_combined",
         "structured_preupdate_decision",
+        "structured_preupdate_persistence_combined",
+        "structured_preupdate_persistence_decision",
+        "structured_preupdate_persistence_patch",
+        "structured_preupdate_persistence_economy",
+        "structured_preupdate_persistence_opponent_summary",
+        "structured_preupdate_persistence_opponent_patches",
         "structured_actor_opponent_summary",
         "structured_actor_opponent_patches",
         "structured_actor_opponent_patch_all",
@@ -2174,6 +2202,17 @@ def test_structured_predictor_trains_during_critic_only_warmup_without_actor_gra
         not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
     )
     assert all(parameter.grad is None for parameter in actor.parameters())
+    # Warmup still advances the fresh-wave gate, even without gradient diagnostics.
+    gate_fields = (
+        "combined",
+        "decision",
+        "patch",
+        "economy",
+        "opponent_summary",
+        "opponent_patches",
+    )
+    for name in gate_fields:
+        assert math.isfinite(metrics[f"structured_preupdate_persistence_{name}"])
 
 
 def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
@@ -2202,9 +2241,7 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
     actor_parameters = {id(parameter) for parameter in actor.parameters()}
     critic_head_ids = {id(parameter) for parameter in critic.value_head.parameters()}
     critic_trunk_parameters = {
-        id(parameter)
-        for parameter in critic.parameters()
-        if id(parameter) not in critic_head_ids
+        id(parameter) for parameter in critic.parameters() if id(parameter) not in critic_head_ids
     }
     backward_calls = 0
     clipped_parameter_sets: list[set[int]] = []
@@ -2282,7 +2319,7 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
                 if parameter.grad is not None
             ]
         )
-        <= config.max_gradient_norm + 1e-7
+        <= config.nextlat_max_gradient_norm + 1e-7
     )
     assert (
         torch.nn.utils.get_total_norm(
@@ -2292,7 +2329,7 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
                 if parameter.grad is not None
             ]
         )
-        <= config.max_gradient_norm + 1e-7
+        <= config.nextlat_max_gradient_norm + 1e-7
     )
     assert model_clock_observations[0] == (0, 0, 0, 0)
     assert actor_optimizer.param_groups[0]["warmup_step"] == metrics["actor_updates"]
@@ -2315,6 +2352,9 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
         "structured_critic_preupdate_combined",
         "structured_critic_preupdate_latent",
         "structured_critic_preupdate_value",
+        "structured_critic_preupdate_persistence_combined",
+        "structured_critic_preupdate_persistence_latent",
+        "structured_critic_preupdate_persistence_value",
         "structured_critic_latent",
         "structured_critic_value",
     ):
@@ -3058,13 +3098,55 @@ def test_credit_diagnostics_distinguish_potential_fit_from_terminal_skill() -> N
     assert all(math.isfinite(value) for value in baseline.values())
 
 
-def test_gradient_diagnostic_measures_opposition_without_accumulating_gradients() -> None:
-    model = torch.nn.Linear(2, 1, bias=False)
-    main = model.weight.sum()
-    auxiliary = -2.0 * model.weight.sum()
-    measured = _gradient_contributions(main, auxiliary, model)
-    assert measured["auxiliary_to_main"] == pytest.approx(2.0)
-    assert measured["cosine"] == pytest.approx(-1.0)
-    assert model.weight.grad is None
-    (main + auxiliary).backward()
-    torch.testing.assert_close(model.weight.grad, -torch.ones_like(model.weight))
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_auxiliary_gradient_observation_preserves_single_backward_updates(compiled) -> None:
+    from kaggriculture.structured import StructuredBelief
+
+    model = torch.nn.Linear(16, 16, bias=False, device="cuda")
+    reference = copy.deepcopy(model)
+    inputs = torch.linspace(-1, 1, 512, device="cuda").reshape(32, 16)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    mode = "default" if compiled else "eager"
+    forward = _cached_update_callable(model, "_gradient_probe", model.forward, mode)
+
+    def auxiliary(*fields):
+        return sum(field.float().sin().square().mean() for field in fields)
+
+    auxiliary_fn = _cached_update_callable(model, "_auxiliary_probe", auxiliary, mode)
+    for observed in (False, True, False, True):
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = forward(inputs)
+            reference_output = reference(inputs)
+        belief = StructuredBelief(*(output[:, None, :] for _ in StructuredBelief._fields))
+        squares = []
+        source = _observe_auxiliary_gradient(belief, squares) if observed else belief
+        auxiliary_loss = auxiliary_fn(*source)
+        # Primary gradients deliberately oppose the auxiliary. A hook on shared
+        # outputs rather than the auxiliary-only views would include this term.
+        primary_loss = -3 * output.float().square().mean()
+        (primary_loss + auxiliary_loss).backward()
+        reference_auxiliary = auxiliary(
+            *(reference_output[:, None, :] for _ in StructuredBelief._fields)
+        )
+        (-3 * reference_output.float().square().mean() + reference_auxiliary).backward()
+        if observed:
+            expected = (
+                (2 * output.detach().float().sin() * output.detach().float().cos() / output.numel())
+                .to(output.dtype)
+                .float()
+            )
+            torch.testing.assert_close(
+                torch.stack(squares).sum(),
+                expected.square().sum() * len(StructuredBelief._fields),
+                rtol=1e-2,
+                atol=2e-5,
+            )
+        torch.testing.assert_close(model.weight.grad, reference.weight.grad, rtol=1e-2, atol=2e-4)
+        optimizer.step()
+        reference_optimizer.step()
+        torch.testing.assert_close(model.weight, reference.weight, rtol=2e-3, atol=5e-5)

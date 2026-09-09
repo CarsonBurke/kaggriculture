@@ -80,10 +80,10 @@ def test_polar_express_flattens_the_spectrum_without_exploding_it(
 def test_polar_express_is_invariant_to_the_scale_of_its_input(shape: tuple[int, int]) -> None:
     """The property that removes gradient clipping's effective-rate variation.
 
-    `max_gradient_norm` rescales every gradient in this trainer, so a matrix
-    optimizer that responded to that scale would inherit a learning rate that
-    varied minibatch to minibatch. Measured in bfloat16 this same check fails
-    at 5-16%, which is why `polar_express` runs in fp32.
+    PPO actor and critic gradients are not clipped, so their matrix optimizer
+    receives the raw scale. This check ensures Polar Express itself is
+    invariant to that scale. Measured in bfloat16 this same check fails at
+    5-16%, which is why `polar_express` runs in fp32.
     """
 
     matrix = _decaying_spectrum(shape)

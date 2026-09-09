@@ -593,20 +593,24 @@ def test_nextlat_actor_and_critic_metrics_have_deliberate_separate_categories() 
     expected = {
         "structured_preupdate_decision": "nextlat-actor-holdout-decision/decision",
         "structured_predictor_combined": "nextlat-actor-predictor/combined",
-        "structured_gate_passed": "nextlat-actor-gate/passed",
-        "structured_gate_actor_enabled_next": "nextlat-actor-gate/actor_enabled_next",
+        "structured_persistence_combined_ratio": "nextlat-actor-persistence/combined_ratio",
+        "structured_persistence_decision_informative": (
+            "nextlat-actor-persistence/decision_informative"
+        ),
         "structured_actor_decision": "nextlat-actor-auxiliary-decision/decision",
         "structured_critic_preupdate_value": "nextlat-critic-holdout-loss/value",
         "structured_critic_predictor_latent": "nextlat-critic-predictor-loss/latent",
-        "structured_critic_gate_passed": "nextlat-critic-gate/passed",
-        "structured_critic_gate_enabled_next": "nextlat-critic-gate/enabled_next",
+        "structured_critic_persistence_combined_ratio": (
+            "nextlat-critic-persistence/combined_ratio"
+        ),
+        "structured_critic_persistence_value_informative": (
+            "nextlat-critic-persistence/value_informative"
+        ),
         "structured_critic_value": "nextlat-critic-auxiliary-loss/value",
         "structured_learning_rate": "nextlat-schedule/actor_learning_rate",
         "structured_critic_learning_rate": "nextlat-schedule/critic_learning_rate",
-        "structured_gradient_cosine": "nextlat-actor-gradients/cosine",
-        "structured_critic_gradient_auxiliary_to_main": (
-            "nextlat-critic-gradients/auxiliary_to_main"
-        ),
+        "structured_gradient_source_norm": "nextlat-actor-gradients/source_norm",
+        "structured_critic_gradient_source_norm": ("nextlat-critic-gradients/source_norm"),
         "credit_preupdate_opponent_scripted_v27_ttg_33_128_terminal_residual_mse": (
             "credit-opponent-scripted-v27-ttg-33-128/terminal_residual_mse"
         ),

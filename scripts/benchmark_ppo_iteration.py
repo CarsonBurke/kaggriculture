@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         choices=("off", "predictor", "enabled"),
         default="enabled",
         help="isolate ordinary PPO, predictor fitting, or predictor plus source updates; "
-        "enabled measures auxiliary-active cost, not production readiness",
+        "enabled measures production joint NextLat updates",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(

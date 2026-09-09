@@ -58,10 +58,10 @@ What is deliberately NOT ported:
 An important interaction with the rest of this trainer: Polar Express opens by
 dividing its input by that input's Frobenius norm, so a NorMuon step is
 invariant to any uniform rescaling of the gradient. PPO therefore leaves the
-policy gradient unclipped and applies `max_gradient_norm` only to actor-side
-NextLat and the critic trunk. The categorical value head is excluded as well;
-NorMuon's matrix directions would be scale-invariant, while Adam-managed gains,
-biases, and heads would otherwise inherit a variable effective rate.
+policy and critic gradients unclipped and applies `nextlat_max_gradient_norm`
+only to the actor-side and critic-side NextLat predictors. The categorical
+value head remains Adam-managed; unlike predictor parameters, it has no
+auxiliary gradient safeguard to clip.
 """
 
 from __future__ import annotations

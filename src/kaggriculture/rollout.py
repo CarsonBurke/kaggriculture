@@ -1418,9 +1418,8 @@ def _mark_cuda_graph_step(device: torch.device, enabled: bool) -> None:
 _CUDA_GRAPH_GENERATION = threading.Lock()
 
 
-#: What one step's forward region produces: either a single whole-wave actor
-#: output, or the current-policy and frozen-opponent outputs of a league wave.
-#: Exactly one of the two shapes is populated, which the consumers assert.
+#: A device-assembled whole-wave output, or the separate current/frozen
+#: outputs that the CPU sampling path assembles after host transfer.
 _StepOutputs = tuple["ActorOutput | None", "ActorOutput | None", "ActorOutput | None"]
 
 #: Whatever a captured region returns. The mixed-play wave and the population
@@ -1431,6 +1430,23 @@ _Captured = TypeVar("_Captured")
 # Capture switches the caching allocator to a private pool. Serialize this
 # once-per-collection operation against any other collector in the process.
 _CUDA_GRAPH_CAPTURE = threading.Lock()
+_ROLLOUT_STREAMS = threading.local()
+
+
+def _rollout_cuda_streams(device: torch.device) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    """Keep capture/warmup and frozen activation owners stable across waves.
+
+    Like PPO's stream pair, these are thread/device-owned rather than
+    shape-owned. Only streams persist: inputs, outputs and graphs remain owned
+    by the collecting wave, and every use establishes its own dependencies.
+    """
+    streams = getattr(_ROLLOUT_STREAMS, "devices", None)
+    if streams is None:
+        streams = _ROLLOUT_STREAMS.devices = {}
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in streams:
+        streams[index] = (torch.cuda.Stream(device=index), torch.cuda.Stream(device=index))
+    return streams[index]
 
 
 class _CapturedStep(Generic[_Captured]):
@@ -1463,7 +1479,7 @@ class _CapturedStep(Generic[_Captured]):
             # The documented recipe: warm up on a side stream so that allocator
             # growth, cuBLAS handle creation, and any lazy kernel load happen
             # before the capture rather than inside it.
-            side = torch.cuda.Stream()
+            side, _ = _rollout_cuda_streams(torch.cuda.current_stream().device)
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(warmup):
@@ -1472,7 +1488,7 @@ class _CapturedStep(Generic[_Captured]):
             self._graph = torch.cuda.CUDAGraph()
             # Thread-local capture remains robust if an unrelated CUDA-using
             # thread exists in the embedding process.
-            with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):
+            with torch.cuda.graph(self._graph, stream=side, capture_error_mode="thread_local"):
                 self._outputs = run()
 
     def __call__(self) -> _Captured:
@@ -1906,7 +1922,7 @@ def _collect_mixed_play_rust_wave(
     ensemble: _StackedActorEnsemble | None = None
     frozen_tensor: torch.Tensor | None = None
     frozen_store_tensor: torch.Tensor | None = None
-    lane_valid_tensor: torch.Tensor | None = None
+    lane_valid_indices: torch.Tensor | None = None
     frozen_store_rows: np.ndarray | None = None
     lane_valid_flat: np.ndarray | None = None
     lanes = 0
@@ -1935,7 +1951,9 @@ def _collect_mixed_play_rust_wave(
         frozen_store_rows = np.concatenate(active_groups)
         frozen_tensor = torch.as_tensor(lane_rows.reshape(-1), device=device)
         frozen_store_tensor = torch.as_tensor(frozen_store_rows, device=device)
-        lane_valid_tensor = torch.as_tensor(lane_valid_flat, device=device)
+        # Resolve padding on the host once. CUDA boolean indexing would compact
+        # dynamically (and synchronize) every step, and cannot be captured.
+        lane_valid_indices = torch.as_tensor(np.flatnonzero(lane_valid_flat), device=device)
         # Built-in lanes keep their slot in the stack, borrowing the last
         # frozen opponent's weights. The ensemble batch shape therefore follows
         # total lane count, so a captured CUDA graph survives the next mix.
@@ -1995,7 +2013,7 @@ def _collect_mixed_play_rust_wave(
     # Schedule them on separate streams while keeping one physical-game wave;
     # both streams join before sampling, so every game still advances together.
     frozen_forward_stream = (
-        torch.cuda.Stream(device=device)
+        _rollout_cuda_streams(device)[1]
         if league_games and ensemble is not None and device.type == "cuda"
         else None
     )
@@ -2012,105 +2030,101 @@ def _collect_mixed_play_rust_wave(
         return ActorOutput(*(tensor.flatten(0, 1) for tensor in lane_output))
 
     def step_forwards() -> _StepOutputs:
-        """Every device-side forward of one step, and nothing else.
+        """Gather, forward and assemble device outputs before host sampling.
 
-        Kept to exactly the region that reads persistent input buffers and
-        writes fresh outputs, because that is what `_CapturedStep` can capture
-        as a unit: the sampling and storage that follow round-trip to the host.
+        Fixed integer gathers and scatters belong inside the captured region;
+        sampling stays outside so graph bootstrap never consumes random draws.
         """
         if not league_games:
             return run_actor(*wave_inputs), None, None
         assert current_tensor is not None
         if frozen_forward_stream is None:
             current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
-            return None, current, run_frozen()
-
-        current_stream = torch.cuda.current_stream(device)
-        frozen_forward_stream.wait_stream(current_stream)
-        with torch.cuda.stream(frozen_forward_stream):
             frozen = run_frozen()
-        current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
-        current_stream.wait_stream(frozen_forward_stream)
-        return None, current, frozen
+        else:
+            current_stream = torch.cuda.current_stream(device)
+            frozen_forward_stream.wait_stream(current_stream)
+            with torch.cuda.stream(frozen_forward_stream):
+                frozen = run_frozen()
+            current = run_actor(*_select_inputs(wave_inputs, current_tensor, current_gather))
+            current_stream.wait_stream(frozen_forward_stream)
+        if not gpu_sampling:
+            return None, current, frozen
+
+        assert isinstance(unit_logits, torch.Tensor)
+        assert isinstance(kind_logits, torch.Tensor)
+        assert isinstance(quantity_context, torch.Tensor)
+        assert gpu_current_rows is not None
+        assert frozen_store_tensor is not None
+        assert lane_valid_indices is not None
+        for destination, current_values, frozen_values in zip(
+            (unit_logits, kind_logits, quantity_context),
+            current,
+            (None, None, None) if frozen is None else frozen,
+            strict=True,
+        ):
+            destination.index_copy_(0, gpu_current_rows, current_values.to(destination.dtype))
+            if frozen_values is not None:
+                selected_frozen = frozen_values.index_select(0, lane_valid_indices)
+                destination.index_copy_(
+                    0, frozen_store_tensor, selected_frozen.to(destination.dtype)
+                )
+        return ActorOutput(unit_logits, kind_logits, quantity_context), None, None
 
     graphed = forward_mode in CAPTURED_ROLLOUT_FORWARD_MODES and device.type == "cuda"
     step_graph: _CapturedStep[_StepOutputs] | None = None
+    pending_outputs: _StepOutputs | None = None
 
     for step in range(horizon):
         if graphed and step_graph is None:
             # Capture on the first real uploaded wave and replay the static
             # forward region for the remaining steps.
             step_graph = _CapturedStep(step_forwards)
-        if step_graph is not None:
+        if pending_outputs is not None:
+            full_output, current_output, frozen_output = pending_outputs
+            pending_outputs = None
+        elif step_graph is not None:
             full_output, current_output, frozen_output = step_graph()
         else:
             with _cuda_graph_generation(device, forward_mode):
                 full_output, current_output, frozen_output = step_forwards()
-        if league_games:
+        if league_games and not gpu_sampling:
             assert current_output is not None
-            if gpu_sampling:
-                assert isinstance(unit_logits, torch.Tensor)
-                assert isinstance(kind_logits, torch.Tensor)
-                assert isinstance(quantity_context, torch.Tensor)
-                assert gpu_current_rows is not None
-                assert frozen_store_tensor is not None
-                assert lane_valid_tensor is not None
-                for destination, current_values, frozen_values in zip(
-                    (unit_logits, kind_logits, quantity_context),
-                    current_output,
-                    (None, None, None) if frozen_output is None else frozen_output,
-                    strict=True,
-                ):
-                    destination.index_copy_(
-                        0, gpu_current_rows, current_values.to(destination.dtype)
+            assert isinstance(unit_logits, np.ndarray)
+            assert isinstance(kind_logits, np.ndarray)
+            assert isinstance(quantity_context, np.ndarray)
+            assert frozen_store_rows is not None
+            assert lane_valid_flat is not None
+            transfer_outputs = (
+                (current_output,) if frozen_output is None else (current_output, frozen_output)
+            )
+            host_outputs, packed_transfer = _packed_outputs_to_host(
+                transfer_outputs, packed_transfer
+            )
+            current_host = host_outputs[0]
+            frozen_host = None if frozen_output is None else host_outputs[1]
+            for destination, current_values, frozen_values in zip(
+                (unit_logits, kind_logits, quantity_context),
+                (
+                    current_host.unit_logits,
+                    current_host.market_kind_logits,
+                    current_host.market_quantity_context,
+                ),
+                (
+                    (None, None, None)
+                    if frozen_host is None
+                    else (
+                        frozen_host.unit_logits,
+                        frozen_host.market_kind_logits,
+                        frozen_host.market_quantity_context,
                     )
-                    if frozen_values is not None:
-                        selected_frozen = frozen_values[lane_valid_tensor]
-                        destination.index_copy_(
-                            0, frozen_store_tensor, selected_frozen.to(destination.dtype)
-                        )
-            else:
-                assert isinstance(unit_logits, np.ndarray)
-                assert isinstance(kind_logits, np.ndarray)
-                assert isinstance(quantity_context, np.ndarray)
-                assert frozen_store_rows is not None
-                assert lane_valid_flat is not None
-                transfer_outputs = (
-                    (current_output,) if frozen_output is None else (current_output, frozen_output)
-                )
-                host_outputs, packed_transfer = _packed_outputs_to_host(
-                    transfer_outputs, packed_transfer
-                )
-                current_host = host_outputs[0]
-                frozen_host = None if frozen_output is None else host_outputs[1]
-                for destination, current_values, frozen_values in zip(
-                    (unit_logits, kind_logits, quantity_context),
-                    (
-                        current_host.unit_logits,
-                        current_host.market_kind_logits,
-                        current_host.market_quantity_context,
-                    ),
-                    (
-                        (None, None, None)
-                        if frozen_host is None
-                        else (
-                            frozen_host.unit_logits,
-                            frozen_host.market_kind_logits,
-                            frozen_host.market_quantity_context,
-                        )
-                    ),
-                    strict=True,
-                ):
-                    destination[stored_rows] = current_values
-                    if frozen_values is not None:
-                        destination[frozen_store_rows] = frozen_values[lane_valid_flat]
-            if gpu_sampling:
-                assert isinstance(unit_logits, torch.Tensor)
-                assert isinstance(kind_logits, torch.Tensor)
-                assert isinstance(quantity_context, torch.Tensor)
-                full_output = ActorOutput(unit_logits, kind_logits, quantity_context)
-            else:
-                full_output = current_output
+                ),
+                strict=True,
+            ):
+                destination[stored_rows] = current_values
+                if frozen_values is not None:
+                    destination[frozen_store_rows] = frozen_values[lane_valid_flat]
+            full_output = current_output
 
         assert full_output is not None
         if gpu_sampling:
@@ -2220,12 +2234,18 @@ def _collect_mixed_play_rust_wave(
                 sampled,
             )
         if step + 1 < horizon:
-            # Encode and submit the next state before copying this step into the
-            # trajectory arena. Both host waves share fixed device destinations,
-            # so the H2D transfer overlaps CPU storage without invalidating a
-            # captured forward's input addresses.
+            # Both host waves share fixed device destinations. Upload and graph
+            # replay use the sampling/statistics stream, so all reads of this
+            # step's outputs finish before the next replay overwrites them.
+            # The next preference transfer synchronizes that stream before the
+            # native step or either pinned host buffer can be refilled.
             next_encoded_wave.refresh(environment)
             next_encoded_wave.copy_to_device()
+            if step_graph is not None:
+                # Launch ahead of CPU arena storage and consume once at the
+                # next loop head. Bootstrap runs above; the final step never
+                # queues a speculative extra forward.
+                pending_outputs = step_graph()
         rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
         _store_native_wave(
             architecture,

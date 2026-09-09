@@ -1920,20 +1920,9 @@ def test_the_entropy_reference_is_persisted_per_population_member() -> None:
         module._validate_entropy_references([-0.1, None, 0.29], population=3)
 
 
-def test_structured_predictor_gates_are_independent_and_recovery_safe() -> None:
+def test_structured_persistence_diagnostics_use_each_fresh_wave() -> None:
     module = _training_script()
-    config = PpoConfig(
-        structured_decision_coefficient=0.5,
-        structured_opponent_summary_coefficient=0.5,
-        structured_opponent_patch_coefficient=0.5,
-        structured_critic_latent_coefficient=1.0,
-        structured_critic_value_coefficient=1.0,
-    )
-    states = module._new_structured_gate_states(2, config)
-    actor_state = states[0]["actor"]
-    critic_state = states[0]["critic"]
-    assert actor_state is not None and critic_state is not None
-    reference_metrics = {
+    metrics = {
         "structured_preupdate_combined": 2.0,
         "structured_preupdate_decision": 4.0,
         "structured_preupdate_patch": 0.5,
@@ -1944,93 +1933,31 @@ def test_structured_predictor_gates_are_independent_and_recovery_safe() -> None:
         "structured_critic_preupdate_latent": 2.0,
         "structured_critic_preupdate_value": 1.0,
     }
-    reference_metrics.update(
+    metrics.update(
         {
-            name.replace("preupdate_", "preupdate_persistence_"): value
-            for name, value in tuple(reference_metrics.items())
+            name.replace("preupdate_", "preupdate_persistence_"): value / 2
+            for name, value in tuple(metrics.items())
         }
     )
+    for kind, prefix in (
+        ("actor", "structured_persistence_"),
+        ("critic", "structured_critic_persistence_"),
+    ):
+        measured = module._structured_persistence_diagnostics(metrics, kind=kind)
+        assert measured[f"{prefix}combined_ratio"] == 2.0
+        assert measured[f"{prefix}combined_informative"] == 1
+        assert all(name.endswith(("_ratio", "_informative")) for name in measured)
 
-    actor_first = module._advance_structured_gate(
-        actor_state, reference_metrics, config, kind="actor"
-    )
-    critic_first = module._advance_structured_gate(
-        critic_state, reference_metrics, config, kind="critic"
-    )
-    assert actor_first["structured_gate_passed"] == 0
-    assert critic_first["structured_critic_gate_passed"] == 0
-    assert states[1] == {
-        "actor": {"streak": 0, "enabled": False},
-        "critic": {"streak": 0, "enabled": False},
-    }
-
-    qualified = {
-        name: value if "_persistence_" in name else value * 0.8
-        for name, value in reference_metrics.items()
-    }
-    module._advance_structured_gate(actor_state, qualified, config, kind="actor")
-    actor_third = module._advance_structured_gate(actor_state, qualified, config, kind="actor")
-    critic_second = module._advance_structured_gate(critic_state, qualified, config, kind="critic")
-    assert actor_third["structured_gate_actor_enabled_next"] == 1
-    assert critic_second["structured_critic_gate_enabled_next"] == 0
-    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=True) == (
-        False,
-        False,
-    )
-
-    critic_third = module._advance_structured_gate(critic_state, qualified, config, kind="critic")
-    assert critic_third["structured_critic_gate_enabled_next"] == 1
-    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=True) == (
-        False,
-        True,
-    )
-    assert module._structured_auxiliary_gate_decisions(states[0], warmup_active=False) == (
-        True,
-        True,
-    )
-
-    revoked = dict(qualified)
-    revoked["structured_preupdate_opponent_patches"] = (
-        reference_metrics["structured_preupdate_opponent_patches"] * 0.99
-    )
-    actor_fourth = module._advance_structured_gate(actor_state, revoked, config, kind="actor")
-    assert actor_fourth["structured_gate_passed"] == 0
-    assert actor_fourth["structured_gate_actor_enabled_next"] == 0
-    assert critic_state["enabled"]
-
-    record = module._structured_gate_record(states)
-    assert module._validate_structured_gate_states(record, 2, config) == states
-    with pytest.raises(ValueError, match="fresh-wave persistence"):
-        module._validate_structured_gate_states({"version": 2, "agents": states}, 2, config)
-    incomplete = {
-        "version": record["version"],
-        "agents": [{"actor": actor_state}] * 2,
-    }
-    with pytest.raises(ValueError, match="incomplete"):
-        module._validate_structured_gate_states(incomplete, 2, config)
-
-    critic_only = PpoConfig(structured_critic_value_coefficient=1.0)
-    critic_only_states = module._new_structured_gate_states(1, critic_only)
-    assert critic_only_states[0]["actor"] is None
-    assert critic_only_states[0]["critic"] is not None
-    assert (
-        module._validate_structured_gate_states(
-            module._structured_gate_record(critic_only_states),
-            1,
-            critic_only,
-        )
-        == critic_only_states
-    )
+    # Changing decoder scales next wave must change the comparison immediately,
+    # without historical references or predictor-quality admission state.
+    metrics["structured_preupdate_persistence_opponent_patches"] = 0.06
+    actor = module._structured_persistence_diagnostics(metrics, kind="actor")
+    assert actor["structured_persistence_opponent_patches_ratio"] == 0.5
+    assert actor["structured_persistence_decision_ratio"] == 2.0
 
 
-def test_zero_decoder_defers_then_qualifies_on_fresh_informative_waves() -> None:
+def test_zero_decoder_diagnostics_become_informative_on_fresh_waves() -> None:
     module = _training_script()
-    config = PpoConfig(
-        structured_critic_latent_coefficient=1.0,
-        structured_critic_value_coefficient=1.0,
-        structured_gate_patience=2,
-    )
-    state = module._new_structured_gate_states(1, config)[0]["critic"]
 
     def wave(value: float, baseline: float) -> dict[str, float]:
         return {
@@ -2043,21 +1970,26 @@ def test_zero_decoder_defers_then_qualifies_on_fresh_informative_waves() -> None
         }
 
     for value in (0.0, 0.01, 0.0):
-        measured = module._advance_structured_gate(state, wave(value, 0.0), config, kind="critic")
-        assert not state["enabled"]
-        assert not measured["structured_critic_gate_value_informative"]
+        measured = module._structured_persistence_diagnostics(wave(value, 0.0), kind="critic")
+        assert measured["structured_critic_persistence_value_informative"] == 0
+        assert measured["structured_critic_persistence_value_ratio"] == 1.0
         json.dumps(measured, allow_nan=False)
-    # A small but genuinely positive baseline is meaningful; no arbitrary
-    # loss-scale floor can permanently prevent the decoder becoming ready.
-    for _ in range(2):
-        measured = module._advance_structured_gate(state, wave(1e-9, 2e-9), config, kind="critic")
-        json.dumps(measured, allow_nan=False)
-    assert state["enabled"]
-    # A different scale/head next wave must be compared with its own baseline,
-    # and a regressing decoder revokes even when the combined loss improves.
-    module._advance_structured_gate(state, wave(0.1, 0.09), config, kind="critic")
-    assert not state["enabled"]
-    assert state["streak"] == 0
+    # There is no arbitrary loss-scale floor: tiny positive baselines carry
+    # genuine information, while a worse-than-persistence ratio remains useful.
+    measured = module._structured_persistence_diagnostics(wave(1e-9, 2e-9), kind="critic")
+    assert measured["structured_critic_persistence_value_informative"] == 1
+    assert measured["structured_critic_persistence_value_ratio"] == 0.5
+    measured = module._structured_persistence_diagnostics(wave(0.1, 0.09), kind="critic")
+    assert measured["structured_critic_persistence_value_ratio"] == pytest.approx(10 / 9)
+    json.dumps(measured, allow_nan=False)
+
+    for value, baseline in (
+        (float("nan"), 1.0),
+        (1.0, float("inf")),
+        (1.0, 1e-320),
+    ):
+        with pytest.raises(FloatingPointError, match="non-finite structured critic persistence"):
+            module._structured_persistence_diagnostics(wave(value, baseline), kind="critic")
 
 
 def _population_wave(module, *, games: int, population: int, steps: int = 2, seed: int = 0):
@@ -2117,7 +2049,13 @@ def _distinct_actors(config: ModelConfig, count: int, *, seed: int = 5) -> list[
     return actors
 
 
-def _actor_artifact(path: Path, actor: FarmActor, config: ModelConfig) -> Path:
+def _actor_artifact(
+    path: Path,
+    actor: torch.nn.Module,
+    config: ModelConfig | StructuredConfig,
+    *,
+    architecture: str = CONV_ENTITY,
+) -> Path:
     """One exported actor artifact of the shape a BC clone writes."""
     from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
     from kaggriculture.provenance import source_identity
@@ -2125,7 +2063,7 @@ def _actor_artifact(path: Path, actor: FarmActor, config: ModelConfig) -> Path:
     torch.save(
         {
             "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
-            "architecture": CONV_ENTITY,
+            "architecture": architecture,
             "model_config": config.to_dict(),
             "actor": actor.state_dict(),
             "iteration": 0,
@@ -2148,6 +2086,7 @@ def _population_arguments(
     population: int,
     games: int,
     iterations: int = 1,
+    architecture: str = CONV_ENTITY,
 ):
     arguments = [
         "train_ppo.py",
@@ -2171,14 +2110,12 @@ def _population_arguments(
         "16",
         "--attention-heads",
         "2",
-        "--cnn-width",
-        "8",
-        "--cnn-blocks",
-        "1",
-        "--transformer-layers",
-        "3",
         "--no-bfloat16",
     ]
+    if architecture == CONV_ENTITY:
+        arguments.extend(("--cnn-width", "8", "--cnn-blocks", "1", "--transformer-layers", "3"))
+    else:
+        arguments.extend(("--architecture", architecture))
     return arguments
 
 
@@ -2192,6 +2129,10 @@ def _run_population_main(
     iterations: int = 1,
     initial_actors: tuple[Path, ...] = (),
     resume: Path | None = None,
+    architecture: str = CONV_ENTITY,
+    critic_warmup_iterations: int = 0,
+    update_fn=None,
+    extra_arguments: tuple[str, ...] = (),
 ):
     """Run one iteration of the loop with only the wave and the update mocked out.
 
@@ -2241,23 +2182,98 @@ def _run_population_main(
     monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
     monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
     monkeypatch.setattr(module, "update_replay_parity", lambda *a, **k: _parity_metrics(module))
-    monkeypatch.setattr(module, "update_ppo", update)
+    monkeypatch.setattr(module, "update_ppo", update if update_fn is None else update_fn)
     arguments = _population_arguments(
         run_dir,
         population=population,
         games=games,
         iterations=iterations,
+        architecture=architecture,
     )
     for artifact in initial_actors:
         arguments.extend(("--init-actor-from", str(artifact)))
     if initial_actors:
-        arguments.extend(("--critic-warmup-iterations", "0"))
+        arguments.extend(("--critic-warmup-iterations", str(critic_warmup_iterations)))
     if resume is not None:
         arguments.extend(("--resume", str(resume)))
+    arguments.extend(extra_arguments)
     monkeypatch.setattr(sys, "argv", arguments)
     module.main()
     record = json.loads((run_dir / "metrics.jsonl").read_text().splitlines()[-1])
     return record, seen
+
+
+def test_runner_enters_joint_training_despite_poor_predictor_persistence(
+    monkeypatch, tmp_path
+) -> None:
+    from kaggriculture.structured import StructuredActor
+
+    module = _training_script()
+    config = StructuredConfig(model_dim=16, attention_heads=2)
+    artifact = _actor_artifact(
+        tmp_path / "initial.pt",
+        StructuredActor(config),
+        config,
+        architecture=STRUCTURED,
+    )
+    phases: list[tuple[int | None, bool, bool]] = []
+
+    def update(*args, actor_epochs=None, **kwargs):
+        phases.append(
+            (
+                actor_epochs,
+                kwargs["structured_actor_auxiliary"],
+                kwargs["structured_critic_auxiliary"],
+            )
+        )
+        metrics = {
+            "actor_updates": 0 if actor_epochs == 0 else 1,
+            "actor_minibatches_intended": 1,
+            "critic_updates": 1,
+            "first_minibatch_approx_kl": 0.0,
+            "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
+            # Prior-wave evidence releases the actor after the warmup floor.
+            "monte_carlo_explained_variance": 0.2,
+        }
+        for prefix, fields in (
+            ("structured_preupdate_", module._STRUCTURED_ACTOR_PERSISTENCE_FIELDS),
+            ("structured_critic_preupdate_", module._STRUCTURED_CRITIC_PERSISTENCE_FIELDS),
+        ):
+            for name in fields:
+                metrics[f"{prefix}{name}"] = 10.0
+                metrics[f"{prefix}persistence_{name}"] = 1.0
+        return metrics
+
+    run_dir = tmp_path / "joint"
+    _run_population_main(
+        module,
+        monkeypatch,
+        run_dir,
+        population=1,
+        games=2,
+        iterations=3,
+        architecture=STRUCTURED,
+        initial_actors=(artifact,),
+        critic_warmup_iterations=1,
+        update_fn=update,
+        extra_arguments=(
+            "--structured-decision-coefficient",
+            "0.5",
+            "--structured-critic-latent-coefficient",
+            "0.5",
+        ),
+    )
+    # This is the actual runner's adaptive warmup transition, not independent
+    # calls to a boolean helper: a bad fresh-wave ratio neither delays release
+    # nor revokes joint learning on the following iteration.
+    assert phases == [(0, False, True), (None, True, True), (None, True, True)]
+    records = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    updates = [record for record in records if "critic_warmup_active" in record]
+    assert [record["critic_warmup_active"] for record in updates] == [1, 0, 0]
+    for record in updates:
+        assert record["structured_persistence_combined_ratio"] == 10.0
+        assert record["structured_critic_persistence_combined_ratio"] == 10.0
 
 
 def test_a_single_learner_run_keeps_todays_metric_layout(monkeypatch, tmp_path) -> None:

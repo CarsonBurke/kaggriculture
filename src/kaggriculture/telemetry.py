@@ -63,7 +63,8 @@ from typing import Any, Protocol
 #: diagnostics moved out of `misc` into `representation-<module>/`. Both are
 #: placement logic the table values do not express, so the epoch moves with the
 #: fingerprint.
-_LAYOUT_EPOCH = 11
+#: 12: NextLat persistence ratios are diagnostics, not predictor-quality gates.
+_LAYOUT_EPOCH = 12
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -664,19 +665,19 @@ _PER_HEAD_PREFIXES: tuple[tuple[str, str], ...] = (
     ("holdout_", "holdout"),
 )
 #: Actor and critic NextLat measurements are intentionally separate categories:
-#: held-out pre-update loss decides the gate, predictor loss fits only the
-#: training-only transition module, and auxiliary loss is the representation
-#: gradient reaching the policy/value model. Combining any two would make a
-#: healthy predictor look like a healthy representation update.
+#: held-out pre-update loss compares predictors with fresh-wave persistence,
+#: predictor loss measures transition fitting, and auxiliary loss measures the
+#: representation gradient reaching the policy/value model. Predictor quality
+#: is diagnostic only and never admits or revokes a representation update.
 _STRUCTURED_PREFIXES: tuple[tuple[str, str], ...] = (
     ("structured_critic_preupdate_", "nextlat-critic-holdout"),
     ("structured_critic_predictor_", "nextlat-critic-predictor"),
-    ("structured_critic_gate_", "nextlat-critic-gate"),
+    ("structured_critic_persistence_", "nextlat-critic-persistence"),
     ("structured_critic_gradient_", "nextlat-critic-gradients"),
     ("structured_critic_", "nextlat-critic-auxiliary"),
     ("structured_preupdate_", "nextlat-actor-holdout"),
     ("structured_predictor_", "nextlat-actor-predictor"),
-    ("structured_gate_", "nextlat-actor-gate"),
+    ("structured_persistence_", "nextlat-actor-persistence"),
     ("structured_gradient_", "nextlat-actor-gradients"),
     ("structured_actor_", "nextlat-actor-auxiliary"),
 )
@@ -732,7 +733,7 @@ _STRUCTURED_CRITIC_LOSS_TERMS = ("latent", "value")
 
 #: Behavior cloning's per-module representation diagnostics, as
 #: `structured_<module>_<statistic>`. They match no NextLat prefix -- those all
-#: name a gate, predictor, or holdout role this journal never writes -- so they
+#: name a persistence, predictor, or holdout role this journal never writes -- so they
 #: fell through to `misc`, twenty-eight charts in the drawer for unfiled
 #: metrics. Each module is one accordion of four charts, following the same
 #: facet-joins-category convention as the per-head rules: overlaying the seven

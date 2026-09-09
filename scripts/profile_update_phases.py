@@ -352,7 +352,9 @@ def main() -> None:
         loss.backward()
 
     def critic_norm():
-        return torch.nn.utils.clip_grad_norm_(critic.parameters(), ppo_config.max_gradient_norm)
+        return torch.nn.utils.get_total_norm(
+            [parameter.grad for parameter in critic.parameters() if parameter.grad is not None]
+        )
 
     def critic_step():
         _optimizer_step(
@@ -407,7 +409,9 @@ def main() -> None:
             complete_windows=False,
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(dynamics.parameters(), ppo_config.max_gradient_norm)
+        torch.nn.utils.clip_grad_norm_(
+            dynamics.parameters(), ppo_config.nextlat_max_gradient_norm
+        )
         _optimizer_step(
             dynamics_optimizer,
             ppo_config.resolved_structured_learning_rate,
@@ -428,7 +432,9 @@ def main() -> None:
             complete_windows=False,
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic_dynamics.parameters(), ppo_config.max_gradient_norm)
+        torch.nn.utils.clip_grad_norm_(
+            critic_dynamics.parameters(), ppo_config.nextlat_max_gradient_norm
+        )
         _optimizer_step(
             critic_dynamics_optimizer,
             ppo_config.resolved_structured_critic_learning_rate,
@@ -445,7 +451,7 @@ def main() -> None:
         "actor_optimizer_step": actor_step,
         "critic_forward": critic_forward,
         "critic_forward_backward": critic_forward_backward,
-        "critic_gradient_clip": critic_norm,
+        "critic_gradient_norm": critic_norm,
         "critic_optimizer_step": critic_step,
         "value_replay_chunk_4096": replay_chunk,
         "actor_source_forward_eager": actor_source_forward_eager,

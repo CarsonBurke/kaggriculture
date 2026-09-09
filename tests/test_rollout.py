@@ -1032,6 +1032,21 @@ def test_stacked_frozen_lanes_pad_uneven_opponent_groups_exactly() -> None:
             np.testing.assert_array_equal(
                 padded.opponent_money[game], baseline.opponent_money[game]
             )
+            for name in (
+                "unit_actions",
+                "market_kinds",
+                "market_quantities",
+                "unit_masks",
+                "market_kind_masks",
+                "market_quantity_masks",
+                "old_unit_logprobs",
+                "old_market_kind_logprobs",
+                "old_market_quantity_logprobs",
+                "rewards",
+            ):
+                np.testing.assert_array_equal(
+                    getattr(padded, name)[game], getattr(baseline, name)[game]
+                )
 
 
 @pytest.mark.parametrize("indices", [[0], [0.0, 0.0], [0, 2], [0, -1]])
@@ -1759,7 +1774,21 @@ def test_the_generation_guard_marks_the_compiled_modes_and_only_those() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
+@pytest.mark.parametrize(
+    ("opponent_count", "builtin_lanes", "assignments", "deterministic"),
+    [
+        pytest.param(2, (), (0, 1, 0), False, id="unequal-frozen-lanes"),
+        pytest.param(1, ("pass",), (0, 1, 0), True, id="frozen-and-builtin"),
+        pytest.param(0, ("pass", "starter"), (1, 0, 1), False, id="only-builtins"),
+        pytest.param(0, (), (), True, id="pure-self-play"),
+    ],
+)
+def test_a_captured_collection_reproduces_the_eager_one_exactly(
+    opponent_count: int,
+    builtin_lanes: tuple[str, ...],
+    assignments: tuple[int, ...],
+    deterministic: bool,
+) -> None:
     """`graph` must be the same wave as `eager`, not merely a similar one.
 
     Capture replays the identical kernel sequence over the identical buffers, so
@@ -1768,9 +1797,10 @@ def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
     owes exact equality. Anything less means the graph is reading something the
     step did not just upload, which is the failure mode capture actually has.
 
-    The wave carries both a self-play pair and league rows against a distinct
-    opponent, because the current-policy forward and the stacked frozen ensemble
-    are captured as one region and only a league wave exercises the second.
+    Unequal groups exercise discarded padding, built-ins exercise ignored
+    logits and the no-ensemble path, and pure self-play bypasses scatter.
+    Repeated waves change seeds and lane rows while reusing the same stream
+    owners, exposing stale graph/input ownership as well as per-step races.
     """
     config = StructuredConfig(
         model_dim=32,
@@ -1783,35 +1813,55 @@ def test_a_captured_collection_reproduces_the_eager_one_exactly() -> None:
         core_layers=1,
     )
     actor = StructuredActor(config).cuda()
-    opponent = StructuredActor(config).cuda()
+    opponents = tuple(StructuredActor(config).cuda() for _ in range(opponent_count))
 
-    def collect(mode: str):
+    def collect(mode: str, wave: int):
         return collect_mixed_play_rust(
             actor,
-            (opponent,),
+            opponents,
             self_play_games=1,
-            league_games=2,
-            opponent_indices=np.asarray([0, 0]),
-            seed_start=77,
-            sampling_seed=5,
+            league_games=len(assignments),
+            opponent_indices=np.roll(np.asarray(assignments, dtype=np.int64), wave),
+            builtin_lanes=builtin_lanes,
+            deterministic=deterministic,
+            deterministic_opponents=np.asarray(
+                [index % 2 == 0 for index in range(opponent_count)], dtype=np.bool_
+            ),
+            seed_start=77 + wave,
+            sampling_seed=5 + wave,
             forward_mode=mode,
             forward_autocast=True,
         )
 
-    reference = collect("eager")
-    captured = collect("graph")
+    for wave in range(2):
+        reference = collect("eager", wave)
+        captured = collect("graph", wave)
 
-    np.testing.assert_array_equal(captured.episode_seeds, reference.episode_seeds)
-    np.testing.assert_array_equal(captured.valid, reference.valid)
-    for name in ("unit_actions", "market_kinds", "market_quantities"):
-        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
-    for name in (
-        "old_unit_logprobs",
-        "old_market_kind_logprobs",
-        "old_market_quantity_logprobs",
-        "rewards",
-    ):
-        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
+        assert captured.learner_stochastic is reference.learner_stochastic
+        for name in (
+            "episode_seeds",
+            "valid",
+            "unit_actions",
+            "market_kinds",
+            "market_quantities",
+            "unit_masks",
+            "market_kind_masks",
+            "market_quantity_masks",
+            "unit_active",
+            "market_active",
+            "market_quantity_active",
+            "old_unit_logprobs",
+            "old_market_kind_logprobs",
+            "old_market_quantity_logprobs",
+            "rewards",
+            "entropy_sums",
+            "final_money",
+            "opponent_money",
+            "seats",
+        ):
+            np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
+        for name, state in reference.states.items():
+            np.testing.assert_array_equal(captured.states[name], state)
 
 
 @pytest.mark.cuda
@@ -1859,9 +1909,18 @@ def test_the_fused_capture_reproduces_the_fused_uncaptured_wave_exactly() -> Non
         "unit_actions",
         "market_kinds",
         "market_quantities",
+        "unit_masks",
+        "market_kind_masks",
+        "market_quantity_masks",
+        "unit_active",
+        "market_active",
+        "market_quantity_active",
         "old_unit_logprobs",
         "old_market_kind_logprobs",
         "old_market_quantity_logprobs",
         "rewards",
+        "entropy_sums",
+        "final_money",
+        "opponent_money",
     ):
         np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))

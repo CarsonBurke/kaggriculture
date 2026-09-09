@@ -284,7 +284,7 @@ def parse_args() -> argparse.Namespace:
             "step, and they differ by sqrt(fan_in)"
         ),
     )
-    parser.add_argument("--max-gradient-norm", type=float, default=1.0)
+    parser.add_argument("--nextlat-max-gradient-norm", type=float, default=1.0)
     # Two phases, two knobs, decided separately by calibration: the collection
     # forward and the update compile different graphs, and their measured
     # speedups on the conv model fall on opposite sides of the threshold.
@@ -401,31 +401,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=PpoConfig.structured_critic_learning_rate,
         help="critic predictor optimizer rate; defaults to --critic-lr",
-    )
-    parser.add_argument(
-        "--structured-gate-combined-ratio",
-        type=float,
-        default=PpoConfig.structured_gate_combined_ratio,
-    )
-    parser.add_argument(
-        "--structured-gate-decision-ratio",
-        type=float,
-        default=PpoConfig.structured_gate_decision_ratio,
-    )
-    parser.add_argument(
-        "--structured-gate-opponent-summary-ratio",
-        type=float,
-        default=PpoConfig.structured_gate_opponent_summary_ratio,
-    )
-    parser.add_argument(
-        "--structured-gate-opponent-patch-ratio",
-        type=float,
-        default=PpoConfig.structured_gate_opponent_patch_ratio,
-    )
-    parser.add_argument(
-        "--structured-gate-patience",
-        type=int,
-        default=PpoConfig.structured_gate_patience,
     )
     parser.add_argument(
         "--expected-source-digest",
@@ -609,20 +584,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         or args.structured_critic_learning_rate <= 0.0
     ):
         raise ValueError("structured critic learning rate must be finite and positive")
-    if args.structured_gate_patience < 1:
-        raise ValueError("structured gate patience must be positive")
     if args.league_games < 0:
         raise ValueError("league games cannot be negative")
     if args.league_active_opponents < 0 or args.league_historical_opponents < 0:
         raise ValueError("league opponent counts cannot be negative")
-    for name, value in (
-        ("combined", args.structured_gate_combined_ratio),
-        ("decision", args.structured_gate_decision_ratio),
-        ("opponent summary", args.structured_gate_opponent_summary_ratio),
-        ("opponent patch", args.structured_gate_opponent_patch_ratio),
-    ):
-        if not math.isfinite(value) or not 0.0 < value <= 1.0:
-            raise ValueError(f"structured gate {name} ratio must be finite and in (0, 1]")
     if args.league_builtin_lanes < 0:
         raise ValueError("league built-in lane budget cannot be negative")
     builtins = _league_builtin_opponents(args)
@@ -1928,168 +1893,50 @@ def _validate_policy_entropy_reference(value: object) -> float:
     return float(value)
 
 
-_STRUCTURED_GATE_FORMAT_VERSION = 3
-_STRUCTURED_ACTOR_GATE_FIELDS = (
-    ("combined", "structured_gate_combined_ratio", None),
-    ("decision", "structured_gate_decision_ratio", "structured_decision_coefficient"),
-    ("patch", "structured_gate_combined_ratio", "structured_patch_coefficient"),
-    ("economy", "structured_gate_combined_ratio", "structured_economy_coefficient"),
-    (
-        "opponent_summary",
-        "structured_gate_opponent_summary_ratio",
-        "structured_opponent_summary_coefficient",
-    ),
-    (
-        "opponent_patches",
-        "structured_gate_opponent_patch_ratio",
-        "structured_opponent_patch_coefficient",
-    ),
+_STRUCTURED_ACTOR_PERSISTENCE_FIELDS = (
+    "combined",
+    "decision",
+    "patch",
+    "economy",
+    "opponent_summary",
+    "opponent_patches",
 )
-# The critic predictor has no independently calibrated per-term thresholds.
-# Apply the configured combined-loss improvement requirement to its latent and
-# decoded-value terms too, so a falling weighted sum cannot hide a regressing
-# constituent.
-_STRUCTURED_CRITIC_GATE_FIELDS = (
-    ("combined", "structured_gate_combined_ratio", None),
-    ("latent", "structured_gate_combined_ratio", "structured_critic_latent_coefficient"),
-    ("value", "structured_gate_combined_ratio", "structured_critic_value_coefficient"),
-)
+_STRUCTURED_CRITIC_PERSISTENCE_FIELDS = ("combined", "latent", "value")
 
 
-def _new_structured_gate_state() -> dict[str, Any]:
-    return {"streak": 0, "enabled": False}
-
-
-def _new_structured_gate_states(population: int, config: PpoConfig) -> list[dict[str, Any]]:
-    return [
-        {
-            "actor": (
-                _new_structured_gate_state() if config.structured_actor_auxiliary_active else None
-            ),
-            "critic": (
-                _new_structured_gate_state() if config.structured_critic_auxiliary_active else None
-            ),
-        }
-        for _ in range(population)
-    ]
-
-
-def _structured_gate_record(states: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "version": _STRUCTURED_GATE_FORMAT_VERSION,
-        "agents": copy.deepcopy(states),
-    }
-
-
-def _validate_structured_gate_state(
-    value: object,
-    *,
-    kind: str,
-    config: PpoConfig,
-) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != {"streak", "enabled"}:
-        raise ValueError(f"structured {kind} predictor gate state is incomplete")
-    streak = value["streak"]
-    enabled = value["enabled"]
-    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
-        raise ValueError(f"structured {kind} predictor gate streak is invalid")
-    if not isinstance(enabled, bool):
-        raise ValueError(f"structured {kind} predictor gate enabled state is invalid")
-    should_be_enabled = streak >= config.structured_gate_patience
-    if enabled != should_be_enabled:
-        raise ValueError(f"structured {kind} predictor gate enabled state is inconsistent")
-    return {
-        "streak": streak,
-        "enabled": enabled,
-    }
-
-
-def _validate_structured_gate_states(
-    record: object,
-    population: int,
-    config: PpoConfig,
-) -> list[dict[str, Any]]:
-    if not isinstance(record, Mapping):
-        raise ValueError("resume checkpoint is missing structured predictor gate state")
-    if record.get("version") != _STRUCTURED_GATE_FORMAT_VERSION:
-        raise ValueError(
-            "resume checkpoint structured predictor gate state has an unsupported "
-            "format; fresh-wave persistence gate state is required"
-        )
-    if set(record) != {"version", "agents"}:
-        raise ValueError("resume checkpoint structured predictor gate state is incomplete")
-    agents = record["agents"]
-    if not isinstance(agents, list) or len(agents) != population:
-        raise ValueError("resume checkpoint structured predictor gate state has wrong population")
-    states: list[dict[str, Any]] = []
-    for entry in agents:
-        if not isinstance(entry, Mapping) or set(entry) != {"actor", "critic"}:
-            raise ValueError("structured predictor gate agent state is incomplete")
-        state: dict[str, Any] = {}
-        for kind, active in (
-            ("actor", config.structured_actor_auxiliary_active),
-            ("critic", config.structured_critic_auxiliary_active),
-        ):
-            value = entry[kind]
-            if not active:
-                if value is not None:
-                    raise ValueError(
-                        f"inactive structured {kind} auxiliary has predictor gate state"
-                    )
-                state[kind] = None
-                continue
-            state[kind] = _validate_structured_gate_state(
-                value,
-                kind=kind,
-                config=config,
-            )
-        states.append(state)
-    return states
-
-
-def _advance_structured_gate(
-    state: dict[str, Any],
+def _structured_persistence_diagnostics(
     update_metrics: Mapping[str, float | int],
-    config: PpoConfig,
     *,
     kind: str,
 ) -> dict[str, float | int]:
-    """Advance one predictor's revocable held-out gate for the next iteration."""
+    """Compare predictors with fresh-wave persistence without controlling learning."""
     if kind == "actor":
-        fields = _STRUCTURED_ACTOR_GATE_FIELDS
+        fields = _STRUCTURED_ACTOR_PERSISTENCE_FIELDS
         metric_prefix = "structured_preupdate_"
-        telemetry_prefix = "structured_gate_"
-        enabled_metric = "structured_gate_actor_enabled_next"
+        telemetry_prefix = "structured_persistence_"
     elif kind == "critic":
-        fields = _STRUCTURED_CRITIC_GATE_FIELDS
+        fields = _STRUCTURED_CRITIC_PERSISTENCE_FIELDS
         metric_prefix = "structured_critic_preupdate_"
-        telemetry_prefix = "structured_critic_gate_"
-        enabled_metric = "structured_critic_gate_enabled_next"
+        telemetry_prefix = "structured_critic_persistence_"
     else:
-        raise ValueError(f"unknown structured predictor gate kind: {kind}")
-    measured = {name: float(update_metrics[f"{metric_prefix}{name}"]) for name, _, _ in fields}
-    # Compare the current predictor with persistence on this exact fresh wave,
-    # through the same fixed source encoder and decoder. Historical teacher
-    # losses are incomparable as those representations and heads evolve.
+        raise ValueError(f"unknown structured predictor diagnostic kind: {kind}")
+    measured = {name: float(update_metrics[f"{metric_prefix}{name}"]) for name in fields}
+    # The predictor and persistence use the same fresh wave, source encoder and
+    # decoder. Historical losses are incomparable as representations evolve.
     reference = {
-        name: float(update_metrics[f"{metric_prefix}persistence_{name}"]) for name, _, _ in fields
+        name: float(update_metrics[f"{metric_prefix}persistence_{name}"]) for name in fields
     }
     if any(not math.isfinite(value) for value in (*measured.values(), *reference.values())):
-        raise FloatingPointError(f"non-finite structured {kind} gate loss")
+        raise FloatingPointError(f"non-finite structured {kind} persistence loss")
     # A zero persistence loss provides no prediction task for that decoder.
-    # Reconsider every fresh wave, once PPO makes the decoder informative.
-    informative = {name: reference[name] > 0.0 for name in measured}
+    # Keep the ratio finite and label it uninformative, reconsidering each wave.
+    informative = {name: reference[name] > 0.0 for name in fields}
     ratios = {
         name: max(0.0, measured[name]) / reference[name] if informative[name] else 1.0
-        for name in measured
+        for name in fields
     }
-    passed = all(
-        informative[name] and ratios[name] <= float(getattr(config, threshold))
-        for name, threshold, coefficient in fields
-        if coefficient is None or float(getattr(config, coefficient)) > 0.0
-    )
-    state["streak"] = int(state["streak"]) + 1 if passed else 0
-    state["enabled"] = bool(passed and state["streak"] >= config.structured_gate_patience)
+    if any(not math.isfinite(value) for value in ratios.values()):
+        raise FloatingPointError(f"non-finite structured {kind} persistence ratio")
     telemetry: dict[str, float | int] = {
         f"{telemetry_prefix}{name}_ratio": ratio for name, ratio in ratios.items()
     }
@@ -2099,25 +1946,7 @@ def _advance_structured_gate(
             for name, active in informative.items()
         }
     )
-    telemetry[f"{telemetry_prefix}passed"] = int(passed)
-    telemetry[f"{telemetry_prefix}streak"] = int(state["streak"])
-    telemetry[enabled_metric] = int(state["enabled"])
     return telemetry
-
-
-def _structured_auxiliary_gate_decisions(
-    gate_state: Mapping[str, Any] | None,
-    *,
-    warmup_active: bool,
-) -> tuple[bool, bool]:
-    if gate_state is None:
-        return False, False
-    actor_gate = gate_state["actor"]
-    critic_gate = gate_state["critic"]
-    return (
-        bool(not warmup_active and actor_gate is not None and actor_gate["enabled"]),
-        bool(critic_gate is not None and critic_gate["enabled"]),
-    )
 
 
 def _entropy_reference_record(
@@ -2455,7 +2284,7 @@ def main() -> None:
         gamma=args.gamma,
         actor_gae_lambda=args.actor_gae_lambda,
         critic_gae_lambda=args.critic_gae_lambda,
-        max_gradient_norm=args.max_gradient_norm,
+        nextlat_max_gradient_norm=args.nextlat_max_gradient_norm,
         target_kl=args.target_kl,
         optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
@@ -2472,11 +2301,6 @@ def main() -> None:
         structured_critic_horizon=args.structured_critic_horizon,
         structured_learning_rate=args.structured_learning_rate,
         structured_critic_learning_rate=args.structured_critic_learning_rate,
-        structured_gate_combined_ratio=args.structured_gate_combined_ratio,
-        structured_gate_decision_ratio=args.structured_gate_decision_ratio,
-        structured_gate_opponent_summary_ratio=args.structured_gate_opponent_summary_ratio,
-        structured_gate_opponent_patch_ratio=args.structured_gate_opponent_patch_ratio,
-        structured_gate_patience=args.structured_gate_patience,
     )
     training_data_config = _training_data_config(args, device)
     # Derived from the configured trust region rather than fixed, because that
@@ -2540,11 +2364,6 @@ def main() -> None:
     # member itself, and a second name for one of N would read as though it
     # were the run's optimizer.
     actor = members[0].actor
-    structured_gate_states = (
-        _new_structured_gate_states(population, ppo_config)
-        if ppo_config.structured_auxiliary_active
-        else []
-    )
     critic = members[0].critic
     initial_actor_provenance: dict[str, Any] | None = None
     critic_warmup_iterations = 0
@@ -2595,12 +2414,6 @@ def main() -> None:
             )
         require_source_identity(resume_payload.get("source_identity"))
         checkpoint_run_provenance = validate_run_provenance(resume_payload.get("run_provenance"))
-        if ppo_config.structured_auxiliary_active:
-            structured_gate_states = _validate_structured_gate_states(
-                resume_payload.get("structured_gate_state"),
-                population,
-                ppo_config,
-            )
         # The same attributed knobs as the launch-time check above, compared the
         # same way. Collection precision is again left out; the
         # `training_data_config` equality a few lines above already refuses a
@@ -2838,9 +2651,6 @@ def main() -> None:
             policy_entropy_reference=_entropy_reference_record(entropy_references, population),
             initial_actor=copy.deepcopy(initial_actor_provenance),
             seed_usage=seed_usage,
-            structured_gate_state=(
-                _structured_gate_record(structured_gate_states) if structured_gate_states else None
-            ),
         )
 
     def publish_checkpoint(payload: dict[str, Any]) -> Path:
@@ -2934,9 +2744,6 @@ def main() -> None:
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
             seed_usage=seed_usage,
-            structured_gate_state=(
-                _structured_gate_record(structured_gate_states) if structured_gate_states else None
-            ),
         )
     replace_checkpoint_alias(numbered_checkpoint, destination_latest)
     last_checkpoint_iteration = iteration
@@ -3208,15 +3015,6 @@ def main() -> None:
                     raise RuntimeError(
                         f"training member has incomplete structured {name} predictor state"
                     )
-            gate_state = structured_gate_states[agent] if structured_gate_states else None
-            actor_gate = gate_state["actor"] if gate_state is not None else None
-            critic_gate = gate_state["critic"] if gate_state is not None else None
-            actor_auxiliary_enabled, critic_auxiliary_enabled = (
-                _structured_auxiliary_gate_decisions(
-                    gate_state,
-                    warmup_active=warmup_active,
-                )
-            )
             measured = update_ppo(
                 member.actor,
                 member.critic,
@@ -3229,32 +3027,22 @@ def main() -> None:
                 rows=rows,
                 structured_dynamics=member.structured_dynamics,
                 structured_dynamics_optimizer=member.structured_dynamics_optimizer,
-                structured_actor_auxiliary=actor_auxiliary_enabled,
+                structured_actor_auxiliary=(
+                    ppo_config.structured_actor_auxiliary_active and not warmup_active
+                ),
                 structured_critic_dynamics=member.structured_critic_dynamics,
                 structured_critic_dynamics_optimizer=(member.structured_critic_dynamics_optimizer),
-                structured_critic_auxiliary=critic_auxiliary_enabled,
+                structured_critic_auxiliary=ppo_config.structured_critic_auxiliary_active,
                 auxiliary_generator=auxiliary_generator,
                 diagnostic_groups=diagnostic_groups,
                 diagnostic_gradients=iteration % 25 == 0,
             )
-            if actor_gate is not None:
-                measured.update(
-                    _advance_structured_gate(
-                        actor_gate,
-                        measured,
-                        ppo_config,
-                        kind="actor",
-                    )
-                )
-            if critic_gate is not None:
-                measured.update(
-                    _advance_structured_gate(
-                        critic_gate,
-                        measured,
-                        ppo_config,
-                        kind="critic",
-                    )
-                )
+            for kind, active in (
+                ("actor", ppo_config.structured_actor_auxiliary_active),
+                ("critic", ppo_config.structured_critic_auxiliary_active),
+            ):
+                if active:
+                    measured.update(_structured_persistence_diagnostics(measured, kind=kind))
             # Per member, so one collapsed member stops the run as itself rather
             # than being averaged into three healthy ones.
             if not warmup_active and entropy_references[agent] is None:

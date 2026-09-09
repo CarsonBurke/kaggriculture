@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,11 @@ from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, slice_trajectories
 from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from train_ppo import _critic_warmup_decision, _validate_critic_warmup_state  # noqa: E402
 
 #: Update metrics worth a column. The pair `actor_updates` /
 #: `actor_minibatches_intended` is the one that says whether the trust region
@@ -195,6 +201,9 @@ def main() -> None:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     require_checkpoint_format(state)
     member_state = checkpoint_agent_states(state)[0]
+    warmup_minimum, saved_warmup_complete, saved_previous_evs = _validate_critic_warmup_state(
+        state.get("initial_actor"), population=len(checkpoint_agent_states(state))
+    )
     required_auxiliary_state = {
         "structured_dynamics",
         "structured_dynamics_optimizer",
@@ -202,41 +211,13 @@ def main() -> None:
         "structured_critic_dynamics_optimizer",
     }
     missing_auxiliary_state = sorted(required_auxiliary_state - member_state.keys())
-    if "structured_auxiliary_rng" not in state:
-        missing_auxiliary_state.append("structured_auxiliary_rng")
     if missing_auxiliary_state:
         raise ValueError(
             "checkpoint is missing production structured auxiliary recovery state: "
             + ", ".join(missing_auxiliary_state)
         )
 
-    gate_record = state.get("structured_gate_state")
-    if (
-        not isinstance(gate_record, Mapping)
-        or gate_record.get("version") != 2
-        or set(gate_record) != {"version", "agents"}
-    ):
-        raise ValueError("checkpoint structured predictor gate state is not version 2")
-    gate_agents = gate_record["agents"]
-    if not isinstance(gate_agents, list) or not gate_agents:
-        raise ValueError("checkpoint has no structured predictor gate state for member zero")
-    gate_member = gate_agents[0]
-    if not isinstance(gate_member, Mapping) or set(gate_member) != {"actor", "critic"}:
-        raise ValueError("checkpoint member-zero structured predictor gate state is incomplete")
-    enabled: dict[str, bool] = {}
-    for kind in ("actor", "critic"):
-        gate = gate_member[kind]
-        if not isinstance(gate, Mapping) or not isinstance(gate.get("enabled"), bool):
-            raise ValueError(f"checkpoint member-zero structured {kind} gate is incomplete")
-        enabled[kind] = gate["enabled"]
-
     saved_auxiliary_rng = copy.deepcopy(state["structured_auxiliary_rng"])
-    recovered_auxiliary_generator = np.random.default_rng()
-    try:
-        recovered_auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("checkpoint structured auxiliary RNG state is invalid") from error
-    saved_auxiliary_rng = copy.deepcopy(recovered_auxiliary_generator.bit_generator.state)
 
     optimizer_state_names = (
         "actor_optimizer",
@@ -351,7 +332,17 @@ def main() -> None:
                 group["warmup_step"] = 0
                 group["lr"] = rate
         history: list[dict[str, Any]] = []
+        warmup_complete = saved_warmup_complete
+        previous_evs = saved_previous_evs[:1]
         for iteration in range(args.iterations):
+            warmup_active, warmup_reason = _critic_warmup_decision(
+                iteration=int(state["iteration"]) + iteration,
+                minimum=warmup_minimum,
+                complete=warmup_complete,
+                previous_evs=previous_evs,
+            )
+            if not warmup_active:
+                warmup_complete = True
             candidate_actor.eval()
             # Every candidate draws the same waves in the same order: the seed
             # advances with the iteration and not with the candidate, so a
@@ -380,16 +371,25 @@ def main() -> None:
                 rollout,
                 config,
                 generator=np.random.default_rng(seed),
+                actor_epochs=0 if warmup_active else None,
                 structured_dynamics=candidate_dynamics,
                 structured_dynamics_optimizer=dynamics_optimizer,
-                structured_actor_auxiliary=enabled["actor"],
+                structured_actor_auxiliary=(
+                    config.structured_actor_auxiliary_active and not warmup_active
+                ),
                 structured_critic_dynamics=candidate_critic_dynamics,
                 structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
-                structured_critic_auxiliary=enabled["critic"],
+                structured_critic_auxiliary=config.structured_critic_auxiliary_active,
                 auxiliary_generator=auxiliary_generator,
             )
+            previous_evs = [float(metrics["monte_carlo_explained_variance"])]
             league_part = slice_trajectories(rollout, args.games * 2, rollout.trajectories)
-            row: dict[str, Any] = {"config": label, "iteration": iteration}
+            row: dict[str, Any] = {
+                "config": label,
+                "iteration": iteration,
+                "critic_warmup_active": int(warmup_active),
+                "critic_warmup_reason": warmup_reason,
+            }
             row.update({name: float(metrics[name]) for name in REPORTED if name in metrics})
             intended = float(metrics.get("actor_minibatches_intended") or 0.0)
             row["epoch_fraction"] = (

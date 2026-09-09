@@ -274,14 +274,12 @@ def _run_cell(
             *actor_args,
         )
         (-policy_sum / rows).backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), config.max_gradient_norm)
         _optimizer_step(actor_optimizer, config.actor_learning_rate, config.lr_warmup_steps)
 
     def critic_step() -> None:
         critic_optimizer.zero_grad(set_to_none=True)
         value_loss, _predicted = critic_loss(critic, batch["value_targets"], autocast, *critic_args)
         value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), config.max_gradient_norm)
         _optimizer_step(critic_optimizer, config.critic_learning_rate, config.lr_warmup_steps)
 
     def one_schedule() -> None:

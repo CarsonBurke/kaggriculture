@@ -24,14 +24,13 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-from collections.abc import Mapping
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION
 from kaggriculture.league import load_actor_snapshot
 from kaggriculture.ppo import (
     PpoConfig,
@@ -53,6 +52,11 @@ from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from train_ppo import _critic_warmup_decision, _validate_critic_warmup_state  # noqa: E402
+
 REPORTED = (
     "actor_updates",
     "kl_early_stop",
@@ -68,16 +72,9 @@ REPORTED = (
 
 def _auxiliary_recovery(
     state: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
-    version = state.get("format_version")
-    if version != CHECKPOINT_FORMAT_VERSION:
-        raise ValueError(
-            "learning-rate probe requires a complete v13 checkpoint; "
-            f"got format version {version!r}"
-        )
+) -> tuple[dict[str, Any], dict[str, Any]]:
     require_checkpoint_format(state)
-    member_states = checkpoint_agent_states(state)
-    member = member_states[0]
+    member = checkpoint_agent_states(state)[0]
     required = {
         "structured_dynamics",
         "structured_dynamics_optimizer",
@@ -87,49 +84,11 @@ def _auxiliary_recovery(
     missing = sorted(required - set(member))
     if missing:
         raise ValueError(
-            "v13 checkpoint member zero has incomplete actor/critic predictor recovery: "
+            "checkpoint member zero has incomplete actor/critic predictor recovery: "
             + ", ".join(missing)
         )
 
-    auxiliary_rng = state.get("structured_auxiliary_rng")
-    if not isinstance(auxiliary_rng, Mapping):
-        raise ValueError("v13 checkpoint is missing a valid structured auxiliary RNG state")
-    saved_auxiliary_rng = copy.deepcopy(dict(auxiliary_rng))
-    try:
-        validation_generator = np.random.default_rng()
-        validation_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("v13 checkpoint structured auxiliary RNG state is invalid") from error
-
-    gate_record = state.get("structured_gate_state")
-    if (
-        not isinstance(gate_record, Mapping)
-        or set(gate_record) != {"version", "agents"}
-        or gate_record.get("version") != 2
-    ):
-        raise ValueError(
-            "v13 checkpoint requires structured gate state version 2 for actor and critic"
-        )
-    gate_agents = gate_record["agents"]
-    if not isinstance(gate_agents, list) or len(gate_agents) != len(member_states):
-        raise ValueError("v13 checkpoint structured gate state has the wrong population")
-    member_gate = gate_agents[0]
-    if not isinstance(member_gate, Mapping) or set(member_gate) != {"actor", "critic"}:
-        raise ValueError("v13 checkpoint member-zero structured gate state is incomplete")
-
-    enabled: dict[str, bool] = {}
-    for side in ("actor", "critic"):
-        gate = member_gate[side]
-        if not isinstance(gate, Mapping) or set(gate) != {
-            "reference",
-            "streak",
-            "enabled",
-        }:
-            raise ValueError(f"v13 checkpoint member-zero {side} gate state is incomplete")
-        if not isinstance(gate["enabled"], bool):
-            raise ValueError(f"v13 checkpoint member-zero {side} gate enabled state is invalid")
-        enabled[side] = gate["enabled"]
-    return member, saved_auxiliary_rng, enabled["actor"], enabled["critic"]
+    return member, copy.deepcopy(state["structured_auxiliary_rng"])
 
 
 def main() -> None:
@@ -158,16 +117,20 @@ def main() -> None:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if not isinstance(state, dict):
         raise ValueError("learning-rate probe checkpoint payload must be a mapping")
-    (
-        member_state,
-        saved_auxiliary_rng,
-        structured_actor_auxiliary,
-        structured_critic_auxiliary,
-    ) = _auxiliary_recovery(state)
+    member_state, saved_auxiliary_rng = _auxiliary_recovery(state)
+    warmup_minimum, warmup_complete, previous_evs = _validate_critic_warmup_state(
+        state.get("initial_actor"), population=len(checkpoint_agent_states(state))
+    )
+    warmup_active, warmup_reason = _critic_warmup_decision(
+        iteration=int(state["iteration"]),
+        minimum=warmup_minimum,
+        complete=warmup_complete,
+        previous_evs=previous_evs[:1],
+    )
     entry = resolve_architecture(state["architecture"])
     model_config = entry.build_config(state["model_config"])
     if not isinstance(model_config, StructuredConfig):
-        raise ValueError("v13 production auxiliary recovery requires a structured model")
+        raise ValueError("production auxiliary recovery requires a structured model")
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
     actor.load_state_dict(member_state["actor"])
@@ -298,15 +261,22 @@ def main() -> None:
             rollout,
             config,
             generator=np.random.default_rng(args.seed),
+            actor_epochs=0 if warmup_active else None,
             structured_dynamics=candidate_dynamics,
             structured_dynamics_optimizer=dynamics_optimizer,
-            structured_actor_auxiliary=structured_actor_auxiliary,
+            structured_actor_auxiliary=(
+                config.structured_actor_auxiliary_active and not warmup_active
+            ),
             structured_critic_dynamics=candidate_critic_dynamics,
             structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
-            structured_critic_auxiliary=structured_critic_auxiliary,
+            structured_critic_auxiliary=config.structured_critic_auxiliary_active,
             auxiliary_generator=auxiliary_generator,
         )
-        row = {"actor_learning_rate": rate}
+        row = {
+            "actor_learning_rate": rate,
+            "critic_warmup_active": int(warmup_active),
+            "critic_warmup_reason": warmup_reason,
+        }
         row.update({k: float(metrics[k]) for k in REPORTED if k in metrics})
         row["completed_epoch"] = bool(
             int(metrics["actor_updates"]) == report["minibatches_per_epoch"]

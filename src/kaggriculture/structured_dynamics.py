@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import NamedTuple
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
@@ -301,6 +302,54 @@ class StructuredDynamicsTerms(NamedTuple):
     residual_market_decisions: Tensor
 
 
+class StructuredHorizonPlan(NamedTuple):
+    """Bucketed source/action/target indices and explicit loss eligibility."""
+
+    indices: Tensor
+    eligible: Tensor
+
+
+def structured_horizon_plan(
+    episode_index: np.ndarray,
+    step: np.ndarray,
+    horizon: int,
+) -> StructuredHorizonPlan:
+    """Plan immutable CPU metadata; never discover variable shapes on CUDA.
+
+    Retain the union of eligible sources at every offset, not only one-step
+    pairs: the flat loss checks endpoints and can admit a later endpoint even
+    when an intermediate row is discontinuous. Every retained source runs its
+    complete recursive ancestry. Eight aligned occupancy buckets per minibatch
+    size bound compiled shapes; all-false padding keeps zero-loss backward alive.
+    """
+    if horizon < 1:
+        raise ValueError("structured plan horizon must be positive")
+    if episode_index.ndim != 1 or step.shape != episode_index.shape or not step.size:
+        raise ValueError("structured plan metadata must be matching nonempty vectors")
+    rows = np.arange(step.size, dtype=np.int64)
+    offsets = np.arange(1, horizon + 1, dtype=np.int64)[:, None]
+    unclamped = rows[None, :] + offsets
+    targets = np.minimum(unclamped, step.size - 1)
+    eligible = (
+        (unclamped < step.size)
+        & (episode_index[targets] == episode_index[None, :])
+        & (step[targets] == step[None, :] + offsets)
+    )
+    sources = np.flatnonzero(eligible.any(axis=0))
+    count = sources.size
+    alignment = max(64, (1 << (step.size - 1).bit_length()) // 8)
+    bucket = max(alignment, ((count + alignment - 1) // alignment) * alignment)
+    padded_sources = np.zeros(bucket, dtype=np.int64)
+    padded_sources[:count] = sources
+    indices = np.empty((1 + 2 * horizon, bucket), dtype=np.int64)
+    indices[0] = padded_sources
+    indices[1 : horizon + 1] = np.minimum(padded_sources[None, :] + offsets - 1, step.size - 1)
+    indices[horizon + 1 :] = targets[:, padded_sources]
+    mask = np.zeros((horizon, bucket), dtype=np.bool_)
+    mask[:, :count] = eligible[:, sources]
+    return StructuredHorizonPlan(torch.from_numpy(indices), torch.from_numpy(mask))
+
+
 def _target_index(
     episode_index: Tensor,
     step: Tensor,
@@ -353,6 +402,44 @@ def _eligible_rms_ratio(predicted: Tensor, previous: Tensor, eligible: Tensor) -
     ).sqrt()
     baseline_rms = ((previous_value.square() * weight).sum() / elements.clamp_min(1)).sqrt()
     return residual_rms / baseline_rms.clamp_min(1e-6)
+
+
+def _belief_latent_smooth_l1(
+    predicted: tuple[Tensor, ...],
+    target: tuple[Tensor, ...],
+    eligible: Tensor,
+) -> Tensor:
+    """Element-weighted SmoothL1 without materializing a joined belief."""
+    total = predicted[0].new_zeros((), dtype=torch.float32)
+    elements_per_row = 0
+    for current, teacher in zip(predicted, target, strict=True):
+        error = nn.functional.smooth_l1_loss(
+            current.float(), teacher.detach().float(), reduction="none"
+        )
+        weight = eligible.float().reshape(-1, *([1] * (current.ndim - 1)))
+        total = total + (error * weight).sum()
+        elements_per_row += current[0].numel()
+    return total / (eligible.float().sum() * elements_per_row).clamp_min(1)
+
+
+def _belief_rms_ratio(
+    predicted: tuple[Tensor, ...],
+    previous: tuple[Tensor, ...],
+    eligible: Tensor,
+) -> Tensor:
+    """Global residual/baseline RMS, not a mean of differently sized families."""
+    residual = predicted[0].new_zeros((), dtype=torch.float32)
+    baseline = residual
+    elements_per_row = 0
+    for current, source in zip(predicted, previous, strict=True):
+        current_value = current.detach().float()
+        source_value = source.detach().float()
+        weight = eligible.float().reshape(-1, *([1] * (current.ndim - 1)))
+        residual = residual + ((current_value - source_value).square() * weight).sum()
+        baseline = baseline + (source_value.square() * weight).sum()
+        elements_per_row += current[0].numel()
+    elements = (eligible.float().sum() * elements_per_row).clamp_min(1)
+    return (residual / elements).sqrt() / (baseline / elements).sqrt().clamp_min(1e-6)
 
 
 def _patch_losses(
@@ -422,6 +509,7 @@ def structured_horizon_loss(
     opponent_summary_active: bool = False,
     opponent_patches_active: bool = False,
     target_belief: StructuredBelief | None = None,
+    plan: StructuredHorizonPlan | None = None,
 ) -> StructuredDynamicsTerms:
     """Unroll typed dynamics against exact contiguous demonstrated successors."""
     if decision_horizon < 0 or patch_horizon < 0 or latent_horizon < 0:
@@ -435,7 +523,19 @@ def structured_horizon_loss(
     if max_horizon < 1:
         raise ValueError("at least one structured auxiliary horizon must be active")
     targets = belief if target_belief is None else target_belief
-    predicted = belief
+    # The shuffled control permutes the original batch, including invalid rows.
+    if isinstance(dynamics, ShuffledActionDynamics):
+        plan = None
+    if plan is not None and plan.eligible.shape[0] < max_horizon:
+        raise ValueError("structured plan does not cover the requested horizon")
+    source_index = (
+        torch.arange(belief.central_latents.shape[0], device=belief.central_latents.device)
+        if plan is None
+        else plan.indices[0]
+    )
+    predicted = (
+        belief if plan is None else StructuredBelief(*(value[source_index] for value in belief))
+    )
     zero = belief.central_latents.new_zeros((), dtype=torch.float32)
     sums = [zero for _ in range(16)]
     eligible_sum = zero
@@ -459,7 +559,11 @@ def structured_horizon_loss(
         device=factors["episode_index"].device,
     )
     for offset in range(1, max_horizon + 1):
-        action_index = (rows + offset - 1).clamp_max(rows.shape[0] - 1)
+        action_index = (
+            (rows + offset - 1).clamp_max(rows.shape[0] - 1)
+            if plan is None
+            else plan.indices[offset]
+        )
         previous = predicted
         predicted = dynamics(
             predicted,
@@ -470,10 +574,14 @@ def structured_horizon_loss(
             inputs.unit_active[action_index],
             active_fields=active_fields,
         )
-        target_index, eligible = _target_index(factors["episode_index"], factors["step"], offset)
-        joined_predicted = torch.cat(tuple(predicted), dim=1)
-        joined_previous = torch.cat(tuple(previous), dim=1)
-        sums[11] = sums[11] + _eligible_rms_ratio(joined_predicted, joined_previous, eligible)
+        if plan is None:
+            target_index, eligible = _target_index(
+                factors["episode_index"], factors["step"], offset
+            )
+        else:
+            target_index = plan.indices[plan.eligible.shape[0] + offset]
+            eligible = plan.eligible[offset - 1]
+        sums[11] = sums[11] + _belief_rms_ratio(predicted, previous, eligible)
         for kind, (predicted_value, previous_value) in enumerate(
             zip(predicted, previous, strict=True)
         ):
@@ -535,9 +643,9 @@ def structured_horizon_loss(
 
         if offset <= patch_horizon:
             if own_patches_active:
-                source_categorical = inputs.tile_categorical[:, :TILE_COUNT]
+                source_categorical = inputs.tile_categorical[source_index, :TILE_COUNT]
                 target_categorical = inputs.tile_categorical[target_index, :TILE_COUNT]
-                source_continuous = inputs.tile_continuous[:, :TILE_COUNT]
+                source_continuous = inputs.tile_continuous[source_index, :TILE_COUNT]
                 target_continuous = inputs.tile_continuous[target_index, :TILE_COUNT]
                 changed = _tile_changes(
                     source_categorical,
@@ -574,9 +682,9 @@ def structured_horizon_loss(
             if opponent_patches_active:
                 opponent_slice = slice(TILE_COUNT, 2 * TILE_COUNT)
                 changed = _tile_changes(
-                    inputs.tile_categorical[:, opponent_slice],
+                    inputs.tile_categorical[source_index, opponent_slice],
                     inputs.tile_categorical[target_index, opponent_slice],
-                    inputs.tile_continuous[:, opponent_slice],
+                    inputs.tile_continuous[source_index, opponent_slice],
                     inputs.tile_continuous[target_index, opponent_slice],
                 )
                 opponent_patch_terms = _patch_losses(
@@ -642,12 +750,10 @@ def structured_window_loss(
 ) -> StructuredDynamicsTerms:
     """Score complete fixed-width windows without running invalid trailing rows.
 
-    ``structured_horizon_loss`` accepts arbitrary flat sequences and therefore
-    advances every row at every horizon before masking rows that crossed a
-    boundary. Predictor training already supplies validated windows of exactly
-    ``max_horizon + 1`` rows. For horizon two that generic path advances six
-    rows per window although only three are eligible. This path preserves the
-    same eligible predictions and reductions while advancing only those three.
+    ``structured_horizon_loss`` accepts arbitrary flat sequences, optionally
+    compacted with an immutable CPU plan. This window path instead consumes
+    validated groups of exactly ``max_horizon + 1`` rows and shrinks recursive
+    predictions as each trailing position loses its successor.
     """
     max_horizon = max(decision_horizon, patch_horizon)
     if max_horizon < 1:
@@ -722,9 +828,7 @@ def structured_window_loss(
             dtype=torch.bool,
             device=belief.own_patches.device,
         )
-        joined_predicted = torch.cat(tuple(current), dim=1)
-        joined_previous = torch.cat(tuple(previous), dim=1)
-        sums[11] = sums[11] + _eligible_rms_ratio(joined_predicted, joined_previous, eligible)
+        sums[11] = sums[11] + _belief_rms_ratio(current, previous, eligible)
         for kind, (predicted_value, previous_value) in enumerate(
             zip(current, previous, strict=True)
         ):
@@ -894,6 +998,10 @@ def _critic_value_kl(
     per_row = (
         teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1))
     ).sum(dim=-1)
+    # Beliefs keep a singleton token dimension. Reduce tokens before applying
+    # the row mask: [B, 1] * [B] would broadcast to [B, B], admitting invalid
+    # successors and scaling the value objective by the entire minibatch.
+    per_row = per_row.reshape(per_row.shape[0], -1).mean(dim=-1)
     if eligible is None:
         return per_row.mean()
     weight_rows = eligible.float()
@@ -978,24 +1086,13 @@ def structured_critic_window_loss(
             dtype=torch.bool,
             device=belief.own_patches.device,
         )
-        joined_current = torch.cat(tuple(current), dim=1)
-        joined_target = torch.cat(tuple(target), dim=1)
-        joined_previous = torch.cat(tuple(previous), dim=1)
-        latent_sum = latent_sum + _latent_smooth_l1(
-            joined_current,
-            joined_target,
-            eligible,
-        )
+        latent_sum = latent_sum + _belief_latent_smooth_l1(current, target, eligible)
         value_sum = value_sum + _critic_value_kl(
             current.value_decision,
             target.value_decision,
             value_head,
         )
-        residual_sum = residual_sum + _eligible_rms_ratio(
-            joined_current,
-            joined_previous,
-            eligible,
-        )
+        residual_sum = residual_sum + _belief_rms_ratio(current, previous, eligible)
         eligible_sum = eligible_sum + eligible.float().sum()
 
     return StructuredCriticDynamicsTerms(
@@ -1014,6 +1111,7 @@ def structured_critic_horizon_loss(
     *,
     value_head: nn.Linear,
     horizon: int,
+    plan: StructuredHorizonPlan | None = None,
 ) -> StructuredCriticDynamicsTerms:
     """Unroll critic dynamics against in-batch successors, as NextLat shifts h_t.
 
@@ -1022,7 +1120,15 @@ def structured_critic_horizon_loss(
     """
     if horizon < 1:
         raise ValueError("structured critic horizon must be positive")
-    predicted = belief
+    if isinstance(dynamics, ShuffledActionDynamics):
+        plan = None
+    if plan is not None and plan.eligible.shape[0] < horizon:
+        raise ValueError("structured plan does not cover the requested horizon")
+    predicted = (
+        belief
+        if plan is None
+        else StructuredCriticBelief(*(value[plan.indices[0]] for value in belief))
+    )
     zero = belief.central_latents.new_zeros((), dtype=torch.float32)
     latent_sum = zero
     value_sum = zero
@@ -1033,7 +1139,11 @@ def structured_critic_horizon_loss(
         device=factors["episode_index"].device,
     )
     for offset in range(1, horizon + 1):
-        action_index = (rows + offset - 1).clamp_max(rows.shape[0] - 1)
+        action_index = (
+            (rows + offset - 1).clamp_max(rows.shape[0] - 1)
+            if plan is None
+            else plan.indices[offset]
+        )
         previous = predicted
         predicted = dynamics(
             predicted,
@@ -1043,21 +1153,22 @@ def structured_critic_horizon_loss(
             inputs.unit_categorical[action_index],
             inputs.unit_active[action_index],
         )
-        target_index, eligible = _target_index(factors["episode_index"], factors["step"], offset)
+        if plan is None:
+            target_index, eligible = _target_index(
+                factors["episode_index"], factors["step"], offset
+            )
+        else:
+            target_index = plan.indices[plan.eligible.shape[0] + offset]
+            eligible = plan.eligible[offset - 1]
         target = StructuredCriticBelief(*(value[target_index] for value in belief))
-        joined_predicted = torch.cat(tuple(predicted), dim=1)
-        joined_target = torch.cat(tuple(target), dim=1)
-        joined_previous = torch.cat(tuple(previous), dim=1)
-        latent_sum = latent_sum + _latent_smooth_l1(joined_predicted, joined_target, eligible)
+        latent_sum = latent_sum + _belief_latent_smooth_l1(predicted, target, eligible)
         value_sum = value_sum + _critic_value_kl(
             predicted.value_decision,
             target.value_decision,
             value_head,
             eligible,
         )
-        residual_sum = residual_sum + _eligible_rms_ratio(
-            joined_predicted, joined_previous, eligible
-        )
+        residual_sum = residual_sum + _belief_rms_ratio(predicted, previous, eligible)
         eligible_sum = eligible_sum + eligible.float().sum()
     return StructuredCriticDynamicsTerms(
         latent=latent_sum / horizon,

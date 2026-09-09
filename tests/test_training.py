@@ -144,15 +144,6 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         metrics={},
         source_identity=source_identity(),
         auxiliary_rng_state=auxiliary_state,
-        structured_gate_state={
-            "version": 3,
-            "agents": [
-                {
-                    "actor": {"streak": 0, "enabled": False},
-                    "critic": {"streak": 0, "enabled": False},
-                }
-            ],
-        },
         seed_usage=[{"domain": "online_rl", "start": 20_000_000, "count": 100}],
     )
 
@@ -187,12 +178,6 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
     restored_generator = np.random.default_rng()
     restored_generator.bit_generator.state = payload["structured_auxiliary_rng"]
 
-    assert payload["structured_gate_state"] == {
-        "version": 3,
-        "agents": [
-            {"actor": {"streak": 0, "enabled": False}, "critic": {"streak": 0, "enabled": False}}
-        ],
-    }
     assert payload["seed_usage"] == [{"domain": "online_rl", "start": 20_000_000, "count": 100}]
     for name, value in dynamics.state_dict().items():
         torch.testing.assert_close(restored_dynamics.state_dict()[name], value)
@@ -249,6 +234,17 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
             [restored_agent],
             device=torch.device("cpu"),
         )
+    assert all(
+        torch.equal(value, before_rejected_load[name])
+        for name, value in restored_actor.state_dict().items()
+    )
+
+    invalid_rng_path = tmp_path / "invalid-auxiliary-rng.pt"
+    invalid_rng_payload = torch.load(path, weights_only=False)
+    invalid_rng_payload["structured_auxiliary_rng"] = {"bit_generator": "PCG64"}
+    torch.save(invalid_rng_payload, invalid_rng_path)
+    with pytest.raises(ValueError, match="structured auxiliary RNG state is invalid"):
+        load_checkpoint(invalid_rng_path, [restored_agent], device=torch.device("cpu"))
     assert all(
         torch.equal(value, before_rejected_load[name])
         for name, value in restored_actor.state_dict().items()
@@ -402,7 +398,7 @@ def test_latest_alias_atomically_tracks_immutable_regular_checkpoints(tmp_path) 
         write_immutable_checkpoint(first, {"iteration": 99})
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+@pytest.mark.parametrize("version", [None, *range(1, CHECKPOINT_FORMAT_VERSION)])
 def test_checkpoint_rejects_incompatible_format(tmp_path, version) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"format_version": version}, path)

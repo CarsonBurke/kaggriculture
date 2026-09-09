@@ -280,7 +280,6 @@ def _critic_epoch(
         critic_optimizer.zero_grad(set_to_none=True)
         value_loss = loss_fn(critic, value_targets, autocast_enabled, *critic_args)
         value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), config.max_gradient_norm)
         if gateable:
             critic_skip = (~torch.isfinite(value_loss.detach())).float()
             nonfinite += critic_skip

@@ -135,6 +135,14 @@ def checkpoint_member_orientations(payload: Mapping[str, Any]) -> list[Orientati
     ]
 
 
+def _validate_auxiliary_rng_state(state: Mapping[str, Any]) -> None:
+    """Reject an unrecoverable auxiliary stream before restoring learner state."""
+    try:
+        np.random.default_rng().bit_generator.state = dict(state)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint structured auxiliary RNG state is invalid") from error
+
+
 def require_checkpoint_format(payload: dict[str, Any]) -> None:
     """Reject checkpoints from incompatible model and action schemas.
 
@@ -172,8 +180,8 @@ def require_checkpoint_format(payload: dict[str, Any]) -> None:
     )
     if ("structured_auxiliary_rng" in payload) != has_predictor:
         raise ValueError("checkpoint structured predictor recovery RNG is incomplete")
-    if (payload.get("structured_gate_state") is not None) != has_predictor:
-        raise ValueError("checkpoint structured predictor gate state is incomplete")
+    if has_predictor:
+        _validate_auxiliary_rng_state(payload["structured_auxiliary_rng"])
     identity = validate_source_identity(payload.get("source_identity"))
     run_provenance = validate_run_provenance(payload.get("run_provenance"))
     if run_provenance is not None and run_provenance["source_identity"] != identity:
@@ -339,7 +347,6 @@ def checkpoint_payload(
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
-    structured_gate_state: Mapping[str, Any] | None = None,
     seed_usage: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Assemble a validated checkpoint payload from already-captured state."""
@@ -392,10 +399,8 @@ def checkpoint_payload(
         raise ValueError(
             "structured predictors, optimizers, and auxiliary RNG must be checkpointed together"
         )
-    if any(auxiliary_members) != (structured_gate_state is not None):
-        raise ValueError(
-            "structured predictors and predictor gate state must be checkpointed together"
-        )
+    if auxiliary_rng_state is not None:
+        _validate_auxiliary_rng_state(auxiliary_rng_state)
     # Evaluation and submission play the real board. Training cycles
     # symmetries per game, so a member has no private frame to record.
     # Identity is the code inference applies when it is asked to play.
@@ -431,9 +436,6 @@ def checkpoint_payload(
         **rng_states,
         "training_rng": training_rng_state,
         **auxiliary_recovery,
-        "structured_gate_state": (
-            None if structured_gate_state is None else dict(structured_gate_state)
-        ),
         "training_data_config": training_data_config,
         "league_snapshot_manifest": league_snapshot_manifest,
         # PFSP opponent estimates are part of the training state: without
@@ -576,7 +578,6 @@ def save_checkpoint(
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
     initial_actor: dict[str, Any] | None = None,
-    structured_gate_state: Mapping[str, Any] | None = None,
     seed_usage: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     payload = checkpoint_payload(
@@ -598,7 +599,6 @@ def save_checkpoint(
         population_disagreement_reference=population_disagreement_reference,
         policy_entropy_reference=policy_entropy_reference,
         initial_actor=initial_actor,
-        structured_gate_state=structured_gate_state,
         seed_usage=seed_usage,
     )
     write_checkpoint(path, payload)
