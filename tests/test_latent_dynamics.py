@@ -108,6 +108,34 @@ def test_the_decode_reproduces_the_actors_own_heads_exactly() -> None:
     )
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("normalized_units", [False, True])
+def test_decode_unit_gradient_matches_its_exact_head_input(normalized_units: bool) -> None:
+    actor = _actor().cuda()
+    with torch.no_grad():
+        actor.unit_head[0].weight.copy_(torch.linspace(0.5, 1.5, 16))
+    belief = torch.randn(2, BELIEF_TOKENS, 16, device="cuda", requires_grad=True)
+    heads = DecodeHeads.from_actor(actor, normalized_units=normalized_units)
+    actual = heads.decode(belief).unit_logits
+    units = belief[:, :MAX_UNITS]
+    if not normalized_units:
+        norm = actor.unit_head[0]
+        units = torch.nn.functional.rms_norm(
+            units, norm.normalized_shape, norm.weight.detach(), norm.eps
+        )
+    projection = actor.unit_head[-1]
+    expected = torch.nn.functional.linear(
+        units, projection.weight.detach(), projection.bias.detach()
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual_gradient = torch.autograd.grad(actual.square().sum(), belief, retain_graph=True)[0]
+    expected_gradient = torch.autograd.grad(expected.square().sum(), belief)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+    assert actual_gradient[:, :MAX_UNITS].abs().sum() > 0
+    assert all(parameter.grad is None for parameter in actor.parameters())
+
+
 def test_each_slot_gets_its_own_prediction() -> None:
     """The failure this module was rewritten to remove.
 
@@ -230,20 +258,23 @@ def test_the_decode_kl_is_zero_exactly_when_the_prediction_is_exact() -> None:
     assert wrong.item() > 1e-4
 
 
-def test_the_decode_kl_never_moves_a_head_weight() -> None:
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("normalized_units", [False, True])
+def test_the_decode_kl_never_moves_a_head_weight(normalized_units: bool) -> None:
     """The gradient must reach the prediction and stop at the heads.
 
     Otherwise the term has a degenerate solution: flatten the policy until every
     decode agrees, which lowers the KL without predicting anything.
     """
-    actor = _actor()
-    heads = DecodeHeads.from_actor(actor)
+    actor = _actor().cuda()
+    heads = DecodeHeads.from_actor(actor, normalized_units=normalized_units)
     rows = 3
     actions = _actions(rows)
-    masks = _masks(rows, actions)
-    truth = torch.randn(rows, BELIEF_TOKENS, 16)
+    masks = DecodeMasks(*(value.cuda() for value in _masks(rows, actions)))
+    truth = torch.randn(rows, BELIEF_TOKENS, 16, device="cuda")
     teacher = heads.decode(truth)
-    predicted = (truth + 0.5).requires_grad_(True)
+    predicted = (truth.detach() + 0.5).requires_grad_(True)
     latent_decode_kl(
         predicted,
         teacher.unit_logits,
@@ -251,7 +282,7 @@ def test_the_decode_kl_never_moves_a_head_weight() -> None:
         teacher.market_quantity_context,
         heads,
         masks,
-        torch.ones(rows, dtype=torch.bool),
+        torch.ones(rows, dtype=torch.bool, device="cuda"),
     ).backward()
     assert predicted.grad is not None and bool(predicted.grad.abs().max() > 0)
     for name, parameter in actor.named_parameters():

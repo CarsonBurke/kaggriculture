@@ -16,10 +16,12 @@ from kaggriculture.structured_dynamics import (
     _critic_value_kl,
     _eligible_rms_ratio,
     _latent_smooth_l1,
+    _target_index,
     structured_critic_horizon_loss,
     structured_critic_window_loss,
     structured_horizon_loss,
     structured_horizon_plan,
+    structured_window_loss,
 )
 from kaggriculture.tokens import TILE_COUNT
 
@@ -80,14 +82,14 @@ def test_action_conditioning_beats_persistence_and_shuffled_actions_without_rng(
 
 
 class _RecurrentTransition(nn.Module):
-    """Row-independent transition with observable recurrent central ancestry."""
+    """Row-independent transition with observable recursive belief ancestry."""
 
     def __init__(self, fields: int) -> None:
         super().__init__()
         self.scales = nn.Parameter(torch.linspace(0.05, 0.2, fields))
 
     def forward(self, belief, unit_actions, *context, active_fields=None):
-        central = belief.central_latents.mean(dim=1, keepdim=True)
+        central = belief[-1].mean(dim=1, keepdim=True)
         action = unit_actions[:, :1, None].float() * 0.01
         active_fields = active_fields or (True,) * len(belief)
         return type(belief)(
@@ -99,7 +101,7 @@ class _RecurrentTransition(nn.Module):
 
 
 @pytest.mark.parametrize("critic", [False, True])
-@pytest.mark.parametrize("layout", ["pairs", "discontinuous", "empty"])
+@pytest.mark.parametrize("layout", ["pairs", "non_power_of_two", "discontinuous", "step_gap", "empty"])
 def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
     critic: bool, layout: str
 ) -> None:
@@ -108,11 +110,19 @@ def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
         episodes = np.repeat(np.arange(65), 2)
         steps = np.tile(np.arange(2), 65)
         horizon = 1
+    elif layout == "non_power_of_two":
+        # A larger, non-power-of-two batch exercises compact occupancy padding.
+        episodes = np.repeat(np.arange(2397), 2)
+        steps = np.tile(np.arange(2), 2397)
+        horizon = 1
     elif layout == "discontinuous":
-        # Offset two admits source zero despite its discontinuous intermediate:
-        # dropping it at offset one would sever a valid recursive prediction.
+        # Matching endpoints cannot repair the invalid intermediate row at one.
         episodes = np.array([0, 1, 0, 0, 2, 2, 2, 3])
         steps = np.array([0, 9, 2, 3, 0, 1, 2, 0])
+        horizon = 3
+    elif layout == "step_gap":
+        episodes = np.zeros(8, dtype=np.int64)
+        steps = np.array([0, 9, 2, 3, 10, 11, 12, 13])
         horizon = 3
     else:
         episodes = np.arange(5)
@@ -121,9 +131,7 @@ def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
     rows = len(steps)
     generator = torch.Generator().manual_seed(947)
     belief_type = StructuredCriticBelief if critic else StructuredBelief
-    sizes = (
-        (TILE_COUNT, TILE_COUNT, 2, 3, 2, 1) if critic else (TILE_COUNT, TILE_COUNT, 2, 3, 2, 2, 1)
-    )
+    sizes = (1,) if critic else (TILE_COUNT, TILE_COUNT, 2, 3, 2, 2, 1)
     values = tuple(torch.randn(rows, size, 4, generator=generator) for size in sizes)
     inputs = StructuredInputs(
         **{
@@ -143,6 +151,23 @@ def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
         "market_quantities": torch.zeros(rows, 1, dtype=torch.long),
     }
     plan = structured_horizon_plan(episodes, steps, horizon)
+    expected_eligibility = [
+        [
+            source + offset < rows
+            and all(
+                episodes[index] == episodes[index - 1]
+                and steps[index] == steps[index - 1] + 1
+                for index in range(source + 1, source + offset + 1)
+            )
+            for source in range(rows)
+        ]
+        for offset in range(1, horizon + 1)
+    ]
+    for offset, expected_rows in enumerate(expected_eligibility, start=1):
+        _, dense_mask = _target_index(factors["episode_index"], factors["step"], offset)
+        assert dense_mask.tolist() == expected_rows
+        expected_sources = [source for source, valid in enumerate(expected_rows) if valid]
+        assert plan.indices[0][plan.eligible[offset - 1]].tolist() == expected_sources
     dynamics = _RecurrentTransition(len(sizes))
     head = nn.Linear(4, 3)
     outcomes = []
@@ -179,6 +204,9 @@ def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
                 + terms.opponent_summary
                 + terms.opponent_patches
             )
+        assert terms.eligible.item() == pytest.approx(
+            sum(sum(mask) for mask in expected_eligibility) / horizon
+        )
         # The diagnostic retains this same graph; the source and predictor then
         # receive one combined primary+NextLat backward rather than a second trunk.
         parameters = (*belief, *model.parameters())
@@ -252,3 +280,76 @@ def test_critic_value_kl_masks_rows_without_cross_batch_broadcast() -> None:
     assert torch.count_nonzero(predicted.grad[1:]) == 0
     assert target.grad is None
     assert head.weight.grad is None
+
+
+def test_actor_window_latent_loss_matches_recursive_head_only_reference() -> None:
+    generator = torch.Generator().manual_seed(829)
+    rows, horizon = 6, 2
+    sizes = (4, 4, 2, 3, 2, 2, 1)
+    belief = StructuredBelief(
+        *(torch.randn(rows, size, 4, generator=generator).requires_grad_() for size in sizes)
+    )
+    inputs = StructuredInputs(
+        **{name: torch.zeros(rows, 1, dtype=torch.long) for name in StructuredInputs._fields}
+    )
+    factors = {
+        "unit_actions": torch.arange(rows).reshape(rows, 1),
+        "market_kinds": torch.zeros(rows, 1, dtype=torch.long),
+        "market_quantities": torch.zeros(rows, 1, dtype=torch.long),
+    }
+    dynamics = _RecurrentTransition(len(belief))
+
+    def loss(current):
+        return structured_window_loss(
+            dynamics,
+            current,
+            inputs,
+            factors,
+            decode=None,
+            decision_horizon=0,
+            latent_horizon=horizon,
+            patch_horizon=0,
+            own_patches_active=False,
+            economy_active=False,
+            opponent_summary_active=False,
+            opponent_patches_active=False,
+        ).latent
+
+    actual = loss(belief)
+    changed_world = StructuredBelief(
+        *(value * -1000 for value in belief[:5]), *belief[5:]
+    )
+    torch.testing.assert_close(loss(changed_world), actual, rtol=0, atol=0)
+    # Independent recurrence over two complete three-state windows, followed by
+    # the reference's masked-element SmoothL1 reduction at each horizon.
+    per_horizon = [[], []]
+    for start in (0, 3):
+        for source in range(start, start + 2):
+            units, market = belief.unit_decisions[source], belief.market_decisions[source]
+            for offset in range(1, start + 3 - source):
+                action = factors["unit_actions"][source + offset - 1].float() * 0.01
+                context = market.mean(dim=0, keepdim=True)
+                units = units + dynamics.scales[5] * (units.sin() + context + action)
+                market = market + dynamics.scales[6] * (market.sin() + context + action)
+                predicted = torch.cat((units, market), dim=0)
+                target = torch.cat(
+                    (
+                        belief.unit_decisions[source + offset],
+                        belief.market_decisions[source + offset],
+                    ),
+                    dim=0,
+                ).detach()
+                per_horizon[offset - 1].append(
+                    nn.functional.smooth_l1_loss(predicted, target)
+                )
+    expected = sum(torch.stack(losses).mean() for losses in per_horizon) / horizon
+    torch.testing.assert_close(actual, expected)
+    parameters = (*belief, dynamics.scales)
+    actual_gradients = torch.autograd.grad(
+        actual, parameters, allow_unused=True, retain_graph=True
+    )
+    expected_gradients = torch.autograd.grad(expected, parameters, allow_unused=True)
+    torch.testing.assert_close(actual_gradients, expected_gradients)
+    assert all(gradient is None for gradient in actual_gradients[:5])
+    assert actual_gradients[5][0].abs().sum() > 0
+    assert actual_gradients[5][[2, 5]].count_nonzero() == 0

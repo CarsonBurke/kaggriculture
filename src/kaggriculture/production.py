@@ -13,7 +13,7 @@ from kaggriculture.provenance import repository_root
 from kaggriculture.registry import STRUCTURED
 
 PRODUCTION_ARCHITECTURE = STRUCTURED
-PRODUCTION_CRITIC_WARMUP_ITERATIONS = 5
+PRODUCTION_CRITIC_WARMUP_ITERATIONS = 10
 PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 
 # A mirror self-play game contributes two current-policy trajectories; a
@@ -168,7 +168,7 @@ def production_ppo_config(
 ) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    With 230,080 states, a 4096-row ceiling produces 57 balanced minibatches per
+    With 230,080 states, a 4800-row ceiling produces 48 balanced minibatches per
     epoch. Production is one actor epoch and one critic epoch on the same wave:
     a second same-wave critic pass memorized holdout, and a second actor pass
     is a replay at a KL that does not bind. Independent CUDA streams overlap
@@ -183,15 +183,15 @@ def production_ppo_config(
             critic_epochs=PpoConfig.epochs,
             target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
-            # The actor predicts future policy distributions. The critic uses
-            # both latent regression and decoded categorical-value matching.
+            # Preserve the head's boost over ordinary Adam groups as base rates change.
+            critic_head_learning_rate=(
+                PpoConfig.critic_learning_rate * PpoConfig.adam_learning_rate_ratio * (25.0 / 3.0)
+            ),
+            # Independent actor/critic NextLat objectives supervise only the
+            # normalized inputs to their policy/value heads, never world state.
+            structured_latent_coefficient=1.0,
             structured_decision_coefficient=1.0,
-            structured_patch_coefficient=0.0,
-            structured_economy_coefficient=0.0,
-            structured_opponent_summary_coefficient=0.0,
-            structured_opponent_patch_coefficient=0.0,
             structured_decision_horizon=1,
-            structured_patch_horizon=1,
             structured_critic_latent_coefficient=1.0,
             structured_critic_value_coefficient=1.0,
             structured_critic_horizon=1,
@@ -412,6 +412,8 @@ def build_training_command(
             str(ppo["actor_learning_rate"]),
             "--critic-lr",
             str(ppo["critic_learning_rate"]),
+            "--critic-head-lr",
+            str(ppo["critic_head_learning_rate"]),
             "--lr-warmup-steps",
             str(ppo["lr_warmup_steps"]),
             "--epochs",
@@ -436,20 +438,12 @@ def build_training_command(
             str(ppo["optimizer"]),
             "--nextlat-max-gradient-norm",
             str(ppo["nextlat_max_gradient_norm"]),
+            "--structured-latent-coefficient",
+            str(ppo["structured_latent_coefficient"]),
             "--structured-decision-coefficient",
             str(ppo["structured_decision_coefficient"]),
-            "--structured-patch-coefficient",
-            str(ppo["structured_patch_coefficient"]),
-            "--structured-economy-coefficient",
-            str(ppo["structured_economy_coefficient"]),
-            "--structured-opponent-summary-coefficient",
-            str(ppo["structured_opponent_summary_coefficient"]),
-            "--structured-opponent-patch-coefficient",
-            str(ppo["structured_opponent_patch_coefficient"]),
             "--structured-decision-horizon",
             str(ppo["structured_decision_horizon"]),
-            "--structured-patch-horizon",
-            str(ppo["structured_patch_horizon"]),
             "--structured-critic-latent-coefficient",
             str(ppo["structured_critic_latent_coefficient"]),
             "--structured-critic-value-coefficient",

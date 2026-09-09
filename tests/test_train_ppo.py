@@ -49,8 +49,8 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.league_active_pool_size == 16
     assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
     assert (args.epochs, args.critic_epochs) == (1, 1)
-    assert args.critic_lr == pytest.approx(2.5e-4)
-    assert args.minibatch_size == 4096
+    assert args.critic_lr == args.actor_lr == pytest.approx(5.0e-5)
+    assert args.minibatch_size == 4800
     # An unflagged run is exactly the family's dataclass configuration, which
     # is what a warm-start artifact and the calibration benchmark both carry.
     assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
@@ -64,17 +64,6 @@ def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch
     assert args.checkpoint_seconds == 420.0
     assert not hasattr(args, "checkpoint_every")
     assert not args.deterministic_training
-    assert not any(
-        (
-            args.structured_decision_coefficient,
-            args.structured_patch_coefficient,
-            args.structured_economy_coefficient,
-            args.structured_opponent_summary_coefficient,
-            args.structured_opponent_patch_coefficient,
-            args.structured_critic_latent_coefficient,
-            args.structured_critic_value_coefficient,
-        )
-    )
     assert not hasattr(args, "structured_actor_gradient_ratio")
     module._validate_args(args)
     for rejected in (299.0, 601.0, float("nan")):
@@ -122,9 +111,7 @@ def test_structured_auxiliary_cli_is_typed_population_safe_and_resume_bound(
             "0",
             "--structured-decision-coefficient",
             "0.5",
-            "--structured-opponent-summary-coefficient",
-            "0.5",
-            "--structured-opponent-patch-coefficient",
+            "--structured-latent-coefficient",
             "0.5",
             "--structured-critic-latent-coefficient",
             "0.75",
@@ -138,8 +125,6 @@ def test_structured_auxiliary_cli_is_typed_population_safe_and_resume_bound(
     args = module.parse_args()
     module._validate_args(args)
 
-    assert args.structured_decision_horizon == 2
-    assert args.structured_patch_horizon == 1
     assert args.structured_critic_horizon == 3
     assert args.structured_critic_latent_coefficient == pytest.approx(0.75)
     assert args.structured_critic_value_coefficient == pytest.approx(0.25)
@@ -1612,7 +1597,7 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     )
     defaulted = module.parse_args()
     module._validate_args(defaulted)
-    assert defaulted.critic_warmup_iterations == module.DEFAULT_CRITIC_WARMUP_ITERATIONS == 5
+    assert defaulted.critic_warmup_iterations == module.DEFAULT_CRITIC_WARMUP_ITERATIONS == 10
 
 
 def test_adaptive_critic_warmup_uses_prior_wave_ev_and_has_a_hard_deadline() -> None:
@@ -2544,3 +2529,201 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     torch.save({**payload, "format_version": CHECKPOINT_FORMAT_VERSION - 1}, stale)
     with pytest.raises(ValueError, match="unsupported checkpoint format"):
         load_checkpoint(stale, restored, device=torch.device("cpu"))
+
+
+def _autocull_observation(guard, *, money=100_000.0, loss=1.0, actor_frozen=False):
+    return guard.observe(
+        {
+            "iteration": guard.state["iteration"] + 1,
+            "money_mean": money,
+            "value_loss": loss,
+            "actor_updates": int(not actor_frozen),
+            "updates": 1,
+        },
+        actor_frozen=actor_frozen,
+    )
+
+
+@pytest.mark.parametrize("improvement", [{"money": 120_000.0}, {"loss": 0.5}])
+def test_autocull_either_proxy_improvement_resets_full_patience(improvement) -> None:
+    module = _training_script()
+    guard = module.OnlinePlateauGuard()
+    for _ in range(49):
+        _autocull_observation(guard)
+    assert not guard.culled
+    improved = _autocull_observation(guard, **improvement)
+    assert improved["stale_observations"] == 0
+    assert not guard.culled
+    # A single subsequent regression cannot undo the renewed patience.
+    for _ in range(29):
+        _autocull_observation(guard)
+        assert not guard.culled
+    _autocull_observation(guard)
+    assert guard.culled
+
+
+def test_autocull_discards_frozen_waves_and_warmup_extrema() -> None:
+    module = _training_script()
+    guard = module.OnlinePlateauGuard()
+    for _ in range(60):
+        state = _autocull_observation(guard, money=1e9, loss=0.0, actor_frozen=True)
+    assert state["observations"] == 0
+    assert not guard.culled
+    for _ in range(19):
+        _autocull_observation(guard, money=1e9, loss=0.0)
+    state = _autocull_observation(guard)
+    assert state["reference"] == {"money_mean": 100_000.0, "value_loss": 1.0}
+    assert state["ema"] == state["reference"]
+    assert state["stale_observations"] == 0
+    state = _autocull_observation(guard, money=120_000.0)
+    assert state["reference"]["money_mean"] == pytest.approx(102_000.0)
+    assert state["stale_observations"] == 0
+    for _ in range(29):
+        _autocull_observation(guard)
+    assert not guard.culled
+    _autocull_observation(guard)
+    assert guard.culled
+
+
+def test_autocull_resumes_the_same_ema_and_patience_without_aliasing(tmp_path) -> None:
+    module = _training_script()
+    uninterrupted = module.OnlinePlateauGuard()
+    for _ in range(4):
+        _autocull_observation(uninterrupted, actor_frozen=True)
+    for _ in range(45):
+        state = _autocull_observation(uninterrupted)
+    path = tmp_path / "metrics.pt"
+    torch.save({"iteration": 49, "autocull_state": state}, path)
+    metrics = torch.load(path, weights_only=False)
+    resumed = module.OnlinePlateauGuard(metrics["autocull_state"], iteration=49)
+    for _ in range(5):
+        expected = _autocull_observation(uninterrupted)
+        assert _autocull_observation(resumed) == expected
+    assert uninterrupted.culled and resumed.culled
+    assert state["observations"] == 45
+    assert metrics["autocull_state"]["observations"] == 45
+    with pytest.raises(ValueError, match="checkpoint boundary"):
+        module.OnlinePlateauGuard(state, iteration=48)
+    with pytest.raises(ValueError, match="missing autocull state"):
+        module.OnlinePlateauGuard(iteration=49)
+    with pytest.raises(ValueError, match="checkpoint boundary"):
+        module.OnlinePlateauGuard({**state, "stale_observations": 30}, iteration=49)
+    with pytest.raises(ValueError, match="consecutive"):
+        resumed.observe({"iteration": 56}, actor_frozen=True)
+
+
+@pytest.mark.parametrize(
+    "metric,value",
+    [
+        ("value_loss", None),
+        ("value_loss", float("nan")),
+        ("value_loss", -0.1),
+        ("updates", 0),
+    ],
+)
+def test_autocull_requires_meaningful_critic_observations(metric, value) -> None:
+    module = _training_script()
+    guard = module.OnlinePlateauGuard()
+    metrics = {
+        "iteration": 1,
+        "money_mean": 100_000.0,
+        "value_loss": 1.0,
+        "actor_updates": 1,
+        "updates": 1,
+        metric: value,
+    }
+    with pytest.raises(ValueError, match="updated critic value_loss"):
+        guard.observe(metrics, actor_frozen=False)
+
+
+def test_autocull_is_opt_in_population_rejected_and_resume_bound(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    argv = _population_arguments(tmp_path, population=1, games=1)
+    monkeypatch.setattr(sys, "argv", argv)
+    disabled = module.parse_args()
+    assert not disabled.autocull
+    monkeypatch.setattr(sys, "argv", [*argv, "--autocull"])
+    enabled = module.parse_args()
+    module._validate_args(enabled)
+    assert module._training_data_config(disabled, torch.device("cpu")) != (
+        module._training_data_config(enabled, torch.device("cpu"))
+    )
+    monkeypatch.setattr(
+        sys, "argv", [*_population_arguments(tmp_path, population=2, games=2), "--autocull"]
+    )
+    with pytest.raises(ValueError, match="autocull requires --population 1"):
+        module._validate_args(module.parse_args())
+    guard = module.OnlinePlateauGuard()
+    original = {"metrics": {"autocull_state": _autocull_observation(guard)}}
+    replayed = {"metrics": {"autocull_state": _autocull_observation(guard)}}
+    assert not module._checkpoint_recovery_values_equal(original, replayed)
+
+
+def test_autocull_terminal_boundary_commits_before_exit_and_stays_terminal_on_resume(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    module = _training_script()
+    updates = 0
+
+    def update(*args, **kwargs):
+        nonlocal updates
+        updates += 1
+        return {
+            "actor_updates": 1,
+            "actor_minibatches_intended": 1,
+            "updates": 1,
+            "first_minibatch_approx_kl": 0.0,
+            "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
+            "money_mean": 100_000.0,
+            "value_loss": 1.0,
+        }
+
+    _run_population_main(
+        module,
+        monkeypatch,
+        tmp_path,
+        population=1,
+        games=2,
+        iterations=49,
+        update_fn=update,
+        extra_arguments=("--autocull",),
+    )
+    initial = torch.load(tmp_path / "checkpoint-000000.pt", weights_only=False)
+    assert initial["metrics"]["autocull_state"]["observations"] == 0
+    checkpoint = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert checkpoint["metrics"]["autocull_state"]["stale_observations"] == 29
+    capsys.readouterr()
+    real_print = print
+    observed_terminal = []
+
+    def observe_print(message, *args, **kwargs):
+        if isinstance(message, str) and message.startswith("AUTOCULL "):
+            # This executes at emission, not only after main has returned.
+            current = torch.load(tmp_path / "latest.pt", weights_only=False)
+            assert current["iteration"] == 50
+            assert current["metrics"]["autocull_state"]["stale_observations"] == 30
+            assert (tmp_path / "checkpoint-000050.pt").is_file()
+            journal = (tmp_path / "metrics.jsonl").read_text().splitlines()
+            assert json.loads(journal[-1]) == current["metrics"]
+            observed_terminal.append(json.loads(message.removeprefix("AUTOCULL ")))
+        real_print(message, *args, **kwargs)
+
+    monkeypatch.setattr(module, "print", observe_print, raising=False)
+    for _ in range(2):
+        with pytest.raises(SystemExit) as stopped:
+            _run_population_main(
+                module,
+                monkeypatch,
+                tmp_path,
+                population=1,
+                games=2,
+                iterations=100,
+                resume=tmp_path / "latest.pt",
+                update_fn=update,
+                extra_arguments=("--autocull",),
+            )
+        assert stopped.value.code == 75
+        assert updates == 50
+    assert len(observed_terminal) == 2
+    assert not (tmp_path / "checkpoint-000051.pt").exists()

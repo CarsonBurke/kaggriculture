@@ -328,6 +328,7 @@ Append one row immediately when a run family completes.
 |---|---|---|---:|---:|---|---|---:|---:|---|---|
 | V0 | Recorded in artifacts | `runs/ab-structured-s1`, `runs/econ-pastself-100-structured` | 1 / 20260813 | 0.0008224 | Recorded external panel | 0.84375 score rate after PPO | 8.86 steady | 27.98 steady | Current anchor | V0 |
 | VRAM-20260908 | BC `1a92bd83`; RL `2f669120` | `runs/production-vram-bc-20260908`, `runs/production-vram-p100-20260908-r3` | BC default / 20260812 | 0.00178258 | Not evaluated | Not evaluated | 222.02 cold; 26.36 second | Not a matched throughput comparison | BC complete; P100 interrupted by kernel global OOM after iteration 56, recovery at 39; no promotion | — |
+| Joint-NextLat-VRAM-20260908 | Dense `dc651682` + corrected critic mask; compact `dc803236` | `artifacts/benchmarks/perf-joint-20260908-production-{dense,compact}.jsonl` | 20260812 | Existing BC initializer | Not evaluated | Not evaluated | — | 17.21 dense → 15.04 compact, warm median | Keep execution changes and user-selected ungated joint learning; no play-strength promotion | — |
 
 Promotion decisions must name the evidence and the rejected tradeoff. “Lower loss” or “faster” alone is not a decision.
 
@@ -363,3 +364,197 @@ headroom is available; do not retrain BC or bypass checkpoint source identity.
 There are 61 iterations remaining from that durable checkpoint. The full
 source digest, job chain, validation, and exact continuation command are in
 `artifacts/probes/vram-20260907/training-run.json`. No automatic retry remains queued.
+
+### Joint NextLat and execution comparison, 2026-09-08
+
+The user selected ungated joint representation learning. Actor NextLat joins
+accepted actor PPO updates after critic warmup; critic NextLat joins critic
+updates throughout. Persistence is diagnostic only. Successors and auxiliary
+readouts remain stop-gradient. Gradient observation now uses auxiliary-only
+branch views during the same combined backward, not repeated parameter VJPs.
+Recovery format 14 removes quality-gate state; old format 13 remains actor-exportable
+but must not be resumed under the changed training contract.
+
+Fixed critic KL eligibility broadcasting from `[B,1] * [B]` to a per-row masked
+mean. The original-code witness (MLQ 5691) measured loss 36.23235 instead of
+0.23235 and four nonzero invalid-row gradients. MLQ 5674 passed 333 targeted
+tests, including corrected masking, compact/dense losses and gradients, compiled
+single-backward observation, CUDA rollout parity, runner warmup transitions,
+and recovery. Two independent reviews found no actionable defect.
+
+Matched production benchmarks 5721/5722 each completed six full 192-game,
+720-step waves with joint auxiliaries, BF16, compilation, the existing
+4096-row ceiling, and `deterministic_training=false` as recorded in the prior
+production run. Dense control changes only the critic mask defect; it does not
+receive the execution optimizations.
+
+| Measurement | Dense control | Compact/pipelined |
+|---|---:|---:|
+| Warm iteration median | 17.213 s | 15.043 s |
+| Warm update median | 13.096 s | 11.876 s |
+| Warm rollout median | 3.774 s | 3.167 s |
+| Diagnostic iteration | 41.749 s | 18.789 s |
+| Peak live CUDA allocation | 18.449 GiB | 15.189 GiB |
+| Peak CUDA reservation | 25.000 GiB | 24.844 GiB |
+| First iteration, including setup/compilation | 100.156 s | 109.813 s |
+
+This is 17.7% less peak live allocation and 12.6% less warm iteration time
+(1.14x throughput), not a comparable reduction in driver-reserved VRAM.
+Caches still reserve nearly 25 GiB; allocator mapping warnings persist in both
+arms. Host RSS was approximately 8 GiB in both. No cold-start improvement,
+host-RAM-pressure resolution, or play-strength improvement is established.
+The actor's unchanged KL stop gives counts `[42,25,24,22,21,22]` versus
+`[42,25,23,23,20,22]` as numerical trajectories diverge; every wave performs
+57 critic auxiliary updates. Configured minibatch/epoch budgets are unchanged.
+Replay KL stays below 0.00114; worst tail fraction stays below 3.64e-6.
+The candidate diagnostic measured live source-belief norms 0.08127 (actor)
+and 9.67e-6 (critic).
+
+Earlier arms incorrectly added strict deterministic algorithms and are excluded
+from production throughput claims. A bounded warm profile (5710) identified
+2.69 s in deterministic indexing-backward kernels in one sampled update
+minibatch, plus allocator retries. The dense strict arm was allowed to run
+too long; later strict arms 5690/5699 were automatically cancelled after their
+diagnostic wave exceeded 120 s. Subsequent experiments enforce 300 s cold,
+120 s first diagnostic, 90 s ordinary-wave hard limits and reject two ordinary
+waves above 45 s, with no automatic retry. Queue waiting is not runtime.
+
+Full source identities, commands, measurements, harness source and rejected-arm
+provenance are preserved in
+`artifacts/probes/vram-20260907/performance-joint-comparison.json`.
+That comparison phase did not launch RL or terminate unrelated processes.
+
+### Cheap diagnostics and completed P100, 2026-09-09
+
+Diagnostics now preserve identical observed/unobserved auxiliary input views,
+reduce source cotangents without full-gradient float/square intermediates, and
+defer compact preupdate/persistence readback until the final stream join.
+Matched full-production jobs 5753/5754 forced gradient diagnostics off/on for
+all six waves. Warm update medians were 11.926/12.025 seconds (+0.099 seconds,
+0.83%); whole-wave medians were 15.098/15.326 seconds. This is a workload-level
+comparison, not isolated kernel overhead: accepted actor-step counts differ
+slightly under nondeterministic production execution. Observed actor/critic
+source norms were 0.08137/9.73e-6. Production observes every 25 waves.
+
+MLQ 5763 passed 269 contract tests; targeted Ruff passed. Independent review
+found one incorrect plateau-guard metric name, fixed before training and
+re-reviewed. Temporary execution harnesses were removed after completion;
+their exact sources and setup failures remain in the evidence artifact.
+
+MLQ 5769 completed all 100 iterations under frozen source
+`5279bdb8fccefdfe921df720521c135ddfac2881a7178bf60b701db3290e21a0`,
+using the current canonical production configuration: 128 self-play plus
+64 league games, 720 steps, 4096-row ceiling, compiled BF16, seed 20260812,
+and the compatible `dadfd6ce` BC initializer. Actor/critic clipping follows
+the current repository contract; only predictors retain the configured
+NextLat norm ceiling. The actor released at iteration 17, producing 84
+actor-active waves, 3313 actor auxiliary steps and 5700 critic auxiliary steps.
+The run took 0.498 hours; warm actor-active iteration median was 16.965 seconds.
+Recovery checkpoints were scheduled every 300 seconds. No unrelated process
+was terminated.
+
+This is a failed learning result, not a promotion. Online mean money fell from
+35875 at release to 11.82 at iteration 100, with median zero. Critic value loss
+fell from 3.732 to 1.533 while shaped-return explained variance rose to 0.912.
+The optional both-signal EMA guard did not cull: improving value loss reset its
+patience, leaving 21 stale waves at completion against a threshold of 30.
+Lower value loss therefore did not protect against catastrophic policy loss.
+
+Official Python evaluations 5770–5773 used compiled CUDA BF16, fixed batch 32,
+the same development seeds 4000000–4000031, and both seats. All 256 games
+completed with zero invalid games; these are not CPU submission-parity reports.
+
+| Opponent | Initial wins / games | Final wins / games | Initial mean money | Final mean money |
+|---|---:|---:|---:|---:|
+| starter | 64 / 64 | 0 / 64 | 149439.05 | 4.69 |
+| public-v27 Python reference | 53 / 64 | 0 / 64 | 83465.13 | 5.92 |
+
+Seed-cluster bootstrap 95% intervals for paired money changes are
+[-161536, -136530] against starter and [-93874, -73262] against public-v27.
+The pinned public-v16 file was unavailable; no native opponent was substituted.
+Reject the final RL policy and retain the initializer. Read-only diagnosis
+found no demonstrated reward-sign/mask defect; weak early-horizon terminal
+credit and a moving current-policy NextLat target remain causal hypotheses,
+not established explanations from these losses alone.
+
+Final recovery: `runs/production-joint-p100-20260909/checkpoint-000100.pt`,
+SHA-256 `1f2ddbe95ac78ff2e332f4520f80e05452a5ada56bc52e3fc8080b8c8aefd21a`.
+Complete launch, diagnostic measurements, paired results, culling state,
+reviews and limitations:
+`artifacts/probes/vram-20260907/cheap-diagnostics-fullrun.json`.
+Per-game reports: `evaluations/production-joint-p100-20260909-{before,after}-{starter,public-v27}.json`.
+
+### Head-only LR and 4800-row batches, 2026-09-09
+
+The equal-rate trial 5783 never released the actor: at iteration 40,
+Monte Carlo-return EV was 8.12e-6 and prediction std 2.87e-5 versus target
+std 0.467. The readiness deadline stopped it; redundant evaluations of the
+unchanged BC actor were cancelled.
+
+The next configuration keeps actor/critic trunk LR at 3e-5 and raises only
+the critic value-head Adam LR to 8.75e-5. Other critic Adam parameters and
+predictor rates remain unchanged. The user selected a 4800-row physical
+minibatch ceiling with headroom rather than pushing the 5120 boundary.
+Each full critic epoch now covers all 230080 states in 48 balanced batches.
+
+Two exact memory-lifetime/work reductions accompany it: release prior
+minibatch inputs and returned beliefs after last use/existing stream joins;
+refine compact NextLat buckets using unused shape slots, retaining every
+old boundary so padding never increases and the eight-shape cap remains.
+No precision, model-capacity, sample-budget, or accumulation change was made.
+MLQ 5794 passed 318 tests, including dense/compact loss and gradient parity
+at a non-power-of-two batch size, head-only update isolation, and optimizer
+resume. Targeted Ruff and two independent reviews passed.
+
+First launch 5796 was killed by kernel global host-RAM OOM before its first
+completed iteration; a CUDA allocation warning preceded termination.
+After explicit user approval, only language servers 403230, 1219214, and
+1495681 were terminated. Recovery job 5815 resumed the intact iteration-zero
+checkpoint and completed repeated full waves with 48 critic updates and
+the intended separate head rate. It stopped at the 40-iteration critic-readiness
+deadline: EV 0.03701 remained below 0.10; value loss was 3.71237. The actor never
+updated. This improves on the equal-rate trial's near-zero EV but does not
+establish a successful RL setup. Final panels depend on successful training,
+so the unchanged BC policy is not evaluated again. No automatic retry is queued.
+
+Run: `runs/production-head-lr4800-p100-20260909`.
+Frozen source: `a1ae27c818f9db9e75119edc48cf16821f6ed7ec66714aad350d210bd8e17df8`.
+Evidence and job records:
+`artifacts/probes/vram-20260907/head-lr-larger-batch.json`.
+
+### 5e-5 trunks and 5120-row full-run attempt, 2026-09-09
+
+Requested 100 iterations from the same BC initializer, with actor/critic trunk
+LR 5e-5, ordinary Adam LR 1.75e-5, and value-head Adam LR 1.458333e-4.
+The run-specific 5120 ceiling gives 45 balanced batches; the default stays 4800.
+Initial job 5822 suffered kernel-confirmed host-RAM OOM before iteration one.
+Recovery 5825 rejected the `latest.pt` alias at the initial-checkpoint safety
+gate. Job 5828 resumed the exact `checkpoint-000000.pt`, with two Inductor
+compiler workers and recompile diagnostics, without changing training semantics.
+
+Critic return EV reached 0.10443 at wave 30; actor updates began at 31.
+During warmup the actor weights were frozen, but its predictor took 45 detached
+predictor-only updates per wave. At actor release, PPO and NextLat source
+gradients both became active on the actor. Rollout mean entropy rose from
+0.17373 at wave 31 to 0.39000 at 40, while mean money fell from 39210.63 to
+228.79. Critic combined gradient norm peaked at 318.169 at wave 46, almost
+entirely in the trunk. These are pre-step parameter-gradient norms, not NorMuon
+update magnitudes; existing diagnostics do not identify the responsible loss.
+
+Job 5828 was cancelled by request after 49 completed waves; the watchdog did
+not emit a no-progress cancellation. Last mean money was 42.35 and return EV
+0.44347. Latest durable numbered checkpoint is `checkpoint-000046.pt`.
+Success-gated final panels 5829/5830 were skipped. No automatic retry is queued.
+Joint execution at 5120 completed but repeatedly hit allocator mapping warnings,
+so this is not evidence of comfortable VRAM headroom.
+
+Runtime recorded 19 recompile events for first-use batch/gradient-phase and
+league-lane variants, not a repeated compile on every wave. League growth
+introduced additional compilations later in training; startup-only compilation
+is not the current contract. Rollout CUDA graphs are also captured per wave,
+separately from Inductor kernel compilation.
+
+Run: `runs/production-lr5e5-b5120-p100-20260909`.
+Frozen source: `04be752fd0fe16bb820299a71c6f3c73c0ba491e0b0634ba07b3d2b4f9133159`.
+Evidence: `artifacts/probes/vram-20260907/lr5e5-b5120-fullrun.json` and
+`artifacts/probes/vram-20260907/lr5e5-gradient-entropy-diagnosis.json`.

@@ -12,6 +12,7 @@ from kaggle_environments import make
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.constants import ANIMALS, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.latent_dynamics import DecodeHeads
 from kaggriculture.model import FarmActor, ModelConfig, ReluSquared
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
@@ -21,6 +22,7 @@ from kaggriculture.structured import (
     FeedForward,
     FusedFeedForward,
     StructuredActor,
+    StructuredBelief,
     StructuredConfig,
     StructuredCritic,
     StructuredCriticBelief,
@@ -30,8 +32,10 @@ from kaggriculture.structured import (
 )
 from kaggriculture.structured_dynamics import (
     StructuredCriticDynamics,
+    StructuredDynamics,
     _latent_smooth_l1,
     structured_critic_window_loss,
+    structured_horizon_loss,
 )
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
@@ -430,10 +434,14 @@ def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-1)
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.autocast("cuda", dtype=torch.bfloat16)
 def test_structured_actor_exposes_typed_training_belief(
     real_inputs: StructuredInputs,
 ) -> None:
-    actor = StructuredActor(_tiny_config())
+    actor = StructuredActor(_tiny_config()).cuda()
+    real_inputs = StructuredInputs(*(value.cuda() for value in real_inputs))
 
     output, belief = actor.forward_with_belief(real_inputs)
 
@@ -444,6 +452,92 @@ def test_structured_actor_exposes_typed_training_belief(
     assert belief.central_latents.shape == (real_inputs.unit_active.shape[0], 8, 32)
     assert belief.unit_decisions.shape == (real_inputs.unit_active.shape[0], 16, 32)
     assert belief.market_decisions.shape == (real_inputs.unit_active.shape[0], 10, 32)
+
+    # Non-unit norm weights expose accidental second normalization. Reconstruct
+    # the original Sequential head from its raw input to pin unchanged logits.
+    with torch.no_grad():
+        actor.unit_head[0].weight.copy_(torch.linspace(0.5, 1.5, actor.config.model_dim))
+    raw_units = []
+    handle = actor.unit_head[0].register_forward_pre_hook(
+        lambda _module, arguments: raw_units.append(arguments[0])
+    )
+    try:
+        output, belief = actor.forward_with_belief(real_inputs)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(
+        output.unit_logits, actor.unit_head(raw_units[0]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        belief.unit_decisions, actor.unit_head[0](raw_units[0]), rtol=0, atol=0
+    )
+    decoded = DecodeHeads.from_actor(actor, normalized_units=True).decode(
+        torch.cat((belief.unit_decisions, belief.market_decisions), dim=1)
+    )
+    torch.testing.assert_close(
+        tuple(decoded), tuple(value.float() for value in output), rtol=2e-2, atol=2e-3
+    )
+    kinds = output.market_kind_logits.argmax(dim=-1)
+    torch.testing.assert_close(
+        DecodeHeads.from_actor(actor, normalized_units=True).quantity_logits(
+            decoded.market_quantity_context, kinds
+        ),
+        actor.quantity_logits(output.market_quantity_context, kinds),
+        rtol=2e-2,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.autocast("cuda", dtype=torch.bfloat16)
+def test_actor_nextlat_predicts_heads_without_world_inputs_or_targets(
+    real_inputs: StructuredInputs,
+) -> None:
+    torch.manual_seed(94)
+    actor = StructuredActor(_tiny_config()).cuda()
+    dynamics = StructuredDynamics(actor.config).cuda()
+    inputs = StructuredInputs(*(value[:3].cuda() for value in real_inputs))
+    _, belief = actor.forward_with_belief(inputs)
+    source = StructuredBelief(*(value.detach().requires_grad_() for value in belief))
+    target = StructuredBelief(*(value.detach().clone().requires_grad_() for value in belief))
+    factors = {
+        "episode_index": torch.zeros(3, dtype=torch.long, device="cuda"),
+        "step": torch.arange(3, device="cuda"),
+        "unit_actions": torch.zeros(3, MAX_UNITS, dtype=torch.long, device="cuda"),
+        "market_kinds": torch.zeros(3, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
+        "market_quantities": torch.zeros(3, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
+    }
+
+    def loss(current, teacher):
+        return structured_horizon_loss(
+            dynamics,
+            current,
+            inputs,
+            factors,
+            decode=None,
+            decision_horizon=0,
+            latent_horizon=2,
+            patch_horizon=0,
+            own_patches_active=False,
+            target_belief=teacher,
+        ).latent
+
+    actual = loss(source, target)
+    changed_source = StructuredBelief(
+        *(value * -100 for value in source[:5]), *source[5:]
+    )
+    changed_target = StructuredBelief(
+        *(value * 100 for value in target[:5]), *target[5:]
+    )
+    torch.testing.assert_close(loss(changed_source, changed_target), actual, rtol=0, atol=0)
+    actual.backward()
+    assert all(value.grad is None for value in source[:5])
+    assert all(value.grad is None for value in target)
+    assert source.unit_decisions.grad[0].abs().sum() > 0
+    assert source.market_decisions.grad[0].abs().sum() > 0
+    assert dynamics.action.unit_action.weight.grad.abs().sum() > 0
+    assert source.unit_decisions.grad[-1].count_nonzero() == 0
 
 
 @pytest.mark.parametrize(
@@ -623,12 +717,15 @@ def test_structured_actor_gradients_reach_every_input_family(
         assert gradient is not None and gradient.abs().sum() > 0, f"no gradient into {name}"
 
 
-def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits(
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.autocast("cuda", dtype=torch.bfloat16)
+def test_structured_critic_exposes_only_normalized_value_head_input(
     real_pairs: list[tuple[dict, dict]],
 ) -> None:
     torch.manual_seed(0)
     config = replace(_tiny_config(), critic_latents=5)
-    critic = StructuredCritic(config)
+    critic = StructuredCritic(config).cuda()
 
     rows = [
         encode_structured_observation(observation, opponent["private"])
@@ -636,6 +733,8 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
     ]
     stacked, extras = stack_structured(rows)
     assert extras is not None
+    stacked = StructuredInputs(*(value.cuda() for value in stacked))
+    extras = type(extras)(*(value.cuda() for value in extras))
     assert extras.products.shape[-1] == 2 and extras.crops.shape[-1] == 1
     batch = stacked.tile_categorical.shape[0]
     inputs = stacked._replace(
@@ -652,22 +751,29 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
 
     torch.nn.init.normal_(critic.value_head.weight, std=0.01)
     expected = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
-    actual, belief = critic.forward_with_belief(
-        inputs,
-        extras.unit_categorical,
-        extras.unit_continuous,
-        extras.unit_active,
+    raw_value = []
+    handle = critic.value_norm.register_forward_pre_hook(
+        lambda _module, arguments: raw_value.append(arguments[0])
     )
+    try:
+        actual, belief = critic.forward_with_belief(
+            inputs,
+            extras.unit_categorical,
+            extras.unit_continuous,
+            extras.unit_active,
+        )
+    finally:
+        handle.remove()
     assert torch.equal(actual, expected)
-    assert belief.own_patches.shape == (batch, 100, config.model_dim)
-    assert belief.opponent_patches.shape == belief.own_patches.shape
-    assert belief.opponent_summary.shape == (batch, config.opponent_latents, config.model_dim)
-    assert belief.economy_entities.shape == (
-        batch,
-        len(PRODUCTS) + len(ANIMALS) + len(CROPS) + 3,
-        config.model_dim,
+    assert belief._fields == ("value_decision",)
+    with torch.autocast("cuda", enabled=False):
+        normalized = torch.nn.functional.rms_norm(
+            raw_value[0], (config.model_dim,), critic.value_norm.weight, eps=1e-5
+        )
+    torch.testing.assert_close(belief.value_decision, normalized, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual, critic.value_head(belief.value_decision[:, 0]), rtol=0, atol=0
     )
-    assert belief.central_latents.shape == (batch, config.critic_latents, config.model_dim)
     assert belief.value_decision.shape == (batch, 1, config.model_dim)
 
     product_values = inputs.products.clone()
@@ -678,7 +784,7 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
         extras.unit_continuous,
         extras.unit_active,
     )
-    assert not torch.equal(product_belief.economy_entities, belief.economy_entities)
+    assert not torch.equal(product_belief.value_decision, belief.value_decision)
 
     animal_values = inputs.animals.clone()
     animal_values[..., -1] += 0.25
@@ -688,7 +794,7 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
         extras.unit_continuous,
         extras.unit_active,
     )
-    assert not torch.equal(animal_belief.central_latents, belief.central_latents)
+    assert not torch.equal(animal_belief.value_decision, belief.value_decision)
 
     crop_values = inputs.crops.clone()
     crop_values[..., -1] += 0.25
@@ -698,7 +804,7 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
         extras.unit_continuous,
         extras.unit_active,
     )
-    assert not torch.equal(crop_belief.economy_entities, belief.economy_entities)
+    assert not torch.equal(crop_belief.value_decision, belief.value_decision)
 
     assert extras.unit_active.any()
     opponent_unit_continuous = extras.unit_continuous.clone()
@@ -709,38 +815,32 @@ def test_structured_critic_exposes_typed_private_beliefs_without_changing_logits
         opponent_unit_continuous,
         extras.unit_active,
     )
-    assert not torch.equal(unit_belief.central_latents, belief.central_latents)
-
-    expected.sum().backward()
-    gate = critic.trunk.units.farm.weight.grad
-    assert gate is not None and gate[1].abs().sum() > 0
+    assert not torch.equal(unit_belief.value_decision, belief.value_decision)
 
 
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.autocast("cuda", dtype=torch.bfloat16)
 def test_structured_critic_dynamics_loss_is_recursive_and_detached(
     real_inputs: StructuredInputs,
 ) -> None:
     torch.manual_seed(13)
     config = replace(_tiny_config(), critic_latents=5)
-    dynamics = StructuredCriticDynamics(config)
+    dynamics = StructuredCriticDynamics(config).cuda()
     rows = 3
-    inputs = StructuredInputs(*(value[:rows] for value in real_inputs))
+    inputs = StructuredInputs(*(value[:rows].cuda() for value in real_inputs))
     belief = StructuredCriticBelief(
-        *(
-            torch.randn(
-                rows,
-                identity.num_embeddings,
-                config.model_dim,
-                requires_grad=True,
-            )
-            for identity in dynamics.position_identity
+        torch.randn(
+            rows, 1, config.model_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
     )
     factors = {
-        "unit_actions": torch.zeros(rows, MAX_UNITS, dtype=torch.long),
-        "market_kinds": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long),
-        "market_quantities": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long),
+        "unit_actions": torch.zeros(rows, MAX_UNITS, dtype=torch.long, device="cuda"),
+        "market_kinds": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
+        "market_quantities": torch.zeros(rows, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
     }
-    value_head = torch.nn.Linear(config.model_dim, config.value_atoms)
+    value_head = torch.nn.Linear(config.model_dim, config.value_atoms).cuda()
 
     terms = structured_critic_window_loss(
         dynamics,

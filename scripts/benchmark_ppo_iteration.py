@@ -495,11 +495,8 @@ def main() -> None:
         ppo_config = PpoConfig(
             **{
                 **asdict(ppo_config),
+                "structured_latent_coefficient": 0.0,
                 "structured_decision_coefficient": 0.0,
-                "structured_patch_coefficient": 0.0,
-                "structured_economy_coefficient": 0.0,
-                "structured_opponent_summary_coefficient": 0.0,
-                "structured_opponent_patch_coefficient": 0.0,
                 "structured_critic_latent_coefficient": 0.0,
                 "structured_critic_value_coefficient": 0.0,
             }

@@ -93,8 +93,7 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         minibatch_size=4,
         use_bfloat16=False,
         structured_decision_coefficient=0.5,
-        structured_opponent_summary_coefficient=0.5,
-        structured_opponent_patch_coefficient=0.5,
+        structured_latent_coefficient=0.5,
     )
     actor = StructuredActor(model_config)
     critic = StructuredCritic(model_config)

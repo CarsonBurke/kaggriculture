@@ -986,7 +986,7 @@ def _clone_and_structured_loss(
         clone = _clone_loss_from_output(actor, output, factors)
         decode = (
             DecodeContext(
-                heads=DecodeHeads.from_actor(actor),
+                heads=DecodeHeads.from_actor(actor, normalized_units=True),
                 masks=DecodeMasks(
                     unit_masks=factors["unit_masks"],
                     market_kind_masks=factors["market_kind_masks"],
@@ -1009,6 +1009,7 @@ def _clone_and_structured_loss(
             decision_horizon=decision_horizon,
             latent_horizon=latent_horizon,
             patch_horizon=patch_horizon,
+            own_patches_active=bool(patch_horizon),
             economy_active=economy_active,
             opponent_summary_active=opponent_summary_active,
             opponent_patches_active=opponent_patches_active,

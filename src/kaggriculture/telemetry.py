@@ -530,6 +530,7 @@ _TRAINING_TAGS = {
     "value_prediction_std": "value/prediction_std",
     "actor_learning_rate": "schedule/actor_learning_rate",
     "critic_learning_rate": "schedule/critic_learning_rate",
+    "critic_head_learning_rate": "schedule/critic_head_learning_rate",
     "actor_gae_lambda": "schedule/actor_gae_lambda",
     "critic_gae_lambda": "schedule/critic_gae_lambda",
     "gamma": "schedule/gamma",

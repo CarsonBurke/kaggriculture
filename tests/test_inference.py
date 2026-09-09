@@ -95,6 +95,19 @@ def _checkpoint_agent_with_ranked_actions(
     return CheckpointAgent(path)
 
 
+def test_compiled_bf16_agent_refuses_cpu_before_loading_weights(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        CheckpointAgent(tmp_path / "missing.pt", device="cpu", cuda_bf16_compiled=True)
+
+
+def test_compiled_bf16_agent_does_not_fall_back_when_cuda_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="requires available CUDA"):
+        CheckpointAgent(tmp_path / "missing.pt", device="cuda", cuda_bf16_compiled=True)
+
+
 def test_checkpoint_agent_preserves_same_tile_dig_then_plant(tmp_path: Path) -> None:
     agent = _checkpoint_agent_with_ranked_actions(
         tmp_path, (UnitAction.PLANT_WHEAT, UnitAction.DIG)

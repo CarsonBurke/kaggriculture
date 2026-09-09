@@ -250,7 +250,7 @@ class DecodeHeads(NamedTuple):
     shares the attribute names `from_actor` reads.
     """
 
-    unit_norm: RMSNorm
+    unit_norm: RMSNorm | None
     unit_projection: nn.Linear
     market_kind: nn.Linear
     market_quantity_context: nn.Linear
@@ -260,9 +260,9 @@ class DecodeHeads(NamedTuple):
     quantity_rank: int
 
     @classmethod
-    def from_actor(cls, actor: nn.Module) -> DecodeHeads:
+    def from_actor(cls, actor: nn.Module, *, normalized_units: bool = False) -> DecodeHeads:
         return cls(
-            unit_norm=actor.unit_head[0],
+            unit_norm=None if normalized_units else actor.unit_head[0],
             unit_projection=actor.unit_head[-1],
             market_kind=actor.market_kind,
             market_quantity_context=actor.market_quantity_context,
@@ -282,20 +282,19 @@ class DecodeHeads(NamedTuple):
         predicted latent but never the heads, and as the teacher nothing should be
         reached at all.
 
-        `market_norm` is deliberately absent. The actor applies it inside
-        `_head_inputs` before the market heads see anything, so the belief's
-        market half arrives already normalized; re-applying it here would norm
-        twice and decode a tensor the heads never see.
+        Market beliefs already include their head normalization. Structured
+        actors also expose post-normalization unit beliefs and set `unit_norm`
+        to None; unstructured actors retain their pre-normalization unit tokens.
         """
         if belief.ndim != 3 or belief.shape[-2] <= MAX_UNITS:
             raise ValueError("belief must carry one token per unit slot and per market slot")
         with torch.autocast(device_type=belief.device.type, enabled=False):
             belief = belief.float()
             units, market = belief[:, :MAX_UNITS], belief[:, MAX_UNITS:]
+            if self.unit_norm is not None:
+                units = _frozen_norm(self.unit_norm, units)
             return BeliefDecode(
-                unit_logits=_frozen_linear(
-                    self.unit_projection, _frozen_norm(self.unit_norm, units)
-                ),
+                unit_logits=_frozen_linear(self.unit_projection, units),
                 market_kind_logits=_frozen_linear(self.market_kind, market),
                 market_quantity_context=_frozen_linear(self.market_quantity_context, market),
             )

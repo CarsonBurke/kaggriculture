@@ -359,11 +359,11 @@ def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
     actor, critic = _production_modules()
     config = PpoConfig()
     assert config.optimizer == "normuon"
-    assert config.actor_learning_rate == 3.0e-5
+    assert config.actor_learning_rate == 5.0e-5
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     for optimizer, learning_rate in (
-        (actor_optimizer, 3.0e-5),
-        (critic_optimizer, 2.5e-4),
+        (actor_optimizer, 5.0e-5),
+        (critic_optimizer, 5.0e-5),
     ):
         assert isinstance(optimizer, NorMuon)
         kinds = {group["kind"]: group for group in optimizer.param_groups}
@@ -587,3 +587,58 @@ def test_a_mixed_shape_group_batches_only_what_shares_a_shape() -> None:
 
     for index in range(len(shapes)):
         torch.testing.assert_close(together[index], apart[index], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("optimizer_kind", ["normuon", "adamw"])
+def test_critic_head_rate_changes_only_readout_updates_and_resumes(optimizer_kind) -> None:
+    from kaggriculture.ppo import _optimizer_step
+    from kaggriculture.structured import StructuredActor, StructuredCritic
+
+    model_config = StructuredConfig(
+        model_dim=16, attention_heads=2, ffn_multiplier=1, latents=4, core_layers=1
+    )
+    actor = StructuredActor(model_config)
+    critic = StructuredCritic(model_config)
+    reference = copy.deepcopy(critic)
+    config = PpoConfig(
+        optimizer=optimizer_kind, critic_head_learning_rate=8.75e-5, lr_warmup_steps=2
+    )
+    _, optimizer = make_optimizers(actor, critic, config)
+    _, reference_optimizer = make_optimizers(
+        actor, reference, PpoConfig(optimizer=optimizer_kind, lr_warmup_steps=2)
+    )
+
+    def step(model, selected_optimizer):
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 0.25)
+        _optimizer_step(selected_optimizer, config.critic_learning_rate, config.lr_warmup_steps)
+
+    step(critic, optimizer)
+    step(reference, reference_optimizer)
+    for (name, parameter), (_, expected) in zip(
+        critic.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        if not name.startswith("value_head."):
+            torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+    # The readout starts at zero; its first Adam step includes half-rate warmup.
+    torch.testing.assert_close(
+        critic.value_head.weight,
+        torch.full_like(critic.value_head.weight, -8.75e-5 / 2),
+        rtol=1e-4,
+        atol=1e-8,
+    )
+    assert not torch.equal(critic.value_head.weight, reference.value_head.weight)
+
+    resumed = copy.deepcopy(critic)
+    _, resumed_optimizer = make_optimizers(actor, resumed, config)
+    resumed_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+    step(critic, optimizer)
+    step(resumed, resumed_optimizer)
+    for parameter, expected in zip(critic.parameters(), resumed.parameters(), strict=True):
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        critic.value_head.weight,
+        torch.full_like(critic.value_head.weight, -8.75e-5 * 1.5),
+        rtol=1e-4,
+        atol=1e-8,
+    )

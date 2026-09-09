@@ -187,7 +187,14 @@ class StructuredDynamics(nn.Module):
             unit_categorical,
             unit_active,
         )
-        context = torch.cat((belief.central_latents, unit_action, market_action), dim=1)
+        # BC world objectives retain their recurrent central workspace. PPO
+        # decision-only transitions see only the head representations and action.
+        state_context = (
+            belief.central_latents
+            if any(active_fields[:5])
+            else torch.cat((belief.unit_decisions, belief.market_decisions), dim=1)
+        )
+        context = torch.cat((state_context, unit_action, market_action), dim=1)
         joined = torch.cat(queries, dim=1)
         transitioned = self.transition(joined, context, context_norm=self.context_norm)
         residual = transitioned - joined
@@ -199,41 +206,14 @@ class StructuredDynamics(nn.Module):
 
 
 class StructuredCriticDynamics(nn.Module):
-    """Action-conditioned residual transition over every typed critic belief."""
-
-    _TYPE_COUNT = 6
+    """Predict only the normalized value-head input from itself and own actions."""
 
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
-        width = config.model_dim
         predictor_config = replace(config, zero_init_branches=False, global_modulation=False)
-        critic_latents = config.critic_latents or config.latents
-        economy_tokens = (
-            len(PRODUCTS) + len(ANIMALS) + len(CROPS) + 2 + (2 if config.split_clock_token else 1)
-        )
-        counts = (
-            TILE_COUNT,
-            TILE_COUNT,
-            config.opponent_latents,
-            economy_tokens,
-            critic_latents,
-            1,
-        )
-        self.action = StructuredActionEncoder(width)
-        self.type_identity = nn.Embedding(self._TYPE_COUNT, width)
-        self.position_identity = nn.ModuleList(nn.Embedding(count, width) for count in counts)
-        self.context_norm = RMSNorm(width)
+        self.action = StructuredActionEncoder(config.model_dim)
+        self.context_norm = RMSNorm(config.model_dim)
         self.transition = Block(predictor_config)
-
-    def _query(self, value: Tensor, kind: int) -> Tensor:
-        tokens = value.shape[1]
-        identity = self.position_identity[kind]
-        assert isinstance(identity, nn.Embedding)
-        if tokens > identity.num_embeddings:
-            raise ValueError(
-                f"critic belief type {kind} has more tokens than its configured identity table"
-            )
-        return value + identity.weight[:tokens] + self.type_identity.weight[kind]
 
     def forward(
         self,
@@ -244,11 +224,6 @@ class StructuredCriticDynamics(nn.Module):
         unit_categorical: Tensor,
         unit_active: Tensor,
     ) -> StructuredCriticBelief:
-        values = tuple(belief)
-        joined = torch.cat(
-            [self._query(value, kind) for kind, value in enumerate(values)],
-            dim=1,
-        )
         unit_action, market_action = self.action(
             unit_actions,
             market_kinds,
@@ -256,11 +231,9 @@ class StructuredCriticDynamics(nn.Module):
             unit_categorical,
             unit_active,
         )
-        context = torch.cat((belief.central_latents, unit_action, market_action), dim=1)
-        transitioned = self.transition(joined, context, context_norm=self.context_norm)
-        deltas = (transitioned - joined).split([value.shape[1] for value in values], dim=1)
+        context = torch.cat((belief.value_decision, unit_action, market_action), dim=1)
         return StructuredCriticBelief(
-            *(value + delta for value, delta in zip(values, deltas, strict=True))
+            self.transition(belief.value_decision, context, context_norm=self.context_norm)
         )
 
 
@@ -316,11 +289,10 @@ def structured_horizon_plan(
 ) -> StructuredHorizonPlan:
     """Plan immutable CPU metadata; never discover variable shapes on CUDA.
 
-    Retain the union of eligible sources at every offset, not only one-step
-    pairs: the flat loss checks endpoints and can admit a later endpoint even
-    when an intermediate row is discontinuous. Every retained source runs its
-    complete recursive ancestry. Eight aligned occupancy buckets per minibatch
-    size bound compiled shapes; all-false padding keeps zero-loss backward alive.
+    Eligibility is cumulative across every intervening step: a matching later
+    endpoint cannot repair a broken recursive ancestry. Retain only sources
+    with a valid first edge. Eight aligned occupancy buckets per minibatch size
+    bound compiled shapes; all-false padding keeps zero-loss backward alive.
     """
     if horizon < 1:
         raise ValueError("structured plan horizon must be positive")
@@ -335,10 +307,16 @@ def structured_horizon_plan(
         & (episode_index[targets] == episode_index[None, :])
         & (step[targets] == step[None, :] + offsets)
     )
-    sources = np.flatnonzero(eligible.any(axis=0))
+    eligible = np.logical_and.accumulate(eligible, axis=0)
+    sources = np.flatnonzero(eligible[0])
     count = sources.size
     alignment = max(64, (1 << (step.size - 1).bit_length()) // 8)
     bucket = max(alignment, ((count + alignment - 1) // alignment) * alignment)
+    # Use spare shape slots to split coarse buckets. Retaining every old boundary
+    # ensures padding never increases, while still allowing at most eight shapes.
+    spare_buckets = 8 - (step.size + alignment - 1) // alignment
+    if alignment > 64 and bucket <= spare_buckets * alignment and count <= bucket - alignment // 2:
+        bucket -= alignment // 2
     padded_sources = np.zeros(bucket, dtype=np.int64)
     padded_sources[:count] = sources
     indices = np.empty((1 + 2 * horizon, bucket), dtype=np.int64)
@@ -358,11 +336,14 @@ def _target_index(
     rows = torch.arange(episode_index.shape[0], device=episode_index.device)
     unclamped = rows + offset
     index = unclamped.clamp_max(episode_index.shape[0] - 1)
-    eligible = (
-        (unclamped < episode_index.shape[0])
-        & (episode_index[index] == episode_index)
-        & (step[index] == step + offset)
-    )
+    eligible = unclamped < episode_index.shape[0]
+    for distance in range(1, offset + 1):
+        intermediate = (rows + distance).clamp_max(episode_index.shape[0] - 1)
+        eligible = (
+            eligible
+            & (episode_index[intermediate] == episode_index)
+            & (step[intermediate] == step + distance)
+        )
     return index, eligible
 
 
@@ -488,7 +469,8 @@ def _active_belief_fields(
         opponent_patches_active,
         opponent_summary_active,
         economy_active,
-        recurrent_workspace,
+        recurrent_workspace
+        and (own_patches_active or economy_active or opponent_summary_active or opponent_patches_active),
         bool(decision_horizon),
         bool(decision_horizon),
     )
@@ -548,7 +530,7 @@ def structured_horizon_loss(
     active_fields = _active_belief_fields(
         decision_horizon=max(decision_horizon, latent_horizon),
         recurrent_workspace=max_horizon > 1,
-        own_patches_active=own_patches_active,
+        own_patches_active=own_patches_active and patch_horizon > 0,
         economy_active=economy_active,
         opponent_summary_active=opponent_summary_active,
         opponent_patches_active=opponent_patches_active,
@@ -743,10 +725,11 @@ def structured_window_loss(
     decode: DecodeContext | None,
     decision_horizon: int,
     patch_horizon: int,
+    latent_horizon: int = 0,
     own_patches_active: bool,
-    economy_active: bool,
-    opponent_summary_active: bool,
-    opponent_patches_active: bool,
+    economy_active: bool = False,
+    opponent_summary_active: bool = False,
+    opponent_patches_active: bool = False,
 ) -> StructuredDynamicsTerms:
     """Score complete fixed-width windows without running invalid trailing rows.
 
@@ -755,7 +738,9 @@ def structured_window_loss(
     validated groups of exactly ``max_horizon + 1`` rows and shrinks recursive
     predictions as each trailing position loses its successor.
     """
-    max_horizon = max(decision_horizon, patch_horizon)
+    if decision_horizon < 0 or patch_horizon < 0 or latent_horizon < 0:
+        raise ValueError("structured horizons cannot be negative")
+    max_horizon = max(decision_horizon, patch_horizon, latent_horizon)
     if max_horizon < 1:
         raise ValueError("structured window objective needs a positive horizon")
     width = max_horizon + 1
@@ -776,6 +761,7 @@ def structured_window_loss(
     }
     zero = belief.own_patches.new_zeros(())
     sums = [zero for _ in range(15)]
+    latent_sum = zero
     eligible_sum = zero
     decision_steps = 0
     patch_steps = 0
@@ -784,9 +770,9 @@ def structured_window_loss(
     patch_one = patch_final = zero
     residual_sums = [zero for _ in StructuredBelief._fields]
     active_fields = _active_belief_fields(
-        decision_horizon=decision_horizon,
+        decision_horizon=max(decision_horizon, latent_horizon),
         recurrent_workspace=max_horizon > 1,
-        own_patches_active=own_patches_active,
+        own_patches_active=own_patches_active and patch_horizon > 0,
         economy_active=economy_active,
         opponent_summary_active=opponent_summary_active,
         opponent_patches_active=opponent_patches_active,
@@ -834,6 +820,13 @@ def structured_window_loss(
         ):
             residual_sums[kind] = residual_sums[kind] + _eligible_rms_ratio(
                 predicted_value, previous_value, eligible
+            )
+
+        if offset <= latent_horizon:
+            latent_sum = latent_sum + _belief_latent_smooth_l1(
+                (current.unit_decisions, current.market_decisions),
+                (targets.unit_decisions, targets.market_decisions),
+                eligible,
             )
 
         if offset <= decision_horizon:
@@ -951,7 +944,7 @@ def structured_window_loss(
     patch_divisor = max(patch_steps, 1)
     state_divisor = max(state_steps, 1)
     return StructuredDynamicsTerms(
-        latent=zero,
+        latent=latent_sum / max(latent_horizon, 1),
         decision=sums[0] / decision_divisor,
         decision_one=decision_one,
         decision_final=decision_final,
@@ -1021,12 +1014,9 @@ def structured_critic_window_loss(
     if horizon < 1:
         raise ValueError("structured critic horizon must be positive")
     width = horizon + 1
-    rows = belief.own_patches.shape[0]
+    rows = belief.value_decision.shape[0]
     if rows == 0 or rows % width:
         raise ValueError("structured critic rows do not contain complete windows")
-    for value in belief:
-        if value.shape[0] != rows:
-            raise ValueError("structured critic belief families must have matching rows")
     for value in inputs:
         if value.shape[0] != rows:
             raise ValueError("structured critic inputs must match belief rows")
@@ -1045,7 +1035,7 @@ def structured_critic_window_loss(
         name: window(factors[name])
         for name in ("unit_actions", "market_kinds", "market_quantities")
     }
-    zero = belief.central_latents.new_zeros((), dtype=torch.float32)
+    zero = belief.value_decision.new_zeros((), dtype=torch.float32)
     latent_sum = zero
     value_sum = zero
     eligible_sum = zero
@@ -1084,7 +1074,7 @@ def structured_critic_window_loss(
         eligible = torch.ones(
             windows * source_positions,
             dtype=torch.bool,
-            device=belief.own_patches.device,
+            device=belief.value_decision.device,
         )
         latent_sum = latent_sum + _belief_latent_smooth_l1(current, target, eligible)
         value_sum = value_sum + _critic_value_kl(
@@ -1129,7 +1119,7 @@ def structured_critic_horizon_loss(
         if plan is None
         else StructuredCriticBelief(*(value[plan.indices[0]] for value in belief))
     )
-    zero = belief.central_latents.new_zeros((), dtype=torch.float32)
+    zero = belief.value_decision.new_zeros((), dtype=torch.float32)
     latent_sum = zero
     value_sum = zero
     eligible_sum = zero

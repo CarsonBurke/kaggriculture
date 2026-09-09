@@ -113,7 +113,7 @@ def _measure(
                 steps_per_trajectory=steps_per_trajectory,
                 config=config,
                 autocast_enabled=autocast_enabled,
-                actor_grad=False,
+                model_grad=False,
                 complete_windows=True,
             )
             weight = selected.shape[0]

@@ -127,6 +127,7 @@ class _BatchedGame:
 
 _WORKER_AGENT: CheckpointAgent | None = None
 _WORKER_OPPONENT: str | None = None
+_WORKER_WARMUP_SECONDS: float = 0.0
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -293,9 +294,12 @@ def _initialize_worker(
     torch_threads: int,
     opponent: str,
     agent: int | None,
+    cuda_bf16_compiled: bool = False,
+    batch_size: int = 1,
+    warmup_seed: int = 0,
 ) -> None:
     """Load one persistent candidate model per process, never per action or game."""
-    global _WORKER_AGENT, _WORKER_OPPONENT
+    global _WORKER_AGENT, _WORKER_OPPONENT, _WORKER_WARMUP_SECONDS
     threads = max(1, int(torch_threads))
     os.environ["OMP_NUM_THREADS"] = str(threads)
     os.environ["MKL_NUM_THREADS"] = str(threads)
@@ -306,8 +310,20 @@ def _initialize_worker(
         device=torch.device(device),
         torch_threads=torch_threads,
         agent=agent,
+        cuda_bf16_compiled=cuda_bf16_compiled,
     )
     _WORKER_OPPONENT = opponent
+    _WORKER_WARMUP_SECONDS = 0.0
+    if cuda_bf16_compiled:
+        # Compile and capture the exact fixed wave shape outside official action
+        # and game clocks. No opponent runs and no policy state is learned here.
+        started = time.perf_counter()
+        environment = _make_environment(warmup_seed, EPISODE_STEPS)
+        observation = environment.reset(2)[0].observation
+        for _ in range(3):
+            _WORKER_AGENT.act_many([observation] * batch_size)
+        torch.cuda.synchronize(torch.device(device))
+        _WORKER_WARMUP_SECONDS = time.perf_counter() - started
 
 
 def _make_environment(seed: int, episode_steps: int):
@@ -505,7 +521,20 @@ def _run_games_batched(specs: list[GameSpec], batch_size: int) -> list[GameResul
                 action_started = time.perf_counter()
                 error_log = ""
                 try:
-                    actions = _WORKER_AGENT.act_many(observations)
+                    # Keep compiled CUDA graph shapes fixed when a final wave
+                    # is short or another game has ended. Padding rows are never
+                    # stepped into an environment or counted as evaluated games.
+                    policy_observations = observations
+                    if (
+                        getattr(_WORKER_AGENT, "cuda_bf16_compiled", False)
+                        and len(observations) < batch_size
+                    ):
+                        policy_observations = observations + [observations[-1]] * (
+                            batch_size - len(observations)
+                        )
+                    actions = _WORKER_AGENT.act_many(policy_observations)
+                    if policy_observations is not observations:
+                        del actions[len(observations) :]
                 except Exception as exc:
                     error_log = traceback.format_exc()
                     actions = [exc] * len(model_games)
@@ -761,6 +790,15 @@ def parse_args() -> argparse.Namespace:
         help="inference device; defaults to CPU because submission admission must match Kaggle",
     )
     parser.add_argument(
+        "--cuda-bf16-compiled",
+        action="store_true",
+        help=(
+            "opt in to Inductor reduce-overhead CUDA BF16 inference; requires "
+            "--device cuda and --workers 1, warms outside game clocks, and is "
+            "not CPU submission-admission evidence"
+        ),
+    )
+    parser.add_argument(
         "--selection-report",
         type=Path,
         help="checkpoint-selection evidence; mandatory for --seed-domain finalist",
@@ -779,6 +817,7 @@ def parse_args() -> argparse.Namespace:
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     batch_size = int(getattr(args, "batch_size", 1))
+    cuda_bf16_compiled = bool(getattr(args, "cuda_bf16_compiled", False))
     if args.seeds < 1:
         raise ValueError("--seeds must be positive")
     if args.workers < 1:
@@ -798,6 +837,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if not artifact.is_file():
         raise FileNotFoundError(artifact)
     device = _resolve_device(args.device)
+    if cuda_bf16_compiled:
+        if device.type != "cuda":
+            raise ValueError("--cuda-bf16-compiled requires --device cuda")
+        if args.workers != 1:
+            raise ValueError("--cuda-bf16-compiled requires --workers 1")
     opponent_label, opponent = normalize_opponent(args.opponent)
     seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     started = time.perf_counter()
@@ -834,7 +878,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             usage.append(selection_provenance["seed_protocol"]["evaluation"])
         protocol = seed_protocol(domain, args.seed_start, args.seeds, usage=usage)
         worker_opponent = opponent
-        if opponent_label in BUILTIN_OPPONENTS:
+        if opponent in BUILTIN_OPPONENTS:
             opponent_provenance = _opponent_provenance(opponent_label, opponent)
         else:
             opponent_snapshot = snapshot_root / "opponent.py"
@@ -852,14 +896,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "finalist opponent does not match the checkpoint-selection evidence"
                 )
         if batch_size > 1:
-            if worker_opponent not in BUILTIN_OPPONENTS:
-                raise ValueError("lockstep batching currently requires a built-in opponent")
             _initialize_worker(
                 str(artifact_snapshot),
                 str(device),
                 args.torch_threads,
                 worker_opponent,
                 member,
+                cuda_bf16_compiled,
+                batch_size,
+                seeds[0],
             )
             specs = [GameSpec(seed, seat) for seed in seeds for seat in (0, 1)]
             pairs = [(result,) for result in _run_games_batched(specs, batch_size)]
@@ -870,6 +915,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 args.torch_threads,
                 worker_opponent,
                 member,
+                cuda_bf16_compiled,
+                1,
+                seeds[0],
             )
             pairs = [_run_seed_pair(seed) for seed in seeds]
         else:
@@ -885,6 +933,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     args.torch_threads,
                     worker_opponent,
                     member,
+                    cuda_bf16_compiled,
+                    1,
+                    seeds[0],
                 ),
             ) as pool:
                 pairs = list(pool.imap_unordered(_run_seed_pair, seeds))
@@ -910,6 +961,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": batch_size,
         "torch_threads_per_worker": args.torch_threads,
         "device": str(device),
+        "inference": {
+            "mode": "inductor-reduce-overhead" if cuda_bf16_compiled else "eager",
+            "autocast_dtype": (
+                "bfloat16"
+                if cuda_bf16_compiled or artifact_provenance["model_config"].get("fused_mlp")
+                else None
+            ),
+            "parameter_dtype": "float32",
+            "quantity_head_dtype": "float32",
+            "cpu_submission_parity": device.type == "cpu",
+            "warmup_seconds": _WORKER_WARMUP_SECONDS if cuda_bf16_compiled else 0.0,
+            "warmup_excluded_from_game_timing": cuda_bf16_compiled,
+            "fixed_policy_batch_size": batch_size if cuda_bf16_compiled else None,
+            "environment_backend": "official-python",
+        },
         "elapsed_seconds": time.perf_counter() - started,
         "summary": summary,
         "games": [_game_payload(result) for result in results],

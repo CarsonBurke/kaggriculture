@@ -180,11 +180,14 @@ def test_worker_reuses_one_loaded_model_across_actions_and_paired_games(monkeypa
     assert [len(result.action_seconds) for result in pair] == [3, 3]
 
 
-def test_lockstep_evaluation_uses_one_batched_model_forward_per_step(monkeypatch) -> None:
+@pytest.mark.parametrize("compiled", [False, True])
+def test_lockstep_evaluation_uses_one_batched_model_forward_per_step(monkeypatch, compiled) -> None:
     evaluator = _load_evaluator()
     batches: list[list[int]] = []
 
     class FakeAgent:
+        cuda_bf16_compiled = compiled
+
         def act_many(self, observations):
             batches.append([observation["lane"] for observation in observations])
             return [
@@ -235,11 +238,15 @@ def test_lockstep_evaluation_uses_one_batched_model_forward_per_step(monkeypatch
         "_make_environment",
         lambda seed, _episode_steps: FakeEnvironment(seed),
     )
-    specs = [evaluator.GameSpec(seed, 0) for seed in range(4)]
+    specs = [evaluator.GameSpec(seed, 0) for seed in range(6)]
 
     results = evaluator._run_games_batched(specs, batch_size=4)
 
-    assert batches == [[0, 1, 2, 3]] * 3
+    last_batch = [4, 5, 5, 5] if compiled else [4, 5]
+    assert batches == [[0, 1, 2, 3]] * 3 + [last_batch] * 3
+    assert [(result.seed, result.candidate_seat) for result in results] == [
+        (spec.seed, spec.candidate_seat) for spec in specs
+    ]
     assert all(result.complete for result in results)
     assert all(len(result.action_seconds) == 3 for result in results)
 
@@ -271,6 +278,38 @@ def test_lockstep_evaluation_matches_official_model_error_envelope() -> None:
     assert lockstep.opponent_reward == serial.opponent_reward
     assert lockstep.steps == serial.steps
     assert len(lockstep.action_seconds) == len(serial.action_seconds)
+
+
+def test_lockstep_python_file_opponent_has_independent_game_state(tmp_path: Path) -> None:
+    evaluator = _load_evaluator()
+    opponent = tmp_path / "opponent.py"
+    opponent.write_text(
+        "next_step = 0\n"
+        "def agent(observation):\n"
+        "    global next_step\n"
+        "    if observation['step'] != next_step:\n"
+        "        raise RuntimeError('opponent state leaked across games')\n"
+        "    next_step += 1\n"
+        "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n",
+        encoding="utf-8",
+    )
+
+    class PassAgent:
+        @staticmethod
+        def act_many(observations):
+            return [{"farmer": ["PASS"], "hands": [], "market": []} for _ in observations]
+
+    evaluator._WORKER_AGENT = PassAgent()
+    evaluator._WORKER_OPPONENT = str(opponent)
+    specs = [
+        evaluator.GameSpec(seed=seed, candidate_seat=seat, episode_steps=8)
+        for seed in (17, 18)
+        for seat in (0, 1)
+    ]
+    results = evaluator._run_games_batched(specs, batch_size=4)
+
+    assert all(result.complete for result in results)
+    assert [result.opponent_status for result in results] == ["DONE"] * 4
 
 
 def test_run_game_records_non_done_status_as_an_explicit_error(monkeypatch) -> None:

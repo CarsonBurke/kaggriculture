@@ -20,6 +20,9 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 15 restricts PPO NextLat to normalized actor/value head inputs and
+# adds the critic value norm. Version-14 actor weights remain exportable, but
+# old critic/predictor/optimizer states cannot resume under the new objective.
 # Version 14 makes NextLat joint and ungated and removes predictor gate recovery
 # state. Old checkpoints remain exportable as actors, not resumable training.
 # Version 13 adds a critic-side structured dynamics predictor and its optimizer
@@ -61,11 +64,11 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 14
-# Versions before 14 remain readable on the actor-only path because the recovery
+CHECKPOINT_FORMAT_VERSION = 15
+# Versions before 15 remain readable on the actor-only path because the recovery
 # additions do not change actor weights or model configuration. Resume demands
 # the current version exactly and never guesses absent training state.
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12, 13))
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12, 13, 14))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
@@ -356,15 +359,32 @@ class CheckpointAgent:
         device: torch.device | str = "cpu",
         torch_threads: int = 1,
         agent: int | None = None,
+        cuda_bf16_compiled: bool = False,
     ) -> None:
+        target_device = torch.device(device)
+        if cuda_bf16_compiled:
+            if target_device.type != "cuda":
+                raise ValueError("compiled BF16 inference requires a CUDA device")
+            if not torch.cuda.is_available():
+                raise RuntimeError("compiled BF16 inference requires available CUDA")
+            with torch.cuda.device(target_device):
+                if not torch.cuda.is_bf16_supported():
+                    raise RuntimeError("compiled BF16 inference requires BF16-capable CUDA")
         if torch_threads > 0:
             torch.set_num_threads(torch_threads)
             with suppress(RuntimeError):
                 # PyTorch only permits changing this before the first parallel op.
                 torch.set_num_interop_threads(1)
-        self.actor, self.metadata = load_actor_artifact(artifact, device, agent=agent)
+        self.actor, self.metadata = load_actor_artifact(artifact, target_device, agent=agent)
         self.member = agent
         self.quantity_heads = prepare_quantity_heads(self.actor)
+        self.cuda_bf16_compiled = cuda_bf16_compiled
+        if cuda_bf16_compiled:
+            # Compile only the forward: act_batch dispatches by actor type and
+            # samples selected-kind quantities from the frozen CPU heads above.
+            self.actor.forward = torch.compile(
+                self.actor.forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+            )
         model_config = self.metadata.get("model_config")
         self.fused_mlp = isinstance(model_config, Mapping) and bool(
             model_config.get("fused_mlp", False)
@@ -376,9 +396,11 @@ class CheckpointAgent:
 
     def act_many(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Act on independent environments in one model forward."""
+        if self.cuda_bf16_compiled:
+            torch.compiler.cudagraph_mark_step_begin()
         inference_context = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if self.fused_mlp
+            if self.cuda_bf16_compiled or self.fused_mlp
             else nullcontext()
         )
         with inference_context:

@@ -1080,18 +1080,13 @@ class StructuredBelief(NamedTuple):
     opponent_summary: Tensor
     economy_entities: Tensor
     central_latents: Tensor
-    unit_decisions: Tensor
-    market_decisions: Tensor
+    unit_decisions: Tensor  # Exact post-normalization input to the unit projection.
+    market_decisions: Tensor  # Exact post-normalization input to the market heads.
 
 
 class StructuredCriticBelief(NamedTuple):
-    """Typed critic representations exposed only to training auxiliaries."""
+    """The normalized representation consumed by the critic's final value head."""
 
-    own_patches: Tensor
-    opponent_patches: Tensor
-    opponent_summary: Tensor
-    economy_entities: Tensor
-    central_latents: Tensor
     value_decision: Tensor
 
 
@@ -1187,6 +1182,7 @@ class StructuredActor(nn.Module):
                 context_valid=local_valid.reshape(batch * units, slots),
             ).view(batch, units, width)
         unit_hidden = torch.where(inputs.unit_active.unsqueeze(-1), unit_hidden, 0.0)
+        unit_hidden = self.unit_head[0](unit_hidden)
 
         market_queries = self.market_queries.weight.unsqueeze(0).expand(batch, -1, -1)
         if self.market_economy_decoder is None:
@@ -1207,7 +1203,7 @@ class StructuredActor(nn.Module):
             )
         market_hidden = self.market_norm(market_hidden)
         output = ActorOutput(
-            unit_logits=self.unit_head(unit_hidden).contiguous(),
+            unit_logits=self.unit_head[-1](unit_hidden).contiguous(),
             market_kind_logits=self.market_kind(market_hidden).contiguous(),
             market_quantity_context=self.market_quantity_context(market_hidden).contiguous(),
         )
@@ -1259,6 +1255,7 @@ class StructuredCritic(nn.Module):
         self.trunk = StructuredTrunk(trunk_config, private_columns=True)
         self.value_query = nn.Parameter(torch.randn(1, config.model_dim) * 0.02)
         self.value_decoder = Block(trunk_config)
+        self.value_norm = RMSNorm(config.model_dim, eps=1e-5)
         self.value_head = nn.Linear(config.model_dim, config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
@@ -1298,13 +1295,9 @@ class StructuredCritic(nn.Module):
             self.value_query.unsqueeze(0).expand(batch, -1, -1),
             trunk.latents,
         )
+        value_hidden = self.value_norm(value_hidden)
         logits = self.value_head(value_hidden[:, 0]).contiguous()
         belief = StructuredCriticBelief(
-            own_patches=trunk.own_patches,
-            opponent_patches=trunk.opponent_patches,
-            opponent_summary=trunk.opponent_summary,
-            economy_entities=trunk.economy_tokens,
-            central_latents=trunk.latents,
             value_decision=value_hidden,
         )
         return logits, belief

@@ -388,15 +388,11 @@ UPDATE_COMPILE_MODES = (
 
 @dataclass(frozen=True)
 class PpoConfig:
-    # The critic follows CleanRL's PPO reference (2.5e-4, Adam eps 1e-5), which
-    # this pipeline anneals to nothing -- warmup then constant -- rather than
-    # linearly to zero. The tenfold NorMuon conversion that briefly sat here
-    # (2.5e-3) was the same unmeasured unit change the actor tabulation
-    # falsified; the critic never got its own sweep, and the 2.5e-3 step
-    # clipped ~9x every minibatch on the economic population runs. The
-    # reference rate is the one that has a citation.
+    # Actor and critic share a 5e-5 base rate. The 3e-5 critic did not reach
+    # readiness within 40 waves even with its value-head boost; raising both
+    # rates is a requested experiment, not evidence of recovered policy strength.
     #
-    # The actor does not, and cannot: 2.5e-4 is incompatible with `target_kl`
+    # Historical actor calibration: 2.5e-4 is incompatible with `target_kl`
     # once the actor is warm-started from behavior cloning. A full epoch is 113
     # sequential updates over one 230,080-state wave, and a BC-cloned policy is
     # sharp, so it moves far more KL per unit of parameter movement than the
@@ -493,8 +489,10 @@ class PpoConfig:
     # deterministic update could be committed, with no entropy term in the
     # objective. This measurement supersedes the optimizer unit-conversion
     # projection while leaving the older Adam evidence above as history.
-    actor_learning_rate: float = 3.0e-5
-    critic_learning_rate: float = 2.5e-4
+    actor_learning_rate: float = 5.0e-5
+    critic_learning_rate: float = 5.0e-5
+    # Optional absolute LR for value_head only, independent of trunk Adam gains.
+    critic_head_learning_rate: float | None = None
     lr_warmup_steps: int = 32
     # Which optimizer `make_optimizers` builds. `normuon` gives every hidden
     # matrix a spectrally normalized step (Polar Express + NorMuon's low-rank
@@ -532,11 +530,9 @@ class PpoConfig:
     # a second same-wave critic pass memorized holdout, and a second actor pass
     # is a replay at a KL that does not bind.
     critic_epochs: int | None = None
-    # Largest measured update batch with working headroom for the structured
-    # n16 model. 2048 rows was 2.2-4.8% faster in the earlier throughput sweep,
-    # but used roughly 12 GiB and left the device underfilled. 4096 uses roughly
-    # 24 GiB; 8192 exceeds this 31.36-GiB GPU.
-    minibatch_size: int = 4096
+    # Keep physical batches larger without consuming the last VRAM headroom.
+    # Balanced partitioning covers the full wave without a small final tail.
+    minibatch_size: int = 4800
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
     # collapse: a symmetric band clips a low-probability action's upside at the
@@ -615,13 +611,9 @@ class PpoConfig:
     # shape, and inference artifacts on their historical paths. When active,
     # minibatches are contiguous episode runs so h_t and h_{t+1} come from one
     # trunk forward, as in NextLat.
+    structured_latent_coefficient: float = 0.0
     structured_decision_coefficient: float = 0.0
-    structured_patch_coefficient: float = 0.0
-    structured_economy_coefficient: float = 0.0
-    structured_opponent_summary_coefficient: float = 0.0
-    structured_opponent_patch_coefficient: float = 0.0
     structured_decision_horizon: int = 2
-    structured_patch_horizon: int = 1
     # Predictor parameters live in a separate optimizer so they are not in the
     # actor/critic state dicts consumed by snapshots. They step on the same
     # minibatches as the trunk, through one combined task + auxiliary backward.
@@ -651,15 +643,7 @@ class PpoConfig:
 
     @property
     def structured_actor_auxiliary_active(self) -> bool:
-        return any(
-            (
-                self.structured_decision_coefficient,
-                self.structured_patch_coefficient,
-                self.structured_economy_coefficient,
-                self.structured_opponent_summary_coefficient,
-                self.structured_opponent_patch_coefficient,
-            )
-        )
+        return bool(self.structured_latent_coefficient or self.structured_decision_coefficient)
 
     @property
     def structured_critic_auxiliary_active(self) -> bool:
@@ -753,6 +737,11 @@ def _validate_config(config: PpoConfig) -> None:
     ):
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
+    if config.critic_head_learning_rate is not None and (
+        not math.isfinite(config.critic_head_learning_rate)
+        or config.critic_head_learning_rate <= 0.0
+    ):
+        raise ValueError("critic head learning rate must be finite and positive")
     if config.optimizer not in _OPTIMIZERS:
         raise ValueError(f"unsupported optimizer {config.optimizer!r}, want one of {_OPTIMIZERS}")
     for name, value in (
@@ -776,11 +765,8 @@ def _validate_config(config: PpoConfig) -> None:
     if not math.isfinite(config.critic_gae_lambda) or not 0.0 <= config.critic_gae_lambda <= 1.0:
         raise ValueError("critic GAE lambda must be finite and in [0, 1]")
     coefficients = {
+        "structured latent": config.structured_latent_coefficient,
         "structured decision": config.structured_decision_coefficient,
-        "structured patch": config.structured_patch_coefficient,
-        "structured economy": config.structured_economy_coefficient,
-        "structured opponent summary": config.structured_opponent_summary_coefficient,
-        "structured opponent patch": config.structured_opponent_patch_coefficient,
         "structured critic latent": config.structured_critic_latent_coefficient,
         "structured critic value": config.structured_critic_value_coefficient,
     }
@@ -798,29 +784,14 @@ def _validate_config(config: PpoConfig) -> None:
         raise ValueError("structured critic learning rate must be finite and positive")
     horizons = (
         config.structured_decision_horizon,
-        config.structured_patch_horizon,
         config.structured_critic_horizon,
     )
     if any(not isinstance(value, int) or isinstance(value, bool) for value in horizons):
         raise ValueError("structured auxiliary horizons must be integers")
     if any(value < 0 for value in horizons):
         raise ValueError("structured auxiliary horizons cannot be negative")
-    if config.structured_decision_coefficient and config.structured_decision_horizon < 1:
-        raise ValueError("structured decision horizon must be positive when decision KL is active")
-    if (
-        any(
-            (
-                config.structured_patch_coefficient,
-                config.structured_economy_coefficient,
-                config.structured_opponent_summary_coefficient,
-                config.structured_opponent_patch_coefficient,
-            )
-        )
-        and config.structured_patch_horizon < 1
-    ):
-        raise ValueError(
-            "structured patch horizon must be positive when feature prediction is active"
-        )
+    if config.structured_actor_auxiliary_active and config.structured_decision_horizon < 1:
+        raise ValueError("structured decision horizon must be positive when actor auxiliary is active")
     if config.structured_critic_auxiliary_active and config.structured_critic_horizon < 1:
         raise ValueError(
             "structured critic horizon must be positive when critic auxiliary is active"
@@ -1239,6 +1210,30 @@ def _initialize_optimizer_schedule(
         group["warmup_step"] = 0
 
 
+def _configure_critic_head_rate(
+    optimizer: torch.optim.Optimizer, critic: Critic, learning_rate: float | None
+) -> None:
+    """Separate only the value readout while retaining optimizer and warmup state."""
+    if learning_rate is None:
+        return
+    head = list(critic.value_head.parameters())
+    head_ids = {id(parameter) for parameter in head}
+    for group in optimizer.param_groups:
+        if head_ids <= {id(parameter) for parameter in group["params"]}:
+            remaining = [
+                parameter for parameter in group["params"] if id(parameter) not in head_ids
+            ]
+            settings = dict(group)
+            settings.update(params=head, lr=learning_rate, base_lr=learning_rate, role="value_head")
+            if remaining:
+                group["params"] = remaining
+                optimizer.add_param_group(settings)
+            else:
+                group.update(settings)
+            return
+    raise ValueError("critic value head must belong to one optimizer group")
+
+
 def make_optimizers(
     actor: Actor,
     critic: Critic,
@@ -1274,6 +1269,7 @@ def make_optimizers(
             momentum=config.normuon_momentum,
             beta2=config.normuon_beta2,
         )
+        _configure_critic_head_rate(critic_optimizer, critic, config.critic_head_learning_rate)
         return actor_optimizer, critic_optimizer
     fused = actor_device.type == "cuda"
     actor_optimizer = torch.optim.AdamW(
@@ -1292,6 +1288,7 @@ def make_optimizers(
     )
     _initialize_optimizer_schedule(actor_optimizer, config.actor_learning_rate)
     _initialize_optimizer_schedule(critic_optimizer, config.critic_learning_rate)
+    _configure_critic_head_rate(critic_optimizer, critic, config.critic_head_learning_rate)
     return actor_optimizer, critic_optimizer
 
 
@@ -1367,9 +1364,10 @@ def _contiguous_run_indices(
 ) -> np.ndarray:
     """Permute valid states as contiguous same-trajectory runs.
 
-    Every index appears once. A run never crosses a trajectory or a hole in
-    validity. Short tail runs are kept so late-game states are not dropped.
-    ``run_length == 1`` is ``rng.permutation``.
+    Every index appears once. Each contiguous validity segment gets an
+    independent random partition phase before its bounded runs are shuffled,
+    so fixed-period game events are not systematically omitted as sources.
+    Short edge runs are retained. ``run_length == 1`` is ``rng.permutation``.
     """
     if run_length < 1:
         raise ValueError("run length must be positive")
@@ -1388,7 +1386,8 @@ def _contiguous_run_indices(
     segment_starts = positions[opens]
     segment_lengths = np.diff(np.append(segment_starts, indices.size))
     within = positions - np.repeat(segment_starts, segment_lengths)
-    block_starts = positions[within % run_length == 0]
+    phases = np.repeat(rng.integers(run_length, size=segment_starts.size), segment_lengths)
+    block_starts = positions[opens | ((within + phases) % run_length == 0)]
     block_lengths = np.diff(np.append(block_starts, indices.size))
     order = rng.permutation(block_starts.size)
     shuffled_starts = block_starts[order]
@@ -2403,31 +2402,15 @@ def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> N
 
 
 _STRUCTURED_AUXILIARY_METRICS = (
+    "latent",
     "decision",
     "decision_one",
     "decision_final",
     "decision_unit",
     "decision_market_kind",
     "decision_market_quantity",
-    "patch",
-    "patch_one",
-    "patch_final",
-    "patch_all",
-    "patch_changed",
-    "patch_unchanged",
-    "economy",
-    "opponent_summary",
-    "opponent_patches",
-    "opponent_patch_all",
-    "opponent_patch_changed",
-    "opponent_patch_unchanged",
     "eligible",
     "residual_ratio",
-    "residual_own_patches",
-    "residual_opponent_patches",
-    "residual_opponent_summary",
-    "residual_economy_entities",
-    "residual_central_latents",
     "residual_unit_decisions",
     "residual_market_decisions",
 )
@@ -2519,15 +2502,9 @@ def _structured_auxiliary_terms(
     decision_horizon = (
         config.structured_decision_horizon if config.structured_decision_coefficient else 0
     )
-    state_active = any(
-        (
-            config.structured_patch_coefficient,
-            config.structured_economy_coefficient,
-            config.structured_opponent_summary_coefficient,
-            config.structured_opponent_patch_coefficient,
-        )
+    latent_horizon = (
+        config.structured_decision_horizon if config.structured_latent_coefficient else 0
     )
-    patch_horizon = config.structured_patch_horizon if state_active else 0
     with torch.autocast(
         device_type=indices.device.type,
         dtype=torch.bfloat16,
@@ -2554,7 +2531,7 @@ def _structured_auxiliary_terms(
             raise ValueError("belief indices and inverse must be supplied together")
         decode = (
             DecodeContext(
-                heads=DecodeHeads.from_actor(actor),
+                heads=DecodeHeads.from_actor(actor, normalized_units=True),
                 masks=DecodeMasks(
                     unit_masks=factors["unit_masks"],
                     market_kind_masks=factors["market_kind_masks"],
@@ -2576,40 +2553,20 @@ def _structured_auxiliary_terms(
             factors,
             decode=decode,
             decision_horizon=decision_horizon,
-            patch_horizon=patch_horizon,
-            own_patches_active=bool(config.structured_patch_coefficient),
-            economy_active=bool(config.structured_economy_coefficient),
-            opponent_summary_active=bool(config.structured_opponent_summary_coefficient),
-            opponent_patches_active=bool(config.structured_opponent_patch_coefficient),
+            latent_horizon=latent_horizon,
+            patch_horizon=0,
+            own_patches_active=False,
             **({} if complete_windows else {"plan": plan}),
         )
         loss = (
-            config.structured_decision_coefficient * terms.decision
-            + config.structured_patch_coefficient * terms.patch
-            + config.structured_economy_coefficient * terms.economy
-            + config.structured_opponent_summary_coefficient * terms.opponent_summary
-            + config.structured_opponent_patch_coefficient * terms.opponent_patches
+            config.structured_latent_coefficient * terms.latent
+            + config.structured_decision_coefficient * terms.decision
         )
     return loss, terms
 
 
 def _structured_auxiliary_horizon(config: PpoConfig) -> int:
-    state_horizon = (
-        config.structured_patch_horizon
-        if any(
-            (
-                config.structured_patch_coefficient,
-                config.structured_economy_coefficient,
-                config.structured_opponent_summary_coefficient,
-                config.structured_opponent_patch_coefficient,
-            )
-        )
-        else 0
-    )
-    return max(
-        config.structured_decision_horizon if config.structured_decision_coefficient else 0,
-        state_horizon,
-    )
+    return config.structured_decision_horizon if config.structured_actor_auxiliary_active else 0
 
 
 def _structured_run_length(config: PpoConfig) -> int:
@@ -2750,24 +2707,37 @@ def _credit_quality_metrics(
     return metrics
 
 
-def _observe_auxiliary_gradient(belief, squared_norms: list[Tensor]):
-    """Observe auxiliary cotangents during the single combined backward.
+def _auxiliary_branch_belief(belief, squared_norms: list[Tensor] | None = None):
+    """Fork auxiliary edges, optionally observing their combined-backward cotangents.
 
-    Views fork only the auxiliary edge, so hooks exclude the primary objective
-    even without compilation. Each hook reduces immediately; neither full
-    gradients nor saved activations are retained for a second traversal.
+    Always use the same zero-copy views, including unobserved minibatches: changing
+    input view/autograd metadata only for diagnostics can specialize AOTAutograd.
+    Hooks exclude the primary objective and reduce immediately to one scalar per
+    field; neither full gradients nor activations survive for a second traversal.
     """
 
     def observe(gradient: Tensor) -> None:
-        squared_norms.append(gradient.detach().float().square().sum())
+        assert squared_norms is not None
+        squared_norms.append(
+            torch.linalg.vector_norm(gradient.detach(), dtype=torch.float32).square()
+        )
 
     fields = []
     for field in belief:
         branch = field.view_as(field)
-        if branch.requires_grad:
+        if squared_norms is not None and branch.requires_grad:
             branch.register_hook(observe)
         fields.append(branch)
     return type(belief)(*fields)
+
+
+def _auxiliary_preupdate_metrics(
+    prefix: str, loss: Tensor, terms, names: tuple[str, ...]
+) -> dict[str, Tensor]:
+    """Snapshot compact scalars without retaining a compiled callable's outputs."""
+    values = torch.stack((loss.detach(), *(getattr(terms, name).detach() for name in names)))
+    keys = (f"{prefix}_combined", *(f"{prefix}_{name}" for name in names))
+    return dict(zip(keys, values.unbind(), strict=True))
 
 
 def _elapsed_cuda_seconds(start: torch.cuda.Event | None, end: torch.cuda.Event | None) -> float:
@@ -2955,7 +2925,7 @@ def update_ppo(
     refresh_fused_mlp_fp8(critic)
     actor_optimizer.zero_grad(set_to_none=True)
     critic_optimizer.zero_grad(set_to_none=True)
-    predictor_metrics: dict[str, float | int] = {}
+    predictor_metrics: dict[str, Tensor] = {}
     gradient_metrics: dict[str, Tensor] = {}
     structured_terms_fn: Any = None
     structured_critic_terms_fn: Any = None
@@ -3327,10 +3297,10 @@ def update_ppo(
                         else:
                             actor_auxiliary_started = time.perf_counter()
                         actor_source_squares: list[Tensor] = []
-                        if actor_gradient_diagnostic:
-                            source_belief = _observe_auxiliary_gradient(
-                                source_belief, actor_source_squares
-                            )
+                        source_belief = _auxiliary_branch_belief(
+                            source_belief,
+                            actor_source_squares if actor_gradient_diagnostic else None,
+                        )
                         actor_auxiliary_loss, actor_auxiliary_terms = structured_terms_fn(
                             actor,
                             structured_dynamics,
@@ -3345,13 +3315,14 @@ def update_ppo(
                             plan=horizon_plan,
                         )
                         if "structured_preupdate_combined" not in predictor_metrics:
-                            predictor_metrics["structured_preupdate_combined"] = float(
-                                actor_auxiliary_loss.detach()
-                            )
-                            for name in _STRUCTURED_AUXILIARY_METRICS:
-                                predictor_metrics[f"structured_preupdate_{name}"] = float(
-                                    getattr(actor_auxiliary_terms, name).detach()
+                            predictor_metrics.update(
+                                _auxiliary_preupdate_metrics(
+                                    "structured_preupdate",
+                                    actor_auxiliary_loss,
+                                    actor_auxiliary_terms,
+                                    _STRUCTURED_AUXILIARY_METRICS,
                                 )
+                            )
                             # Fresh-wave persistence is diagnostic only and
                             # never controls source-gradient admission.
                             with torch.no_grad():
@@ -3368,13 +3339,14 @@ def update_ppo(
                                     belief=_detached_belief(actor_belief),
                                     plan=horizon_plan,
                                 )
-                                predictor_metrics["structured_preupdate_persistence_combined"] = (
-                                    float(persistence_loss.detach())
+                                predictor_metrics.update(
+                                    _auxiliary_preupdate_metrics(
+                                        "structured_preupdate_persistence",
+                                        persistence_loss,
+                                        persistence_terms,
+                                        _STRUCTURED_AUXILIARY_METRICS,
+                                    )
                                 )
-                                for name in _STRUCTURED_AUXILIARY_METRICS:
-                                    predictor_metrics[
-                                        f"structured_preupdate_persistence_{name}"
-                                    ] = float(getattr(persistence_terms, name).detach())
                         combined_actor_loss = policy_loss + actor_auxiliary_loss
                         combined_actor_loss.backward()
                         if actor_gradient_diagnostic:
@@ -3461,13 +3433,14 @@ def update_ppo(
                     )
                     actor_auxiliary_loss.backward()
                     if "structured_preupdate_combined" not in predictor_metrics:
-                        predictor_metrics["structured_preupdate_combined"] = float(
-                            actor_auxiliary_loss.detach()
-                        )
-                        for name in _STRUCTURED_AUXILIARY_METRICS:
-                            predictor_metrics[f"structured_preupdate_{name}"] = float(
-                                getattr(actor_auxiliary_terms, name).detach()
+                        predictor_metrics.update(
+                            _auxiliary_preupdate_metrics(
+                                "structured_preupdate",
+                                actor_auxiliary_loss,
+                                actor_auxiliary_terms,
+                                _STRUCTURED_AUXILIARY_METRICS,
                             )
+                        )
                         with torch.no_grad():
                             persistence_loss, persistence_terms = _structured_auxiliary_terms(
                                 actor,
@@ -3482,13 +3455,14 @@ def update_ppo(
                                 belief=actor_belief,
                                 plan=horizon_plan,
                             )
-                            predictor_metrics["structured_preupdate_persistence_combined"] = float(
-                                persistence_loss.detach()
-                            )
-                            for name in _STRUCTURED_AUXILIARY_METRICS:
-                                predictor_metrics[f"structured_preupdate_persistence_{name}"] = (
-                                    float(getattr(persistence_terms, name).detach())
+                            predictor_metrics.update(
+                                _auxiliary_preupdate_metrics(
+                                    "structured_preupdate_persistence",
+                                    persistence_loss,
+                                    persistence_terms,
+                                    _STRUCTURED_AUXILIARY_METRICS,
                                 )
+                            )
                     torch.nn.utils.clip_grad_norm_(
                         structured_dynamics.parameters(), config.nextlat_max_gradient_norm
                     )
@@ -3552,10 +3526,9 @@ def update_ppo(
                     else:
                         critic_auxiliary_started = time.perf_counter()
                     critic_source_squares: list[Tensor] = []
-                    if critic_gradient_diagnostic:
-                        source_belief = _observe_auxiliary_gradient(
-                            source_belief, critic_source_squares
-                        )
+                    source_belief = _auxiliary_branch_belief(
+                        source_belief, critic_source_squares if critic_gradient_diagnostic else None
+                    )
                     critic_auxiliary_loss, critic_auxiliary_terms = structured_critic_terms_fn(
                         critic,
                         structured_critic_dynamics,
@@ -3570,13 +3543,14 @@ def update_ppo(
                         plan=horizon_plan,
                     )
                     if "structured_critic_preupdate_combined" not in predictor_metrics:
-                        predictor_metrics["structured_critic_preupdate_combined"] = float(
-                            critic_auxiliary_loss.detach()
-                        )
-                        for name in _STRUCTURED_CRITIC_AUXILIARY_METRICS:
-                            predictor_metrics[f"structured_critic_preupdate_{name}"] = float(
-                                getattr(critic_auxiliary_terms, name).detach()
+                        predictor_metrics.update(
+                            _auxiliary_preupdate_metrics(
+                                "structured_critic_preupdate",
+                                critic_auxiliary_loss,
+                                critic_auxiliary_terms,
+                                _STRUCTURED_CRITIC_AUXILIARY_METRICS,
                             )
+                        )
                         with torch.no_grad():
                             persistence_loss, persistence_terms = (
                                 _structured_critic_auxiliary_terms(
@@ -3593,13 +3567,14 @@ def update_ppo(
                                     plan=horizon_plan,
                                 )
                             )
-                            predictor_metrics[
-                                "structured_critic_preupdate_persistence_combined"
-                            ] = float(persistence_loss.detach())
-                            for name in _STRUCTURED_CRITIC_AUXILIARY_METRICS:
-                                predictor_metrics[
-                                    f"structured_critic_preupdate_persistence_{name}"
-                                ] = float(getattr(persistence_terms, name).detach())
+                            predictor_metrics.update(
+                                _auxiliary_preupdate_metrics(
+                                    "structured_critic_preupdate_persistence",
+                                    persistence_loss,
+                                    persistence_terms,
+                                    _STRUCTURED_CRITIC_AUXILIARY_METRICS,
+                                )
+                            )
                     combined_critic_loss = value_loss + critic_auxiliary_loss
                     combined_critic_loss.backward()
                     if critic_gradient_diagnostic:
@@ -3846,9 +3821,21 @@ def update_ppo(
                 assert critic_stream is not None
                 update_stream.wait_stream(actor_stream)
                 update_stream.wait_stream(critic_stream)
+            # Drop Python-owned inputs and returned beliefs before the next
+            # gather/forward; backward has already released its saved tensors.
+            actor_args = critic_args = inputs = None
+            actor_pack = critic_pack = None
+            actor_belief = critic_belief = source_belief = None
         epoch_marks.append((totals["value_loss"].clone(), total_states))
         completed_epochs += 1
 
+    # All observations are detached scalars. Pack after the stream joins, before
+    # the existing synchronization, instead of interrupting the first minibatch
+    # with one host readback per preupdate/persistence field.
+    diagnostic_metrics = predictor_metrics | gradient_metrics
+    diagnostic_values = (
+        torch.stack(tuple(diagnostic_metrics.values())) if diagnostic_metrics else None
+    )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     mark_phase("update_minibatch_seconds")
@@ -3923,6 +3910,13 @@ def update_ppo(
         "gamma": config.gamma,
         "actor_learning_rate": float(actor_optimizer.param_groups[0]["lr"]),
         "critic_learning_rate": float(critic_optimizer.param_groups[0]["lr"]),
+        "critic_head_learning_rate": float(
+            next(
+                group["lr"]
+                for group in critic_optimizer.param_groups
+                if any(parameter is critic.value_head.weight for parameter in group["params"])
+            )
+        ),
         # Against the discounted suffix return, which decoupled GAE also uses
         # as the critic target. Pre-update predictions, so this is not a fit.
         "monte_carlo_explained_variance": _explained_variance(
@@ -3967,7 +3961,8 @@ def update_ppo(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
     }
-    metrics.update(predictor_metrics)
+    if diagnostic_values is not None:
+        metrics.update(zip(diagnostic_metrics, diagnostic_values.cpu().tolist(), strict=True))
     metrics.update(
         _credit_quality_metrics(
             rollout,
@@ -3978,7 +3973,6 @@ def update_ppo(
             diagnostic_groups,
         )
     )
-    metrics.update({name: float(value) for name, value in gradient_metrics.items()})
     if actor_predictor_active:
         metrics["structured_actor_auxiliary_enabled"] = int(actor_auxiliary_active)
         metrics["structured_actor_predictor_updates"] = actor_predictor_updates

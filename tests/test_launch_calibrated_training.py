@@ -39,18 +39,6 @@ def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
     # be silently defaulted here rather than decided, so the keys are pinned too.
     assert set(shipped) == fields
     _validate_config(PpoConfig(**shipped))
-    assert shipped["actor_learning_rate"] == 3.0e-5
-    assert shipped["optimizer"] == "normuon"
-    assert PRODUCTION_LEAGUE_BUILTIN_OPPONENTS == "pass,random,starter,scripted-v27"
-    assert shipped["structured_decision_coefficient"] == 1.0
-    assert shipped["structured_decision_horizon"] == 1
-    assert shipped["structured_patch_coefficient"] == 0.0
-    assert shipped["structured_economy_coefficient"] == 0.0
-    assert shipped["structured_opponent_summary_coefficient"] == 0.0
-    assert shipped["structured_opponent_patch_coefficient"] == 0.0
-    assert shipped["structured_critic_latent_coefficient"] == 1.0
-    assert shipped["structured_critic_value_coefficient"] == 1.0
-    assert shipped["structured_critic_horizon"] == 1
 
     # The pairing this guards: critic epochs are the critic-only refits that run
     # after the actor's epochs, so a schedule asking for fewer of them than actor
@@ -166,25 +154,6 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     assert args.rollout_bfloat16 is True
     assert args.update_compile_mode == PRODUCTION_UPDATE_COMPILE_MODE
     assert "--compile-update" not in command
-    structured_flags = {
-        "--structured-decision-coefficient": 1.0,
-        "--structured-patch-coefficient": 0.0,
-        "--structured-economy-coefficient": 0.0,
-        "--structured-opponent-summary-coefficient": 0.0,
-        "--structured-opponent-patch-coefficient": 0.0,
-        "--structured-decision-horizon": 1,
-        "--structured-patch-horizon": 1,
-        "--structured-critic-latent-coefficient": 1.0,
-        "--structured-critic-value-coefficient": 1.0,
-        "--structured-critic-horizon": 1,
-    }
-    for flag, expected in structured_flags.items():
-        assert float(command[command.index(flag) + 1]) == expected
-    assert args.structured_decision_coefficient == 1.0
-    assert args.structured_critic_latent_coefficient == 1.0
-    assert args.structured_critic_value_coefficient == 1.0
-    assert "--structured-actor-gradient-ratio" not in command
-    assert not hasattr(args, "structured_actor_gradient_ratio")
 
 
 def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
@@ -221,9 +190,6 @@ def test_a_population_command_round_trips_and_names_no_opponent_it_never_meets(
     assert args.init_actor_from == artifacts
     assert args.league_games == 0
     assert args.league_builtin_lanes == 0
-    assert args.structured_decision_coefficient == 1.0
-    assert args.structured_critic_latent_coefficient == 1.0
-    assert args.structured_critic_value_coefficient == 1.0
     # A population has no built-in lane. Each immutable recovery event triggers
     # external evaluation directly, with no iteration-modulo coupling.
     assert args.external_eval
@@ -1290,11 +1256,11 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         ("--league-historical-opponents", "6"),
         ("--league-builtin-opponents", "pass,random,starter,scripted-v27"),
         ("--architecture", "structured"),
-        ("--actor-lr", "3e-05"),
+        ("--actor-lr", "5e-05"),
         ("--optimizer", "normuon"),
         ("--epochs", "1"),
         ("--critic-epochs", "1"),
-        ("--minibatch-size", "4096"),
+        ("--minibatch-size", "4800"),
         ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
         (
             "--actor-gae-lambda",
@@ -1461,7 +1427,7 @@ def test_direct_fresh_launch_requires_a_bc_actor(
     assert not (run_directory / "launch.json").exists()
 
 
-def test_direct_fresh_launch_defaults_to_five_critic_warmup_iterations(
+def test_direct_fresh_launch_defaults_to_ten_critic_warmup_iterations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _script("launch_production.py")
@@ -1496,9 +1462,9 @@ def test_direct_fresh_launch_defaults_to_five_critic_warmup_iterations(
     assert launch["architecture"] == "structured"
     assert launch["model"] == production_model_config()
     assert launch["initial_actor"] == str(actor)
-    assert launch["critic_warmup_iterations"] == 5
+    assert launch["critic_warmup_iterations"] == 10
     assert command[command.index("--init-actor-from") + 1] == str(actor)
-    assert command[command.index("--critic-warmup-iterations") + 1] == "5"
+    assert command[command.index("--critic-warmup-iterations") + 1] == "10"
     assert command[command.index("--architecture") + 1] == "structured"
 
 

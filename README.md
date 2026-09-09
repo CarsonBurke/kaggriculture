@@ -5,7 +5,7 @@ Research and evaluation tooling for the Kaggriculture simulation competition.
 Production training is BC-initialized self-play PPO with DAPO's asymmetric clip
 band, discount-correct potential shaping, and VAPO's decoupled GAE. A fresh
 production run must load one behavior-cloned actor, then fits its fresh critic
-for at least five iterations and until every member's previous fresh-wave
+for at least ten iterations and until every member's previous fresh-wave
 pre-update Monte Carlo-return explained variance reaches 0.10. Only an existing
 checkpoint can bypass that initialization. An exact batched Rust simulator supplies
 high-throughput rollouts; the pinned Kaggle environment remains the parity
@@ -235,10 +235,18 @@ rows after reducing its singleton token dimension, avoiding cross-batch
 broadcasting. Field-wise latent/RMS reductions avoid joined-belief temporaries.
 
 Diagnostic iterations observe auxiliary source-belief cotangents through
-zero-copy branch views during that same backward. There are no extra diagnostic
-backwards or retained-graph compiler variants; ordinary buffer donation remains
-enabled. Captured rollout forwards include fixed-index scatter and are submitted
-before CPU trajectory storage to overlap device work with host copies.
+zero-copy branch views during that same backward. Ordinary and observed calls
+use identical view layouts; only the scalar-reduction hooks are conditional.
+Preupdate and persistence scalars are packed for one final diagnostic readback.
+There are no extra diagnostic backwards or retained-graph compiler variants;
+ordinary buffer donation remains enabled. Captured rollout forwards include
+fixed-index scatter and are submitted before CPU trajectory storage to overlap
+device work with host copies.
+Minibatch inputs and returned beliefs are released after their final use and
+existing stream joins, before the next gather/forward. Compact NextLat plans
+use spare occupancy-shape slots to reduce padding while retaining every former
+bucket boundary: padding never increases and there are still at most eight
+aligned shapes per minibatch size.
 
 Training uses discount-correct, exactly zero-sum potential shaping. Let `L[i,t]`
 be player `i`'s actual liquid assets: bank money plus the exact proceeds from
@@ -340,13 +348,36 @@ main/auxiliary cosine estimates. Observation does not change optimizer updates.
 
 Fresh production training must be initialized from a BC actor through
 `--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no
-persistent BC or KL term, and a critic-only warmup lasting at least five
+persistent BC or KL term, and a critic-only warmup lasting at least ten
 iterations. Actor updates begin only after every member's previous fresh-wave
 pre-update Monte Carlo-return explained variance reaches 0.10; failure to reach
 that gate by iteration 40 stops the run instead of training against an unready
 baseline. Both production launchers reject a fresh random actor; `--resume`
 remains valid for continuing a checkpoint. Raw `train_ppo.py` remains available
 for controlled from-scratch experiments.
+
+Actor and critic trunk base learning rates both default to `5e-5` (NorMuon
+matrices), with `1.75e-5` for their ordinary Adam parameter groups. Production
+sets the separate value-head Adam LR to approximately `1.45833e-4`, preserving
+its `25/3` boost over ordinary Adam groups. The raw training CLI accepts
+`--critic-head-lr` as an optional absolute override. Each group retains its own
+32-optimizer-step linear LR warmup and checkpointed state. NextLat predictors
+inherit their corresponding actor/critic base rate unless explicitly overridden.
+
+The physical minibatch ceiling is 4800: a complete 230080-state production
+wave uses 48 balanced critic minibatches, with no dropped states or gradient
+accumulation. Larger batches are a goal only where model capacity, precision,
+sample coverage and throughput are preserved; do not exhaust VRAM headroom
+merely to reach a lower minibatch count.
+
+Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
+plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup
+waves, either a 1000-money increase or a 0.01 value-loss decrease in the
+alpha-0.1 EMA resets patience. Thirty waves without either improvement force a
+recovery checkpoint, emit `AUTOCULL`, and exit 75. State and configuration are
+checkpointed; use MLQ `--max-attempts 1`. These signals are not external
+strength: a collapsing policy can make value fitting easier and keep resetting
+patience. External before/after games remain necessary.
 
 Each full checkpoint binds the immutable `league/` sidecar archive with a
 SHA-256 manifest, the complete source identity, and canonical calibration/run
@@ -408,6 +439,15 @@ mlq submit --name kagg-checkpoint-screen --max-parallel-runs 1 --priority 0 \
   --seed-domain screening --seeds 32 --device cuda \
   --output "$repo/evaluations/checkpoint-000100-v27-screen.json"
 ```
+
+For accelerated official development/screening games, explicitly add
+`--cuda-bf16-compiled --workers 1 --batch-size 32` alongside `--device cuda`.
+The evaluator compiles and warms the fixed-size BF16 forward before game
+clocks, pads incomplete inference waves without adding scored games, and runs
+Python opponent files through independent official per-game agents. Compare
+checkpoints using identical seeds, seats, batch size, and execution mode.
+Reports record the warmup, precision, and backend; CUDA results do not establish
+CPU submission parity. Default CPU admission behavior is unchanged.
 
 The 32-seed screening panel ranks candidates; it is not final admission evidence.
 Freeze the selected checkpoint before running the untouched finalist panel.

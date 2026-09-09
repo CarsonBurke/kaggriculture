@@ -120,6 +120,13 @@ from kaggriculture.training import (
     write_immutable_checkpoint,
 )
 
+# Keep the standalone hook's EMA/material-improvement semantics, including when
+# this entry point is loaded through importlib rather than executed as a script.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from autocull_hook import CULL, _better, _ema  # noqa: E402
+
 MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
@@ -127,6 +134,128 @@ DEFAULT_CRITIC_EPOCHS = PpoConfig.epochs
 DEFAULT_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_ITERATIONS
 CRITIC_WARMUP_READY_MONTE_CARLO_EV = 0.10
 MAX_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS
+
+AUTOCULL_POLICY = {
+    "signals": "online_proxies_not_external_strength",
+    "actor_active_warmup": 20,
+    "patience": 30,
+    "ema_alpha": 0.1,
+    "money_min_improvement": 1000.0,
+    "value_loss_min_improvement": 0.01,
+    "target": None,
+    "warmup_anchor": "last_actor_active_warmup_observation",
+    "combination": "either_improvement_resets_patience",
+}
+
+
+class OnlinePlateauGuard:
+    """Constant-space, checkpointed online-proxy guard; culling exits with 75.
+
+    Actor-frozen waves are not observations. Anchor both EMA and material
+    references at the twentieth actor-active observation, discarding warmup
+    extrema. Thereafter either improving proxy resets the shared stale count.
+    """
+
+    def __init__(self, record: object = None, *, iteration: int = 0) -> None:
+        self.state: dict[str, Any] = {
+            "iteration": 0,
+            "observations": 0,
+            "stale_observations": 0,
+            "ema": None,
+            "reference": None,
+        }
+        if record is None:
+            if iteration:
+                raise ValueError("resume checkpoint is missing autocull state")
+            return
+        if not isinstance(record, dict) or set(record) != set(self.state):
+            raise ValueError("invalid autocull state fields")
+        for name in ("iteration", "observations", "stale_observations"):
+            if type(record[name]) is not int or record[name] < 0:
+                raise ValueError(f"invalid autocull {name}")
+        count = record["observations"]
+        if (
+            record["iteration"] != iteration
+            or count > iteration
+            or record["stale_observations"] > max(0, count - AUTOCULL_POLICY["actor_active_warmup"])
+        ):
+            raise ValueError("autocull state does not match checkpoint boundary")
+        for name in ("ema", "reference"):
+            values = record[name]
+            expected = (
+                count > 0 if name == "ema" else count >= AUTOCULL_POLICY["actor_active_warmup"]
+            )
+            if not expected:
+                if values is not None:
+                    raise ValueError(f"unexpected autocull {name}")
+                continue
+            if not isinstance(values, dict) or set(values) != {"money_mean", "value_loss"}:
+                raise ValueError(f"invalid autocull {name}")
+            if (
+                any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in values.values()
+                )
+                or values["value_loss"] < 0
+            ):
+                raise ValueError(f"invalid autocull {name} values")
+        self.state = copy.deepcopy(record)
+
+    @property
+    def culled(self) -> bool:
+        return self.state["stale_observations"] >= AUTOCULL_POLICY["patience"]
+
+    def observe(self, metrics: Mapping[str, Any], *, actor_frozen: bool) -> dict[str, Any]:
+        iteration = metrics["iteration"]
+        if iteration != self.state["iteration"] + 1:
+            raise ValueError("autocull requires consecutive complete iteration boundaries")
+        self.state["iteration"] = iteration
+        if actor_frozen:
+            return copy.deepcopy(self.state)
+        values = {name: metrics.get(name) for name in ("money_mean", "value_loss")}
+        if (
+            metrics.get("actor_updates", 0) <= 0
+            or metrics.get("updates", 0) <= 0
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in values.values()
+            )
+            or values["value_loss"] < 0
+        ):
+            raise ValueError("autocull requires finite money_mean and updated critic value_loss")
+        count = self.state["observations"] + 1
+        warmup = AUTOCULL_POLICY["actor_active_warmup"]
+        prior = self.state["ema"]
+        smoothed = (
+            dict(values)
+            if prior is None or count == warmup
+            else {
+                name: _ema((prior[name], value), AUTOCULL_POLICY["ema_alpha"])[-1]
+                for name, value in values.items()
+            }
+        )
+        self.state["observations"] = count
+        self.state["ema"] = smoothed
+        if count == warmup:
+            self.state["reference"] = dict(smoothed)
+        elif count > warmup:
+            improved = False
+            reference = self.state["reference"]
+            for name, mode, delta in (
+                ("money_mean", "max", AUTOCULL_POLICY["money_min_improvement"]),
+                ("value_loss", "min", AUTOCULL_POLICY["value_loss_min_improvement"]),
+            ):
+                if _better(smoothed[name], reference[name], delta, mode):
+                    reference[name] = smoothed[name]
+                    improved = True
+            self.state["stale_observations"] = (
+                0 if improved else self.state["stale_observations"] + 1
+            )
+        return copy.deepcopy(self.state)
 
 
 class RecoveryCheckpointTimer:
@@ -153,6 +282,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--iterations", type=int, default=500)
+    parser.add_argument(
+        "--autocull",
+        action="store_true",
+        help=(
+            "single-learner online-proxy plateau guard (not external strength): "
+            "ignore frozen actors, anchor after 20 actor-active waves, then stop "
+            "after 30 waves without either money EMA +1000 or value-loss EMA -0.01 "
+            "(alpha 0.1); commit latest checkpoint, emit AUTOCULL, and exit 75"
+        ),
+    )
     parser.add_argument(
         "--games",
         type=int,
@@ -236,6 +375,12 @@ def parse_args() -> argparse.Namespace:
     # than maintaining a second schedule in this parser.
     parser.add_argument("--actor-lr", type=float, default=PpoConfig.actor_learning_rate)
     parser.add_argument("--critic-lr", type=float, default=PpoConfig.critic_learning_rate)
+    parser.add_argument(
+        "--critic-head-lr",
+        type=float,
+        default=PpoConfig.critic_head_learning_rate,
+        help="absolute value-head LR override; other critic parameters retain their existing rates",
+    )
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=PpoConfig.epochs)
     parser.add_argument(
@@ -334,40 +479,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--structured-latent-coefficient",
+        type=float,
+        default=PpoConfig.structured_latent_coefficient,
+        help="weight on normalized actor decision-latent SmoothL1",
+    )
+    parser.add_argument(
         "--structured-decision-coefficient",
         type=float,
         default=PpoConfig.structured_decision_coefficient,
         help="weight on structured future-decision decode KL",
     )
     parser.add_argument(
-        "--structured-patch-coefficient",
-        type=float,
-        default=PpoConfig.structured_patch_coefficient,
-        help="weight on normalized future own-patch feature L1",
-    )
-    parser.add_argument(
-        "--structured-economy-coefficient",
-        type=float,
-        default=PpoConfig.structured_economy_coefficient,
-        help="weight on normalized future economy-entity feature L1",
-    )
-    parser.add_argument(
-        "--structured-opponent-summary-coefficient",
-        type=float,
-        default=PpoConfig.structured_opponent_summary_coefficient,
-        help="weight on normalized future opponent-summary feature L1",
-    )
-    parser.add_argument(
-        "--structured-opponent-patch-coefficient",
-        type=float,
-        default=PpoConfig.structured_opponent_patch_coefficient,
-        help="weight on normalized future opponent-patch feature L1",
-    )
-    parser.add_argument(
         "--structured-critic-latent-coefficient",
         type=float,
         default=PpoConfig.structured_critic_latent_coefficient,
-        help="weight on critic-belief NextLat latent prediction",
+        help="weight on normalized critic value-latent SmoothL1",
     )
     parser.add_argument(
         "--structured-critic-value-coefficient",
@@ -379,11 +506,6 @@ def parse_args() -> argparse.Namespace:
         "--structured-decision-horizon",
         type=int,
         default=PpoConfig.structured_decision_horizon,
-    )
-    parser.add_argument(
-        "--structured-patch-horizon",
-        type=int,
-        default=PpoConfig.structured_patch_horizon,
     )
     parser.add_argument(
         "--structured-critic-horizon",
@@ -508,6 +630,8 @@ def _validate_population(args: argparse.Namespace) -> None:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.autocull and args.population != 1:
+        raise ValueError("--autocull requires --population 1")
     # Model-configuration flags are validated by the config dataclass itself,
     # so every entry point that builds one gets the same rules.
     positive = {
@@ -542,11 +666,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
     structured_actor_coefficients = (
+        args.structured_latent_coefficient,
         args.structured_decision_coefficient,
-        args.structured_patch_coefficient,
-        args.structured_economy_coefficient,
-        args.structured_opponent_summary_coefficient,
-        args.structured_opponent_patch_coefficient,
     )
     structured_critic_coefficients = (
         args.structured_critic_latent_coefficient,
@@ -560,17 +681,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("structured auxiliary coefficients require --architecture structured")
     structured_horizons = (
         args.structured_decision_horizon,
-        args.structured_patch_horizon,
         args.structured_critic_horizon,
     )
     if any(horizon < 0 for horizon in structured_horizons):
         raise ValueError("structured auxiliary horizons cannot be negative")
-    if args.structured_decision_coefficient and args.structured_decision_horizon < 1:
-        raise ValueError("structured decision horizon must be positive when decision KL is active")
-    if any(structured_actor_coefficients[1:]) and args.structured_patch_horizon < 1:
-        raise ValueError(
-            "structured patch horizon must be positive when feature prediction is active"
-        )
+    if any(structured_actor_coefficients) and args.structured_decision_horizon < 1:
+        raise ValueError("structured decision horizon must be positive when actor NextLat is active")
     if any(structured_critic_coefficients) and args.structured_critic_horizon < 1:
         raise ValueError(
             "structured critic horizon must be positive when critic auxiliary is active"
@@ -1588,6 +1704,7 @@ def _select_league_opponents(
 def _training_data_config(args: argparse.Namespace, device: torch.device) -> dict[str, object]:
     """Return every non-model setting that can alter future rollout data."""
     return {
+        "autocull": dict(AUTOCULL_POLICY) if args.autocull else None,
         "games": args.games,
         "league_games": args.league_games,
         "league_active_opponents": args.league_active_opponents,
@@ -1644,6 +1761,13 @@ def _checkpoint_recovery_values_equal(left: object, right: object) -> bool:
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
     if left.keys() != right.keys():
+        return False
+    # Online stopping state affects future execution, unlike timing diagnostics.
+    # A replayed orphan must not silently replace it with another patience clock.
+    if not _checkpoint_values_equal(
+        left.get("metrics", {}).get("autocull_state"),
+        right.get("metrics", {}).get("autocull_state"),
+    ):
         return False
     return all(key == "metrics" or _checkpoint_values_equal(left[key], right[key]) for key in left)
 
@@ -2275,6 +2399,7 @@ def main() -> None:
     ppo_config = PpoConfig(
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
+        critic_head_learning_rate=args.critic_head_lr,
         lr_warmup_steps=args.lr_warmup_steps,
         epochs=args.epochs,
         critic_epochs=args.critic_epochs,
@@ -2289,13 +2414,9 @@ def main() -> None:
         optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,
+        structured_latent_coefficient=args.structured_latent_coefficient,
         structured_decision_coefficient=args.structured_decision_coefficient,
-        structured_patch_coefficient=args.structured_patch_coefficient,
-        structured_economy_coefficient=args.structured_economy_coefficient,
-        structured_opponent_summary_coefficient=(args.structured_opponent_summary_coefficient),
-        structured_opponent_patch_coefficient=(args.structured_opponent_patch_coefficient),
         structured_decision_horizon=args.structured_decision_horizon,
-        structured_patch_horizon=args.structured_patch_horizon,
         structured_critic_latent_coefficient=args.structured_critic_latent_coefficient,
         structured_critic_value_coefficient=args.structured_critic_value_coefficient,
         structured_critic_horizon=args.structured_critic_horizon,
@@ -2445,6 +2566,20 @@ def main() -> None:
             initial_actor_provenance,
             population=population,
         )
+    if (
+        args.autocull
+        and resume_payload is not None
+        and "autocull_state" not in resume_payload["metrics"]
+    ):
+        raise ValueError("resume checkpoint is missing autocull state")
+    autocull = (
+        OnlinePlateauGuard(
+            None if resume_payload is None else resume_payload["metrics"].get("autocull_state"),
+            iteration=iteration,
+        )
+        if args.autocull
+        else None
+    )
 
     seed_usage = (
         artifact_seed_usage(resume_payload)
@@ -2727,7 +2862,10 @@ def main() -> None:
             ppo_config=ppo_config,
             iteration=0,
             next_seed=next_seed,
-            metrics={"iteration": 0},
+            metrics={
+                "iteration": 0,
+                **({"autocull_state": copy.deepcopy(autocull.state)} if autocull else {}),
+            },
             training_rng_state=dict(generator.bit_generator.state),
             training_data_config=training_data_config,
             auxiliary_rng_state=(
@@ -2756,7 +2894,7 @@ def main() -> None:
     # iteration rather than wait out the cadence.
     last_parity_audit: dict[str, int] = {}
     external_eval_process: subprocess.Popen | None = None
-    while iteration < args.iterations:
+    while iteration < args.iterations and not (autocull is not None and autocull.culled):
         # Opponent discovery below must observe the previous iteration's
         # immutable actor snapshot. The same barrier publishes its metrics and
         # recovery checkpoint before this iteration consumes league RNG.
@@ -3093,10 +3231,14 @@ def main() -> None:
         }
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
+        if autocull is not None:
+            metrics["autocull_state"] = autocull.observe(metrics, actor_frozen=warmup_active)
 
         checkpoint_now = time.monotonic()
-        clean_final = iteration >= args.iterations or bool(
-            args.max_hours and (checkpoint_now - started) / 3600.0 >= args.max_hours
+        clean_final = (
+            iteration >= args.iterations
+            or bool(args.max_hours and (checkpoint_now - started) / 3600.0 >= args.max_hours)
+            or (autocull is not None and autocull.culled)
         )
         recovery_due = clean_final or checkpoint_timer.due(checkpoint_now)
         recovery_payload = build_recovery_payload(metrics) if recovery_due else None
@@ -3166,6 +3308,32 @@ def main() -> None:
         )
     commit_executor.shutdown(wait=True)
     writer.close()
+    if autocull is not None and autocull.culled:
+        # The async boundary above has completed, but atomic publication alone
+        # does not flush file contents or directory entries to durable storage.
+        with destination_latest.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if league_snapshot_refs:
+            with league_snapshot_refs[-1].path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            _fsync_directory(league_directory)
+        _fsync_directory(args.run_dir)
+        print(
+            "AUTOCULL "
+            + json.dumps(
+                {
+                    "decision": "cull",
+                    "reason": "both_online_proxies_plateaued",
+                    "exit_code": CULL,
+                    "checkpoint": str(destination_latest),
+                    "policy": AUTOCULL_POLICY,
+                    "state": autocull.state,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(CULL)
 
 
 if __name__ == "__main__":
