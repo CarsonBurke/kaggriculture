@@ -1131,24 +1131,24 @@ fn fill_structured_output(
     const FARM_VALUES: usize = PLAYERS * FARM_TOKEN_FIELDS;
     py.detach(|| {
         tile_categorical
-            .par_chunks_mut(TILE_CATEGORICAL_VALUES)
-            .zip(tile_continuous.par_chunks_mut(TILE_CONTINUOUS_VALUES))
-            .zip(unit_categorical.par_chunks_mut(UNIT_CATEGORICAL_VALUES))
-            .zip(unit_continuous.par_chunks_mut(UNIT_CONTINUOUS_VALUES))
-            .zip(unit_active.par_chunks_mut(MAX_UNITS))
-            .zip(unit_tile_gather.par_chunks_mut(UNIT_GATHER_VALUES))
-            .zip(unit_tile_gather_valid.par_chunks_mut(UNIT_GATHER_VALUES))
-            .zip(products.par_chunks_mut(PRODUCT_VALUES))
-            .zip(crops.par_chunks_mut(CROP_VALUES))
-            .zip(farms.par_chunks_mut(FARM_VALUES))
+            .par_chunks_mut(PLAYERS * TILE_CATEGORICAL_VALUES)
+            .zip(tile_continuous.par_chunks_mut(PLAYERS * TILE_CONTINUOUS_VALUES))
+            .zip(unit_categorical.par_chunks_mut(PLAYERS * UNIT_CATEGORICAL_VALUES))
+            .zip(unit_continuous.par_chunks_mut(PLAYERS * UNIT_CONTINUOUS_VALUES))
+            .zip(unit_active.par_chunks_mut(PLAYERS * MAX_UNITS))
+            .zip(unit_tile_gather.par_chunks_mut(PLAYERS * UNIT_GATHER_VALUES))
+            .zip(unit_tile_gather_valid.par_chunks_mut(PLAYERS * UNIT_GATHER_VALUES))
+            .zip(products.par_chunks_mut(PLAYERS * PRODUCT_VALUES))
+            .zip(crops.par_chunks_mut(PLAYERS * CROP_VALUES))
+            .zip(farms.par_chunks_mut(PLAYERS * FARM_VALUES))
             .zip(
-                town.par_chunks_mut(TOWN_TOKEN_FIELDS)
-                    .zip(animals.par_chunks_mut(ANIMAL_VALUES)),
+                town.par_chunks_mut(PLAYERS * TOWN_TOKEN_FIELDS)
+                    .zip(animals.par_chunks_mut(PLAYERS * ANIMAL_VALUES)),
             )
             .enumerate()
             .for_each(
                 |(
-                    row,
+                    game,
                     (
                         (
                             (
@@ -1178,53 +1178,84 @@ fn fill_structured_output(
                         (town, animals),
                     ),
                 )| {
-                    let mut tile_continuous_f32 = [0.0f32; TILE_CONTINUOUS_VALUES];
-                    let mut unit_continuous_f32 = [0.0f32; UNIT_CONTINUOUS_VALUES];
-                    let mut products_f32 = [0.0f32; PRODUCT_VALUES];
-                    let mut animals_f32 = [0.0f32; ANIMAL_VALUES];
-                    let mut crops_f32 = [0.0f32; CROP_VALUES];
-                    let mut farms_f32 = [0.0f32; FARM_VALUES];
-                    let mut town_f32 = [0.0f32; TOWN_TOKEN_FIELDS];
-                    games[row / PLAYERS].encode_player_structured(
-                        row % PLAYERS,
+                    encode_game_structured(
+                        &games[game],
                         tile_categorical,
-                        &mut tile_continuous_f32,
+                        tile_continuous,
                         unit_categorical,
-                        &mut unit_continuous_f32,
+                        unit_continuous,
                         unit_active,
                         unit_tile_gather,
                         unit_tile_gather_valid,
-                        &mut products_f32,
-                        &mut animals_f32,
-                        &mut crops_f32,
-                        &mut farms_f32,
-                        &mut town_f32,
+                        products,
+                        animals,
+                        crops,
+                        farms,
+                        town,
                     );
-                    for (target, value) in tile_continuous.iter_mut().zip(tile_continuous_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in unit_continuous.iter_mut().zip(unit_continuous_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in products.iter_mut().zip(products_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in animals.iter_mut().zip(animals_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in crops.iter_mut().zip(crops_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in farms.iter_mut().zip(farms_f32) {
-                        *target = f16::from_f32(value);
-                    }
-                    for (target, value) in town.iter_mut().zip(town_f32) {
-                        *target = f16::from_f32(value);
-                    }
                 },
             );
     });
     Ok(())
+}
+
+/// Fill game-major, seat-minor rows, retaining both private views for the critic.
+#[allow(clippy::too_many_arguments)]
+fn encode_game_structured(
+    game: &Game,
+    tile_categorical: &mut [i8],
+    tile_continuous: &mut [f16],
+    unit_categorical: &mut [i8],
+    unit_continuous: &mut [f16],
+    unit_active: &mut [bool],
+    unit_tile_gather: &mut [i8],
+    unit_tile_gather_valid: &mut [bool],
+    products: &mut [f16],
+    animals: &mut [f16],
+    crops: &mut [f16],
+    farms: &mut [f16],
+    town: &mut [f16],
+) {
+    game.encode_pair_structured_tiles(tile_categorical, tile_continuous, f16::from_f32);
+    let mut unit_continuous_f32 = [0.0f32; MAX_UNITS * UNIT_CONTINUOUS];
+    let mut products_f32 = [0.0f32; PRODUCTS * PRODUCT_TOKEN_FIELDS];
+    let mut animals_f32 = [0.0f32; ANIMALS * ANIMAL_TOKEN_FIELDS];
+    let mut crops_f32 = [0.0f32; CROPS * CROP_TOKEN_FIELDS];
+    let mut farms_f32 = [0.0f32; PLAYERS * FARM_TOKEN_FIELDS];
+    let mut town_f32 = [0.0f32; TOWN_TOKEN_FIELDS];
+    for player in 0..PLAYERS {
+        game.encode_player_structured_state(
+            player,
+            &mut unit_categorical[player * MAX_UNITS * UNIT_CATEGORICAL
+                ..(player + 1) * MAX_UNITS * UNIT_CATEGORICAL],
+            &mut unit_continuous_f32,
+            &mut unit_active[player * MAX_UNITS..(player + 1) * MAX_UNITS],
+            &mut unit_tile_gather
+                [player * MAX_UNITS * UNIT_GATHERS..(player + 1) * MAX_UNITS * UNIT_GATHERS],
+            &mut unit_tile_gather_valid
+                [player * MAX_UNITS * UNIT_GATHERS..(player + 1) * MAX_UNITS * UNIT_GATHERS],
+            &mut products_f32,
+            &mut animals_f32,
+            &mut crops_f32,
+            &mut farms_f32,
+            &mut town_f32,
+        );
+        for (output, values) in [
+            (&mut *unit_continuous, unit_continuous_f32.as_slice()),
+            (&mut *products, products_f32.as_slice()),
+            (&mut *animals, animals_f32.as_slice()),
+            (&mut *crops, crops_f32.as_slice()),
+            (&mut *farms, farms_f32.as_slice()),
+            (&mut *town, town_f32.as_slice()),
+        ] {
+            for (target, &value) in output[player * values.len()..(player + 1) * values.len()]
+                .iter_mut()
+                .zip(values)
+            {
+                *target = f16::from_f32(value);
+            }
+        }
+    }
 }
 
 fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound<'py, PyDict>> {
@@ -1868,6 +1899,139 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_structured_rows_match_single_seats_and_preserve_private_stock() {
+        use crate::core::{PRIVATE_ITEMS, Position, TILE_COUNT, Tile, TileKind};
+
+        let mut game = Game::new(17, GameConfig::default());
+        for player in 0..PLAYERS {
+            game.farms[player].money += player as i64 * 1234;
+            game.farms[player].positions[0] = Position(player as u8 * 9, 0);
+            game.farms[player].positions.push(Position(9, 9));
+            game.privates[player].inventories.push([0; PRIVATE_ITEMS]);
+            game.privates[player]
+                .inventory_order
+                .push([u8::MAX; PRIVATE_ITEMS]);
+            game.privates[player].shed[0] = 11 + player as u16;
+            game.privates[player].shed[PRODUCTS] = 3 + player as u16;
+            game.privates[player].seeds[0] = 5 + player as u16;
+            game.privates[player].inventories[0][0] = 7 + player as u16;
+            game.privates[player].inventories[0][PRODUCTS + 1] = 2 + player as u16;
+            game.privates[player].inventory_order[0][0] = (PRODUCTS + 1) as u8;
+            game.privates[player].inventory_order[0][1] = 0;
+            for (token, tile) in game.farms[player].tiles.iter_mut().enumerate() {
+                let kind = match (token + player) % 6 {
+                    0 => TileKind::Locked,
+                    1 => TileKind::Empty,
+                    2 => TileKind::Weed,
+                    3 => TileKind::Plant,
+                    4 => TileKind::Coop,
+                    _ => TileKind::Pasture,
+                };
+                *tile = Tile {
+                    kind,
+                    species: if kind == TileKind::Plant {
+                        (token % CROPS) as u8
+                    } else if kind == TileKind::Pasture {
+                        1 + (token % 2) as u8
+                    } else {
+                        0
+                    },
+                    has_animal: token % 3 != 0,
+                    origin_day: player as u16,
+                    yield_units: (token % 5) as u8,
+                    consecutive_unmet: (token % 4) as u8,
+                    watered_or_fed: token % 2 == 0,
+                    cared_today: token % 3 == 0,
+                    fertilizer_available: token % 4 == 0,
+                    pending_care_bonus: (token % 6) as u8,
+                    max_lifespan_step: if token % 2 == 0 { 240 } else { -1 },
+                    fertilized_until_day: 10,
+                };
+            }
+        }
+
+        macro_rules! compare_rows {
+            ($check:block; $(($paired:ident, $single:ident, $staged:ty, $native:ty, $width:expr, $convert:expr)),+ $(,)?) => {
+                $(
+                    let mut $paired = vec![<$staged>::default(); PLAYERS * $width];
+                    let mut $single = vec![<$native>::default(); $width];
+                )+
+                // Reuse the same output buffers across a reset as the rollout does.
+                for step in [0, 250, 719] {
+                    game.step = step;
+                    encode_game_structured(&game, $(&mut $paired),+);
+                    for player in 0..PLAYERS {
+                        game.encode_player_structured(player, $(&mut $single),+);
+                        $(
+                            let expected: Vec<$staged> =
+                                $single.iter().copied().map($convert).collect();
+                            assert_eq!(
+                                &$paired[player * $width..(player + 1) * $width],
+                                expected.as_slice(),
+                                "{} differs at step {step}, seat {player}",
+                                stringify!($paired),
+                            );
+                        )+
+                    }
+                }
+                $check
+                game = Game::new(23, GameConfig::default());
+                encode_game_structured(&game, $(&mut $paired),+);
+                for player in 0..PLAYERS {
+                    game.encode_player_structured(player, $(&mut $single),+);
+                    $(
+                        let expected: Vec<$staged> =
+                            $single.iter().copied().map($convert).collect();
+                        assert_eq!(
+                            &$paired[player * $width..(player + 1) * $width],
+                            expected.as_slice(),
+                            "{} retains stale values after reset, seat {player}",
+                            stringify!($paired),
+                        );
+                    )+
+                }
+            };
+        }
+        compare_rows!(
+            {
+                assert_ne!(
+                    &units[..MAX_UNITS * UNIT_CONTINUOUS],
+                    &units[MAX_UNITS * UNIT_CONTINUOUS..],
+                );
+                assert_ne!(
+                    &products[..PRODUCTS * PRODUCT_TOKEN_FIELDS],
+                    &products[PRODUCTS * PRODUCT_TOKEN_FIELDS..],
+                );
+                assert_ne!(
+                    &animals[..ANIMALS * ANIMAL_TOKEN_FIELDS],
+                    &animals[ANIMALS * ANIMAL_TOKEN_FIELDS..],
+                );
+                assert_ne!(
+                    &crops[..CROPS * CROP_TOKEN_FIELDS],
+                    &crops[CROPS * CROP_TOKEN_FIELDS..],
+                );
+                for categorical in tiles.chunks_exact(TILE_TOKENS * TILE_CATEGORICAL) {
+                    for (token, row) in categorical.chunks_exact(TILE_CATEGORICAL).enumerate() {
+                        assert_eq!(row[2], i8::from(token >= TILE_COUNT));
+                    }
+                }
+            };
+            (tiles, single_tiles, i8, i8, TILE_TOKENS * TILE_CATEGORICAL, std::convert::identity),
+            (tile_values, single_tile_values, f16, f32, TILE_TOKENS * TILE_CONTINUOUS, f16::from_f32),
+            (unit_kinds, single_unit_kinds, i8, i8, MAX_UNITS * UNIT_CATEGORICAL, std::convert::identity),
+            (units, single_units, f16, f32, MAX_UNITS * UNIT_CONTINUOUS, f16::from_f32),
+            (active, single_active, bool, bool, MAX_UNITS, std::convert::identity),
+            (gathers, single_gathers, i8, i8, MAX_UNITS * UNIT_GATHERS, std::convert::identity),
+            (valid, single_valid, bool, bool, MAX_UNITS * UNIT_GATHERS, std::convert::identity),
+            (products, single_products, f16, f32, PRODUCTS * PRODUCT_TOKEN_FIELDS, f16::from_f32),
+            (animals, single_animals, f16, f32, ANIMALS * ANIMAL_TOKEN_FIELDS, f16::from_f32),
+            (crops, single_crops, f16, f32, CROPS * CROP_TOKEN_FIELDS, f16::from_f32),
+            (farms, single_farms, f16, f32, PLAYERS * FARM_TOKEN_FIELDS, f16::from_f32),
+            (town, single_town, f16, f32, TOWN_TOKEN_FIELDS, f16::from_f32),
+        );
+    }
 
     #[test]
     fn submitted_unit_rows_accept_omitted_and_excess_hand_commands() {

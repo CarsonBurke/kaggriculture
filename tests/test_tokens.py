@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from kaggle_environments import make
 
+from kaggriculture.actions import UnitAction, apply_unit_shed_effect
 from kaggriculture.constants import (
     ANIMAL_COST,
     ANIMALS,
@@ -288,6 +289,42 @@ def test_unit_tokens_follow_execution_order_and_gather_local_tiles() -> None:
     assert not tokens.categorical[3:].any()
     assert not tokens.continuous[3:].any()
     assert not tokens.tile_gather_valid[3:].any()
+
+
+@pytest.mark.parametrize("player", [0, 1])
+def test_inventory_order_distinguishes_drop_successors_without_leaking_private_state(
+    player,
+) -> None:
+    observation = {
+        "player": player,
+        "farms": [
+            {"tiles": [], "farmer": [4, 4], "hands": []},
+            {"tiles": [], "farmer": [4, 4], "hands": []},
+        ],
+        "private": {"shed": {"WHEAT": 99}, "inventories": [{"WHEAT": 1, "MILK": 1}]},
+    }
+    reversed_private = {"shed": {"WHEAT": 99}, "inventories": [{"MILK": 1, "WHEAT": 1}]}
+    baseline = encode_structured_observation(observation, observation["private"])
+    reversed_own = {**observation, "private": reversed_private}
+    own = encode_structured_observation(reversed_own, observation["private"])
+    hidden = encode_structured_observation(observation, reversed_private)
+    base_width = len(PRIVATE_ITEMS) + 2
+    np.testing.assert_array_equal(
+        own.unit_continuous[:, :base_width], baseline.unit_continuous[:, :base_width]
+    )
+    assert not np.array_equal(own.unit_continuous, baseline.unit_continuous)
+    assert not np.array_equal(hidden.opponent_unit_continuous, baseline.opponent_unit_continuous)
+    for name in baseline.__dataclass_fields__:
+        if not name.startswith(("critic_", "opponent_")):
+            np.testing.assert_array_equal(getattr(hidden, name), getattr(baseline, name))
+    wheat, milk = (PRIVATE_ITEMS.index(item) for item in ("WHEAT", "MILK"))
+    assert baseline.unit_continuous[0, base_width + wheat] == 1 / 32
+    assert baseline.unit_continuous[0, base_width + milk] == 2 / 32
+    first_shed, second_shed = {"WHEAT": 99}, {"WHEAT": 99}
+    apply_unit_shed_effect(observation, 0, UnitAction.DROP, first_shed)
+    apply_unit_shed_effect(reversed_own, 0, UnitAction.DROP, second_shed)
+    assert first_shed == {"WHEAT": 100}
+    assert second_shed == {"WHEAT": 99, "MILK": 1}
 
 
 def test_economy_tokens_match_engine_market_state() -> None:

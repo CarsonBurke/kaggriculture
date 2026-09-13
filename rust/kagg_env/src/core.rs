@@ -29,11 +29,11 @@ pub const TILE_TOKENS: usize = TILE_COUNT * PLAYERS;
 pub const TILE_CATEGORICAL: usize = 6;
 pub const TILE_CONTINUOUS: usize = 20;
 pub const UNIT_CATEGORICAL: usize = 4;
-pub const UNIT_CONTINUOUS: usize = PRIVATE_ITEMS + 2;
+pub const UNIT_CONTINUOUS: usize = 2 * PRIVATE_ITEMS + 2;
 pub const UNIT_GATHERS: usize = 5;
 pub const PRODUCT_TOKEN_FIELDS: usize = 5;
 pub const ANIMAL_TOKEN_FIELDS: usize = 3;
-pub const OBSERVATION_SCHEMA_VERSION: usize = 2;
+pub const OBSERVATION_SCHEMA_VERSION: usize = 3;
 pub const CROP_TOKEN_FIELDS: usize = 6;
 pub const FARM_TOKEN_FIELDS: usize = 4;
 pub const TOWN_TOKEN_FIELDS: usize = 14;
@@ -1023,8 +1023,102 @@ impl Game {
         farms: &mut [f32],
         town: &mut [f32],
     ) {
+        self.encode_player_structured_tiles(player, tile_categorical, tile_continuous);
+        self.encode_player_structured_state(
+            player,
+            unit_categorical,
+            unit_continuous,
+            unit_active,
+            unit_tile_gather,
+            unit_tile_gather_valid,
+            products,
+            animals,
+            crops,
+            farms,
+            town,
+        );
+    }
+
+    /// Shared tile formula for single-seat and paired-seat encoding.
+    fn encode_player_structured_tiles(
+        &self,
+        player: usize,
+        tile_categorical: &mut [i8],
+        tile_continuous: &mut [f32],
+    ) {
         assert_eq!(tile_categorical.len(), TILE_TOKENS * TILE_CATEGORICAL);
         assert_eq!(tile_continuous.len(), TILE_TOKENS * TILE_CONTINUOUS);
+        tile_categorical.fill(0);
+        tile_continuous.fill(0.0);
+        let day = self.step / self.config.turns_per_day;
+        for (slot, index) in [player, 1 - player].into_iter().enumerate() {
+            encode_farm_structured(
+                &self.farms[index],
+                day,
+                self.step,
+                slot != 0,
+                &mut tile_categorical[slot * TILE_COUNT * TILE_CATEGORICAL
+                    ..(slot + 1) * TILE_COUNT * TILE_CATEGORICAL],
+                &mut tile_continuous[slot * TILE_COUNT * TILE_CONTINUOUS
+                    ..(slot + 1) * TILE_COUNT * TILE_CONTINUOUS],
+            );
+        }
+    }
+
+    /// Encode both tile views once, converting each continuous value only once.
+    ///
+    /// The second seat sees the same physical farms in reversed order. Only
+    /// categorical column 2 changes with perspective; all other tile fields
+    /// are public. `convert` retains the binding's f32 -> f16 staging boundary.
+    pub(crate) fn encode_pair_structured_tiles<T: Copy>(
+        &self,
+        categorical: &mut [i8],
+        continuous: &mut [T],
+        mut convert: impl FnMut(f32) -> T,
+    ) {
+        const CATEGORICAL_VALUES: usize = TILE_TOKENS * TILE_CATEGORICAL;
+        const CONTINUOUS_VALUES: usize = TILE_TOKENS * TILE_CONTINUOUS;
+        assert_eq!(categorical.len(), PLAYERS * CATEGORICAL_VALUES);
+        assert_eq!(continuous.len(), PLAYERS * CONTINUOUS_VALUES);
+        let (zero_categorical, one_categorical) = categorical.split_at_mut(CATEGORICAL_VALUES);
+        let (zero_continuous, one_continuous) = continuous.split_at_mut(CONTINUOUS_VALUES);
+        let mut values = [0.0; CONTINUOUS_VALUES];
+        self.encode_player_structured_tiles(0, zero_categorical, &mut values);
+        let categorical_half = TILE_COUNT * TILE_CATEGORICAL;
+        one_categorical[..categorical_half].copy_from_slice(&zero_categorical[categorical_half..]);
+        one_categorical[categorical_half..].copy_from_slice(&zero_categorical[..categorical_half]);
+        for row in one_categorical.chunks_exact_mut(TILE_CATEGORICAL) {
+            row[2] = 1 - row[2];
+        }
+        let continuous_half = TILE_COUNT * TILE_CONTINUOUS;
+        let (one_own, one_opponent) = one_continuous.split_at_mut(continuous_half);
+        for ((target, paired_target), value) in zero_continuous
+            .iter_mut()
+            .zip(one_opponent.iter_mut().chain(one_own.iter_mut()))
+            .zip(values.iter().copied())
+        {
+            let converted = convert(value);
+            *target = converted;
+            *paired_target = converted;
+        }
+    }
+
+    /// Encode all non-tile tokens independently for this seat, including private stock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_player_structured_state(
+        &self,
+        player: usize,
+        unit_categorical: &mut [i8],
+        unit_continuous: &mut [f32],
+        unit_active: &mut [bool],
+        unit_tile_gather: &mut [i8],
+        unit_tile_gather_valid: &mut [bool],
+        products: &mut [f32],
+        animals: &mut [f32],
+        crops: &mut [f32],
+        farms: &mut [f32],
+        town: &mut [f32],
+    ) {
         assert_eq!(unit_categorical.len(), MAX_UNITS * UNIT_CATEGORICAL);
         assert_eq!(unit_continuous.len(), MAX_UNITS * UNIT_CONTINUOUS);
         assert_eq!(unit_active.len(), MAX_UNITS);
@@ -1035,8 +1129,6 @@ impl Game {
         assert_eq!(crops.len(), CROPS * CROP_TOKEN_FIELDS);
         assert_eq!(farms.len(), PLAYERS * FARM_TOKEN_FIELDS);
         assert_eq!(town.len(), TOWN_TOKEN_FIELDS);
-        tile_categorical.fill(0);
-        tile_continuous.fill(0.0);
         unit_categorical.fill(0);
         unit_continuous.fill(0.0);
         unit_active.fill(false);
@@ -1050,22 +1142,6 @@ impl Game {
 
         let opponent = 1 - player;
         let day = self.step / self.config.turns_per_day;
-        encode_farm_structured(
-            &self.farms[player],
-            day,
-            self.step,
-            false,
-            &mut tile_categorical[..TILE_COUNT * TILE_CATEGORICAL],
-            &mut tile_continuous[..TILE_COUNT * TILE_CONTINUOUS],
-        );
-        encode_farm_structured(
-            &self.farms[opponent],
-            day,
-            self.step,
-            true,
-            &mut tile_categorical[TILE_COUNT * TILE_CATEGORICAL..],
-            &mut tile_continuous[TILE_COUNT * TILE_CONTINUOUS..],
-        );
 
         let farm = &self.farms[player];
         let private = &self.privates[player];
@@ -1092,6 +1168,12 @@ impl Game {
             }
             continuous[PRIVATE_ITEMS] = (total / 32.0) as f32;
             continuous[PRIVATE_ITEMS + 1] = f32::from(u8::from(is_shed_access(x, y)));
+            for (rank, &item) in private.inventory_order[unit].iter().enumerate() {
+                if item == u8::MAX {
+                    break;
+                }
+                continuous[PRIVATE_ITEMS + 2 + usize::from(item)] = (rank + 1) as f32 / 32.0;
+            }
             const GATHER_DELTAS: [(i16, i16); UNIT_GATHERS] =
                 [(0, 0), (0, -1), (0, 1), (1, 0), (-1, 0)];
             for (gather, (dx, dy)) in GATHER_DELTAS.iter().enumerate() {
@@ -1211,18 +1293,18 @@ impl Game {
         value
     }
 
-    /// Log-relative actual liquid assets from player zero's perspective.
+    /// Bounded liquidation margin from player zero's perspective.
     pub fn pair_potential(&self) -> f32 {
-        log_asset_ratio(
+        symmetric_margin(
             self.liquidation_value(0),
             self.liquidation_value(1),
             self.config.starting_money as f64,
         )
     }
 
-    /// Terminal log-relative bank utility from player zero's perspective.
+    /// Terminal symmetric bank margin from player zero's perspective.
     pub fn terminal_pair_utility(&self) -> f32 {
-        log_asset_ratio(
+        symmetric_margin(
             self.farms[0].money as f64,
             self.farms[1].money as f64,
             self.config.starting_money as f64,
@@ -1823,6 +1905,9 @@ impl Game {
         let mut unit_active = [false; MAX_UNITS];
         let mut market_active = [false; MAX_MARKET_ORDERS];
         let mut market_quantity_active = [false; MAX_MARKET_ORDERS];
+        let mut market_quantity_logprobs = [0.0; MAX_MARKET_ORDERS];
+        let mut market_quantity_entropies = [0.0; MAX_MARKET_ORDERS];
+        let mut quantity_entropy_sum = 0.0;
         let day = self.step / self.config.turns_per_day;
         let mut unit_ledger = UnitLedger::from_game(self, player);
         let active_units = self.farms[player].positions.len();
@@ -1891,7 +1976,7 @@ impl Game {
                 quantity_head,
                 &mut quantity_logits,
             );
-            let (quantity, _, _) = sample_categorical(
+            let (quantity, quantity_logprob, quantity_entropy) = sample_categorical(
                 &quantity_logits,
                 quantity_mask,
                 deterministic,
@@ -1899,6 +1984,9 @@ impl Game {
                 market_quantity_draws[slot],
             );
             action.market_quantities[slot] = quantity as u8;
+            market_quantity_logprobs[slot] = quantity_logprob;
+            market_quantity_entropies[slot] = quantity_entropy;
+            quantity_entropy_sum += quantity_entropy;
             apply_policy_market_order(
                 &unit_ledger.config,
                 &mut ledger,
@@ -1906,6 +1994,12 @@ impl Game {
                 quantity as u16 + 1,
             );
         }
+        let component_count = unit_active.iter().filter(|&&active| active).count()
+            + market_active.iter().filter(|&&active| active).count()
+            + market_quantity_active
+                .iter()
+                .filter(|&&active| active)
+                .count();
 
         SampledFactors {
             masks: FactorMasks {
@@ -1919,11 +2013,12 @@ impl Game {
             action,
             unit_logprobs: [0.0; MAX_UNITS],
             market_kind_logprobs: [0.0; MAX_MARKET_ORDERS],
-            market_quantity_logprobs: [0.0; MAX_MARKET_ORDERS],
+            market_quantity_logprobs,
             unit_entropies: [0.0; MAX_UNITS],
             market_kind_entropies: [0.0; MAX_MARKET_ORDERS],
-            market_quantity_entropies: [0.0; MAX_MARKET_ORDERS],
-            mean_entropy: 0.0,
+            market_quantity_entropies,
+            // GPU reconstruction adds unit/kind entropy in the same normalization.
+            mean_entropy: quantity_entropy_sum / component_count.max(1) as f32,
         }
     }
 
@@ -2683,7 +2778,7 @@ fn sample_categorical(
     debug_assert!(logits.len() <= MARKET_QUANTITIES);
     debug_assert!(mask.iter().any(|&valid| valid));
     let temperature = temperature.max(1e-4);
-    let mut shifted = [0.0f32; MARKET_QUANTITIES];
+    let mut weights = [0.0f32; MARKET_QUANTITIES];
     let mut maximum = f32::NEG_INFINITY;
     let mut argmax = 0usize;
     for index in 0..logits.len() {
@@ -2695,37 +2790,41 @@ fn sample_categorical(
             }
         }
     }
-    let mut total = 0.0f32;
+    let mut total = 0.0f64;
+    let mut weighted_shift_sum = 0.0f64;
+    let mut last_positive = argmax;
     for index in 0..logits.len() {
         if mask[index] {
-            shifted[index] = (logits[index] / temperature - maximum).exp();
-            total += shifted[index];
+            let shifted = logits[index] / temperature - maximum;
+            let weight = shifted.exp();
+            weights[index] = weight;
+            total += f64::from(weight);
+            if weight > 0.0 {
+                last_positive = index;
+                weighted_shift_sum += f64::from(weight) * f64::from(shifted);
+            }
         }
     }
     let mut selected = argmax;
     if !deterministic {
-        let mut cumulative = 0.0f32;
-        selected = mask.iter().rposition(|&valid| valid).unwrap();
-        for (index, probability) in shifted[..logits.len()].iter().enumerate() {
-            if !mask[index] {
+        let threshold = f64::from(draw) * total;
+        let mut cumulative = 0.0f64;
+        selected = last_positive;
+        for (index, &weight) in weights[..logits.len()].iter().enumerate() {
+            if weight <= 0.0 {
                 continue;
             }
-            cumulative += *probability / total;
-            if draw < cumulative {
+            cumulative += f64::from(weight);
+            if threshold < cumulative {
                 selected = index;
                 break;
             }
         }
     }
-    let selected_probability = (shifted[selected] / total).max(f32::MIN_POSITIVE);
-    let mut entropy = 0.0f32;
-    for raw_probability in &shifted[..logits.len()] {
-        let probability = *raw_probability / total;
-        if probability > 0.0 {
-            entropy -= probability * probability.max(f32::MIN_POSITIVE).ln();
-        }
-    }
-    (selected, selected_probability.ln(), entropy)
+    let log_total = total.ln();
+    let logprob = f64::from(logits[selected] / temperature - maximum) - log_total;
+    let entropy = log_total - weighted_shift_sum / total;
+    (selected, logprob as f32, entropy as f32)
 }
 
 #[inline]
@@ -3098,12 +3197,12 @@ fn shape(kind: Shape, x: f64) -> f64 {
     }
 }
 
-/// Log-relative wealth regularized by each player's starting bank.
-fn log_asset_ratio(zero: f64, one: f64, starting_money: f64) -> f32 {
+/// Bounded wealth margin regularized by both players' starting banks.
+fn symmetric_margin(zero: f64, one: f64, starting_money: f64) -> f32 {
     debug_assert!(zero.is_finite() && zero >= 0.0);
     debug_assert!(one.is_finite() && one >= 0.0);
     debug_assert!(starting_money.is_finite() && starting_money > 0.0);
-    ((zero / starting_money).ln_1p() - (one / starting_money).ln_1p()) as f32
+    ((zero - one) / (zero + one + 2.0 * starting_money)) as f32
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
@@ -3420,16 +3519,18 @@ mod tests {
     }
 
     #[test]
-    fn pair_potential_is_a_zero_sum_log_liquid_asset_ratio() {
+    fn pair_potential_is_a_bounded_antisymmetric_liquidation_margin() {
         let mut game = Game::new(0, GameConfig::default());
         game.farms[0].money = 9_000;
         game.farms[1].money = 3_000;
-        let lead = log_asset_ratio(9_000.0, 3_000.0, game.config.starting_money as f64);
+        let lead = (6_000.0 / (12_000.0 + 2.0 * game.config.starting_money as f64)) as f32;
         assert_eq!(game.pair_potential(), lead);
+        assert_eq!(game.pair_potential(), game.terminal_pair_utility());
 
         game.farms[0].money = 3_000;
         game.farms[1].money = 9_000;
         assert_eq!(game.pair_potential(), -lead);
+        assert_eq!(game.pair_potential(), game.terminal_pair_utility());
 
         // Equal farms have zero potential at any absolute wealth.
         game.farms[0].money = 250_000;
@@ -3450,8 +3551,25 @@ mod tests {
         let one = game.liquidation_value(1);
         assert_eq!(
             game.pair_potential(),
-            log_asset_ratio(zero, one, game.config.starting_money as f64)
+            ((zero - one) / (zero + one + 2.0 * game.config.starting_money as f64)) as f32
         );
+
+        // Large disparities remain bounded, unlike a log-relative potential.
+        game.privates[0].shed.fill(0);
+        game.privates[0]
+            .inventories
+            .iter_mut()
+            .for_each(|held| held.fill(0));
+        game.privates[1].shed.fill(0);
+        game.farms[0].money = 1_000_000_000;
+        game.farms[1].money = 0;
+        let rich = game.pair_potential();
+        assert!(rich > 0.0 && rich < 1.0);
+        assert_eq!(rich, game.terminal_pair_utility());
+        game.farms[0].money = 0;
+        game.farms[1].money = 1_000_000_000;
+        assert_eq!(game.pair_potential(), -rich);
+        assert_eq!(game.pair_potential(), game.terminal_pair_utility());
     }
 
     #[test]
@@ -3512,9 +3630,17 @@ mod tests {
         assert!(game.pair_potential() < 0.0);
 
         game.done = true;
-        let banked = log_asset_ratio(3_000.0, 1_000.0, game.config.starting_money as f64);
-        assert_eq!(game.terminal_pair_utility(), banked);
+        assert_eq!(game.terminal_pair_utility(), 0.2);
         assert_eq!(game.post_step_potential(), 0.0);
+
+        game.farms[0].money = 1000;
+        game.farms[1].money = 3000;
+        assert_eq!(game.terminal_pair_utility(), -0.2);
+        game.farms[0].money = 0;
+        game.farms[1].money = 0;
+        assert_eq!(game.terminal_pair_utility(), 0.0);
+        game.farms[0].money = 3000;
+        assert_eq!(game.terminal_pair_utility(), 1.0 / 3.0);
     }
 
     #[test]
@@ -3827,12 +3953,50 @@ mod tests {
         let mut game = Game::new(0, config);
         game.add_inventory(0, 0, 11, 1);
         game.add_inventory(0, 0, 0, 1);
+        let encoded_units = |game: &Game| {
+            let mut units = [0.0; MAX_UNITS * UNIT_CONTINUOUS];
+            game.encode_player_structured(
+                0,
+                &mut [0; TILE_TOKENS * TILE_CATEGORICAL],
+                &mut [0.0; TILE_TOKENS * TILE_CONTINUOUS],
+                &mut [0; MAX_UNITS * UNIT_CATEGORICAL],
+                &mut units,
+                &mut [false; MAX_UNITS],
+                &mut [0; MAX_UNITS * UNIT_GATHERS],
+                &mut [false; MAX_UNITS * UNIT_GATHERS],
+                &mut [0.0; PRODUCTS * PRODUCT_TOKEN_FIELDS],
+                &mut [0.0; ANIMALS * ANIMAL_TOKEN_FIELDS],
+                &mut [0.0; CROPS * CROP_TOKEN_FIELDS],
+                &mut [0.0; PLAYERS * FARM_TOKEN_FIELDS],
+                &mut [0.0; TOWN_TOKEN_FIELDS],
+            );
+            units
+        };
+        let units = encoded_units(&game);
+        let mut reversed = game.clone();
+        reversed.privates[0].inventory_order[0].swap(0, 1);
+        let reversed_units = encoded_units(&reversed);
+        assert_eq!(
+            &units[..PRIVATE_ITEMS + 2],
+            &reversed_units[..PRIVATE_ITEMS + 2]
+        );
+        assert_eq!(units[PRIVATE_ITEMS + 2 + 11], 1.0 / 32.0);
+        assert_eq!(units[PRIVATE_ITEMS + 2], 2.0 / 32.0);
+        assert_eq!(reversed_units[PRIVATE_ITEMS + 2], 1.0 / 32.0);
+        reversed.drop_inventory(0, 0);
+        assert_eq!(reversed.privates[0].shed[0], 1);
+        assert_eq!(reversed.privates[0].shed[11], 0);
         game.drop_inventory(0, 0);
         assert_eq!(game.privates[0].shed[11], 1);
         assert_eq!(game.privates[0].shed[0], 0);
         assert_eq!(
             game.privates[0].inventory_order[0],
             [u8::MAX; PRIVATE_ITEMS]
+        );
+        assert!(
+            encoded_units(&game)[PRIVATE_ITEMS + 2..UNIT_CONTINUOUS]
+                .iter()
+                .all(|rank| *rank == 0.0)
         );
     }
 
@@ -3937,13 +4101,46 @@ mod tests {
     }
 
     #[test]
-    fn categorical_roundoff_fallback_is_last_valid_category() {
-        let logits = [0.0, 0.0, 100.0];
+    fn categorical_roundoff_fallback_skips_underflowed_legal_tail() {
+        let mut logits = [0.0; 14];
+        logits[12] = -200.0;
+        logits[13] = 100.0;
+        let mut mask = [true; 14];
+        mask[13] = false;
+        let (selected, logprob, entropy) =
+            sample_categorical(&logits, &mask, false, 1.0, 0.999_999_94);
+        assert_eq!(selected, 11);
+        assert!((logprob + 12.0f32.ln()).abs() < 1e-6);
+        assert!((entropy - 12.0f32.ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn categorical_uses_strict_representable_cdf_boundaries() {
+        let logits = [0.0, -200.0, 0.0];
+        let mask = [true; 3];
+        let boundary = 0.5f32;
+        for (draw, expected) in [
+            (f32::from_bits(boundary.to_bits() - 1), 0),
+            (boundary, 2),
+            (f32::from_bits(boundary.to_bits() + 1), 2),
+        ] {
+            let (selected, logprob, entropy) = sample_categorical(&logits, &mask, false, 1.0, draw);
+            assert_eq!(selected, expected);
+            assert!((logprob + 2.0f32.ln()).abs() < 1e-6);
+            assert!((entropy - 2.0f32.ln()).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn categorical_subnormal_mass_keeps_logits_based_likelihood() {
+        let logits = [-100.0, 0.0, 200.0];
         let mask = [true, true, false];
-        assert_eq!(
-            sample_categorical(&logits, &mask, false, 1.0, 0.999_999_94).0,
-            1
-        );
+        let (selected, logprob, entropy) = sample_categorical(&logits, &mask, false, 1.0, 0.0);
+        assert_eq!(selected, 0);
+        assert!((logprob + 100.0).abs() < 1e-6);
+        let expected_entropy = (100.0 * f64::from((-100.0f32).exp())) as f32;
+        assert!(entropy > 0.0 && entropy.is_finite());
+        assert!((entropy / expected_entropy - 1.0).abs() < 1e-6);
     }
 
     #[test]

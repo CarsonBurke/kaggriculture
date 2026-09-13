@@ -43,7 +43,7 @@ from kaggriculture.constants import (
 )
 
 TILE_COUNT = BOARD_SIZE * BOARD_SIZE
-OBSERVATION_SCHEMA_VERSION = 2
+OBSERVATION_SCHEMA_VERSION = 3
 
 # Categorical vocabularies. Index 0 of the occupant vocabulary is the "no
 # occupant" value so embeddings for absent fields are learned, not
@@ -260,13 +260,14 @@ UNIT_CATEGORICAL_FIELDS = (
     "row",  # 0..BOARD_SIZE-1
     "column",  # 0..BOARD_SIZE-1
 )
-# Continuous columns per unit token: exact per-item held counts followed by
-# situational flags. Hand inventories have no engine cap, so counts use the
-# rollout encoder's 32-unit scale without clipping to stay exact.
+# Continuous columns per unit token: exact held counts, situational flags,
+# then insertion ranks. DROP fills the shed in insertion order and discards
+# overflow, so counts alone do not determine the next economic state.
 UNIT_CONTINUOUS_FIELDS = (
     *(f"holds_{item}" for item in PRIVATE_ITEMS),
     "holds_total",
     "shed_access",  # standing on a shed-access tile
+    *(f"inventory_rank_{item}" for item in PRIVATE_ITEMS),
 )
 N_UNIT_CATEGORICAL = len(UNIT_CATEGORICAL_FIELDS)
 N_UNIT_CONTINUOUS = len(UNIT_CONTINUOUS_FIELDS)
@@ -321,6 +322,13 @@ def tokenize_units(farm: dict, private: dict) -> UnitTokens:
         continuous[slot, : len(PRIVATE_ITEMS)] = np.asarray(held) / _UNIT_INVENTORY_SCALE
         continuous[slot, len(PRIVATE_ITEMS)] = sum(held) / _UNIT_INVENTORY_SCALE
         continuous[slot, len(PRIVATE_ITEMS) + 1] = float((x, y) in _SHED_ACCESS)
+        rank = 0
+        for item, count in inventory.items():
+            if item in PRIVATE_ITEMS and count:
+                rank += 1
+                continuous[slot, len(PRIVATE_ITEMS) + 2 + PRIVATE_ITEMS.index(item)] = (
+                    rank / _UNIT_INVENTORY_SCALE
+                )
         for gather, (dx, dy) in enumerate(_GATHER_DELTA):
             nx, ny = x + dx, y + dy
             if 0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE:

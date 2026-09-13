@@ -299,18 +299,16 @@ def liquidation_value(observation: dict[str, Any], expected_player: int) -> floa
     return value
 
 
-def _log_asset_ratio(zero: float, one: float) -> float:
-    """Log-relative wealth regularized by each player's starting bank."""
+def _symmetric_margin(zero: float, one: float) -> float:
+    """Bounded wealth margin regularized by both players' starting banks."""
     if not math.isfinite(zero) or zero < 0.0 or not math.isfinite(one) or one < 0.0:
         raise ValueError("economic values must be finite and non-negative")
-    # The game-defined starting stake supplies the zero-asset prior. This keeps
-    # the ratio percentage-like without the extreme log($1) slope near ruin.
-    return math.log1p(zero / STARTING_MONEY) - math.log1p(one / STARTING_MONEY)
+    return (zero - one) / (zero + one + 2.0 * STARTING_MONEY)
 
 
 def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, Any]) -> float:
-    """Log-relative actual liquid assets from player zero's perspective."""
-    return _log_asset_ratio(
+    """Bounded liquidation margin from player zero's perspective."""
+    return _symmetric_margin(
         liquidation_value(observation_zero, 0),
         liquidation_value(observation_one, 1),
     )
@@ -319,8 +317,8 @@ def pair_potential(observation_zero: dict[str, Any], observation_one: dict[str, 
 def terminal_pair_utility(
     observation_zero: dict[str, Any], observation_one: dict[str, Any]
 ) -> float:
-    """Terminal log-relative bank utility from player zero's perspective."""
-    return _log_asset_ratio(
+    """Terminal symmetric bank margin from player zero's perspective."""
+    return _symmetric_margin(
         _scored_money(observation_zero, 0),
         _scored_money(observation_one, 1),
     )
