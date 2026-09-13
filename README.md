@@ -3,10 +3,10 @@
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
 Production training is BC-initialized self-play PPO with DAPO's asymmetric clip
-band, discount-correct potential shaping, and VAPO's decoupled GAE. A fresh
+band, discount-correct potential shaping, and full-return actor/critic GAE. A fresh
 production run must load one behavior-cloned actor, then fits its fresh critic
 for at least ten iterations and until every member's previous fresh-wave
-pre-update Monte Carlo-return explained variance reaches 0.10. Only an existing
+pre-update Monte Carlo-return R-squared reaches 0.10. Only an existing
 checkpoint can bypass that initialization. An exact batched Rust simulator supplies
 high-throughput rollouts; the pinned Kaggle environment remains the parity
 oracle and final evaluator.
@@ -114,7 +114,7 @@ mlq submit --name kagg-ppo-training --max-parallel-runs 1 --priority 0 \
   --eager-report "$repo/artifacts/benchmarks/eager-ppo.jsonl" \
   --mixed-report "$repo/artifacts/benchmarks/mixed-ppo.jsonl" \
   --compiled-report "$repo/artifacts/benchmarks/compiled-ppo.jsonl" \
-  --init-actor-from "$repo/runs/rl-repair-schema2-bc/bc-actor.pt" \
+  --init-actor-from "$repo/runs/schema3-bc/bc-actor.pt" \
   --run-dir "$repo/runs/ppo-main"
 ```
 
@@ -184,15 +184,37 @@ all, so no chain over that flag could have found anything better than eager.
 `inductor` with `reduce-overhead` measures 2.720 ms in fp32 and 1.626 ms under
 bf16 autocast, and end to end on the stage profile it is 1.87x faster -- 9.408
 ms per step against 5.035 ms, a projected rollout phase of 6.76 s against
-3.62 s. It is also 8.4x further inside the gate it risks: over four production
-waves the shipped replay-parity audit measures a worst max_kl of 2.2786e-04
-under inductor/bf16 against 1.9089e-03 under eager/fp32, on a bound of 5e-3.
-The drift is dominated by systematic differences between the collection and the
-update path rather than by rounding, and the update path is already Inductor
-plus bf16, so matching it cancels most of the difference. That is also why the
-collection precision is held fixed at bf16 on every node instead of becoming a
-third knob: three reports attribute two knobs because each step moves exactly
-one, and the precision's answer is settled by measurement outside the chain.
+3.62 s. These are historical throughput measurements, not evidence for the
+current numerical contract; source-bound calibration must be regenerated after
+changing operators or compiler settings.
+
+PPO clips each active conditional action ratio independently. Policy loss, KL,
+clipping statistics, and entropy are means over genuine active components, not
+means of per-state means. The stopping threshold remains `target_kl = 0.03`.
+Static minibatch padding has zero
+loss/gradient/metric weight, and every epoch gets a fresh permutation. Auxiliary
+trajectory plans follow that permutation and exclude padding. The native horizon
+of 720 states produces 719 transitions; pre-step observations/actions and
+post-step rewards remain aligned, with zero bootstrap at true episode termination.
+
+Rollout and update use the same FP32 master parameters under compiled BF16
+autocast, rather than sampling from a separately rounded parameter replica.
+Stored behavior likelihoods are the sampler's actual probabilities, never
+replaced by update replay. The small selected-kind quantity head uses the same
+FP32 accumulation order as the native sampler. CUDA RMS normalization packs
+independent rows into width-specific tiles while retaining batch-independent
+FP32 row arithmetic. Conditioning means have a fixed token reduction order,
+and linear bias addition has an explicit BF16 rounding boundary. Structured
+attention uses one memory-efficient CUDA SDPA backend across batch sizes and
+autograd modes, with head padding and GQA groups folded into the query axis
+instead of duplicating K/V tensors. Policy compilation preserves cast boundaries
+and disables inference-only pattern rewrites; BF16 matrix products retain FP32
+accumulation.
+
+`update_replay_joint_kl` measures the complete action likelihood as a diagnostic;
+`update_replay_component_kl` measures the component-averaged trust-region quantity.
+Replay audits compare both inference and gradient graphs against unchanged sampler values.
+Numerical parity is necessary for PPO correctness, not evidence of better returns.
 
 All three reports time the production batch and nothing else, because the
 decision reads the steady medians at 128 games and nothing from the other
@@ -216,19 +238,25 @@ For VRAM comparisons, read `peak_cuda_reserved_bytes` alongside
 `peak_cuda_bytes` (peak live allocations). The iteration records also expose
 `current_cuda_allocated_bytes` and `current_cuda_reserved_bytes` after the
 update, so retained tensors can be distinguished from allocator caches.
-PPO reuses one actor/critic CUDA stream pair per thread and device: drawing
-fresh streams each iteration strands reusable activation blocks in separate
-stream-local caches. This preserves actor/critic overlap without changing
-precision, batch size, or the training objective; do not replace it with
-per-iteration `empty_cache()`, which discards the working set.
+PPO runs actor and critic updates on the caller's CUDA stream so both branches
+reuse one activation allocation pool. Even a stable pair of separate streams
+strands each branch's cached blocks: at production shape this forced repeated
+allocator eviction and remapping despite much lower live memory. Ordered
+execution removes that overhead without changing precision, batch size, or
+objectives; do not replace it with per-iteration `empty_cache()`, which discards
+the working set.
 
 NextLat jointly trains each updating source model and its independent predictor
-with one combined PPO/value-plus-auxiliary backward. Production uses coefficient
-1 for both SmoothL1 and decoded KL, at horizon 1, on each model's normalized
-head inputs: actor unit/market decision tokens and the critic's single value
-token. Successor representations and auxiliary readout weights are stop-gradient;
-source representations remain attached. The actor's exposed unit belief is
-already normalized, so its frozen decoder does not normalize it again.
+with one combined PPO/value-plus-auxiliary backward. At the normalized head-input
+boundary, actor and critic each mix `0.5*g_main + 0.5*||g_main||/||g_aux||*g_aux`,
+with the norms spanning all source fields and rows in that minibatch. This gives
+50/50 source-cotangent contributions, not equal scalar losses or a guarantee of
+equal parameter-gradient norms after the trunk Jacobian. A zero auxiliary
+cotangent preserves the main gradient; a zero main cotangent supplies no auxiliary
+representation update. Readout and predictor parameters retain their independent
+objectives. Production uses coefficient 1 for both SmoothL1 and decoded KL, at
+horizon 1. Successors and auxiliary readout weights remain stop-gradient.
+No second trunk traversal or Python parameter-gradient mixing is required.
 
 PPO has no patch, economy, or opponent-state prediction objectives. Its actor
 predictor reads decision representations and actions; its critic predictor reads
@@ -236,6 +264,46 @@ the value representation and actions. Existing BC-only world-feature experiments
 remain separate from this PPO contract; they are not evidence for a world model.
 Actor critic-warmup and KL-stop phases still freeze the actor while fitting its
 predictor. Fresh-wave persistence scores are diagnostic only.
+
+PPO exports only unit/market decision beliefs across its compiled actor boundary;
+BC retains the full world-belief interface. Frozen actor predictor training uses
+a cached compiled BF16 belief-only forward, without unused policy logits. A
+released-actor backward warmup is discarded once per callable/configuration/shape,
+not once per frozen wave.
+
+Rollout statistics validate categorical support on existing host masks, avoiding
+two device-to-host boolean barriers per environment step. Unit/kind statistics
+and entropy packing are compiled; native quantity likelihoods no longer make an
+unnecessary GPU roundtrip. Built-in league agents occupy no neural ensemble
+slots. Only encountered neural lane/width layouts compile; a new layout can still
+incur first-use compilation rather than precompiling every reachable layout.
+Mutable ensemble weights are thread-owned. Native paired encoding computes each
+physical farm's public tile features once and reuses them for the opposite seat.
+The source-bound 2026-09-12 probe in
+`artifacts/probes/balanced-objectives-20260912/summary.json` measured cached
+production-shape waves at 33.15 → 25.51 seconds (23% less time): rollout
+6.77 → 5.69 seconds, update 26.37 → 19.82 seconds. Each arm used one initial
+wave plus two cached repeats, 230,080 states, BF16, 4,800-state minibatches,
+128 self-play games and 64 league games, and the trainer's expandable allocator
+and CPU-thread settings. All 48 actor, critic, and predictor minibatches ran.
+This comparison includes the parameter-gradient to source-cotangent balancing
+change; it is not an identical-objective optimizer A/B. The isolated four-optimizer
+step with identical production-shaped gradients measured 14.51 → 11.38 ms median.
+Allocator retries remained in both arms; neither full GPU utilization nor a
+learning-quality improvement is established by these timings.
+
+The 2026-09-13 update-memory probe
+(`artifacts/probes/update-memory-20260913/summary.json`) isolates the remaining
+allocator bottleneck and measures the optimized kernels at the same production
+shape. Cached update times were 16.79 s at 4800 rows before these changes,
+10.18 s at 4800 afterward, and 9.32 s at 6400 (36 minibatches instead of 48).
+At fixed batch size, peak live/reserved VRAM fell from 20.27/26.56 GiB to
+17.14/17.85 GiB; the 6400-row run used 21.12/22.09 GiB. Allocator retries fell
+from 95 per wave to zero. Each timing is one unprofiled cached wave; profiled
+repeats are excluded. Both completed 6400-row waves retained every state and
+accepted all 36 actor, critic, and predictor steps. Its three-minute cap stopped
+the optional third replay audit, not either measured wave. These are execution
+measurements, not evidence that the larger-batch learning dynamics are better.
 
 Contiguous validity segments receive independent random partition phases before
 their bounded runs are shuffled. Every valid state appears once in the primary
@@ -254,9 +322,9 @@ There are no extra diagnostic backwards or retained-graph compiler variants;
 ordinary buffer donation remains enabled. Captured rollout forwards include
 fixed-index scatter and are submitted before CPU trajectory storage to overlap
 device work with host copies.
-Minibatch inputs and returned beliefs are released after their final use and
-existing stream joins, before the next gather/forward. Compact NextLat plans
-use spare occupancy-shape slots to reduce padding while retaining every former
+Minibatch inputs and returned beliefs are released after their final use,
+before the next gather/forward. Compact NextLat plans use spare occupancy-shape
+slots to reduce padding while retaining every former
 bucket boundary: padding never increases and there are still at most eight
 aligned shapes per minibatch size.
 
@@ -266,8 +334,8 @@ selling every held product at the current market curve. With the game-defined
 starting bank `k = 3000`,
 
 ```
-P[t] = log((L[0,t]       + k) / (L[1,t]       + k))  # nonterminal potential
-U[T] = log((bank[0,T]    + k) / (bank[1,T]    + k))  # terminal utility
+P[t] = (L[0,t] - L[1,t]) / (L[0,t] + L[1,t] + 2*k)  # nonterminal potential
+U[T] = (bank[0,T] - bank[1,T]) / (bank[0,T] + bank[1,T] + 2*k)  # terminal utility
 
 r[0,t] = gamma * P[t+1] - P[t]  # nonterminal
 r[0,T-1] = U[T] - P[T-1]        # terminal; terminal shaping potential is zero
@@ -282,10 +350,13 @@ without requiring gamma one, adding dense credit assignment without an
 early-lead or time-average occupancy objective. Every transition, including the
 terminal transition, sums to exactly zero.
 
-The starting bank supplies a game-defined zero-asset prior. This keeps the
-comparison percentage-like and defined at zero without the extreme slope of a
-one-dollar pseudocount: `3000` versus `0` scores `log(2)`, not `log(3001)`.
-There is no fitted dollar scale or nonlinear margin saturation.
+Potential and terminal utility use the same bounded, zero-sum margin function.
+The `2*k` denominator regularizes the slope near ruin: `3000` versus `0`
+scores `1/3` for both cash-only potential and terminal utility. Equal banks score
+zero, including mutual bankruptcy. At unchanged holdings, the terminal
+correction is the difference between bank-only and liquidation margins, so
+unsold goods lose their shaping credit rather than a dominant cash lead paying
+a logarithmic scale-mismatch penalty.
 
 Liquid assets deliberately exclude seeds, animals, planted crops, pending
 yields, and land because the market cannot liquidate them. Market products are
@@ -293,23 +364,19 @@ valued by walking the engine's sell arithmetic unit by unit, including its
 price-floor restock rule. Moving those products into the bank is therefore
 potential-neutral, so cycling inventory cannot manufacture reward.
 
-The log potential is not artificially bounded. Critic targets outside the
-categorical support saturate at its outer atom, and the saturated fraction is a
-reported training gate rather than a hidden reward transform. Rust supplies
-binary32 potentials and terminal utility; one Python reward implementation
-applies the same configurable gamma to native and interpreted rollouts.
+Rust supplies binary32 potentials and terminal utility; one Python reward
+implementation applies the same configurable gamma to native and interpreted
+rollouts.
 
-GAE follows VAPO's decoupled schedule, not CleanRL's shared lambda. Policy
-advantages use ``lambda = 1 - 1/(0.05 * 719)`` -- VAPO's length-adaptive
-formula evaluated at the known 719-action horizon, not per sequence. Critic
-targets use lambda 1, the unbiased discounted suffix return. Actor advantages,
-critic targets, and collection shaping all use the same gamma. Targets beyond
-categorical support saturate at the outer atom and the saturated fraction is
-reported.
+Actor and critic GAE both default to lambda 1, retaining discounted delayed
+investment payoffs instead of additionally attenuating them by `lambda^delay`.
+Explicit actor/critic lambda overrides remain available. Advantages, value
+targets, and collection shaping share gamma. Targets outside categorical
+support saturate at its outer atom, with the saturated fraction reported.
 
-The trust region is `target_kl = 0.03`; at the shipped actor learning rate the
-population runs measure per-iteration approx KL of 1e-4 to 2e-4, so the region
-rarely binds.
+The trust region is `target_kl = 0.03` on the active-component mean KL.
+Its historical calibration does not establish the stopping frequency after
+changing rewards and auxiliary balance; measure accepted minibatches explicitly.
 
 Entropy is measured but not optimized. The main actor objective is clipped PPO;
 production jointly optimizes a one-step future-policy KL auxiliary. The critic
@@ -317,6 +384,13 @@ jointly optimizes one-step latent and decoded-value prediction auxiliaries. Prod
 uses one learner with 128 self-play games and 64 league games per wave (320
 learner trajectories). Stale matchup evidence for built-ins and snapshots decays
 toward 0.5 alike, so formerly easy opponents can become contested again.
+
+With `inductor_graph`, training precompiles balanced league layouts up to the
+configured lane budget on its first nonempty league wave. This moves their cold
+compilation to startup without changing assignments or padding steady waves.
+CUDA graphs remain wave-owned; new update-gradient phases can still compile
+separately. Structured fused-MLP predictors refresh cached projections before
+training and after each predictor optimizer step, including critic warmup.
 
 Optional population training uses uniform ordered round-robin pairings and both
 seats' trajectories. `--population 4` requires `--league-games 0`; frozen
@@ -338,36 +412,48 @@ factories in `src/kaggriculture/production.py`. Production launchers serialize t
 resolved configuration into each run's provenance; those records describe what
 ran, while the executable defaults determine future launches.
 
-Structured observation schema v2 includes separate goose/cow/sheep purchase,
-shed and carried-stock tokens, and public farmer/hand occupancy on both farms.
-Opponent private stocks remain critic-only. Rebuild native encoding and BC caches
+Structured observation schema v3 includes per-unit carried-item insertion ranks,
+alongside exact counts: DROP fills available shed space in that order and discards
+overflow. Ranks are encoded consistently in Python/native storage for both players;
+opponent inventory ranks remain critic-only. Separate goose/cow/sheep purchase,
+shed and carried-stock tokens and public farmer/hand occupancy remain unchanged.
+Rebuild native encoding and BC caches
 and train fresh actors: old structured model artifacts are rejected, not migrated.
 
 Fresh-wave persistence diagnostics compare each active loss with no-change
 prediction through the same encoder/readout. A zero baseline is uninformative,
 not evidence of success. Ratios never enable or disable representation learning.
 Predictor fitting and preupdate diagnostics have separate synchronized timings.
-Recovery checkpoint format 15 records head-only NextLat and the critic's final
-value normalization. Older checkpoints remain readable for actor extraction,
-not training resume; old critic/predictor states are not migrated.
+Recovery checkpoint format 17 separates the bounded-margin reward and balanced
+source-gradient regime from prior critic targets and optimizer moments. Older
+containers, including version 16, remain actor-readable when their observation
+schema matches, but are not resumable training states under the new objective.
 
 `credit_preupdate_*` reports critic error against terminal utility after removing
 the shaping potential, including a potential-only baseline, grouped by opponent
 and time-to-go. High shaped-return explained variance alone is not evidence of
 long-horizon prediction. Every 25 iterations, gradient diagnostics report
 `structured_gradient_source_norm` and `structured_critic_gradient_source_norm`:
-NextLat's source-belief cotangent norms, not parameter-gradient norms or
-main/auxiliary cosine estimates. Observation does not change optimizer updates.
+NextLat's raw source-belief cotangent norms before balancing, not parameter-gradient
+norms or main/auxiliary cosine estimates. Observation does not change optimizer updates.
 
 Fresh production training must be initialized from a BC actor through
 `--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no
 persistent BC or KL term, and a critic-only warmup lasting at least ten
 iterations. Actor updates begin only after every member's previous fresh-wave
-pre-update Monte Carlo-return explained variance reaches 0.10; failure to reach
+pre-update Monte Carlo-return R-squared reaches 0.10; failure to reach
 that gate by iteration 40 stops the run instead of training against an unready
 baseline. Both production launchers reject a fresh random actor; `--resume`
 remains valid for continuing a checkpoint. Raw `train_ppo.py` remains available
 for controlled from-scratch experiments.
+Readiness uses `1 - MSE(G - V) / Var(G)`, not centered residual variance, so
+constant value bias cannot disappear from the gate. Centered explained variance
+remains separate telemetry.
+
+Categorical CPU/native sampling accumulates positive unnormalized masses in
+float64 and uses strict intervals. Rounding fallback selects only positive mass;
+selected log-probabilities come from logits and the normalizer, without flooring
+underflowed probabilities.
 
 Actor and critic trunk base learning rates both default to `5e-5` (NorMuon
 matrices), with `1.75e-5` for their ordinary Adam parameter groups. Production
@@ -376,12 +462,51 @@ its `25/3` boost over ordinary Adam groups. The raw training CLI accepts
 `--critic-head-lr` as an optional absolute override. Each group retains its own
 32-optimizer-step linear LR warmup and checkpointed state. NextLat predictors
 inherit their corresponding actor/critic base rate unless explicitly overridden.
+Embedding weights are assigned to Adam by module ownership, including tied
+weights; direct learned latent/opponent/value queries also use Adam. Hidden
+projection matrices remain on NorMuon. This corrects older structured-model
+partitions that treated categorical tables and those queries as hidden matrices.
+Model weight formats are unchanged, but old optimizer histories cannot be loaded
+into the corrected partition: NorMuon state does not contain Adam's second-moment
+history. Retain the original source for an exact historical resume; adopting the
+correction requires fresh optimizer state rather than an implicit conversion.
 
-The physical minibatch ceiling is 4800: a complete 230080-state production
-wave uses 48 balanced critic minibatches, with no dropped states or gradient
-accumulation. Larger batches are a goal only where model capacity, precision,
-sample coverage and throughput are preserved; do not exhaust VRAM headroom
-merely to reach a lower minibatch count.
+Compatible CUDA FP32 Adam groups without cautious decay use PyTorch's native
+fused Adam update, retaining per-parameter device counters and checkpointed
+moments. Nonzero/nonfinite skip flags leave both weights and optimizer state
+unchanged. CPU, cautious-decay, and incompatible layouts retain their existing
+arithmetic. Gated NorMuon gradients are selected once per matrix-shape group and
+reuse the packed storage for Nesterov directions, rather than launching one
+selection per parameter. Fusion is numerically equivalent, not bitwise identity.
+
+The raw structured training CLI exposes `--critic-state-read true` (default
+`false`). The critic's central latent and value queries address observation
+context through attention but are not added to the residual content. Each read
+normalizes the attention output with a non-affine RMSNorm, then applies the
+existing gated FFN. The core entrance remains non-affine normalized. Read
+attention is an input projection and stays nonzero-initialized even when
+`zero_init_branches` zeros residual branches; the actor and other blocks are
+unchanged. Central/value query parameters initialize at unit RMS as addresses,
+not constant residual shortcuts.
+Actor-only BC warm starts permit differences in `critic_core_layers`,
+`critic_latents`, and `critic_state_read`; actor-affecting fields must still match.
+Training resume requires complete model-configuration identity. Start a fresh
+critic and optimizers for this architecture. The failed `critic_unit_rms`
+experiment has no active flag or compatibility alias; its checkpoints require
+their original frozen source rather than reinterpretation as state-read models.
+
+Polar Express guards a zero normalization denominator without adding a fixed
+epsilon to nonzero momentum norms. Small PPO momenta therefore retain the same
+normalization as larger copies, up to floating-point error. Its tensors are
+float32; multiplication accuracy still follows the process-wide matmul setting.
+
+The default physical minibatch ceiling is 6400: a complete 230080-state
+production wave uses 36 balanced minibatches, with no dropped states or
+gradient accumulation. The measured 6400-row update is faster than 4800 while
+retaining VRAM headroom. Larger batches reduce optimizer steps per wave and
+change gradient statistics; they are not learning-equivalent merely because
+sample coverage is unchanged. Learning rates, objectives, and precision are
+unchanged; the full learning run measures the resulting optimization dynamics.
 
 Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
 plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup
