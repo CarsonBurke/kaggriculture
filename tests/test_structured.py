@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import unittest.mock
 from dataclasses import replace
 
 import pytest
@@ -11,9 +10,15 @@ from kaggle_environments import make
 
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
-from kaggriculture.constants import ANIMALS, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.latent_dynamics import DecodeHeads
-from kaggriculture.model import FarmActor, ModelConfig, ReluSquared
+from kaggriculture.model import (
+    FarmActor,
+    ModelConfig,
+    ReluSquared,
+    policy_compile_options,
+    softcap_value_logits,
+)
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import _StackedActorEnsemble
@@ -26,6 +31,7 @@ from kaggriculture.structured import (
     StructuredConfig,
     StructuredCritic,
     StructuredCriticBelief,
+    StructuredDecisionBelief,
     StructuredInputs,
     refresh_fused_mlp_fp8,
     stack_structured,
@@ -118,7 +124,7 @@ def test_structured_actor_preserves_the_output_contract(real_inputs: StructuredI
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() -> None:
+def test_masked_cuda_attention_ignores_padded_context_forward_and_backward() -> None:
     torch.manual_seed(0)
     config = replace(
         _tiny_config(),
@@ -151,7 +157,9 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
     )
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        tiny_output = torch.compile(tiny, fullgraph=True)(
+        tiny_output = torch.compile(
+            tiny, options=policy_compile_options("default"), fullgraph=True
+        )(
             queries,
             context,
             context_valid=valid,
@@ -169,6 +177,9 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
     torch.testing.assert_close(tiny_output, general_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(queries.grad, general_queries.grad, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(context.grad, general_context.grad, rtol=3e-2, atol=3e-2)
+    assert torch.count_nonzero(queries.grad[0]) == 0
+    assert torch.count_nonzero(context.grad[~valid]) == 0
+    assert torch.count_nonzero(padding.grad) == 0
     for tiny_parameter, general_parameter in zip(
         tiny.parameters(), general.parameters(), strict=True
     ):
@@ -184,18 +195,12 @@ def test_tiny_masked_cuda_attention_matches_general_sdpa_forward_and_backward() 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("model_dim,heads", [(80, 4), (128, 4)])
-def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -> None:
-    """Both attention branches compute the same function at the same shape.
-
-    `EXPLICIT_ATTENTION_SCORE_LIMIT` selects between an explicit
-    matmul/softmax/matmul and a fused SDPA kernel purely on measured cost, so
-    the two must be interchangeable at any shape. `model_dim` 80 over four
-    heads is production's 20-wide head, which no fused kernel accepts
-    unpadded; 128 over four is already aligned, so its fused branch pads
-    nothing and the same equality must still hold.
-    """
+def test_attention_policy_is_invariant_to_rollout_and_update_batch_sizes(model_dim, heads) -> None:
+    """The same state must not switch BF16 attention arithmetic in a larger batch."""
     if not torch.cuda.is_available():
-        pytest.skip("attention branch selection is a CUDA decision")
+        pytest.skip("attention batch-size parity requires CUDA")
+    # Each parameter case owns its shape/mode specializations, not prior tests'.
+    torch._dynamo.reset_code(Attention.forward.__code__)
     torch.manual_seed(0)
     config = replace(
         _tiny_config(),
@@ -203,59 +208,156 @@ def test_attention_branches_agree_across_the_score_threshold(model_dim, heads) -
         attention_heads=heads,
         attention_kv_heads=heads // 2,
     )
-    module = Attention(config).cuda().train()
-    queries = torch.randn(6, 32, model_dim, device="cuda", requires_grad=True)
-    context = torch.randn(6, 41, model_dim, device="cuda", requires_grad=True)
-    valid = torch.ones(6, 41, dtype=torch.bool, device="cuda")
-    valid[:, 30:] = False
-    valid[0, :] = True
+    module = torch.compile(
+        Attention(config).cuda().train(),
+        options=policy_compile_options("default"),
+        fullgraph=True,
+        dynamic=False,
+    )
+    # Farm attention doubles actor rows; cover a rollout row and a PPO batch.
+    query = torch.randn(1, 100, model_dim, device="cuda")
+    context = torch.randn(1, 100, model_dim, device="cuda")
+    valid = torch.ones(1, 100, dtype=torch.bool, device="cuda")
+    valid[:, 70:] = False
 
-    def run(limit: int) -> tuple[torch.Tensor, ...]:
-        for tensor in (queries, context):
-            tensor.grad = None
-        module.zero_grad(set_to_none=True)
-        with (
-            unittest.mock.patch.object(structured, "EXPLICIT_ATTENTION_SCORE_LIMIT", limit),
-            torch.autocast("cuda", dtype=torch.bfloat16),
-        ):
-            output = module(queries, context, context_valid=valid)
-        output.backward(torch.ones_like(output))
-        assert queries.grad is not None
-        assert context.grad is not None
-        return output.detach(), queries.grad.clone(), context.grad.clone()
+    def run(batch: int) -> tuple[torch.Tensor, ...]:
+        queries = query.repeat(batch, 1, 1).requires_grad_()
+        contexts = context.repeat(batch, 1, 1).requires_grad_()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = module(queries, contexts, context_valid=valid.repeat(batch, 1))
+        query_grad, context_grad = torch.autograd.grad(output[0].sum(), (queries, contexts))
+        return output[0].detach(), query_grad[0], context_grad[0]
 
-    explicit = run(1 << 30)
-    fused = run(0)
-    for left, right in zip(explicit, fused, strict=True):
-        torch.testing.assert_close(left, right, rtol=3e-2, atol=3e-2)
+    rollout = run(1)
+    update = run(840)
+    for left, right in zip(rollout, update, strict=True):
+        torch.testing.assert_close(left, right, rtol=2e-3, atol=2e-3)
+    for mode in (torch.no_grad, torch.inference_mode):
+        with mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for batch in (1, 840):
+                output = module(
+                    query.repeat(batch, 1, 1),
+                    context.repeat(batch, 1, 1),
+                    context_valid=valid.repeat(batch, 1),
+                )
+                torch.testing.assert_close(output[0], rollout[0], rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("kv_heads,head_dim", [(2, 20), (2, 32), (4, 32)])
+@pytest.mark.parametrize("mask_axes", [None, (1, 1), (1, 12), (4, 1), (4, 12)])
+def test_fused_attention_matches_reference_forward_and_backward(
+    device: str, kv_heads: int, head_dim: int, mask_axes: tuple[int, int] | None
+) -> None:
+    """GQA preserves key-, query-, and head-specific masks and fully masked rows."""
+    torch.manual_seed(0)
+    heads = 4
+    # Exercise token-major projection strides, including unpadded GQA heads.
+    query = (
+        torch.randn(4, 12, heads, head_dim, dtype=torch.bfloat16, device=device)
+        .transpose(1, 2)
+        .requires_grad_()
+    )
+    key = (
+        torch.randn(4, 17, kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+        .transpose(1, 2)
+        .requires_grad_()
+    )
+    value = (
+        torch.randn(4, 17, kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+        .transpose(1, 2)
+        .requires_grad_()
+    )
+    mask = None
+    if mask_axes is not None:
+        mask = torch.rand(4, *mask_axes, 17, device=device) > 0.3
+        mask[0] = False
+    forward = structured._fused_attention
+    if device == "cuda":
+        # Each mask/stride/head case deliberately owns a distinct specialization.
+        torch._dynamo.reset_code(structured._fused_attention.__code__)
+        forward = torch.compile(forward, options=policy_compile_options("default"), fullgraph=True)
+    actual = forward(query, key, value, mask, enable_gqa=heads != kv_heads, scale=head_dim**-0.5)
+
+    # Independent FP32 mathematics deliberately uses the original head width.
+    # Reusing a production attention helper would miss a shared scale/mask bug.
+    reference_query, reference_key, reference_value = (
+        tensor.detach().float().requires_grad_() for tensor in (query, key, value)
+    )
+    repeated_key = reference_key.repeat_interleave(heads // kv_heads, dim=1)
+    repeated_value = reference_value.repeat_interleave(heads // kv_heads, dim=1)
+    scores = (reference_query @ repeated_key.transpose(-2, -1)) * head_dim**-0.5
+    if mask is not None:
+        scores = scores.masked_fill(~mask, -torch.inf)
+        scores = torch.where(mask.any(dim=-1, keepdim=True), scores, 0.0)
+    probabilities = scores.softmax(dim=-1)
+    if mask is not None:
+        probabilities = probabilities.masked_fill(~mask, 0.0)
+    expected = probabilities @ repeated_value
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream.float())
+
+    assert actual.dtype == query.dtype
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    for tensor, reference in zip(
+        (query, key, value), (reference_query, reference_key, reference_value), strict=True
+    ):
+        assert tensor.grad is not None
+        assert reference.grad is not None
+        torch.testing.assert_close(tensor.grad.float(), reference.grad, rtol=3e-2, atol=3e-2)
+        if mask_axes is not None:
+            assert torch.count_nonzero(tensor.grad[0]) == 0
+    if mask_axes is not None:
+        assert torch.count_nonzero(actual[0]) == 0
 
 
 @pytest.mark.cuda
-def test_fused_attention_head_padding_does_not_change_the_result() -> None:
-    """Zero-padding the head width is exact, not an approximation.
-
-    Padded head channels contribute nothing to QK^T and produce zeros in the
-    padded output channels, which are sliced away -- provided the scale stays
-    the one the unpadded width defines. Comparing the padded fused call to an
-    explicit reference at the same width is what proves the scale was not
-    silently taken from the padded width, which would rescale every logit.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("fused attention kernels are CUDA-only")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_masked_attention_supports_production_unit_decoder_batch() -> None:
+    """Unit decoding exceeds cuDNN's 65,535-row limit even with short contexts."""
     torch.manual_seed(0)
-    heads, kv_heads, head_dim = 4, 2, 20
-    query = torch.randn(4, heads, 12, head_dim, dtype=torch.bfloat16, device="cuda")
-    key = torch.randn(4, kv_heads, 17, head_dim, dtype=torch.bfloat16, device="cuda")
-    value = torch.randn(4, kv_heads, 17, head_dim, dtype=torch.bfloat16, device="cuda")
-    assert head_dim % 8, "this test only means something for an unaligned head width"
-    fused = structured._fused_attention(
-        query, key, value, None, enable_gqa=True, scale=head_dim**-0.5
+    query = torch.randn(8, 4, 1, 20, dtype=torch.bfloat16, device="cuda")
+    key = torch.randn(8, 2, 5, 20, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    mask = torch.rand(8, 1, 1, 5, device="cuda") > 0.3
+    mask[0] = False
+    forward = torch.compile(
+        structured._fused_attention,
+        options=policy_compile_options("default"),
+        fullgraph=True,
+        dynamic=False,
     )
-    explicit = structured._explicit_attention(
-        query, key, value, None, repeats=heads // kv_heads, scale=head_dim**-0.5
+    repeats = 10_240
+    with torch.inference_mode():
+        expected = forward(query, key, value, mask, enable_gqa=True, scale=20**-0.5)
+        actual = forward(
+            query.repeat(repeats, 1, 1, 1),
+            key.repeat(repeats, 1, 1, 1),
+            value.repeat(repeats, 1, 1, 1),
+            mask.repeat(repeats, 1, 1, 1),
+            enable_gqa=True,
+            scale=20**-0.5,
+        )
+    torch.testing.assert_close(
+        actual.reshape(repeats, *expected.shape),
+        expected.unsqueeze(0).expand(repeats, *expected.shape),
+        rtol=2e-3,
+        atol=2e-3,
     )
-    assert fused.shape == explicit.shape
-    torch.testing.assert_close(fused, explicit, rtol=2e-2, atol=2e-2)
+    assert torch.count_nonzero(actual[::8]) == 0
 
 
 def test_hardware_native_mlp_rejects_cpu_execution() -> None:
@@ -287,7 +389,7 @@ def test_hardware_native_mlp_compiles_fp8_forward_and_backward() -> None:
     module = FusedFeedForward(config).cuda().train()
     refresh_fused_mlp_fp8(module, bootstrap_down=True)
     values = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    compiled = torch.compile(module, fullgraph=True)
+    compiled = torch.compile(module, options=policy_compile_options("default"), fullgraph=True)
 
     compiled(values).float().square().mean().backward()
 
@@ -315,7 +417,9 @@ def test_hardware_native_mlp_compiles_bf16_backward() -> None:
     module = FusedFeedForward(config).cuda().eval()
     values = torch.randn(2, 4, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-    torch.compile(module, fullgraph=True)(values).float().square().mean().backward()
+    torch.compile(module, options=policy_compile_options("default"), fullgraph=True)(
+        values
+    ).float().square().mean().backward()
 
     assert values.grad is not None and torch.isfinite(values.grad).all()
     assert module.up_weight.grad is not None and torch.isfinite(module.up_weight.grad).all()
@@ -465,9 +569,7 @@ def test_structured_actor_exposes_typed_training_belief(
         output, belief = actor.forward_with_belief(real_inputs)
     finally:
         handle.remove()
-    torch.testing.assert_close(
-        output.unit_logits, actor.unit_head(raw_units[0]), rtol=0, atol=0
-    )
+    torch.testing.assert_close(output.unit_logits, actor.unit_head(raw_units[0]), rtol=0, atol=0)
     torch.testing.assert_close(
         belief.unit_decisions, actor.unit_head[0](raw_units[0]), rtol=0, atol=0
     )
@@ -524,13 +626,21 @@ def test_actor_nextlat_predicts_heads_without_world_inputs_or_targets(
         ).latent
 
     actual = loss(source, target)
-    changed_source = StructuredBelief(
-        *(value * -100 for value in source[:5]), *source[5:]
-    )
-    changed_target = StructuredBelief(
-        *(value * 100 for value in target[:5]), *target[5:]
-    )
+    changed_source = StructuredBelief(*(value * -100 for value in source[:5]), *source[5:])
+    changed_target = StructuredBelief(*(value * 100 for value in target[:5]), *target[5:])
     torch.testing.assert_close(loss(changed_source, changed_target), actual, rtol=0, atol=0)
+    decisions = StructuredDecisionBelief(source.unit_decisions, source.market_decisions)
+    decision_targets = StructuredDecisionBelief(target.unit_decisions, target.market_decisions)
+    compact_loss = loss(decisions, decision_targets)
+    torch.testing.assert_close(compact_loss, actual, rtol=0, atol=0)
+    differentiated = (*decisions, *dynamics.parameters())
+    expected_gradients = torch.autograd.grad(
+        actual, differentiated, retain_graph=True, allow_unused=True
+    )
+    compact_gradients = torch.autograd.grad(
+        compact_loss, differentiated, retain_graph=True, allow_unused=True
+    )
+    torch.testing.assert_close(compact_gradients, expected_gradients, rtol=0, atol=0)
     actual.backward()
     assert all(value.grad is None for value in source[:5])
     assert all(value.grad is None for value in target)
@@ -719,6 +829,27 @@ def test_structured_actor_gradients_reach_every_input_family(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("zero_init_branches", [False, True])
+def test_state_read_uses_context_content_without_query_shortcut(zero_init_branches) -> None:
+    torch.manual_seed(81)
+    config = replace(_tiny_config(), zero_init_branches=zero_init_branches)
+    block = structured.Block(config, state_read=True).cuda().eval()
+    context = torch.randn(2, 1, config.model_dim, device="cuda")
+    first_queries = torch.randn(2, 3, config.model_dim, device="cuda")
+    other_queries = torch.randn_like(first_queries) * 4
+    forward = torch.compile(block, options=policy_compile_options("default"), fullgraph=True)
+
+    # With one context token, queries cannot change what is read. They must not
+    # leak into the residual content, even when residual branches initialize zero.
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        first = forward(first_queries, context)
+        other = forward(other_queries, context)
+    torch.testing.assert_close(first, other, rtol=0, atol=0)
+    assert not torch.allclose(first[0], first[1])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.autocast("cuda", dtype=torch.bfloat16)
 def test_structured_critic_exposes_only_normalized_value_head_input(
     real_pairs: list[tuple[dict, dict]],
@@ -772,7 +903,10 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
         )
     torch.testing.assert_close(belief.value_decision, normalized, rtol=0, atol=0)
     torch.testing.assert_close(
-        actual, critic.value_head(belief.value_decision[:, 0]), rtol=0, atol=0
+        actual,
+        softcap_value_logits(critic.value_head(belief.value_decision[:, 0])),
+        rtol=0,
+        atol=0,
     )
     assert belief.value_decision.shape == (batch, 1, config.model_dim)
 
@@ -816,7 +950,6 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
         extras.unit_active,
     )
     assert not torch.equal(unit_belief.value_decision, belief.value_decision)
-
 
 
 @pytest.mark.cuda
@@ -988,3 +1121,30 @@ def test_structured_config_validation() -> None:
         StructuredConfig(latents=0)
     round_trip = StructuredConfig(**StructuredConfig().to_dict())
     assert round_trip == StructuredConfig()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_conditioning_mean_is_batch_invariant_with_correct_gradient() -> None:
+    torch.manual_seed(20260912)
+    tokens = torch.randn(320, 20, 80, device="cuda")
+    row_ids = torch.randperm(5120, device="cuda") % tokens.shape[0]
+    compiled = torch.compile(
+        structured._token_mean,
+        options=policy_compile_options("default"),
+        fullgraph=True,
+        dynamic=False,
+    )
+    with torch.inference_mode():
+        baseline = compiled(tokens).clone()
+        repeated = compiled(tokens.index_select(0, row_ids)).clone()
+    torch.testing.assert_close(repeated, baseline[row_ids], rtol=0, atol=0)
+    torch.testing.assert_close(baseline, tokens.double().mean(1).float(), rtol=2e-6, atol=1e-7)
+    tokens.requires_grad_()
+    output = compiled(tokens)
+    torch.testing.assert_close(output, baseline, rtol=0, atol=0)
+    gradient = torch.randn_like(output)
+    output.backward(gradient)
+    torch.testing.assert_close(
+        tokens.grad, gradient[:, None, :].expand_as(tokens) / tokens.shape[1], rtol=0, atol=0
+    )

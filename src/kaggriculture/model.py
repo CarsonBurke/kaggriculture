@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +30,32 @@ from kaggriculture.encoding import (
     UNIT_FEATURES,
 )
 
+#: `modded-nanogpt` never lets its readout logits grow without bound: the
+#: cross-entropy reads `23 * sigmoid((z + 5) / 7.5)` (`train_gpt.py:1690`,
+#: `triton_kernels.py:1208-1213`), so however far `lm_head` drifts, the loss
+#: gradient it produces is bounded and its derivative decays. This trainer's
+#: categorical value head is zero-initialized, carries the only elevated Adam
+#: rate in the critic, and fed an unbounded logit into HL-Gauss CE; measured
+#: across three controlled 100-wave runs its weight norm was the one
+#: exponentially growing parameter, at a rate no optimizer change moved
+#: (RUNS.md, "The invariant driver"). The constants are the reference's.
+#:
+#: The cap costs nothing in expressiveness here. An HL-Gauss target with
+#: `sigma = 0.75` bin widths puts essentially all of its mass inside four
+#: bins, where the optimal logit span is about eight nats; 23 covers it with
+#: room, and the atoms outside contribute `exp(-23)` of the partition sum.
+VALUE_LOGIT_SOFTCAP = 23.0
+VALUE_LOGIT_SOFTCAP_SHIFT = 5.0
+VALUE_LOGIT_SOFTCAP_WIDTH = 7.5
+
+
+def softcap_value_logits(logits: Tensor) -> Tensor:
+    """Bound a categorical value readout the way the reference bounds its own."""
+
+    return VALUE_LOGIT_SOFTCAP * torch.sigmoid(
+        (logits + VALUE_LOGIT_SOFTCAP_SHIFT) / VALUE_LOGIT_SOFTCAP_WIDTH
+    )
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -44,6 +70,12 @@ class ModelConfig:
     value_min: float = -2.2
     value_max: float = 2.2
     value_sigma_ratio: float = 0.75
+    # Scalar critic, as in CleanRL's PPO: one output, half squared error against
+    # the return, and no clipping anywhere -- not of the value target to a
+    # support, and not of the prediction to the behavior value. The categorical
+    # path is the default and keeps `value_atoms`, `value_min`, `value_max` and
+    # `value_sigma_ratio`; those four are inert when this is set.
+    scalar_value: bool = False
 
     def __post_init__(self) -> None:
         if self.cnn_width <= 0:
@@ -107,41 +139,44 @@ def _group_count(width: int) -> int:
     return groups
 
 
-class RMSNorm(nn.RMSNorm):
-    """`nn.RMSNorm` that returns the compute dtype instead of promoting to fp32.
+def policy_compile_options(mode: str) -> dict[str, Any]:
+    """Preserve policy arithmetic across inference and training specializations.
 
-    `aten::rms_norm` sits on autocast's fp32 cast list, so under the production
-    bf16 autocast every one of the 31 norms in an actor forward upcast its input,
-    ran in fp32, and returned fp32 -- which then set the dtype of the residual
-    add, the RoPE application, and the next norm's input. The residual stream was
-    fp32 with bf16 islands at the GEMMs, and each island cost a cast in and a cast
-    back out. Measured at 1.022 ms across 31 launches, 13% of a 4.1 ms forward.
+    Reduced BF16 accumulation and inference-only graph rewrites can change a
+    stored behavior likelihood before any optimizer step. Keep tensor-core
+    BF16 compute, but retain explicit cast boundaries and the chosen operators.
+    The cuBLAS reduction policy is process-wide, as required by PyTorch.
+    """
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    return {
+        **torch._inductor.list_mode_options(mode),
+        "emulate_precision_casts": True,
+        "pattern_matcher": False,
+    }
 
-    Disabling autocast for the call inverts that: `F.rms_norm` on a bf16 input
-    returns bf16 even with an fp32 weight, because the weight does not promote the
-    output. The master weight stays fp32 -- storing it in bf16 is not an option,
-    since at |w| = 1 a 2.5e-4 AdamW step is 6x below bf16's 3.906e-3 relative ULP
-    and would round away entirely -- while the residual stream becomes bf16 end to
-    end and the cast kernels disappear. Measured 1.158x on the forward, 1.033x on
-    forward+backward, with the largest head logit moving 0.65%.
 
-    End to end at the shipped configuration, median over 11 steady iterations: the
-    iteration goes 33.679 s -> 32.473 s, rollout 5.087 -> 4.381 and update 28.373
-    -> 28.027, for 107 -> 110.9 iterations/hour. The split is the interesting part.
-    The rollout is forward-only and collects -13.9% against the -13.7% the forward
-    microbenchmark predicts; the update carries a backward whose cast traffic
-    Inductor was already fusing, so it collects -1.2% rather than the -3.2% the
-    forward+backward microbenchmark suggested. A 2-sample run of the same
-    configuration read -4.7% for the total and was resampled to 11, because two
-    samples do not survive this machine's background contention.
+class Linear(nn.Linear):
+    """Keep the bias epilogue identical across rollout and update batch sizes.
 
-    ATen cannot use its fused kernel on a bf16 input with an fp32 weight and warns
-    once about it. Casting the weight per call does unlock the fused kernel and
-    measures *slower* -- 3.849 ms against 3.718 ms -- because 31 extra launches
-    cost more than the fusion saves at this width. The unfused path is the fast one.
+    A fused BF16 addmm can round the accumulator before or after adding bias,
+    depending on the selected GEMM. Make that boundary explicit while retaining
+    tensor-core matrix multiplication and FP32 optimizer master parameters.
     """
 
     def forward(self, inputs: Tensor) -> Tensor:
+        output = F.linear(inputs, self.weight, None)
+        return output if self.bias is None else output + self.bias.to(output.dtype)
+
+
+class RMSNorm(nn.RMSNorm):
+    """Compute-dtype normalization with fixed CUDA forward reduction arithmetic."""
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.is_cuda:
+            from kaggriculture.triton_norm import rms_norm
+
+            eps = self.eps if self.eps is not None else torch.finfo(torch.float32).eps
+            return rms_norm(inputs, self.weight, eps)
         with torch.autocast(inputs.device.type, enabled=False):
             return F.rms_norm(inputs, self.normalized_shape, self.weight, self.eps)
 
@@ -333,10 +368,10 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.heads = config.attention_heads
         self.head_dim = config.model_dim // self.heads
-        self.qkv = nn.Linear(config.model_dim, 3 * config.model_dim, bias=False)
+        self.qkv = Linear(config.model_dim, 3 * config.model_dim, bias=False)
         self.query_norm = RMSNorm(self.head_dim)
         self.key_norm = RMSNorm(self.head_dim)
-        self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
+        self.output = Linear(config.model_dim, config.model_dim, bias=False)
 
     def forward(
         self,
@@ -376,9 +411,9 @@ class ReluSquaredFeedForward(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         hidden = config.model_dim * config.ffn_multiplier
-        self.input = nn.Linear(config.model_dim, hidden)
+        self.input = Linear(config.model_dim, hidden)
         self.activation = ReluSquared()
-        self.output = nn.Linear(hidden, config.model_dim)
+        self.output = Linear(hidden, config.model_dim)
 
     def forward(self, inputs: Tensor) -> Tensor:
         return self.output(self.activation(self.input(inputs)))
@@ -557,16 +592,22 @@ def factored_quantity_logits(
     quantity_bias: Tensor,
     quantity_rank: int,
 ) -> Tensor:
-    """Score exact quantities only for the already-selected market kind."""
+    """Score the native sampler's small FP32 head, even under trunk autocast."""
     if quantity_context.shape[:-1] != market_kinds.shape:
         raise ValueError("quantity context and selected market kinds must align")
     if quantity_context.shape[-1] != quantity_rank:
         raise ValueError("quantity context has the wrong feature width")
-    quantity_features = quantity_context * (1.0 + kind_gate(market_kinds.long()))
-    return (
-        torch.einsum("bsr,qr->bsq", quantity_features, quantity_value.weight)
-        + quantity_bias[market_kinds.long()]
-    )
+    with torch.autocast(quantity_context.device.type, enabled=False):
+        kinds = market_kinds.long()
+        quantity_features = quantity_context.float() * (1.0 + kind_gate(kinds).float())
+        # A matmul here may use TF32 under the trainer's global "high"
+        # setting, even with autocast disabled. This small rank reduction is
+        # fused by Inductor and follows the Rust sampler's FP32 accumulation.
+        values = quantity_value.weight.float()
+        scores = quantity_bias[kinds].float()
+        for rank in range(quantity_rank):
+            scores = scores + quantity_features[..., rank, None] * values[:, rank]
+        return scores
 
 
 class FarmActor(nn.Module):
@@ -577,22 +618,22 @@ class FarmActor(nn.Module):
         config = config or ModelConfig()
         self.config = config
         self.spatial = SpatialUNet(config)
-        self.state_projection = nn.Linear(GLOBAL_FEATURES, config.model_dim)
-        self.unit_projection = nn.Linear(UNIT_FEATURES, config.model_dim, bias=False)
+        self.state_projection = Linear(GLOBAL_FEATURES, config.model_dim)
+        self.unit_projection = Linear(UNIT_FEATURES, config.model_dim, bias=False)
         self.unit_slots = nn.Embedding(MAX_UNITS, config.model_dim)
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
         self.token_types = nn.Embedding(4, config.model_dim)
         self.transformer = EntityTransformer(config)
         self.unit_head = nn.Sequential(
             RMSNorm(config.model_dim),
-            nn.Linear(config.model_dim, N_UNIT_ACTIONS),
+            Linear(config.model_dim, N_UNIT_ACTIONS),
         )
         self.market_norm = RMSNorm(config.model_dim)
-        self.market_kind = nn.Linear(config.model_dim, N_MARKET_KINDS)
+        self.market_kind = Linear(config.model_dim, N_MARKET_KINDS)
         # A dense model_dim -> kind x exact-quantity head would be a material
         # fraction of the policy. This state x kind factorization retains a
         # learned interaction plus a fully expressive kind/quantity bias.
-        self.market_quantity_context = nn.Linear(config.model_dim, config.quantity_rank, bias=False)
+        self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
         self.market_quantity_value = nn.Embedding(N_QUANTITIES, config.quantity_rank)
         self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, N_QUANTITIES))
@@ -750,10 +791,10 @@ class DistributionalCritic(nn.Module):
         config = config or ModelConfig()
         self.config = config
         self.spatial = SpatialUNet(config)
-        self.state_projection = nn.Linear(CRITIC_FEATURES, config.model_dim)
+        self.state_projection = Linear(CRITIC_FEATURES, config.model_dim)
         self.token_types = nn.Embedding(2, config.model_dim)
         self.transformer = EntityTransformer(config)
-        self.value_head = nn.Linear(config.model_dim, config.value_atoms)
+        self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
         self.register_buffer("board_positions", _board_positions(), persistent=False)
@@ -785,9 +826,14 @@ class DistributionalCritic(nn.Module):
         # critic has no invalid rows to mask, and the value is read from the state
         # token alone -- a single query into the final block.
         value_token = self.transformer(tokens, positions, None, readout=1)[:, 0]
-        return self.value_head(value_token).contiguous()
+        readout = self.value_head(value_token)
+        if self.config.scalar_value:
+            return readout.contiguous()
+        return softcap_value_logits(readout).contiguous()
 
     def value(self, logits: Tensor) -> Tensor:
+        if self.config.scalar_value:
+            return logits.float().squeeze(-1)
         return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)
 
 
@@ -844,6 +890,23 @@ def distributional_value_loss(
         raise ValueError("value logits, targets, and support shapes must align")
     projected = hl_gauss_value_targets(targets, support, sigma_ratio, validate=validate)
     return -(projected * logits.float().log_softmax(dim=-1)).sum(dim=-1)
+
+
+def scalar_value_loss(predictions: Tensor, targets: Tensor) -> Tensor:
+    """CleanRL's unclipped value loss: half the squared error, per state.
+
+    `0.5 *` rather than a bare square because that is the reference's
+    coefficient, and the critic's learning rate was tuned against a gradient of
+    that size. Neither argument is clipped: this path exists to remove the
+    bounded support, so re-introducing a bound on either the target or the
+    prediction would defeat it.
+    """
+    if predictions.shape != targets.shape:
+        raise ValueError(
+            f"value predictions {tuple(predictions.shape)} must match targets "
+            f"{tuple(targets.shape)}"
+        )
+    return 0.5 * (predictions.float() - targets.float()).square()
 
 
 def parameter_count(module: nn.Module) -> int:

@@ -118,14 +118,14 @@ def main() -> None:
     if not isinstance(state, dict):
         raise ValueError("learning-rate probe checkpoint payload must be a mapping")
     member_state, saved_auxiliary_rng = _auxiliary_recovery(state)
-    warmup_minimum, warmup_complete, previous_evs = _validate_critic_warmup_state(
+    warmup_minimum, warmup_complete, previous_r_squared = _validate_critic_warmup_state(
         state.get("initial_actor"), population=len(checkpoint_agent_states(state))
     )
     warmup_active, warmup_reason = _critic_warmup_decision(
         iteration=int(state["iteration"]),
         minimum=warmup_minimum,
         complete=warmup_complete,
-        previous_evs=previous_evs[:1],
+        previous_r_squared=previous_r_squared[:1],
     )
     entry = resolve_architecture(state["architecture"])
     model_config = entry.build_config(state["model_config"])

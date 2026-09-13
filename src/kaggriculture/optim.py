@@ -14,8 +14,8 @@ What is kept, and why each piece is here:
     approximates that factor without an SVD.  The coefficients are
     `modded-nanogpt`'s, computed for five iterations at safety factor 2e-2 and
     cushion 2, and are meaningless if the iteration count changes.  We run the
-    iteration in fp32 rather than the reference's bf16; `polar_express` records
-    the measurement behind that.
+    iteration in float32 tensors; backend matmul precision remains controlled
+    by the caller.
 
   * **Nesterov momentum** in fp32 ahead of the orthogonalization, the standard
     Muon formulation.
@@ -62,6 +62,26 @@ policy and critic gradients unclipped and applies `nextlat_max_gradient_norm`
 only to the actor-side and critic-side NextLat predictors. The categorical
 value head remains Adam-managed; unlike predictor parameters, it has no
 auxiliary gradient safeguard to clip.
+
+That invariance covers the matrices and stops there, which is why Adam's epsilon
+is 1e-20 here and not `modded-nanogpt`'s 1e-10. Epsilon is only negligible
+against the second moments a trainer actually produces, and a PPO surrogate's
+are nothing like a language model's. Measured on the actor optimizer state of
+`runs/production-value-softcap-p100-20260910`, per-element `sqrt(v_hat)` at the
+tenth percentile is 1.9e-9 and `market_quantity_bias` sits at a median of
+1.07e-11 by wave 100 -- two orders BELOW a 1e-10 epsilon. Those elements are not
+Adam-stepped at all: their update is `m_hat / eps`, proportional to the gradient
+instead of normalized by it, so their effective learning rate is the advantage
+scale. It tightens as the critic fits and advantages shrink:
+`market_quantity_bias` runs 0.69 -> 0.59 -> 0.42 -> 0.38 mean
+`sqrt(v_hat)/(sqrt(v_hat) + eps)` across waves 41, 59, 78 and 100, and the count
+of Adam parameters under 0.95 goes 1 -> 2 -> 5 -> 7 over the same waves. The
+rarely-sampled action rows are hit hardest and first, which makes an action's
+disappearance self-sealing: sampled less, smaller second moment, more epsilon
+attenuation, updated less. The ratio `m_hat / sqrt(v_hat)` is bounded near one
+for any decaying-moment schedule, and a parameter with no gradient history has
+both moments exactly zero, so shrinking epsilon to 1e-20 changes nothing except
+removing that floor.
 """
 
 from __future__ import annotations
@@ -81,67 +101,104 @@ __all__ = [
 ]
 
 
-# Parameters whose input or output side is an index rather than a feature, plus
-# the gates. `modded-nanogpt` keeps exactly these on Adam -- `embed`, `lm_head`,
-# the value embeddings, the gates and scalars -- and gives the spectral
-# treatment only to hidden matrices. The reason is that Muon's premise is a
-# statement about a matrix acting on a feature space: an embedding table's rows
-# are independent lookups, so orthogonalizing across them mixes unrelated
-# directions, and a logit head's rows are per-action scores whose relative
-# magnitudes ARE the output rather than an artifact of conditioning.
-#
-# Named by dotted-path component, so a rename shows up as a routing test
-# failure rather than a silent demotion to Adam.
+# Lookup rows and output-head rows are not feature-to-feature maps. Follow the
+# reference's separation of embeddings/readouts from hidden matrix projections.
+# Embedding weights are recognized by module ownership below, including tied
+# weights. Raw learned queries and output heads need explicit role names.
 ADAM_PARAMETER_ROLES: frozenset[str] = frozenset(
     {
-        # Learned queries and type embeddings: rows are lookups.
-        "unit_slots",
-        "market_queries",
-        "token_types",
+        # Learned queries stored directly as Parameters rather than Embeddings.
+        "opponent_queries",
+        "latent_queries",
+        "value_query",
         # Output heads: rows are per-action logits.
         "unit_head",
         "market_kind",
-        "market_quantity_value",
         "market_quantity_bias",
         "value_head",
-        # Gate.
-        "market_quantity_kind_gate",
-        # Training-only transition embeddings: every row is an independent
-        # action, slot, coordinate, type, or position lookup.
-        "unit_action",
-        "unit_slot",
-        "unit_row",
-        "unit_column",
-        "unit_active",
-        "market_quantity",
-        "market_slot",
-        "action_type",
-        "type_identity",
-        "position_identity",
     }
 )
 
 
-def route_parameters(module: torch.nn.Module) -> tuple[list[Tensor], list[Tensor]]:
-    """Split a module's parameters into the NorMuon and Adam sets.
+#: Attribute a module sets to declare Adam rate multipliers for parameters it
+#: deliberately initializes away from unit RMS. Maps its own attribute name to
+#: the multiplier.
+_MULTIPLIER_ATTRIBUTE = "adam_learning_rate_multipliers"
 
-    Everything with two or more dimensions is a matrix for NorMuon unless its
-    name names a role in `ADAM_PARAMETER_ROLES`; everything one-dimensional --
-    normalization gains, biases, learned scalars -- goes to Adam, which is
-    where Muon is not defined and not wanted.
+
+def _declared_multipliers(module: torch.nn.Module) -> dict[int, float]:
+    """Collect the Adam rate multipliers the module tree declares.
+
+    Adam's step is an ABSOLUTE per-element displacement, so two parameters at
+    different scales under one rate move by entirely different fractions of
+    themselves. Neither reference leaves that to chance: `modded-nanogpt`
+    carries an explicit `lr_mul` on every Adam-routed role in its parameter
+    table (`train_gpt.py:2026-2050`, 0.01 on `smear_gate` through 75 on the
+    embedding tables), and `../NextLat` exposes the same idea as the
+    `_get_param_lr_overrides` hook (`models/model_base.py:150-159`). This
+    trainer had no such mechanism, and `trunk.opponent_queries` at 0.02 RMS was
+    taking fifty times the relative step of the unit-RMS query banks beside it.
     """
 
+    multipliers: dict[int, float] = {}
+    for child in module.modules():
+        declared = getattr(child, _MULTIPLIER_ATTRIBUTE, None)
+        if declared is None:
+            continue
+        for name, multiplier in declared.items():
+            parameter = getattr(child, name, None)
+            if not isinstance(parameter, torch.nn.Parameter):
+                raise ValueError(
+                    f"{type(child).__name__}.{name} is not a parameter but declares a "
+                    "learning-rate multiplier"
+                )
+            value = float(multiplier)
+            if not 0.0 < value < float("inf"):
+                raise ValueError(
+                    f"{type(child).__name__}.{name} declares a non-positive or non-finite "
+                    f"learning-rate multiplier {multiplier}"
+                )
+            multipliers[id(parameter)] = value
+    return multipliers
+
+
+def route_parameters(
+    module: torch.nn.Module,
+) -> tuple[list[Tensor], list[Tensor], list[float]]:
+    """Split a module's parameters into the NorMuon and Adam sets.
+
+    Embedding weights use Adam regardless of module names or weight sharing.
+    Named lookup/readout roles and one-dimensional gains, biases, and gates
+    also use Adam. Other parameters with two or more dimensions use NorMuon.
+
+    The third result is each Adam parameter's rate multiplier, one per entry of
+    the second. A NorMuon step is already invariant to the matrix's scale --
+    Polar Express divides by the input's Frobenius norm -- so a multiplier on a
+    matrix would describe nothing, and declaring one is an error.
+    """
+
+    embedding_parameters = {
+        id(child.weight) for child in module.modules() if isinstance(child, torch.nn.Embedding)
+    }
+    declared = _declared_multipliers(module)
     matrices: list[Tensor] = []
     vectors: list[Tensor] = []
+    multipliers: list[float] = []
     for name, parameter in module.named_parameters():
         if not parameter.requires_grad:
             continue
         role = ADAM_PARAMETER_ROLES.isdisjoint(name.split("."))
-        if parameter.ndim >= 2 and role:
+        if parameter.ndim >= 2 and id(parameter) not in embedding_parameters and role:
+            if id(parameter) in declared:
+                raise ValueError(
+                    f"{name} routes to NorMuon, whose step is scale-invariant, and cannot "
+                    "carry an Adam learning-rate multiplier"
+                )
             matrices.append(parameter)
         else:
             vectors.append(parameter)
-    return matrices, vectors
+            multipliers.append(declared.get(id(parameter), 1.0))
+    return matrices, vectors, multipliers
 
 
 # Computed by `modded-nanogpt` for num_iters=5, safety_factor=2e-2, cushion=2.
@@ -159,7 +216,8 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = (
 def _polar_express_wide_batch(matrices: Tensor) -> Tensor:
     """Evaluate the fixed polynomial for a rank-3 batch in wide orientation."""
     x = matrices.float()
-    x = x / (x.norm(dim=(-2, -1), keepdim=True) * (1.0 + 2e-2) + 1e-6)
+    denominator = x.norm(dim=(-2, -1), keepdim=True) * (1.0 + 2e-2)
+    x = x / torch.where(denominator == 0, 1.0, denominator)
     for a, b, c in POLAR_EXPRESS_COEFFICIENTS:
         gram = torch.bmm(x, x.mT)
         combined = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
@@ -182,19 +240,11 @@ def polar_express(matrices: Tensor) -> Tensor:
     what removes gradient-clipping's tenfold effective-rate variation from
     every matrix that goes through here.
 
-    **This runs in fp32 where the reference runs bf16, and that is measured,
-    not preferred.**  The iteration is chaotic near degenerate singular values:
-    the polar factor of a matrix with two close singular values is not unique,
-    so an input perturbation the size of bf16's 8-bit mantissa moves the output
-    a finite distance.  Feeding the same matrix scaled by 1000 -- which is
-    algebraically the same problem, since the first line divides the scale back
-    out -- moves a bf16 step by 4.7% to 15.7% of its own length across our
-    shapes, against 3e-6 in fp32, and bf16 also scores *worse* against an exact
-    float64 SVD polar factor (cos 0.970-0.975 versus 0.980).  The reference
-    accepts that because its matrices are large enough for the weight read to
-    be the binding cost.  Ours are at most 384x96 and the forward is launch-gap
-    bound, so the halved read buys nothing and the noise costs reproducibility:
-    two identical runs would take different steps.
+    The polynomial uses float32 tensors; CUDA multiplication accuracy still
+    follows PyTorch's process-wide matmul precision setting. Normalization
+    guards only a zero denominator: adding a fixed epsilon changes the spectrum
+    at the small momentum magnitudes PPO actually produces, making the update
+    depend on gradient scale again.
     """
 
     if matrices.ndim < 2:
@@ -250,9 +300,9 @@ class NorMuon(torch.optim.Optimizer):
     `found_inf`, the skip signal `GradScaler` and the fused optimizers use, is
     honoured device-side: a nonzero value leaves parameters, both moment
     buffers, and the step counter exactly as they were, without the host
-    learning which way it went.  Gating is written with `torch.where` and not a
-    multiply so that a non-finite gradient is never multiplied by zero, which
-    would launder an infinity into a NaN.
+    learning which way it went. Matrix gradients are selected before arithmetic;
+    compatible Adam groups use the native fused kernel's early-return gate.
+    Neither path multiplies a non-finite gradient by zero.
     """
 
     # Asked by `update_ppo` instead of inferring gateability from `fused`.
@@ -269,18 +319,34 @@ class NorMuon(torch.optim.Optimizer):
         self,
         matrix_parameters: Iterable[Tensor],
         vector_parameters: Iterable[Tensor],
+        vector_learning_rate_multipliers: Iterable[float] | None = None,
         *,
         learning_rate: float,
         adam_learning_rate: float,
         momentum: float = 0.95,
         beta2: float = 0.9,
         adam_betas: tuple[float, float] = (0.9, 0.99),
-        adam_epsilon: float = 1e-10,
+        adam_epsilon: float = 1e-20,
         weight_decay: float = 0.0,
         adam_weight_decay: float = 0.0,
     ) -> None:
         matrices = [parameter for parameter in matrix_parameters]
         vectors = [parameter for parameter in vector_parameters]
+        multipliers = (
+            [1.0] * len(vectors)
+            if vector_learning_rate_multipliers is None
+            else [float(multiplier) for multiplier in vector_learning_rate_multipliers]
+        )
+        if len(multipliers) != len(vectors):
+            raise ValueError(
+                f"got {len(multipliers)} learning-rate multipliers for {len(vectors)} "
+                "Adam parameters"
+            )
+        for multiplier in multipliers:
+            if not 0.0 < multiplier < float("inf"):
+                raise ValueError(
+                    f"adam learning rate multiplier must be positive and finite, got {multiplier}"
+                )
         for parameter in matrices:
             if parameter.ndim < 2:
                 raise ValueError(
@@ -324,13 +390,21 @@ class NorMuon(torch.optim.Optimizer):
                     "weight_decay": weight_decay,
                 }
             )
-        if vectors:
+        # One group per distinct multiplier, which is how the reference's
+        # `lr_mul` column resolves too. Descending order keeps the shared rate
+        # -- the group holding the value head and every gain and bias -- first.
+        by_multiplier: dict[float, list[Tensor]] = {}
+        for parameter, multiplier in zip(vectors, multipliers, strict=True):
+            by_multiplier.setdefault(multiplier, []).append(parameter)
+        for multiplier, members in sorted(by_multiplier.items(), reverse=True):
+            rate = adam_learning_rate * multiplier
             groups.append(
                 {
-                    "params": vectors,
+                    "params": members,
                     "kind": "adam",
-                    "lr": adam_learning_rate,
-                    "base_lr": adam_learning_rate,
+                    "lr": rate,
+                    "base_lr": rate,
+                    "lr_multiplier": multiplier,
                     "warmup_step": 0,
                     "betas": tuple(adam_betas),
                     "eps": adam_epsilon,
@@ -379,10 +453,9 @@ class NorMuon(torch.optim.Optimizer):
             actor       34.087 ms   6.582 ms     5.18x   3.886 -> 0.750 s
             critic      36.650 ms   8.850 ms     4.14x   8.356 -> 2.018 s
 
-        The critic trails the actor despite holding fewer parameters because it
-        is the half that carries a device-side `found_inf` on every step, and
-        selecting the gradient is the one thing below that no shape grouping
-        removes.
+        Gated steps pack gradients into the same shape batches the polar factor
+        needs anyway. One selection per shape replaces one per parameter, and
+        the packed storage becomes the Nesterov batch in place.
 
         Two properties make the batching exact rather than approximate.
         `polar_express` normalizes and iterates per matrix over the trailing two
@@ -426,30 +499,42 @@ class NorMuon(torch.optim.Optimizer):
         if not flat_parameters:
             return
 
+        shape_groups: dict[tuple[int, int], list[int]] = {}
+        for index, flat_parameter in enumerate(flat_parameters):
+            key = (flat_parameter.shape[0], flat_parameter.shape[1])
+            shape_groups.setdefault(key, []).append(index)
+        packed_nesterovs: dict[tuple[int, int], Tensor] = {}
+
         if found_inf is None:
             blend: Tensor | float = 1.0 - momentum
-            safe_gradients = gradients
+            torch._foreach_lerp_(buffers, gradients, blend)
+            nesterovs = torch._foreach_lerp(gradients, buffers, momentum)
         else:
             # A skipped minibatch must not move the buffer at all, and its
             # gradient may be non-finite, so select rather than scale: scaling
             # would turn an infinity into a NaN the buffer then keeps forever.
             applied = found_inf == 0
-            safe_gradients = [torch.where(applied, g, 0.0) for g in gradients]
+            skipped = ~applied
             blend = torch.where(applied, 1.0 - momentum, 0.0)
-            # This is the one per-parameter launch left, and it stays: there is
-            # no foreach select, and the batched alternative -- scrub the
-            # non-finite values, then scale by the gate -- would quietly start
-            # tolerating a non-finite gradient under a finite loss, which the
-            # current form propagates and a run would notice.
-        torch._foreach_lerp_(buffers, safe_gradients, blend)
-        nesterovs = torch._foreach_lerp(safe_gradients, buffers, momentum)
+            safe_by_index: dict[int, Tensor] = {}
+            for shape, members in shape_groups.items():
+                if len(members) == 1:
+                    # A single selection already owns its output; stacking a
+                    # singleton first would add a copy with nothing to amortize.
+                    packed = torch.where(applied, gradients[members[0]], 0.0).unsqueeze(0)
+                else:
+                    packed = torch.stack([gradients[index] for index in members])
+                    packed.masked_fill_(skipped, 0.0)
+                packed_nesterovs[shape] = packed
+                for index, gradient in zip(members, packed.unbind(0), strict=True):
+                    safe_by_index[index] = gradient
+            nesterovs = [safe_by_index[index] for index in range(len(gradients))]
+            torch._foreach_lerp_(buffers, nesterovs, blend)
+            # These views own packed copies, never parameter.grad storage.
+            torch._foreach_lerp_(nesterovs, buffers, momentum)
 
-        shape_groups: dict[tuple[int, int], list[int]] = {}
-        for index, flat_parameter in enumerate(flat_parameters):
-            key = (flat_parameter.shape[0], flat_parameter.shape[1])
-            shape_groups.setdefault(key, []).append(index)
         reduced: dict[int, Tensor] = {}
-        for members in shape_groups.values():
+        for shape, members in shape_groups.items():
             reduced_dimension = reduced_dimensions[members[0]]
             if len(members) == 1:
                 index = members[0]
@@ -466,7 +551,11 @@ class NorMuon(torch.optim.Optimizer):
             # the whole group's running estimates to their own state entries.
             stacked_second = torch.stack([second_moments[index] for index in members])
             group_directions = self._reduce_variance(
-                _polar_factor(torch.stack([nesterovs[index] for index in members])),
+                _polar_factor(
+                    packed_nesterovs[shape]
+                    if found_inf is not None
+                    else torch.stack([nesterovs[index] for index in members])
+                ),
                 stacked_second,
                 beta2,
                 reduced_dimension,
@@ -535,23 +624,17 @@ class NorMuon(torch.optim.Optimizer):
         return direction * (scale * (norm_before / norm_after.clamp_min(1e-10))).type_as(direction)
 
     def _adam_group(self, group: dict[str, Any], found_inf: Tensor | None) -> None:
-        """Step every vector in the group in a fixed number of launches.
+        """Use native fused Adam for the production FP32, no-decay CUDA groups.
 
-        `torch._foreach_*` takes heterogeneous shapes in one multi-tensor kernel,
-        so unlike the matrix path this needs no shape grouping: the actor's ~150
-        vectors move in about a dozen launches instead of the ~2200 a
-        parameter-at-a-time loop issued.
+        The kernel consumes one device-side counter per parameter and fuses
+        moments, bias corrections and updates in one multi-tensor operation.
+        The only ungated companion operation advances those counters. Native Adam's
+        decay is not our quadratic cautious decay, so that branch retains its
+        reference arithmetic, as do CPU and incompatible dtype/layout groups.
 
-        The one op that cannot collapse is dividing each moment by its own
-        `step`-derived bias correction, because those live as separate
-        zero-dimensional tensors and a foreach kernel needs matching shapes.
-        Reading them to the host would turn them into a scalar list -- which is
-        what `torch.optim.Adam` does when it is not capturable -- but that is
-        exactly the synchronization the device-side step counter exists to
-        avoid, so the broadcast stays. `_foreach_addcdiv_` would take them as a
-        tensor of scalars and collapse the whole tail into one kernel, but it
-        requires that tensor on the CPU, which is the same synchronization
-        wearing a different hat.
+        No optimizer object or compiled graph wraps this call: warmup changes
+        the scalar rate without recompilation, and the existing state tensors
+        remain the complete checkpoint representation.
         """
 
         beta1, beta2 = group["betas"]
@@ -579,6 +662,52 @@ class NorMuon(torch.optim.Optimizer):
             firsts.append(state["exp_avg"])
             seconds.append(state["exp_avg_sq"])
         if not parameters:
+            return
+
+        device = parameters[0].device
+        if (
+            not weight_decay
+            and device.type == "cuda"
+            # Native bias corrections are not clamped. A beta rounding to one
+            # in FP32 needs the reference's denominator floor instead.
+            and beta1 < 1.0 - 2.0**-25
+            and beta2 < 1.0 - 2.0**-25
+            and all(
+                tensor.device == device and tensor.dtype == torch.float32 and tensor.is_contiguous()
+                for tensors in (parameters, gradients, firsts, seconds, counts)
+                for tensor in tensors
+            )
+            and all(count.ndim == 0 for count in counts)
+            and (found_inf is None or (found_inf.device == device and found_inf.numel() == 1))
+        ):
+            native_found_inf = None
+            increment: Tensor | float = 1.0
+            if found_inf is not None:
+                # The native kernel only skips exactly 1, whereas our public
+                # gate skips every nonzero value (including NaN). Normalize on
+                # device, preserving the caller's gate and gradient storage.
+                native_found_inf = (found_inf != 0).to(dtype=torch.float32)
+                increment = 1.0 - native_found_inf
+            # Unlike torch.optim's increment-and-rollback, adding zero on a
+            # skip also preserves counters at the FP32 integer precision limit.
+            torch._foreach_add_(counts, increment)
+            torch._fused_adam_(
+                parameters,
+                gradients,
+                firsts,
+                seconds,
+                [],
+                counts,
+                amsgrad=False,
+                lr=learning_rate,
+                beta1=beta1,
+                beta2=beta2,
+                weight_decay=0.0,
+                eps=epsilon,
+                maximize=False,
+                grad_scale=None,
+                found_inf=native_found_inf,
+            )
             return
 
         if found_inf is None:

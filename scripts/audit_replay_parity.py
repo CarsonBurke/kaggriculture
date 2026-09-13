@@ -317,13 +317,10 @@ def main() -> None:
     # ungoverned is what let a 50x-wrong bound survive two recalibrations of
     # its own siblings.
     worst_joint = max(float(record["update_replay_joint_kl"]) for record in records)
+    worst_component = max(float(record["update_replay_component_kl"]) for record in records)
     worst_minibatch = max(float(record["update_replay_minibatch_kl"]) for record in records)
-    # A different comparison from every number above it. Those measure the
-    # sampling likelihoods against the update replay; this one measures the
-    # replay against the update forward, which is what the every-iteration gate
-    # sees because `update_ppo` overwrites the sampling likelihoods before the
-    # loop. They sit at a similar magnitude on a cloned actor, which is exactly
-    # why gating one against the other's bound has to be done deliberately.
+    # Same sampler likelihoods, but the grad-tracking update graph rather than
+    # the no-grad replay graph. The optimizer never rewrites the behavior side.
     worst_first = max(float(record["update_replay_first_minibatch_kl"]) for record in records)
     worst_first_mean = max(float(record["update_replay_mean_minibatch_kl"]) for record in records)
     print(
@@ -331,10 +328,10 @@ def main() -> None:
         f"(bound {MAX_UPDATE_REPLAY_KL}, margin {MAX_UPDATE_REPLAY_KL / max(worst_kl, 1e-30):.1f}x)"
         f"  tail_fraction {worst_tail:.4e} (bound {MAX_UPDATE_REPLAY_TAIL_FRACTION}, "
         f"margin {MAX_UPDATE_REPLAY_TAIL_FRACTION / max(worst_tail, 1e-30):.1f}x)"
-        f"\njoint kl {worst_joint:.4e} over all heads; worst single minibatch "
-        f"{worst_minibatch:.4e}, minibatch-to-batch ratio "
-        f"{worst_minibatch / max(worst_joint, 1e-30):.2f}x"
-        f"\nreplay-vs-update worst minibatch {worst_first:.4e} "
+        f"\njoint kl diagnostic {worst_joint:.4e}; component kl {worst_component:.4e}; "
+        f"worst single minibatch {worst_minibatch:.4e}, minibatch-to-batch ratio "
+        f"{worst_minibatch / max(worst_component, 1e-30):.2f}x"
+        f"\nsampler-vs-update worst minibatch {worst_first:.4e} "
         f"(bound {MAX_FIRST_MINIBATCH_KL}, margin "
         f"{MAX_FIRST_MINIBATCH_KL / max(worst_first, 1e-30):.1f}x)"
         f", mean over minibatches {worst_first_mean:.4e}, "
@@ -352,7 +349,7 @@ def main() -> None:
         )
     if worst_first > MAX_FIRST_MINIBATCH_KL:
         raise SystemExit(
-            "single-minibatch replay-vs-update divergence exceeded "
+            "single-minibatch sampler-vs-update divergence exceeded "
             f"{MAX_FIRST_MINIBATCH_KL}: {worst_first}"
         )
 

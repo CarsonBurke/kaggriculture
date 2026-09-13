@@ -35,11 +35,13 @@ from kaggriculture.constants import (
 from kaggriculture.model import (
     ActorOutput,
     AxialRotaryEmbedding,
+    Linear,
     ReluSquared,
     RMSNorm,
     _sdpa_inputs,
     factored_quantity_logits,
     initialize_policy_heads,
+    softcap_value_logits,
 )
 from kaggriculture.tokens import (
     ANIMAL_PRIVATE_FIELDS,
@@ -97,10 +99,16 @@ class StructuredConfig:
     fused_mlp: bool = False
     critic_core_layers: int = 0
     critic_latents: int = 0
+    # Critic reads seed residual content from observations, not learned queries.
+    critic_state_read: bool = False
     value_atoms: int = 101
     value_min: float = -2.2
     value_max: float = 2.2
     value_sigma_ratio: float = 0.75
+    # Scalar critic on half squared error, as in CleanRL's PPO, with no support
+    # clipping of the target and no softcap on the readout. The four fields above
+    # are inert when this is set.
+    scalar_value: bool = False
 
     def __post_init__(self) -> None:
         if self.observation_schema_version != OBSERVATION_SCHEMA_VERSION:
@@ -273,111 +281,19 @@ class GatedResidual(nn.Module):
         return residual.to(compute_dtype) + self.gate.to(compute_dtype) * branch
 
 
-#: Score elements -- batch * heads * query_tokens * key_tokens -- at or above
-#: which attention runs through a fused SDPA kernel rather than an explicit
-#: matmul/softmax/matmul the surrounding Inductor graph can fuse.
-#:
-#: The shipped path sent every attention to `scaled_dot_product_attention`, and
-#: at this architecture's shapes that was the update's single largest kernel.
-#: A compiled production minibatch (4040 rows) spent 32.9 ms of its 87.4 ms
-#: actor forward+backward inside `_flash_attention_backward` against a 3.0 ms
-#: forward: an 11x backward-to-forward ratio, where 2-3x is ordinary. Flash
-#: amortizes its fixed cost over long sequences, and the longest context here
-#: is 141 tokens.
-#:
-#: Isolated compiled forward+backward, bf16, RTX 5090, median of 15, at the
-#: geometries the trunk and decoders actually run (`probe_attention*`):
-#:
-#:     geometry      batch  scores      flash   cuDNN(pad)   explicit
-#:     core 32x32      4040   16.5M   1.735 ms    1.026 ms   0.793 ms
-#:     core 32x32      8080   33.1M   3.855 ms    2.061 ms   2.040 ms
-#:     latent 32x141   4040   72.9M   3.553 ms    2.564 ms   4.670 ms
-#:     farm 100x100    2048   81.9M   1.622 ms    1.483 ms   1.868 ms
-#:     farm 100x100    8080  323.2M  10.091 ms    7.010 ms  20.117 ms
-#:
-#: Flash is never the fastest cell. Explicit attention wins below roughly 32M
-#: score elements and loses above it, because its cost is the materialized
-#: score matrix while a fused kernel's is the fixed per-launch overhead. 32M
-#: sits between the last cell explicit wins (33.1M, a tie) and the first it
-#: clearly loses (72.9M), and it also bounds the materialized softmax.
-#:
-#: Both branches are exact rewrites of the same function, not approximations:
-#: the explicit path is the algorithm SDPA implements, and the fused path zero-
-#: pads the head width, which contributes nothing to QK^T and returns zeros in
-#: the padded output channels that are then sliced away. Neither is bitwise
-#: identical to the other -- `update_replay_parity` bounds that drift, and both
-#: collection and update read this one implementation, so they move together.
-#: Measured, the drift is nowhere near the bound: `update_replay_max_kl` moves
-#: 3.12e-7 to 3.14e-7 against a 5e-3 gate, with every tail fraction still zero.
-#:
-#: End to end on the then-production 2-actor/4-critic schedule
-#: (`scripts/benchmark_ppo_iteration.py`, 128 self-play + 64 league games,
-#: minibatch 4096, median of five steady repeats,
-#: `artifacts/benchmarks/attn-*.jsonl`):
-#:
-#:                       rollout    update     total   iterations/hour
-#:     before             18.540    41.617    60.272        59.73
-#:     after              19.479    36.181    55.911        64.39
-#:
-#: The update, which is entirely compiled, takes the whole 13.1% the isolated
-#: measurement predicted. The rollout runs eager and gives 5.1% back, which is
-#: the same finding read from the other side: unfused, the explicit path is six
-#: kernel launches where flash is one. The two do not cancel -- collection is
-#: under a third of an iteration -- but they are why this is written as a
-#: property of the geometry rather than of the model.
-EXPLICIT_ATTENTION_SCORE_LIMIT = 32 << 20
-
-#: Fused SDPA kernels reject a head width that is not a multiple of eight:
-#: cuDNN and the memory-efficient backend refuse outright, and a masked call at
-#: such a width has no fused kernel at all and silently decomposes to the math
-#: backend. Production runs `model_dim` 80 over four heads, so its 20-wide
-#: heads take exactly that decomposition today. Padding is a no-op for an
-#: already-aligned width.
+#: Memory-efficient CUDA attention requires head widths divisible by eight.
+#: Padding preserves the original scale and is a no-op for aligned widths.
 _FUSED_ATTENTION_HEAD_MULTIPLE = 8
 
-#: cuDNN first: it is the fastest admissible backend at every measured geometry
-#: above, and the only fused one that accepts a mask at these head widths.
-#: Flash and math follow so an unsupported shape degrades instead of raising.
-_FUSED_ATTENTION_BACKENDS = (
-    SDPBackend.CUDNN_ATTENTION,
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.MATH,
-)
-
-
-def _expand_key_value(key: Tensor, value: Tensor, repeats: int) -> tuple[Tensor, Tensor]:
-    """Materialize grouped-query key/value heads for explicit attention."""
-    if repeats == 1:
-        return key, value
-    return key.repeat_interleave(repeats, dim=1), value.repeat_interleave(repeats, dim=1)
-
-
-def _explicit_attention(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    attention_mask: Tensor | None,
-    *,
-    repeats: int,
-    scale: float,
-) -> Tensor:
-    """Attention as an explicit matmul/softmax/matmul, fusable by Inductor.
-
-    The softmax reduces in fp32 exactly as every fused backend does
-    internally, so this trades no precision for its speed.
-    """
-    key, value = _expand_key_value(key, value, repeats)
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-    if attention_mask is not None:
-        valid_rows = attention_mask.any(dim=-1, keepdim=True)
-        scores = scores.masked_fill(~attention_mask, -torch.inf)
-        # Avoid NaN softmax inputs for query rows whose entire context is
-        # masked. SDPA defines both their output and gradient as zero.
-        scores = torch.where(valid_rows, scores, 0.0)
-    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-    if attention_mask is not None:
-        probabilities = torch.where(attention_mask, probabilities, 0.0)
-    return torch.matmul(probabilities.to(value.dtype), value)
+#: Standard-deviation of a learned query bank that seeds a residual stream
+#: rather than reading one. A query at unit RMS would dominate the block's
+#: first residual sum; 0.02 is the small init every such bank here started
+#: from. It is named because the optimizer has to know it: Adam's step is an
+#: absolute per-element displacement, so a parameter living at 0.02 RMS moves
+#: by fifty times the FRACTION of itself that a unit-RMS neighbour does under
+#: one shared rate. `route_parameters` reads it back through
+#: `adam_learning_rate_multipliers`.
+SMALL_QUERY_INITIAL_SCALE = 0.02
 
 
 def _pad_head_width(tensor: Tensor, width: int) -> Tensor:
@@ -400,11 +316,36 @@ def _fused_attention(
     padded width, which is not the width this attention is defined over.
     """
     head_dim = query.shape[-1]
-    remainder = head_dim % _FUSED_ATTENTION_HEAD_MULTIPLE
+    remainder = head_dim % _FUSED_ATTENTION_HEAD_MULTIPLE if query.is_cuda else 0
     if remainder:
         width = head_dim + _FUSED_ATTENTION_HEAD_MULTIPLE - remainder
         query, key, value = (_pad_head_width(t, width) for t in (query, key, value))
-    with sdpa_kernel(list(_FUSED_ATTENTION_BACKENDS), set_priority=True):
+    fold_gqa = query.is_cuda and enable_gqa
+    if fold_gqa:
+        # The efficient kernel requires equal head counts. Fold each group into
+        # the query sequence instead of materializing repeated K/V heads.
+        batch, heads, query_tokens, width = query.shape
+        kv_heads = key.shape[1]
+        grouped_tokens = (heads // kv_heads) * query_tokens
+        query = query.reshape(batch, kv_heads, grouped_tokens, width)
+        # Key-only masks already broadcast over the folded query sequence.
+        # Query/head-specific masks must follow the original score layout.
+        if (
+            attention_mask is not None
+            and attention_mask.ndim >= 2
+            and (
+                attention_mask.shape[-2] != 1
+                or (attention_mask.ndim >= 3 and attention_mask.shape[-3] != 1)
+            )
+        ):
+            attention_mask = attention_mask.expand(
+                batch, heads, query_tokens, key.shape[-2]
+            ).reshape(batch, kv_heads, grouped_tokens, key.shape[-2])
+        enable_gqa = False
+    # One CUDA backend for every batch and autograd context. cuDNN cannot
+    # handle the unit decoder's batches above 65,535 rows with arbitrary masks.
+    backend = SDPBackend.EFFICIENT_ATTENTION if query.is_cuda else SDPBackend.MATH
+    with sdpa_kernel(backend):
         attended = nn.functional.scaled_dot_product_attention(
             query,
             key,
@@ -414,6 +355,8 @@ def _fused_attention(
             scale=scale,
             enable_gqa=enable_gqa,
         )
+    if fold_gqa:
+        attended = attended.reshape(batch, heads, query_tokens, attended.shape[-1])
     return attended[..., :head_dim] if remainder else attended
 
 
@@ -425,11 +368,11 @@ class Attention(nn.Module):
         self.heads = config.attention_heads
         self.kv_heads = config.attention_kv_heads
         self.head_dim = config.model_dim // self.heads
-        self.query = nn.Linear(config.model_dim, config.model_dim, bias=False)
-        self.key_value = nn.Linear(config.model_dim, 2 * self.kv_heads * self.head_dim, bias=False)
+        self.query = Linear(config.model_dim, config.model_dim, bias=False)
+        self.key_value = Linear(config.model_dim, 2 * self.kv_heads * self.head_dim, bias=False)
         self.query_norm = RMSNorm(self.head_dim)
         self.key_norm = RMSNorm(self.head_dim)
-        self.output = nn.Linear(config.model_dim, config.model_dim, bias=False)
+        self.output = Linear(config.model_dim, config.model_dim, bias=False)
         if config.zero_init_branches:
             nn.init.zeros_(self.output.weight)
 
@@ -470,25 +413,14 @@ class Attention(nn.Module):
             attention_mask = context_valid.view(batch, 1, 1, key_tokens)
         query, key, value = _sdpa_inputs(query, key, value)
         scale = self.head_dim**-0.5
-        scores = batch * self.heads * query_tokens * key_tokens
-        if scores < EXPLICIT_ATTENTION_SCORE_LIMIT:
-            attended = _explicit_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                repeats=self.heads // self.kv_heads,
-                scale=scale,
-            )
-        else:
-            attended = _fused_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                enable_gqa=self.heads != self.kv_heads,
-                scale=scale,
-            )
+        attended = _fused_attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            enable_gqa=self.heads != self.kv_heads,
+            scale=scale,
+        )
         attended = attended.to(dtype=queries.dtype)
         return self.output(attended.transpose(1, 2).reshape(batch, query_tokens, width))
 
@@ -497,9 +429,9 @@ class FeedForward(nn.Module):
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
         hidden = config.model_dim * config.ffn_multiplier
-        self.input = nn.Linear(config.model_dim, hidden)
+        self.input = Linear(config.model_dim, hidden)
         self.activation = ReluSquared()
-        self.output = nn.Linear(hidden, config.model_dim)
+        self.output = Linear(hidden, config.model_dim)
         if config.zero_init_branches:
             nn.init.zeros_(self.output.weight)
             nn.init.zeros_(self.output.bias)
@@ -682,7 +614,7 @@ def refresh_fused_mlp_fp8(
 
 
 class Block(nn.Module):
-    """Pre-norm attention + FFN block with near-identity gated residuals."""
+    """Pre-norm block; state reads initialize residuals from normalized attention."""
 
     def __init__(
         self,
@@ -690,15 +622,21 @@ class Block(nn.Module):
         *,
         residual_initial: float = 0.1,
         conditioned: bool = False,
+        state_read: bool = False,
     ) -> None:
         super().__init__()
         self.attention_norm = RMSNorm(config.model_dim)
-        self.attention = Attention(config)
-        self.attention_gate = GatedResidual(config.model_dim, residual_initial)
+        # A state read is the input projection, not a zero-initialized residual branch.
+        attention_config = replace(config, zero_init_branches=False) if state_read else config
+        self.attention = Attention(attention_config)
+        self.attention_gate = (
+            None if state_read else GatedResidual(config.model_dim, residual_initial)
+        )
+        self.read_norm = RMSNorm(config.model_dim, elementwise_affine=False) if state_read else None
         self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = FusedFeedForward(config) if config.fused_mlp else FeedForward(config)
         self.ffn_gate = GatedResidual(config.model_dim, residual_initial)
-        self.modulation = nn.Linear(config.model_dim, 4 * config.model_dim) if conditioned else None
+        self.modulation = Linear(config.model_dim, 4 * config.model_dim) if conditioned else None
         if self.modulation is not None:
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
@@ -714,6 +652,8 @@ class Block(nn.Module):
         context_valid: Tensor | None = None,
         conditioning: Tensor | None = None,
     ) -> Tensor:
+        if self.read_norm is not None and context is None:
+            raise ValueError("a state read requires observation context")
         attention_input = self.attention_norm(queries)
         ffn_scale = ffn_shift = None
         if self.modulation is not None:
@@ -731,16 +671,18 @@ class Block(nn.Module):
             keys = attention_input
         else:
             keys = context_norm(context) if context_norm is not None else context
-        hidden = self.attention_gate(
-            queries,
-            self.attention(
-                attention_input,
-                keys,
-                query_rotation=query_rotation,
-                key_rotation=key_rotation,
-                context_valid=context_valid,
-            ),
+        hidden = self.attention(
+            attention_input,
+            keys,
+            query_rotation=query_rotation,
+            key_rotation=key_rotation,
+            context_valid=context_valid,
         )
+        if self.read_norm is not None:
+            hidden = self.read_norm(hidden)
+        else:
+            assert self.attention_gate is not None
+            hidden = self.attention_gate(queries, hidden)
         ffn_input = self.ffn_norm(hidden)
         if ffn_scale is not None and ffn_shift is not None:
             ffn_input = ffn_input * (1 + ffn_scale.unsqueeze(1)) + ffn_shift.unsqueeze(1)
@@ -760,9 +702,9 @@ class TileEmbedder(nn.Module):
         self.column = nn.Embedding(BOARD_SIZE, width)
         self.quadrant = nn.Embedding(QUADRANT_COUNT, width)
         self.continuous = nn.Sequential(
-            nn.Linear(N_TILE_CONTINUOUS, width),
+            Linear(N_TILE_CONTINUOUS, width),
             ReluSquared(),
-            nn.Linear(width, width),
+            Linear(width, width),
         )
 
     def forward(self, categorical: Tensor, continuous: Tensor) -> Tensor:
@@ -789,12 +731,12 @@ class UnitEmbedder(nn.Module):
         self.column = nn.Embedding(BOARD_SIZE, width)
         self.farm = nn.Embedding(2, width)
         self.continuous = nn.Sequential(
-            nn.Linear(N_UNIT_CONTINUOUS, width),
+            Linear(N_UNIT_CONTINUOUS, width),
             ReluSquared(),
-            nn.Linear(width, width),
+            Linear(width, width),
         )
         self.gather_relation = nn.Embedding(len(UNIT_TILE_GATHERS), width)
-        self.gather_projection = nn.Linear(len(UNIT_TILE_GATHERS) * width, width, bias=False)
+        self.gather_projection = Linear(len(UNIT_TILE_GATHERS) * width, width, bias=False)
 
     def local_tiles(self, farm_tiles: Tensor, gather: Tensor, gather_valid: Tensor) -> Tensor:
         """Gather each unit's HERE/NSEW encoded tiles: [B, U, 5, width]."""
@@ -843,19 +785,19 @@ class EconomyEmbedder(nn.Module):
         self.private_columns = private_columns
         self.split_clock = config.split_clock_token
         self.product_identity = nn.Embedding(len(PRODUCTS), width)
-        self.product_projection = nn.Linear(product_width, width)
+        self.product_projection = Linear(product_width, width)
         self.animal_identity = nn.Embedding(len(ANIMALS), width)
-        self.animal_projection = nn.Linear(animal_width, width)
+        self.animal_projection = Linear(animal_width, width)
         self.crop_identity = nn.Embedding(len(CROPS), width)
-        self.crop_projection = nn.Linear(crop_width, width)
+        self.crop_projection = Linear(crop_width, width)
         self.farm_identity = nn.Embedding(2, width)
-        self.farm_projection = nn.Linear(len(FARM_TOKEN_FIELDS), width)
+        self.farm_projection = Linear(len(FARM_TOKEN_FIELDS), width)
         if self.split_clock:
-            self.clock_projection = nn.Linear(6, width)
-            self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS) - 6, width)
+            self.clock_projection = Linear(6, width)
+            self.town_projection = Linear(len(TOWN_TOKEN_FIELDS) - 6, width)
         else:
             self.clock_projection = None
-            self.town_projection = nn.Linear(len(TOWN_TOKEN_FIELDS), width)
+            self.town_projection = Linear(len(TOWN_TOKEN_FIELDS), width)
 
     def forward(
         self, products: Tensor, animals: Tensor, crops: Tensor, farms: Tensor, town: Tensor
@@ -897,9 +839,9 @@ class MuddLite(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
         self.norm = RMSNorm(width)
-        self.input = nn.Linear(width, 64)
+        self.input = Linear(width, 64)
         self.activation = ReluSquared()
-        self.output = nn.Linear(64, 4)
+        self.output = Linear(64, 4)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
@@ -907,6 +849,19 @@ class MuddLite(nn.Module):
         coefficients = 0.1 * self.output(self.activation(self.input(self.norm(current))))
         stacked = torch.stack(sources, dim=-2)
         return (coefficients.unsqueeze(-1) * stacked).sum(dim=-2)
+
+
+def _token_mean(tokens: Tensor) -> Tensor:
+    """Keep conditioning reduction order fixed across rollout/update batches.
+
+    A batch-dependent parallel FP32 reduction can cross a BF16 midpoint before
+    the modulation projection. The short token axis is accumulated in order;
+    Inductor fuses the additions without allocating intermediate tensors.
+    """
+    total = tokens.select(-2, 0).float()
+    for token in range(1, tokens.shape[-2]):
+        total = total + tokens.select(-2, token).float()
+    return (total / tokens.shape[-2]).to(tokens.dtype)
 
 
 class StructuredTrunk(nn.Module):
@@ -921,14 +876,37 @@ class StructuredTrunk(nn.Module):
         self.units = UnitEmbedder(config)
         self.economy = EconomyEmbedder(config, private_columns=private_columns)
         self.farm_local = nn.ModuleList(Block(config) for _ in range(config.farm_blocks))
+        state_read = private_columns and config.critic_state_read
+        opponent_queries = torch.randn(config.opponent_latents, config.model_dim)
         self.opponent_queries = nn.Parameter(
-            torch.randn(config.opponent_latents, config.model_dim) * 0.02
+            torch.nn.functional.rms_norm(opponent_queries, (config.model_dim,))
+            if state_read
+            else opponent_queries * SMALL_QUERY_INITIAL_SCALE
         )
-        self.opponent_summary = Block(config)
+        self.opponent_summary = Block(config, state_read=state_read)
         self.opponent_context_norm = RMSNorm(config.model_dim)
-        self.latent_queries = nn.Parameter(torch.randn(config.latents, config.model_dim) * 0.02)
-        self.latent_read = Block(config)
+        latent_queries = torch.randn(config.latents, config.model_dim)
+        self.latent_queries = nn.Parameter(
+            torch.nn.functional.rms_norm(latent_queries, (config.model_dim,))
+            if state_read
+            else latent_queries * SMALL_QUERY_INITIAL_SCALE
+        )
+        # Read by `route_parameters`: only the banks actually left at the small
+        # scale get the matching rate. A state read is normalized on the way in
+        # and initialized at unit RMS, so it keeps the shared rate.
+        self.adam_learning_rate_multipliers = (
+            {}
+            if state_read
+            else {
+                "opponent_queries": SMALL_QUERY_INITIAL_SCALE,
+                "latent_queries": SMALL_QUERY_INITIAL_SCALE,
+            }
+        )
+        self.latent_read = Block(config, state_read=state_read)
         self.latent_context_norm = RMSNorm(config.model_dim)
+        self.core_input_norm = (
+            RMSNorm(config.model_dim, elementwise_affine=False) if state_read else None
+        )
         self.core = nn.ModuleList(
             Block(config, conditioned=config.global_modulation) for _ in range(config.core_layers)
         )
@@ -1016,6 +994,8 @@ class StructuredTrunk(nn.Module):
             context_norm=self.latent_context_norm,
             context_valid=context_valid,
         )
+        if self.core_input_norm is not None:
+            latents = self.core_input_norm(latents)
         x0 = latents
         normalized_x0 = self.reinject_norm(x0) if self.reinject_norm is not None else None
         if self.config.global_refresh_context == "economy":
@@ -1032,7 +1012,7 @@ class StructuredTrunk(nn.Module):
             global_valid = context_valid
         else:
             global_context = global_valid = None
-        conditioning = economy_tokens.mean(dim=1) if self.config.global_modulation else None
+        conditioning = _token_mean(economy_tokens) if self.config.global_modulation else None
         snapshots: dict[int, Tensor] = {}
         for layer, block in enumerate(self.core, start=1):
             if self.mudd is not None and layer == self.config.core_layers:
@@ -1084,6 +1064,13 @@ class StructuredBelief(NamedTuple):
     market_decisions: Tensor  # Exact post-normalization input to the market heads.
 
 
+class StructuredDecisionBelief(NamedTuple):
+    """Only the normalized policy head inputs required by PPO NextLat."""
+
+    unit_decisions: Tensor
+    market_decisions: Tensor
+
+
 class StructuredCriticBelief(NamedTuple):
     """The normalized representation consumed by the critic's final value head."""
 
@@ -1110,11 +1097,11 @@ class StructuredActor(nn.Module):
 
         self.unit_head = nn.Sequential(
             RMSNorm(config.model_dim),
-            nn.Linear(config.model_dim, N_UNIT_ACTIONS),
+            Linear(config.model_dim, N_UNIT_ACTIONS),
         )
         self.market_norm = RMSNorm(config.model_dim)
-        self.market_kind = nn.Linear(config.model_dim, N_MARKET_KINDS)
-        self.market_quantity_context = nn.Linear(config.model_dim, config.quantity_rank, bias=False)
+        self.market_kind = Linear(config.model_dim, N_MARKET_KINDS)
+        self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
         self.market_quantity_value = nn.Embedding(N_QUANTITIES, config.quantity_rank)
         self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, N_QUANTITIES))
@@ -1138,7 +1125,7 @@ class StructuredActor(nn.Module):
             self.config.quantity_rank,
         )
 
-    def forward_with_belief(self, inputs: StructuredInputs) -> tuple[ActorOutput, StructuredBelief]:
+    def encode_belief(self, inputs: StructuredInputs) -> StructuredBelief:
         batch = inputs.tile_categorical.shape[0]
         trunk = self.trunk(inputs)
         local = trunk.unit_local_tiles
@@ -1202,12 +1189,7 @@ class StructuredActor(nn.Module):
                 context_norm=self.economy_context_norm,
             )
         market_hidden = self.market_norm(market_hidden)
-        output = ActorOutput(
-            unit_logits=self.unit_head[-1](unit_hidden).contiguous(),
-            market_kind_logits=self.market_kind(market_hidden).contiguous(),
-            market_quantity_context=self.market_quantity_context(market_hidden).contiguous(),
-        )
-        belief = StructuredBelief(
+        return StructuredBelief(
             own_patches=trunk.own_patches,
             opponent_patches=trunk.opponent_patches,
             opponent_summary=trunk.opponent_summary,
@@ -1216,7 +1198,23 @@ class StructuredActor(nn.Module):
             unit_decisions=unit_hidden,
             market_decisions=market_hidden,
         )
-        return output, belief
+
+    def decision_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
+        belief = self.encode_belief(inputs)
+        return StructuredDecisionBelief(belief.unit_decisions, belief.market_decisions)
+
+    def decode_belief(self, belief: StructuredBelief | StructuredDecisionBelief) -> ActorOutput:
+        return ActorOutput(
+            unit_logits=self.unit_head[-1](belief.unit_decisions).contiguous(),
+            market_kind_logits=self.market_kind(belief.market_decisions).contiguous(),
+            market_quantity_context=self.market_quantity_context(
+                belief.market_decisions
+            ).contiguous(),
+        )
+
+    def forward_with_belief(self, inputs: StructuredInputs) -> tuple[ActorOutput, StructuredBelief]:
+        belief = self.encode_belief(inputs)
+        return self.decode_belief(belief), belief
 
     def forward(self, inputs: StructuredInputs) -> ActorOutput:
         return self.forward_with_belief(inputs)[0]
@@ -1253,10 +1251,19 @@ class StructuredCritic(nn.Module):
             critic_latents=0,
         )
         self.trunk = StructuredTrunk(trunk_config, private_columns=True)
-        self.value_query = nn.Parameter(torch.randn(1, config.model_dim) * 0.02)
-        self.value_decoder = Block(trunk_config)
+        value_query = torch.randn(1, config.model_dim)
+        self.value_query = nn.Parameter(
+            torch.nn.functional.rms_norm(value_query, (config.model_dim,))
+            if config.critic_state_read
+            else value_query * SMALL_QUERY_INITIAL_SCALE
+        )
+        if not config.critic_state_read:
+            self.adam_learning_rate_multipliers = {
+                "value_query": SMALL_QUERY_INITIAL_SCALE,
+            }
+        self.value_decoder = Block(trunk_config, state_read=config.critic_state_read)
         self.value_norm = RMSNorm(config.model_dim, eps=1e-5)
-        self.value_head = nn.Linear(config.model_dim, config.value_atoms)
+        self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
         self.register_buffer(
@@ -1265,13 +1272,13 @@ class StructuredCritic(nn.Module):
             persistent=True,
         )
 
-    def forward_with_belief(
+    def encode_belief(
         self,
         inputs: StructuredInputs,
         opponent_unit_categorical: Tensor,
         opponent_unit_continuous: Tensor,
         opponent_unit_active: Tensor,
-    ) -> tuple[Tensor, StructuredCriticBelief]:
+    ) -> StructuredCriticBelief:
         batch = inputs.tile_categorical.shape[0]
         # Opponent units attend as context only; their local tiles sit on the
         # opponent farm, which the latents already read through its tokens, so
@@ -1296,11 +1303,23 @@ class StructuredCritic(nn.Module):
             trunk.latents,
         )
         value_hidden = self.value_norm(value_hidden)
-        logits = self.value_head(value_hidden[:, 0]).contiguous()
-        belief = StructuredCriticBelief(
-            value_decision=value_hidden,
+        return StructuredCriticBelief(value_decision=value_hidden)
+
+    def decode_belief(self, belief: StructuredCriticBelief) -> Tensor:
+        readout = self.value_head(belief.value_decision[:, 0])
+        return (readout if self.config.scalar_value else softcap_value_logits(readout)).contiguous()
+
+    def forward_with_belief(
+        self,
+        inputs: StructuredInputs,
+        opponent_unit_categorical: Tensor,
+        opponent_unit_continuous: Tensor,
+        opponent_unit_active: Tensor,
+    ) -> tuple[Tensor, StructuredCriticBelief]:
+        belief = self.encode_belief(
+            inputs, opponent_unit_categorical, opponent_unit_continuous, opponent_unit_active
         )
-        return logits, belief
+        return self.decode_belief(belief), belief
 
     def forward(
         self,
@@ -1317,4 +1336,6 @@ class StructuredCritic(nn.Module):
         )[0]
 
     def value(self, logits: Tensor) -> Tensor:
+        if self.config.scalar_value:
+            return logits.float().squeeze(-1)
         return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)

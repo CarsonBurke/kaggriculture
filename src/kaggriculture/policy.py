@@ -113,6 +113,7 @@ class PolicyStep:
     encoded: list[EncodedObservation] | list[StructuredObservation]
     factors: ActionFactors
 
+
 @dataclass(frozen=True)
 class PreparedQuantityHeads:
     """Immutable CPU quantity parameters for a frozen inference actor."""
@@ -274,26 +275,28 @@ def _sample_numpy_categorical(
         raise ValueError("every categorical decision needs at least one valid action")
     masked = np.where(mask, logits / max(temperature, 1e-4), -np.inf)
     shifted = masked - np.max(masked, axis=-1, keepdims=True)
-    probabilities = np.exp(shifted)
-    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    weights = np.exp(shifted)
+    positive_mass = weights > 0
     if deterministic:
+        total = weights.sum(axis=-1, keepdims=True, dtype=np.float64)
         actions = masked.argmax(axis=-1)
     else:
-        cumulative = np.cumsum(probabilities, axis=-1)
-        last_valid = mask.shape[-1] - 1 - mask[:, ::-1].argmax(axis=-1)
-        cumulative[np.arange(mask.shape[0]), last_valid] = 1.0
+        cumulative = np.cumsum(weights, axis=-1, dtype=np.float64)
+        total = cumulative[:, -1:]
         if draws is None:
-            draws = generator.random((probabilities.shape[0], 1))
-        elif draws.shape != (probabilities.shape[0], 1):
+            draws = generator.random((weights.shape[0], 1))
+        elif draws.shape != (weights.shape[0], 1):
             raise ValueError(
-                f"categorical draw shape mismatch: {draws.shape} != {(probabilities.shape[0], 1)}"
+                f"categorical draw shape mismatch: {draws.shape} != {(weights.shape[0], 1)}"
             )
-        actions = (mask & (draws <= cumulative)).argmax(axis=-1).astype(np.int64)
-    selected = probabilities[np.arange(probabilities.shape[0]), actions]
-    logprobs = np.log(np.maximum(selected, np.finfo(np.float32).tiny))
-    entropy = -(probabilities * np.log(np.maximum(probabilities, np.finfo(np.float32).tiny))).sum(
-        axis=-1
-    )
+        intervals = positive_mass & (draws * total < cumulative)
+        last_positive = weights.shape[-1] - 1 - positive_mass[:, ::-1].argmax(axis=-1)
+        actions = np.where(intervals.any(axis=-1), intervals.argmax(axis=-1), last_positive)
+    log_total = np.log(total[:, 0])
+    logprobs = shifted[np.arange(weights.shape[0]), actions] - log_total
+    # Zero-mass entries contribute zero even when their masked logit is -inf.
+    np.multiply(weights, shifted, out=weights, where=positive_mass)
+    entropy = log_total - weights.sum(axis=-1, dtype=np.float64) / total[:, 0]
     return actions, logprobs.astype(np.float32), entropy.astype(np.float32)
 
 
@@ -727,9 +730,7 @@ def act_batch(
         # scores the same categorical event the sampler drew.
         unit_masks=unit_masks
         if orientation is Orientation.IDENTITY
-        else orient_unit_masks(
-            unit_masks, np.full(batch_size, int(orientation), dtype=np.int8)
-        ),
+        else orient_unit_masks(unit_masks, np.full(batch_size, int(orientation), dtype=np.int8)),
         market_kind_masks=kind_masks,
         market_quantity_masks=quantity_masks,
         unit_active=unit_active,

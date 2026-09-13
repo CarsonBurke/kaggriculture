@@ -61,10 +61,13 @@ from typing import Any, Protocol
 #: are flat configuration bounds, one chart per head, and the bound they guard
 #: keeps its own curve -- and behavior cloning's per-module representation
 #: diagnostics moved out of `misc` into `representation-<module>/`. Both are
-#: placement logic the table values do not express, so the epoch moves with the
-#: fingerprint.
+#: placement logic the table values do not express, so the epoch moves with
+#: the fingerprint.
 #: 12: NextLat persistence ratios are diagnostics, not predictor-quality gates.
-_LAYOUT_EPOCH = 12
+#: 13: per-opponent credit diagnostics are weighted into one opponent cohort
+#: per horizon. Opponent checkpoint ids are unbounded, so exposing each as a
+#: TensorBoard run creates one six-chart selector row per sampled opponent.
+_LAYOUT_EPOCH = 13
 _MANIFEST_NAME = ".kaggriculture-tensorboard.json"
 
 
@@ -517,6 +520,7 @@ _TRAINING_TAGS = {
     "critic_fit_explained_variance_last_epoch": "critic/fit_explained_variance_last_epoch",
     "lambda_return_explained_variance": "critic/lambda_return_explained_variance",
     "monte_carlo_explained_variance": "critic/monte_carlo_explained_variance",
+    "monte_carlo_r_squared": "critic/monte_carlo_r_squared",
     "value_target_correlation": "critic/target_correlation",
     "critic_gradient_norm": "critic/gradient_norm",
     "critic_trunk_gradient_norm": "critic-clip/trunk_gradient_norm",
@@ -684,6 +688,10 @@ _STRUCTURED_PREFIXES: tuple[tuple[str, str], ...] = (
 )
 _CREDIT_PREFIX = "credit_preupdate_"
 _CREDIT_HORIZONS = ("all", "ttg_1_32", "ttg_33_128", "ttg_129_512", "ttg_513_plus")
+#: All sampled opponents share one TensorBoard cohort. Their ids are useful in
+#: the JSONL journal, but not as independent curves: a new checkpoint would
+#: otherwise mint another six-chart category forever.
+_CREDIT_OPPONENT_CATEGORY = "opponents"
 _STRUCTURED_ACTOR_TERM_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "decision",
@@ -928,7 +936,11 @@ def _layout_fingerprint() -> str:
                 "statistics": _STRUCTURED_REPRESENTATION_STATISTICS,
             },
             "fatal_at": _FATAL_AT_SUFFIX,
-            "credit": {"prefix": _CREDIT_PREFIX, "horizons": _CREDIT_HORIZONS},
+            "credit": {
+                "prefix": _CREDIT_PREFIX,
+                "horizons": _CREDIT_HORIZONS,
+                "opponent_category": _CREDIT_OPPONENT_CATEGORY,
+            },
             "unplotted": sorted(_UNPLOTTED),
             "opponents": {
                 "prefix": _OPPONENT_PREFIX,
@@ -1040,6 +1052,66 @@ def _population_placement(statistic: str) -> tuple[str, str]:
     return "", f"{_POPULATION_CATEGORY}/{statistic}"
 
 
+def _credit_metric_parts(name: str) -> tuple[str, str, str] | None:
+    """Split a credit field into group, horizon, and metric."""
+    if not name.startswith(_CREDIT_PREFIX):
+        return None
+    statistic = name[len(_CREDIT_PREFIX) :]
+    for horizon in _CREDIT_HORIZONS:
+        group, separator, metric = statistic.partition(f"_{horizon}_")
+        if group and separator and metric:
+            return group, horizon, metric
+    return None
+
+
+def _credit_placement(name: str) -> tuple[str, str] | None:
+    parts = _credit_metric_parts(name)
+    if parts is None:
+        return None
+    group, horizon, metric = parts
+    label = _CREDIT_OPPONENT_CATEGORY if group.startswith("opponent_") else group.replace("_", "-")
+    return "", f"credit-{label}-{horizon.replace('_', '-')}/{metric}"
+
+
+def _credit_opponent_scalars(
+    record: dict[str, Any],
+) -> Iterator[tuple[str, str, float]]:
+    """Aggregate opponent credit diagnostics by horizon.
+
+    Checkpoint ids are intentionally retained in JSONL but are not stable
+    TensorBoard series. Each metric is averaged with its state's count, so a
+    partially sampled opponent cannot outweigh a fully sampled one.
+    """
+    groups: dict[tuple[str, str], dict[str, float]] = {}
+    for name, value in record.items():
+        parts = _credit_metric_parts(name)
+        if parts is None or not parts[0].startswith("opponent_"):
+            continue
+        numeric = _number(value)
+        if numeric is not None:
+            groups.setdefault((parts[0], parts[1]), {})[parts[2]] = numeric
+
+    for horizon in _CREDIT_HORIZONS:
+        weighted: dict[str, float] = {}
+        total_states = 0.0
+        for (_, group_horizon), metrics in groups.items():
+            if group_horizon != horizon:
+                continue
+            states = max(metrics.get("states", 0.0), 0.0)
+            if states <= 0.0:
+                continue
+            total_states += states
+            for metric, value in metrics.items():
+                if metric != "states":
+                    weighted[metric] = weighted.get(metric, 0.0) + value * states
+        if total_states <= 0.0:
+            continue
+        tag_root = f"credit-{_CREDIT_OPPONENT_CATEGORY}-{horizon.replace('_', '-')}"
+        yield "", f"{tag_root}/states", total_states
+        for metric in sorted(weighted):
+            yield "", f"{tag_root}/{metric}", weighted[metric] / total_states
+
+
 def _agentless_placement(name: str) -> tuple[str, str] | None:
     """Return the (run, tag) a field is mirrored at, before its agent joins it.
 
@@ -1061,12 +1133,9 @@ def _agentless_placement(name: str) -> tuple[str, str] | None:
     tag = _TRAINING_TAGS.get(name)
     if tag is not None:
         return "", tag
-    if name.startswith(_CREDIT_PREFIX):
-        statistic = name[len(_CREDIT_PREFIX) :]
-        for horizon in _CREDIT_HORIZONS:
-            group, separator, metric = statistic.partition(f"_{horizon}_")
-            if group and separator and metric:
-                return "", f"credit-{group.replace('_', '-')}-{horizon.replace('_', '-')}/{metric}"
+    credit = _credit_placement(name)
+    if credit is not None:
+        return credit
     if name.startswith(_POPULATION_PREFIX):
         # Ahead of the cohort loop below, whose empty prefix matches everything:
         # it would file the whole matrix in `misc`, one chart per ordered pair.
@@ -1198,12 +1267,19 @@ def _write_record(
     if step_field is not None:
         step = int(record[step_field])
         for name, value in record.items():
-            if name == step_field or name.startswith(_OPPONENT_PREFIX):
+            credit_parts = _credit_metric_parts(name)
+            if (
+                name == step_field
+                or name.startswith(_OPPONENT_PREFIX)
+                or (credit_parts is not None and credit_parts[0].startswith("opponent_"))
+            ):
                 continue
             scalar = _number(value)
             placement = None if scalar is None else _placement(name)
             if scalar is not None and placement is not None:
                 writers.add_scalar(placement[0], placement[1], scalar, step)
+        for run, tag, aggregate in _credit_opponent_scalars(record):
+            writers.add_scalar(run, tag, aggregate, step)
         for run, tag, aggregate in _opponent_scalars(record):
             writers.add_scalar(run, tag, aggregate, step)
         return

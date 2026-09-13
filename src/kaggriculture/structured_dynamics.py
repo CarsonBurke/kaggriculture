@@ -29,6 +29,7 @@ from kaggriculture.structured import (
     StructuredBelief,
     StructuredConfig,
     StructuredCriticBelief,
+    StructuredDecisionBelief,
     StructuredInputs,
 )
 from kaggriculture.tokens import TILE_COUNT
@@ -160,7 +161,7 @@ class StructuredDynamics(nn.Module):
 
     def forward(
         self,
-        belief: StructuredBelief,
+        belief: StructuredBelief | StructuredDecisionBelief,
         unit_actions: Tensor,
         market_kinds: Tensor,
         market_quantities: Tensor,
@@ -168,7 +169,7 @@ class StructuredDynamics(nn.Module):
         unit_active: Tensor,
         *,
         active_fields: tuple[bool, ...] | None = None,
-    ) -> StructuredBelief:
+    ) -> StructuredBelief | StructuredDecisionBelief:
         values = tuple(belief)
         if active_fields is None:
             active_fields = (True,) * len(values)
@@ -179,7 +180,10 @@ class StructuredDynamics(nn.Module):
             for kind, (value, active) in enumerate(zip(values, active_fields, strict=True))
             if active
         ]
-        queries = [self._query(value, kind) for kind, value in selected]
+        queries = [
+            self._query(value, StructuredBelief._fields.index(belief._fields[kind]))
+            for kind, value in selected
+        ]
         unit_action, market_action = self.action(
             unit_actions,
             market_kinds,
@@ -191,7 +195,7 @@ class StructuredDynamics(nn.Module):
         # decision-only transitions see only the head representations and action.
         state_context = (
             belief.central_latents
-            if any(active_fields[:5])
+            if isinstance(belief, StructuredBelief) and any(active_fields[:5])
             else torch.cat((belief.unit_decisions, belief.market_decisions), dim=1)
         )
         context = torch.cat((state_context, unit_action, market_action), dim=1)
@@ -202,7 +206,7 @@ class StructuredDynamics(nn.Module):
         outputs = list(values)
         for (kind, value), delta in zip(selected, deltas, strict=True):
             outputs[kind] = value + delta
-        return StructuredBelief(*outputs)
+        return type(belief)(*outputs)
 
 
 class StructuredCriticDynamics(nn.Module):
@@ -470,15 +474,26 @@ def _active_belief_fields(
         opponent_summary_active,
         economy_active,
         recurrent_workspace
-        and (own_patches_active or economy_active or opponent_summary_active or opponent_patches_active),
+        and (
+            own_patches_active
+            or economy_active
+            or opponent_summary_active
+            or opponent_patches_active
+        ),
         bool(decision_horizon),
         bool(decision_horizon),
     )
 
 
+def _selected_belief_fields(belief, active: tuple[bool, ...]) -> tuple[bool, ...]:
+    if isinstance(belief, StructuredDecisionBelief) and any(active[:5]):
+        raise ValueError("world objectives require complete structured beliefs")
+    return tuple(active[StructuredBelief._fields.index(name)] for name in belief._fields)
+
+
 def structured_horizon_loss(
     dynamics: StructuredDynamics,
-    belief: StructuredBelief,
+    belief: StructuredBelief | StructuredDecisionBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
     *,
@@ -490,7 +505,7 @@ def structured_horizon_loss(
     economy_active: bool = False,
     opponent_summary_active: bool = False,
     opponent_patches_active: bool = False,
-    target_belief: StructuredBelief | None = None,
+    target_belief: StructuredBelief | StructuredDecisionBelief | None = None,
     plan: StructuredHorizonPlan | None = None,
 ) -> StructuredDynamicsTerms:
     """Unroll typed dynamics against exact contiguous demonstrated successors."""
@@ -511,14 +526,12 @@ def structured_horizon_loss(
     if plan is not None and plan.eligible.shape[0] < max_horizon:
         raise ValueError("structured plan does not cover the requested horizon")
     source_index = (
-        torch.arange(belief.central_latents.shape[0], device=belief.central_latents.device)
+        torch.arange(belief.unit_decisions.shape[0], device=belief.unit_decisions.device)
         if plan is None
         else plan.indices[0]
     )
-    predicted = (
-        belief if plan is None else StructuredBelief(*(value[source_index] for value in belief))
-    )
-    zero = belief.central_latents.new_zeros((), dtype=torch.float32)
+    predicted = belief if plan is None else type(belief)(*(value[source_index] for value in belief))
+    zero = belief.unit_decisions.new_zeros((), dtype=torch.float32)
     sums = [zero for _ in range(16)]
     eligible_sum = zero
     decision_steps = 0
@@ -535,6 +548,7 @@ def structured_horizon_loss(
         opponent_summary_active=opponent_summary_active,
         opponent_patches_active=opponent_patches_active,
     )
+    active_fields = _selected_belief_fields(belief, active_fields)
 
     rows = torch.arange(
         factors["episode_index"].shape[0],
@@ -563,13 +577,19 @@ def structured_horizon_loss(
         else:
             target_index = plan.indices[plan.eligible.shape[0] + offset]
             eligible = plan.eligible[offset - 1]
-        sums[11] = sums[11] + _belief_rms_ratio(predicted, previous, eligible)
+        sums[11] = sums[11] + _belief_rms_ratio(
+            tuple(value for value, active in zip(predicted, active_fields, strict=True) if active),
+            tuple(value for value, active in zip(previous, active_fields, strict=True) if active),
+            eligible,
+        )
         for kind, (predicted_value, previous_value) in enumerate(
             zip(predicted, previous, strict=True)
         ):
-            residual_sums[kind] = residual_sums[kind] + _eligible_rms_ratio(
-                predicted_value, previous_value, eligible
-            )
+            if active_fields[kind]:
+                field_index = StructuredBelief._fields.index(belief._fields[kind])
+                residual_sums[field_index] = residual_sums[field_index] + _eligible_rms_ratio(
+                    predicted_value, previous_value, eligible
+                )
 
         if offset <= latent_horizon:
             joined_predicted_latent = torch.cat(
@@ -718,7 +738,7 @@ def structured_horizon_loss(
 
 def structured_window_loss(
     dynamics: StructuredDynamics,
-    belief: StructuredBelief,
+    belief: StructuredBelief | StructuredDecisionBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
     *,
@@ -744,7 +764,7 @@ def structured_window_loss(
     if max_horizon < 1:
         raise ValueError("structured window objective needs a positive horizon")
     width = max_horizon + 1
-    rows = belief.own_patches.shape[0]
+    rows = belief.unit_decisions.shape[0]
     if rows % width:
         raise ValueError("structured window rows do not contain complete windows")
     windows = rows // width
@@ -752,14 +772,14 @@ def structured_window_loss(
     def window(value: Tensor) -> Tensor:
         return value.reshape(windows, width, *value.shape[1:])
 
-    windowed_belief = StructuredBelief(*(window(value) for value in belief))
+    windowed_belief = type(belief)(*(window(value) for value in belief))
     windowed_inputs = StructuredInputs(*(window(value) for value in inputs))
     windowed_factors = {
         name: window(value)
         for name, value in factors.items()
         if name not in {"episode_index", "step"}
     }
-    zero = belief.own_patches.new_zeros(())
+    zero = belief.unit_decisions.new_zeros((), dtype=torch.float32)
     sums = [zero for _ in range(15)]
     latent_sum = zero
     eligible_sum = zero
@@ -777,16 +797,17 @@ def structured_window_loss(
         opponent_summary_active=opponent_summary_active,
         opponent_patches_active=opponent_patches_active,
     )
-    predicted: StructuredBelief | None = None
+    active_fields = _selected_belief_fields(belief, active_fields)
+    predicted: StructuredBelief | StructuredDecisionBelief | None = None
 
     for offset in range(1, max_horizon + 1):
         source_positions = width - offset
         if predicted is None:
-            previous = StructuredBelief(
+            previous = type(belief)(
                 *(value[:, :source_positions].flatten(0, 1) for value in windowed_belief)
             )
         else:
-            previous = StructuredBelief(
+            previous = type(belief)(
                 *(
                     value.reshape(windows, source_positions + 1, *value.shape[1:])[
                         :, :source_positions
@@ -806,21 +827,25 @@ def structured_window_loss(
         )
         predicted = current
         target_slice = slice(offset, offset + source_positions)
-        targets = StructuredBelief(
-            *(value[:, target_slice].flatten(0, 1) for value in windowed_belief)
-        )
+        targets = type(belief)(*(value[:, target_slice].flatten(0, 1) for value in windowed_belief))
         eligible = torch.ones(
             windows * source_positions,
             dtype=torch.bool,
-            device=belief.own_patches.device,
+            device=belief.unit_decisions.device,
         )
-        sums[11] = sums[11] + _belief_rms_ratio(current, previous, eligible)
+        sums[11] = sums[11] + _belief_rms_ratio(
+            tuple(value for value, active in zip(current, active_fields, strict=True) if active),
+            tuple(value for value, active in zip(previous, active_fields, strict=True) if active),
+            eligible,
+        )
         for kind, (predicted_value, previous_value) in enumerate(
             zip(current, previous, strict=True)
         ):
-            residual_sums[kind] = residual_sums[kind] + _eligible_rms_ratio(
-                predicted_value, previous_value, eligible
-            )
+            if active_fields[kind]:
+                field_index = StructuredBelief._fields.index(belief._fields[kind])
+                residual_sums[field_index] = residual_sums[field_index] + _eligible_rms_ratio(
+                    predicted_value, previous_value, eligible
+                )
 
         if offset <= latent_horizon:
             latent_sum = latent_sum + _belief_latent_smooth_l1(

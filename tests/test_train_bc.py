@@ -1288,7 +1288,6 @@ def test_the_structured_auxiliary_trains_and_is_journalled(
         "structured_decision_unit",
         "structured_decision_market_kind",
         "structured_residual_ratio",
-        "structured_residual_own_patches",
         "structured_decision_one",
         "structured_decision_final",
     ):

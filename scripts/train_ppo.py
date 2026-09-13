@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.evaluation import (
     DEVELOPMENT_SEED_START,
     ONLINE_RL_SEED_START,
@@ -65,8 +66,10 @@ from kaggriculture.ppo import (
     Actor,
     PpoConfig,
     actor_forward_args,
+    actor_lr_cooldown_scale,
     make_optimizers,
     make_structured_dynamics_optimizer,
+    set_lr_cooldown,
     update_ppo,
     update_replay_parity,
 )
@@ -132,7 +135,7 @@ MAX_CHECKPOINT_SECONDS = 600.0
 DEFAULT_CHECKPOINT_SECONDS = 420.0
 DEFAULT_CRITIC_EPOCHS = PpoConfig.epochs
 DEFAULT_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_ITERATIONS
-CRITIC_WARMUP_READY_MONTE_CARLO_EV = 0.10
+CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED = 0.10
 MAX_CRITIC_WARMUP_ITERATIONS = PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS
 
 AUTOCULL_POLICY = {
@@ -390,8 +393,8 @@ def parse_args() -> argparse.Namespace:
         help="total critic epochs (>= --epochs; defaults to the same one pass)",
     )
     parser.add_argument("--minibatch-size", type=int, default=PpoConfig.minibatch_size)
-    parser.add_argument("--clip-low", type=float, default=0.80)
-    parser.add_argument("--clip-high", type=float, default=1.28)
+    parser.add_argument("--clip-low", type=float, default=PpoConfig.clip_low)
+    parser.add_argument("--clip-high", type=float, default=PpoConfig.clip_high)
     parser.add_argument(
         "--gamma",
         type=float,
@@ -403,15 +406,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            "policy GAE lambda; defaults to VAPO's formula 1-1/(0.05*719) at the "
-            "fixed competition horizon. Critic targets use --critic-gae-lambda"
+            "policy GAE lambda; defaults to 1.0 to retain delayed investment "
+            "payoffs. Critic targets use --critic-gae-lambda"
         ),
     )
     parser.add_argument(
         "--critic-gae-lambda",
         type=float,
         default=DEFAULT_CRITIC_GAE_LAMBDA,
-        help="critic GAE lambda; defaults to 1.0 (VAPO decoupled GAE, unbiased return)",
+        help="critic GAE lambda; defaults to 1.0 (discounted Monte Carlo return)",
+    )
+    parser.add_argument(
+        "--normalize-advantages",
+        action="store_true",
+        help=(
+            "whiten the surrogate's advantages over each wave's owned valid "
+            "states. The scale half is a no-op under NorMuon, which normalizes "
+            "every matrix update's spectrum; the mean half removes the "
+            "common-mode offset that pushes every sampled action's logprob the "
+            "same way"
+        ),
     )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
@@ -547,8 +561,34 @@ def parse_args() -> argparse.Namespace:
         help=(
             "minimum critic-only iterations before actor release; after this floor, "
             "the actor remains frozen until the previous fresh-wave pre-update Monte "
-            f"Carlo-return EV reaches {CRITIC_WARMUP_READY_MONTE_CARLO_EV:.2f}; "
+            f"Carlo-return R-squared reaches {CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED:.2f}; "
             f"defaults to {DEFAULT_CRITIC_WARMUP_ITERATIONS} for a fresh warm start"
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-late-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "abort the run if anything compiles once the actor is released and "
+            "the neural league layout is unchanged from the previous wave. "
+            "Newly selected neural lane counts or widths compile on first use; "
+            "previously seen layouts reuse persistent compiled callables. "
+            "Compiles in settled waves indicate a guard failure or a frame "
+            "the warmups missed, and their wall time is recorded per wave"
+        ),
+    )
+    parser.add_argument(
+        "--actor-lr-cooldown-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "decay the actor's learning rate linearly to zero over this trailing "
+            "fraction of --iterations; zero disables it. A NorMuon step is "
+            "invariant to gradient scale and Adam's is scale-free, so without a "
+            "decay the policy's displacement per step is constant for the whole "
+            "run no matter how good it already is. The reference this optimizer "
+            "comes from uses 0.60"
         ),
     )
     args = parser.parse_args()
@@ -686,7 +726,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     if any(horizon < 0 for horizon in structured_horizons):
         raise ValueError("structured auxiliary horizons cannot be negative")
     if any(structured_actor_coefficients) and args.structured_decision_horizon < 1:
-        raise ValueError("structured decision horizon must be positive when actor NextLat is active")
+        raise ValueError(
+            "structured decision horizon must be positive when actor NextLat is active"
+        )
     if any(structured_critic_coefficients) and args.structured_critic_horizon < 1:
         raise ValueError(
             "structured critic horizon must be positive when critic auxiliary is active"
@@ -815,10 +857,10 @@ def _load_initial_actor(
 ) -> dict[str, object]:
     """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
 
-    The artifact must carry exactly this run's model configuration. The critic
-    and both optimizers deliberately start fresh — a clone brings no value
-    function — and the pre-loop league snapshot then seeds the frozen-opponent
-    archive with the pretrained policy automatically, so the learner must keep
+    The artifact must carry the same actor configuration; critic-only structured
+    fields may differ. The critic and both optimizers deliberately start fresh —
+    a clone brings no value function — and the pre-loop league snapshot seeds
+    the archive with the pretrained policy automatically, so the learner must keep
     beating its own starting point.
     """
     pretrained, payload = load_actor_artifact(path, device)
@@ -826,7 +868,18 @@ def _load_initial_actor(
     if artifact_architecture.name != architecture_name:
         raise ValueError("initial actor artifact architecture does not match arguments")
     artifact_config = artifact_architecture.build_config(payload["model_config"]).to_dict()
-    if artifact_config != model_config.to_dict():
+    expected_config = model_config.to_dict()
+    # Only the critic reads `scalar_value`: it selects that model's value head,
+    # and a BC clone's actor is bit-identical either way, so requiring equality
+    # here would make every scalar-critic arm need its own clone.
+    for name in ("scalar_value",):
+        artifact_config.pop(name)
+        expected_config.pop(name)
+    if isinstance(model_config, StructuredConfig):
+        for name in ("critic_core_layers", "critic_latents", "critic_state_read"):
+            artifact_config.pop(name)
+            expected_config.pop(name)
+    if artifact_config != expected_config:
         raise ValueError("initial actor artifact model configuration does not match arguments")
     actor.load_state_dict(pretrained.state_dict())
     return {
@@ -1322,11 +1375,11 @@ def _validate_critic_warmup_state(
         raise ValueError("resume checkpoint has an invalid critic warmup minimum")
     if not isinstance(state, dict) or set(state) != {
         "complete",
-        "last_monte_carlo_explained_variance",
+        "last_monte_carlo_r_squared",
     }:
         raise ValueError("resume checkpoint has no valid adaptive critic warmup state")
     complete = state["complete"]
-    values = state["last_monte_carlo_explained_variance"]
+    values = state["last_monte_carlo_r_squared"]
     if type(complete) is not bool or not isinstance(values, list) or len(values) != population:
         raise ValueError("resume checkpoint has no valid adaptive critic warmup state")
     validated: list[float | None] = []
@@ -1336,7 +1389,7 @@ def _validate_critic_warmup_state(
         elif type(value) is float and math.isfinite(value):
             validated.append(value)
         else:
-            raise ValueError("resume checkpoint has an invalid critic warmup EV")
+            raise ValueError("resume checkpoint has an invalid critic warmup R-squared")
     return minimum, complete, validated
 
 
@@ -1345,26 +1398,29 @@ def _critic_warmup_decision(
     iteration: int,
     minimum: int,
     complete: bool,
-    previous_evs: Sequence[float | None],
+    previous_r_squared: Sequence[float | None],
 ) -> tuple[bool, str]:
     """Decide actor release from only prior-wave evidence."""
     if complete:
         return False, "complete"
     if iteration < minimum:
         return True, "minimum_iterations"
-    ready = bool(previous_evs) and all(
-        value is not None and math.isfinite(value) and value >= CRITIC_WARMUP_READY_MONTE_CARLO_EV
-        for value in previous_evs
+    ready = bool(previous_r_squared) and all(
+        value is not None
+        and math.isfinite(value)
+        and value >= CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED
+        for value in previous_r_squared
     )
     if ready:
-        return False, "monte_carlo_ev_ready"
+        return False, "monte_carlo_r_squared_ready"
     if iteration >= MAX_CRITIC_WARMUP_ITERATIONS:
         raise RuntimeError(
-            "critic warmup failed to reach Monte Carlo-return explained variance "
-            f"{CRITIC_WARMUP_READY_MONTE_CARLO_EV:.2f} within "
-            f"{MAX_CRITIC_WARMUP_ITERATIONS} iterations; previous member EVs={list(previous_evs)}"
+            "critic warmup failed to reach Monte Carlo-return R-squared "
+            f"{CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED:.2f} within "
+            f"{MAX_CRITIC_WARMUP_ITERATIONS} iterations; "
+            f"previous member R-squared={list(previous_r_squared)}"
         )
-    return True, "waiting_for_monte_carlo_ev"
+    return True, "waiting_for_monte_carlo_r_squared"
 
 
 def _validate_league_score_rates(rates: object) -> dict[str, float]:
@@ -2017,14 +2073,7 @@ def _validate_policy_entropy_reference(value: object) -> float:
     return float(value)
 
 
-_STRUCTURED_ACTOR_PERSISTENCE_FIELDS = (
-    "combined",
-    "decision",
-    "patch",
-    "economy",
-    "opponent_summary",
-    "opponent_patches",
-)
+_STRUCTURED_ACTOR_PERSISTENCE_FIELDS = ("combined", "latent", "decision")
 _STRUCTURED_CRITIC_PERSISTENCE_FIELDS = ("combined", "latent", "value")
 
 
@@ -2409,6 +2458,7 @@ def main() -> None:
         gamma=args.gamma,
         actor_gae_lambda=args.actor_gae_lambda,
         critic_gae_lambda=args.critic_gae_lambda,
+        normalize_advantages=args.normalize_advantages,
         nextlat_max_gradient_norm=args.nextlat_max_gradient_norm,
         target_kl=args.target_kl,
         optimizer=args.optimizer,
@@ -2489,7 +2539,7 @@ def main() -> None:
     initial_actor_provenance: dict[str, Any] | None = None
     critic_warmup_iterations = 0
     critic_warmup_complete = True
-    critic_warmup_previous_evs: list[float | None] = []
+    critic_warmup_previous_r_squared: list[float | None] = []
     initial_actors = _initial_actor_paths(args)
     if initial_actors:
         records = [
@@ -2508,13 +2558,13 @@ def main() -> None:
         initial_actor_provenance = records[0] if population == 1 else {"agents": records}
         critic_warmup_iterations = args.critic_warmup_iterations or 0
         critic_warmup_complete = False
-        critic_warmup_previous_evs = [None for _ in members]
+        critic_warmup_previous_r_squared = [None for _ in members]
         # The release gate travels inside the warm-start record so a crash
         # resumes with the exact prior-wave evidence and latch state.
         initial_actor_provenance["critic_warmup_iterations"] = critic_warmup_iterations
         initial_actor_provenance["critic_warmup_state"] = {
             "complete": critic_warmup_complete,
-            "last_monte_carlo_explained_variance": list(critic_warmup_previous_evs),
+            "last_monte_carlo_r_squared": list(critic_warmup_previous_r_squared),
         }
     generator = np.random.default_rng(args.seed + 1)
     auxiliary_generator = (
@@ -2561,7 +2611,7 @@ def main() -> None:
         (
             critic_warmup_iterations,
             critic_warmup_complete,
-            critic_warmup_previous_evs,
+            critic_warmup_previous_r_squared,
         ) = _validate_critic_warmup_state(
             initial_actor_provenance,
             population=population,
@@ -2881,7 +2931,6 @@ def main() -> None:
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
-            seed_usage=seed_usage,
         )
     replace_checkpoint_alias(numbered_checkpoint, destination_latest)
     last_checkpoint_iteration = iteration
@@ -2894,6 +2943,9 @@ def main() -> None:
     # iteration rather than wait out the cadence.
     last_parity_audit: dict[str, int] = {}
     external_eval_process: subprocess.Popen | None = None
+    compile_watch = CompileWatch()
+    previous_lane_signature: tuple[int, int] | None = None
+    previous_warmup_active: bool | None = None
     while iteration < args.iterations and not (autocull is not None and autocull.culled):
         # Opponent discovery below must observe the previous iteration's
         # immutable actor snapshot. The same barrier publishes its metrics and
@@ -2916,7 +2968,7 @@ def main() -> None:
             iteration=iteration,
             minimum=critic_warmup_iterations,
             complete=critic_warmup_complete,
-            previous_evs=critic_warmup_previous_evs,
+            previous_r_squared=critic_warmup_previous_r_squared,
         )
         if initial_actor_provenance is not None and not warmup_active:
             critic_warmup_complete = True
@@ -2926,20 +2978,20 @@ def main() -> None:
             ready_members = sum(
                 value is not None
                 and math.isfinite(value)
-                and value >= CRITIC_WARMUP_READY_MONTE_CARLO_EV
-                for value in critic_warmup_previous_evs
+                and value >= CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED
+                for value in critic_warmup_previous_r_squared
             )
             warmup_diagnostics = {
                 "critic_warmup_active": int(warmup_active),
                 "critic_warmup_reason": warmup_reason,
                 "critic_warmup_minimum_iterations": critic_warmup_iterations,
                 "critic_warmup_max_iterations": MAX_CRITIC_WARMUP_ITERATIONS,
-                "critic_warmup_readiness_threshold": CRITIC_WARMUP_READY_MONTE_CARLO_EV,
+                "critic_warmup_readiness_threshold": CRITIC_WARMUP_READY_MONTE_CARLO_R_SQUARED,
                 "critic_warmup_ready_members": ready_members,
                 "critic_warmup_required_members": population,
             }
-            for agent, value in enumerate(critic_warmup_previous_evs):
-                name = "critic_warmup_previous_monte_carlo_explained_variance"
+            for agent, value in enumerate(critic_warmup_previous_r_squared):
+                name = "critic_warmup_previous_monte_carlo_r_squared"
                 if population > 1:
                     name = population_agent_field(agent, name)
                 warmup_diagnostics[name] = value
@@ -2952,6 +3004,9 @@ def main() -> None:
         # The wave's wall-clock is indivisible; per-part timing keys would
         # merely repeat it, so slice diagnostics keep only outcome metrics.
         indivisible_timings = ("rollout_seconds", "rollout_states_per_second")
+        # A population wave has no frozen or built-in lane, so its layout is the
+        # population itself and never moves.
+        lane_signature: tuple[int, int] = (population, 0)
         if population > 1:
             # One ensemble forward over N lanes covering every row, lane index =
             # agent index. Both seats belong to learners and both are stored, so
@@ -3034,6 +3089,19 @@ def main() -> None:
                     seed_start=next_seed + args.games,
                 )
                 opponent_checkpoint = ",".join(row.label for row in selections)
+            # Only assigned neural lanes enter the ensemble. Built-in contests
+            # can change this geometry even after the snapshot pool is full.
+            # Previously seen layouts reuse their persistent compiled callable;
+            # a new layout pays its first compile when it is actually selected.
+            neural_counts = (
+                np.bincount(assignments, minlength=len(selections))[: len(opponents)]
+                if assignments is not None
+                else np.empty(0, dtype=np.int64)
+            )
+            lane_signature = (
+                int(np.count_nonzero(neural_counts)),
+                int(neural_counts.max(initial=0)),
+            )
             # Self-play and league games advance in one native wave, so the
             # learner forward covers every current-policy row at once and the
             # collector writes straight into the shared arena.
@@ -3072,6 +3140,7 @@ def main() -> None:
                 forward_autocast=args.rollout_bfloat16,
                 storage=rollout_arena if league_games else self_play_storage,
             )
+
             diagnostic_groups = {
                 "self_play": np.arange(rollout.trajectories) < self_play_rows,
                 "league": np.arange(rollout.trajectories) >= self_play_rows,
@@ -3133,10 +3202,14 @@ def main() -> None:
         # Once per member, over that member's rows. A game's two seats belong to
         # two members, so the partition is a row index, not a slice.
         update_metrics: dict[str, float | int] = {}
-        current_warmup_evs: list[float] = []
+        current_warmup_r_squared: list[float] = []
+        actor_cooldown = actor_lr_cooldown_scale(
+            iteration, args.iterations, args.actor_lr_cooldown_frac
+        )
         for agent, (member, rows) in enumerate(zip(members, agent_rows, strict=True)):
             if member.actor_optimizer is None or member.critic_optimizer is None:
                 raise RuntimeError("training member has no optimizer")
+            set_lr_cooldown(member.actor_optimizer, actor_cooldown)
             for name, predictor, optimizer in (
                 (
                     "actor",
@@ -3197,12 +3270,12 @@ def main() -> None:
             )
             update_metrics.update(_agent_fields(measured, agent, population))
             if initial_actor_provenance is not None:
-                current_warmup_evs.append(float(measured["monte_carlo_explained_variance"]))
+                current_warmup_r_squared.append(float(measured["monte_carlo_r_squared"]))
         if initial_actor_provenance is not None:
-            critic_warmup_previous_evs = current_warmup_evs
-            initial_actor_provenance["critic_warmup_state"][
-                "last_monte_carlo_explained_variance"
-            ] = list(critic_warmup_previous_evs)
+            critic_warmup_previous_r_squared = current_warmup_r_squared
+            initial_actor_provenance["critic_warmup_state"]["last_monte_carlo_r_squared"] = list(
+                critic_warmup_previous_r_squared
+            )
         update_seconds = time.monotonic() - update_started
         iteration += 1
         metrics = {
@@ -3229,6 +3302,45 @@ def main() -> None:
             **update_metrics,
             **warmup_diagnostics,
         }
+        compile_events, compile_reasons = compile_watch.drain()
+        metrics["dynamo_compiles"] = len(compile_events)
+        metrics["actor_lr_cooldown_scale"] = actor_cooldown
+        metrics["dynamo_recompiles"] = sum(event.recompile for event in compile_events)
+        metrics["dynamo_compile_seconds"] = sum(event.seconds for event in compile_events)
+        if compile_events:
+            print(
+                json.dumps(
+                    {
+                        "event": "compilations",
+                        "iteration": iteration,
+                        "frames": [event.describe() for event in compile_events],
+                    }
+                ),
+                flush=True,
+            )
+        # Two facts have to hold before a compile is a fault rather than a run
+        # growing into its own configuration:
+        #  * the actor was already unfrozen for the *previous* wave, so the
+        #    actor optimizer and its objective have traced -- its forward and
+        #    backward are warmed while frozen, but the release wave is still the
+        #    first to step the actor, so it keeps a one-wave grace;
+        #  * this wave's league lane layout repeats the previous one, so the
+        #    collector's only legitimately moving shape has stopped moving.
+        # Everything else -- minibatch rows, replay chunks, rollout batch,
+        # episode horizon -- is fixed by configuration from wave one, and every
+        # frame is warmed in wave one, so a settled wave must compile nothing at
+        # all: a recompile means an input varied, a first compile means a warmup
+        # did not reach a frame that the wave then paid for.
+        settled = (
+            not warmup_active
+            and previous_warmup_active is False
+            and lane_signature == previous_lane_signature
+        )
+        metrics["dynamo_shapes_settled"] = int(settled)
+        if args.fail_on_late_compile and settled:
+            compile_watch.check(compile_events, compile_reasons)
+        previous_lane_signature = lane_signature
+        previous_warmup_active = warmup_active
         if not all(math.isfinite(value) for value in metrics.values() if isinstance(value, float)):
             raise FloatingPointError(f"non-finite training metric: {metrics}")
         if autocull is not None:

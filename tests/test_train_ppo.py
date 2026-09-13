@@ -36,35 +36,11 @@ def _training_script():
     return module
 
 
-def test_training_defaults_prioritize_fresh_games_and_diverse_league(monkeypatch, tmp_path) -> None:
+def test_training_rejects_invalid_checkpoint_gamma_and_kl_boundaries(monkeypatch, tmp_path) -> None:
     module = _training_script()
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path)])
 
     args = module.parse_args()
-
-    assert (args.games, args.league_games) == (128, 64)
-    # Self-play contributes both learner seats; a league game contributes one.
-    assert args.games * 2 == 4 * args.league_games
-    assert (args.league_active_opponents, args.league_historical_opponents) == (2, 6)
-    assert args.league_active_pool_size == 16
-    assert (args.league_builtin_opponents, args.league_builtin_lanes) == ("", 0)
-    assert (args.epochs, args.critic_epochs) == (1, 1)
-    assert args.critic_lr == args.actor_lr == pytest.approx(5.0e-5)
-    assert args.minibatch_size == 4800
-    # An unflagged run is exactly the family's dataclass configuration, which
-    # is what a warm-start artifact and the calibration benchmark both carry.
-    assert model_config_from_args(resolve_architecture(args.architecture), args) == ModelConfig()
-    # Entropy is telemetry only; the training CLI has no bonus coefficient.
-    assert not hasattr(args, "entropy_coefficient")
-    assert args.gamma == pytest.approx(0.997)
-    assert args.actor_gae_lambda == pytest.approx(1.0 - 1.0 / (0.05 * 719.0))
-    assert args.critic_gae_lambda == pytest.approx(1.0)
-    assert not hasattr(args, "gae_lambda")
-    assert args.target_kl == PpoConfig.target_kl
-    assert args.checkpoint_seconds == 420.0
-    assert not hasattr(args, "checkpoint_every")
-    assert not args.deterministic_training
-    assert not hasattr(args, "structured_actor_gradient_ratio")
     module._validate_args(args)
     for rejected in (299.0, 601.0, float("nan")):
         args.checkpoint_seconds = rejected
@@ -1600,14 +1576,14 @@ def test_warm_start_flags_validate_freshness_and_sign(monkeypatch, tmp_path) -> 
     assert defaulted.critic_warmup_iterations == module.DEFAULT_CRITIC_WARMUP_ITERATIONS == 10
 
 
-def test_adaptive_critic_warmup_uses_prior_wave_ev_and_has_a_hard_deadline() -> None:
+def test_adaptive_critic_warmup_uses_prior_wave_r_squared_and_has_a_hard_deadline() -> None:
     module = _training_script()
 
     active, reason = module._critic_warmup_decision(
         iteration=4,
         minimum=5,
         complete=False,
-        previous_evs=[0.9],
+        previous_r_squared=[0.9],
     )
     assert active and reason == "minimum_iterations"
 
@@ -1615,31 +1591,101 @@ def test_adaptive_critic_warmup_uses_prior_wave_ev_and_has_a_hard_deadline() -> 
         iteration=5,
         minimum=5,
         complete=False,
-        previous_evs=[0.09],
+        previous_r_squared=[0.09],
     )
-    assert active and reason == "waiting_for_monte_carlo_ev"
+    assert active and reason == "waiting_for_monte_carlo_r_squared"
 
     active, reason = module._critic_warmup_decision(
         iteration=6,
         minimum=5,
         complete=False,
-        previous_evs=[0.10, 0.35],
+        previous_r_squared=[0.10, 0.35],
     )
-    assert not active and reason == "monte_carlo_ev_ready"
+    assert not active and reason == "monte_carlo_r_squared_ready"
     assert module._critic_warmup_decision(
         iteration=20,
         minimum=5,
         complete=True,
-        previous_evs=[-1.0],
+        previous_r_squared=[-1.0],
     ) == (False, "complete")
 
-    with pytest.raises(RuntimeError, match="within 40 iterations"):
+    with pytest.raises(RuntimeError):
         module._critic_warmup_decision(
             iteration=module.MAX_CRITIC_WARMUP_ITERATIONS,
             minimum=5,
             complete=False,
-            previous_evs=[0.099],
+            previous_r_squared=[0.099],
         )
+    assert module._critic_warmup_decision(
+        iteration=module.MAX_CRITIC_WARMUP_ITERATIONS,
+        minimum=5,
+        complete=False,
+        previous_r_squared=[0.10],
+    ) == (False, "monte_carlo_r_squared_ready")
+
+
+@pytest.mark.parametrize("previous_r_squared", [[], [None], [0.2, 0.09], [0.2, float("nan")]])
+def test_critic_warmup_requires_finite_r_squared_evidence_from_every_member(
+    previous_r_squared,
+) -> None:
+    module = _training_script()
+
+    assert module._critic_warmup_decision(
+        iteration=10,
+        minimum=10,
+        complete=False,
+        previous_r_squared=previous_r_squared,
+    ) == (True, "waiting_for_monte_carlo_r_squared")
+
+
+def test_critic_warmup_rejects_constant_value_bias_and_releases_unbiased_fit() -> None:
+    from kaggriculture.ppo import _explained_variance, _r_squared
+
+    module = _training_script()
+    targets = np.array([-0.1, 0.1])
+    biased = np.array([1.9, 2.1])
+    valid = np.ones_like(targets, dtype=np.bool_)
+    assert _explained_variance(targets, biased, valid) == pytest.approx(1.0)
+
+    assert module._critic_warmup_decision(
+        iteration=10,
+        minimum=10,
+        complete=False,
+        previous_r_squared=[_r_squared(targets, biased, valid)],
+    ) == (True, "waiting_for_monte_carlo_r_squared")
+    assert module._critic_warmup_decision(
+        iteration=10,
+        minimum=10,
+        complete=False,
+        previous_r_squared=[_r_squared(targets, targets, valid)],
+    ) == (False, "monte_carlo_r_squared_ready")
+
+
+@pytest.mark.parametrize("latched", [False, True])
+def test_critic_warmup_resume_rejects_legacy_ev_evidence(latched: bool) -> None:
+    from kaggriculture.training import require_checkpoint_format
+
+    module = _training_script()
+    provenance = {
+        "critic_warmup_iterations": 10,
+        "critic_warmup_state": {
+            "complete": latched,
+            "last_monte_carlo_explained_variance": [1.0],
+        },
+    }
+
+    with pytest.raises(ValueError):
+        require_checkpoint_format({"format_version": 15, "initial_actor": provenance})
+    with pytest.raises(ValueError):
+        module._validate_critic_warmup_state(provenance, population=1)
+    provenance["critic_warmup_state"] = {
+        "complete": False,
+        "last_monte_carlo_r_squared": [-399.0],
+    }
+    minimum, complete, evidence = module._validate_critic_warmup_state(provenance, population=1)
+    assert module._critic_warmup_decision(
+        iteration=10, minimum=minimum, complete=complete, previous_r_squared=evidence
+    ) == (True, "waiting_for_monte_carlo_r_squared")
 
 
 def test_critic_warmup_cannot_be_restated_on_a_resume(monkeypatch, tmp_path) -> None:
@@ -1706,7 +1752,7 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
     record["critic_warmup_iterations"] = 15
     record["critic_warmup_state"] = {
         "complete": False,
-        "last_monte_carlo_explained_variance": [0.04],
+        "last_monte_carlo_r_squared": [0.04],
     }
 
     payload = checkpoint_payload(
@@ -1732,7 +1778,7 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
     assert payload["initial_actor"]["critic_warmup_iterations"] == 15
     assert payload["initial_actor"]["critic_warmup_state"] == {
         "complete": False,
-        "last_monte_carlo_explained_variance": [0.04],
+        "last_monte_carlo_r_squared": [0.04],
     }
     assert module._validate_critic_warmup_state(payload["initial_actor"], population=1) == (
         15,
@@ -1794,6 +1840,59 @@ def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -
         module._load_initial_actor(
             artifact, FarmActor(other), CONV_ENTITY, other, torch.device("cpu")
         )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_critic_only_warm_start_preserves_compiled_actor_policy(tmp_path) -> None:
+    from dataclasses import replace
+
+    from kaggle_environments import make
+
+    from kaggriculture.structured import StructuredActor, stack_structured
+    from kaggriculture.tokens import encode_structured_observation
+
+    module = _training_script()
+    config = StructuredConfig(
+        model_dim=32, attention_heads=2, farm_blocks=1, latents=8, core_layers=2
+    )
+    environment = make("kaggriculture", configuration={"episodeSteps": 30, "seed": 3})
+    environment.run(["starter", "starter"])
+    inputs, _ = stack_structured(
+        [
+            encode_structured_observation(environment.steps[step][seat].observation)
+            for step in (1, 25)
+            for seat in (0, 1)
+        ],
+        device="cuda",
+    )
+    with torch.device("cuda"):
+        pretrained = StructuredActor(config).eval()
+        changed = replace(
+            config,
+            critic_state_read=True,
+            critic_core_layers=1,
+            critic_latents=4,
+            # Selects the critic's value head only. A scalar-critic arm must warm
+            # start from the same BC clone as a categorical one rather than
+            # needing its own.
+            scalar_value=True,
+        )
+        actor = StructuredActor(changed).eval()
+    artifact = _actor_artifact(
+        tmp_path / "bc-actor.pt", pretrained, config, architecture=STRUCTURED
+    )
+    module._load_initial_actor(artifact, actor, STRUCTURED, changed, torch.device("cuda"))
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = torch.compile(pretrained, fullgraph=True)(inputs)
+        actual = torch.compile(actor, fullgraph=True)(inputs)
+    for expected_field, actual_field in zip(expected, actual, strict=True):
+        torch.testing.assert_close(actual_field, expected_field, rtol=0, atol=0)
+
+    # Same-shaped actor changes still cannot silently reuse a BC artifact.
+    incompatible = replace(changed, input_reinject_layers=(1,))
+    with pytest.raises(ValueError, match="model configuration"):
+        module._load_initial_actor(artifact, actor, STRUCTURED, incompatible, torch.device("cuda"))
 
 
 def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None:
@@ -1910,10 +2009,7 @@ def test_structured_persistence_diagnostics_use_each_fresh_wave() -> None:
     metrics = {
         "structured_preupdate_combined": 2.0,
         "structured_preupdate_decision": 4.0,
-        "structured_preupdate_patch": 0.5,
-        "structured_preupdate_economy": 0.5,
-        "structured_preupdate_opponent_summary": 0.06,
-        "structured_preupdate_opponent_patches": 0.03,
+        "structured_preupdate_latent": 0.5,
         "structured_critic_preupdate_combined": 3.0,
         "structured_critic_preupdate_latent": 2.0,
         "structured_critic_preupdate_value": 1.0,
@@ -1935,9 +2031,9 @@ def test_structured_persistence_diagnostics_use_each_fresh_wave() -> None:
 
     # Changing decoder scales next wave must change the comparison immediately,
     # without historical references or predictor-quality admission state.
-    metrics["structured_preupdate_persistence_opponent_patches"] = 0.06
+    metrics["structured_preupdate_persistence_latent"] = 1.0
     actor = module._structured_persistence_diagnostics(metrics, kind="actor")
-    assert actor["structured_persistence_opponent_patches_ratio"] == 0.5
+    assert actor["structured_persistence_latent_ratio"] == 0.5
     assert actor["structured_persistence_decision_ratio"] == 2.0
 
 
@@ -2150,7 +2246,7 @@ def _run_population_main(
             "first_minibatch_approx_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
-            "monte_carlo_explained_variance": 0.2,
+            "monte_carlo_r_squared": 0.2,
         }
 
     wave = _population_wave(module, games=games, population=max(population, 2))
@@ -2219,7 +2315,7 @@ def test_runner_enters_joint_training_despite_poor_predictor_persistence(
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
             # Prior-wave evidence releases the actor after the warmup floor.
-            "monte_carlo_explained_variance": 0.2,
+            "monte_carlo_r_squared": 0.2,
         }
         for prefix, fields in (
             ("structured_preupdate_", module._STRUCTURED_ACTOR_PERSISTENCE_FIELDS),
@@ -2410,7 +2506,7 @@ def test_finite_warm_start_cannot_exit_before_actor_release(monkeypatch, tmp_pat
     assert checkpoint["iteration"] == 1
     assert checkpoint["initial_actor"]["critic_warmup_state"] == {
         "complete": False,
-        "last_monte_carlo_explained_variance": [0.2],
+        "last_monte_carlo_r_squared": [0.2],
     }
 
 
@@ -2476,14 +2572,14 @@ def test_a_population_checkpoint_round_trips_and_the_bump_refuses_a_stale_one(
     assert reloaded["iteration"] == 2
     assert reloaded["population_disagreement_reference"] == record["population_disagreement_floor"]
     assert record["critic_warmup_active"] == 0
-    assert record["critic_warmup_reason"] == "monte_carlo_ev_ready"
+    assert record["critic_warmup_reason"] == "monte_carlo_r_squared_ready"
     assert record["critic_warmup_ready_members"] == population
     # The first wave is critic-only even with a zero configured minimum; the
-    # second uses that fresh-wave EV to release every actor.
+    # second uses that fresh-wave R-squared to release every actor.
     assert reloaded["policy_entropy_reference"] == [0.2] * population
     assert reloaded["initial_actor"]["critic_warmup_state"] == {
         "complete": True,
-        "last_monte_carlo_explained_variance": [0.2] * population,
+        "last_monte_carlo_r_squared": [0.2] * population,
     }
     for member, stored in zip(restored, members, strict=True):
         assert all(

@@ -12,9 +12,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from train_bc import (
-    _balanced_minibatch_slices,
     _batch,
     _clone_and_structured_loss,
+    _fixed_minibatch_positions,
     _run_blocks,
     _run_epoch_order,
     load_dataset,
@@ -82,8 +82,8 @@ def main() -> None:
     starts, lengths = _run_blocks(train_split.staged["episode_index"], args.run_length)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
     order = _run_epoch_order(starts, lengths, generator)
-    first_slice = _balanced_minibatch_slices(train_split.rows, args.batch_size)[0]
-    batch_indices = order[first_slice]
+    positions, _counts = _fixed_minibatch_positions(train_split.rows, args.batch_size)
+    batch_indices = order[positions[0]]
     actor_args, factors = _batch(STRUCTURED, train_split, batch_indices, device)
 
     actor = StructuredActor(config).to(device)

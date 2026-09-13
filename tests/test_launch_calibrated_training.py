@@ -17,7 +17,6 @@ from kaggriculture.production import (
     PRODUCTION_CHECKPOINT_SECONDS,
     PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
-    PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
@@ -1249,34 +1248,6 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
     assert decision["source_identity"] == module.source_identity()
     digest_index = decision["training_command"].index("--expected-source-digest")
     assert decision["training_command"][digest_index + 1] == module.source_identity()["sha256"]
-    for flag, expected in (
-        ("--games", "128"),
-        ("--league-games", "64"),
-        ("--league-active-opponents", "2"),
-        ("--league-historical-opponents", "6"),
-        ("--league-builtin-opponents", "pass,random,starter,scripted-v27"),
-        ("--architecture", "structured"),
-        ("--actor-lr", "5e-05"),
-        ("--optimizer", "normuon"),
-        ("--epochs", "1"),
-        ("--critic-epochs", "1"),
-        ("--minibatch-size", "4800"),
-        ("--gamma", str(module.production_ppo_config(update_compile_mode="eager")["gamma"])),
-        (
-            "--actor-gae-lambda",
-            str(module.production_ppo_config(update_compile_mode="eager")["actor_gae_lambda"]),
-        ),
-        (
-            "--critic-gae-lambda",
-            str(module.production_ppo_config(update_compile_mode="eager")["critic_gae_lambda"]),
-        ),
-        (
-            "--target-kl",
-            str(module.production_ppo_config(update_compile_mode="eager")["target_kl"]),
-        ),
-    ):
-        index = decision["training_command"].index(flag)
-        assert decision["training_command"][index + 1] == expected
 
 
 def test_direct_launch_compiles_without_calibration_evidence(

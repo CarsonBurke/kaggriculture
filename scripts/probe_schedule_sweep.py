@@ -201,7 +201,7 @@ def main() -> None:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     require_checkpoint_format(state)
     member_state = checkpoint_agent_states(state)[0]
-    warmup_minimum, saved_warmup_complete, saved_previous_evs = _validate_critic_warmup_state(
+    warmup_minimum, saved_warmup_complete, saved_previous_r_squared = _validate_critic_warmup_state(
         state.get("initial_actor"), population=len(checkpoint_agent_states(state))
     )
     required_auxiliary_state = {
@@ -333,13 +333,13 @@ def main() -> None:
                 group["lr"] = rate
         history: list[dict[str, Any]] = []
         warmup_complete = saved_warmup_complete
-        previous_evs = saved_previous_evs[:1]
+        previous_r_squared = saved_previous_r_squared[:1]
         for iteration in range(args.iterations):
             warmup_active, warmup_reason = _critic_warmup_decision(
                 iteration=int(state["iteration"]) + iteration,
                 minimum=warmup_minimum,
                 complete=warmup_complete,
-                previous_evs=previous_evs,
+                previous_r_squared=previous_r_squared,
             )
             if not warmup_active:
                 warmup_complete = True
@@ -382,7 +382,7 @@ def main() -> None:
                 structured_critic_auxiliary=config.structured_critic_auxiliary_active,
                 auxiliary_generator=auxiliary_generator,
             )
-            previous_evs = [float(metrics["monte_carlo_explained_variance"])]
+            previous_r_squared = [float(metrics["monte_carlo_r_squared"])]
             league_part = slice_trajectories(rollout, args.games * 2, rollout.trajectories)
             row: dict[str, Any] = {
                 "config": label,

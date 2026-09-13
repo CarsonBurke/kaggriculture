@@ -6,8 +6,6 @@ import pytest
 import torch
 
 from kaggriculture.optim import (
-    ADAM_PARAMETER_ROLES,
-    POLAR_EXPRESS_COEFFICIENTS,
     NorMuon,
     polar_express,
     route_parameters,
@@ -78,15 +76,8 @@ def test_polar_express_flattens_the_spectrum_without_exploding_it(
 
 @pytest.mark.parametrize("shape", SHAPES)
 def test_polar_express_is_invariant_to_the_scale_of_its_input(shape: tuple[int, int]) -> None:
-    """The property that removes gradient clipping's effective-rate variation.
-
-    PPO actor and critic gradients are not clipped, so their matrix optimizer
-    receives the raw scale. This check ensures Polar Express itself is
-    invariant to that scale. Measured in bfloat16 this same check fails at
-    5-16%, which is why `polar_express` runs in fp32.
-    """
-
-    matrix = _decaying_spectrum(shape)
+    """Small PPO momenta must have the same update direction as larger copies."""
+    matrix = _decaying_spectrum(shape) * 1e-6
     once = polar_express(matrix)
     scaled = polar_express(matrix * 1000.0)
     assert (once - scaled).norm() / once.norm() < 1e-4
@@ -104,10 +95,12 @@ def test_polar_express_rejects_a_matrix_without_two_dimensions() -> None:
         polar_express(torch.zeros(8))
 
 
-def test_the_iteration_length_matches_the_coefficients_it_was_solved_for() -> None:
-    # The coefficients are a solved polynomial, not a tunable list; a different
-    # length is a different function and no longer approximates a polar factor.
-    assert len(POLAR_EXPRESS_COEFFICIENTS) == 5
+def test_polar_express_preserves_zero_matrices_in_a_mixed_batch() -> None:
+    matrix = _decaying_spectrum((22, 100)) * 1e-6
+    batch = torch.stack((torch.zeros_like(matrix), matrix))
+    result = polar_express(batch)
+    assert torch.equal(result[0], torch.zeros_like(matrix))
+    torch.testing.assert_close(result[1], polar_express(matrix), rtol=1e-4, atol=1e-5)
 
 
 def test_a_normuon_step_is_invariant_to_the_gradient_scale() -> None:
@@ -272,6 +265,206 @@ def test_a_parameter_without_a_gradient_is_skipped_rather_than_stepped() -> None
 
 
 @pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("weight_decay", [0.0, 0.005])
+def test_adam_matches_reference_with_missing_gradients_gates_and_resume(
+    device: str,
+    weight_decay: float,
+) -> None:
+    # CUDA/no-decay exercises native fusion; the other cases retain cautious
+    # decay and CPU arithmetic. Distinct histories must not share a timestep.
+    expected = [
+        torch.linspace(-0.4, 0.3, 7),
+        torch.linspace(-0.2, 0.4, 10).reshape(2, 5),
+        torch.tensor(0.15),
+    ]
+    parameters = [torch.nn.Parameter(value.to(device).clone()) for value in expected]
+    optimizer = NorMuon(
+        [],
+        parameters,
+        learning_rate=0.01,
+        adam_learning_rate=0.003,
+        adam_betas=(0.8, 0.95),
+        adam_epsilon=1e-12,
+        adam_weight_decay=weight_decay,
+    )
+    reference_states: list[dict[str, torch.Tensor]] = [{}, {}, {}]
+    resumed_parameters = None
+    resumed_optimizer = None
+    schedule = [
+        (2.0, (float("inf"), float("nan"), None)),
+        (0.0, (0.03, -0.04, None)),
+        (None, (0.0, None, 2e-12)),
+        (float("nan"), (float("nan"), None, float("inf"))),
+        (0.0, (-3e-12, 0.02, 0.0)),
+        (0.0, (None, 0.0, -0.03)),
+        (-2.0, (float("inf"), float("nan"), float("inf"))),
+        (None, (0.01, -0.03, None)),
+    ]
+    for index, (gate, magnitudes) in enumerate(schedule):
+        learning_rate = 0.003 * (index + 1) / len(schedule)
+        skipped = gate is not None and gate != 0
+        gradients = [
+            None if magnitude is None else torch.full_like(value, magnitude)
+            for value, magnitude in zip(expected, magnitudes, strict=True)
+        ]
+        # Independent per-parameter reference: the original FP32 lerp and
+        # corrected moments, including quadratic, sign-cautious decay.
+        for value, gradient, state in zip(expected, gradients, reference_states, strict=True):
+            if gradient is None:
+                continue
+            if not state:
+                state.update(
+                    step=torch.zeros(()),
+                    exp_avg=torch.zeros_like(value),
+                    exp_avg_sq=torch.zeros_like(value),
+                )
+            if skipped:
+                continue
+            state["step"].add_(1)
+            state["exp_avg"].lerp_(gradient, 0.2)
+            state["exp_avg_sq"].lerp_(gradient.square(), 0.05)
+            bias1 = (1 - 0.8 ** state["step"]).clamp_min(1e-12)
+            bias2 = (1 - 0.95 ** state["step"]).clamp_min(1e-12)
+            update = (state["exp_avg"] / bias1) / ((state["exp_avg_sq"] / bias2).sqrt() + 1e-12)
+            decay = ((update * value) > 0) * value * (weight_decay * learning_rate**2)
+            value.sub_(update * learning_rate + decay)
+
+        instances = [(parameters, optimizer)]
+        if resumed_optimizer is not None:
+            instances.append((resumed_parameters, resumed_optimizer))
+        for selected_parameters, selected_optimizer in instances:
+            selected_optimizer.param_groups[0]["lr"] = learning_rate
+            before_parameters = [parameter.detach().clone() for parameter in selected_parameters]
+            before_state = copy.deepcopy(selected_optimizer.state_dict())
+            for parameter, gradient in zip(selected_parameters, gradients, strict=True):
+                parameter.grad = None if gradient is None else gradient.to(device).clone()
+            if gate is not None:
+                # Non-binary, double-precision and NaN gates must all retain
+                # the public nonzero-means-skip contract of the eager path.
+                selected_optimizer.found_inf = torch.tensor(
+                    gate, device=device, dtype=torch.float64
+                )
+            selected_optimizer.step()
+            if gate is not None:
+                del selected_optimizer.found_inf
+            for position, (parameter, value, gradient, state) in enumerate(
+                zip(selected_parameters, expected, gradients, reference_states, strict=True)
+            ):
+                torch.testing.assert_close(parameter.detach().cpu(), value, rtol=1e-5, atol=1e-7)
+                actual = selected_optimizer.state[parameter]
+                assert actual.keys() == state.keys()
+                for key, reference in state.items():
+                    assert actual[key].dtype == torch.float32
+                    assert actual[key].shape == reference.shape
+                    torch.testing.assert_close(
+                        actual[key].cpu(),
+                        reference,
+                        rtol=0 if key == "step" else 1e-5,
+                        atol=0 if key == "step" else 1e-30,
+                    )
+                if gradient is not None:
+                    torch.testing.assert_close(
+                        parameter.grad.cpu(),
+                        gradient,
+                        rtol=0,
+                        atol=0,
+                        equal_nan=True,
+                    )
+                if skipped:
+                    assert torch.equal(parameter, before_parameters[position])
+                    previous = before_state["state"].get(position, {})
+                    for key, previous_value in previous.items():
+                        assert torch.equal(actual[key], previous_value)
+        if resumed_optimizer is not None:
+            for original, resumed in zip(parameters, resumed_parameters, strict=True):
+                assert torch.equal(original, resumed)
+                for key, value in optimizer.state[original].items():
+                    assert torch.equal(value, resumed_optimizer.state[resumed][key])
+        if index == 4:
+            resumed_parameters = [
+                torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters
+            ]
+            resumed_optimizer = NorMuon(
+                [],
+                resumed_parameters,
+                learning_rate=0.01,
+                adam_learning_rate=0.003,
+            )
+            resumed_optimizer.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_adam_does_not_sanitize_an_applied_nonfinite_gradient() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([0.1, -0.2, 0.3], device="cuda"))
+    parameter.grad = torch.tensor([float("nan"), float("inf"), 0.25], device="cuda")
+    optimizer = NorMuon([], [parameter], learning_rate=0.01, adam_learning_rate=0.003)
+    optimizer.found_inf = torch.zeros((), device="cuda")
+    optimizer.step()
+    assert not torch.isfinite(parameter[:2]).any()
+    assert torch.isfinite(parameter[2])
+    for key in ("exp_avg", "exp_avg_sq"):
+        assert not torch.isfinite(optimizer.state[parameter][key][:2]).any()
+    assert optimizer.state[parameter]["step"].item() == 1
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_adam_keeps_bias_correction_floor_when_beta_rounds_to_one() -> None:
+    outcomes = []
+    for device in ("cpu", "cuda"):
+        parameter = torch.nn.Parameter(torch.tensor([0.1, -0.2], device=device))
+        optimizer = NorMuon(
+            [],
+            [parameter],
+            learning_rate=0.01,
+            adam_learning_rate=0.003,
+            adam_betas=(1.0 - 1e-10, 0.95),
+        )
+        parameter.grad = torch.tensor([0.25, -0.5], device=device)
+        optimizer.step()
+        outcomes.append(
+            (
+                parameter.detach().cpu(),
+                {key: value.cpu() for key, value in optimizer.state[parameter].items()},
+            )
+        )
+    torch.testing.assert_close(outcomes[1][0], outcomes[0][0])
+    for key, value in outcomes[0][1].items():
+        torch.testing.assert_close(outcomes[1][1][key], value)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_adam_skip_preserves_a_large_checkpoint_counter() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([0.1, -0.2], device="cuda"))
+    optimizer = NorMuon([], [parameter], learning_rate=0.01, adam_learning_rate=0.003)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.state[parameter]["step"].fill_(2**24)
+    before = parameter.detach().clone()
+    state_before = copy.deepcopy(optimizer.state[parameter])
+    parameter.grad.fill_(float("inf"))
+    optimizer.found_inf = torch.ones((), device="cuda")
+    optimizer.step()
+    assert torch.equal(parameter, before)
+    for key, value in state_before.items():
+        assert torch.equal(optimizer.state[parameter][key], value)
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     (
         ("learning_rate", 0.0),
@@ -308,7 +501,8 @@ def _production_modules() -> tuple[torch.nn.Module, torch.nn.Module]:
 
 def test_every_production_parameter_is_routed_exactly_once() -> None:
     for module in _production_modules():
-        matrices, vectors = route_parameters(module)
+        matrices, vectors, multipliers = route_parameters(module)
+        assert len(multipliers) == len(vectors)
         routed = {id(parameter) for parameter in matrices} | {
             id(parameter) for parameter in vectors
         }
@@ -316,30 +510,32 @@ def test_every_production_parameter_is_routed_exactly_once() -> None:
         assert routed == {id(parameter) for parameter in module.parameters()}
 
 
-def test_heads_and_embeddings_stay_on_adam_while_hidden_matrices_do_not() -> None:
-    """Muon's premise is about a matrix acting on a feature space.
-
-    A logit head's rows are per-action scores whose relative magnitudes are the
-    output, and an embedding's rows are independent lookups, so orthogonalizing
-    across either mixes quantities that are not comparable. This pins the
-    routing so a rename cannot silently move a layer between the two.
-    """
-
+def test_production_lookup_and_head_roles_are_not_hidden_matrices() -> None:
     for module in _production_modules():
-        matrices, vectors = route_parameters(module)
+        matrices, vectors, _ = route_parameters(module)
         matrix_ids = {id(parameter) for parameter in matrices}
         vector_ids = {id(parameter) for parameter in vectors}
-        for name, parameter in module.named_parameters():
-            named_role = not ADAM_PARAMETER_ROLES.isdisjoint(name.split("."))
-            if named_role or parameter.ndim < 2:
-                assert id(parameter) in vector_ids, name
-            else:
-                assert id(parameter) in matrix_ids, name
+        for name, child in module.named_modules():
+            if isinstance(child, torch.nn.Embedding):
+                assert id(child.weight) in vector_ids, name
+        for query in (module.trunk.opponent_queries, module.trunk.latent_queries):
+            assert id(query) in vector_ids
+        if hasattr(module, "value_query"):
+            assert id(module.value_query) in vector_ids
+            assert id(module.value_head.weight) in vector_ids
+        else:
+            assert id(module.unit_head[-1].weight) in vector_ids
+            assert id(module.market_kind.weight) in vector_ids
+            assert id(module.market_quantity_bias) in vector_ids
+        assert id(module.trunk.core[0].attention.query.weight) in matrix_ids
+
+
+def test_convolution_weights_remain_hidden_matrices() -> None:
     # Production is structured and currently has no convolution. Pin the
     # standard Muon flattening convention independently so a later CNN route
     # cannot regress when the production architecture changes.
     convolution = torch.nn.Conv2d(2, 3, kernel_size=3)
-    matrices, vectors = route_parameters(convolution)
+    matrices, vectors, _ = route_parameters(convolution)
     assert any(parameter is convolution.weight for parameter in matrices)
     assert any(parameter is convolution.bias for parameter in vectors)
 
@@ -348,11 +544,33 @@ def test_structured_transition_lookup_tables_stay_on_adam() -> None:
     dynamics = StructuredDynamics(
         StructuredConfig(model_dim=16, attention_heads=2, ffn_multiplier=1)
     )
-    _, vectors = route_parameters(dynamics)
+    _, vectors, _ = route_parameters(dynamics)
     vector_ids = {id(parameter) for parameter in vectors}
     for module in dynamics.modules():
         if isinstance(module, torch.nn.Embedding):
             assert id(module.weight) in vector_ids
+
+
+def test_lookup_updates_ignore_other_rows_even_with_a_tied_projection() -> None:
+    module = torch.nn.Module()
+    module.projection = torch.nn.Linear(4, 3, bias=False)
+    module.vocabulary = torch.nn.Embedding(3, 4)
+    module.projection.weight = module.vocabulary.weight
+    isolated = copy.deepcopy(module)
+    optimizers = [
+        NorMuon(*route_parameters(model), learning_rate=1e-2, adam_learning_rate=1e-3)
+        for model in (module, isolated)
+    ]
+    gradient = torch.tensor([[1.0, 2.0, -1.0, 0.5], [3.0, -1.0, 2.0, 1.0], [2.0, 1.0, 3.0, -1.0]])
+    for scale in (1.0, -0.5):
+        module.vocabulary.weight.grad = gradient * scale
+        isolated.vocabulary.weight.grad = gradient * scale
+        isolated.vocabulary.weight.grad[1:].zero_()
+        for optimizer in optimizers:
+            optimizer.step()
+        torch.testing.assert_close(
+            module.vocabulary.weight[0], isolated.vocabulary.weight[0], rtol=0, atol=0
+        )
 
 
 def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
@@ -366,12 +584,16 @@ def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
         (critic_optimizer, 5.0e-5),
     ):
         assert isinstance(optimizer, NorMuon)
-        kinds = {group["kind"]: group for group in optimizer.param_groups}
-        assert set(kinds) == {"normuon", "adam"}
-        assert kinds["normuon"]["lr"] == pytest.approx(learning_rate)
-        assert kinds["adam"]["lr"] == pytest.approx(
-            learning_rate * PpoConfig().adam_learning_rate_ratio
-        )
+        rates = {
+            (group["kind"], group.get("lr_multiplier")): group["lr"]
+            for group in optimizer.param_groups
+        }
+        adam_rate = learning_rate * PpoConfig().adam_learning_rate_ratio
+        assert rates[("normuon", None)] == pytest.approx(learning_rate)
+        assert rates[("adam", 1.0)] == pytest.approx(adam_rate)
+        # Query banks initialized at 0.02 RMS take 0.02 of the shared Adam
+        # rate, so every Adam parameter moves by the same fraction of itself.
+        assert rates[("adam", 0.02)] == pytest.approx(adam_rate * 0.02)
         # `_optimizer_step` drives the warmup through this metadata.
         for group in optimizer.param_groups:
             assert group["base_lr"] == pytest.approx(group["lr"])
@@ -520,9 +742,11 @@ def test_an_unusable_weight_decay_is_rejected(value: float) -> None:
         )
 
 
+@pytest.mark.parametrize("weight_decay", [0.0, 1.2])
 @pytest.mark.parametrize("shape", [(24, 24), (48, 16), (16, 48)])
 def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
     shape: tuple[int, int],
+    weight_decay: float,
 ) -> None:
     """One optimizer over many same-shaped matrices must not couple them.
 
@@ -531,36 +755,76 @@ def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
     both reduce over the trailing two dimensions alone. If either ever grew a
     reduction across the batch, the step a matrix takes would start depending
     on which other parameters happened to share its shape -- so compare a group
-    of five against five optimizers holding one matrix each.
+    of five against five optimizers holding one matrix each. Gated packed
+    gradients must match ungated reference steps, including after a skipped
+    non-finite minibatch and when one matrix has no gradient.
     """
 
     torch.manual_seed(11)
     count = 5
     together = [torch.nn.Parameter(torch.randn(shape)) for _ in range(count)]
     apart = [torch.nn.Parameter(parameter.detach().clone()) for parameter in together]
-    grouped = NorMuon(together, [], learning_rate=1e-2, adam_learning_rate=1e-2)
+    grouped = NorMuon(
+        together,
+        [],
+        learning_rate=1e-2,
+        adam_learning_rate=1e-2,
+        weight_decay=weight_decay,
+    )
     separate = [
-        NorMuon([parameter], [], learning_rate=1e-2, adam_learning_rate=1e-2) for parameter in apart
+        NorMuon(
+            [parameter],
+            [],
+            learning_rate=1e-2,
+            adam_learning_rate=1e-2,
+            weight_decay=weight_decay,
+        )
+        for parameter in apart
     ]
 
     generator = torch.Generator().manual_seed(12)
-    for _ in range(3):
+    for iteration, gate in enumerate((None, 0.0, 2.0, 0.0)):
+        skipped = gate is not None and gate != 0
+        original_gradients = []
+        before = [parameter.detach().clone() for parameter in together]
+        before_state = [copy.deepcopy(grouped.state[parameter]) for parameter in together]
         for index in range(count):
-            gradient = torch.randn(shape, generator=generator)
+            gradient = (
+                None
+                if iteration == 3 and index == 2
+                else torch.full(shape, float("inf"))
+                if skipped
+                else torch.randn(shape, generator=generator)
+            )
             together[index].grad = gradient
-            apart[index].grad = gradient.clone()
+            apart[index].grad = None if gradient is None else gradient.clone()
+            original_gradients.append(None if gradient is None else gradient.clone())
+        if gate is not None:
+            grouped.found_inf = torch.tensor(gate)
         grouped.step()
-        for optimizer in separate:
-            optimizer.step()
+        if gate is not None:
+            del grouped.found_inf
+        if not skipped:
+            for optimizer in separate:
+                optimizer.step()
 
-    for index in range(count):
-        torch.testing.assert_close(together[index], apart[index], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(
-            grouped.state[together[index]]["second_moment"],
-            separate[index].state[apart[index]]["second_moment"],
-            rtol=1e-5,
-            atol=1e-6,
-        )
+        for index in range(count):
+            torch.testing.assert_close(together[index], apart[index], rtol=1e-5, atol=1e-6)
+            for key in ("momentum", "second_moment"):
+                torch.testing.assert_close(
+                    grouped.state[together[index]][key],
+                    separate[index].state[apart[index]][key],
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+                if skipped:
+                    assert torch.equal(
+                        grouped.state[together[index]][key], before_state[index][key]
+                    )
+            if skipped:
+                assert torch.equal(together[index], before[index])
+            if original_gradients[index] is not None:
+                assert torch.equal(together[index].grad, original_gradients[index])
 
 
 def test_a_mixed_shape_group_batches_only_what_shares_a_shape() -> None:

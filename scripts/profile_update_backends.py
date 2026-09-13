@@ -43,6 +43,7 @@ from kaggriculture.model import (
     UNIT_FEATURES,
     DistributionalCritic,
     FarmActor,
+    policy_compile_options,
 )
 from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
@@ -98,7 +99,9 @@ def _minibatch(rows: int, device: torch.device) -> dict[str, Any]:
 def _compiled(function: Any, mode: str) -> Any:
     if mode == "eager":
         return function
-    return torch.compile(function, mode=mode, fullgraph=True, dynamic=False)
+    return torch.compile(
+        function, options=policy_compile_options(mode), fullgraph=True, dynamic=False
+    )
 
 
 def _run_mode(
@@ -123,6 +126,9 @@ def _run_mode(
 
     actor_args = (batch["board"], batch["global_features"], batch["units"], batch["unit_positions"])
     critic_args = (batch["board"], batch["critic_features"])
+    component_count = max(
+        1, int(sum(batch[name].sum() for name in ("unit_active", "kind_active", "quantity_active")))
+    )
 
     def one_minibatch(run_actor: bool) -> None:
         if run_actor:
@@ -147,7 +153,7 @@ def _run_mode(
                 autocast,
                 *actor_args,
             )
-            (-policy_sum / 2048).backward()
+            (-policy_sum / component_count).backward()
             _optimizer_step(actor_optimizer, config.actor_learning_rate, config.lr_warmup_steps)
         critic_optimizer.zero_grad(set_to_none=True)
         value_loss, _predicted = critic_loss_fn(

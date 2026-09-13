@@ -42,7 +42,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from kaggriculture.model import FarmActor
+from kaggriculture.model import FarmActor, policy_compile_options
 from kaggriculture.rollout import _native_encoded_wave
 from kaggriculture.rust_env import load_native
 
@@ -91,7 +91,10 @@ def _build(backend: str, actor: FarmActor, inputs, autocast: bool) -> Callable[[
         return run_compiled
     if backend == "inductor_reduce_overhead":
         compiled = torch.compile(
-            actor.forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+            actor.forward,
+            options=policy_compile_options("reduce-overhead"),
+            fullgraph=True,
+            dynamic=False,
         )
 
         def run_inductor() -> Any:

@@ -19,7 +19,7 @@ states into the holdout and would report memorization as generalization. Games
 are split 80/20 on `episode_seeds` -- both self-play seats of a game share one
 seed and therefore land on the same side -- the critic is refitted on the fit
 games alone under the measured schedule (same `_stage_tensor` staging, same
-`_balanced_minibatch_slices` partitioning, same `make_optimizers` construction
+`_fixed_minibatch_positions` partitioning, same `make_optimizers` construction
 and `_optimizer_step` warmup, same bf16 autocast, same `update_compile_mode`,
 same `_critic_minibatch_objective`), and after every epoch
 explained variance and the optimized distributional loss are measured on both
@@ -78,7 +78,6 @@ from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
     PpoConfig,
-    _balanced_minibatch_slices,
     _batch_tensor,
     _cached_update_callable,
     _critic_batch_args,
@@ -87,6 +86,7 @@ from kaggriculture.ppo import (
     _device_compile_mode,
     _fit_explained_variance,
     _fit_moment_mapping,
+    _fixed_minibatch_positions,
     _optimizer_step,
     _stage_tensor,
     make_optimizers,
@@ -116,9 +116,12 @@ def _production_critic_minibatches_per_epoch(minibatch_size: int) -> int:
 
     (128 self-play games x 2 seats + 64 league games) x 719 stored steps is
     230,080 states, every one of them a valid learner state, and
-    `_balanced_minibatch_slices` partitions an epoch into
-    ceil(states / minibatch_size) minibatches -- 57 at the current 4096-row
-    ceiling, or 228 critic minibatches over four epochs.
+    `_fixed_minibatch_positions` splits an epoch into
+    ceil(states / minibatch_size) minibatches of exactly `minibatch_size` rows
+    -- 57 at the current 4096-row ceiling, or 228 critic minibatches over four
+    epochs. Only the last one can hold fewer than `minibatch_size` fresh rows,
+    and it wraps onto the epoch's leading rows rather than running short, so
+    every minibatch is one compiled shape.
 
     This probe fits self-play states minus a holdout, so its per-epoch seconds
     are reported raw AND rescaled through this count, which is the unit an
@@ -267,14 +270,16 @@ def _critic_epoch(
     gateable = any(group.get("fused", False) for group in critic_optimizer.param_groups)
     nonfinite = torch.zeros((), dtype=torch.float64, device=device)
     shuffled = generator.permutation(indices)
-    shuffled_device = torch.from_numpy(shuffled).to(device=device)
-    slices = _balanced_minibatch_slices(shuffled.size, config.minibatch_size)
+    positions, _counts = _fixed_minibatch_positions(shuffled.size, config.minibatch_size)
+    # One staged (batch_count, minibatch_size) index tensor, gathered on the
+    # host before the clock starts: the timed loop must not pay a host-to-device
+    # copy per minibatch.
+    batch_indices = torch.from_numpy(shuffled[positions]).to(device=device)
     was_training = critic.training
     critic.train()
     _synchronize(device)
     started = time.perf_counter()
-    for batch_slice in slices:
-        batch = shuffled_device[batch_slice]
+    for batch in batch_indices:
         critic_args = _critic_batch_args(architecture, staged, batch)
         value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
         critic_optimizer.zero_grad(set_to_none=True)
@@ -298,7 +303,7 @@ def _critic_epoch(
     critic.train(was_training)
     if nonfinite.item():
         raise FloatingPointError("non-finite critic loss")
-    return seconds, len(slices)
+    return seconds, len(batch_indices)
 
 
 @torch.no_grad()
@@ -326,12 +331,15 @@ def _evaluate(
     sums = torch.zeros(4, dtype=torch.float64, device=device)
     loss_total = torch.zeros((), dtype=torch.float64, device=device)
     states = int(indices.size)
-    device_indices = torch.from_numpy(indices).to(device=device)
+    positions, counts = _fixed_minibatch_positions(states, config.minibatch_size)
     was_training = critic.training
     critic.eval()
     try:
-        for batch_slice in _balanced_minibatch_slices(states, config.minibatch_size):
-            batch = device_indices[batch_slice]
+        for row, count in zip(positions, counts, strict=True):
+            # Trimmed to the fresh rows: the final minibatch wraps onto the
+            # epoch's leading states, and an explained variance must score every
+            # held-out state exactly once.
+            batch = torch.from_numpy(indices[row[: int(count)]]).to(device=device)
             critic_args = _critic_batch_args(architecture, staged, batch)
             value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
             value_loss, moments = _critic_minibatch_fit_terms(

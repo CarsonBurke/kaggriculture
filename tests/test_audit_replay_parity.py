@@ -35,9 +35,10 @@ def _passing_metrics() -> dict[str, float | int]:
         "update_replay_max_ratio_error": 61.5,
         # A component-weighted mean of the heads cannot exceed the largest of
         # them, and the worst minibatch cannot fall below that mean.
-        "update_replay_joint_kl": 1.7e-3,
+        "update_replay_component_kl": 1.7e-3,
+        "update_replay_joint_kl": 1.7e-2,
         "update_replay_minibatch_kl": 5.0e-3,
-        # A different comparison entirely: replay against update forward.
+        # Same sampler likelihoods, evaluated through the grad-tracking graph.
         "update_replay_first_minibatch_kl": 5.0e-3,
         "update_replay_mean_minibatch_kl": 2.0e-3,
         **{

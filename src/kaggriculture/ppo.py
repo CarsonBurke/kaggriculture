@@ -1,12 +1,10 @@
-"""PPO masked-token update with VAPO's decoupled GAE and lambda-return targets."""
+"""Masked-component PPO with independently configurable actor and critic GAE."""
 
 from __future__ import annotations
 
 import math
-import threading
 import time
-from collections.abc import Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,12 +12,14 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from kaggriculture.constants import DEFAULT_REWARD_GAMMA, EPISODE_STEPS, STARTING_MONEY
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
 from kaggriculture.latent_dynamics import DecodeContext, DecodeHeads, DecodeMasks
 from kaggriculture.model import (
     DistributionalCritic,
     FarmActor,
     distributional_value_loss,
+    policy_compile_options,
+    scalar_value_loss,
 )
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
@@ -31,6 +31,7 @@ from kaggriculture.structured import (
     StructuredBelief,
     StructuredCritic,
     StructuredCriticBelief,
+    StructuredDecisionBelief,
     StructuredInputs,
     refresh_fused_mlp_fp8,
 )
@@ -51,204 +52,21 @@ from kaggriculture.structured_dynamics import (
 Critic = DistributionalCritic | StructuredCritic
 Actor = FarmActor | StructuredActor
 
-#: VAPO (arXiv:2504.05118) GAE alpha. Length-adaptive GAE would set
-#: ``lambda_policy = 1 - 1 / (alpha * length)`` per sequence because LLM
-#: responses vary. Kaggriculture episodes are a known 719-action horizon, so
-#: the same formula is a constant rather than a per-row schedule.
-VAPO_GAE_ALPHA = 0.05
-COMPETITION_ACTION_STEPS = EPISODE_STEPS - 1
-DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (VAPO_GAE_ALPHA * COMPETITION_ACTION_STEPS)
-#: VAPO / VC-PPO decoupled GAE: the critic regresses on the unbiased
-#: lambda-one return. Policy advantages keep the shorter actor lambda.
+#: Dense investment costs and delayed proceeds must share the full return.
+#: Both objectives default to lambda one; explicit overrides remain available.
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0
 DEFAULT_CRITIC_GAE_LAMBDA = 1.0
 
 #: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
 _OPTIMIZERS = ("normuon", "adamw")
 
-# Numerics gates shared by the calibration benchmark, the training launcher's
-# expected configuration, and the production training loop.
-#
-# The sampling-path versus update-replay divergence is bounded as a KL, not as
-# a worst component. The quantity at risk is off-policy sampling bias — actions
-# were drawn from the rollout forward while the gradient treats them as drawn
-# from the update forward — which is a divergence between two distributions,
-# taken under the one that did the sampling. A maximum over active components
-# does not estimate that: it is an extreme-value statistic whose expectation
-# grows with the component count, so the same policy fails or passes depending
-# on rollout size, and it is dominated by actions whose behavior probability is
-# too small to carry weight in any expectation. The earlier 5e-2 bound came
-# from sweeping a randomly initialized actor, whose near-uniform heads have a
-# thin tail; a behavior-cloned actor measures 20.68 on the identical code path
-# with no defect present, which is what falsified the premise that only bugs
-# reach that magnitude.
-#
-# The estimator is the k3 form `expm1(d) - d`, averaged over each head's active
-# components, matching `_clipped_surrogate_sums` exactly so the two numbers are
-# at least computed the same way. They are not, however, interchangeable as
-# budgets: `target_kl` bounds staleness that the importance ratio *corrects
-# for*, which costs variance and leaves the estimator consistent, whereas this
-# divergence is uncorrected — nothing multiplies by p/q. Reading a bias budget
-# off a variance budget would be a category error, so this bound is not derived
-# from target_kl. Taking the maximum over heads rather than pooling keeps a
-# single-head defect from being diluted by the unit head, which supplies most
-# components.
-#
-# A mean alone would be the wrong single gate, because the bugs this audit
-# exists to catch are characteristically localized — an off-by-one on the final
-# minibatch, one seat, one action type, one mask path — and a mean dilutes them
-# by the corrupted fraction. At production scale a 20% likelihood error confined
-# to the last minibatch moves the mean by well under the bound while being an
-# unambiguous defect. So the tail is gated too, by the *fraction* of sampled
-# actions the two paths disagree about by more than
-# UPDATE_REPLAY_TAIL_LOGPROB, rather than by how far the worst one strayed.
-# Counting is what makes this stable: an indicator mean is bounded in [0, 1] and
-# has finite variance no matter how heavy the log-ratio tail is, whereas a
-# maximum — and, under a sufficiently heavy tail, the k3 mean itself — is
-# dominated by a handful of order statistics and swings across seeds. A bug
-# touching a fraction f of components registers as a tail fraction of about f,
-# so the bound reads directly as the smallest detectable corrupted share.
-#
-# Both bounds are set from measurement on a behavior-cloned actor at production
-# rollout size, because that is the sharp-policy regime the earlier calibration
-# never sampled. Holding one rollout fixed and varying only autocast attributes
-# the divergence almost entirely to bf16 in the update forward: per-component KL
-# 3.0e-3 under bf16 against 2.2e-5 in fp32, a factor of 138, with backend and
-# minibatch shape accounting for only the fp32 remainder. It is a bulk effect,
-# not a tail one — 7.7% of unit components disagree by more than 0.05 nats where
-# a randomly initialized actor has none at all — and it scales with how sharp
-# the policy is, from 4e-7 at initialization to 2.1e-3 for the clone.
-#
-# The update must nevertheless use the likelihood of the distribution that
-# actually sampled each action. Replaying the actor through the update graph is
-# useful for diagnosing sampling-versus-update numerical drift, but substituting
-# that replay for the stored likelihood changes PPO's behavior distribution and
-# erases precisely the drift the importance ratio is meant to correct.
-#
-# Writing d = log q - log p for the update and sampling heads, the likelihood
-# audit measures the corresponding off-policy sampling divergence. Both heads
-# normalize over the same masked support, so E_p[exp(d)] = 1 within each state,
-# but the gradient bias A * E_p[grad log q] need not vanish. That is why the
-# replay remains a repeatedly gated diagnostic (see
-# REPLAY_PARITY_AUDIT_INTERVAL), while the surrogate itself always consumes the
-# rollout-stored log-probabilities.
-#
-# Note also that the magnitude is easy to understate, and the honest reference
-# point is what the update actually moves rather than what it is permitted to.
-# KL is second order in d, so a per-component KL of 2.5e-3 means std[d] =
-# sqrt(2 * KL) = 0.071. Measured across four runs, realized approx_kl has a
-# median of 2.3e-3 per iteration — std 0.068. The uncorrected divergence is
-# therefore about as wide as the corrected one, not a fraction of it; comparing
-# instead against target_kl's 0.245 would report 29% and comparing the KLs
-# directly would report 8%, and both flatter the number by measuring it against
-# a trust region the update never reaches. Removing the divergence would mean an fp32
-# update forward and forfeiting the bf16 speedup. MAX_UPDATE_REPLAY_KL is set
-# at roughly 2.6x the worst production measurement of the clone: 1.77e-3,
-# 1.87e-3 and 1.91e-3 over three waves drawn from disjoint environments, a
-# spread of 1.08x, which is what makes a fixed bound meaningful at all.
-#
-# The materiality threshold must sit above the numerical noise floor of the
-# precision actually in use, or it measures rounding instead of defects, and
-# that floor has to be measured at the threshold rather than extrapolated to it.
-# Swept on a production wave of the behavior clone, the share of components bf16
-# rounding alone pushes past a threshold falls off far more slowly than an
-# exponential — nearer a factor of three per half nat than a factor of two, and
-# slowing as the threshold rises:
-#
-#     0.247 nats 9.8e-3 | 0.50 2.7e-3 | 0.75 1.1e-3 | 1.00 5.1e-4
-#      1.25 nats 2.8e-4 | 1.50 1.6e-4 | 2.00 5.7e-5 | 2.50 1.9e-5
-#      3.00 nats 1.1e-5 | 4.00 3.3e-6
-#
-# For contrast a randomly initialized actor has *zero* components past even
-# 0.247 nats on any head, which is why the earlier calibration could never have
-# predicted any of this.
-#
-# Picking the pair is more constrained than it looks, and the constraint is
-# worth writing down because it decides how much this gate can ever be trusted
-# to do. Call the KL gate's remaining budget B — about 2.5e-3, conservatively,
-# after the clone's own ~1.9e-3. A defect touching a share f of components at
-# log-likelihood error d already fails the KL gate when f * k3(d) > B, so the
-# tail gate only earns its place on defects with f above the bound but
-# f * k3(d) still under B, which caps the useful bound at B / k3(threshold).
-# The bound must also clear the measured floor. Both at once are governed by
-# floor(t) * k3(t), and what that product does is decided by a race: the floor
-# decays faster than k3 grows from half a nat through 2.5, so the product
-# improves, from 4.0e-4 at half a nat to 3.7e-4 at one, 2.5e-4 at two and
-# 1.7e-4 at 2.5 — and then the two rates cross, 1.81x against k3's 1.85x over
-# the half nat from 2.5 to 3, and the product goes flat within 4% through three
-# and four nats. So 2.5 nats is the knee, and the knee is exactly where those
-# rates meet. Below it the product is still sliding and the gate is weaker for
-# no reason; above it there is nothing further to gain on this metric, and the
-# floor grows too sparse to calibrate against — five components at four nats
-# cannot support a three-wave spread estimate, and this whole method depends on
-# a *measured* floor. At no threshold does bf16 turn this into a strong
-# independent detector; the honest most it buys is an extension of the mean's
-# reach to defects too concentrated for a mean to see.
-#
-# 2.5 nats with a 2e-4 bound is pinned from both sides. Above, by redundancy:
-# the ceiling is the KL gate's remaining budget over k3(2.5), which is 2.9e-4
-# against the conservative B and 3.6e-4 against the clone's actual 1.9e-3, so a
-# looser bound would be decoration. Below, by the false-abort rate on the
-# *smallest* head, which is what governs it because the gated statistic is a max
-# over heads. As fractions the heads are comparable; as counts they are not. At
-# production the quantity head carries 75k active components against the unit
-# head's 1.45M, so the same 2e-4 bound is a count of 15 there and 290 there.
-# Measured tail counts over three waves are 29/43/46 on the unit head and 0/1/1
-# on the quantity head: the bound sits 40 Poisson sigma out on the former and
-# still needs a 15-against-0.67 excursion on the latter. Over-dispersion is what
-# could spoil that, and its mechanism is components within one state sharing
-# logits and therefore sharing their rounding — which is why the unit head, at
-# 6.3 active components per state, measures 2.1x over-dispersed (three waves
-# cannot exclude more, so read Poisson as a floor on the noise rather than a
-# model of it), and why the quantity head, at 0.33 per state, has almost nothing
-# to cluster with. Tightening to 1e-4 halves both counts and 0/1/1 does not
-# support it.
-#
-# What the gate uniquely covers is f in (2.0e-4, 3.6e-4], roughly 300 to 520
-# components — severe corruption too small in extent for the mean to notice.
-# That window is not a fixed property of the pair: its ceiling is the KL gate's
-# *remaining* budget, so it narrows as the run's own divergence drifts up and
-# closes altogether once that reaches 3.3e-3, about 44% of the drift available
-# between the clone and the bound. Past that point the tail statistic is
-# redundant as a gate and earns its keep as a numerics-regime monitor in
-# telemetry, which is the honest description of most of its working life.
-#
-# What that leaves the KL gate alone responsible for is stated plainly: the
-# canonical localized defect, one confined to the final minibatch, covers 2048
-# of 320 * 719 = 230,080 states, a 0.89% share, and the KL gate binds there at
-# d <= 0.666. So such a defect is visible from a 1.95x likelihood error up,
-# where the original 0.247-nat threshold caught it from 1.28x. That band, 1.28x
-# to 1.95x on a last-minibatch-sized defect, is what the bf16 update forward
-# costs in detection power. The budget is computed against the unit head's
-# baseline, the largest of the three, so the other heads are caught earlier and
-# this is the worst case.
-#
-# MAX_FIRST_MINIBATCH_KL bounds the same sampler-versus-update comparison the
-# PPO surrogate now uses, measured through the actual grad-tracking update
-# graph. `_replay_to_update_minibatch_kl` runs that comparison with a fixed
-# shuffle so the audit can gate the production first-minibatch statistic. The
-# separate no-grad replay remains useful for locating whether excessive drift
-# came from collection-versus-update execution rather than from a changed
-# policy.
-#
-# The old 1e-4 came from ~7e-8 measured on a randomly initialized actor, whose
-# heads have no confident components at all. A cloned actor has many, and rare
-# catastrophic cancellation on near-zero-probability components dominates the
-# k3 mean; production training measured 1.98e-3 on the clone's first actor
-# minibatch. Calibrating a numerical bound against random init and applying it
-# to a clone had repeatedly failed.
+# Numerical audit gates retained pending measurements on the aligned sampling
+# and per-component update paths. Replay is diagnostic only: PPO always uses
+# the likelihoods stored by the distribution that sampled each action.
 MAX_UPDATE_REPLAY_KL = 5e-3
 UPDATE_REPLAY_TAIL_LOGPROB = 2.5
 MAX_UPDATE_REPLAY_TAIL_FRACTION = 2e-4
-# Measured on the cloned conv actor at production scale, worst of the 113
-# minibatches in each of three disjoint waves:
-#
-#   4.634e-3   7.338e-3   4.060e-2
-#
-# Like its full-rollout siblings, this statistic includes collection-versus-
-# update numerical drift. Its minibatch maximum is more variable than the full
-# rollout mean because rare near-zero-probability components can dominate one
-# slice. The fixed-shuffle audit records both the maximum and mean so a healthy
-# numerical tail can be distinguished from a systematic staging desync.
+# Gate the actual grad-tracking minibatch graph as well as full-rollout replay.
 MAX_FIRST_MINIBATCH_KL = 1.1e-1
 #: Any shuffle reproduces the gate's residual, so the audit fixes one and the
 #: measurement stays comparable between waves and between trees.
@@ -391,104 +209,6 @@ class PpoConfig:
     # Actor and critic share a 5e-5 base rate. The 3e-5 critic did not reach
     # readiness within 40 waves even with its value-head boost; raising both
     # rates is a requested experiment, not evidence of recovered policy strength.
-    #
-    # Historical actor calibration: 2.5e-4 is incompatible with `target_kl`
-    # once the actor is warm-started from behavior cloning. A full epoch is 113
-    # sequential updates over one 230,080-state wave, and a BC-cloned policy is
-    # sharp, so it moves far more KL per unit of parameter movement than the
-    # from-scratch policy the reference rate was inherited for.
-    #
-    # Measured three times, and only the third measurement decides it, because
-    # the first two used proxies for the state the actor actually starts from.
-    # Worst minibatch KL against the stored behavior, and the updates completed
-    # of 113:
-    #
-    #   lr                    1e-12    3e-6    1e-5     1.5e-5   3e-5    2.5e-4
-    #   iter-66, self-play    113      --      --       113      113     1
-    #     max KL              1.44e-4  --      --       8.4e-3*  2.0e-2  --
-    #   iter-66, league-mix   113      --      --       --       113     2
-    #     max KL              1.40e-4  --      --       --       1.6e-2  --
-    #   iter-40, league-mix   113      113     113      18       4       --
-    #     max KL              3.73e-3  7.0e-3  1.58e-2  3.3e-2   3.3e-2  --
-    #
-    #   (* that column is 1.5e-5 on the first row only; the sweeps do not share
-    #    every rate, since each narrowed around the previous one's answer.)
-    #
-    # The iteration-40 row is the one that counts: it is the checkpoint the actor
-    # first updates from, with the critic its own 40 warmup iterations produced,
-    # on the wave that ships. The iteration-66 rows understate movement 5.8x --
-    # that actor had already taken 66 steps and carried a differently trained
-    # critic -- and a run launched on their answer of 3.0e-5 stopped at 4-37 of
-    # 113 on its first actor-active iteration.
-    #
-    # The 1e-12 control is why the readings above it mean anything: it completes
-    # all 113 and reports the replay-parity floor, the divergence at unchanged
-    # weights. That floor is 1.4e-4 on the trained actor and 3.73e-3 on this one
-    # -- 26x larger and 12% of the whole budget -- because a sharp softmax
-    # amplifies the same logit noise into far more KL. It is the clearest single
-    # number for why a cloned policy cannot use a from-scratch policy's rate.
-    #
-    # 1.0e-5 was the largest rate whose whole epoch fits inside a 0.03 bound, and
-    # shipping on that criterion was the mistake. Fitting the bound is necessary
-    # and says nothing about learning: at 1.0e-5 the bound never even binds --
-    # worst minibatch 0.024 against a 0.03 budget over 12 iterations -- so the
-    # rate was tuned against a constraint that was not the constraint.
-    #
-    # What decides it is play. Every candidate below ran 12 to 16 iterations from
-    # `checkpoint-000040`, drawing the same waves in the same order, on the
-    # production lane shape (4 frozen snapshots beside the 3 native built-ins),
-    # judged on score rate against `starter` -- the objective -- with entropy as
-    # the liveness check and the applied share of the epoch as the operational
-    # one (`scripts/probe_schedule_sweep.py`, `artifacts/probes/trust-*.json`):
-    #
-    #   lr      target_kl  epoch applied  entropy  money  score vs starter
-    #   3.0e-6  0.03       100% / 100%    0.169     235   0.000
-    #   1.0e-5  0.03        98% /  79%    0.206     367   0.026   <- shipped
-    #   1.0e-5  0.10       100% / 100%    0.206     360   0.000
-    #   3.0e-5  0.03        22% /   8%    0.291    1074   0.064
-    #   3.0e-5  0.10        89% /  31%    0.311     826   0.051
-    #   3.0e-5  0.30       100% / 100%    0.161    2383   0.000
-    #   6.0e-5  0.30        99% /  87%    0.001    3000   0.000
-    #   1.0e-4  0.03        15% /   1%    0.000    1833   0.000
-    #   1.0e-4  0.10        49% /   3%    0.000    2993   0.000
-    #   1.0e-4  0.30        90% /  34%    0.001    3000   0.000
-    #   3.0e-4  0.03         1% /   1%    0.502     551   0.026
-    #
-    # Two failure modes bracket the answer. Below 3.0e-5 the policy barely moves
-    # and never wins. At and above 6.0e-5 it converges onto passing every turn --
-    # entropy 0.001, money exactly the untouched 3000 starting bank, and zero
-    # score against everything, which is the reward's inaction basin and is
-    # terminal (see MINIMUM_POLICY_ENTROPY). Money alone cannot rank these: it is
-    # MAXIMIZED by the collapse, so a row is only readable with its entropy.
-    #
-    # 3.0e-5 is the whole viable band, and its two bounds are tied on the
-    # objective: 0.064 against 0.051 is 5 wins against 4 over ~82 games. What
-    # separates them is the data budget -- 0.03 discards 78% of every wave it
-    # collects, 0.10 discards 11% -- so the bound moves to 0.10 and pays for
-    # itself in rollout that is actually used. That reverses the earlier decision
-    # to hold 0.03 and move the rate instead, on evidence the earlier decision did
-    # not have: `clip_fraction` was already telling us the bound was stricter than
-    # the clip band it backs up (0.036 at a barely-engaging 0.80/1.28), and a
-    # 12-iteration trajectory at 0.10 ends with the highest entropy of any run
-    # measured, rising rather than falling.
-    #
-    # The tenfold NorMuon conversion below was a hypothesis, not a measurement,
-    # and the four-learner economic-reward run falsified it. Starting from the
-    # same four clones after the same 40 critic-only iterations:
-    #
-    #   NorMuon lr  iteration  internal money  public-v27  public-v16
-    #   3.0e-4     50         54,088          1/32        5/32
-    #   3.0e-5     50         80,923          52/64       64/64
-    #   1.0e-5     70         82,587          49/64       64/64
-    #
-    # External counts use both seats; the two lower-rate rows use 16 held-out
-    # games per member and opponent. At 3.0e-4 the first ten actor updates erase
-    # a strong clone. 3.0e-5 preserves the economy and wins the strongest
-    # measured external row; 1.0e-5 survives longer but gives back three v27
-    # games. The entropy floor stopped both conservative runs before a
-    # deterministic update could be committed, with no entropy term in the
-    # objective. This measurement supersedes the optimizer unit-conversion
-    # projection while leaving the older Adam evidence above as history.
     actor_learning_rate: float = 5.0e-5
     critic_learning_rate: float = 5.0e-5
     # Optional absolute LR for value_head only, independent of trunk Adam gains.
@@ -532,12 +252,18 @@ class PpoConfig:
     critic_epochs: int | None = None
     # Keep physical batches larger without consuming the last VRAM headroom.
     # Balanced partitioning covers the full wave without a small final tail.
-    minibatch_size: int = 4800
+    minibatch_size: int = 6400
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
     # collapse: a symmetric band clips a low-probability action's upside at the
     # same ratio as a high-probability one's, which is a much tighter bound on
     # its absolute probability, so exploration dies faster than it should.
+    #
+    # Measured either way over 100 waves and it is not a lever: 1.20 plateaus
+    # entropy at 0.210 from wave 65 where 1.28 reaches 0.233 still rising, and
+    # money is 21.6k against 23.4k -- inside the spread two
+    # identical-configuration runs show by wave 33, since
+    # `deterministic_training` is off (`runs/production-lam1-{,clip12-}p100-20260911`).
     clip_low: float = 0.80
     clip_high: float = 1.28
     # The other half of the same fight, and until now the missing half: the
@@ -571,14 +297,32 @@ class PpoConfig:
     # bank utility is paid separately. The fixed-horizon discounted return
     # therefore preserves the terminal objective without forcing gamma one.
     #
-    # VAPO decoupled GAE (arXiv:2504.05118, following VC-PPO): the policy uses
-    # a shorter lambda so advantages stay low-variance; the critic regresses on
-    # the lambda-one return so long-horizon reward does not decay as lambda^t.
-    # Length-adaptive GAE is not used -- every episode is COMPETITION_ACTION_STEPS
-    # long, so actor_gae_lambda is VAPO's formula evaluated at that constant.
+    # Preserve delayed investment payoffs in both policy and value targets.
+    # Explicit actor/critic overrides still permit controlled GAE comparisons.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     critic_gae_lambda: float = DEFAULT_CRITIC_GAE_LAMBDA
     gamma: float = DEFAULT_REWARD_GAMMA
+    # Whitening the surrogate's advantages -- `(A - mean) / std` over the owned
+    # valid states of the wave -- shipped here until `15e869c`, which removed it
+    # inside a performance commit with no recorded rationale. Restoring it is a
+    # flag rather than a default because the two halves of the transform are not
+    # equally consequential, and the measurement says so:
+    #
+    #  * The scale half only reaches the update through Adam's epsilon. Polar
+    #    Express opens by dividing by its input's Frobenius norm
+    #    (`optim.py:58-64`), so a NorMuon matrix step is exactly invariant to any
+    #    uniform rescaling of the gradient. Adam is invariant only where epsilon
+    #    is negligible against `sqrt(v_hat)`, which the reference's 1e-10 was not
+    #    at these magnitudes; `optim.py` now ships 1e-20 and records the
+    #    measurement. With that floor gone a per-wave rescale is a per-update
+    #    constant the optimizer divides back out.
+    #  * The mean half changes the direction, not the size: subtracting a common
+    #    offset pushes every sampled action's logprob the same way, which is an
+    #    entropy force with no counterpart in the clipped surrogate. Over waves
+    #    24-100 of three runs the realized offset is small but sign-persistent
+    #    late: mean advantage over advantage std averages -0.005 to -0.010 in the
+    #    second half, positive in only 15-20 of 50 waves.
+    normalize_advantages: bool = False
     # The PPO actor and critic gradients are intentionally unclipped. NorMuon
     # already normalizes matrix directions; the value head is Adam-managed.
     # Keep this threshold only for the actor/critic NextLat predictors, where
@@ -616,7 +360,7 @@ class PpoConfig:
     structured_decision_horizon: int = 2
     # Predictor parameters live in a separate optimizer so they are not in the
     # actor/critic state dicts consumed by snapshots. They step on the same
-    # minibatches as the trunk, through one combined task + auxiliary backward.
+    # minibatches as the trunk, balancing main/auxiliary source cotangents 50/50.
     # The source remains attached whenever its model updates; successor targets
     # and auxiliary readout weights are always stop-gradient.
     structured_learning_rate: float | None = None
@@ -683,8 +427,8 @@ def generalized_advantage_and_targets(
     """Compute lambda-GAE advantages and the matching lambda-return ``A + V``.
 
     Callers pick the lambda: the actor uses `PpoConfig.actor_gae_lambda`, the
-    critic uses `PpoConfig.critic_gae_lambda` (VAPO's decoupled GAE, lambda one
-    by default). This helper is the recurrence only.
+    critic uses `PpoConfig.critic_gae_lambda`. Both default to lambda one.
+    This helper is the recurrence only.
     """
     if rewards.shape != values.shape or valid.shape != values.shape:
         raise ValueError("rewards, values, and valid mask must have the same shape")
@@ -791,7 +535,9 @@ def _validate_config(config: PpoConfig) -> None:
     if any(value < 0 for value in horizons):
         raise ValueError("structured auxiliary horizons cannot be negative")
     if config.structured_actor_auxiliary_active and config.structured_decision_horizon < 1:
-        raise ValueError("structured decision horizon must be positive when actor auxiliary is active")
+        raise ValueError(
+            "structured decision horizon must be positive when actor auxiliary is active"
+        )
     if config.structured_critic_auxiliary_active and config.structured_critic_horizon < 1:
         raise ValueError(
             "structured critic horizon must be positive when critic auxiliary is active"
@@ -1065,10 +811,15 @@ def replay_behavior_values(
         _replayed_value_chunk,
         _device_compile_mode(compile_mode, device),
     )
-    chunks = [
-        slice(start, start + chunk_size) if states is None else states[start : start + chunk_size]
-        for start in range(0, row_count, chunk_size)
-    ]
+    # Every chunk is exactly `chunk_size` rows: the tail wraps to the leading
+    # rows and the duplicates are dropped from the result. A short final chunk
+    # was a second shape for this callable, and the wave's row count moves, so
+    # the measured cost was an Inductor compile of the value replay for each new
+    # remainder a run produced.
+    chunk_count = math.ceil(row_count / chunk_size)
+    wrapped = torch.arange(chunk_count * chunk_size, device=device) % row_count
+    rows = wrapped if states is None else states.reshape(-1)[wrapped]
+    chunks = [rows[start : start + chunk_size] for start in range(0, rows.numel(), chunk_size)]
     was_training = critic.training
     critic.eval()
     try:
@@ -1078,7 +829,7 @@ def replay_behavior_values(
         ]
     finally:
         critic.train(was_training)
-    return torch.cat(values).float()
+    return torch.cat(values)[:row_count].float()
 
 
 def _owned_valid(rollout: RolloutBatch, rows: np.ndarray | None) -> np.ndarray:
@@ -1179,6 +930,13 @@ def prepare_advantages(
     selected = advantages[valid.bool()]
     if selected.numel() == 0:
         raise ValueError("rollout contains no valid states")
+    raw_mean = float(selected.mean())
+    raw_std = float(selected.std(unbiased=False))
+    if config.normalize_advantages:
+        # The wave's own statistics, over the states this update owns: a pooled
+        # normalizer would let one population member's return scale set another
+        # member's offset, and the partition is by seat, not by contiguous rows.
+        advantages = (advantages - raw_mean) / max(raw_std, 1e-6)
     advantages = advantages * valid
     # Lambda one against a zero reference: the residuals telescope, so the
     # advantage is the exact suffix return and the same recurrence yields it.
@@ -1194,8 +952,8 @@ def prepare_advantages(
         value_targets=critic_targets.numpy(),
         policy_lambda_returns=policy_lambda_returns.numpy(),
         monte_carlo_returns=monte_carlo.numpy(),
-        raw_advantage_mean=float(selected.mean()),
-        raw_advantage_std=float(selected.std(unbiased=False)),
+        raw_advantage_mean=raw_mean,
+        raw_advantage_std=raw_std,
     )
 
 
@@ -1336,24 +1094,21 @@ def _batch_tensor(
     return selected if dtype is None or selected.dtype == dtype else selected.to(dtype=dtype)
 
 
-def _balanced_minibatch_slices(sample_count: int, maximum_size: int) -> tuple[slice, ...]:
-    """Partition an epoch into near-equal, nonempty minibatches.
+def _fixed_minibatch_positions(
+    sample_count: int, minibatch_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fixed-shape positions plus genuine row counts for one epoch.
 
-    A short final tail would otherwise receive a full optimizer step despite
-    its mean loss containing fewer samples. Balancing keeps every sample's
-    per-epoch influence approximately equal without dropping any states.
+    Only the final minibatch may wrap to the ordering's beginning. Wrapped
+    rows keep compiled graph shapes fixed; callers must give them zero weight.
     """
-    if sample_count < 1 or maximum_size < 1:
-        raise ValueError("sample count and maximum minibatch size must be positive")
-    batch_count = math.ceil(sample_count / maximum_size)
-    base_size, larger_batches = divmod(sample_count, batch_count)
-    slices: list[slice] = []
-    start = 0
-    for batch in range(batch_count):
-        size = base_size + int(batch < larger_batches)
-        slices.append(slice(start, start + size))
-        start += size
-    return tuple(slices)
+    if sample_count < 1 or minibatch_size < 1:
+        raise ValueError("sample count and minibatch size must be positive")
+    batch_count = math.ceil(sample_count / minibatch_size)
+    positions = np.arange(batch_count * minibatch_size) % sample_count
+    counts = np.full(batch_count, minibatch_size, dtype=np.int64)
+    counts[-1] = sample_count - (batch_count - 1) * minibatch_size
+    return positions.reshape(batch_count, minibatch_size), counts
 
 
 def _contiguous_run_indices(
@@ -1396,8 +1151,48 @@ def _contiguous_run_indices(
     return indices[np.repeat(shuffled_starts - offsets, shuffled_lengths) + np.arange(indices.size)]
 
 
-def _detached_belief(belief: StructuredBelief | StructuredCriticBelief):
+def _detached_belief(
+    belief: StructuredBelief | StructuredDecisionBelief | StructuredCriticBelief,
+):
     return type(belief)(*(field.detach() for field in belief))
+
+
+def actor_lr_cooldown_scale(
+    iteration: int, total_iterations: int, cooldown_fraction: float
+) -> float:
+    """Linear decay to zero over the final `cooldown_fraction` of the planned run.
+
+    Polar Express divides its input by that input's Frobenius norm, so a NorMuon
+    step's size is whatever the learning rate says and nothing the objective
+    says (`optim.py:58-64`); Adam's `m_hat / sqrt(v_hat)` is scale-free for the
+    same reason. Measured over three 90-100 wave arms, a 3.3x spread in
+    `advantage_std` (0.085 / 0.284 / 0.252) produced a 1.26x spread in realized
+    `approx_kl` (0.0030 / 0.0024 / 0.0024): the policy's displacement per step
+    is set by the rate, not by how much the return says to move.
+
+    With warmup as the only schedule that displacement is constant for the whole
+    run, which is a constant entropy injection into a policy that starts peaked.
+    `modded-nanogpt`, where this optimizer comes from, pairs it with a linear
+    decay over the final 60% of training plus a momentum warmup and cooldown
+    (`train_gpt.py:1992`, `:1995-2007`); this trainer kept the normalization and
+    dropped the schedule.
+
+    Actor only. The critic's rate is its tracking rate against data that moves
+    every wave, so decaying it would grow the advantage bias being tested here.
+    """
+    if cooldown_fraction <= 0.0 or total_iterations <= 0:
+        return 1.0
+    start = (1.0 - min(cooldown_fraction, 1.0)) * float(total_iterations)
+    if float(iteration) <= start:
+        return 1.0
+    span = float(total_iterations) - start
+    return max(0.0, (float(total_iterations) - float(iteration)) / span)
+
+
+def set_lr_cooldown(optimizer: torch.optim.Optimizer, scale: float) -> None:
+    """Multiply every group's warmup-scaled rate by `scale` from the next step."""
+    for group in optimizer.param_groups:
+        group["cooldown_scale"] = float(scale)
 
 
 def _optimizer_step(
@@ -1420,7 +1215,7 @@ def _optimizer_step(
             group["warmup_step"] = step
             group_base_lr = float(group.get("base_lr", base_learning_rate))
             scale = min(step / warmup_steps, 1.0) if warmup_steps else 1.0
-            group["lr"] = group_base_lr * scale
+            group["lr"] = group_base_lr * scale * float(group.get("cooldown_scale", 1.0))
     if found_inf is None:
         optimizer.step()
         return
@@ -1471,7 +1266,7 @@ def _restore_skipped_optimizer_steps(
         else:
             base_lr = float(group.get("base_lr", initial_lr))
             scale = min(restored_step / warmup_steps, 1.0) if warmup_steps else 1.0
-            group["lr"] = base_lr * scale
+            group["lr"] = base_lr * scale * float(group.get("cooldown_scale", 1.0))
 
 
 def _replayed_component_logprobs(
@@ -1587,8 +1382,10 @@ def replay_behavior_logprobs(
         ),
     }
     ordered = torch.from_numpy(valid_indices).to(device=device)
-    for batch_slice in _balanced_minibatch_slices(valid_indices.size, minibatch_size):
-        indices = ordered[batch_slice]
+    positions, counts = _fixed_minibatch_positions(valid_indices.size, minibatch_size)
+    staged_positions = torch.from_numpy(positions).to(device=device)
+    for batch in range(positions.shape[0]):
+        indices = ordered[staged_positions[batch]]
         unit_logprobs, kind_logprobs, quantity_logprobs = replay(
             actor,
             _batch_tensor(staged["unit_actions"], indices, torch.long),
@@ -1605,7 +1402,8 @@ def replay_behavior_logprobs(
             ("old_market_kind_logprobs", kind_logprobs),
             ("old_market_quantity_logprobs", quantity_logprobs),
         ):
-            replayed[name].index_copy_(0, indices, values.float())
+            count = int(counts[batch])
+            replayed[name].index_copy_(0, indices[:count], values[:count].float())
     return replayed
 
 
@@ -1692,7 +1490,9 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function, m
         object.__setattr__(module, attribute, cache)
     compiled = cache.get(mode)
     if compiled is None:
-        compiled = torch.compile(function, mode=mode, fullgraph=True, dynamic=False)
+        compiled = torch.compile(
+            function, options=policy_compile_options(mode), fullgraph=True, dynamic=False
+        )
         cache[mode] = compiled
     return compiled
 
@@ -1716,6 +1516,7 @@ def _actor_minibatch_terms(
     clip_high: float,
     autocast_enabled: bool,
     *actor_args: Any,
+    sample_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """One actor minibatch: update likelihood plus clipped surrogate reductions.
 
@@ -1745,29 +1546,53 @@ def _actor_minibatch_terms(
         autocast_enabled,
         *actor_args,
     )
-    device = unit_actions.device
-    policy_sum = torch.zeros((), device=device)
-    entropy_sum = torch.zeros((), device=device)
-    kl_sum = torch.zeros((), device=device)
-    clipped_sum = torch.zeros((), device=device)
-    for new, old, active, entropy in (
-        (new_unit, old_unit, unit_active, unit_entropy),
-        (new_kind, old_kind, kind_active, kind_entropy),
-        (new_quantity, old_quantity, quantity_active, quantity_entropy),
-    ):
-        component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
-            new,
-            old,
-            advantages,
-            active,
-            clip_low,
-            clip_high,
+    return _component_policy_sums(
+        (new_unit, new_kind, new_quantity),
+        (old_unit, old_kind, old_quantity),
+        (unit_active, kind_active, quantity_active),
+        (unit_entropy, kind_entropy, quantity_entropy),
+        advantages,
+        clip_low,
+        clip_high,
+        sample_weight=sample_weight,
+    )
+
+
+class _BalancedSource(torch.autograd.Function):
+    """Fork head inputs, balancing main/auxiliary cotangents before one trunk VJP.
+
+    The norm spans every source head input together, not individual tokens.
+    Readout and predictor parameter gradients keep their own objectives.
+    Forward is zero-copy and bit-identical; Inductor compiles the backward
+    reductions and mix along with the existing model backward.
+    """
+
+    @staticmethod
+    def forward(ctx, *fields: Tensor) -> tuple[Tensor, ...]:
+        ctx.count = len(fields)
+        return tuple(field.view_as(field) for field in (*fields, *fields))
+
+    @staticmethod
+    def backward(ctx, *gradients: Tensor) -> tuple[Tensor, ...]:
+        primary = gradients[: ctx.count]
+        auxiliary = gradients[ctx.count :]
+        primary_norm = torch.stack(tuple(g.float().square().sum() for g in primary)).sum().sqrt()
+        auxiliary_norm = (
+            torch.stack(tuple(g.float().square().sum() for g in auxiliary)).sum().sqrt()
         )
-        policy_sum = policy_sum + component_objective
-        entropy_sum = entropy_sum + (entropy * active).sum()
-        kl_sum = kl_sum + component_kl
-        clipped_sum = clipped_sum + component_clipped
-    return policy_sum, entropy_sum.detach(), kl_sum.detach(), clipped_sum
+        has_auxiliary = auxiliary_norm != 0
+        primary_scale = torch.where(has_auxiliary, 0.5, 1.0)
+        auxiliary_scale = torch.where(
+            has_auxiliary,
+            0.5
+            * primary_norm
+            / torch.where(has_auxiliary, auxiliary_norm, torch.ones_like(auxiliary_norm)),
+            0.0,
+        )
+        return tuple(
+            (left.float() * primary_scale + right.float() * auxiliary_scale).to(left.dtype)
+            for left, right in zip(primary, auxiliary, strict=True)
+        )
 
 
 def _structured_actor_minibatch_terms(
@@ -1789,6 +1614,8 @@ def _structured_actor_minibatch_terms(
     clip_high: float,
     autocast_enabled: bool,
     *actor_args: Any,
+    sample_weight: Tensor | None = None,
+    balance_auxiliary: bool = False,
 ) -> tuple[Tensor, ...]:
     """PPO terms and the belief from one structured actor forward."""
     (inputs,) = actor_args
@@ -1799,7 +1626,17 @@ def _structured_actor_minibatch_terms(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        output, belief = actor.forward_with_belief(inputs)
+        belief = actor.decision_belief(inputs)
+        primary_belief = belief
+        if balance_auxiliary:
+            unit, market, auxiliary_unit, auxiliary_market = _BalancedSource.apply(
+                belief.unit_decisions, belief.market_decisions
+            )
+            primary_belief = belief._replace(unit_decisions=unit, market_decisions=market)
+            belief = belief._replace(
+                unit_decisions=auxiliary_unit, market_decisions=auxiliary_market
+            )
+        output = actor.decode_belief(primary_belief)
         (
             new_unit,
             new_kind,
@@ -1818,29 +1655,46 @@ def _structured_actor_minibatch_terms(
             quantity_masks,
             validate_masks=False,
         )
-    device = unit_actions.device
-    policy_sum = torch.zeros((), device=device)
-    entropy_sum = torch.zeros((), device=device)
-    kl_sum = torch.zeros((), device=device)
-    clipped_sum = torch.zeros((), device=device)
-    for new, old, active, entropy in (
-        (new_unit, old_unit, unit_active, unit_entropy),
-        (new_kind, old_kind, kind_active, kind_entropy),
-        (new_quantity, old_quantity, quantity_active, quantity_entropy),
-    ):
-        component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
-            new,
-            old,
+    return (
+        *_component_policy_sums(
+            (new_unit, new_kind, new_quantity),
+            (old_unit, old_kind, old_quantity),
+            (unit_active, kind_active, quantity_active),
+            (unit_entropy, kind_entropy, quantity_entropy),
             advantages,
-            active,
             clip_low,
             clip_high,
+            sample_weight=sample_weight,
+        ),
+        *belief,
+    )
+
+
+def _value_objective(
+    critic: Critic,
+    critic_logits: Tensor,
+    value_targets: Tensor,
+    *,
+    sample_weight: Tensor | None = None,
+) -> Tensor:
+    """The critic's per-minibatch objective, in whichever parameterization it has.
+
+    The scalar branch reads the prediction back through `critic.value`, which is
+    a squeeze there, so both branches spend exactly one readout.
+    """
+    if critic.config.scalar_value:
+        per_state = scalar_value_loss(critic.value(critic_logits), value_targets)
+    else:
+        per_state = distributional_value_loss(
+            critic_logits,
+            value_targets,
+            critic.support,
+            sigma_ratio=critic.config.value_sigma_ratio,
+            validate=False,
         )
-        policy_sum = policy_sum + component_objective
-        entropy_sum = entropy_sum + (entropy * active).sum()
-        kl_sum = kl_sum + component_kl
-        clipped_sum = clipped_sum + component_clipped
-    return (policy_sum, entropy_sum.detach(), kl_sum.detach(), clipped_sum, *belief)
+    if sample_weight is None:
+        return per_state.mean()
+    return (per_state * sample_weight).sum() / sample_weight.sum().clamp_min(1)
 
 
 def _critic_logits_and_loss(
@@ -1848,22 +1702,19 @@ def _critic_logits_and_loss(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
+    sample_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """The shared critic forward and distributional objective."""
+    """The shared critic forward and value objective."""
     with torch.autocast(
         device_type=value_targets.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
         critic_logits = critic(*critic_args)
-    loss = distributional_value_loss(
+    return (
+        _value_objective(critic, critic_logits, value_targets, sample_weight=sample_weight),
         critic_logits,
-        value_targets,
-        critic.support,
-        sigma_ratio=critic.config.value_sigma_ratio,
-        validate=False,
-    ).mean()
-    return loss, critic_logits
+    )
 
 
 def _critic_minibatch_objective(
@@ -1871,10 +1722,11 @@ def _critic_minibatch_objective(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
+    sample_weight: Tensor | None = None,
 ) -> Tensor:
     """One critic minibatch without the value telemetry scoring epochs need."""
     loss, _critic_logits = _critic_logits_and_loss(
-        critic, value_targets, autocast_enabled, *critic_args
+        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
     )
     return loss
 
@@ -1884,6 +1736,7 @@ def _critic_minibatch_loss(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
+    sample_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """One critic minibatch: the distributional loss and the mean it implies.
 
@@ -1892,7 +1745,7 @@ def _critic_minibatch_loss(
     `_critic_minibatch_objective`, avoiding the softmax and support reduction.
     """
     loss, critic_logits = _critic_logits_and_loss(
-        critic, value_targets, autocast_enabled, *critic_args
+        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
     )
     return loss, critic.value(critic_logits).detach()
 
@@ -1902,6 +1755,7 @@ def _critic_minibatch_fit_terms(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
+    sample_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Critic loss plus float64 target/residual moments for a scoring epoch.
 
@@ -1910,18 +1764,11 @@ def _critic_minibatch_fit_terms(
     a full minibatch and materializing five eager float64 intermediates.
     """
     loss, predictions = _critic_minibatch_loss(
-        critic, value_targets, autocast_enabled, *critic_args
+        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
     )
     targets = value_targets.double()
     residuals = targets - predictions.double()
-    moments = torch.stack(
-        (
-            targets.sum(),
-            targets.square().sum(),
-            residuals.sum(),
-            residuals.square().sum(),
-        )
-    )
+    moments = _value_fit_moments(targets, residuals, sample_weight)
     return loss, moments
 
 
@@ -1930,33 +1777,38 @@ def _structured_critic_minibatch_fit_terms(
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
+    sample_weight: Tensor | None = None,
+    balance_auxiliary: bool = False,
 ) -> tuple[Tensor, ...]:
-    """Distributional critic loss, fit moments, and belief from one forward."""
+    """Critic loss, fit moments, and belief from one forward."""
     with torch.autocast(
         device_type=value_targets.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        critic_logits, belief = critic.forward_with_belief(*critic_args)
-    loss = distributional_value_loss(
-        critic_logits,
-        value_targets,
-        critic.support,
-        sigma_ratio=critic.config.value_sigma_ratio,
-        validate=False,
-    ).mean()
+        belief = critic.encode_belief(*critic_args)
+        primary_belief = belief
+        if balance_auxiliary:
+            primary, auxiliary = _BalancedSource.apply(belief.value_decision)
+            primary_belief = StructuredCriticBelief(primary)
+            belief = StructuredCriticBelief(auxiliary)
+        critic_logits = critic.decode_belief(primary_belief)
+    loss = _value_objective(critic, critic_logits, value_targets, sample_weight=sample_weight)
     predictions = critic.value(critic_logits).detach()
     targets = value_targets.double()
     residuals = targets - predictions.double()
-    moments = torch.stack(
-        (
-            targets.sum(),
-            targets.square().sum(),
-            residuals.sum(),
-            residuals.square().sum(),
+    moments = _value_fit_moments(targets, residuals, sample_weight)
+    return (loss, moments, *belief)
+
+
+def _value_fit_moments(targets: Tensor, residuals: Tensor, sample_weight: Tensor | None) -> Tensor:
+    values = (targets, targets.square(), residuals, residuals.square())
+    return torch.stack(
+        tuple(
+            value.sum() if sample_weight is None else (value * sample_weight).sum()
+            for value in values
         )
     )
-    return (loss, moments, *belief)
 
 
 # `torch.no_grad` rather than inference mode keeps every explicit replay
@@ -2041,13 +1893,20 @@ def update_replay_parity(
     # loses the quantity being measured.
     kl_sums = dict.fromkeys(("unit", "kind", "quantity"), 0.0)
     tail_counts = dict.fromkeys(("unit", "kind", "quantity"), 0)
-    # Joint over all three heads on one minibatch, reported as a diagnostic for
-    # how far a 2048-row slice strays from the full-batch mean.
+    # Worst component-mean KL in a production-shaped minibatch.
     worst_minibatch_kl = 0.0
-    for batch_slice in _balanced_minibatch_slices(valid_indices.size, minibatch_size):
-        indices = ordered[batch_slice]
-        minibatch_kl_sum = 0.0
-        minibatch_active = 0
+    joint_kl_sum = 0.0
+    positions, counts = _fixed_minibatch_positions(valid_indices.size, minibatch_size)
+    staged_positions = torch.from_numpy(positions).to(device=device)
+    for batch in range(positions.shape[0]):
+        indices = ordered[staged_positions[batch]]
+        # The replay runs the padded shape so it compiles once, but this is an
+        # audit: the wrapped tail's repeated rows are excluded from every sum so
+        # the reported means and tail counts stay per-state exact.
+        rows = int(counts[batch])
+        joint_log_ratio = torch.zeros(rows, device=device, dtype=torch.float64)
+        minibatch_component_kl_sum = 0.0
+        minibatch_components = 0
         market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
         replayed = replay(
             actor,
@@ -2061,18 +1920,31 @@ def update_replay_parity(
             *_actor_batch_args(rollout.architecture, staged, indices),
         )
         for name, new_logprobs, old_key, active_key in (
-            ("unit", replayed[0], "old_unit_logprobs", "unit_active"),
-            ("kind", replayed[1], "old_market_kind_logprobs", "market_active"),
-            ("quantity", replayed[2], "old_market_quantity_logprobs", "market_quantity_active"),
+            ("unit", replayed[0][:rows], "old_unit_logprobs", "unit_active"),
+            ("kind", replayed[1][:rows], "old_market_kind_logprobs", "market_active"),
+            (
+                "quantity",
+                replayed[2][:rows],
+                "old_market_quantity_logprobs",
+                "market_quantity_active",
+            ),
         ):
-            active = _batch_tensor(staged[active_key], indices, torch.bool)
+            active = _batch_tensor(staged[active_key], indices, torch.bool)[:rows]
+            row_difference = torch.where(
+                active,
+                new_logprobs.float()
+                - _batch_tensor(staged[old_key], indices, torch.float32)[:rows],
+                0.0,
+            )
+            joint_log_ratio += row_difference.double().sum(-1)
             active_count = int(active.sum())
             active_counts[name] += active_count
+            minibatch_components += active_count
             if not active_count:
                 continue
             difference = (
                 new_logprobs[active].float()
-                - _batch_tensor(staged[old_key], indices, torch.float32)[active]
+                - _batch_tensor(staged[old_key], indices, torch.float32)[:rows][active]
             )
             if not bool(torch.isfinite(difference).all()):
                 raise FloatingPointError(f"non-finite {name} update replay difference")
@@ -2095,11 +1967,12 @@ def update_replay_parity(
             widened = difference.double()
             head_kl_sum = float((torch.expm1(widened) - widened).sum())
             kl_sums[name] += head_kl_sum
-            minibatch_kl_sum += head_kl_sum
-            minibatch_active += active_count
+            minibatch_component_kl_sum += head_kl_sum
             tail_counts[name] += int((widened.abs() > UPDATE_REPLAY_TAIL_LOGPROB).sum())
-        if minibatch_active:
-            worst_minibatch_kl = max(worst_minibatch_kl, minibatch_kl_sum / minibatch_active)
+        joint_kl_sum += float((torch.expm1(joint_log_ratio) - joint_log_ratio).sum())
+        worst_minibatch_kl = max(
+            worst_minibatch_kl, minibatch_component_kl_sum / max(1, minibatch_components)
+        )
     first_minibatch_kl, mean_first_minibatch_kl = _replay_to_update_minibatch_kl(
         actor,
         rollout,
@@ -2134,15 +2007,9 @@ def update_replay_parity(
         "update_replay_max_ratio_error": max(maximum_ratio_error.values()),
         "update_replay_max_kl": max(replay_kl.values()),
         "update_replay_max_tail_fraction": max(tail_fraction.values()),
-        # A component-weighted mean of the three heads, so it can never exceed
-        # the largest of them and MAX_UPDATE_REPLAY_KL bounds it by
-        # construction. Reported so the relationship is visible rather than
-        # merely true.
-        "update_replay_joint_kl": total_kl_sum / total_active if total_active else 0.0,
-        # The same sampling-versus-replay mean on the worst single minibatch.
-        # Diagnostic only: it says how much a 2048-row slice of a heavy-tailed
-        # per-component distribution strays from the full-batch mean, which is
-        # what makes the tail statistics rather than the mean the bug detector.
+        "update_replay_component_kl": total_kl_sum / total_active if total_active else 0.0,
+        "update_replay_joint_kl": joint_kl_sum / valid_indices.size,
+        # Same active-component mean k3 estimator as the PPO objective.
         "update_replay_minibatch_kl": worst_minibatch_kl,
         # The fixed-shuffle sampling-versus-update statistic
         # `MAX_FIRST_MINIBATCH_KL` bounds. Unlike the no-grad replay numbers
@@ -2171,19 +2038,13 @@ def _replay_to_update_minibatch_kl(
     `_actor_minibatch_terms` over shuffled minibatches through the same
     grad-tracking graph as the optimizer. Advantages are zero because the k3
     sum does not depend on them, and every minibatch of one epoch is measured
-    rather than only the first.
+    rather than only the first. The epoch mean is weighted by active components.
     """
     device = next(actor.parameters()).device
     resolved_mode = _device_compile_mode(compile_mode, device)
     # The k3 sum ignores both the advantages and the clip bounds, so the
     # defaults stand in for a config this audit is not otherwise given.
     clip = PpoConfig()
-    flat_valid_size = rollout.valid.size
-    flat_component_counts = (
-        rollout.unit_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_quantity_active.reshape(flat_valid_size, -1).sum(axis=1, dtype=np.int64)
-    )
     # Keep the audit's compiled callable separate from the optimizer's so fixed
     # diagnostic modes and shapes cannot specialize or evict the production
     # update cache.
@@ -2194,14 +2055,25 @@ def _replay_to_update_minibatch_kl(
     # between audit waves.
     shuffled = np.random.default_rng(_REPLAY_AUDIT_SHUFFLE_SEED).permutation(valid_indices)
     shuffled_device = torch.from_numpy(shuffled).to(device=device)
+    flat_component_counts = (
+        rollout.unit_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
+        + rollout.market_quantity_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
+    )
     zero_advantages = torch.zeros(minibatch_size, dtype=torch.float32, device=device)
     worst = 0.0
     total = 0.0
     measured = 0
-    for batch_slice in _balanced_minibatch_slices(shuffled.size, minibatch_size):
-        host_indices = shuffled[batch_slice]
-        indices = shuffled_device[batch_slice]
-        component_count = max(1, int(flat_component_counts[host_indices].sum()))
+    positions, counts = _fixed_minibatch_positions(shuffled.size, minibatch_size)
+    staged_positions = torch.from_numpy(positions).to(device=device)
+    sample_weights = torch.from_numpy(
+        (np.arange(minibatch_size)[None, :] < counts[:, None]).astype(np.float32)
+    ).to(device=device)
+    for batch in range(positions.shape[0]):
+        indices = shuffled_device[staged_positions[batch]]
+        component_count = int(
+            flat_component_counts[shuffled[positions[batch, : counts[batch]]]].sum()
+        )
         # Grad is re-enabled inside this no_grad audit deliberately. Dynamo
         # specializes on the grad context, so measuring under no_grad would both
         # compile a second entry for a code object already at two of its eight
@@ -2232,13 +2104,51 @@ def _replay_to_update_minibatch_kl(
                 clip.clip_high,
                 autocast_enabled,
                 *_actor_batch_args(rollout.architecture, staged, indices),
+                sample_weight=sample_weights[batch],
             )
-        minibatch_kl = float(kl_sum.detach().double()) / component_count
+        minibatch_kl_sum = float(kl_sum.detach().double())
+        minibatch_kl = minibatch_kl_sum / max(1, component_count)
         del policy_sum, entropy_sum, kl_sum, clipped_sum
         worst = max(worst, minibatch_kl)
-        total += minibatch_kl
-        measured += 1
+        total += minibatch_kl_sum
+        measured += component_count
     return worst, total / measured if measured else 0.0
+
+
+def _component_policy_sums(
+    new_logprobs: tuple[Tensor, Tensor, Tensor],
+    old_logprobs: tuple[Tensor, Tensor, Tensor],
+    active: tuple[Tensor, Tensor, Tensor],
+    entropies: tuple[Tensor, Tensor, Tensor],
+    advantages: Tensor,
+    clip_low: float,
+    clip_high: float,
+    *,
+    sample_weight: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Sum independently clipped objectives over active action components.
+
+    Callers divide every sum by the global active-component count, not by
+    states or by a mean of per-state means. Each active conditional decision
+    receives the state's advantage; padding has zero weight in every term.
+    """
+    objective = torch.zeros((), device=advantages.device)
+    entropy_sum = torch.zeros_like(objective)
+    kl = torch.zeros_like(objective)
+    clipped = torch.zeros_like(objective)
+    for new, old, mask, entropy in zip(new_logprobs, old_logprobs, active, entropies, strict=True):
+        weight = mask.float()
+        if sample_weight is not None:
+            weight = torch.where(sample_weight[:, None].bool(), weight, 0.0)
+            weight = weight * sample_weight[:, None]
+        component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
+            new, old, advantages, weight, clip_low, clip_high
+        )
+        objective = objective + component_objective
+        kl = kl + component_kl
+        clipped = clipped + component_clipped
+        entropy_sum = entropy_sum + (torch.where(weight.bool(), entropy, 0.0) * weight).sum()
+    return objective, entropy_sum.detach(), kl.detach(), clipped
 
 
 def _clipped_surrogate_sums(
@@ -2249,9 +2159,10 @@ def _clipped_surrogate_sums(
     clip_low: float,
     clip_high: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return the PPO token objective, non-negative k3 KL, and clipped count."""
-    log_ratio = torch.where(active.bool(), new_logprobs.float() - old_logprobs.float(), 0.0)
-    expanded_advantage = advantages.float()[:, None]
+    """Return weighted per-component PPO objective, k3 KL, and clipped count."""
+    valid = active.bool()
+    log_ratio = torch.where(valid, new_logprobs.float() - old_logprobs.float(), 0.0)
+    expanded_advantage = torch.where(valid, advantages.float()[:, None], 0.0)
     effective_log_ratio = torch.where(
         expanded_advantage >= 0.0,
         log_ratio.clamp_max(math.log(clip_high)),
@@ -2317,6 +2228,18 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray, valid: np.
     if variance < 1e-12:
         return 0.0
     return 1.0 - float(np.var(selected_targets - selected_predictions)) / variance
+
+
+def _r_squared(targets: np.ndarray, predictions: np.ndarray, valid: np.ndarray) -> float:
+    """Bias-sensitive pre-update fit on valid owned rows, unlike centered EV."""
+    selected_targets = targets[valid]
+    if selected_targets.size < 2:
+        return 0.0
+    variance = float(np.var(selected_targets, dtype=np.float64))
+    if variance < 1e-12:
+        return 0.0
+    residual = np.subtract(selected_targets, predictions[valid], dtype=np.float64)
+    return 1.0 - float(np.mean(np.square(residual))) / variance
 
 
 _FIT_MOMENT_KEYS = ("target", "target_square", "residual", "residual_square")
@@ -2469,7 +2392,7 @@ def _structured_auxiliary_terms(
     complete_windows: bool,
     belief_indices: Tensor | None = None,
     belief_inverse: Tensor | None = None,
-    belief: StructuredBelief | None = None,
+    belief: StructuredBelief | StructuredDecisionBelief | None = None,
     plan: StructuredHorizonPlan | None = None,
 ) -> tuple[Tensor, StructuredDynamicsTerms]:
     """Evaluate the typed NextLat objective on the supplied or forwarded belief.
@@ -2516,17 +2439,17 @@ def _structured_auxiliary_terms(
         elif model_grad:
             if belief_indices is not None or belief_inverse is not None:
                 raise ValueError("actor-gradient auxiliary cannot reuse unique-row beliefs")
-            _, belief = actor.forward_with_belief(inputs)
+            belief = actor.decision_belief(inputs)
         elif belief_indices is not None and belief_inverse is not None:
             (belief_inputs,) = _actor_batch_args(STRUCTURED, staged, belief_indices)
             if not isinstance(belief_inputs, StructuredInputs):
                 raise TypeError("structured auxiliary requires StructuredInputs")
             with torch.no_grad():
-                _, unique_belief = actor.forward_with_belief(belief_inputs)
-            belief = StructuredBelief(*(value[belief_inverse] for value in unique_belief))
+                unique_belief = actor.decision_belief(belief_inputs)
+            belief = StructuredDecisionBelief(*(value[belief_inverse] for value in unique_belief))
         elif belief_indices is None and belief_inverse is None:
             with torch.no_grad():
-                _, belief = actor.forward_with_belief(inputs)
+                belief = actor.decision_belief(inputs)
         else:
             raise ValueError("belief indices and inverse must be supplied together")
         decode = (
@@ -2663,9 +2586,9 @@ def _credit_quality_metrics(
     diagnostics; neither the terminal outcome nor this reconstruction is staged.
     """
     remaining = rollout.valid.sum(axis=1)[:, None] - np.arange(valid.shape[1])[None, :]
-    terminal = np.log1p(rollout.final_money.astype(np.float64) / STARTING_MONEY) - np.log1p(
-        rollout.opponent_money.astype(np.float64) / STARTING_MONEY
-    )
+    own = rollout.final_money.astype(np.float64)
+    opponent = rollout.opponent_money.astype(np.float64)
+    terminal = (own - opponent) / (own + opponent + 2.0 * STARTING_MONEY)
     target = np.power(gamma, np.maximum(remaining - 1, 0)) * terminal[:, None]
     potential = target - monte_carlo
     prediction = values + potential
@@ -2708,12 +2631,12 @@ def _credit_quality_metrics(
 
 
 def _auxiliary_branch_belief(belief, squared_norms: list[Tensor] | None = None):
-    """Fork auxiliary edges, optionally observing their combined-backward cotangents.
+    """Fork auxiliary edges, optionally observing their raw source cotangents.
 
     Always use the same zero-copy views, including unobserved minibatches: changing
     input view/autograd metadata only for diagnostics can specialize AOTAutograd.
     Hooks exclude the primary objective and reduce immediately to one scalar per
-    field; neither full gradients nor activations survive for a second traversal.
+    field before model-parameter gradient balancing.
     """
 
     def observe(gradient: Tensor) -> None:
@@ -2747,25 +2670,123 @@ def _elapsed_cuda_seconds(start: torch.cuda.Event | None, end: torch.cuda.Event 
     return start.elapsed_time(end) / 1000.0
 
 
-_UPDATE_STREAMS = threading.local()
+def _structured_actor_belief(
+    actor: StructuredActor, autocast_enabled: bool, inputs: StructuredInputs
+) -> StructuredDecisionBelief:
+    with torch.autocast(
+        device_type=inputs.tile_categorical.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        return actor.decision_belief(inputs)
 
 
-def _update_cuda_streams(device: torch.device) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
-    """Reuse activation-cache owners across updates and population members.
+def _warm_actor_update_graphs(
+    actor: Actor,
+    *,
+    actor_terms: Callable[..., tuple[Tensor, ...]],
+    actor_optimizer: torch.optim.Optimizer,
+    structured_dynamics: torch.nn.Module | None,
+    structured_terms_fn: Callable[..., Any] | None,
+    auxiliary_active: bool,
+    architecture: str,
+    staged: dict[str, Tensor],
+    indices: Tensor,
+    plan: StructuredHorizonPlan | None,
+    steps_per_trajectory: int,
+    config: PpoConfig,
+    autocast_enabled: bool,
+    sample_weight: Tensor | None = None,
+) -> None:
+    """Compile the released actor's forward and backward while it is frozen.
 
-    The CUDA allocator reuses blocks on their allocation stream. Drawing two
-    new streams each update spreads the same working set over the runtime's
-    round-robin stream pool. Keep one pair per thread/device instead; callers
-    still establish batch-ready and completion dependencies on every update.
+    A warmup wave runs `actor_epochs=0`, so the actor's update graphs -- and
+    above all their backwards, which Inductor compiles on the first `.backward()`
+    and not with the forward -- first trace on the release wave itself: measured
+    18.0 s and 6.0 s of compile landing in one 17 s wave. Nothing about them
+    depends on the actor being unfrozen, so one minibatch runs here with
+    gradients enabled and the flags the released path will use, and the result
+    is discarded: no optimizer steps, no schedule advance, no metrics, and both
+    gradient buffers cleared on the way out. The actor stays bit-identical.
+
+    Each callable/configuration/shape is warmed once per actor, not once per
+    frozen wave. The marker records successful discarded backward execution,
+    not the existence of a lazily compiled forward wrapper.
     """
-    streams = getattr(_UPDATE_STREAMS, "devices", None)
-    if streams is None:
-        streams = _UPDATE_STREAMS.devices = {}
-    # Resolve an unindexed CUDA device before caching, including after set_device.
-    index = torch.cuda.current_device() if device.index is None else device.index
-    if index not in streams:
-        streams[index] = (torch.cuda.Stream(device=index), torch.cuda.Stream(device=index))
-    return streams[index]
+    key = (
+        actor_terms,
+        structured_terms_fn,
+        config,
+        auxiliary_active,
+        autocast_enabled,
+        tuple(indices.shape),
+        None if plan is None else (tuple(plan.indices.shape), tuple(plan.eligible.shape)),
+    )
+    warmed = getattr(actor, "_kaggriculture_warmed_update_graphs", None)
+    if warmed is not None and key in warmed:
+        return
+    actor_optimizer.zero_grad(set_to_none=True)
+    if structured_dynamics is not None:
+        structured_dynamics.zero_grad(set_to_none=True)
+    actor_args = _actor_batch_args(architecture, staged, indices)
+    actor_pack = actor_terms(
+        actor,
+        _batch_tensor(staged["unit_actions"], indices, torch.long),
+        _batch_tensor(staged["market_kinds"], indices, torch.long),
+        _batch_tensor(staged["market_quantities"], indices, torch.long),
+        _batch_tensor(staged["unit_masks"], indices, torch.bool),
+        _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+        _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+        _batch_tensor(staged["unit_active"], indices, torch.float32),
+        _batch_tensor(staged["market_active"], indices, torch.float32),
+        _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
+        _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
+        _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
+        _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
+        _batch_tensor(staged["advantages"], indices, torch.float32),
+        config.clip_low,
+        config.clip_high,
+        autocast_enabled,
+        *actor_args,
+        sample_weight=sample_weight,
+        **({"balance_auxiliary": auxiliary_active} if structured_terms_fn is not None else {}),
+    )
+    component_count = sum(
+        (
+            _batch_tensor(staged[name], indices, torch.float32)
+            * (sample_weight[:, None] if sample_weight is not None else 1.0)
+        ).sum()
+        for name in ("unit_active", "market_active", "market_quantity_active")
+    ).clamp_min(1)
+    loss = -actor_pack[0] / component_count
+    if structured_terms_fn is not None:
+        assert isinstance(actor, StructuredActor)
+        assert structured_dynamics is not None
+        belief = StructuredDecisionBelief(*actor_pack[4:])
+        auxiliary_loss, _ = structured_terms_fn(
+            actor,
+            structured_dynamics,
+            staged,
+            indices,
+            steps_per_trajectory=steps_per_trajectory,
+            config=config,
+            autocast_enabled=autocast_enabled,
+            model_grad=auxiliary_active,
+            complete_windows=False,
+            belief=_auxiliary_branch_belief(
+                belief if auxiliary_active else _detached_belief(belief), None
+            ),
+            plan=plan,
+        )
+        (loss + auxiliary_loss).backward()
+    else:
+        loss.backward()
+    actor_optimizer.zero_grad(set_to_none=True)
+    if structured_dynamics is not None:
+        structured_dynamics.zero_grad(set_to_none=True)
+    if warmed is None:
+        actor._kaggriculture_warmed_update_graphs = warmed = set()
+    warmed.add(key)
 
 
 def update_ppo(
@@ -2961,47 +2982,39 @@ def update_ppo(
         autocast_enabled=autocast_enabled,
     )
     mark_phase("update_behavior_replay_seconds")
-    # NextLat needs h_t and h_{t+1} from one trunk pass, so those minibatches
-    # are contiguous episode runs shuffled independently of the PPO generator.
-    # Without an auxiliary the order stays an IID permutation of valid states.
-    run_order = None
-    if predictor_active:
-        assert auxiliary_generator is not None
-        run_order = _contiguous_run_indices(
-            valid_indices,
-            rollout.valid.shape[1],
-            _structured_run_length(config),
-            auxiliary_generator,
-        )
-    actor_order = (
-        (run_order if run_order is not None else generator.permutation(valid_indices))
-        if actor_epochs > 0
-        else None
-    )
     if structured_dynamics is not None:
         structured_dynamics.train()
+        refresh_fused_mlp_fp8(structured_dynamics)
     if structured_critic_dynamics is not None:
         structured_critic_dynamics.train()
+        refresh_fused_mlp_fp8(structured_critic_dynamics)
     prepared = prepare_advantages(rollout, behavior_values, config, rows=rows)
     valid_value_targets = prepared.value_targets[owned_valid]
-    value_support = critic.support.detach().float().cpu().numpy()
-    support_widths = np.diff(value_support)
-    if (
-        not np.isfinite(value_support).all()
-        or not (support_widths > 0).all()
-        or not np.allclose(support_widths, support_widths[:1])
-    ):
-        raise ValueError("critic value support must be finite, increasing, and evenly spaced")
     if not np.isfinite(valid_value_targets).all():
         raise ValueError("value targets must be finite")
-    # The critic target is the decoupled lambda-one return. A bounded
-    # categorical mean still cannot represent a target outside its atoms, so
-    # saturation is measured rather than fatal: it is error escaping the
-    # support, and the fraction over time is the signal.
-    saturated = np.count_nonzero(
-        (valid_value_targets < value_support[0]) | (valid_value_targets > value_support[-1])
-    )
-    value_targets = np.clip(prepared.value_targets, value_support[0], value_support[-1])
+    if critic.config.scalar_value:
+        # No support, so nothing to clip and nothing to escape: the reference's
+        # scalar critic regresses on the return as it stands. The saturation
+        # reading stays in the telemetry layout and reads zero.
+        saturated = 0
+        value_targets = prepared.value_targets
+    else:
+        value_support = critic.support.detach().float().cpu().numpy()
+        support_widths = np.diff(value_support)
+        if (
+            not np.isfinite(value_support).all()
+            or not (support_widths > 0).all()
+            or not np.allclose(support_widths, support_widths[:1])
+        ):
+            raise ValueError("critic value support must be finite, increasing, and evenly spaced")
+        # The critic target is the decoupled lambda-one return. A bounded
+        # categorical mean still cannot represent a target outside its atoms, so
+        # saturation is measured rather than fatal: it is error escaping the
+        # support, and the fraction over time is the signal.
+        saturated = np.count_nonzero(
+            (valid_value_targets < value_support[0]) | (valid_value_targets > value_support[-1])
+        )
+        value_targets = np.clip(prepared.value_targets, value_support[0], value_support[-1])
     staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
     staged["value_targets"] = torch.from_numpy(value_targets.reshape(-1)).to(device)
     if device.type == "cuda":
@@ -3123,15 +3136,10 @@ def update_ppo(
         for parameter in critic.parameters()
         if id(parameter) not in critic_head_parameter_ids
     )
-    # Actor and critic graphs have no parameter or activation dependency. Queue
-    # them on independent CUDA streams after the shared batch gathers so their
-    # forwards, backwards, norm reductions, and optimizer work can overlap.
-    # CPU keeps the same ordered path through nullcontext.
-    update_stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    actor_stream, critic_stream = (
-        _update_cuda_streams(device) if device.type == "cuda" else (None, None)
-    )
-    batch_ready_event = torch.cuda.Event() if device.type == "cuda" else None
+    # Share one activation allocation pool on the caller's CUDA stream.
+    # Separate actor/critic streams strand each branch's cached blocks; at
+    # production shape their combined reservations force eviction every batch.
+    # Ordered execution lets the critic reuse the actor's released activations.
     guard_host = torch.empty(
         4 if actor_predictor_active else 3,
         dtype=torch.float64,
@@ -3155,37 +3163,74 @@ def update_ppo(
 
     critic_epochs = config.epochs if config.critic_epochs is None else config.critic_epochs
     epoch_marks: list[tuple[Tensor, int]] = []
-    minibatch_slices = _balanced_minibatch_slices(valid_indices.size, config.minibatch_size)
-    actor_minibatches_intended = actor_epochs * len(minibatch_slices)
+    minibatch_positions, minibatch_counts = _fixed_minibatch_positions(
+        valid_indices.size, config.minibatch_size
+    )
+    actor_minibatches_intended = actor_epochs * minibatch_positions.shape[0]
     actor_zero = torch.zeros((), device=device, dtype=torch.float32)
-    # Run order is immutable across epochs. Discover occupancy once on the CPU,
-    # then stage the small plans before either update stream consumes them.
-    horizon_plans: list[StructuredHorizonPlan] = []
-    if run_order is not None:
-        plan_horizon = _structured_run_length(config) - 1
-        for batch_slice in minibatch_slices:
-            episodes, steps = np.divmod(run_order[batch_slice], rollout.valid.shape[1])
-            host_plan = structured_horizon_plan(episodes, steps, plan_horizon)
-            horizon_plans.append(
-                StructuredHorizonPlan(
-                    *(
-                        value.pin_memory().to(device=device, non_blocking=True)
-                        if device.type == "cuda"
-                        else value
-                        for value in host_plan
+    # Epoch-invariant: the partition is fixed for the wave, only the permutation
+    # it indexes changes, so this transfer happens once rather than per epoch.
+    staged_positions = torch.from_numpy(minibatch_positions).to(device=device)
+    sample_weights = torch.from_numpy(
+        (np.arange(config.minibatch_size)[None, :] < minibatch_counts[:, None]).astype(np.float32)
+    ).to(device=device)
+    for epoch_index in range(critic_epochs):
+        # NextLat shuffles contiguous runs; plain PPO shuffles individual states.
+        # Both orders and their successor plans belong to this epoch only.
+        if predictor_active:
+            assert auxiliary_generator is not None
+            shuffled = _contiguous_run_indices(
+                valid_indices,
+                rollout.valid.shape[1],
+                _structured_run_length(config),
+                auxiliary_generator,
+            )
+        else:
+            shuffled = generator.permutation(valid_indices)
+        horizon_plans: list[StructuredHorizonPlan] = []
+        if predictor_active:
+            for batch_positions, count in zip(minibatch_positions, minibatch_counts, strict=True):
+                episodes, steps = np.divmod(shuffled[batch_positions], rollout.valid.shape[1])
+                # Wrapped rows are neither sources nor successors. Sentinels
+                # preserve the full graph shape without creating duplicate
+                # windows or changing the weight of any genuine target.
+                episodes[count:] = -1
+                steps[count:] = -1
+                host_plan = structured_horizon_plan(
+                    episodes, steps, _structured_run_length(config) - 1
+                )
+                horizon_plans.append(
+                    StructuredHorizonPlan(
+                        *(
+                            value.pin_memory().to(device=device, non_blocking=True)
+                            if device.type == "cuda"
+                            else value
+                            for value in host_plan
+                        )
                     )
                 )
-            )
-    for epoch_index in range(critic_epochs):
-        shuffled = (
-            actor_order
-            if epoch_index < actor_epochs and actor_order is not None
-            else (run_order if run_order is not None else generator.permutation(valid_indices))
-        )
         shuffled_device = torch.from_numpy(shuffled).to(device=device)
-        for batch_number, batch_slice in enumerate(minibatch_slices):
-            host_indices = shuffled[batch_slice]
-            indices = shuffled_device[batch_slice]
+        if actor_epochs == 0 and epoch_index == 0:
+            _warm_actor_update_graphs(
+                actor,
+                actor_terms=actor_terms,
+                actor_optimizer=actor_optimizer,
+                structured_dynamics=structured_dynamics,
+                structured_terms_fn=structured_terms_fn if actor_predictor_active else None,
+                auxiliary_active=bool(actor_predictor_active and structured_actor_auxiliary),
+                architecture=architecture,
+                staged=staged,
+                indices=shuffled_device[staged_positions[0]],
+                plan=horizon_plans[0] if horizon_plans else None,
+                steps_per_trajectory=rollout.valid.shape[1],
+                config=config,
+                autocast_enabled=autocast_enabled,
+                sample_weight=sample_weights[0],
+            )
+
+        for batch_number in range(minibatch_positions.shape[0]):
+            host_indices = shuffled[minibatch_positions[batch_number]]
+            indices = shuffled_device[staged_positions[batch_number]]
             horizon_plan = horizon_plans[batch_number] if horizon_plans else None
             run_actor = epoch_index < actor_epochs and not stop_for_kl
             actor_args = (
@@ -3195,14 +3240,8 @@ def update_ppo(
             )
             critic_args = _critic_batch_args(architecture, staged, indices, actor_args=actor_args)
             value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
-            states = indices.numel()
-            if batch_ready_event is not None:
-                assert update_stream is not None
-                assert actor_stream is not None
-                assert critic_stream is not None
-                batch_ready_event.record(update_stream)
-                actor_stream.wait_event(batch_ready_event)
-                critic_stream.wait_event(batch_ready_event)
+            states = int(minibatch_counts[batch_number])
+            sample_weight = sample_weights[batch_number]
             component_count = 0
             batch_kl = actor_zero
             policy_loss = actor_zero
@@ -3216,208 +3255,87 @@ def update_ppo(
             actor_auxiliary_start_event: torch.cuda.Event | None = None
             actor_auxiliary_end_event: torch.cuda.Event | None = None
             actor_skip: Tensor | None = None
-            with torch.cuda.stream(actor_stream) if actor_stream is not None else nullcontext():
-                if run_actor:
-                    assert actor_args is not None
-                    # Component activity is immutable rollout metadata. Reducing it
-                    # on the host avoids a CUDA synchronization in every minibatch
-                    # merely to recover a denominator already known before staging.
-                    component_count = max(1, int(flat_component_counts[host_indices].sum()))
-                    unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
-                    market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
-                    market_quantities = _batch_tensor(
-                        staged["market_quantities"], indices, torch.long
-                    )
-                    unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
-                    kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
-                    quantity_masks = _batch_tensor(
-                        staged["market_quantity_masks"], indices, torch.bool
-                    )
-                    unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
-                    kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
-                    quantity_active = _batch_tensor(
-                        staged["market_quantity_active"], indices, torch.float32
-                    )
-                    old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
-                    old_kind = _batch_tensor(
-                        staged["old_market_kind_logprobs"], indices, torch.float32
-                    )
-                    old_quantity = _batch_tensor(
-                        staged["old_market_quantity_logprobs"], indices, torch.float32
-                    )
-                    advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
+            if run_actor:
+                assert actor_args is not None
+                # Component activity is immutable rollout metadata. Reducing it
+                # on the host avoids a CUDA synchronization in every minibatch
+                # merely to recover a denominator already known before staging.
+                component_count = int(flat_component_counts[host_indices[:states]].sum())
+                component_denominator = max(1, component_count)
+                unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
+                market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
+                market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
+                unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
+                kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
+                quantity_masks = _batch_tensor(staged["market_quantity_masks"], indices, torch.bool)
+                unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
+                kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
+                quantity_active = _batch_tensor(
+                    staged["market_quantity_active"], indices, torch.float32
+                )
+                old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
+                old_kind = _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32)
+                old_quantity = _batch_tensor(
+                    staged["old_market_quantity_logprobs"], indices, torch.float32
+                )
+                advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
-                    actor_optimizer.zero_grad(set_to_none=True)
-                    if structured_dynamics is not None:
-                        structured_dynamics.zero_grad(set_to_none=True)
-                    actor_gradient_diagnostic = (
-                        diagnostic_gradients
-                        and actor_predictor_active
-                        and not actor_predictor_updates
-                    )
-                    actor_pack = actor_terms(
-                        actor,
-                        unit_actions,
-                        market_kinds,
-                        market_quantities,
-                        unit_masks,
-                        kind_masks,
-                        quantity_masks,
-                        unit_active,
-                        kind_active,
-                        quantity_active,
-                        old_unit,
-                        old_kind,
-                        old_quantity,
-                        advantages,
-                        config.clip_low,
-                        config.clip_high,
-                        autocast_enabled,
-                        *actor_args,
-                    )
-                    policy_sum, entropy_sum, kl_sum, clipped_sum = actor_pack[:4]
-                    batch_kl = kl_sum.detach().double() / component_count
-                    policy_loss = -policy_sum / component_count
-                    entropy_mean = entropy_sum / component_count
-                    if actor_predictor_active:
-                        assert isinstance(actor, StructuredActor)
-                        assert structured_dynamics is not None
-                        assert structured_dynamics_optimizer is not None
-                        assert structured_terms_fn is not None
-                        actor_belief = StructuredBelief(*actor_pack[4:])
-                        source_belief = (
-                            actor_belief
-                            if actor_auxiliary_active
-                            else _detached_belief(actor_belief)
-                        )
-                        if device.type == "cuda":
-                            actor_auxiliary_start_event = torch.cuda.Event(enable_timing=True)
-                            actor_auxiliary_end_event = torch.cuda.Event(enable_timing=True)
-                            actor_auxiliary_start_event.record()
-                        else:
-                            actor_auxiliary_started = time.perf_counter()
-                        actor_source_squares: list[Tensor] = []
-                        source_belief = _auxiliary_branch_belief(
-                            source_belief,
-                            actor_source_squares if actor_gradient_diagnostic else None,
-                        )
-                        actor_auxiliary_loss, actor_auxiliary_terms = structured_terms_fn(
-                            actor,
-                            structured_dynamics,
-                            staged,
-                            indices,
-                            steps_per_trajectory=rollout.valid.shape[1],
-                            config=config,
-                            autocast_enabled=autocast_enabled,
-                            model_grad=actor_auxiliary_active,
-                            complete_windows=False,
-                            belief=source_belief,
-                            plan=horizon_plan,
-                        )
-                        if "structured_preupdate_combined" not in predictor_metrics:
-                            predictor_metrics.update(
-                                _auxiliary_preupdate_metrics(
-                                    "structured_preupdate",
-                                    actor_auxiliary_loss,
-                                    actor_auxiliary_terms,
-                                    _STRUCTURED_AUXILIARY_METRICS,
-                                )
-                            )
-                            # Fresh-wave persistence is diagnostic only and
-                            # never controls source-gradient admission.
-                            with torch.no_grad():
-                                persistence_loss, persistence_terms = _structured_auxiliary_terms(
-                                    actor,
-                                    PersistenceDynamics(),
-                                    staged,
-                                    indices,
-                                    steps_per_trajectory=rollout.valid.shape[1],
-                                    config=config,
-                                    autocast_enabled=autocast_enabled,
-                                    model_grad=False,
-                                    complete_windows=False,
-                                    belief=_detached_belief(actor_belief),
-                                    plan=horizon_plan,
-                                )
-                                predictor_metrics.update(
-                                    _auxiliary_preupdate_metrics(
-                                        "structured_preupdate_persistence",
-                                        persistence_loss,
-                                        persistence_terms,
-                                        _STRUCTURED_AUXILIARY_METRICS,
-                                    )
-                                )
-                        combined_actor_loss = policy_loss + actor_auxiliary_loss
-                        combined_actor_loss.backward()
-                        if actor_gradient_diagnostic:
-                            gradient_metrics["structured_gradient_source_norm"] = (
-                                torch.stack(actor_source_squares).sum().sqrt()
-                                if actor_source_squares
-                                else actor_zero
-                            )
-                        actor_gradient_norm = torch.nn.utils.get_total_norm(
-                            [
-                                parameter.grad
-                                for parameter in actor.parameters()
-                                if parameter.grad is not None
-                            ]
-                        ).detach()
-                        torch.nn.utils.clip_grad_norm_(
-                            structured_dynamics.parameters(), config.nextlat_max_gradient_norm
-                        )
-                        if actor_auxiliary_end_event is not None:
-                            actor_auxiliary_end_event.record()
-                        else:
-                            actor_auxiliary_seconds += time.perf_counter() - actor_auxiliary_started
-                    else:
-                        combined_actor_loss = policy_loss
-                        combined_actor_loss.backward()
-                        actor_gradient_norm = torch.nn.utils.get_total_norm(
-                            [
-                                parameter.grad
-                                for parameter in actor.parameters()
-                                if parameter.grad is not None
-                            ]
-                        ).detach()
-                    guard_values = [
-                        batch_kl,
-                        policy_loss.detach().double(),
-                        actor_gradient_norm.double(),
-                    ]
-                    if actor_predictor_active:
-                        guard_values.insert(2, combined_actor_loss.detach().double())
-                    guard_tensor = torch.stack(guard_values)
-                    actor_finite = torch.isfinite(guard_tensor).all()
-                    actor_skip = (~actor_finite).float() if actor_step_is_gateable else None
-                    guard_host.copy_(guard_tensor, non_blocking=True)
-                    if guard_event is not None:
-                        guard_event.record()
-                elif actor_predictor_active:
+                actor_optimizer.zero_grad(set_to_none=True)
+                if structured_dynamics is not None:
+                    structured_dynamics.zero_grad(set_to_none=True)
+                actor_gradient_diagnostic = (
+                    diagnostic_gradients and actor_predictor_active and not actor_predictor_updates
+                )
+                actor_pack = actor_terms(
+                    actor,
+                    unit_actions,
+                    market_kinds,
+                    market_quantities,
+                    unit_masks,
+                    kind_masks,
+                    quantity_masks,
+                    unit_active,
+                    kind_active,
+                    quantity_active,
+                    old_unit,
+                    old_kind,
+                    old_quantity,
+                    advantages,
+                    config.clip_low,
+                    config.clip_high,
+                    autocast_enabled,
+                    *actor_args,
+                    sample_weight=sample_weight,
+                    **(
+                        {"balance_auxiliary": actor_auxiliary_active}
+                        if actor_predictor_active
+                        else {}
+                    ),
+                )
+                policy_sum, entropy_sum, kl_sum, clipped_sum = actor_pack[:4]
+                batch_kl = kl_sum.detach().double() / component_denominator
+                policy_loss = -policy_sum / component_denominator
+                entropy_mean = entropy_sum / component_denominator
+                if actor_predictor_active:
                     assert isinstance(actor, StructuredActor)
                     assert structured_dynamics is not None
                     assert structured_dynamics_optimizer is not None
                     assert structured_terms_fn is not None
-                    assert actor_args is not None
-                    (inputs,) = actor_args
-                    if not isinstance(inputs, StructuredInputs):
-                        raise TypeError("structured actor minibatches require StructuredInputs")
-                    structured_dynamics.zero_grad(set_to_none=True)
-                    with (
-                        torch.no_grad(),
-                        torch.autocast(
-                            device_type=device.type,
-                            dtype=torch.bfloat16,
-                            enabled=autocast_enabled,
-                        ),
-                    ):
-                        _, actor_belief = actor.forward_with_belief(inputs)
-                    actor_belief = _detached_belief(actor_belief)
+                    actor_belief = StructuredDecisionBelief(*actor_pack[4:])
+                    source_belief = (
+                        actor_belief if actor_auxiliary_active else _detached_belief(actor_belief)
+                    )
                     if device.type == "cuda":
                         actor_auxiliary_start_event = torch.cuda.Event(enable_timing=True)
                         actor_auxiliary_end_event = torch.cuda.Event(enable_timing=True)
                         actor_auxiliary_start_event.record()
                     else:
                         actor_auxiliary_started = time.perf_counter()
+                    actor_source_squares: list[Tensor] = []
+                    source_belief = _auxiliary_branch_belief(
+                        source_belief,
+                        actor_source_squares if actor_gradient_diagnostic else None,
+                    )
                     actor_auxiliary_loss, actor_auxiliary_terms = structured_terms_fn(
                         actor,
                         structured_dynamics,
@@ -3426,12 +3344,11 @@ def update_ppo(
                         steps_per_trajectory=rollout.valid.shape[1],
                         config=config,
                         autocast_enabled=autocast_enabled,
-                        model_grad=False,
+                        model_grad=actor_auxiliary_active,
                         complete_windows=False,
-                        belief=actor_belief,
+                        belief=source_belief,
                         plan=horizon_plan,
                     )
-                    actor_auxiliary_loss.backward()
                     if "structured_preupdate_combined" not in predictor_metrics:
                         predictor_metrics.update(
                             _auxiliary_preupdate_metrics(
@@ -3441,6 +3358,8 @@ def update_ppo(
                                 _STRUCTURED_AUXILIARY_METRICS,
                             )
                         )
+                        # Fresh-wave persistence is diagnostic only and
+                        # never controls source-gradient admission.
                         with torch.no_grad():
                             persistence_loss, persistence_terms = _structured_auxiliary_terms(
                                 actor,
@@ -3452,7 +3371,7 @@ def update_ppo(
                                 autocast_enabled=autocast_enabled,
                                 model_grad=False,
                                 complete_windows=False,
-                                belief=actor_belief,
+                                belief=_detached_belief(actor_belief),
                                 plan=horizon_plan,
                             )
                             predictor_metrics.update(
@@ -3463,6 +3382,21 @@ def update_ppo(
                                     _STRUCTURED_AUXILIARY_METRICS,
                                 )
                             )
+                    combined_actor_loss = policy_loss + actor_auxiliary_loss
+                    combined_actor_loss.backward()
+                    if actor_gradient_diagnostic:
+                        gradient_metrics["structured_gradient_source_norm"] = (
+                            torch.stack(actor_source_squares).sum().sqrt()
+                            if actor_source_squares
+                            else actor_zero
+                        )
+                    actor_gradient_norm = torch.nn.utils.get_total_norm(
+                        [
+                            parameter.grad
+                            for parameter in actor.parameters()
+                            if parameter.grad is not None
+                        ]
+                    ).detach()
                     torch.nn.utils.clip_grad_norm_(
                         structured_dynamics.parameters(), config.nextlat_max_gradient_norm
                     )
@@ -3470,6 +3404,112 @@ def update_ppo(
                         actor_auxiliary_end_event.record()
                     else:
                         actor_auxiliary_seconds += time.perf_counter() - actor_auxiliary_started
+                else:
+                    combined_actor_loss = policy_loss
+                    combined_actor_loss.backward()
+                    actor_gradient_norm = torch.nn.utils.get_total_norm(
+                        [
+                            parameter.grad
+                            for parameter in actor.parameters()
+                            if parameter.grad is not None
+                        ]
+                    ).detach()
+                guard_values = [
+                    batch_kl,
+                    policy_loss.detach().double(),
+                    actor_gradient_norm.double(),
+                ]
+                if actor_predictor_active:
+                    guard_values.insert(2, combined_actor_loss.detach().double())
+                guard_tensor = torch.stack(guard_values)
+                actor_finite = torch.isfinite(guard_tensor).all()
+                actor_skip = (~actor_finite).float() if actor_step_is_gateable else None
+                guard_host.copy_(guard_tensor, non_blocking=True)
+                if guard_event is not None:
+                    guard_event.record()
+            elif actor_predictor_active:
+                assert isinstance(actor, StructuredActor)
+                assert structured_dynamics is not None
+                assert structured_dynamics_optimizer is not None
+                assert structured_terms_fn is not None
+                assert actor_args is not None
+                (inputs,) = actor_args
+                if not isinstance(inputs, StructuredInputs):
+                    raise TypeError("structured actor minibatches require StructuredInputs")
+                structured_dynamics.zero_grad(set_to_none=True)
+                with (
+                    torch.no_grad(),
+                    torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=autocast_enabled,
+                    ),
+                ):
+                    actor_belief = _cached_update_callable(
+                        actor,
+                        "_kaggriculture_frozen_decision_belief",
+                        _structured_actor_belief,
+                        compile_mode,
+                    )(actor, autocast_enabled, inputs)
+                actor_belief = _detached_belief(actor_belief)
+                if device.type == "cuda":
+                    actor_auxiliary_start_event = torch.cuda.Event(enable_timing=True)
+                    actor_auxiliary_end_event = torch.cuda.Event(enable_timing=True)
+                    actor_auxiliary_start_event.record()
+                else:
+                    actor_auxiliary_started = time.perf_counter()
+                actor_auxiliary_loss, actor_auxiliary_terms = structured_terms_fn(
+                    actor,
+                    structured_dynamics,
+                    staged,
+                    indices,
+                    steps_per_trajectory=rollout.valid.shape[1],
+                    config=config,
+                    autocast_enabled=autocast_enabled,
+                    model_grad=False,
+                    complete_windows=False,
+                    belief=actor_belief,
+                    plan=horizon_plan,
+                )
+                actor_auxiliary_loss.backward()
+                if "structured_preupdate_combined" not in predictor_metrics:
+                    predictor_metrics.update(
+                        _auxiliary_preupdate_metrics(
+                            "structured_preupdate",
+                            actor_auxiliary_loss,
+                            actor_auxiliary_terms,
+                            _STRUCTURED_AUXILIARY_METRICS,
+                        )
+                    )
+                    with torch.no_grad():
+                        persistence_loss, persistence_terms = _structured_auxiliary_terms(
+                            actor,
+                            PersistenceDynamics(),
+                            staged,
+                            indices,
+                            steps_per_trajectory=rollout.valid.shape[1],
+                            config=config,
+                            autocast_enabled=autocast_enabled,
+                            model_grad=False,
+                            complete_windows=False,
+                            belief=actor_belief,
+                            plan=horizon_plan,
+                        )
+                        predictor_metrics.update(
+                            _auxiliary_preupdate_metrics(
+                                "structured_preupdate_persistence",
+                                persistence_loss,
+                                persistence_terms,
+                                _STRUCTURED_AUXILIARY_METRICS,
+                            )
+                        )
+                torch.nn.utils.clip_grad_norm_(
+                    structured_dynamics.parameters(), config.nextlat_max_gradient_norm
+                )
+                if actor_auxiliary_end_event is not None:
+                    actor_auxiliary_end_event.record()
+                else:
+                    actor_auxiliary_seconds += time.perf_counter() - actor_auxiliary_started
 
             # Target KL constrains only the actor. Keep fitting the critic for
             # every configured epoch after policy updates stop.
@@ -3479,160 +3519,165 @@ def update_ppo(
             critic_auxiliary_start_event: torch.cuda.Event | None = None
             critic_auxiliary_end_event: torch.cuda.Event | None = None
             critic_auxiliary_started = 0.0
-            with torch.cuda.stream(critic_stream) if critic_stream is not None else nullcontext():
-                critic_optimizer.zero_grad(set_to_none=True)
-                if structured_critic_dynamics is not None:
-                    structured_critic_dynamics.zero_grad(set_to_none=True)
-                critic_belief: StructuredCriticBelief | None = None
-                critic_gradient_diagnostic = (
-                    diagnostic_gradients
-                    and critic_predictor_active
-                    and not critic_predictor_updates
+            critic_optimizer.zero_grad(set_to_none=True)
+            if structured_critic_dynamics is not None:
+                structured_critic_dynamics.zero_grad(set_to_none=True)
+            critic_belief: StructuredCriticBelief | None = None
+            critic_gradient_diagnostic = (
+                diagnostic_gradients and critic_predictor_active and not critic_predictor_updates
+            )
+            if critic_predictor_active or epoch_index == 0 or epoch_index == critic_epochs - 1:
+                critic_pack = critic_fit_terms_fn(
+                    critic,
+                    value_targets,
+                    autocast_enabled,
+                    *critic_args,
+                    sample_weight=sample_weight,
+                    **(
+                        {"balance_auxiliary": critic_auxiliary_active}
+                        if critic_predictor_active
+                        else {}
+                    ),
                 )
-                if critic_predictor_active or epoch_index == 0 or epoch_index == critic_epochs - 1:
-                    critic_pack = critic_fit_terms_fn(
-                        critic, value_targets, autocast_enabled, *critic_args
-                    )
-                    if critic_predictor_active:
-                        value_loss, fit_moments = critic_pack[0], critic_pack[1]
-                        critic_belief = StructuredCriticBelief(*critic_pack[2:])
-                    else:
-                        value_loss, fit_moments = critic_pack
-                    if epoch_index == 0:
-                        first_fit_sums += fit_moments
-                        first_fit_states += states
-                    if epoch_index == critic_epochs - 1:
-                        last_fit_sums += fit_moments
-                        last_fit_states += states
-                else:
-                    value_loss = critic_objective_fn(
-                        critic, value_targets, autocast_enabled, *critic_args
-                    )
                 if critic_predictor_active:
-                    assert isinstance(critic, StructuredCritic)
-                    assert structured_critic_dynamics is not None
-                    assert structured_critic_dynamics_optimizer is not None
-                    assert structured_critic_terms_fn is not None
-                    assert critic_belief is not None
-                    source_belief = (
-                        critic_belief
-                        if critic_auxiliary_active
-                        else _detached_belief(critic_belief)
+                    value_loss, fit_moments = critic_pack[0], critic_pack[1]
+                    critic_belief = StructuredCriticBelief(*critic_pack[2:])
+                else:
+                    value_loss, fit_moments = critic_pack
+                if epoch_index == 0:
+                    first_fit_sums += fit_moments
+                    first_fit_states += states
+                if epoch_index == critic_epochs - 1:
+                    last_fit_sums += fit_moments
+                    last_fit_states += states
+            else:
+                value_loss = critic_objective_fn(
+                    critic,
+                    value_targets,
+                    autocast_enabled,
+                    *critic_args,
+                    sample_weight=sample_weight,
+                )
+            if critic_predictor_active:
+                assert isinstance(critic, StructuredCritic)
+                assert structured_critic_dynamics is not None
+                assert structured_critic_dynamics_optimizer is not None
+                assert structured_critic_terms_fn is not None
+                assert critic_belief is not None
+                source_belief = (
+                    critic_belief if critic_auxiliary_active else _detached_belief(critic_belief)
+                )
+                if device.type == "cuda":
+                    critic_auxiliary_start_event = torch.cuda.Event(enable_timing=True)
+                    critic_auxiliary_end_event = torch.cuda.Event(enable_timing=True)
+                    critic_auxiliary_start_event.record()
+                else:
+                    critic_auxiliary_started = time.perf_counter()
+                critic_source_squares: list[Tensor] = []
+                source_belief = _auxiliary_branch_belief(
+                    source_belief, critic_source_squares if critic_gradient_diagnostic else None
+                )
+                critic_auxiliary_loss, critic_auxiliary_terms = structured_critic_terms_fn(
+                    critic,
+                    structured_critic_dynamics,
+                    staged,
+                    indices,
+                    steps_per_trajectory=rollout.valid.shape[1],
+                    config=config,
+                    autocast_enabled=autocast_enabled,
+                    model_grad=critic_auxiliary_active,
+                    complete_windows=False,
+                    belief=source_belief,
+                    plan=horizon_plan,
+                )
+                if "structured_critic_preupdate_combined" not in predictor_metrics:
+                    predictor_metrics.update(
+                        _auxiliary_preupdate_metrics(
+                            "structured_critic_preupdate",
+                            critic_auxiliary_loss,
+                            critic_auxiliary_terms,
+                            _STRUCTURED_CRITIC_AUXILIARY_METRICS,
+                        )
                     )
-                    if device.type == "cuda":
-                        critic_auxiliary_start_event = torch.cuda.Event(enable_timing=True)
-                        critic_auxiliary_end_event = torch.cuda.Event(enable_timing=True)
-                        critic_auxiliary_start_event.record()
-                    else:
-                        critic_auxiliary_started = time.perf_counter()
-                    critic_source_squares: list[Tensor] = []
-                    source_belief = _auxiliary_branch_belief(
-                        source_belief, critic_source_squares if critic_gradient_diagnostic else None
-                    )
-                    critic_auxiliary_loss, critic_auxiliary_terms = structured_critic_terms_fn(
-                        critic,
-                        structured_critic_dynamics,
-                        staged,
-                        indices,
-                        steps_per_trajectory=rollout.valid.shape[1],
-                        config=config,
-                        autocast_enabled=autocast_enabled,
-                        model_grad=critic_auxiliary_active,
-                        complete_windows=False,
-                        belief=source_belief,
-                        plan=horizon_plan,
-                    )
-                    if "structured_critic_preupdate_combined" not in predictor_metrics:
+                    with torch.no_grad():
+                        persistence_loss, persistence_terms = _structured_critic_auxiliary_terms(
+                            critic,
+                            PersistenceDynamics(),
+                            staged,
+                            indices,
+                            steps_per_trajectory=rollout.valid.shape[1],
+                            config=config,
+                            autocast_enabled=autocast_enabled,
+                            model_grad=False,
+                            complete_windows=False,
+                            belief=_detached_belief(critic_belief),
+                            plan=horizon_plan,
+                        )
                         predictor_metrics.update(
                             _auxiliary_preupdate_metrics(
-                                "structured_critic_preupdate",
-                                critic_auxiliary_loss,
-                                critic_auxiliary_terms,
+                                "structured_critic_preupdate_persistence",
+                                persistence_loss,
+                                persistence_terms,
                                 _STRUCTURED_CRITIC_AUXILIARY_METRICS,
                             )
                         )
-                        with torch.no_grad():
-                            persistence_loss, persistence_terms = (
-                                _structured_critic_auxiliary_terms(
-                                    critic,
-                                    PersistenceDynamics(),
-                                    staged,
-                                    indices,
-                                    steps_per_trajectory=rollout.valid.shape[1],
-                                    config=config,
-                                    autocast_enabled=autocast_enabled,
-                                    model_grad=False,
-                                    complete_windows=False,
-                                    belief=_detached_belief(critic_belief),
-                                    plan=horizon_plan,
-                                )
-                            )
-                            predictor_metrics.update(
-                                _auxiliary_preupdate_metrics(
-                                    "structured_critic_preupdate_persistence",
-                                    persistence_loss,
-                                    persistence_terms,
-                                    _STRUCTURED_CRITIC_AUXILIARY_METRICS,
-                                )
-                            )
-                    combined_critic_loss = value_loss + critic_auxiliary_loss
-                    combined_critic_loss.backward()
-                    if critic_gradient_diagnostic:
-                        gradient_metrics["structured_critic_gradient_source_norm"] = (
-                            torch.stack(critic_source_squares).sum().sqrt()
-                            if critic_source_squares
-                            else actor_zero
-                        )
-                    critic_trunk_gradient_norm = torch.nn.utils.get_total_norm(
-                        [
-                            parameter.grad
-                            for parameter in critic_trunk_parameters
-                            if parameter.grad is not None
-                        ]
-                    ).detach()
-                    torch.nn.utils.clip_grad_norm_(
-                        structured_critic_dynamics.parameters(),
-                        config.nextlat_max_gradient_norm,
+                combined_critic_loss = value_loss + critic_auxiliary_loss
+                combined_critic_loss.backward()
+                if critic_gradient_diagnostic:
+                    gradient_metrics["structured_critic_gradient_source_norm"] = (
+                        torch.stack(critic_source_squares).sum().sqrt()
+                        if critic_source_squares
+                        else actor_zero
                     )
-                    critic_head_gradient_norm = torch.nn.utils.get_total_norm(
-                        [
-                            parameter.grad
-                            for parameter in critic_head_parameters
-                            if parameter.grad is not None
-                        ]
-                    ).detach()
-                    critic_gradient_norm = torch.linalg.vector_norm(
-                        torch.stack((critic_trunk_gradient_norm, critic_head_gradient_norm))
-                    )
-                    if critic_auxiliary_end_event is not None:
-                        critic_auxiliary_end_event.record()
-                    else:
-                        critic_auxiliary_seconds += time.perf_counter() - critic_auxiliary_started
+                critic_trunk_gradient_norm = torch.nn.utils.get_total_norm(
+                    [
+                        parameter.grad
+                        for parameter in critic_trunk_parameters
+                        if parameter.grad is not None
+                    ]
+                ).detach()
+                torch.nn.utils.clip_grad_norm_(
+                    structured_critic_dynamics.parameters(),
+                    config.nextlat_max_gradient_norm,
+                )
+                critic_head_gradient_norm = torch.nn.utils.get_total_norm(
+                    [
+                        parameter.grad
+                        for parameter in critic_head_parameters
+                        if parameter.grad is not None
+                    ]
+                ).detach()
+                critic_gradient_norm = torch.linalg.vector_norm(
+                    torch.stack((critic_trunk_gradient_norm, critic_head_gradient_norm))
+                )
+                if critic_auxiliary_end_event is not None:
+                    critic_auxiliary_end_event.record()
                 else:
-                    combined_critic_loss = value_loss
-                    combined_critic_loss.backward()
-                    critic_trunk_gradient_norm = torch.nn.utils.get_total_norm(
-                        [
-                            parameter.grad
-                            for parameter in critic_trunk_parameters
-                            if parameter.grad is not None
-                        ]
-                    ).detach()
-                    critic_head_gradient_norm = torch.nn.utils.get_total_norm(
-                        [
-                            parameter.grad
-                            for parameter in critic_head_parameters
-                            if parameter.grad is not None
-                        ]
-                    ).detach()
-                    critic_gradient_norm = torch.linalg.vector_norm(
-                        torch.stack((critic_trunk_gradient_norm, critic_head_gradient_norm))
-                    )
+                    critic_auxiliary_seconds += time.perf_counter() - critic_auxiliary_started
+            else:
+                combined_critic_loss = value_loss
+                combined_critic_loss.backward()
+                critic_trunk_gradient_norm = torch.nn.utils.get_total_norm(
+                    [
+                        parameter.grad
+                        for parameter in critic_trunk_parameters
+                        if parameter.grad is not None
+                    ]
+                ).detach()
+                critic_head_gradient_norm = torch.nn.utils.get_total_norm(
+                    [
+                        parameter.grad
+                        for parameter in critic_head_parameters
+                        if parameter.grad is not None
+                    ]
+                ).detach()
+                critic_gradient_norm = torch.linalg.vector_norm(
+                    torch.stack((critic_trunk_gradient_norm, critic_head_gradient_norm))
+                )
 
             if run_actor:
-                # The event covers only actor scalars. Synchronizing it does not
-                # wait for the critic stream, which continues its independent
-                # forward and backward while the host enforces the trust region.
+                # Read only the actor guard; the already queued critic work
+                # can continue while the host enforces the trust region.
                 if guard_event is not None:
                     guard_event.synchronize()
                 guard_values_list = guard_host.tolist()
@@ -3675,39 +3720,31 @@ def update_ppo(
                 if batch_kl_value > config.target_kl:
                     stop_for_kl = True
                 else:
-                    with (
-                        torch.cuda.stream(actor_stream)
-                        if actor_stream is not None
-                        else nullcontext()
-                    ):
-                        _optimizer_step(
-                            actor_optimizer,
-                            config.actor_learning_rate,
-                            config.lr_warmup_steps,
-                        )
-                        refresh_fused_mlp_fp8(actor, bootstrap_down=False)
-                        totals["policy_loss"] += policy_loss.detach().double() * component_count
-                        totals["entropy"] += entropy_mean.detach().double() * component_count
-                        totals["approx_kl"] += batch_kl * component_count
-                        totals["clip_fraction"] += clipped_sum.detach().double()
-                        totals["actor_gradient_norm"] += actor_gradient_norm * states
-                        total_components += component_count
-                        actor_states += states
-                        actor_updates += 1
-                        if actor_auxiliary_active:
-                            actor_auxiliary_updates += 1
+                    _optimizer_step(
+                        actor_optimizer,
+                        config.actor_learning_rate,
+                        config.lr_warmup_steps,
+                    )
+                    refresh_fused_mlp_fp8(actor, bootstrap_down=False)
+                    totals["policy_loss"] += policy_loss.detach().double() * component_count
+                    totals["entropy"] += entropy_mean.detach().double() * component_count
+                    totals["approx_kl"] += batch_kl * component_count
+                    totals["clip_fraction"] += clipped_sum.detach().double()
+                    totals["actor_gradient_norm"] += actor_gradient_norm * states
+                    total_components += component_count
+                    actor_states += states
+                    actor_updates += 1
+                    if actor_auxiliary_active:
+                        actor_auxiliary_updates += 1
                 if actor_predictor_active and actor_auxiliary_terms is not None:
+                    assert structured_dynamics is not None
                     assert structured_dynamics_optimizer is not None
-                    with (
-                        torch.cuda.stream(actor_stream)
-                        if actor_stream is not None
-                        else nullcontext()
-                    ):
-                        _optimizer_step(
-                            structured_dynamics_optimizer,
-                            config.resolved_structured_learning_rate,
-                            config.lr_warmup_steps,
-                        )
+                    _optimizer_step(
+                        structured_dynamics_optimizer,
+                        config.resolved_structured_learning_rate,
+                        config.lr_warmup_steps,
+                    )
+                    refresh_fused_mlp_fp8(structured_dynamics, bootstrap_down=False)
                     for name in _STRUCTURED_AUXILIARY_METRICS:
                         actor_auxiliary_totals[name] += (
                             getattr(actor_auxiliary_terms, name).detach().double()
@@ -3722,6 +3759,7 @@ def update_ppo(
                     actor_predictor_updates += 1
                     actor_predictor_states += states
             elif actor_predictor_active and actor_auxiliary_terms is not None:
+                assert structured_dynamics is not None
                 assert structured_dynamics_optimizer is not None
                 actor_auxiliary_seconds += _elapsed_cuda_seconds(
                     actor_auxiliary_start_event, actor_auxiliary_end_event
@@ -3733,6 +3771,7 @@ def update_ppo(
                     config.resolved_structured_learning_rate,
                     config.lr_warmup_steps,
                 )
+                refresh_fused_mlp_fp8(structured_dynamics, bootstrap_down=False)
                 for name in _STRUCTURED_AUXILIARY_METRICS:
                     actor_auxiliary_totals[name] += (
                         getattr(actor_auxiliary_terms, name).detach().double()
@@ -3741,86 +3780,82 @@ def update_ppo(
                 actor_auxiliary_loss_total += actor_auxiliary_loss.detach().double() * states
                 actor_predictor_updates += 1
                 actor_predictor_states += states
-            with torch.cuda.stream(critic_stream) if critic_stream is not None else nullcontext():
-                critic_finite = torch.isfinite(
-                    torch.stack(
-                        (
-                            combined_critic_loss.detach(),
-                            critic_trunk_gradient_norm,
-                            critic_head_gradient_norm,
-                            critic_gradient_norm,
-                        )
+            critic_finite = torch.isfinite(
+                torch.stack(
+                    (
+                        combined_critic_loss.detach(),
+                        critic_trunk_gradient_norm,
+                        critic_head_gradient_norm,
+                        critic_gradient_norm,
                     )
-                ).all()
-                critic_nonfinite_message = (
-                    "non-finite combined critic loss or gradient norm"
-                    if critic_predictor_active
-                    else "non-finite critic loss or gradient norm"
                 )
-                if critic_step_is_gateable:
-                    critic_nonfinite += (~critic_finite).float()
-                    # Keep all work after the first poisoned minibatch
-                    # device-skipped until the single end-of-update readback.
-                    critic_skip = critic_nonfinite.ne(0).float()
-                    critic_skipped += critic_skip
-                else:
-                    if not bool(critic_finite):
-                        raise FloatingPointError(critic_nonfinite_message)
-                    critic_skip = None
+            ).all()
+            critic_nonfinite_message = (
+                "non-finite combined critic loss or gradient norm"
+                if critic_predictor_active
+                else "non-finite critic loss or gradient norm"
+            )
+            if critic_step_is_gateable:
+                critic_nonfinite += (~critic_finite).float()
+                # Keep all work after the first poisoned minibatch
+                # device-skipped until the single end-of-update readback.
+                critic_skip = critic_nonfinite.ne(0).float()
+                critic_skipped += critic_skip
+            else:
+                if not bool(critic_finite):
+                    raise FloatingPointError(critic_nonfinite_message)
+                critic_skip = None
+            _optimizer_step(
+                critic_optimizer,
+                config.critic_learning_rate,
+                config.lr_warmup_steps,
+                found_inf=critic_skip,
+            )
+            if critic_predictor_active:
+                assert structured_critic_dynamics is not None
+                assert structured_critic_dynamics_optimizer is not None
                 _optimizer_step(
-                    critic_optimizer,
-                    config.critic_learning_rate,
+                    structured_critic_dynamics_optimizer,
+                    config.resolved_structured_critic_learning_rate,
                     config.lr_warmup_steps,
                     found_inf=critic_skip,
                 )
-                if critic_predictor_active:
-                    assert structured_critic_dynamics_optimizer is not None
-                    _optimizer_step(
-                        structured_critic_dynamics_optimizer,
-                        config.resolved_structured_critic_learning_rate,
-                        config.lr_warmup_steps,
-                        found_inf=critic_skip,
+                refresh_fused_mlp_fp8(structured_critic_dynamics, bootstrap_down=False)
+            # A skipped optimizer step leaves the master weights unchanged,
+            # so this preserves cache contents while keeping every later
+            # fused forward coherent after a finite step.
+            refresh_fused_mlp_fp8(critic, bootstrap_down=False)
+            totals["value_loss"] += value_loss.detach().double() * states
+            totals["critic_gradient_norm"] += critic_gradient_norm * states
+            totals["critic_trunk_gradient_norm"] += critic_trunk_gradient_norm * states
+            totals["critic_head_gradient_norm"] += critic_head_gradient_norm * states
+            if critic_auxiliary_terms is not None:
+                for name in _STRUCTURED_CRITIC_AUXILIARY_METRICS:
+                    critic_auxiliary_totals[name] += (
+                        getattr(critic_auxiliary_terms, name).detach().double()
                     )
-                # A skipped optimizer step leaves the master weights unchanged,
-                # so this preserves cache contents while keeping every later
-                # fused forward coherent after a finite step.
-                refresh_fused_mlp_fp8(critic, bootstrap_down=False)
-                totals["value_loss"] += value_loss.detach().double() * states
-                totals["critic_gradient_norm"] += critic_gradient_norm * states
-                totals["critic_trunk_gradient_norm"] += critic_trunk_gradient_norm * states
-                totals["critic_head_gradient_norm"] += critic_head_gradient_norm * states
-                if critic_auxiliary_terms is not None:
-                    for name in _STRUCTURED_CRITIC_AUXILIARY_METRICS:
-                        critic_auxiliary_totals[name] += (
-                            getattr(critic_auxiliary_terms, name).detach().double()
+                assert critic_auxiliary_loss_total is not None
+                assert critic_combined_loss_total is not None
+                assert critic_combined_gradient_norm_total is not None
+                critic_auxiliary_loss_total += critic_auxiliary_loss.detach().double() * states
+                critic_combined_loss_total += combined_critic_loss.detach().double() * states
+                critic_combined_gradient_norm_total += critic_gradient_norm.double() * states
+                critic_predictor_updates += 1
+                if critic_auxiliary_active:
+                    critic_auxiliary_updates += 1
+                if (
+                    critic_auxiliary_events is not None
+                    and critic_auxiliary_start_event is not None
+                    and critic_auxiliary_end_event is not None
+                ):
+                    critic_auxiliary_events.append(
+                        (
+                            critic_auxiliary_start_event,
+                            critic_auxiliary_end_event,
                         )
-                    assert critic_auxiliary_loss_total is not None
-                    assert critic_combined_loss_total is not None
-                    assert critic_combined_gradient_norm_total is not None
-                    critic_auxiliary_loss_total += critic_auxiliary_loss.detach().double() * states
-                    critic_combined_loss_total += combined_critic_loss.detach().double() * states
-                    critic_combined_gradient_norm_total += critic_gradient_norm.double() * states
-                    critic_predictor_updates += 1
-                    if critic_auxiliary_active:
-                        critic_auxiliary_updates += 1
-                    if (
-                        critic_auxiliary_events is not None
-                        and critic_auxiliary_start_event is not None
-                        and critic_auxiliary_end_event is not None
-                    ):
-                        critic_auxiliary_events.append(
-                            (
-                                critic_auxiliary_start_event,
-                                critic_auxiliary_end_event,
-                            )
-                        )
+                    )
             total_states += states
             updates += 1
-            if update_stream is not None:
-                assert actor_stream is not None
-                assert critic_stream is not None
-                update_stream.wait_stream(actor_stream)
-                update_stream.wait_stream(critic_stream)
             # Drop Python-owned inputs and returned beliefs before the next
             # gather/forward; backward has already released its saved tensors.
             actor_args = critic_args = inputs = None
@@ -3829,8 +3864,8 @@ def update_ppo(
         epoch_marks.append((totals["value_loss"].clone(), total_states))
         completed_epochs += 1
 
-    # All observations are detached scalars. Pack after the stream joins, before
-    # the existing synchronization, instead of interrupting the first minibatch
+    # All observations are detached scalars. Pack before the existing
+    # synchronization instead of interrupting the first minibatch
     # with one host readback per preupdate/persistence field.
     diagnostic_metrics = predictor_metrics | gradient_metrics
     diagnostic_values = (
@@ -3899,8 +3934,8 @@ def update_ppo(
         "value_target_std": float(prepared.value_targets[owned_valid].std()),
         "value_target_min": float(prepared.value_targets[owned_valid].min()),
         "value_target_max": float(prepared.value_targets[owned_valid].max()),
-        # Every target statistic here, and the suffix-return explained variance
-        # and the correlation below, are taken from the unclipped critic target
+        # Every target statistic here, the suffix-return EV and R-squared,
+        # and the correlation below use the unclipped critic target
         # (the lambda-one return). `value_loss` and the two critic-fit explained
         # variances are the exceptions by necessity, since the critic regresses
         # on the saturated copy.
@@ -3920,6 +3955,11 @@ def update_ppo(
         # Against the discounted suffix return, which decoupled GAE also uses
         # as the critic target. Pre-update predictions, so this is not a fit.
         "monte_carlo_explained_variance": _explained_variance(
+            prepared.monte_carlo_returns, behavior_values, owned_valid
+        ),
+        # Retain constant bias in the residual: readiness must reject a critic
+        # with the right ordering but the wrong value baseline.
+        "monte_carlo_r_squared": _r_squared(
             prepared.monte_carlo_returns, behavior_values, owned_valid
         ),
         # Against the policy lambda-return ``A + V``. Residual is identically

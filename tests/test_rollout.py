@@ -4,6 +4,7 @@ import gc
 import threading
 import weakref
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,7 +23,13 @@ from kaggriculture.constants import (
     MAX_UNITS,
     STARTING_MONEY,
 )
-from kaggriculture.encoding import pair_potential, terminal_pair_utility
+from kaggriculture.encoding import (
+    BOARD_CHANNELS,
+    GLOBAL_FEATURES,
+    UNIT_FEATURES,
+    pair_potential,
+    terminal_pair_utility,
+)
 from kaggriculture.model import ActorOutput, FarmActor, ModelConfig
 from kaggriculture.policy import _sample_numpy_categorical, component_logprobs
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
@@ -42,8 +49,8 @@ from kaggriculture.rollout import (
     _fill_gpu_policy_statistics,
     _gumbel_utilities,
     _native_pair_rewards,
-    _pipeline_replica,
     _stacked_actor_ensemble,
+    _StackedActorEnsemble,
     _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
@@ -62,14 +69,48 @@ from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredInputs
 
 
+def test_each_lane_layout_compiles_through_its_own_frame() -> None:
+    """Dynamo's cache and recompile budget are keyed by code object.
+
+    While every lane width shared one `_forward.__code__`, each new width was
+    recorded as a recompile of that frame, so the collector needed its recompile
+    budget raised to avoid silently falling back to eager after eight widths --
+    and real shape churn was indistinguishable from a new league layout. The
+    per-layout frame must be a distinct code object that computes the same
+    stacked forward.
+    """
+    template = torch.nn.Linear(3, 2)
+    lanes = [torch.nn.Linear(3, 2) for _ in range(2)]
+    ensemble = SimpleNamespace(
+        template=template.to("meta"),
+        params={
+            name: torch.stack([dict(lane.named_parameters())[name] for lane in lanes])
+            for name, _ in template.named_parameters()
+        },
+        buffers={},
+    )
+    inputs = torch.randn(2, 4, 3)
+
+    narrow = _StackedActorEnsemble._layout_forward(ensemble, "inductor_w3")
+    wide = _StackedActorEnsemble._layout_forward(ensemble, "inductor_w5")
+
+    assert narrow.__func__.__code__ is not wide.__func__.__code__
+    assert narrow.__func__.__code__.co_name == "_forward_inductor_w3"
+    reference = _StackedActorEnsemble._forward(ensemble, inputs)
+    torch.testing.assert_close(narrow(inputs), reference)
+    torch.testing.assert_close(wide(inputs), reference)
+
+
 class _NearOneGenerator:
     def random(self, size):
         return np.full(size, np.nextafter(1.0, 0.0), dtype=np.float64)
 
 
-def _terminal_log_ratio(own: np.ndarray, opponent: np.ndarray) -> np.ndarray:
-    """Vectorized terminal log-relative bank utility used by training."""
-    return np.log1p(own / STARTING_MONEY) - np.log1p(opponent / STARTING_MONEY)
+def _terminal_bank_margin(own: np.ndarray, opponent: np.ndarray) -> np.ndarray:
+    """Vectorized symmetric terminal bank margin used by training."""
+    own = np.asarray(own, dtype=np.float64)
+    opponent = np.asarray(opponent, dtype=np.float64)
+    return (own - opponent) / (own + opponent + 2.0 * STARTING_MONEY)
 
 
 def _discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
@@ -83,7 +124,7 @@ def _assert_zero_sum_reward_contract(
 ) -> None:
     # Each stored reward rounds one potential difference to binary32. Summing
     # 719 of them therefore telescopes only to binary32 accumulation accuracy.
-    terminal_scores = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
+    terminal_scores = _terminal_bank_margin(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(
         _discounted_returns(rollout.rewards, gamma),
         float(np.float32(gamma)) ** (rollout.horizon - 1) * terminal_scores,
@@ -180,13 +221,6 @@ def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor()
         .expand(rows, MAX_MARKET_ORDERS, -1),
         torch.zeros(rows, MAX_MARKET_ORDERS, rank),
     )
-    heads = (
-        torch.zeros(1, N_MARKET_KINDS, rank),
-        torch.zeros(1, N_QUANTITIES, rank),
-        torch.linspace(-2.0e-4, 2.0e-4, N_QUANTITIES)
-        .reshape(1, 1, -1)
-        .expand(1, N_MARKET_KINDS, -1),
-    )
 
     def statistics(temperature: float) -> dict[str, np.ndarray]:
         sampled = {
@@ -203,14 +237,12 @@ def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor()
             "market_quantity_active": np.ones((rows, MAX_MARKET_ORDERS), dtype=np.bool_),
             "unit_logprobs": np.empty((rows, MAX_UNITS), dtype=np.float32),
             "market_kind_logprobs": np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32),
-            "market_quantity_logprobs": np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32),
-            "entropy": np.empty(rows, dtype=np.float32),
+            "market_quantity_logprobs": np.full((rows, MAX_MARKET_ORDERS), -0.75, dtype=np.float32),
+            "entropy": np.full(rows, 0.125, dtype=np.float32),
         }
         _fill_gpu_policy_statistics(
             sampled,
             output,
-            heads,
-            torch.zeros(rows, dtype=torch.long),
             torch.zeros(rows, dtype=torch.uint8),
             torch.full((rows,), temperature),
         )
@@ -225,9 +257,49 @@ def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor()
         "entropy",
     ):
         np.testing.assert_array_equal(subfloor_statistics[name], floor_statistics[name])
+    np.testing.assert_array_equal(
+        subfloor_statistics["market_quantity_logprobs"],
+        np.full((rows, MAX_MARKET_ORDERS), -0.75, dtype=np.float32),
+    )
 
 
-def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
+@pytest.mark.parametrize("builtin_code", [0, 1])
+@pytest.mark.parametrize(
+    ("device", "logit_dtype", "synchronize"),
+    [
+        ("cpu", torch.float32, True),
+        pytest.param(
+            "cuda",
+            torch.float32,
+            False,
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            True,
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            False,
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+    ],
+)
+def test_native_preference_step_matches_deterministic_masked_sampling(
+    builtin_code: int, device: str, logit_dtype: torch.dtype, synchronize: bool
+) -> None:
     rows = 2
     rank = 4
     generator = np.random.default_rng(9)
@@ -235,170 +307,251 @@ def test_native_preference_step_matches_deterministic_masked_sampling() -> None:
     kind_logits = generator.standard_normal(
         (rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32
     )
+    # Native preferences arrive in FP32, including when the model emits BF16.
+    unit_logits = torch.from_numpy(unit_logits).to(logit_dtype).float().numpy()
+    kind_logits = torch.from_numpy(kind_logits).to(logit_dtype).float().numpy()
     quantity_context = generator.standard_normal((rows, MAX_MARKET_ORDERS, rank), dtype=np.float32)
     kind_gate = generator.standard_normal((1, N_MARKET_KINDS, rank), dtype=np.float32)
     quantity_values = generator.standard_normal((1, N_QUANTITIES, rank), dtype=np.float32)
     quantity_bias = generator.standard_normal((1, N_MARKET_KINDS, N_QUANTITIES), dtype=np.float32)
-    unit_utilities = unit_logits.copy()
-    kind_utilities = kind_logits.copy()
+    # Force a quantified purchase so this also exercises the sampler's
+    # quantity likelihood, not only STOP/HIRE with inactive quantities.
+    kind_logits[:, 0, :] = -100.0
+    kind_logits[:, 0, MarketKind.BUY_SEED_WHEAT] = 100.0
     zeros = np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.float32)
     temperatures = np.asarray([0.7, 1.3], dtype=np.float32)
+    builtin_agents = np.asarray([0, builtin_code], dtype=np.uint8)
     native = load_native()
     sampled_environment = native.BatchEnv(np.asarray([17], dtype=np.uint64))
     selected_environment = native.BatchEnv(np.asarray([17], dtype=np.uint64))
     sampled = sampled_environment.sample_buffers()
     selected = selected_environment.sample_buffers()
+    if device == "cuda":
+        selected = {
+            name: torch.from_numpy(np.asarray(values)).pin_memory().numpy()
+            for name, values in selected.items()
+        }
+    output = ActorOutput(
+        torch.from_numpy(unit_logits).to(device=device, dtype=logit_dtype),
+        torch.from_numpy(kind_logits).to(device=device, dtype=logit_dtype),
+        torch.from_numpy(quantity_context).to(device),
+    )
+    device_builtin_agents = torch.from_numpy(builtin_agents).to(device)
+    device_temperatures = torch.from_numpy(temperatures).to(device)
+    transfer = None
 
-    sampled_environment.sample_and_step_into(
+    for step in range(2):
+        # Reuse the transfer and host arrays with changed masks, actions, and
+        # temperature values after the previous result has been consumed.
+        temperatures += np.float32(0.1)
+        device_temperatures.copy_(torch.from_numpy(temperatures))
+        sampled_environment.sample_and_step_into(
+            unit_logits,
+            kind_logits,
+            quantity_context,
+            kind_gate,
+            quantity_values,
+            quantity_bias,
+            np.zeros(rows, dtype=np.uint16),
+            np.zeros((rows, MAX_UNITS), dtype=np.float32),
+            zeros,
+            zeros,
+            np.ones(rows, dtype=np.bool_),
+            temperatures,
+            builtin_agents,
+            sampled,
+        )
+        selected_environment.select_and_step_into(
+            unit_logits,
+            kind_logits,
+            quantity_context,
+            kind_gate,
+            quantity_values,
+            quantity_bias,
+            np.zeros(rows, dtype=np.uint16),
+            zeros,
+            np.ones(rows, dtype=np.bool_),
+            temperatures,
+            builtin_agents,
+            selected,
+        )
+        if step == 0:
+            assert np.asarray(selected["market_quantity_active"])[0, 0]
+        native_quantity_logprobs = np.asarray(selected["market_quantity_logprobs"]).copy()
+        np.testing.assert_array_equal(
+            native_quantity_logprobs, np.asarray(sampled["market_quantity_logprobs"])
+        )
+        transfer = _fill_gpu_policy_statistics(
+            selected,
+            output,
+            device_builtin_agents,
+            device_temperatures,
+            transfer,
+            synchronize=synchronize,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(selected["market_quantity_logprobs"]), native_quantity_logprobs
+        )
+        if not synchronize:
+            # The collector consumes the packed results only after its event
+            # join, while native quantity likelihoods are already available.
+            transfer.ready.synchronize()
+            for name, values in zip(
+                ("unit_logprobs", "market_kind_logprobs", "entropy"),
+                transfer.arrays,
+                strict=True,
+            ):
+                np.copyto(np.asarray(selected[name]), values)
+
+        for name in (
+            "unit_actions",
+            "market_kinds",
+            "market_quantities",
+            "unit_masks",
+            "market_kind_masks",
+            "market_quantity_masks",
+            "unit_active",
+            "market_active",
+            "market_quantity_active",
+            "rewards",
+            "dones",
+            "final_money",
+        ):
+            np.testing.assert_array_equal(np.asarray(selected[name]), np.asarray(sampled[name]))
+        for name in (
+            "unit_logprobs",
+            "market_kind_logprobs",
+            "market_quantity_logprobs",
+            "entropy",
+        ):
+            np.testing.assert_allclose(
+                np.asarray(selected[name]), np.asarray(sampled[name]), rtol=2e-5, atol=2e-5
+            )
+            if builtin_code:
+                np.testing.assert_array_equal(np.asarray(selected[name])[1], 0.0)
+
+
+@pytest.mark.parametrize("mask_name", ["unit_masks", "market_kind_masks"])
+@pytest.mark.parametrize("invalid_shape", [False, True])
+def test_gpu_policy_statistics_rejects_invalid_host_masks(
+    mask_name: str, invalid_shape: bool
+) -> None:
+    output = ActorOutput(
+        torch.zeros(2, MAX_UNITS, N_UNIT_ACTIONS),
+        torch.zeros(2, MAX_MARKET_ORDERS, N_MARKET_KINDS),
+        torch.zeros(2, MAX_MARKET_ORDERS, 1),
+    )
+    sampled = {
+        "unit_masks": np.ones(output.unit_logits.shape, dtype=np.bool_),
+        "market_kind_masks": np.ones(output.market_kind_logits.shape, dtype=np.bool_),
+    }
+    if invalid_shape:
+        sampled[mask_name] = sampled[mask_name][..., :-1]
+    else:
+        # Inactive/builtin decisions still need support, exactly as learned
+        # decisions do; zeroing their statistics must not hide invalid masks.
+        sampled[mask_name][1, 0] = False
+    with pytest.raises(ValueError):
+        _fill_gpu_policy_statistics(
+            sampled, output, torch.tensor([0, 1], dtype=torch.uint8), torch.ones(2)
+        )
+
+
+def test_native_sampling_skips_zero_mass_and_preserves_subnormal_likelihood() -> None:
+    rows = 2
+    rank = 1
+    unit_logits = np.full((rows, MAX_UNITS, N_UNIT_ACTIONS), -200.0, dtype=np.float32)
+    unit_logits[:, :, UnitAction.PASS] = 0.0
+    kind_logits = np.full((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), -200.0, dtype=np.float32)
+    kind_logits[:, :, MarketKind.STOP] = 0.0
+    kind_logits[:, 0, MarketKind.STOP] = [-200.0, -100.0]
+    kind_logits[:, 0, MarketKind.HIRE] = 0.0
+    environment = load_native().BatchEnv(np.asarray([17], dtype=np.uint64))
+    sampled = environment.sample_buffers()
+    market_zeros = np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+
+    environment.sample_and_step_into(
         unit_logits,
         kind_logits,
-        quantity_context,
-        kind_gate,
-        quantity_values,
-        quantity_bias,
+        np.zeros((rows, MAX_MARKET_ORDERS, rank), dtype=np.float32),
+        np.zeros((1, N_MARKET_KINDS, rank), dtype=np.float32),
+        np.zeros((1, N_QUANTITIES, rank), dtype=np.float32),
+        np.zeros((1, N_MARKET_KINDS, N_QUANTITIES), dtype=np.float32),
         np.zeros(rows, dtype=np.uint16),
         np.zeros((rows, MAX_UNITS), dtype=np.float32),
-        zeros,
-        zeros,
-        np.ones(rows, dtype=np.bool_),
-        temperatures,
+        market_zeros,
+        market_zeros,
+        np.zeros(rows, dtype=np.bool_),
+        np.ones(rows, dtype=np.float32),
         np.zeros(rows, dtype=np.uint8),
         sampled,
     )
-    selected_environment.select_and_step_into(
-        unit_utilities,
-        kind_utilities,
-        quantity_context,
-        kind_gate,
-        quantity_values,
-        quantity_bias,
-        np.zeros(rows, dtype=np.uint16),
-        zeros,
-        np.ones(rows, dtype=np.bool_),
-        temperatures,
-        np.zeros(rows, dtype=np.uint8),
-        selected,
+
+    kinds = np.asarray(sampled["market_kinds"])[:, 0]
+    masks = np.asarray(sampled["market_kind_masks"])[:, 0]
+    assert masks[:, MarketKind.HIRE].all()
+    np.testing.assert_array_equal(kinds, [MarketKind.HIRE, MarketKind.STOP])
+    masked_logits = np.where(masks, kind_logits[:, 0].astype(np.float64), -np.inf)
+    log_normalizer = np.logaddexp.reduce(masked_logits, axis=-1)
+    expected_logprobs = masked_logits[np.arange(rows), kinds] - log_normalizer
+    np.testing.assert_allclose(
+        np.asarray(sampled["market_kind_logprobs"])[:, 0], expected_logprobs, rtol=0, atol=1e-6
     )
-    _fill_gpu_policy_statistics(
-        selected,
-        ActorOutput(
-            torch.from_numpy(unit_logits),
-            torch.from_numpy(kind_logits),
-            torch.from_numpy(quantity_context),
-        ),
-        (
-            torch.from_numpy(kind_gate),
-            torch.from_numpy(quantity_values),
-            torch.from_numpy(quantity_bias),
-        ),
-        torch.zeros(rows, dtype=torch.long),
-        torch.zeros(rows, dtype=torch.uint8),
-        torch.from_numpy(temperatures),
-    )
-
-    for name in (
-        "unit_actions",
-        "market_kinds",
-        "market_quantities",
-        "unit_masks",
-        "market_kind_masks",
-        "market_quantity_masks",
-        "unit_active",
-        "market_active",
-        "market_quantity_active",
-        "rewards",
-        "dones",
-        "final_money",
-    ):
-        np.testing.assert_array_equal(np.asarray(selected[name]), np.asarray(sampled[name]))
-    for name in (
-        "unit_logprobs",
-        "market_kind_logprobs",
-        "market_quantity_logprobs",
-        "entropy",
-    ):
-        np.testing.assert_allclose(
-            np.asarray(selected[name]), np.asarray(sampled[name]), rtol=2e-5, atol=2e-5
-        )
+    assert np.isfinite(np.asarray(sampled["entropy"])).all()
 
 
-def test_bfloat16_pipeline_replica_preserves_fp32_quantity_heads() -> None:
-    actor = StructuredActor(
-        StructuredConfig(
-            model_dim=32,
-            attention_heads=4,
-            attention_kv_heads=2,
-            ffn_multiplier=2,
-            farm_blocks=1,
-            opponent_latents=2,
-            latents=4,
-            core_layers=1,
-        )
-    )
-
-    replica = _pipeline_replica(actor, dtype=torch.bfloat16, namespace=7)
-
-    assert {
-        name for name, parameter in replica.named_parameters() if parameter.dtype == torch.float32
-    } == {
-        "market_quantity_bias",
-        "market_quantity_kind_gate.weight",
-        "market_quantity_value.weight",
-    }
-    assert replica.market_quantity_kind_gate.weight.dtype == torch.float32
-    assert replica.market_quantity_value.weight.dtype == torch.float32
-    assert replica.market_quantity_bias.dtype == torch.float32
-    torch.testing.assert_close(
-        replica.market_quantity_value.weight, actor.market_quantity_value.weight
-    )
-
-    with torch.no_grad():
-        actor.market_quantity_value.weight.add_(1.0)
-    refreshed = _pipeline_replica(actor, dtype=torch.bfloat16, namespace=7)
-    assert refreshed is replica
-    torch.testing.assert_close(
-        refreshed.market_quantity_value.weight, actor.market_quantity_value.weight
-    )
-    fp32_ensemble = _stacked_actor_ensemble((actor,), namespace=1_000_007)
-    bf16_ensemble = _stacked_actor_ensemble((replica,), namespace=1_000_007)
-    assert bf16_ensemble is not fp32_ensemble
-    assert _stacked_actor_ensemble((replica,), namespace=1_000_007) is bf16_ensemble
-
-
-def test_distinct_actor_tuples_have_isolated_mutable_ensemble_state() -> None:
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_overlapping_ensemble_owners_keep_their_own_policies() -> None:
     config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
-    first_models = (FarmActor(config), FarmActor(config))
-    second_models = (FarmActor(config), FarmActor(config))
+    model_sets = [(FarmActor(config).cuda(), FarmActor(config).cuda()) for _ in range(2)]
+    inputs = (
+        torch.zeros(1, BOARD_CHANNELS, 10, 10, device="cuda"),
+        torch.zeros(1, GLOBAL_FEATURES, device="cuda"),
+        torch.zeros(1, MAX_UNITS, UNIT_FEATURES, device="cuda"),
+        torch.zeros(1, MAX_UNITS, 2, device="cuda", dtype=torch.long),
+    )
+    stacked_inputs = tuple(value.unsqueeze(0).expand(2, *value.shape) for value in inputs)
     barrier = threading.Barrier(2)
-    ensembles: list[object] = []
+    outputs = [None, None]
+    errors = []
 
-    def build(models) -> None:
-        barrier.wait()
-        ensembles.append(_stacked_actor_ensemble(models, namespace=1_000_009))
+    def collect(index: int) -> None:
+        try:
+            with torch.no_grad():
+                ensemble = _stacked_actor_ensemble(model_sets[index], namespace=1_000_009)
+                barrier.wait(timeout=10)
+                outputs[index] = tuple(
+                    value.clone() for value in ensemble(*stacked_inputs, mode="eager")
+                )
+        except BaseException as error:
+            errors.append(error)
+            barrier.abort()
 
-    threads = [
-        threading.Thread(target=build, args=(models,)) for models in (first_models, second_models)
-    ]
+    threads = [threading.Thread(target=collect, args=(index,)) for index in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=10.0)
+        thread.join(timeout=30)
         assert not thread.is_alive()
-
-    assert len(ensembles) == 2
-    assert ensembles[0] is not ensembles[1]
-    first_ensemble = _stacked_actor_ensemble(first_models, namespace=1_000_009)
-    second_ensemble = _stacked_actor_ensemble(second_models, namespace=1_000_009)
-    assert first_ensemble in ensembles
-    assert second_ensemble in ensembles
-    parameter_name = next(iter(first_ensemble.params))
-    first_state = first_ensemble.params[parameter_name].clone()
+    assert not errors, errors
     with torch.no_grad():
-        dict(second_models[0].named_parameters())[parameter_name].add_(1.0)
-    _stacked_actor_ensemble(second_models, namespace=1_000_009)
-    torch.testing.assert_close(first_ensemble.params[parameter_name], first_state)
+        for models, actual in zip(model_sets, outputs, strict=True):
+            expected = tuple(
+                torch.stack(values)
+                for values in zip(*(model(*inputs) for model in models), strict=True)
+            )
+            torch.testing.assert_close(actual, expected)
+        # Reusing a shape on one owner must still reload the new policy.
+        for models in model_sets:
+            ensemble = _stacked_actor_ensemble(models, namespace=1_000_009)
+            expected = tuple(
+                torch.stack(values)
+                for values in zip(*(model(*inputs) for model in models), strict=True)
+            )
+            torch.testing.assert_close(tuple(ensemble(*stacked_inputs, mode="eager")), expected)
 
 
 def test_stacked_ensemble_cache_does_not_retain_source_models() -> None:
@@ -583,7 +736,7 @@ def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None
     assert rollout.state_count == 28
     assert rollout.states["board"].shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
-    terminal_scores = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
+    terminal_scores = _terminal_bank_margin(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(
         _discounted_returns(rollout.rewards, gamma),
         gamma ** (rollout.horizon - 1) * terminal_scores,
@@ -1398,10 +1551,27 @@ def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> No
             kinds[0, 0, 0] = MarketKind.BUY_PRODUCT_WHEAT
             quantities[0, 0, 0] = 79  # quantity bin 79 orders 80 units
         out = environment.step_factors(unit, kinds, quantities)
+        if step == 0:
+            frozen = json.loads(environment.snapshot_json(0))
+            observations = [
+                {
+                    "player": player,
+                    "farms": frozen["farms"],
+                    "private": frozen["privates"][player],
+                    "market": frozen["market"],
+                }
+                for player in range(2)
+            ]
+            np.testing.assert_array_equal(
+                out["potentials"],
+                np.asarray([pair_potential(*observations)], dtype=np.float32),
+            )
+        assert np.all(np.abs(out["potentials"]) <= 1.0)
+        assert np.all(np.abs(out["previous_potentials"]) <= 1.0)
         rewards = _native_pair_rewards(out, gamma)
         np.testing.assert_array_equal(rewards[:, 0], -rewards[:, 1])
         if np.asarray(out["dones"]).all():
-            terminal_scores = _terminal_log_ratio(
+            terminal_scores = _terminal_bank_margin(
                 np.asarray(out["final_money"])[:, 0],
                 np.asarray(out["final_money"])[:, 1],
             )
@@ -1431,7 +1601,7 @@ def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> No
 
     money = np.asarray(out["final_money"], dtype=np.float64)[0]
     assert money[0] > 0.0 and money[1] > 0.0
-    expected_zero = _terminal_log_ratio(money[0], money[1])
+    expected_zero = _terminal_bank_margin(money[0], money[1])
     expected_terminal = np.asarray([expected_zero, -expected_zero])
     assert terminal == pytest.approx(expected_zero, abs=1e-9)
     np.testing.assert_array_equal(out["potentials"], [0.0])
@@ -1666,7 +1836,7 @@ def test_population_wave_rewards_are_zero_sum_within_every_game(population_wave)
 
     np.testing.assert_array_equal(rollout.final_money[::2], rollout.opponent_money[1::2])
     np.testing.assert_array_equal(rollout.final_money[1::2], rollout.opponent_money[::2])
-    expected_terminal = _terminal_log_ratio(rollout.final_money, rollout.opponent_money)
+    expected_terminal = _terminal_bank_margin(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(
         _discounted_returns(rollout.rewards, DEFAULT_REWARD_GAMMA),
         DEFAULT_REWARD_GAMMA ** (rollout.horizon - 1) * expected_terminal,
@@ -1779,6 +1949,8 @@ def test_the_generation_guard_marks_the_compiled_modes_and_only_those() -> None:
     [
         pytest.param(2, (), (0, 1, 0), False, id="unequal-frozen-lanes"),
         pytest.param(1, ("pass",), (0, 1, 0), True, id="frozen-and-builtin"),
+        pytest.param(2, ("pass",), (2, 1, 2), False, id="builtin-wider-than-neural"),
+        pytest.param(2, ("pass",), (2, 2, 2), False, id="unassigned-frozen-networks"),
         pytest.param(0, ("pass", "starter"), (1, 0, 1), False, id="only-builtins"),
         pytest.param(0, (), (), True, id="pure-self-play"),
     ],
@@ -1888,39 +2060,44 @@ def test_the_fused_capture_reproduces_the_fused_uncaptured_wave_exactly() -> Non
     actor = StructuredActor(config).cuda()
     opponent = StructuredActor(config).cuda()
 
-    def collect(mode: str):
+    def collect(mode: str, assignments: tuple[int, int]):
         return collect_mixed_play_rust(
             actor,
             (opponent,),
             self_play_games=1,
             league_games=2,
-            opponent_indices=np.asarray([0, 0]),
+            opponent_indices=np.asarray(assignments),
+            builtin_lanes=("pass",),
             seed_start=77,
             sampling_seed=5,
             forward_mode=mode,
             forward_autocast=True,
         )
 
-    reference = collect("inductor_default")
-    captured = collect("inductor_graph")
+    # The total game count stays fixed while the actual neural width changes.
+    # Returning to the first geometry also exercises its persistent weights
+    # and compiled callable after another layout has used the ensemble.
+    for assignments in ((0, 0), (0, 1), (0, 0)):
+        reference = collect("inductor_default", assignments)
+        captured = collect("inductor_graph", assignments)
 
-    np.testing.assert_array_equal(captured.valid, reference.valid)
-    for name in (
-        "unit_actions",
-        "market_kinds",
-        "market_quantities",
-        "unit_masks",
-        "market_kind_masks",
-        "market_quantity_masks",
-        "unit_active",
-        "market_active",
-        "market_quantity_active",
-        "old_unit_logprobs",
-        "old_market_kind_logprobs",
-        "old_market_quantity_logprobs",
-        "rewards",
-        "entropy_sums",
-        "final_money",
-        "opponent_money",
-    ):
-        np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))
+        np.testing.assert_array_equal(captured.valid, reference.valid)
+        for name in (
+            "unit_actions",
+            "market_kinds",
+            "market_quantities",
+            "unit_masks",
+            "market_kind_masks",
+            "market_quantity_masks",
+            "unit_active",
+            "market_active",
+            "market_quantity_active",
+            "old_unit_logprobs",
+            "old_market_kind_logprobs",
+            "old_market_quantity_logprobs",
+            "rewards",
+            "entropy_sums",
+            "final_money",
+            "opponent_money",
+        ):
+            np.testing.assert_array_equal(getattr(captured, name), getattr(reference, name))

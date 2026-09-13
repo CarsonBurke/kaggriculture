@@ -44,9 +44,9 @@ def _pin_kind_head_to_a_quantified_buy(actor: FarmActor) -> None:
         actor.market_kind.bias[MarketKind.BUY_SEED_WHEAT] = 6.0
 
 
-def test_numpy_categorical_roundoff_fallback_stays_on_last_valid_action() -> None:
-    logits = np.asarray([[0.0, -1.0, -2.0, 20.0, 20.0]], dtype=np.float32)
-    mask = np.asarray([[True, True, True, False, False]])
+def test_numpy_categorical_roundoff_fallback_skips_underflowed_legal_tail() -> None:
+    logits = np.asarray([[*([0.0] * 12), -200.0, 100.0]], dtype=np.float32)
+    mask = np.asarray([[*([True] * 13), False]])
 
     actions, logprobs, entropies = _sample_numpy_categorical(
         logits,
@@ -56,9 +56,9 @@ def test_numpy_categorical_roundoff_fallback_stays_on_last_valid_action() -> Non
         generator=_FixedGenerator(np.nextafter(1.0, 0.0)),  # type: ignore[arg-type]
     )
 
-    assert actions.tolist() == [2]
-    assert np.isfinite(logprobs).all()
-    assert np.isfinite(entropies).all()
+    assert actions.tolist() == [11]
+    np.testing.assert_allclose(logprobs, [-np.log(12.0)], rtol=1e-6)
+    np.testing.assert_allclose(entropies, [np.log(12.0)], rtol=1e-6)
 
 
 def test_numpy_categorical_zero_draw_selects_first_valid_sparse_action() -> None:
@@ -74,6 +74,59 @@ def test_numpy_categorical_zero_draw_selects_first_valid_sparse_action() -> None
     )
 
     assert actions.tolist() == [2]
+
+
+def test_numpy_categorical_zero_draw_skips_underflowed_legal_prefix() -> None:
+    logits = np.asarray([[-200.0, 100.0, 0.0]], dtype=np.float32)
+    mask = np.asarray([[True, False, True]])
+
+    actions, logprobs, entropies = _sample_numpy_categorical(
+        logits,
+        mask,
+        False,
+        1.0,
+        _FixedGenerator(0.0),  # type: ignore[arg-type]
+    )
+
+    assert actions.tolist() == [2]
+    np.testing.assert_array_equal(logprobs, [0.0])
+    np.testing.assert_array_equal(entropies, [0.0])
+
+
+def test_numpy_categorical_uses_strict_representable_cdf_boundaries() -> None:
+    logits = np.tile(np.asarray([[0.0, -200.0, 0.0]], dtype=np.float32), (3, 1))
+    draws = np.asarray([[np.nextafter(0.5, 0.0)], [0.5], [np.nextafter(0.5, 1.0)]])
+
+    actions, logprobs, entropies = _sample_numpy_categorical(
+        logits,
+        np.ones_like(logits, dtype=np.bool_),
+        False,
+        1.0,
+        np.random.default_rng(0),
+        draws=draws,
+    )
+
+    assert actions.tolist() == [0, 2, 2]
+    np.testing.assert_allclose(logprobs, -np.log(2.0), rtol=1e-6)
+    np.testing.assert_allclose(entropies, np.log(2.0), rtol=1e-6)
+
+
+def test_numpy_categorical_subnormal_mass_keeps_logits_based_likelihood() -> None:
+    logits = np.asarray([[-100.0, 0.0, 200.0]], dtype=np.float32)
+    mask = np.asarray([[True, True, False]])
+
+    actions, logprobs, entropies = _sample_numpy_categorical(
+        logits,
+        mask,
+        False,
+        1.0,
+        _FixedGenerator(0.0),  # type: ignore[arg-type]
+    )
+
+    assert actions.tolist() == [0]
+    np.testing.assert_allclose(logprobs, [-100.0], rtol=0, atol=1e-6)
+    expected_entropy = 100.0 * float(np.exp(np.float32(-100.0)))
+    np.testing.assert_allclose(entropies, [expected_entropy], rtol=1e-6, atol=0)
 
 
 def test_deterministic_policy_emits_masked_engine_actions() -> None:
@@ -104,6 +157,7 @@ def test_deterministic_policy_emits_masked_engine_actions() -> None:
 
     next_state = environment.step(step.actions)
     assert all(row.status == "ACTIVE" for row in next_state)
+
 
 def test_prepared_quantity_heads_preserve_frozen_policy_actions() -> None:
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 31})
@@ -362,4 +416,3 @@ def test_component_selected_logprobs_matches_component_logprobs() -> None:
     # so it agrees bit-for-bit with the full statistics on every head.
     for lean, reference in zip(selected, full[:3], strict=True):
         torch.testing.assert_close(lean, reference, rtol=0.0, atol=0.0)
-

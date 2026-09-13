@@ -132,11 +132,11 @@ from kaggriculture.ppo import (
     PpoConfig,
     _actor_batch_args,
     _actor_minibatch_terms,
-    _balanced_minibatch_slices,
     _batch_tensor,
     _cached_update_callable,
     _device_compile_mode,
     _explained_variance,
+    _fixed_minibatch_positions,
     _stage_tensor,
     _validate_staged_action_masks,
     prepare_advantages,
@@ -333,19 +333,19 @@ class GradientContext:
     config: PpoConfig
     autocast_enabled: bool
     actor_terms: Any
-    component_counts: np.ndarray
     parameters: list[nn.Parameter]
+    component_counts: np.ndarray
 
-    def policy_objective(self, host_indices: np.ndarray, indices: Tensor) -> tuple[Tensor, int]:
-        """The clipped surrogate sum and its component count for one minibatch.
+    def policy_objective(self, indices: Tensor, sample_count: int) -> Tensor:
+        """Production per-component objective, excluding static-shape padding.
 
-        Identical to `update_ppo`'s actor minibatch: the same compiled callable,
-        the same staged tensors and dtypes, the same host-side component count,
-        and the exact collection-time sampler likelihoods. Any execution-path
-        drift therefore appears in the first-step ratio exactly as it does in
-        training.
+        Score the exact collection-time likelihoods through the same compiled
+        callable, input dtypes, and real-transition weights as `update_ppo`.
         """
         staged = self.staged
+        sample_weight = (
+            torch.arange(indices.numel(), device=indices.device) < sample_count
+        ).float()
         policy_sum, _entropy, _kl, _clipped = self.actor_terms(
             self.actor,
             _batch_tensor(staged["unit_actions"], indices, torch.long),
@@ -365,23 +365,26 @@ class GradientContext:
             self.config.clip_high,
             self.autocast_enabled,
             *_actor_batch_args(self.architecture, staged, indices),
+            sample_weight=sample_weight,
         )
-        return policy_sum, max(1, int(self.component_counts[host_indices].sum()))
+        return policy_sum
 
 
 def full_batch_gradient(context: GradientContext, order: np.ndarray) -> Tensor:
     """The exact full-batch policy gradient, accumulated minibatch by minibatch.
 
-    Normalized once by the total component count rather than per minibatch, so
+    Normalized once by the total active-component count rather than per minibatch, so
     this is the gradient of the whole rollout's policy loss and does not depend
     on how the rollout happens to be partitioned. `Gstar` in the report.
     """
     device = context.staged["unit_actions"].device
-    ordered = torch.from_numpy(order).to(device=device)
+    positions, counts = _fixed_minibatch_positions(order.size, context.config.minibatch_size)
+    host_batches = order[positions]
+    batch_indices = torch.from_numpy(host_batches).to(device=device)
     total = max(1, int(context.component_counts[order].sum()))
     context.actor.zero_grad(set_to_none=True)
-    for batch_slice in _balanced_minibatch_slices(order.size, context.config.minibatch_size):
-        policy_sum, _count = context.policy_objective(order[batch_slice], ordered[batch_slice])
+    for row, count in zip(batch_indices, counts, strict=True):
+        policy_sum = context.policy_objective(row, int(count))
         (-policy_sum / total).backward()
     gradient = _flat_gradient(context.parameters).double()
     context.actor.zero_grad(set_to_none=True)
@@ -391,20 +394,23 @@ def full_batch_gradient(context: GradientContext, order: np.ndarray) -> Tensor:
 def minibatch_gradients(
     context: GradientContext, order: np.ndarray
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Each row is `grad(-policy_sum / component_count)` for one minibatch. The
-    returned gradients are the raw optimizer inputs; `update_ppo` does not
-    rescale PPO actor gradients before the optimizer step.
+    """Each row is `grad(-policy_sum / component_count)` for one minibatch.
+
+    These are the main-policy gradients before any auxiliary gradient balancing.
     """
     device = context.staged["unit_actions"].device
-    ordered = torch.from_numpy(order).to(device=device)
-    slices = _balanced_minibatch_slices(order.size, context.config.minibatch_size)
+    # Keep the production shape, but repeated padding has zero weight.
+    positions, real_counts = _fixed_minibatch_positions(order.size, context.config.minibatch_size)
+    host_batches = order[positions]
+    batch_indices = torch.from_numpy(host_batches).to(device=device)
     total = sum(parameter.numel() for parameter in context.parameters)
-    stack = torch.empty((len(slices), total), dtype=torch.float32, device=device)
-    counts = torch.empty(len(slices), dtype=torch.float64, device=device)
-    for index, batch_slice in enumerate(slices):
+    stack = torch.empty((len(positions), total), dtype=torch.float32, device=device)
+    counts = torch.empty(len(positions), dtype=torch.float64, device=device)
+    for index, (row, real_count) in enumerate(zip(batch_indices, real_counts, strict=True)):
         context.actor.zero_grad(set_to_none=True)
-        policy_sum, count = context.policy_objective(order[batch_slice], ordered[batch_slice])
-        (-policy_sum / count).backward()
+        policy_sum = context.policy_objective(row, int(real_count))
+        count = int(context.component_counts[host_batches[index, :real_count]].sum())
+        (-policy_sum / max(1, count)).backward()
         stack[index] = _flat_gradient(context.parameters)
         counts[index] = count
     context.actor.zero_grad(set_to_none=True)
@@ -893,7 +899,10 @@ def main() -> None:
         + rollout.market_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
         + rollout.market_quantity_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
     )
-    minibatches = len(_balanced_minibatch_slices(valid_indices.size, config.minibatch_size))
+    minibatch_positions, _minibatch_counts = _fixed_minibatch_positions(
+        valid_indices.size, config.minibatch_size
+    )
+    minibatches = len(minibatch_positions)
     # Four is the floor for the split-half diagnostics, and a rollout that
     # cannot supply a draw at the widest requested averaging width measures
     # nothing at the width the verdict is read at.
@@ -926,7 +935,7 @@ def main() -> None:
     )
     prepared = prepare_advantages(rollout, behavior_values, config)
     staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
-    actor.train()
+    actor.eval()
 
     parameters, matrices = tracked_matrices(actor)
     context = GradientContext(
@@ -938,8 +947,8 @@ def main() -> None:
         actor_terms=_cached_update_callable(
             actor, "_kaggriculture_update_terms", _actor_minibatch_terms, compile_mode
         ),
-        component_counts=component_counts,
         parameters=parameters,
+        component_counts=component_counts,
     )
 
     reference = full_batch_gradient(context, valid_indices)

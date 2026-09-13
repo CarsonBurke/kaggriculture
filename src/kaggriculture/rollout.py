@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-import weakref
+import types
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -34,7 +34,7 @@ from kaggriculture.encoding import (
     shaped_pair_reward,
     terminal_pair_utility,
 )
-from kaggriculture.model import ActorOutput, FarmActor
+from kaggriculture.model import ActorOutput, FarmActor, policy_compile_options
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
 from kaggriculture.orientation import (
     orient_boards,
@@ -767,33 +767,6 @@ class _GpuPreferenceTransfer:
     quantity_draws: torch.Tensor
 
 
-def _quantity_head_tensors(
-    actors: Sequence[FarmActor | StructuredActor],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        torch.stack([actor.market_quantity_kind_gate.weight for actor in actors]),
-        torch.stack([actor.market_quantity_value.weight for actor in actors]),
-        torch.stack([actor.market_quantity_bias for actor in actors]),
-    )
-
-
-def _selected_quantity_logits(
-    context: torch.Tensor,
-    kinds: torch.Tensor,
-    head_ids: torch.Tensor,
-    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    kind_gate, values, bias = heads
-    kinds = kinds.long()
-    row = torch.arange(context.shape[0], device=context.device)[:, None]
-    row_gate = kind_gate[head_ids]
-    row_bias = bias[head_ids]
-    selected_gate = row_gate[row, kinds]
-    selected_bias = row_bias[row, kinds]
-    features = context.float() * (1.0 + selected_gate.float())
-    return torch.einsum("bsr,bqr->bsq", features, values[head_ids].float()) + selected_bias.float()
-
-
 def _row_random(
     shape: tuple[int, ...],
     current_rows: torch.Tensor,
@@ -963,63 +936,148 @@ def _gpu_preferences_to_host(
     return (arrays[0], arrays[1], arrays[2], arrays[3]), transfer
 
 
-@dataclass(frozen=True)
+@dataclass
 class _GpuStatisticsTransfer:
-    """Persistent pinned staging for sampled policy statistics."""
+    """Pinned output staging, retaining upload sources until the ready event.
 
-    device: torch.Tensor
+    Deferred consumers must join ``ready`` before reusing either the sampled
+    host buffers or this transfer. Collection does so before the next native
+    step; the intervening GPU work stays on the same stream.
+    """
+
     host: torch.Tensor
-    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray]
     ready: torch.cuda.Event
     inputs: tuple[torch.Tensor, ...]
+    host_inputs: tuple[torch.Tensor, ...]
 
 
 _GPU_STATISTIC_INPUT_NAMES = (
     "unit_actions",
     "market_kinds",
-    "market_quantities",
     "unit_masks",
     "market_kind_masks",
-    "market_quantity_masks",
     "unit_active",
     "market_active",
     "market_quantity_active",
+    "entropy",
 )
+_GPU_STATISTIC_OUTPUT_NAMES = ("unit_logprobs", "market_kind_logprobs", "entropy")
+_GPU_STATISTICS_CACHE: dict[tuple[Any, ...], Any] = {}
+
+
+def _gpu_policy_statistics(
+    unit_logits: torch.Tensor,
+    kind_logits: torch.Tensor,
+    builtin_agents: torch.Tensor,
+    temperatures: torch.Tensor,
+    unit_actions: torch.Tensor,
+    market_kinds: torch.Tensor,
+    unit_masks: torch.Tensor,
+    kind_masks: torch.Tensor,
+    unit_active: torch.Tensor,
+    kind_active: torch.Tensor,
+    quantity_active: torch.Tensor,
+    quantity_entropy_contribution: torch.Tensor,
+) -> torch.Tensor:
+    """Tensor-only FP32 statistics and packing, independent of model compilation."""
+    scale = temperatures.clamp_min(_NATIVE_TEMPERATURE_FLOOR)[:, None, None]
+    unit_logprob, unit_entropy = categorical_statistics(
+        unit_logits / scale, unit_masks, unit_actions, validate_mask=False
+    )
+    kind_logprob, kind_entropy = categorical_statistics(
+        kind_logits / scale, kind_masks, market_kinds, validate_mask=False
+    )
+    learned = (builtin_agents == 0)[:, None]
+    unit_logprob = unit_logprob * learned
+    kind_logprob = kind_logprob * learned
+    unit_entropy = unit_entropy * learned
+    kind_entropy = kind_entropy * learned
+    counts = unit_active.sum(1) + kind_active.sum(1) + quantity_active.sum(1)
+    entropy = (
+        (unit_entropy * unit_active).sum(1) + (kind_entropy * kind_active).sum(1)
+    ) / counts.clamp_min(1) + quantity_entropy_contribution
+    return torch.cat((unit_logprob.flatten(), kind_logprob.flatten(), entropy))
+
+
+def _compiled_gpu_policy_statistics(inputs: tuple[torch.Tensor, ...]) -> Any:
+    # As with stacked forward layouts, each static geometry gets its own frame
+    # rather than consuming a shared frame's finite recompile budget. Tensor
+    # temperatures are runtime inputs, never Python-valued compile guards.
+    key = tuple((value.shape, value.stride(), value.dtype, value.device) for value in inputs)
+    compiled = _GPU_STATISTICS_CACHE.get(key)
+    if compiled is None:
+        template = _gpu_policy_statistics
+        name = f"_gpu_policy_statistics_{len(_GPU_STATISTICS_CACHE)}"
+        function = types.FunctionType(
+            template.__code__.replace(co_name=name, co_qualname=name),
+            template.__globals__,
+            name,
+            template.__defaults__,
+            template.__closure__,
+        )
+        compiled = torch.compile(
+            function,
+            options=policy_compile_options("default"),
+            fullgraph=True,
+            dynamic=False,
+        )
+        _GPU_STATISTICS_CACHE[key] = compiled
+    return compiled
 
 
 def _fill_gpu_policy_statistics(
     sampled: dict[str, np.ndarray],
     output: ActorOutput,
-    heads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    head_ids: torch.Tensor,
     builtin_agents: torch.Tensor,
     temperatures: torch.Tensor,
     transfer: _GpuStatisticsTransfer | None = None,
     *,
     synchronize: bool = True,
 ) -> _GpuStatisticsTransfer | None:
+    """Add GPU unit/kind statistics without transporting native quantity logprobs.
+
+    Native quantities already carry the sampler's actual likelihoods, including
+    zero likelihoods for builtin agents. Native ``entropy`` initially contains
+    only their contribution, normalized by all active factors.
+    """
+    # Masks originate on the host. Reject unsupported decisions here rather
+    # than forcing two CUDA-to-host boolean reductions per environment step.
+    for logits, name in (
+        (output.unit_logits, "unit_masks"),
+        (output.market_kind_logits, "market_kind_masks"),
+    ):
+        mask = np.asarray(sampled[name])
+        if logits.shape != mask.shape:
+            raise ValueError(
+                f"logit/mask shape mismatch: {logits.shape} != {torch.Size(mask.shape)}"
+            )
+        if not mask.any(axis=-1).all():
+            raise ValueError("every categorical decision needs at least one valid action")
+
     device = output.unit_logits.device
+    host_inputs = tuple(
+        torch.from_numpy(np.asarray(sampled[name])) for name in _GPU_STATISTIC_INPUT_NAMES
+    )
+    statistic_shapes = (
+        tuple(host_inputs[0].shape),
+        tuple(host_inputs[1].shape),
+        (host_inputs[0].shape[0],),
+    )
     if device.type == "cpu":
-        input_tensors = tuple(torch.as_tensor(sampled[name]) for name in _GPU_STATISTIC_INPUT_NAMES)
+        input_tensors = host_inputs
     else:
-        host_inputs = tuple(
-            torch.from_numpy(np.asarray(sampled[name])) for name in _GPU_STATISTIC_INPUT_NAMES
-        )
-        statistic_shapes = (
-            tuple(host_inputs[0].shape),
-            tuple(host_inputs[1].shape),
-            tuple(host_inputs[2].shape),
-            (host_inputs[0].shape[0],),
-        )
-        total = sum(int(np.prod(shape)) for shape in statistic_shapes)
         if (
             transfer is None
-            or transfer.device.numel() != total
             or tuple(array.shape for array in transfer.arrays) != statistic_shapes
-            or tuple(tensor.shape for tensor in transfer.inputs)
-            != tuple(tensor.shape for tensor in host_inputs)
+            or any(
+                target.shape != source.shape
+                or target.dtype != source.dtype
+                or target.device != device
+                for target, source in zip(transfer.inputs, host_inputs, strict=True)
+            )
         ):
-            device_buffer = torch.empty(total, dtype=torch.float32, device=device)
+            total = sum(int(np.prod(shape)) for shape in statistic_shapes)
             host_buffer = torch.empty(total, dtype=torch.float32, device="cpu", pin_memory=True)
             flat = host_buffer.numpy()
             cursor = 0
@@ -1029,76 +1087,41 @@ def _fill_gpu_policy_statistics(
                 arrays.append(flat[cursor : cursor + size].reshape(shape))
                 cursor += size
             transfer = _GpuStatisticsTransfer(
-                device=device_buffer,
                 host=host_buffer,
                 arrays=tuple(arrays),
                 ready=torch.cuda.Event(),
                 inputs=tuple(torch.empty_like(tensor, device=device) for tensor in host_inputs),
+                host_inputs=host_inputs,
             )
+        transfer.host_inputs = host_inputs
         for target, source in zip(transfer.inputs, host_inputs, strict=True):
             target.copy_(source, non_blocking=True)
         input_tensors = transfer.inputs
-    (
-        unit_actions,
-        market_kinds,
-        market_quantities,
-        unit_masks,
-        kind_masks,
-        quantity_masks,
-        unit_active,
-        kind_active,
-        quantity_active,
-    ) = input_tensors
-    scale = temperatures.clamp_min(_NATIVE_TEMPERATURE_FLOOR)[:, None, None]
-    unit_logits = output.unit_logits / scale
-    kind_logits = output.market_kind_logits / scale
-    quantity_logits = (
-        _selected_quantity_logits(output.market_quantity_context, market_kinds, head_ids, heads)
-        / scale
-    )
-    unit_logprob, unit_entropy = categorical_statistics(unit_logits, unit_masks, unit_actions)
-    kind_logprob, kind_entropy = categorical_statistics(kind_logits, kind_masks, market_kinds)
-    quantity_logprob, quantity_entropy = categorical_statistics(
-        quantity_logits, quantity_masks, market_quantities
-    )
-    learned = builtin_agents == 0
-    for values in (
-        unit_logprob,
-        kind_logprob,
-        quantity_logprob,
-        unit_entropy,
-        kind_entropy,
-        quantity_entropy,
-    ):
-        values.mul_(learned[:, None])
-    counts = unit_active.sum(1) + kind_active.sum(1) + quantity_active.sum(1)
-    entropy = (
-        (unit_entropy * unit_active).sum(1)
-        + (kind_entropy * kind_active).sum(1)
-        + (quantity_entropy * quantity_active).sum(1)
-    ) / counts.clamp_min(1)
-    statistics = (
-        ("unit_logprobs", unit_logprob),
-        ("market_kind_logprobs", kind_logprob),
-        ("market_quantity_logprobs", quantity_logprob),
-        ("entropy", entropy),
+    arguments = (
+        output.unit_logits,
+        output.market_kind_logits,
+        builtin_agents,
+        temperatures,
+        *input_tensors,
     )
     if device.type == "cpu":
-        for name, values in statistics:
-            np.copyto(np.asarray(sampled[name]), values.float().numpy())
+        packed = _gpu_policy_statistics(*arguments).numpy()
+        cursor = 0
+        for name, shape in zip(_GPU_STATISTIC_OUTPUT_NAMES, statistic_shapes, strict=True):
+            size = int(np.prod(shape))
+            np.copyto(np.asarray(sampled[name]), packed[cursor : cursor + size].reshape(shape))
+            cursor += size
         return transfer
 
     assert transfer is not None
-    cursor = 0
-    for _, values in statistics:
-        size = values.numel()
-        transfer.device[cursor : cursor + size].view(values.shape).copy_(values)
-        cursor += size
-    transfer.host.copy_(transfer.device, non_blocking=True)
+    # Fusion only: no cudagraph-tree generation/lifetime coupling to model
+    # forwards, and no eager per-statistic copies into another device buffer.
+    packed = _compiled_gpu_policy_statistics(arguments)(*arguments)
+    transfer.host.copy_(packed, non_blocking=True)
     transfer.ready.record()
     if synchronize:
         transfer.ready.synchronize()
-        for (name, _), values in zip(statistics, transfer.arrays, strict=True):
+        for name, values in zip(_GPU_STATISTIC_OUTPUT_NAMES, transfer.arrays, strict=True):
             np.copyto(np.asarray(sampled[name]), values)
     return transfer
 
@@ -1184,9 +1207,9 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
     """Return the cached compiled collection forward for `mode`.
 
     CUDA convolution and GEMM kernels are not bitwise invariant across eager,
-    graph, and fused execution, nor across batch shapes, so any mode here moves
-    the behavior policy relative to the update-path replay. That drift is bounded
-    semantically rather than bitwise, by `update_replay_parity`.
+    graph, and fused execution. The shared precision settings preserve policy
+    arithmetic across the compiled rollout/update paths; `update_replay_parity`
+    checks the actual stored sampling likelihoods rather than assuming parity.
 
     `inductor` is `reduce-overhead`, which adds CUDA graphs to the fusion, and
     `inductor_default` is the fusion alone. Compilation is lazy: the first call,
@@ -1211,7 +1234,9 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
         else:
             compiled = torch.compile(
                 model.forward,
-                mode="reduce-overhead" if mode == "inductor" else "default",
+                options=policy_compile_options(
+                    "reduce-overhead" if mode == "inductor" else "default"
+                ),
                 fullgraph=True,
                 dynamic=False,
             )
@@ -1266,17 +1291,9 @@ class _StackedActorEnsemble:
             else FarmActor(first.config)
         ).to("meta")
         self.template.eval()
-        import torch._dynamo
-
-        # Dynamo's recompile budget is per Python code object, not per compiled
-        # callable. Every lane-count-specific ensemble below shares
-        # `_forward.__code__`, so the normal growth from one to N league lanes
-        # otherwise trips the default limit of eight even though each shape has
-        # its own persistent callable. N is also a strict upper bound on the
-        # distinct positive lane counts that can precede this instance.
-        torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit, len(models)
-        )
+        # Each compiled lane layout gets its own code object below, so the
+        # ensemble no longer shares `_forward.__code__` across widths and
+        # Dynamo's per-code recompile budget is never the binding constraint.
 
         # The stacked tensors outlive any inference-mode region the collector
         # runs under; inference tensors would reject the in-place `load`
@@ -1315,6 +1332,27 @@ class _StackedActorEnsemble:
 
         return torch.vmap(run)(self.params, self.buffers, *inputs)
 
+    def _layout_forward(self, tag: str) -> Any:
+        """A bound `_forward` with its own code object, named after its layout.
+
+        Dynamo's cache and its recompile budget are keyed by code object, not by
+        compiled callable, so every lane layout sharing `_forward.__code__` made
+        each new width a *recompile* of the same frame: with the budget raised to
+        survive it, that hid genuine shape churn among legitimate layout
+        specializations, and without the bump the collector fell back to eager
+        after eight widths. A distinct code object per layout makes each one its
+        own first compile, which is what it actually is.
+        """
+        template = _StackedActorEnsemble._forward
+        name = f"_forward_{tag}"
+        return types.FunctionType(
+            template.__code__.replace(co_name=name, co_qualname=name),
+            template.__globals__,
+            name,
+            template.__defaults__,
+            template.__closure__,
+        ).__get__(self, type(self))
+
     def __call__(self, *inputs: Any, mode: str) -> ActorOutput:
         """Run every stacked lane under the same mode as the learner forward.
 
@@ -1338,21 +1376,24 @@ class _StackedActorEnsemble:
         leading = _leading_tensor(inputs)
         if mode not in COMPILED_ROLLOUT_FORWARD_MODES or leading.device.type != "cuda":
             return self._forward(*inputs)
-        # One compiled callable per lane width and mode: league assignments may
-        # change the padded width between waves, and sharing one callable would
-        # burn through Dynamo's per-code recompile budget before falling back to
-        # eager silently.
+        # One compiled callable per lane width and mode, each wrapping its own
+        # code object: league assignments change the padded width between waves,
+        # and the widths are genuinely different graphs rather than one graph
+        # being respecialized.
         key = (mode, leading.shape[1])
         compiled = self._compiled.get(key)
         if compiled is None:
+            layout = self._layout_forward(f"{mode}_w{leading.shape[1]}")
             if mode == "cudagraphs":
                 compiled = torch.compile(
-                    self._forward, backend="cudagraphs", fullgraph=True, dynamic=False
+                    layout, backend="cudagraphs", fullgraph=True, dynamic=False
                 )
             else:
                 compiled = torch.compile(
-                    self._forward,
-                    mode="reduce-overhead" if mode == "inductor" else "default",
+                    layout,
+                    options=policy_compile_options(
+                        "reduce-overhead" if mode == "inductor" else "default"
+                    ),
                     fullgraph=True,
                     dynamic=False,
                 )
@@ -1360,17 +1401,27 @@ class _StackedActorEnsemble:
         return compiled(*inputs)
 
 
-_STACKED_ENSEMBLE_CACHE: dict[tuple[Any, ...], _StackedActorEnsemble] = {}
+_STACKED_ENSEMBLES = threading.local()
 
 
 def _stacked_actor_ensemble(
     models: Sequence[FarmActor | StructuredActor],
     namespace: int = 0,
 ) -> _StackedActorEnsemble:
-    """Fetch or build the persistent stacked ensemble for these lanes."""
-    model_references = tuple(weakref.ref(model) for model in models)
+    """Fetch or build the persistent stacked ensemble for this lane shape.
+
+    The key deliberately excludes *which* models are stacked. Keying on model
+    identity built a fresh instance -- and therefore fresh stacked tensors --
+    every time the league selection changed, which is most waves: the compiled
+    forward bakes those tensors' addresses via `mark_static_address`, so each
+    new instance re-traced the graph inside the wave that built it. Reusing one
+    instance per `(namespace, architecture, lane count, device, dtypes)` on
+    each collector thread preserves compiled addresses across sequential waves.
+    Different threads own different mutable weights: an acquisition elsewhere
+    cannot refill a live wave's ensemble. `namespace` separates independent
+    owners on one thread.
+    """
     cache_key = (
-        model_references,
         namespace,
         type(models[0]),
         models[0].config,
@@ -1379,19 +1430,49 @@ def _stacked_actor_ensemble(
         tuple(parameter.dtype for parameter in models[0].parameters()),
         tuple(buffer.dtype for buffer in models[0].buffers()),
     )
-    ensemble = _STACKED_ENSEMBLE_CACHE.get(cache_key)
+    cache = getattr(_STACKED_ENSEMBLES, "cache", None)
+    if cache is None:
+        _STACKED_ENSEMBLES.cache = cache = {}
+    ensemble = cache.get(cache_key)
     if ensemble is None:
-
-        def evict(_reference: weakref.ReferenceType[FarmActor | StructuredActor]) -> None:
-            _STACKED_ENSEMBLE_CACHE.pop(cache_key, None)
-
-        model_references = tuple(weakref.ref(model, evict) for model in models)
-        cache_key = (model_references, *cache_key[1:])
         ensemble = _StackedActorEnsemble(models)
-        _STACKED_ENSEMBLE_CACHE[cache_key] = ensemble
+        cache[cache_key] = ensemble
     else:
         ensemble.load(models)
     return ensemble
+
+
+@torch.inference_mode()
+def _warmup_league_layout(
+    ensemble: _StackedActorEnsemble,
+    inputs: tuple[Any, ...],
+    *,
+    lanes: int,
+    width: int,
+    mode: str,
+    autocast: bool,
+) -> None:
+    """Compile this wave's league layout before its captured step loop opens.
+
+    Only Inductor without its own graph pool is prewarmed. The forward runs on
+    the persistent ensemble the wave itself will call, over zero-filled lane
+    views: warming a throwaway stack instead compiles against tensor addresses
+    the wave never uses, so the wave re-traced anyway and the warmup was pure
+    cost -- that, not the width formula, is why the earlier loop over every
+    lane count bought nothing. No game advances and no policy draw occurs, and
+    an already-compiled layout costs one stacked forward, about 2 ms.
+    """
+    device = next(iter(ensemble.params.values())).device
+    if mode != "inductor_graph" or device.type != "cuda" or lanes < 1 or width < 1:
+        return
+    with torch.random.fork_rng(devices=[]):
+        indices = torch.zeros(lanes * width, dtype=torch.long, device=device)
+        selected = _empty_selected_inputs(inputs, (lanes, width))
+        lane_inputs = _lane_view_inputs(inputs, indices, lanes, width, selected)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast):
+            ensemble(*lane_inputs, mode=mode)
+        torch.cuda.synchronize(device)
+        del lane_inputs, selected, indices
 
 
 def _mark_cuda_graph_step(device: torch.device, enabled: bool) -> None:
@@ -1746,11 +1827,10 @@ def _collect_mixed_play_rust_wave(
     natively inside the wave, with no network behind them. They extend the
     lane index space that ``opponent_indices`` addresses: lanes below
     ``len(opponents)`` are frozen networks, the rest are these built-ins in
-    order. A built-in lane still occupies a slot in the stacked frozen
-    forward, borrowing the last frozen opponent's weights and discarding the
-    result, so the ensemble's batch shape depends on the total lane count and
-    not on how many lanes happen to be built-in this iteration — a CUDA graph
-    captured for one mix stays valid for every other.
+    order. Only assigned frozen networks enter the stacked forward. Built-in
+    rows keep their physical sampling positions but need no neural outputs.
+    Each actual (neural lane count, padded width) layout compiles on first use
+    and reuses the persistent ensemble thereafter.
 
     Rollouts capture only behavior policy state. Value predictions for GAE
     are replayed from the stored features in one large batched critic pass
@@ -1862,7 +1942,6 @@ def _collect_mixed_play_rust_wave(
     generator = np.random.default_rng(sampling_seed)
     frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
     kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
-    gpu_heads = _quantity_head_tensors((actor, *opponents)) if gpu_sampling else None
     # Per-lane decode of everything a frozen row needs. A built-in lane has no
     # network, so it borrows the learner's quantity head and neutral sampling
     # settings; the native agent replaces that row's whole action regardless.
@@ -1892,7 +1971,6 @@ def _collect_mixed_play_rust_wave(
     gpu_frozen_generator: torch.Generator | None = None
     gpu_current_rows: torch.Tensor | None = None
     gpu_frozen_rows: torch.Tensor | None = None
-    gpu_head_ids: torch.Tensor | None = None
     gpu_deterministic_rows: torch.Tensor | None = None
     gpu_temperatures: torch.Tensor | None = None
     statistics_transfer: _GpuStatisticsTransfer | None = None
@@ -1905,7 +1983,6 @@ def _collect_mixed_play_rust_wave(
         gpu_frozen_generator.manual_seed(sampling_seed ^ 0x5EED_1EAF)
         gpu_current_rows = torch.as_tensor(stored_rows, dtype=torch.long, device=device)
         gpu_frozen_rows = torch.as_tensor(frozen_rows, dtype=torch.long, device=device)
-        gpu_head_ids = torch.as_tensor(head_ids, dtype=torch.long, device=device)
         gpu_deterministic_rows = torch.as_tensor(
             deterministic_rows, dtype=torch.bool, device=device
         )
@@ -1932,15 +2009,15 @@ def _collect_mixed_play_rust_wave(
     quantity_context: torch.Tensor | np.ndarray | None = None
     if league_games:
         frozen_groups = tuple(
-            frozen_rows[np.flatnonzero(assignments == lane)] for lane in range(lane_count)
+            frozen_rows[np.flatnonzero(assignments == lane)] for lane in range(len(opponents))
         )
         active_indices = [index for index, group in enumerate(frozen_groups) if group.size]
         active_groups = [frozen_groups[index] for index in active_indices]
-        # Pad every lane to the widest group so the stacked forward keeps one
-        # static shape. Padding replicates a real row of the same lane; those
-        # outputs are exact duplicates and are discarded on scatter.
+        # Pad only neural lanes to the widest neural group. Built-in groups
+        # neither consume a model slot nor increase its width. Replicated rows
+        # are discarded on scatter; physical sampling rows remain unchanged.
         lanes = len(active_indices)
-        lane_width = max(group.size for group in active_groups)
+        lane_width = max((group.size for group in active_groups), default=0)
         lane_rows = np.empty((lanes, lane_width), dtype=np.int64)
         lane_valid = np.zeros((lanes, lane_width), dtype=np.bool_)
         for lane, group in enumerate(active_groups):
@@ -1948,21 +2025,17 @@ def _collect_mixed_play_rust_wave(
             lane_rows[lane, group.size :] = group[0]
             lane_valid[lane, : group.size] = True
         lane_valid_flat = lane_valid.reshape(-1)
-        frozen_store_rows = np.concatenate(active_groups)
+        frozen_store_rows = (
+            np.concatenate(active_groups) if active_groups else np.empty(0, dtype=np.int64)
+        )
         frozen_tensor = torch.as_tensor(lane_rows.reshape(-1), device=device)
         frozen_store_tensor = torch.as_tensor(frozen_store_rows, device=device)
         # Resolve padding on the host once. CUDA boolean indexing would compact
         # dynamically (and synchronize) every step, and cannot be captured.
         lane_valid_indices = torch.as_tensor(np.flatnonzero(lane_valid_flat), device=device)
-        # Built-in lanes keep their slot in the stack, borrowing the last
-        # frozen opponent's weights. The ensemble batch shape therefore follows
-        # total lane count, so a captured CUDA graph survives the next mix.
-        # Their logits are never read. A wave with no frozen network runs none.
         ensemble = (
-            _stacked_actor_ensemble(
-                [opponents[min(index, len(opponents) - 1)] for index in active_indices]
-            )
-            if opponents
+            _stacked_actor_ensemble([opponents[index] for index in active_indices])
+            if active_indices
             else None
         )
         # Structured mixed play gathers eleven token tensors for the learner
@@ -2074,6 +2147,15 @@ def _collect_mixed_play_rust_wave(
     graphed = forward_mode in CAPTURED_ROLLOUT_FORWARD_MODES and device.type == "cuda"
     step_graph: _CapturedStep[_StepOutputs] | None = None
     pending_outputs: _StepOutputs | None = None
+    if ensemble is not None:
+        _warmup_league_layout(
+            ensemble,
+            wave_inputs,
+            lanes=lanes,
+            width=lane_width,
+            mode=forward_mode,
+            autocast=autocast_forward,
+        )
 
     for step in range(horizon):
         if graphed and step_graph is None:
@@ -2128,8 +2210,6 @@ def _collect_mixed_play_rust_wave(
 
         assert full_output is not None
         if gpu_sampling:
-            assert gpu_heads is not None
-            assert gpu_head_ids is not None
             assert gpu_temperatures is not None
             assert gpu_deterministic_rows is not None
             assert gpu_current_rows is not None
@@ -2158,10 +2238,12 @@ def _collect_mixed_play_rust_wave(
                 assert statistics_transfer is not None
                 statistics_transfer.ready.synchronize()
                 for destination, values in zip(
-                    _POLICY_STATISTIC_FIELD_SOURCES, statistics_transfer.arrays[:3], strict=True
+                    ("old_unit_logprobs", "old_market_kind_logprobs"),
+                    statistics_transfer.arrays[:2],
+                    strict=True,
                 ):
                     fields[destination][:, pending_step] = values[store_rows]
-                entropy_sums += statistics_transfer.arrays[3][store_rows] * pending_counts
+                entropy_sums += statistics_transfer.arrays[2][store_rows] * pending_counts
                 pending_statistics = None
             environment.select_and_step_into(
                 unit_utilities,
@@ -2180,8 +2262,6 @@ def _collect_mixed_play_rust_wave(
             statistics_transfer = _fill_gpu_policy_statistics(
                 sampled,
                 full_output,
-                gpu_heads,
-                gpu_head_ids,
                 gpu_builtin_agents,
                 gpu_temperatures,
                 statistics_transfer,
@@ -2264,6 +2344,9 @@ def _collect_mixed_play_rust_wave(
             + np.asarray(sampled["market_quantity_active"])[store_rows].sum(axis=1)
         )
         if gpu_sampling:
+            fields["old_market_quantity_logprobs"][:, step] = np.asarray(
+                sampled["market_quantity_logprobs"]
+            )[store_rows]
             pending_statistics = (step, counts)
         else:
             entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
@@ -2281,10 +2364,12 @@ def _collect_mixed_play_rust_wave(
         assert statistics_transfer is not None
         statistics_transfer.ready.synchronize()
         for destination, values in zip(
-            _POLICY_STATISTIC_FIELD_SOURCES, statistics_transfer.arrays[:3], strict=True
+            ("old_unit_logprobs", "old_market_kind_logprobs"),
+            statistics_transfer.arrays[:2],
+            strict=True,
         ):
             fields[destination][:, pending_step] = values[store_rows]
-        entropy_sums += statistics_transfer.arrays[3][store_rows] * pending_counts
+        entropy_sums += statistics_transfer.arrays[2][store_rows] * pending_counts
 
     if step_graph is not None:
         step_graph.close()
@@ -2321,39 +2406,6 @@ def _collect_mixed_play_rust_wave(
     )
 
 
-def _pipeline_replica(
-    model: FarmActor | StructuredActor,
-    *,
-    dtype: torch.dtype | None = None,
-    namespace: int = 0,
-) -> FarmActor | StructuredActor:
-    device = next(model.parameters()).device
-    replica_dtype = dtype or next(model.parameters()).dtype
-    replicas = getattr(model, "_kaggriculture_pipeline_replicas", None)
-    if replicas is None:
-        replicas = {}
-        object.__setattr__(model, "_kaggriculture_pipeline_replicas", replicas)
-    key = (device, replica_dtype, namespace)
-    replica = replicas.get(key)
-    if replica is None or type(replica) is not type(model) or replica.config != model.config:
-        replica = (
-            StructuredActor(model.config)
-            if isinstance(model, StructuredActor)
-            else FarmActor(model.config)
-        ).to(device=device, dtype=replica_dtype)
-        if replica_dtype == torch.bfloat16:
-            # These heads are outside actor.forward: GPU factor sampling uses
-            # them in fp32, so keeping them unquantized preserves the current
-            # behavior policy while the expensive forward runs natively BF16.
-            replica.market_quantity_kind_gate.float()
-            replica.market_quantity_value.float()
-            replica.market_quantity_bias.data = replica.market_quantity_bias.data.float()
-        replicas[key] = replica
-    replica.load_state_dict(model.state_dict())
-    replica.eval()
-    return replica
-
-
 @torch.inference_mode()
 def collect_mixed_play_rust(
     actor: FarmActor | StructuredActor,
@@ -2379,22 +2431,9 @@ def collect_mixed_play_rust(
 ) -> RolloutBatch:
     """Collect every game in one native wave and preserve trajectory order."""
     _validate_forward_mode(forward_mode)
-    native_bfloat16 = (
-        forward_autocast
-        and next(actor.parameters()).device.type == "cuda"
-        and isinstance(actor, StructuredActor)
-    )
-    if native_bfloat16:
-        rollout_actor = _pipeline_replica(actor, dtype=torch.bfloat16)
-        rollout_opponents = tuple(
-            _pipeline_replica(opponent, dtype=torch.bfloat16) for opponent in opponents
-        )
-    else:
-        rollout_actor = actor
-        rollout_opponents = tuple(opponents)
     return _collect_mixed_play_rust_wave(
-        rollout_actor,
-        rollout_opponents,
+        actor,
+        tuple(opponents),
         self_play_games=self_play_games,
         league_games=league_games,
         opponent_indices=opponent_indices,
@@ -2410,7 +2449,7 @@ def collect_mixed_play_rust(
         deterministic_opponents=deterministic_opponents,
         sampling_seed=sampling_seed,
         forward_mode=forward_mode,
-        forward_autocast=False if native_bfloat16 else forward_autocast,
+        forward_autocast=forward_autocast,
         storage=storage,
     )
 

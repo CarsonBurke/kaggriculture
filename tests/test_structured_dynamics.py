@@ -101,7 +101,9 @@ class _RecurrentTransition(nn.Module):
 
 
 @pytest.mark.parametrize("critic", [False, True])
-@pytest.mark.parametrize("layout", ["pairs", "non_power_of_two", "discontinuous", "step_gap", "empty"])
+@pytest.mark.parametrize(
+    "layout", ["pairs", "non_power_of_two", "discontinuous", "step_gap", "empty"]
+)
 def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
     critic: bool, layout: str
 ) -> None:
@@ -155,8 +157,7 @@ def test_compact_horizons_preserve_losses_combined_backward_and_empty_steps(
         [
             source + offset < rows
             and all(
-                episodes[index] == episodes[index - 1]
-                and steps[index] == steps[index - 1] + 1
+                episodes[index] == episodes[index - 1] and steps[index] == steps[index - 1] + 1
                 for index in range(source + 1, source + offset + 1)
             )
             for source in range(rows)
@@ -313,13 +314,16 @@ def test_actor_window_latent_loss_matches_recursive_head_only_reference() -> Non
             economy_active=False,
             opponent_summary_active=False,
             opponent_patches_active=False,
-        ).latent
+        )
 
-    actual = loss(belief)
-    changed_world = StructuredBelief(
-        *(value * -1000 for value in belief[:5]), *belief[5:]
+    actual_terms = loss(belief)
+    actual = actual_terms.latent
+    changed_world = StructuredBelief(*(value * -1000 for value in belief[:5]), *belief[5:])
+    changed_terms = loss(changed_world)
+    torch.testing.assert_close(changed_terms.latent, actual, rtol=0, atol=0)
+    torch.testing.assert_close(
+        changed_terms.residual_ratio, actual_terms.residual_ratio, rtol=0, atol=0
     )
-    torch.testing.assert_close(loss(changed_world), actual, rtol=0, atol=0)
     # Independent recurrence over two complete three-state windows, followed by
     # the reference's masked-element SmoothL1 reduction at each horizon.
     per_horizon = [[], []]
@@ -339,15 +343,11 @@ def test_actor_window_latent_loss_matches_recursive_head_only_reference() -> Non
                     ),
                     dim=0,
                 ).detach()
-                per_horizon[offset - 1].append(
-                    nn.functional.smooth_l1_loss(predicted, target)
-                )
+                per_horizon[offset - 1].append(nn.functional.smooth_l1_loss(predicted, target))
     expected = sum(torch.stack(losses).mean() for losses in per_horizon) / horizon
     torch.testing.assert_close(actual, expected)
     parameters = (*belief, dynamics.scales)
-    actual_gradients = torch.autograd.grad(
-        actual, parameters, allow_unused=True, retain_graph=True
-    )
+    actual_gradients = torch.autograd.grad(actual, parameters, allow_unused=True, retain_graph=True)
     expected_gradients = torch.autograd.grad(expected, parameters, allow_unused=True)
     torch.testing.assert_close(actual_gradients, expected_gradients)
     assert all(gradient is None for gradient in actual_gradients[:5])

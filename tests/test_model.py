@@ -28,11 +28,13 @@ from kaggriculture.model import (
     DistributionalCritic,
     EntityTransformer,
     FarmActor,
+    Linear,
     ModelConfig,
     SelfAttention,
     SpatialUNet,
     distributional_value_loss,
     hl_gauss_value_targets,
+    policy_compile_options,
 )
 
 
@@ -379,6 +381,41 @@ def test_low_rank_quantity_head_has_state_by_kind_interaction() -> None:
     torch.testing.assert_close(sell_slope, 2.0 * buy_slope)
 
 
+def test_quantity_likelihood_and_gradients_are_invariant_to_bfloat16_autocast() -> None:
+    torch.manual_seed(37)
+    actor = FarmActor(_small_config())
+    with torch.no_grad():
+        actor.market_quantity_kind_gate.weight.normal_()
+        actor.market_quantity_value.weight.normal_()
+        actor.market_quantity_bias.normal_()
+    context = torch.randn(2, MAX_MARKET_ORDERS, actor.config.quantity_rank).bfloat16()
+    kinds = torch.full((2, MAX_MARKET_ORDERS), MarketKind.BUY_SEED_WHEAT, dtype=torch.long)
+
+    def likelihood(autocast: bool) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        features = context.clone().requires_grad_()
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+            logits = actor.quantity_logits(features, kinds)
+            logprobs = logits.log_softmax(-1)[..., 17]
+        gradients = torch.autograd.grad(
+            logprobs.sum(),
+            (
+                features,
+                actor.market_quantity_kind_gate.weight,
+                actor.market_quantity_value.weight,
+                actor.market_quantity_bias,
+            ),
+        )
+        return logprobs, gradients
+
+    expected, expected_gradients = likelihood(False)
+    actual, actual_gradients = likelihood(True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
 def test_quantity_head_rejects_misaligned_selected_kinds() -> None:
     actor = FarmActor(_small_config())
     context = torch.zeros(2, MAX_MARKET_ORDERS, actor.config.quantity_rank)
@@ -635,3 +672,27 @@ def test_a_masked_block_refuses_to_drop_query_rows() -> None:
 
     with pytest.raises(ValueError, match="cannot drop query rows"):
         trunk(tokens, positions, mixed, readout=1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_bf16_linear_preserves_policy_across_batch_and_grad_modes() -> None:
+    torch.manual_seed(20260912)
+    module = Linear(320, 1280).cuda()
+    inputs = torch.randn(320, 320, device="cuda")
+    compiled = torch.compile(
+        module, options=policy_compile_options("default"), fullgraph=True, dynamic=False
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.inference_mode():
+            baseline = compiled(inputs).clone()
+            repeated = compiled(inputs.repeat(16, 1)).clone()
+        actual = compiled(inputs)
+        reference = torch.nn.functional.linear(inputs, module.weight, None)
+        reference = reference + module.bias.to(reference.dtype)
+    torch.testing.assert_close(repeated, baseline.repeat(16, 1), rtol=0, atol=0)
+    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+    probe = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, (module.weight, module.bias), probe)
+    expected = torch.autograd.grad(reference, (module.weight, module.bias), probe)
+    for value, target in zip(gradients, expected, strict=True):
+        torch.testing.assert_close(value, target, rtol=0, atol=0)

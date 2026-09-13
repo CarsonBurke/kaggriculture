@@ -63,7 +63,7 @@ from kaggriculture.modelargs import add_model_config_arguments, model_config_fro
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.orientation import ORIENTATION_CYCLE, augment_demonstration_rows
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
-from kaggriculture.ppo import _actor_batch_args, _balanced_minibatch_slices, _batch_tensor
+from kaggriculture.ppo import _actor_batch_args, _batch_tensor, _fixed_minibatch_positions
 from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
@@ -1452,14 +1452,18 @@ def train(
         seeds_per_dataset=seeds_per_dataset,
         encoded_cache=encoded_cache,
     )
-    if auxiliary_horizon:
-        minibatches = _balanced_minibatch_slices(train_split.rows, batch_size)
-        minimum_minibatch = min(batch.stop - batch.start for batch in minibatches)
-        if minimum_minibatch <= auxiliary_horizon:
-            raise ValueError(
-                f"an auxiliary horizon of {auxiliary_horizon} needs every balanced "
-                f"minibatch above it; the smallest minibatch has {minimum_minibatch} rows"
-            )
+    # `train_split.rows` is fixed for the life of the process, so the partition
+    # is computed once: every epoch reshuffles only the order these positions
+    # index into, and every minibatch is exactly `batch_size` rows wide.
+    minibatch_positions, _minibatch_counts = _fixed_minibatch_positions(
+        train_split.rows, batch_size
+    )
+    minibatch_rows = int(minibatch_positions.shape[1])
+    if auxiliary_horizon and minibatch_rows <= auxiliary_horizon:
+        raise ValueError(
+            f"an auxiliary horizon of {auxiliary_horizon} needs a wider minibatch; "
+            f"every minibatch has {minibatch_rows} rows"
+        )
     print(
         f"dataset: {len(datasets)} corpora, {train_split.rows} train rows, "
         f"{holdout_split.rows} holdout rows ({holdout_seeds} held-out seeds each)",
@@ -1484,13 +1488,16 @@ def train(
     refresh_fused_mlp_fp8(actor, bootstrap_down=True)
     if dynamics is not None:
         refresh_fused_mlp_fp8(dynamics, bootstrap_down=True)
-    matrices, vectors = route_parameters(actor)
+    matrices, vectors, multipliers = route_parameters(actor)
     if dynamics is not None:
-        extra_matrices, extra_vectors = route_parameters(dynamics)
-        matrices, vectors = matrices + extra_matrices, vectors + extra_vectors
+        extra_matrices, extra_vectors, extra_multipliers = route_parameters(dynamics)
+        matrices = matrices + extra_matrices
+        vectors = vectors + extra_vectors
+        multipliers = multipliers + extra_multipliers
     optimizer = NorMuon(
         matrices,
         vectors,
+        multipliers,
         learning_rate=matrix_learning_rate,
         adam_learning_rate=matrix_learning_rate * adam_learning_rate_ratio,
         weight_decay=matrix_weight_decay,
@@ -1587,7 +1594,7 @@ def train(
             epoch_components = 0.0
             diagnostic_fields = _STRUCTURED_FIELDS if structured_active else _LATENT_FIELDS
             diagnostic_sums = dict.fromkeys(diagnostic_fields, 0.0)
-            for indices in _balanced_minibatch_slices(train_split.rows, batch_size):
+            for indices in minibatch_positions:
                 actor_args, factors = _batch(
                     architecture,
                     train_split,

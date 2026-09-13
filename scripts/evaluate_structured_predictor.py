@@ -19,7 +19,7 @@ from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     _STRUCTURED_AUXILIARY_METRICS,
     PpoConfig,
-    _balanced_minibatch_slices,
+    _fixed_minibatch_positions,
     _stage_tensor,
     _structured_auxiliary_horizon,
     _structured_auxiliary_terms,
@@ -102,8 +102,12 @@ def _measure(
     actor.eval()
     dynamics.eval()
     with torch.inference_mode():
-        for batch_slice in _balanced_minibatch_slices(windows.shape[0], windows_per_batch):
-            selected = windows[batch_slice]
+        positions, counts = _fixed_minibatch_positions(windows.shape[0], windows_per_batch)
+        for row, count in zip(positions, counts, strict=True):
+            # The final row wraps onto the epoch's leading windows so the
+            # training partition is one shape; a mean over windows must not
+            # weight those repeats twice, so it is trimmed to the fresh rows.
+            selected = windows[row[: int(count)]]
             indices = torch.from_numpy(selected.reshape(-1)).to(device=device)
             loss, terms = _structured_auxiliary_terms(
                 actor,

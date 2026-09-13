@@ -13,11 +13,12 @@ at the same speed, so it may admit a minibatch the default mode cannot fit.
 Total work is held at the production schedule in every cell -- the same rollout
 state count, `epochs` actor passes and `critic_epochs` critic passes -- so the
 minibatch COUNT falls as the size rises and the cells are directly comparable.
-Counts come from `_balanced_minibatch_slices`, production's own partitioner, so
-a nominal 4096 runs 37 near-equal batches of 4040 rather than 36 full ones plus
-a short tail. Both the nominal and the effective size are reported, and the
-schedule runs every minibatch at the effective size, which leaves the processed
-state count short of the requested total by at most one row per minibatch.
+Counts come from `_fixed_minibatch_positions`, production's own partitioner, so
+a nominal 4096 runs 37 minibatches of exactly 4096 rather than 36 full ones plus
+a 2048-row tail: the final minibatch wraps onto the epoch's leading rows so
+every minibatch is one compiled shape. The nominal and effective sizes are
+therefore always equal, and the processed state count overshoots the requested
+total by the wrap, which is under one minibatch.
 
 Reported per cell: median steady wall clock for the whole schedule, peak
 reserved and allocated bytes, first-call compile seconds kept strictly separate
@@ -78,10 +79,10 @@ from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
     PpoConfig,
     _actor_minibatch_terms,
-    _balanced_minibatch_slices,
     _cached_update_callable,
     _critic_minibatch_loss,
     _device_compile_mode,
+    _fixed_minibatch_positions,
     _optimizer_step,
     make_optimizers,
 )
@@ -157,9 +158,8 @@ def _cell_schedule(
     states: int, nominal_size: int, epochs: int, critic_epochs: int
 ) -> dict[str, int]:
     """Production's minibatch partition for one nominal size, as plain counts."""
-    slices = _balanced_minibatch_slices(states, nominal_size)
-    effective = min(item.stop - item.start for item in slices)
-    batches = len(slices)
+    positions, _counts = _fixed_minibatch_positions(states, nominal_size)
+    batches, effective = (int(extent) for extent in positions.shape)
     return {
         "minibatch_size": nominal_size,
         "effective_minibatch_size": effective,
@@ -250,6 +250,9 @@ def _run_cell(
     autocast = config.use_bfloat16
     actor_args = (batch["board"], batch["global_features"], batch["units"], batch["unit_positions"])
     critic_args = (batch["board"], batch["critic_features"])
+    component_count = max(
+        1, int(sum(batch[name].sum() for name in ("unit_active", "kind_active", "quantity_active")))
+    )
 
     def actor_step() -> None:
         actor_optimizer.zero_grad(set_to_none=True)
@@ -273,7 +276,7 @@ def _run_cell(
             autocast,
             *actor_args,
         )
-        (-policy_sum / rows).backward()
+        (-policy_sum / component_count).backward()
         _optimizer_step(actor_optimizer, config.actor_learning_rate, config.lr_warmup_steps)
 
     def critic_step() -> None:

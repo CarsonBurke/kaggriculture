@@ -612,7 +612,7 @@ def test_nextlat_actor_and_critic_metrics_have_deliberate_separate_categories() 
         "structured_gradient_source_norm": "nextlat-actor-gradients/source_norm",
         "structured_critic_gradient_source_norm": ("nextlat-critic-gradients/source_norm"),
         "credit_preupdate_opponent_scripted_v27_ttg_33_128_terminal_residual_mse": (
-            "credit-opponent-scripted-v27-ttg-33-128/terminal_residual_mse"
+            "credit-opponents-ttg-33-128/terminal_residual_mse"
         ),
     }
     for field, tag in expected.items():
@@ -621,6 +621,38 @@ def test_nextlat_actor_and_critic_metrics_have_deliberate_separate_categories() 
             "",
             f"{tag.partition('/')[0]}-agent3/{tag.partition('/')[2]}",
         )
+
+
+def test_opponent_credit_metrics_are_aggregated_into_horizon_cohorts(tmp_path: Path) -> None:
+    journal = tmp_path / "metrics.jsonl"
+    log_dir = tmp_path / "tensorboard"
+    metrics = {}
+    for group, states, mse in (
+        ("opponent_00000095", 2, 1.0),
+        ("opponent_builtin_starter", 6, 3.0),
+    ):
+        prefix = f"credit_preupdate_{group}_all"
+        metrics.update(
+            {
+                f"{prefix}_states": states,
+                f"{prefix}_mc_mse": mse,
+                f"{prefix}_potential_only_mse": mse + 1.0,
+                f"{prefix}_terminal_residual_mse": mse + 2.0,
+                f"{prefix}_terminal_target_variance": mse + 3.0,
+                f"{prefix}_terminal_residual_explained_variance": mse / 10.0,
+            }
+        )
+    _write_jsonl(journal, [{"iteration": 1, **metrics}])
+
+    migrate_jsonl_to_tensorboard(journal, log_dir)
+
+    tags = set(_tags(log_dir))
+    assert "credit-opponents-all/states" in tags
+    assert "credit-opponents-all/mc_mse" in tags
+    assert not any("credit-opponent-" in tag for tag in tags)
+    assert _scalars(log_dir, "credit-opponents-all/states") == [(1, 8.0)]
+    assert _scalars(log_dir, "credit-opponents-all/mc_mse") == [(1, 2.5)]
+    assert _scalars(log_dir, "credit-opponents-all/terminal_residual_mse") == [(1, 4.5)]
 
 
 def test_a_population_run_facets_every_agent_and_stays_one_event_file(tmp_path: Path) -> None:

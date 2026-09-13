@@ -575,10 +575,10 @@ def select_league_mix(
     would win well under half a lane per wave, and the learner has to actually
     learn a farming loop against these agents, not be exposed to one
     occasionally. Built-in lanes need no snapshot pool, so a run with nothing
-    frozen yet still plays them from its first iteration. The total lane count
-    stays ``active_count + historical_count + builtin_lanes`` however the
-    contest goes, which is what keeps the wave's stacked frozen forward on one
-    captured shape.
+    frozen yet still plays them from its first iteration. With sufficient
+    eligible snapshots the total lane count stays
+    ``active_count + historical_count + builtin_lanes`` however the contest
+    goes; the neural ensemble contains only the selected snapshot lanes.
 
     ``score_rates`` maps opponent key to the learner's recent score rate
     against that opponent; sampling is prioritized fictitious self-play with

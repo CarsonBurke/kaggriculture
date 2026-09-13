@@ -508,6 +508,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/structured.py",
         "kaggriculture/tokens.py",
         "kaggriculture/triton_mlp.py",
+        "kaggriculture/triton_norm.py",
     }
     with tarfile.open(archive, "r:gz") as bundle:
         assert set(bundle.getnames()) == required

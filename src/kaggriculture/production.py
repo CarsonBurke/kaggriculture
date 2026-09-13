@@ -168,13 +168,13 @@ def production_ppo_config(
 ) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    With 230,080 states, a 4800-row ceiling produces 48 balanced minibatches per
+    With 230,080 states, a 6400-row ceiling produces 36 balanced minibatches per
     epoch. Production is one actor epoch and one critic epoch on the same wave:
     a second same-wave critic pass memorized holdout, and a second actor pass
-    is a replay at a KL that does not bind. Independent CUDA streams overlap
-    each paired actor/critic minibatch. NextLat shares that trunk pass: h_t and
-    h_{t+1} come from contiguous episode runs, and p_ψ steps on the same
-    backward as PPO.
+    is a replay at a KL that does not bind. Actor and critic run on the same
+    CUDA stream to reuse their activation allocation pool without eviction.
+    NextLat shares each trunk pass: h_t and h_{t+1} come from contiguous episode
+    runs, and p_ψ steps on the same backward as PPO.
     """
     from kaggriculture.ppo import PpoConfig
 

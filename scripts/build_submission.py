@@ -57,6 +57,7 @@ PACKAGE_FILES = (
     "registry.py",
     "structured.py",
     "triton_mlp.py",
+    "triton_norm.py",
     "tokens.py",
 )
 MAIN = '''"""Kaggriculture PPO submission entrypoint."""

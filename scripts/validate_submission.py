@@ -45,6 +45,7 @@ REQUIRED_MEMBERS = frozenset(
         "kaggriculture/registry.py",
         "kaggriculture/structured.py",
         "kaggriculture/triton_mlp.py",
+        "kaggriculture/triton_norm.py",
         "kaggriculture/tokens.py",
     }
 )

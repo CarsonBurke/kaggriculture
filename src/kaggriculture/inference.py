@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from kaggriculture.model import policy_compile_options
 from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch, prepare_quantity_heads
 from kaggriculture.provenance import (
@@ -20,6 +21,12 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import resolve_architecture
 
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
+# Version 17 aligns potential/terminal margin and balances main/auxiliary model
+# gradients. Old value targets and optimizer moments cannot resume this regime;
+# version-16 actors remain usable for inference and fresh initialization.
+# Version 16 replaces centered EV with bias-sensitive R-squared in the adaptive
+# critic warmup state. Old EV evidence must never release an actor under the
+# new gate; legacy actor weights remain exportable without training recovery.
 # Version 15 restricts PPO NextLat to normalized actor/value head inputs and
 # adds the critic value norm. Version-14 actor weights remain exportable, but
 # old critic/predictor/optimizer states cannot resume under the new objective.
@@ -64,11 +71,11 @@ ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # calibration nobody can recompute, which is the exact failure the version bump
 # exists to prevent -- so such a checkpoint is refused at the export boundary
 # rather than being migrated or silently stripped.
-CHECKPOINT_FORMAT_VERSION = 15
-# Versions before 15 remain readable on the actor-only path because the recovery
-# additions do not change actor weights or model configuration. Resume demands
+CHECKPOINT_FORMAT_VERSION = 17
+# Versions before 17 remain readable on the actor-only path because the recovery
+# changes do not change actor weights or model configuration. Resume demands
 # the current version exactly and never guesses absent training state.
-LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12, 13, 14))
+LEGACY_CHECKPOINT_FORMAT_VERSIONS = frozenset((7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = LEGACY_CHECKPOINT_FORMAT_VERSIONS | {
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CHECKPOINT_FORMAT_VERSION,
@@ -383,7 +390,10 @@ class CheckpointAgent:
             # Compile only the forward: act_batch dispatches by actor type and
             # samples selected-kind quantities from the frozen CPU heads above.
             self.actor.forward = torch.compile(
-                self.actor.forward, mode="reduce-overhead", fullgraph=True, dynamic=False
+                self.actor.forward,
+                options=policy_compile_options("reduce-overhead"),
+                fullgraph=True,
+                dynamic=False,
             )
         model_config = self.metadata.get("model_config")
         self.fused_mlp = isinstance(model_config, Mapping) and bool(

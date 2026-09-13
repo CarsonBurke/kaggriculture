@@ -311,6 +311,7 @@ def main() -> None:
     actor_args = gather_actor()
     critic_args = gather_critic()
     surrogate = gather_surrogate()
+    component_count = max(1, int(sum(component.sum() for component in surrogate[6:9])))
     value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
 
     def actor_forward():
@@ -333,7 +334,7 @@ def main() -> None:
                 f"params_requiring_grad={sum(p.requires_grad for p in actor.parameters())} "
                 f"inference={policy_sum.is_inference()} training={actor.training}"
             )
-        (-policy_sum).backward()
+        (-policy_sum / component_count).backward()
 
     def actor_norm():
         return torch.nn.utils.get_total_norm(
@@ -388,10 +389,14 @@ def main() -> None:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
             return critic.forward_with_belief(*critic_belief_args)
 
-    for parameter in actor.parameters():
-        parameter.requires_grad_(False)
-    for parameter in critic.parameters():
-        parameter.requires_grad_(False)
+    # The predictor sections pass `model_grad=False`, and that path takes its
+    # source belief under `torch.no_grad()` (`ppo.py:2574-2576`), so no
+    # gradient reaches the actor or critic no matter what `requires_grad` says.
+    # An earlier version froze both models here instead, while the sections were
+    # still being defined -- before any of them ran -- which left
+    # `actor_forward_backward` with a graphless surrogate and killed the
+    # profiler at its fifth section.
+
     dynamics.train()
     critic_dynamics.train()
 
@@ -409,9 +414,7 @@ def main() -> None:
             complete_windows=False,
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            dynamics.parameters(), ppo_config.nextlat_max_gradient_norm
-        )
+        torch.nn.utils.clip_grad_norm_(dynamics.parameters(), ppo_config.nextlat_max_gradient_norm)
         _optimizer_step(
             dynamics_optimizer,
             ppo_config.resolved_structured_learning_rate,
