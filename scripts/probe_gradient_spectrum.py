@@ -337,7 +337,7 @@ class GradientContext:
     component_counts: np.ndarray
 
     def policy_objective(self, indices: Tensor, sample_count: int) -> Tensor:
-        """Production per-component objective, excluding static-shape padding.
+        """Production objective sum, excluding static-shape padding.
 
         Score the exact collection-time likelihoods through the same compiled
         callable, input dtypes, and real-transition weights as `update_ppo`.
@@ -346,7 +346,7 @@ class GradientContext:
         sample_weight = (
             torch.arange(indices.numel(), device=indices.device) < sample_count
         ).float()
-        policy_sum, _entropy, _kl, _clipped = self.actor_terms(
+        policy_sum, _entropy, _kl, _clipped, _component_kl = self.actor_terms(
             self.actor,
             _batch_tensor(staged["unit_actions"], indices, torch.long),
             _batch_tensor(staged["market_kinds"], indices, torch.long),
@@ -366,6 +366,7 @@ class GradientContext:
             self.autocast_enabled,
             *_actor_batch_args(self.architecture, staged, indices),
             sample_weight=sample_weight,
+            policy_ratio_scope=self.config.policy_ratio_scope,
         )
         return policy_sum
 
@@ -373,15 +374,19 @@ class GradientContext:
 def full_batch_gradient(context: GradientContext, order: np.ndarray) -> Tensor:
     """The exact full-batch policy gradient, accumulated minibatch by minibatch.
 
-    Normalized once by the total active-component count rather than per minibatch, so
-    this is the gradient of the whole rollout's policy loss and does not depend
-    on how the rollout happens to be partitioned. `Gstar` in the report.
+    Normalized once by the configured total state or active-component count,
+    independent of minibatch partitioning. `Gstar` in the report.
     """
     device = context.staged["unit_actions"].device
     positions, counts = _fixed_minibatch_positions(order.size, context.config.minibatch_size)
     host_batches = order[positions]
     batch_indices = torch.from_numpy(host_batches).to(device=device)
-    total = max(1, int(context.component_counts[order].sum()))
+    total = max(
+        1,
+        order.size
+        if context.config.policy_loss_reduction == "states"
+        else int(context.component_counts[order].sum()),
+    )
     context.actor.zero_grad(set_to_none=True)
     for row, count in zip(batch_indices, counts, strict=True):
         policy_sum = context.policy_objective(row, int(count))
@@ -409,7 +414,11 @@ def minibatch_gradients(
     for index, (row, real_count) in enumerate(zip(batch_indices, real_counts, strict=True)):
         context.actor.zero_grad(set_to_none=True)
         policy_sum = context.policy_objective(row, int(real_count))
-        count = int(context.component_counts[host_batches[index, :real_count]].sum())
+        count = (
+            int(real_count)
+            if context.config.policy_loss_reduction == "states"
+            else int(context.component_counts[host_batches[index, :real_count]].sum())
+        )
         (-policy_sum / max(1, count)).backward()
         stack[index] = _flat_gradient(context.parameters)
         counts[index] = count

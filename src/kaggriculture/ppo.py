@@ -12,8 +12,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from kaggriculture.actor_dynamics import (
+    ActorDynamics,
+    ActorDynamicsTerms,
+    actor_horizon_loss,
+    actor_window_loss,
+)
 from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
-from kaggriculture.latent_dynamics import DecodeContext, DecodeHeads, DecodeMasks
 from kaggriculture.model import (
     DistributionalCritic,
     FarmActor,
@@ -39,14 +44,10 @@ from kaggriculture.structured_dynamics import (
     PersistenceDynamics,
     StructuredCriticDynamics,
     StructuredCriticDynamicsTerms,
-    StructuredDynamics,
-    StructuredDynamicsTerms,
     StructuredHorizonPlan,
     structured_critic_horizon_loss,
     structured_critic_window_loss,
-    structured_horizon_loss,
     structured_horizon_plan,
-    structured_window_loss,
 )
 
 Critic = DistributionalCritic | StructuredCritic
@@ -253,6 +254,12 @@ class PpoConfig:
     # Keep physical batches larger without consuming the last VRAM headroom.
     # Balanced partitioning covers the full wave without a small final tail.
     minibatch_size: int = 6400
+    # Component scope clips each conditional decision independently; joint scope
+    # clips the product of all active conditional probabilities in one state.
+    policy_ratio_scope: str = "components"
+    # "states" averages the surrogate sum over genuine states; component-count
+    # reduction is only meaningful for independently clipped components.
+    policy_loss_reduction: str = "states"
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
     # collapse: a symmetric band clips a low-probability action's upside at the
@@ -308,7 +315,10 @@ class PpoConfig:
     # flag rather than a default because the two halves of the transform are not
     # equally consequential, and the measurement says so:
     #
-    #  * The scale half only reaches the update through Adam's epsilon. Polar
+    #  * With actor auxiliary losses disabled, the scale half only reaches the
+    #    update through Adam's epsilon. This invariance does not hold when only
+    #    PPO is rescaled inside a PPO-plus-auxiliary sum: that changes the combined
+    #    gradient direction and the effective auxiliary weight. Polar
     #    Express opens by dividing by its input's Frobenius norm
     #    (`optim.py:58-64`), so a NorMuon matrix step is exactly invariant to any
     #    uniform rescaling of the gradient. Adam is invariant only where epsilon
@@ -368,6 +378,7 @@ class PpoConfig:
     structured_critic_latent_coefficient: float = 0.0
     structured_critic_value_coefficient: float = 0.0
     structured_critic_horizon: int = 1
+    structured_critic_gradient_balance: bool = False
 
     @property
     def resolved_structured_learning_rate(self) -> float:
@@ -502,6 +513,12 @@ def _validate_config(config: PpoConfig) -> None:
         raise ValueError("LR warmup steps cannot be negative")
     if not 0.0 < config.clip_low < 1.0 < config.clip_high:
         raise ValueError("clip interval must straddle one")
+    if config.policy_loss_reduction not in ("components", "states"):
+        raise ValueError("policy loss reduction must be 'components' or 'states'")
+    if config.policy_ratio_scope not in ("components", "joint"):
+        raise ValueError("policy ratio scope must be 'components' or 'joint'")
+    if config.policy_ratio_scope == "joint" and config.policy_loss_reduction != "states":
+        raise ValueError("joint policy ratio scope requires state policy loss reduction")
     if not math.isfinite(config.gamma) or not 0.0 < config.gamma <= 1.0:
         raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
@@ -546,7 +563,7 @@ def _validate_config(config: PpoConfig) -> None:
 
 def _validate_structured_auxiliary_modules(
     actor: Actor,
-    dynamics: StructuredDynamics | None,
+    dynamics: ActorDynamics | None,
     config: PpoConfig,
 ) -> None:
     active = config.structured_actor_auxiliary_active
@@ -1051,7 +1068,7 @@ def make_optimizers(
 
 
 def make_structured_dynamics_optimizer(
-    dynamics: StructuredDynamics | StructuredCriticDynamics,
+    dynamics: ActorDynamics | StructuredCriticDynamics,
     config: PpoConfig,
 ) -> torch.optim.Optimizer:
     """Build the predictor-only optimizer with an independent warmup clock."""
@@ -1517,11 +1534,13 @@ def _actor_minibatch_terms(
     autocast_enabled: bool,
     *actor_args: Any,
     sample_weight: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    policy_ratio_scope: str = "components",
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """One actor minibatch: update likelihood plus clipped surrogate reductions.
 
-    Returns device-side (policy objective sum, entropy sum, k3 KL sum, clipped
-    count). Normalization stays outside so host integers never enter the graph.
+    Returns device-side (policy objective sum, entropy sum, scoped k3 KL sum,
+    scoped clipped count, component k3 KL sum). Normalization stays outside so
+    host integers never enter the graph.
 
     Entropy and KL are telemetry, not objective terms. Detaching their sums
     inside this compiled region preserves their exact forward values while
@@ -1546,7 +1565,7 @@ def _actor_minibatch_terms(
         autocast_enabled,
         *actor_args,
     )
-    return _component_policy_sums(
+    return _policy_sums(
         (new_unit, new_kind, new_quantity),
         (old_unit, old_kind, old_quantity),
         (unit_active, kind_active, quantity_active),
@@ -1555,6 +1574,7 @@ def _actor_minibatch_terms(
         clip_low,
         clip_high,
         sample_weight=sample_weight,
+        policy_ratio_scope=policy_ratio_scope,
     )
 
 
@@ -1615,7 +1635,7 @@ def _structured_actor_minibatch_terms(
     autocast_enabled: bool,
     *actor_args: Any,
     sample_weight: Tensor | None = None,
-    balance_auxiliary: bool = False,
+    policy_ratio_scope: str = "components",
 ) -> tuple[Tensor, ...]:
     """PPO terms and the belief from one structured actor forward."""
     (inputs,) = actor_args
@@ -1626,17 +1646,7 @@ def _structured_actor_minibatch_terms(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        belief = actor.decision_belief(inputs)
-        primary_belief = belief
-        if balance_auxiliary:
-            unit, market, auxiliary_unit, auxiliary_market = _BalancedSource.apply(
-                belief.unit_decisions, belief.market_decisions
-            )
-            primary_belief = belief._replace(unit_decisions=unit, market_decisions=market)
-            belief = belief._replace(
-                unit_decisions=auxiliary_unit, market_decisions=auxiliary_market
-            )
-        output = actor.decode_belief(primary_belief)
+        output, belief = actor.forward_with_auxiliary_belief(inputs)
         (
             new_unit,
             new_kind,
@@ -1656,7 +1666,7 @@ def _structured_actor_minibatch_terms(
             validate_masks=False,
         )
     return (
-        *_component_policy_sums(
+        *_policy_sums(
             (new_unit, new_kind, new_quantity),
             (old_unit, old_kind, old_quantity),
             (unit_active, kind_active, quantity_active),
@@ -1665,6 +1675,7 @@ def _structured_actor_minibatch_terms(
             clip_low,
             clip_high,
             sample_weight=sample_weight,
+            policy_ratio_scope=policy_ratio_scope,
         ),
         *belief,
     )
@@ -2009,7 +2020,7 @@ def update_replay_parity(
         "update_replay_max_tail_fraction": max(tail_fraction.values()),
         "update_replay_component_kl": total_kl_sum / total_active if total_active else 0.0,
         "update_replay_joint_kl": joint_kl_sum / valid_indices.size,
-        # Same active-component mean k3 estimator as the PPO objective.
+        # Active-component mean k3, independent of the selected PPO ratio scope.
         "update_replay_minibatch_kl": worst_minibatch_kl,
         # The fixed-shuffle sampling-versus-update statistic
         # `MAX_FIRST_MINIBATCH_KL` bounds. Unlike the no-grad replay numbers
@@ -2085,7 +2096,7 @@ def _replay_to_update_minibatch_kl(
         # minibatch's forward *before* releasing this one's graph, holding two
         # at once, and the update this mirrors only ever holds one.
         with torch.enable_grad():
-            policy_sum, entropy_sum, kl_sum, clipped_sum = terms(
+            policy_sum, entropy_sum, kl_sum, clipped_sum, component_kl_sum = terms(
                 actor,
                 _batch_tensor(staged["unit_actions"], indices, torch.long),
                 _batch_tensor(staged["market_kinds"], indices, torch.long),
@@ -2108,7 +2119,7 @@ def _replay_to_update_minibatch_kl(
             )
         minibatch_kl_sum = float(kl_sum.detach().double())
         minibatch_kl = minibatch_kl_sum / max(1, component_count)
-        del policy_sum, entropy_sum, kl_sum, clipped_sum
+        del policy_sum, entropy_sum, kl_sum, clipped_sum, component_kl_sum
         worst = max(worst, minibatch_kl)
         total += minibatch_kl_sum
         measured += component_count
@@ -2128,9 +2139,9 @@ def _component_policy_sums(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Sum independently clipped objectives over active action components.
 
-    Callers divide every sum by the global active-component count, not by
-    states or by a mean of per-state means. Each active conditional decision
-    receives the state's advantage; padding has zero weight in every term.
+    Callers select the objective's component-count or valid-state denominator;
+    diagnostics always divide by the active-component count. Each active
+    conditional decision receives the state's advantage; padding has zero weight.
     """
     objective = torch.zeros((), device=advantages.device)
     entropy_sum = torch.zeros_like(objective)
@@ -2149,6 +2160,63 @@ def _component_policy_sums(
         clipped = clipped + component_clipped
         entropy_sum = entropy_sum + (torch.where(weight.bool(), entropy, 0.0) * weight).sum()
     return objective, entropy_sum.detach(), kl.detach(), clipped
+
+
+def _policy_sums(
+    new_logprobs: tuple[Tensor, Tensor, Tensor],
+    old_logprobs: tuple[Tensor, Tensor, Tensor],
+    active: tuple[Tensor, Tensor, Tensor],
+    entropies: tuple[Tensor, Tensor, Tensor],
+    advantages: Tensor,
+    clip_low: float,
+    clip_high: float,
+    *,
+    sample_weight: Tensor | None = None,
+    policy_ratio_scope: str = "components",
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Keep sampler-parity KL in component units independently of PPO scope."""
+    if policy_ratio_scope == "components":
+        terms = _component_policy_sums(
+            new_logprobs,
+            old_logprobs,
+            active,
+            entropies,
+            advantages,
+            clip_low,
+            clip_high,
+            sample_weight=sample_weight,
+        )
+        return *terms, terms[2]
+    if policy_ratio_scope != "joint":
+        raise ValueError("policy ratio scope must be 'components' or 'joint'")
+
+    state_weight = (
+        torch.ones_like(advantages, dtype=torch.float32) if sample_weight is None else sample_weight
+    )
+    valid_states = state_weight.bool()
+    joint_log_ratio = torch.zeros_like(advantages, dtype=torch.float32)
+    entropy_sum = torch.zeros((), device=advantages.device)
+    component_kl_sum = torch.zeros_like(entropy_sum)
+    for new, old, mask, entropy in zip(new_logprobs, old_logprobs, active, entropies, strict=True):
+        valid = mask.bool() & valid_states[:, None]
+        # Mask before any state reduction: STOP descendants, inactive quantities,
+        # and wrapped padding never enter the action's likelihood ratio.
+        log_ratio = torch.where(valid, new.float() - old.float(), 0.0)
+        joint_log_ratio = joint_log_ratio + log_ratio.sum(dim=-1)
+        weight = valid.float() * state_weight[:, None]
+        component_kl_sum = component_kl_sum + ((torch.expm1(log_ratio) - log_ratio) * weight).sum()
+        entropy_sum = entropy_sum + (torch.where(valid, entropy, 0.0) * weight).sum()
+    # The product ratio is represented in log space until the surrogate chooses
+    # its one-sided clipping bound. KL retains the unclamped total log ratio.
+    objective, kl, clipped = _clipped_surrogate_sums(
+        joint_log_ratio[:, None],
+        torch.zeros_like(joint_log_ratio[:, None]),
+        advantages,
+        state_weight[:, None],
+        clip_low,
+        clip_high,
+    )
+    return objective, entropy_sum.detach(), kl.detach(), clipped, component_kl_sum.detach()
 
 
 def _clipped_surrogate_sums(
@@ -2334,8 +2402,6 @@ _STRUCTURED_AUXILIARY_METRICS = (
     "decision_market_quantity",
     "eligible",
     "residual_ratio",
-    "residual_unit_decisions",
-    "residual_market_decisions",
 )
 
 
@@ -2381,7 +2447,7 @@ def _structured_transition_order(
 
 def _structured_auxiliary_terms(
     actor: StructuredActor,
-    dynamics: StructuredDynamics,
+    dynamics: ActorDynamics,
     staged: dict[str, Tensor],
     indices: Tensor,
     *,
@@ -2392,15 +2458,14 @@ def _structured_auxiliary_terms(
     complete_windows: bool,
     belief_indices: Tensor | None = None,
     belief_inverse: Tensor | None = None,
-    belief: StructuredBelief | StructuredDecisionBelief | None = None,
+    belief: StructuredDecisionBelief | None = None,
     plan: StructuredHorizonPlan | None = None,
-) -> tuple[Tensor, StructuredDynamicsTerms]:
-    """Evaluate the typed NextLat objective on the supplied or forwarded belief.
+) -> tuple[Tensor, ActorDynamicsTerms]:
+    """Predict actor head inputs, reusing the single PPO forward.
 
-    A caller that already ran the trunk passes ``belief`` so this does not
-    forward again. ``model_grad`` only matters when belief is absent: True
-    forwards with grad, False detaches. Successor targets are stopgrad inside
-    the loss, matching NextLat.
+    Both source head-input fields carry auxiliary gradients; successor targets
+    and final policy projections are stop-gradient.
+    ``model_grad`` controls source encoding when no belief is supplied.
     """
     (inputs,) = _actor_batch_args(STRUCTURED, staged, indices)
     if not isinstance(inputs, StructuredInputs):
@@ -2439,46 +2504,28 @@ def _structured_auxiliary_terms(
         elif model_grad:
             if belief_indices is not None or belief_inverse is not None:
                 raise ValueError("actor-gradient auxiliary cannot reuse unique-row beliefs")
-            belief = actor.decision_belief(inputs)
+            belief = actor.auxiliary_belief(inputs)
         elif belief_indices is not None and belief_inverse is not None:
             (belief_inputs,) = _actor_batch_args(STRUCTURED, staged, belief_indices)
             if not isinstance(belief_inputs, StructuredInputs):
                 raise TypeError("structured auxiliary requires StructuredInputs")
             with torch.no_grad():
-                unique_belief = actor.decision_belief(belief_inputs)
+                unique_belief = actor.auxiliary_belief(belief_inputs)
             belief = StructuredDecisionBelief(*(value[belief_inverse] for value in unique_belief))
         elif belief_indices is None and belief_inverse is None:
             with torch.no_grad():
-                belief = actor.decision_belief(inputs)
+                belief = actor.auxiliary_belief(inputs)
         else:
             raise ValueError("belief indices and inverse must be supplied together")
-        decode = (
-            DecodeContext(
-                heads=DecodeHeads.from_actor(actor, normalized_units=True),
-                masks=DecodeMasks(
-                    unit_masks=factors["unit_masks"],
-                    market_kind_masks=factors["market_kind_masks"],
-                    market_quantity_masks=factors["market_quantity_masks"],
-                    unit_active=factors["unit_active"],
-                    market_active=factors["market_active"],
-                    market_quantity_active=factors["market_quantity_active"],
-                    market_kinds=factors["market_kinds"],
-                ),
-            )
-            if decision_horizon
-            else None
-        )
-        loss_function = structured_window_loss if complete_windows else structured_horizon_loss
+        loss_function = actor_window_loss if complete_windows else actor_horizon_loss
         terms = loss_function(
             dynamics,
+            actor,
             belief,
             inputs,
             factors,
-            decode=decode,
             decision_horizon=decision_horizon,
             latent_horizon=latent_horizon,
-            patch_horizon=0,
-            own_patches_active=False,
             **({} if complete_windows else {"plan": plan}),
         )
         loss = (
@@ -2636,7 +2683,7 @@ def _auxiliary_branch_belief(belief, squared_norms: list[Tensor] | None = None):
     Always use the same zero-copy views, including unobserved minibatches: changing
     input view/autograd metadata only for diagnostics can specialize AOTAutograd.
     Hooks exclude the primary objective and reduce immediately to one scalar per
-    field before model-parameter gradient balancing.
+    connected source field; actor side context is already detached.
     """
 
     def observe(gradient: Tensor) -> None:
@@ -2678,7 +2725,7 @@ def _structured_actor_belief(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        return actor.decision_belief(inputs)
+        return actor.auxiliary_belief(inputs)
 
 
 def _warm_actor_update_graphs(
@@ -2749,20 +2796,25 @@ def _warm_actor_update_graphs(
         autocast_enabled,
         *actor_args,
         sample_weight=sample_weight,
-        **({"balance_auxiliary": auxiliary_active} if structured_terms_fn is not None else {}),
+        policy_ratio_scope=config.policy_ratio_scope,
     )
-    component_count = sum(
-        (
-            _batch_tensor(staged[name], indices, torch.float32)
-            * (sample_weight[:, None] if sample_weight is not None else 1.0)
-        ).sum()
-        for name in ("unit_active", "market_active", "market_quantity_active")
-    ).clamp_min(1)
-    loss = -actor_pack[0] / component_count
+    if config.policy_loss_reduction == "states":
+        policy_denominator = (
+            indices.numel() if sample_weight is None else sample_weight.sum().clamp_min(1)
+        )
+    else:
+        policy_denominator = sum(
+            (
+                _batch_tensor(staged[name], indices, torch.float32)
+                * (sample_weight[:, None] if sample_weight is not None else 1.0)
+            ).sum()
+            for name in ("unit_active", "market_active", "market_quantity_active")
+        ).clamp_min(1)
+    loss = -actor_pack[0] / policy_denominator
     if structured_terms_fn is not None:
         assert isinstance(actor, StructuredActor)
         assert structured_dynamics is not None
-        belief = StructuredDecisionBelief(*actor_pack[4:])
+        belief = StructuredDecisionBelief(*actor_pack[5:])
         auxiliary_loss, _ = structured_terms_fn(
             actor,
             structured_dynamics,
@@ -2800,7 +2852,7 @@ def update_ppo(
     generator: np.random.Generator,
     actor_epochs: int | None = None,
     rows: np.ndarray | None = None,
-    structured_dynamics: StructuredDynamics | None = None,
+    structured_dynamics: ActorDynamics | None = None,
     structured_dynamics_optimizer: torch.optim.Optimizer | None = None,
     structured_actor_auxiliary: bool | None = None,
     structured_critic_dynamics: StructuredCriticDynamics | None = None,
@@ -3001,10 +3053,12 @@ def update_ppo(
     else:
         value_support = critic.support.detach().float().cpu().numpy()
         support_widths = np.diff(value_support)
+        support_width = (value_support[-1] - value_support[0]) / (value_support.size - 1)
+        rounding = 2 * np.finfo(value_support.dtype).eps * np.abs(value_support).max()
         if (
             not np.isfinite(value_support).all()
             or not (support_widths > 0).all()
-            or not np.allclose(support_widths, support_widths[:1])
+            or not (np.abs(support_widths - support_width) <= rounding).all()
         ):
             raise ValueError("critic value support must be finite, increasing, and evenly spaced")
         # The critic target is the decoupled lambda-one return. A bounded
@@ -3027,6 +3081,7 @@ def update_ppo(
             "value_loss",
             "entropy",
             "approx_kl",
+            "component_kl",
             "clip_fraction",
             "actor_gradient_norm",
             "critic_gradient_norm",
@@ -3050,6 +3105,8 @@ def update_ppo(
     completed_epochs = 0
     max_approx_kl = 0.0
     first_minibatch_kl = 0.0
+    first_minibatch_component_kl = 0.0
+    max_component_kl = 0.0
     actor_auxiliary_active = bool(
         actor_predictor_active and structured_actor_auxiliary and actor_epochs
     )
@@ -3141,7 +3198,7 @@ def update_ppo(
     # production shape their combined reservations force eviction every batch.
     # Ordered execution lets the critic reuse the actor's released activations.
     guard_host = torch.empty(
-        4 if actor_predictor_active else 3,
+        5 if actor_predictor_active else 4,
         dtype=torch.float64,
         pin_memory=device.type == "cuda",
     )
@@ -3250,7 +3307,7 @@ def update_ppo(
             actor_gradient_norm = actor_zero
             combined_actor_loss = actor_zero
             actor_auxiliary_loss = actor_zero
-            actor_auxiliary_terms: StructuredDynamicsTerms | None = None
+            actor_auxiliary_terms: ActorDynamicsTerms | None = None
             actor_auxiliary_started = 0.0
             actor_auxiliary_start_event: torch.cuda.Event | None = None
             actor_auxiliary_end_event: torch.cuda.Event | None = None
@@ -3262,6 +3319,13 @@ def update_ppo(
                 # merely to recover a denominator already known before staging.
                 component_count = int(flat_component_counts[host_indices[:states]].sum())
                 component_denominator = max(1, component_count)
+                policy_denominator = (
+                    states if config.policy_loss_reduction == "states" else component_denominator
+                )
+                diagnostic_count = (
+                    states if config.policy_ratio_scope == "joint" else component_count
+                )
+                diagnostic_denominator = max(1, diagnostic_count)
                 unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
                 market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
                 market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
@@ -3306,22 +3370,23 @@ def update_ppo(
                     autocast_enabled,
                     *actor_args,
                     sample_weight=sample_weight,
-                    **(
-                        {"balance_auxiliary": actor_auxiliary_active}
-                        if actor_predictor_active
-                        else {}
-                    ),
+                    policy_ratio_scope=config.policy_ratio_scope,
                 )
-                policy_sum, entropy_sum, kl_sum, clipped_sum = actor_pack[:4]
-                batch_kl = kl_sum.detach().double() / component_denominator
-                policy_loss = -policy_sum / component_denominator
+                policy_sum, entropy_sum, kl_sum, clipped_sum, component_kl_sum = actor_pack[:5]
+                batch_kl = kl_sum.detach().double() / diagnostic_denominator
+                batch_component_kl = (
+                    batch_kl
+                    if config.policy_ratio_scope == "components"
+                    else component_kl_sum.detach().double() / component_denominator
+                )
+                policy_loss = -policy_sum / policy_denominator
                 entropy_mean = entropy_sum / component_denominator
                 if actor_predictor_active:
                     assert isinstance(actor, StructuredActor)
                     assert structured_dynamics is not None
                     assert structured_dynamics_optimizer is not None
                     assert structured_terms_fn is not None
-                    actor_belief = StructuredDecisionBelief(*actor_pack[4:])
+                    actor_belief = StructuredDecisionBelief(*actor_pack[5:])
                     source_belief = (
                         actor_belief if actor_auxiliary_active else _detached_belief(actor_belief)
                     )
@@ -3418,11 +3483,12 @@ def update_ppo(
                     batch_kl,
                     policy_loss.detach().double(),
                     actor_gradient_norm.double(),
+                    batch_component_kl,
                 ]
                 if actor_predictor_active:
                     guard_values.insert(2, combined_actor_loss.detach().double())
                 guard_tensor = torch.stack(guard_values)
-                actor_finite = torch.isfinite(guard_tensor).all()
+                actor_finite = torch.isfinite(guard_tensor[:-1]).all()
                 actor_skip = (~actor_finite).float() if actor_step_is_gateable else None
                 guard_host.copy_(guard_tensor, non_blocking=True)
                 if guard_event is not None:
@@ -3534,7 +3600,10 @@ def update_ppo(
                     *critic_args,
                     sample_weight=sample_weight,
                     **(
-                        {"balance_auxiliary": critic_auxiliary_active}
+                        {
+                            "balance_auxiliary": critic_auxiliary_active
+                            and config.structured_critic_gradient_balance
+                        }
                         if critic_predictor_active
                         else {}
                     ),
@@ -3689,12 +3758,15 @@ def update_ppo(
                 else:
                     combined_actor_loss_value = policy_loss_value
                     actor_gradient_norm_value = guard_values_list[2]
+                batch_component_kl_value = guard_values_list[-1]
                 actor_auxiliary_seconds += _elapsed_cuda_seconds(
                     actor_auxiliary_start_event, actor_auxiliary_end_event
                 )
                 if updates == 0:
                     first_minibatch_kl = batch_kl_value
+                    first_minibatch_component_kl = batch_component_kl_value
                 max_approx_kl = max(max_approx_kl, batch_kl_value)
+                max_component_kl = max(max_component_kl, batch_component_kl_value)
                 nonfinite_message: str | None = None
                 if not math.isfinite(policy_loss_value):
                     nonfinite_message = "non-finite policy loss"
@@ -3726,9 +3798,10 @@ def update_ppo(
                         config.lr_warmup_steps,
                     )
                     refresh_fused_mlp_fp8(actor, bootstrap_down=False)
-                    totals["policy_loss"] += policy_loss.detach().double() * component_count
+                    totals["policy_loss"] -= policy_sum.detach().double()
                     totals["entropy"] += entropy_mean.detach().double() * component_count
-                    totals["approx_kl"] += batch_kl * component_count
+                    totals["approx_kl"] += batch_kl * diagnostic_count
+                    totals["component_kl"] += batch_component_kl * component_count
                     totals["clip_fraction"] += clipped_sum.detach().double()
                     totals["actor_gradient_norm"] += actor_gradient_norm * states
                     total_components += component_count
@@ -3902,6 +3975,7 @@ def update_ppo(
             critic_auxiliary_seconds += _elapsed_cuda_seconds(start_event, end_event)
 
     first_epoch_value_loss, last_epoch_value_loss = _epoch_value_losses(epoch_marks)
+    diagnostic_total = actor_states if config.policy_ratio_scope == "joint" else total_components
     metrics: dict[str, float | int] = {
         "updates": updates,
         "actor_minibatches_intended": actor_minibatches_intended,
@@ -3910,16 +3984,22 @@ def update_ppo(
         # The valid states this update trained on, which `rows` restricts to
         # one member's share of the wave.
         "states": valid_indices.size,
-        "policy_loss": float(totals["policy_loss"] / max(1, total_components)),
+        "policy_loss": float(
+            totals["policy_loss"]
+            / max(1, actor_states if config.policy_loss_reduction == "states" else total_components)
+        ),
         "value_loss": float(totals["value_loss"] / max(1, total_states)),
         "value_loss_first_epoch": first_epoch_value_loss,
         "value_loss_last_epoch": last_epoch_value_loss,
         "entropy": float(totals["entropy"] / max(1, total_components)),
-        "approx_kl": float(totals["approx_kl"] / max(1, total_components)),
+        "approx_kl": float(totals["approx_kl"] / max(1, diagnostic_total)),
+        "component_kl": float(totals["component_kl"] / max(1, total_components)),
+        "max_component_kl": max_component_kl,
+        "first_minibatch_component_kl": first_minibatch_component_kl,
         "max_approx_kl": max_approx_kl,
         "first_minibatch_approx_kl": first_minibatch_kl,
         "kl_early_stop": int(stop_for_kl),
-        "clip_fraction": float(totals["clip_fraction"] / max(1, total_components)),
+        "clip_fraction": float(totals["clip_fraction"] / max(1, diagnostic_total)),
         "actor_gradient_norm": float(totals["actor_gradient_norm"] / max(1, actor_states)),
         "critic_gradient_norm": float(totals["critic_gradient_norm"] / max(1, total_states)),
         "critic_trunk_gradient_norm": float(

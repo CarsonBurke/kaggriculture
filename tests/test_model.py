@@ -32,9 +32,12 @@ from kaggriculture.model import (
     ModelConfig,
     SelfAttention,
     SpatialUNet,
+    categorical_value,
+    categorical_value_support,
     distributional_value_loss,
     hl_gauss_value_targets,
     policy_compile_options,
+    softcap_value_logits,
 )
 
 
@@ -66,8 +69,9 @@ def _actor_inputs(batch: int = 2) -> tuple[torch.Tensor, ...]:
     return board, global_features, units, positions
 
 
-def test_actor_and_critic_outputs_are_finite_contiguous_and_fixed_shape() -> None:
-    config = _small_config()
+@pytest.mark.parametrize("scalar_value", [False, True])
+def test_actor_and_critic_outputs_are_finite_contiguous_and_fixed_shape(scalar_value) -> None:
+    config = _small_config(scalar_value=scalar_value)
     actor = FarmActor(config)
     critic = DistributionalCritic(config)
     board, global_features, units, positions = _actor_inputs(batch=3)
@@ -86,7 +90,7 @@ def test_actor_and_critic_outputs_are_finite_contiguous_and_fixed_shape() -> Non
     selected_kinds = torch.zeros(3, MAX_MARKET_ORDERS, dtype=torch.long)
     quantity_logits = actor.quantity_logits(output.market_quantity_context, selected_kinds)
     assert quantity_logits.shape == (3, MAX_MARKET_ORDERS, N_QUANTITIES)
-    assert critic_logits.shape == (3, config.value_atoms)
+    assert critic_logits.shape == (3, 1 if scalar_value else config.value_atoms)
     for tensor in (*output, quantity_logits, critic_logits):
         assert torch.isfinite(tensor).all()
         assert tensor.is_contiguous()
@@ -210,6 +214,43 @@ def test_hl_gauss_targets_are_normal_cdf_bin_masses() -> None:
     assert torch.count_nonzero(actual[0]) > 2
 
 
+def test_hl_gauss_preserves_small_tail_mass_and_reflection() -> None:
+    support = torch.linspace(-4.0, 4.0, 17)
+    probabilities = hl_gauss_value_targets(torch.tensor([0.0]), support, sigma_ratio=0.75)[0]
+    sigma = 0.5 * 0.75
+    expected = 0.5 * (
+        math.erfc(2.25 / (sigma * math.sqrt(2.0))) - math.erfc(2.75 / (sigma * math.sqrt(2.0)))
+    )
+    torch.testing.assert_close(probabilities[13], torch.tensor(expected), rtol=1e-5, atol=0)
+    assert probabilities[3].item() == probabilities[13].item()
+
+
+def test_hl_gauss_broad_gaussian_has_a_finite_uniform_limit() -> None:
+    support = torch.linspace(-4.0, 4.0, 17)
+    probabilities = hl_gauss_value_targets(torch.tensor([0.0]), support, sigma_ratio=1e10)
+    torch.testing.assert_close(probabilities, torch.full((1, 17), 1.0 / 17))
+
+
+@pytest.mark.parametrize("atoms", [254, 255])
+def test_value_buckets_preserve_reflection_and_exact_zero(atoms: int) -> None:
+    support = categorical_value_support(-2.2, 2.2, atoms)
+    assert torch.equal(support, -support.flip(-1))
+    assert bool(torch.all(support[1:] > support[:-1]))
+    half_logits = torch.linspace(-3.0, 3.0, atoms // 2)
+    middle = torch.tensor([0.7]) if atoms % 2 else torch.empty(0)
+    symmetric = torch.cat((half_logits, middle, half_logits.flip(-1))).unsqueeze(0)
+    torch.testing.assert_close(
+        categorical_value(symmetric, support), torch.zeros(1), rtol=0, atol=0
+    )
+    asymmetric = symmetric + torch.linspace(-0.5, 0.5, atoms)
+    expected = (asymmetric.double().softmax(dim=-1) * support.double()).sum(dim=-1).float()
+    torch.testing.assert_close(
+        categorical_value(asymmetric, support), expected, rtol=1e-6, atol=1e-7
+    )
+    targets = hl_gauss_value_targets(torch.tensor([-0.13, 0.13]), support)
+    torch.testing.assert_close(targets[0], targets[1].flip(-1), rtol=0, atol=0)
+
+
 def test_distributional_loss_prefers_the_matching_hl_gauss_distribution() -> None:
     support = torch.linspace(-2.2, 2.2, 11)
     targets = torch.tensor([0.8])
@@ -222,13 +263,18 @@ def test_distributional_loss_prefers_the_matching_hl_gauss_distribution() -> Non
     assert matching.item() < reversed_prediction.item()
 
 
+def test_value_logit_cap_preserves_small_bf16_readout_differences() -> None:
+    logits = torch.tensor([[-0.001, 0.0, 0.001]], dtype=torch.bfloat16)
+    actual = softcap_value_logits(logits).float().log_softmax(dim=-1)
+    expected = softcap_value_logits(logits.float()).log_softmax(dim=-1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual[0, 0] < actual[0, 1] < actual[0, 2]
+
+
 def test_value_support_has_tail_room_and_rejects_invalid_targets() -> None:
-    config = ModelConfig()
+    config = ModelConfig(scalar_value=False)
     critic = DistributionalCritic(config)
 
-    assert config.value_min == pytest.approx(-2.2)
-    assert config.value_max == pytest.approx(2.2)
-    assert config.value_sigma_ratio == pytest.approx(0.75)
     accepted = hl_gauss_value_targets(torch.tensor([-2.0, 2.0]), critic.support)
     assert accepted.shape == (2, config.value_atoms)
     with pytest.raises(ValueError, match="outside"):

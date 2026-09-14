@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
 from kaggriculture.constants import (
@@ -39,6 +40,8 @@ from kaggriculture.model import (
     ReluSquared,
     RMSNorm,
     _sdpa_inputs,
+    categorical_value,
+    categorical_value_support,
     factored_quantity_logits,
     initialize_policy_heads,
     softcap_value_logits,
@@ -101,13 +104,30 @@ class StructuredConfig:
     critic_latents: int = 0
     # Critic reads seed residual content from observations, not learned queries.
     critic_state_read: bool = False
-    value_atoms: int = 101
+    # The actor's view of the opponent's board. Both farms run the shared
+    # `farm_local` blocks and the opponent half reaches the rest of the actor
+    # only as `opponent_summary`, so it is 30% of the actor's forward bytes at
+    # production width -- half of `farm_local`, half of the tile embedding, and
+    # the summary block. `scripts/ablate_opponent_farm.py` permutes that half
+    # across a batch of real states and measures what the policy does about it:
+    # mean unit KL 1.3e-5 and 0.04% of greedy actions changed at iteration 390,
+    # against 3.80 and 59.9% for the same permutation of the actor's own farm.
+    # The insensitivity is present at initialization and grows with training, so
+    # it is a property of the architecture rather than a stage of learning.
+    #
+    # Disabling it is a learning change, not a speedup, and is off by default
+    # until an A/B says otherwise: an actor that cannot see the opponent's board
+    # cannot learn to react to it, and the ablation cannot distinguish "the
+    # information is useless here" from "this path is too narrow to carry it".
+    # The centralized critic is unaffected either way -- it reads both farms and
+    # measurably uses them -- and the two trunks share no parameters.
+    actor_opponent_farm: bool = True
+    value_atoms: int = 255
     value_min: float = -2.2
     value_max: float = 2.2
-    value_sigma_ratio: float = 0.75
-    # Scalar critic on half squared error, as in CleanRL's PPO, with no support
-    # clipping of the target and no softcap on the readout. The four fields above
-    # are inert when this is set.
+    value_sigma_ratio: float = 3.0
+    # Optional scalar ablation: half squared error without target clipping or
+    # a readout softcap. The four value-support fields above are inert in it.
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
@@ -877,31 +897,35 @@ class StructuredTrunk(nn.Module):
         self.economy = EconomyEmbedder(config, private_columns=private_columns)
         self.farm_local = nn.ModuleList(Block(config) for _ in range(config.farm_blocks))
         state_read = private_columns and config.critic_state_read
-        opponent_queries = torch.randn(config.opponent_latents, config.model_dim)
-        self.opponent_queries = nn.Parameter(
-            torch.nn.functional.rms_norm(opponent_queries, (config.model_dim,))
-            if state_read
-            else opponent_queries * SMALL_QUERY_INITIAL_SCALE
-        )
-        self.opponent_summary = Block(config, state_read=state_read)
-        self.opponent_context_norm = RMSNorm(config.model_dim)
-        latent_queries = torch.randn(config.latents, config.model_dim)
-        self.latent_queries = nn.Parameter(
-            torch.nn.functional.rms_norm(latent_queries, (config.model_dim,))
-            if state_read
-            else latent_queries * SMALL_QUERY_INITIAL_SCALE
-        )
+        # The knob is the actor's alone. The centralized critic reads both farms
+        # and `scripts/ablate_opponent_farm.py` shows it uses them, so private
+        # columns keep the opponent path regardless of how the actor is built.
+        self.opponent_farm = bool(private_columns) or config.actor_opponent_farm
+
+        def small_query(tokens: int) -> nn.Parameter:
+            queries = torch.randn(tokens, config.model_dim)
+            return nn.Parameter(
+                torch.nn.functional.rms_norm(queries, (config.model_dim,))
+                if state_read
+                else queries * SMALL_QUERY_INITIAL_SCALE
+            )
+
+        # Built only when read. Registering an unused query bank would hand the
+        # optimizer parameters that never receive a gradient and would put them
+        # in the checkpoint and the parameter count, where they read as capacity
+        # the model does not have.
+        if self.opponent_farm:
+            self.opponent_queries = small_query(config.opponent_latents)
+            self.opponent_summary = Block(config, state_read=state_read)
+            self.opponent_context_norm = RMSNorm(config.model_dim)
+        self.latent_queries = small_query(config.latents)
         # Read by `route_parameters`: only the banks actually left at the small
         # scale get the matching rate. A state read is normalized on the way in
         # and initialized at unit RMS, so it keeps the shared rate.
-        self.adam_learning_rate_multipliers = (
-            {}
-            if state_read
-            else {
-                "opponent_queries": SMALL_QUERY_INITIAL_SCALE,
-                "latent_queries": SMALL_QUERY_INITIAL_SCALE,
-            }
-        )
+        multipliers = {} if state_read else {"latent_queries": SMALL_QUERY_INITIAL_SCALE}
+        if multipliers and self.opponent_farm:
+            multipliers["opponent_queries"] = SMALL_QUERY_INITIAL_SCALE
+        self.adam_learning_rate_multipliers = multipliers
         self.latent_read = Block(config, state_read=state_read)
         self.latent_context_norm = RMSNorm(config.model_dim)
         self.core_input_norm = (
@@ -930,12 +954,22 @@ class StructuredTrunk(nn.Module):
         self.mudd = MuddLite(config.model_dim) if config.mudd_lite else None
 
     def encode_farms(self, tiles: Tensor, rotation: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
-        """Run shared farm-local blocks over both farms in one larger batch."""
+        """Run shared farm-local blocks over every farm this trunk reads.
+
+        With the opponent farm disabled the tile embedding already stopped at
+        the own half, so the block batch is halved rather than computed and
+        discarded, and the returned opponent patches are the zero-token tensor
+        the rest of the trunk concatenates around.
+        """
         batch = tiles.shape[0]
-        hidden = tiles.view(batch * 2, TILE_COUNT, self.config.model_dim)
+        farms = tiles.shape[1] // TILE_COUNT
+        hidden = tiles.reshape(batch * farms, TILE_COUNT, self.config.model_dim)
         for block in self.farm_local:
             hidden = block(hidden, query_rotation=rotation, key_rotation=rotation)
-        own, opponent = hidden.view(batch, 2, TILE_COUNT, self.config.model_dim).unbind(dim=1)
+        hidden = hidden.view(batch, farms, TILE_COUNT, self.config.model_dim)
+        if farms == 1:
+            return hidden.select(dim=1, index=0), hidden.new_zeros(batch, 0, self.config.model_dim)
+        own, opponent = hidden.unbind(dim=1)
         return own, opponent
 
     def forward(
@@ -946,10 +980,14 @@ class StructuredTrunk(nn.Module):
         opponent_units_active: Tensor | None = None,
     ) -> TrunkOutput:
         batch = inputs.tile_categorical.shape[0]
-        tiles = self.tiles(inputs.tile_categorical, inputs.tile_continuous)
+        farms = 2 if self.opponent_farm else 1
+        tiles = self.tiles(
+            inputs.tile_categorical[:, : farms * TILE_COUNT],
+            inputs.tile_continuous[:, : farms * TILE_COUNT],
+        )
         rotation = (
-            self.rope.cosine.view(1, 1, TILE_COUNT, -1).expand(batch * 2, -1, -1, -1),
-            self.rope.sine.view(1, 1, TILE_COUNT, -1).expand(batch * 2, -1, -1, -1),
+            self.rope.cosine.view(1, 1, TILE_COUNT, -1).expand(batch * farms, -1, -1, -1),
+            self.rope.sine.view(1, 1, TILE_COUNT, -1).expand(batch * farms, -1, -1, -1),
         )
         own_tiles, opponent_tiles = self.encode_farms(tiles, rotation)
 
@@ -967,26 +1005,33 @@ class StructuredTrunk(nn.Module):
             inputs.products, inputs.animals, inputs.crops, inputs.farms, inputs.town
         )
 
-        summary = self.opponent_summary(
-            self.opponent_queries.unsqueeze(0).expand(batch, -1, -1),
-            opponent_tiles,
-            context_norm=self.opponent_context_norm,
+        summary = (
+            self.opponent_summary(
+                self.opponent_queries.unsqueeze(0).expand(batch, -1, -1),
+                opponent_tiles,
+                context_norm=self.opponent_context_norm,
+            )
+            if self.opponent_farm
+            else own_tiles.new_zeros(batch, 0, self.config.model_dim)
         )
 
-        context_parts = [own_tiles, summary, unit_tokens, economy_tokens]
-        valid_parts = [
-            torch.ones(batch, own_tiles.shape[1], dtype=torch.bool, device=tiles.device),
-            torch.ones(batch, summary.shape[1], dtype=torch.bool, device=tiles.device),
-            inputs.unit_active,
-            torch.ones(batch, economy_tokens.shape[1], dtype=torch.bool, device=tiles.device),
-        ]
+        def all_valid(tokens: Tensor) -> Tensor:
+            return torch.ones(batch, tokens.shape[1], dtype=torch.bool, device=tiles.device)
+
+        # Paired so a part can never be added to one list and forgotten in the
+        # other: a context token without its validity entry shifts every later
+        # mask by one and silently reads the wrong tokens.
+        parts: list[tuple[Tensor, Tensor]] = [(own_tiles, all_valid(own_tiles))]
+        if self.opponent_farm:
+            parts.append((summary, all_valid(summary)))
+        parts.append((unit_tokens, inputs.unit_active))
+        parts.append((economy_tokens, all_valid(economy_tokens)))
         if opponent_units is not None:
             if opponent_units_active is None:
                 raise ValueError("opponent unit context requires its active mask")
-            context_parts.append(opponent_units)
-            valid_parts.append(opponent_units_active)
-        context = torch.cat(context_parts, dim=1)
-        context_valid = torch.cat(valid_parts, dim=1)
+            parts.append((opponent_units, opponent_units_active))
+        context = torch.cat([tokens for tokens, _valid in parts], dim=1)
+        context_valid = torch.cat([valid for _tokens, valid in parts], dim=1)
 
         latents = self.latent_read(
             self.latent_queries.unsqueeze(0).expand(batch, -1, -1),
@@ -1065,7 +1110,7 @@ class StructuredBelief(NamedTuple):
 
 
 class StructuredDecisionBelief(NamedTuple):
-    """Only the normalized policy head inputs required by PPO NextLat."""
+    """Normalized entity-decoder outputs consumed by the policy heads."""
 
     unit_decisions: Tensor
     market_decisions: Tensor
@@ -1125,43 +1170,48 @@ class StructuredActor(nn.Module):
             self.config.quantity_rank,
         )
 
-    def encode_belief(self, inputs: StructuredInputs) -> StructuredBelief:
+    def _decode_entities(
+        self,
+        latents: Tensor,
+        unit_tokens: Tensor,
+        local: Tensor,
+        economy_tokens: Tensor,
+        inputs: StructuredInputs,
+    ) -> StructuredDecisionBelief:
         batch = inputs.tile_categorical.shape[0]
-        trunk = self.trunk(inputs)
-        local = trunk.unit_local_tiles
         units, slots, width = local.shape[1], local.shape[2], local.shape[3]
         local_valid = inputs.unit_tile_gather_valid.clone()
         local_valid[..., 0] |= ~inputs.unit_active
 
         if self.unit_local_decoder is None:
-            latent_context = trunk.latents[:, None].expand(-1, units, -1, -1)
+            latent_context = latents[:, None].expand(-1, units, -1, -1)
             unit_context = torch.cat(
                 (
                     latent_context,
                     self.local_context_norm(local),
                 ),
                 dim=2,
-            ).reshape(batch * units, trunk.latents.shape[1] + slots, width)
+            ).reshape(batch * units, latents.shape[1] + slots, width)
             unit_valid = torch.cat(
                 (
                     torch.ones(
                         batch,
                         units,
-                        trunk.latents.shape[1],
+                        latents.shape[1],
                         dtype=torch.bool,
                         device=local.device,
                     ),
                     local_valid,
                 ),
                 dim=2,
-            ).reshape(batch * units, trunk.latents.shape[1] + slots)
+            ).reshape(batch * units, latents.shape[1] + slots)
             unit_hidden = self.unit_decoder(
-                trunk.unit_tokens.reshape(batch * units, 1, width),
+                unit_tokens.reshape(batch * units, 1, width),
                 unit_context,
                 context_valid=unit_valid,
             ).view(batch, units, width)
         else:
-            unit_hidden = self.unit_decoder(trunk.unit_tokens, trunk.latents)
+            unit_hidden = self.unit_decoder(unit_tokens, latents)
             unit_hidden = self.unit_local_decoder(
                 unit_hidden.reshape(batch * units, 1, width),
                 local.reshape(batch * units, slots, width),
@@ -1175,33 +1225,62 @@ class StructuredActor(nn.Module):
         if self.market_economy_decoder is None:
             market_context = torch.cat(
                 (
-                    trunk.latents,
-                    self.economy_context_norm(trunk.economy_tokens),
+                    latents,
+                    self.economy_context_norm(economy_tokens),
                 ),
                 dim=1,
             )
             market_hidden = self.market_decoder(market_queries, market_context)
         else:
-            market_hidden = self.market_decoder(market_queries, trunk.latents)
+            market_hidden = self.market_decoder(market_queries, latents)
             market_hidden = self.market_economy_decoder(
                 market_hidden,
-                trunk.economy_tokens,
+                economy_tokens,
                 context_norm=self.economy_context_norm,
             )
         market_hidden = self.market_norm(market_hidden)
+        return StructuredDecisionBelief(unit_hidden, market_hidden)
+
+    def encode_belief(self, inputs: StructuredInputs) -> StructuredBelief:
+        trunk = self.trunk(inputs)
+        decisions = self._decode_entities(
+            trunk.latents,
+            trunk.unit_tokens,
+            trunk.unit_local_tiles,
+            trunk.economy_tokens,
+            inputs,
+        )
         return StructuredBelief(
             own_patches=trunk.own_patches,
             opponent_patches=trunk.opponent_patches,
             opponent_summary=trunk.opponent_summary,
             economy_entities=trunk.economy_tokens,
             central_latents=trunk.latents,
-            unit_decisions=unit_hidden,
-            market_decisions=market_hidden,
+            unit_decisions=decisions.unit_decisions,
+            market_decisions=decisions.market_decisions,
         )
 
-    def decision_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
-        belief = self.encode_belief(inputs)
-        return StructuredDecisionBelief(belief.unit_decisions, belief.market_decisions)
+    def auxiliary_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
+        # Keep the auxiliary path memory-safe at production minibatch size by
+        # rematerializing the trunk. Both head-input tensors stay source-live.
+        trunk = (
+            checkpoint(self.trunk, inputs, use_reentrant=False)
+            if torch.is_grad_enabled()
+            else self.trunk(inputs)
+        )
+        return self._decode_entities(
+            trunk.latents,
+            trunk.unit_tokens,
+            trunk.unit_local_tiles,
+            trunk.economy_tokens,
+            inputs,
+        )
+
+    def forward_with_auxiliary_belief(
+        self, inputs: StructuredInputs
+    ) -> tuple[ActorOutput, StructuredDecisionBelief]:
+        belief = self.auxiliary_belief(inputs)
+        return self.decode_belief(belief), belief
 
     def decode_belief(self, belief: StructuredBelief | StructuredDecisionBelief) -> ActorOutput:
         return ActorOutput(
@@ -1268,7 +1347,7 @@ class StructuredCritic(nn.Module):
         nn.init.zeros_(self.value_head.bias)
         self.register_buffer(
             "support",
-            torch.linspace(config.value_min, config.value_max, config.value_atoms),
+            categorical_value_support(config.value_min, config.value_max, config.value_atoms),
             persistent=True,
         )
 
@@ -1338,4 +1417,4 @@ class StructuredCritic(nn.Module):
     def value(self, logits: Tensor) -> Tensor:
         if self.config.scalar_value:
             return logits.float().squeeze(-1)
-        return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)
+        return categorical_value(logits, self.support)

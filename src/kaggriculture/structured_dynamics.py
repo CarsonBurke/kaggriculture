@@ -23,13 +23,12 @@ from kaggriculture.latent_dynamics import (
     DecodeMasks,
     latent_decode_kl_terms,
 )
-from kaggriculture.model import RMSNorm
+from kaggriculture.model import RMSNorm, softcap_value_logits
 from kaggriculture.structured import (
     Block,
     StructuredBelief,
     StructuredConfig,
     StructuredCriticBelief,
-    StructuredDecisionBelief,
     StructuredInputs,
 )
 from kaggriculture.tokens import TILE_COUNT
@@ -40,10 +39,10 @@ class PersistenceDynamics(nn.Module):
 
     def forward(
         self,
-        belief: StructuredBelief | StructuredCriticBelief,
+        belief: Tensor | StructuredBelief | StructuredCriticBelief,
         *actions: Tensor,
         active_fields: tuple[bool, ...] | None = None,
-    ) -> StructuredBelief | StructuredCriticBelief:
+    ) -> Tensor | StructuredBelief | StructuredCriticBelief:
         return belief
 
 
@@ -60,13 +59,13 @@ class ShuffledActionDynamics(nn.Module):
 
     def forward(
         self,
-        belief: StructuredBelief | StructuredCriticBelief,
+        belief: Tensor | StructuredBelief | StructuredCriticBelief,
         unit_actions: Tensor,
         market_kinds: Tensor,
         market_quantities: Tensor,
         *context: Tensor,
         active_fields: tuple[bool, ...] | None = None,
-    ) -> StructuredBelief | StructuredCriticBelief:
+    ) -> Tensor | StructuredBelief | StructuredCriticBelief:
         arguments = {} if active_fields is None else {"active_fields": active_fields}
         return self.dynamics(
             belief,
@@ -161,7 +160,7 @@ class StructuredDynamics(nn.Module):
 
     def forward(
         self,
-        belief: StructuredBelief | StructuredDecisionBelief,
+        belief: StructuredBelief,
         unit_actions: Tensor,
         market_kinds: Tensor,
         market_quantities: Tensor,
@@ -169,7 +168,7 @@ class StructuredDynamics(nn.Module):
         unit_active: Tensor,
         *,
         active_fields: tuple[bool, ...] | None = None,
-    ) -> StructuredBelief | StructuredDecisionBelief:
+    ) -> StructuredBelief:
         values = tuple(belief)
         if active_fields is None:
             active_fields = (True,) * len(values)
@@ -191,11 +190,9 @@ class StructuredDynamics(nn.Module):
             unit_categorical,
             unit_active,
         )
-        # BC world objectives retain their recurrent central workspace. PPO
-        # decision-only transitions see only the head representations and action.
         state_context = (
             belief.central_latents
-            if isinstance(belief, StructuredBelief) and any(active_fields[:5])
+            if any(active_fields[:5])
             else torch.cat((belief.unit_decisions, belief.market_decisions), dim=1)
         )
         context = torch.cat((state_context, unit_action, market_action), dim=1)
@@ -394,17 +391,17 @@ def _belief_latent_smooth_l1(
     target: tuple[Tensor, ...],
     eligible: Tensor,
 ) -> Tensor:
-    """Element-weighted SmoothL1 without materializing a joined belief."""
+    """Element-weighted SmoothL1 over every latent coordinate of eligible rows."""
     total = predicted[0].new_zeros((), dtype=torch.float32)
-    elements_per_row = 0
+    elements = total
     for current, teacher in zip(predicted, target, strict=True):
         error = nn.functional.smooth_l1_loss(
             current.float(), teacher.detach().float(), reduction="none"
         )
         weight = eligible.float().reshape(-1, *([1] * (current.ndim - 1)))
+        elements = elements + eligible.float().sum() * current[0].numel()
         total = total + (error * weight).sum()
-        elements_per_row += current[0].numel()
-    return total / (eligible.float().sum() * elements_per_row).clamp_min(1)
+    return total / elements.clamp_min(1)
 
 
 def _belief_rms_ratio(
@@ -486,14 +483,19 @@ def _active_belief_fields(
 
 
 def _selected_belief_fields(belief, active: tuple[bool, ...]) -> tuple[bool, ...]:
-    if isinstance(belief, StructuredDecisionBelief) and any(active[:5]):
-        raise ValueError("world objectives require complete structured beliefs")
-    return tuple(active[StructuredBelief._fields.index(name)] for name in belief._fields)
+    selected = tuple(active[StructuredBelief._fields.index(name)] for name in belief._fields)
+    # An actor built with `actor_opponent_farm=False` produces zero-token
+    # opponent patches and summary, so an objective over them would average a
+    # loss over nothing and report a clean zero rather than refusing.
+    for name, chosen in zip(belief._fields, selected, strict=True):
+        if chosen and name.startswith("opponent_") and getattr(belief, name).shape[1] == 0:
+            raise ValueError(f"{name} objective requires an actor that reads the opponent farm")
+    return selected
 
 
 def structured_horizon_loss(
     dynamics: StructuredDynamics,
-    belief: StructuredBelief | StructuredDecisionBelief,
+    belief: StructuredBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
     *,
@@ -505,7 +507,7 @@ def structured_horizon_loss(
     economy_active: bool = False,
     opponent_summary_active: bool = False,
     opponent_patches_active: bool = False,
-    target_belief: StructuredBelief | StructuredDecisionBelief | None = None,
+    target_belief: StructuredBelief | None = None,
     plan: StructuredHorizonPlan | None = None,
 ) -> StructuredDynamicsTerms:
     """Unroll typed dynamics against exact contiguous demonstrated successors."""
@@ -592,20 +594,9 @@ def structured_horizon_loss(
                 )
 
         if offset <= latent_horizon:
-            joined_predicted_latent = torch.cat(
+            sums[12] = sums[12] + _belief_latent_smooth_l1(
                 (predicted.unit_decisions, predicted.market_decisions),
-                dim=1,
-            )
-            joined_target = torch.cat(
-                (
-                    targets.unit_decisions[target_index],
-                    targets.market_decisions[target_index],
-                ),
-                dim=1,
-            )
-            sums[12] = sums[12] + _latent_smooth_l1(
-                joined_predicted_latent,
-                joined_target,
+                (targets.unit_decisions[target_index], targets.market_decisions[target_index]),
                 eligible,
             )
 
@@ -738,7 +729,7 @@ def structured_horizon_loss(
 
 def structured_window_loss(
     dynamics: StructuredDynamics,
-    belief: StructuredBelief | StructuredDecisionBelief,
+    belief: StructuredBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
     *,
@@ -798,7 +789,7 @@ def structured_window_loss(
         opponent_patches_active=opponent_patches_active,
     )
     active_fields = _selected_belief_fields(belief, active_fields)
-    predicted: StructuredBelief | StructuredDecisionBelief | None = None
+    predicted: StructuredBelief | None = None
 
     for offset in range(1, max_horizon + 1):
         source_positions = width - offset
@@ -1006,16 +997,31 @@ def _critic_value_kl(
     value_head: nn.Linear,
     eligible: Tensor | None = None,
 ) -> Tensor:
-    """Teacher-to-student categorical KL without auxiliary head gradients."""
+    """Teacher-to-student value KL without auxiliary head gradients.
+
+    Scalar MSE readouts represent unit-variance Gaussians, whose KL is half
+    squared mean error. A one-category softmax would erase this supervision.
+    """
     weight = value_head.weight.detach()
     bias = None if value_head.bias is None else value_head.bias.detach()
-    student_logits = nn.functional.linear(predicted, weight, bias).float()
-    teacher_logits = nn.functional.linear(target.detach(), weight, bias).float().detach()
-    teacher_log_probabilities = teacher_logits.log_softmax(dim=-1)
-    teacher_probabilities = teacher_log_probabilities.exp()
-    per_row = (
-        teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1))
-    ).sum(dim=-1)
+    # Match Linear's explicit bias epilogue, without gradients into the head.
+    student_logits = nn.functional.linear(predicted, weight, None)
+    teacher_logits = nn.functional.linear(target.detach(), weight, None)
+    if bias is not None:
+        student_logits = student_logits + bias.to(student_logits.dtype)
+        teacher_logits = teacher_logits + bias.to(teacher_logits.dtype)
+    student_logits = student_logits.float()
+    teacher_logits = teacher_logits.float().detach()
+    if weight.shape[0] == 1:
+        per_row = 0.5 * (student_logits - teacher_logits).square().sum(dim=-1)
+    else:
+        student_logits = softcap_value_logits(student_logits)
+        teacher_logits = softcap_value_logits(teacher_logits)
+        teacher_log_probabilities = teacher_logits.log_softmax(dim=-1)
+        teacher_probabilities = teacher_log_probabilities.exp()
+        per_row = (
+            teacher_probabilities * (teacher_log_probabilities - student_logits.log_softmax(dim=-1))
+        ).sum(dim=-1)
     # Beliefs keep a singleton token dimension. Reduce tokens before applying
     # the row mask: [B, 1] * [B] would broadcast to [B, B], admitting invalid
     # successors and scaling the value objective by the entire minibatch.

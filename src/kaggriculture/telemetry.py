@@ -602,7 +602,8 @@ _TRAINING_TAGS = {
     # a cadence. It is a numerics measurement, not a trust-region one -- the
     # trust region never sees it, because the update replays its own behavior
     # likelihoods -- so it belongs beside the audit rather than beside the KL.
-    "first_minibatch_approx_kl": "parity/first_minibatch_kl",
+    "first_minibatch_component_kl": "parity/first_minibatch_kl",
+    "first_minibatch_approx_kl": "ppo/first_minibatch_kl",
     # Placed explicitly so the per-head prefix rule does not route it into the
     # `parity/<head>` runs, where it would share a chart with the per-head and
     # joint sampling-versus-replay divergences. It measures the replay against

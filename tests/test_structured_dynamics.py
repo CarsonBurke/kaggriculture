@@ -7,7 +7,12 @@ import pytest
 import torch
 from torch import nn
 
-from kaggriculture.structured import StructuredBelief, StructuredCriticBelief, StructuredInputs
+from kaggriculture.model import Linear, softcap_value_logits
+from kaggriculture.structured import (
+    StructuredBelief,
+    StructuredCriticBelief,
+    StructuredInputs,
+)
 from kaggriculture.structured_dynamics import (
     PersistenceDynamics,
     ShuffledActionDynamics,
@@ -21,7 +26,6 @@ from kaggriculture.structured_dynamics import (
     structured_critic_window_loss,
     structured_horizon_loss,
     structured_horizon_plan,
-    structured_window_loss,
 )
 from kaggriculture.tokens import TILE_COUNT
 
@@ -283,73 +287,39 @@ def test_critic_value_kl_masks_rows_without_cross_batch_broadcast() -> None:
     assert head.weight.grad is None
 
 
-def test_actor_window_latent_loss_matches_recursive_head_only_reference() -> None:
-    generator = torch.Generator().manual_seed(829)
-    rows, horizon = 6, 2
-    sizes = (4, 4, 2, 3, 2, 2, 1)
-    belief = StructuredBelief(
-        *(torch.randn(rows, size, 4, generator=generator).requires_grad_() for size in sizes)
-    )
-    inputs = StructuredInputs(
-        **{name: torch.zeros(rows, 1, dtype=torch.long) for name in StructuredInputs._fields}
-    )
-    factors = {
-        "unit_actions": torch.arange(rows).reshape(rows, 1),
-        "market_kinds": torch.zeros(rows, 1, dtype=torch.long),
-        "market_quantities": torch.zeros(rows, 1, dtype=torch.long),
-    }
-    dynamics = _RecurrentTransition(len(belief))
+def test_scalar_critic_value_kl_preserves_decoded_supervision_and_stop_gradients() -> None:
+    head = nn.Linear(2, 1)
+    with torch.no_grad():
+        head.weight.copy_(torch.tensor([[2.0, -1.0]]))
+        head.bias.fill_(0.5)
+    predicted = torch.tensor([[[1.0, 2.0]], [[99.0, 99.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 1.0]], [[-99.0, -99.0]]], requires_grad=True)
+    loss = _critic_value_kl(predicted, target, head, torch.tensor([True, False]))
+    torch.testing.assert_close(loss, torch.tensor(0.5))
+    loss.backward()
+    torch.testing.assert_close(predicted.grad, torch.tensor([[[2.0, -1.0]], [[0.0, 0.0]]]))
+    assert target.grad is None
+    assert head.weight.grad is None
+    assert head.bias.grad is None
 
-    def loss(current):
-        return structured_window_loss(
-            dynamics,
-            current,
-            inputs,
-            factors,
-            decode=None,
-            decision_horizon=0,
-            latent_horizon=horizon,
-            patch_horizon=0,
-            own_patches_active=False,
-            economy_active=False,
-            opponent_summary_active=False,
-            opponent_patches_active=False,
-        )
 
-    actual_terms = loss(belief)
-    actual = actual_terms.latent
-    changed_world = StructuredBelief(*(value * -1000 for value in belief[:5]), *belief[5:])
-    changed_terms = loss(changed_world)
-    torch.testing.assert_close(changed_terms.latent, actual, rtol=0, atol=0)
-    torch.testing.assert_close(
-        changed_terms.residual_ratio, actual_terms.residual_ratio, rtol=0, atol=0
-    )
-    # Independent recurrence over two complete three-state windows, followed by
-    # the reference's masked-element SmoothL1 reduction at each horizon.
-    per_horizon = [[], []]
-    for start in (0, 3):
-        for source in range(start, start + 2):
-            units, market = belief.unit_decisions[source], belief.market_decisions[source]
-            for offset in range(1, start + 3 - source):
-                action = factors["unit_actions"][source + offset - 1].float() * 0.01
-                context = market.mean(dim=0, keepdim=True)
-                units = units + dynamics.scales[5] * (units.sin() + context + action)
-                market = market + dynamics.scales[6] * (market.sin() + context + action)
-                predicted = torch.cat((units, market), dim=0)
-                target = torch.cat(
-                    (
-                        belief.unit_decisions[source + offset],
-                        belief.market_decisions[source + offset],
-                    ),
-                    dim=0,
-                ).detach()
-                per_horizon[offset - 1].append(nn.functional.smooth_l1_loss(predicted, target))
-    expected = sum(torch.stack(losses).mean() for losses in per_horizon) / horizon
+@pytest.mark.parametrize("bfloat16", [False, True])
+def test_categorical_critic_kl_matches_the_actual_capped_value_readout(bfloat16: bool) -> None:
+    head = Linear(2, 2)
+    with torch.no_grad():
+        head.weight.copy_(torch.tensor([[0.73, 0.41], [-0.35, 1.13]]))
+        head.bias.copy_(torch.tensor([0.303, -0.27]))
+    predicted = torch.tensor([[[3.0, -2.0]]], requires_grad=True)
+    target = torch.tensor([[[-3.0, 2.0]]], requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bfloat16):
+        teacher_log_probs = softcap_value_logits(head(target).detach()).log_softmax(dim=-1)
+        student_log_probs = softcap_value_logits(head(predicted)).log_softmax(dim=-1)
+        expected = (teacher_log_probs.exp() * (teacher_log_probs - student_log_probs)).sum()
+        actual = _critic_value_kl(predicted, target, head)
+    expected_gradient = torch.autograd.grad(expected, predicted)[0]
     torch.testing.assert_close(actual, expected)
-    parameters = (*belief, dynamics.scales)
-    actual_gradients = torch.autograd.grad(actual, parameters, allow_unused=True, retain_graph=True)
-    expected_gradients = torch.autograd.grad(expected, parameters, allow_unused=True)
-    torch.testing.assert_close(actual_gradients, expected_gradients)
-    assert all(gradient is None for gradient in actual_gradients[:5])
-    assert actual_gradients[5][0].abs().sum() > 0
-    assert actual_gradients[5][[2, 5]].count_nonzero() == 0
+    actual.backward()
+    torch.testing.assert_close(predicted.grad, expected_gradient)
+    assert target.grad is None
+    assert head.weight.grad is None
+    assert head.bias.grad is None

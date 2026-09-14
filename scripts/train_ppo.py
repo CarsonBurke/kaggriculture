@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.evaluation import (
     DEVELOPMENT_SEED_START,
@@ -52,7 +53,11 @@ from kaggriculture.league import (
     snapshot_sha256,
 )
 from kaggriculture.model import ModelConfig, parameter_count
-from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.modelargs import (
+    CALIBRATED_MODEL_FIELDS,
+    add_model_config_arguments,
+    model_config_from_args,
+)
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
@@ -99,7 +104,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.telemetry import (
     TensorboardMirror,
     population_agent_field,
@@ -145,6 +150,7 @@ AUTOCULL_POLICY = {
     "ema_alpha": 0.1,
     "money_min_improvement": 1000.0,
     "value_loss_min_improvement": 0.01,
+    "value_loss_relative_min_improvement": 0.01,
     "target": None,
     "warmup_anchor": "last_actor_active_warmup_observation",
     "combination": "either_improvement_resets_patience",
@@ -250,7 +256,15 @@ class OnlinePlateauGuard:
             reference = self.state["reference"]
             for name, mode, delta in (
                 ("money_mean", "max", AUTOCULL_POLICY["money_min_improvement"]),
-                ("value_loss", "min", AUTOCULL_POLICY["value_loss_min_improvement"]),
+                (
+                    "value_loss",
+                    "min",
+                    min(
+                        AUTOCULL_POLICY["value_loss_min_improvement"],
+                        reference["value_loss"]
+                        * AUTOCULL_POLICY["value_loss_relative_min_improvement"],
+                    ),
+                ),
             ):
                 if _better(smoothed[name], reference[name], delta, mode):
                     reference[name] = smoothed[name]
@@ -291,7 +305,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "single-learner online-proxy plateau guard (not external strength): "
             "ignore frozen actors, anchor after 20 actor-active waves, then stop "
-            "after 30 waves without either money EMA +1000 or value-loss EMA -0.01 "
+            "after 30 waves without either money EMA +1000 or a value-loss EMA "
+            "decrease of min(0.01, one percent of its reference) "
             "(alpha 0.1); commit latest checkpoint, emit AUTOCULL, and exit 75"
         ),
     )
@@ -427,6 +442,24 @@ def parse_args() -> argparse.Namespace:
             "same way"
         ),
     )
+    parser.add_argument(
+        "--policy-loss-reduction",
+        choices=("components", "states"),
+        default=PpoConfig.policy_loss_reduction,
+        help=(
+            "divide the surrogate sum by valid states (default) or active "
+            "components; joint ratio scope requires states"
+        ),
+    )
+    parser.add_argument(
+        "--policy-ratio-scope",
+        choices=("components", "joint"),
+        default=PpoConfig.policy_ratio_scope,
+        help=(
+            "clip conditional decisions independently (default), or clip their "
+            "joint action ratio and measure KL per state; entropy stays per component"
+        ),
+    )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
@@ -496,13 +529,14 @@ def parse_args() -> argparse.Namespace:
         "--structured-latent-coefficient",
         type=float,
         default=PpoConfig.structured_latent_coefficient,
-        help="weight on normalized actor decision-latent SmoothL1",
+        help="weight on shared post-core actor bottleneck SmoothL1",
     )
     parser.add_argument(
         "--structured-decision-coefficient",
         type=float,
         default=PpoConfig.structured_decision_coefficient,
-        help="weight on structured future-decision decode KL",
+        help="weight on frozen entity-decoder KL with shared-bank prediction "
+        "and detached successor context",
     )
     parser.add_argument(
         "--structured-critic-latent-coefficient",
@@ -515,6 +549,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=PpoConfig.structured_critic_value_coefficient,
         help="weight on decoded future-value prediction from critic NextLat",
+    )
+    parser.add_argument(
+        "--structured-critic-gradient-balance",
+        action=argparse.BooleanOptionalAction,
+        default=PpoConfig.structured_critic_gradient_balance,
+        help="match critic auxiliary source-gradient norm to the value gradient; "
+        "disable for the ordinary sum of configured losses",
     )
     parser.add_argument(
         "--structured-decision-horizon",
@@ -705,6 +746,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     # the update to near-zero optimizer steps silently rather than erroring.
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
+    if args.policy_ratio_scope == "joint" and args.policy_loss_reduction != "states":
+        raise ValueError("joint policy ratio scope requires state policy loss reduction")
     structured_actor_coefficients = (
         args.structured_latent_coefficient,
         args.structured_decision_coefficient,
@@ -869,10 +912,9 @@ def _load_initial_actor(
         raise ValueError("initial actor artifact architecture does not match arguments")
     artifact_config = artifact_architecture.build_config(payload["model_config"]).to_dict()
     expected_config = model_config.to_dict()
-    # Only the critic reads `scalar_value`: it selects that model's value head,
-    # and a BC clone's actor is bit-identical either way, so requiring equality
-    # here would make every scalar-critic arm need its own clone.
-    for name in ("scalar_value",):
+    # A BC clone carries no critic. Readout kind, value buckets, and Gaussian
+    # smoothing may change without changing the actor's architecture or policy.
+    for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
         artifact_config.pop(name)
         expected_config.pop(name)
     if isinstance(model_config, StructuredConfig):
@@ -2173,7 +2215,7 @@ def _gate_update_metrics(
     learner, whose messages are unprefixed.
     """
     where = "" if agent is None else f"agent {agent} "
-    first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
+    first_minibatch_kl = float(update_metrics["first_minibatch_component_kl"])
     if first_minibatch_kl > MAX_FIRST_MINIBATCH_KL:
         raise RuntimeError(
             f"{where}first-minibatch KL at unchanged weights exceeded "
@@ -2453,6 +2495,8 @@ def main() -> None:
         epochs=args.epochs,
         critic_epochs=args.critic_epochs,
         minibatch_size=args.minibatch_size,
+        policy_loss_reduction=args.policy_loss_reduction,
+        policy_ratio_scope=args.policy_ratio_scope,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
         gamma=args.gamma,
@@ -2470,6 +2514,7 @@ def main() -> None:
         structured_critic_latent_coefficient=args.structured_critic_latent_coefficient,
         structured_critic_value_coefficient=args.structured_critic_value_coefficient,
         structured_critic_horizon=args.structured_critic_horizon,
+        structured_critic_gradient_balance=args.structured_critic_gradient_balance,
         structured_learning_rate=args.structured_learning_rate,
         structured_critic_learning_rate=args.structured_critic_learning_rate,
     )
@@ -2491,15 +2536,17 @@ def main() -> None:
         # training-only predictors are constructed afterward, so enabling
         # NextLat cannot silently change the critic seed it is compared against.
         member_critic = architecture.critic_class(model_config).to(device)
-        member_dynamics = (
-            StructuredDynamics(model_config).to(device)
-            if ppo_config.structured_actor_auxiliary_active
-            and isinstance(model_config, StructuredConfig)
-            else None
-        )
+        # Keep the critic predictor's initialization unchanged when opting into
+        # the actor auxiliary.
         member_critic_dynamics = (
             StructuredCriticDynamics(model_config).to(device)
             if ppo_config.structured_critic_auxiliary_active
+            and isinstance(model_config, StructuredConfig)
+            else None
+        )
+        member_dynamics = (
+            ActorDynamics(model_config).to(device)
+            if ppo_config.structured_actor_auxiliary_active
             and isinstance(model_config, StructuredConfig)
             else None
         )

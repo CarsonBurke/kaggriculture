@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.ppo import (
     PpoConfig,
@@ -15,7 +16,7 @@ from kaggriculture.ppo import (
 )
 from kaggriculture.provenance import source_identity
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import (
     CHECKPOINT_FORMAT_VERSION,
     TrainingAgent,
@@ -97,7 +98,7 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
     )
     actor = StructuredActor(model_config)
     critic = StructuredCritic(model_config)
-    dynamics = StructuredDynamics(model_config)
+    dynamics = ActorDynamics(model_config)
     critic_dynamics = StructuredCriticDynamics(model_config)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
     dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, ppo_config)
@@ -148,7 +149,7 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
 
     restored_actor = StructuredActor(model_config)
     restored_critic = StructuredCritic(model_config)
-    restored_dynamics = StructuredDynamics(model_config)
+    restored_dynamics = ActorDynamics(model_config)
     restored_critic_dynamics = StructuredCriticDynamics(model_config)
     restored_actor_optimizer, restored_critic_optimizer = make_optimizers(
         restored_actor,
@@ -280,6 +281,17 @@ def test_structured_auxiliary_recovery_round_trips_predictor_rng_and_optimizer(
         for name, value in restored_actor.state_dict().items()
     )
 
+    # BC's retained typed predictor models a different state, even though the
+    # actor itself still has compatible weights. PPO recovery must not reuse it.
+    from kaggriculture.structured_dynamics import StructuredDynamics
+
+    legacy_path = tmp_path / "legacy-actor-predictor.pt"
+    legacy_payload = torch.load(path, weights_only=False)
+    legacy_payload["structured_dynamics"] = StructuredDynamics(model_config).state_dict()
+    torch.save(legacy_payload, legacy_path)
+    with pytest.raises(RuntimeError):
+        load_checkpoint(legacy_path, [restored_agent], device=torch.device("cpu"))
+
 
 def test_zero_auxiliary_checkpoint_keeps_the_historical_state_shape(tmp_path) -> None:
     model_config = ModelConfig(
@@ -316,7 +328,7 @@ def test_zero_auxiliary_checkpoint_keeps_the_historical_state_shape(tmp_path) ->
 @pytest.mark.parametrize(
     ("predictor_key", "optimizer_key", "predictor_type"),
     [
-        ("structured_dynamics", "structured_dynamics_optimizer", StructuredDynamics),
+        ("structured_dynamics", "structured_dynamics_optimizer", ActorDynamics),
         (
             "structured_critic_dynamics",
             "structured_critic_dynamics_optimizer",

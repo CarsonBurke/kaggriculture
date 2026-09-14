@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from kaggriculture.actions import MarketKind, UnitAction
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
@@ -31,7 +32,7 @@ from kaggriculture.provenance import (
 from kaggriculture.registry import architecture_of, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
 AnyActor = FarmActor | StructuredActor
 AnyCritic = DistributionalCritic | StructuredCritic
@@ -78,7 +79,7 @@ class TrainingAgent:
     critic: AnyCritic
     actor_optimizer: torch.optim.Optimizer | None = None
     critic_optimizer: torch.optim.Optimizer | None = None
-    structured_dynamics: StructuredDynamics | None = None
+    structured_dynamics: ActorDynamics | None = None
     structured_dynamics_optimizer: torch.optim.Optimizer | None = None
     structured_critic_dynamics: StructuredCriticDynamics | None = None
     structured_critic_dynamics_optimizer: torch.optim.Optimizer | None = None
@@ -661,7 +662,7 @@ def load_checkpoint(
             optimizer = getattr(agent, optimizer_key)
             if predictor is not None:
                 assert optimizer is not None
-                predictor.load_state_dict(state[predictor_key])
+                predictor.load_state_dict(state[predictor_key], strict=True)
                 optimizer.load_state_dict(state[optimizer_key])
         if agent.actor_optimizer is not None:
             agent.actor_optimizer.load_state_dict(state["actor_optimizer"])

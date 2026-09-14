@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import parameter_count
 from kaggriculture.ppo import (
@@ -62,7 +63,7 @@ from kaggriculture.provenance import source_identity
 from kaggriculture.registry import STRUCTURED, resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
 
 def _parse_args() -> argparse.Namespace:
@@ -152,7 +153,7 @@ def main() -> None:
     else:
         actor, _ = load_actor_artifact(args.init_actor_from, device=device)
     critic = architecture.critic_class(model_config).to(device)
-    dynamics = StructuredDynamics(model_config).to(device)
+    dynamics = ActorDynamics(model_config).to(device)
     critic_dynamics = StructuredCriticDynamics(model_config).to(device)
     frozen_state = {
         name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
@@ -312,6 +313,9 @@ def main() -> None:
     critic_args = gather_critic()
     surrogate = gather_surrogate()
     component_count = max(1, int(sum(component.sum() for component in surrogate[6:9])))
+    policy_count = (
+        component_count if ppo_config.policy_loss_reduction == "components" else indices.numel()
+    )
     value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
 
     def actor_forward():
@@ -322,11 +326,12 @@ def main() -> None:
             ppo_config.clip_high,
             autocast_enabled,
             *actor_args,
+            policy_ratio_scope=ppo_config.policy_ratio_scope,
         )
 
     def actor_forward_backward():
         actor_optimizer.zero_grad(set_to_none=True)
-        policy_sum, _entropy, _kl, _clipped = actor_forward()
+        policy_sum, _entropy, _kl, _clipped, _component_kl = actor_forward()
         if not policy_sum.requires_grad:
             raise RuntimeError(
                 "actor objective lost its graph: "
@@ -334,7 +339,7 @@ def main() -> None:
                 f"params_requiring_grad={sum(p.requires_grad for p in actor.parameters())} "
                 f"inference={policy_sum.is_inference()} training={actor.training}"
             )
-        (-policy_sum / component_count).backward()
+        (-policy_sum / policy_count).backward()
 
     def actor_norm():
         return torch.nn.utils.get_total_norm(
@@ -382,7 +387,7 @@ def main() -> None:
     @torch.no_grad()
     def actor_source_forward_eager():
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-            return actor.forward_with_belief(belief_inputs)
+            return actor.forward_with_auxiliary_belief(belief_inputs)
 
     @torch.no_grad()
     def critic_source_forward_eager():
@@ -390,7 +395,7 @@ def main() -> None:
             return critic.forward_with_belief(*critic_belief_args)
 
     # The predictor sections pass `model_grad=False`, and that path takes its
-    # source belief under `torch.no_grad()` (`ppo.py:2574-2576`), so no
+    # source belief under `torch.no_grad()`, so no
     # gradient reaches the actor or critic no matter what `requires_grad` says.
     # An earlier version froze both models here instead, while the sections were
     # still being defined -- before any of them ran -- which left

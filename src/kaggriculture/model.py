@@ -50,11 +50,41 @@ VALUE_LOGIT_SOFTCAP_WIDTH = 7.5
 
 
 def softcap_value_logits(logits: Tensor) -> Tensor:
-    """Bound a categorical value readout the way the reference bounds its own."""
+    """Bound categorical logits in FP32 without erasing small readout differences."""
 
+    logits = logits.float()
     return VALUE_LOGIT_SOFTCAP * torch.sigmoid(
         (logits + VALUE_LOGIT_SOFTCAP_SHIFT) / VALUE_LOGIT_SOFTCAP_WIDTH
     )
+
+
+def categorical_value_support(minimum: float, maximum: float, atoms: int) -> Tensor:
+    """Build linear buckets by mirroring one half, with an exact odd midpoint."""
+    midpoint = (minimum + maximum) * 0.5
+    half = atoms // 2
+    step = (maximum - minimum) / (atoms - 1)
+    left_end = midpoint if atoms % 2 else midpoint - step * 0.5
+    left = torch.linspace(minimum, left_end, half + atoms % 2, dtype=torch.float32)
+    right = minimum + maximum - left[:half].flip(-1)
+    return torch.cat((left, right))
+
+
+def _symmetric_sum(values: Tensor) -> Tensor:
+    """Reduce mirrored pairs first so reflection cannot change the normalizer."""
+    half = values.shape[-1] // 2
+    paired = values[..., :half] + values[..., -half:].flip(-1)
+    result = paired.sum(dim=-1)
+    return result + values[..., half] if values.shape[-1] % 2 else result
+
+
+def categorical_value(logits: Tensor, support: Tensor) -> Tensor:
+    """Read a mirrored support without cancellation bias at symmetric logits."""
+    probabilities = logits.float().softmax(dim=-1)
+    support_float = support.float()
+    half = support.numel() // 2
+    midpoint = (support_float[0] + support_float[-1]) * 0.5
+    paired = probabilities[..., -half:] - probabilities[..., :half].flip(-1)
+    return midpoint + (paired * (support_float[-half:] - midpoint)).sum(dim=-1)
 
 
 @dataclass(frozen=True)
@@ -66,15 +96,13 @@ class ModelConfig:
     attention_heads: int = 4
     ffn_multiplier: int = 4
     quantity_rank: int = 32
-    value_atoms: int = 101
+    value_atoms: int = 255
     value_min: float = -2.2
     value_max: float = 2.2
-    value_sigma_ratio: float = 0.75
-    # Scalar critic, as in CleanRL's PPO: one output, half squared error against
-    # the return, and no clipping anywhere -- not of the value target to a
-    # support, and not of the prediction to the behavior value. The categorical
-    # path is the default and keeps `value_atoms`, `value_min`, `value_max` and
-    # `value_sigma_ratio`; those four are inert when this is set.
+    value_sigma_ratio: float = 3.0
+    # HL-Gauss is the default. The scalar ablation uses one output and half
+    # squared error with no target or prediction clipping; the four value-support
+    # fields above are inert in that mode.
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
@@ -800,7 +828,7 @@ class DistributionalCritic(nn.Module):
         self.register_buffer("board_positions", _board_positions(), persistent=False)
         self.register_buffer(
             "support",
-            torch.linspace(config.value_min, config.value_max, config.value_atoms),
+            categorical_value_support(config.value_min, config.value_max, config.value_atoms),
             persistent=True,
         )
 
@@ -834,13 +862,13 @@ class DistributionalCritic(nn.Module):
     def value(self, logits: Tensor) -> Tensor:
         if self.config.scalar_value:
             return logits.float().squeeze(-1)
-        return (logits.float().softmax(dim=-1) * self.support.float()).sum(dim=-1)
+        return categorical_value(logits, self.support)
 
 
 def hl_gauss_value_targets(
     targets: Tensor,
     support: Tensor,
-    sigma_ratio: float = 0.75,
+    sigma_ratio: float = ModelConfig.value_sigma_ratio,
     *,
     validate: bool = True,
 ) -> Tensor:
@@ -848,7 +876,7 @@ def hl_gauss_value_targets(
     if support.ndim != 1 or support.numel() < 2:
         raise ValueError("value support must be one-dimensional with at least two atoms")
     support_float = support.float()
-    widths = support_float[1:] - support_float[:-1]
+    width = (support_float[-1] - support_float[0]) / (support.numel() - 1)
     if not math.isfinite(sigma_ratio) or sigma_ratio <= 0:
         raise ValueError("sigma_ratio must be finite and positive")
 
@@ -856,9 +884,11 @@ def hl_gauss_value_targets(
     if validate:
         if not bool(torch.isfinite(support_float).all()):
             raise ValueError("value support must be finite")
+        widths = support_float[1:] - support_float[:-1]
         if not bool(torch.all(widths > 0)):
             raise ValueError("value support must be strictly increasing")
-        if not torch.allclose(widths, widths[:1].expand_as(widths)):
+        rounding = 2 * torch.finfo(torch.float32).eps * support_float.abs().max()
+        if not bool(torch.all((widths - width).abs() <= rounding)):
             raise ValueError("HL-Gauss requires evenly spaced value atoms")
         if not bool(torch.isfinite(targets_float).all()):
             raise ValueError("value targets must be finite")
@@ -867,28 +897,34 @@ def hl_gauss_value_targets(
         ):
             raise ValueError("value targets fall outside the critic support")
 
-    width = widths[0]
     midpoints = (support_float[1:] + support_float[:-1]) * 0.5
     edges = torch.cat(
         (support_float[:1] - width * 0.5, midpoints, support_float[-1:] + width * 0.5)
     )
     standardized = (edges - targets_float.unsqueeze(-1)) / (width * sigma_ratio * math.sqrt(2.0))
-    cdf = 0.5 * (1.0 + torch.erf(standardized))
-    probabilities = (cdf[..., 1:] - cdf[..., :-1]).clamp_min(0.0)
-    return probabilities / probabilities.sum(dim=-1, keepdim=True)
+    lower, upper = standardized[..., :-1], standardized[..., 1:]
+    erf = torch.erf(standardized)
+    tails = torch.erfc(standardized.abs())
+    central_mass = 0.5 * (erf[..., 1:] - erf[..., :-1])
+    tail_mass = 0.5 * (tails[..., 1:] - tails[..., :-1]).abs()
+    # erf differences preserve narrow central intervals; erfc preserves tails
+    # that would vanish when two CDF values both round to one.
+    central = ((lower <= 0) & (upper >= 0)) | ((lower.abs() < 1) & (upper.abs() < 1))
+    probabilities = torch.where(central, central_mass, tail_mass).clamp_min(0.0)
+    return probabilities / _symmetric_sum(probabilities).unsqueeze(-1)
 
 
 def distributional_value_loss(
     logits: Tensor,
     targets: Tensor,
     support: Tensor,
-    sigma_ratio: float = 0.75,
+    sigma_ratio: float = ModelConfig.value_sigma_ratio,
     *,
     validate: bool = True,
 ) -> Tensor:
     if logits.shape[:-1] != targets.shape or logits.shape[-1] != support.numel():
         raise ValueError("value logits, targets, and support shapes must align")
-    projected = hl_gauss_value_targets(targets, support, sigma_ratio, validate=validate)
+    projected = hl_gauss_value_targets(targets.detach(), support, sigma_ratio, validate=validate)
     return -(projected * logits.float().log_softmax(dim=-1)).sum(dim=-1)
 
 

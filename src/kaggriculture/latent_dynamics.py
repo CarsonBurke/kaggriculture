@@ -424,9 +424,11 @@ def latent_decode_kl(
 
     The reference's ``lambda_kl`` term. The teacher arguments are the decode of
     the *true* next belief -- `DecodeHeads.decode` on the stop-gradient target --
-    and the student is the decode of the prediction; they are detached and share
-    the head weights, so the term is exactly zero when the prediction is exact
-    and can only be reduced by improving the prediction, never by moving a head.
+    and the student is the decode of the prediction. Detached teacher logits
+    and head parameters prevent direct auxiliary updates to either. Exact
+    prediction gives zero KL, but a learned source encoder can also reduce the
+    objective by erasing distinctions; its future teacher coordinates are not
+    fixed across optimizer steps.
 
     All three action factors participate, each under the same legality mask the
     policy applies, and each masked distribution is summed over its categorical

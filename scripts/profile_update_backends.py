@@ -129,11 +129,16 @@ def _run_mode(
     component_count = max(
         1, int(sum(batch[name].sum() for name in ("unit_active", "kind_active", "quantity_active")))
     )
+    policy_count = (
+        component_count
+        if config.policy_loss_reduction == "components"
+        else batch["advantages"].shape[0]
+    )
 
     def one_minibatch(run_actor: bool) -> None:
         if run_actor:
             actor_optimizer.zero_grad(set_to_none=True)
-            policy_sum, _entropy_sum, _kl_sum, _clipped = actor_terms(
+            policy_sum, _entropy_sum, _kl_sum, _clipped, _component_kl = actor_terms(
                 actor,
                 batch["unit_actions"],
                 batch["market_kinds"],
@@ -152,8 +157,9 @@ def _run_mode(
                 config.clip_high,
                 autocast,
                 *actor_args,
+                policy_ratio_scope=config.policy_ratio_scope,
             )
-            (-policy_sum / component_count).backward()
+            (-policy_sum / policy_count).backward()
             _optimizer_step(actor_optimizer, config.actor_learning_rate, config.lr_warmup_steps)
         critic_optimizer.zero_grad(set_to_none=True)
         value_loss, _predicted = critic_loss_fn(

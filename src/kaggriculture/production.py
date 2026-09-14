@@ -151,10 +151,18 @@ def production_model_config() -> dict[str, Any]:
         fused_mlp=False,
         critic_core_layers=0,
         critic_latents=0,
-        value_atoms=101,
+        # Stated rather than defaulted because it is the largest unresolved
+        # question about this architecture's cost: the opponent farm is 30% of
+        # the actor's forward bytes and the ablation in
+        # `scripts/ablate_opponent_farm.py` cannot find a policy that uses it.
+        # Production keeps it until a learning A/B says the score rate does not
+        # need it; the critic reads both farms either way.
+        actor_opponent_farm=True,
+        value_atoms=255,
         value_min=-2.2,
         value_max=2.2,
-        value_sigma_ratio=0.75,
+        value_sigma_ratio=3.0,
+        scalar_value=False,
     ).to_dict()
     # Benchmark reports pass through JSON before the calibrated launcher reads
     # them, so tuple-valued layer schedules are lists in the persisted contract.
@@ -187,10 +195,10 @@ def production_ppo_config(
             critic_head_learning_rate=(
                 PpoConfig.critic_learning_rate * PpoConfig.adam_learning_rate_ratio * (25.0 / 3.0)
             ),
-            # Independent actor/critic NextLat objectives supervise only the
-            # normalized inputs to their policy/value heads, never world state.
-            structured_latent_coefficient=1.0,
-            structured_decision_coefficient=1.0,
+            # Actor NextLat stays off; critic NextLat losses are added directly
+            # to the HL-Gauss value objective, without source-gradient balancing.
+            structured_latent_coefficient=0.0,
+            structured_decision_coefficient=0.0,
             structured_decision_horizon=1,
             structured_critic_latent_coefficient=1.0,
             structured_critic_value_coefficient=1.0,
@@ -408,6 +416,10 @@ def build_training_command(
             str(model["critic_core_layers"]),
             "--critic-latents",
             str(model["critic_latents"]),
+            "--scalar-value",
+            str(model["scalar_value"]).lower(),
+            "--value-sigma-ratio",
+            str(model["value_sigma_ratio"]),
             "--actor-lr",
             str(ppo["actor_learning_rate"]),
             "--critic-lr",
@@ -422,6 +434,10 @@ def build_training_command(
             str(ppo["critic_epochs"]),
             "--minibatch-size",
             str(ppo["minibatch_size"]),
+            "--policy-loss-reduction",
+            str(ppo["policy_loss_reduction"]),
+            "--policy-ratio-scope",
+            str(ppo["policy_ratio_scope"]),
             "--clip-low",
             str(ppo["clip_low"]),
             "--clip-high",
@@ -451,6 +467,11 @@ def build_training_command(
             "--structured-critic-horizon",
             str(ppo["structured_critic_horizon"]),
         )
+    )
+    command.append(
+        "--structured-critic-gradient-balance"
+        if ppo["structured_critic_gradient_balance"]
+        else "--no-structured-critic-gradient-balance"
     )
     # Stated unconditionally, all three: the collection backend and precision
     # move the sampled behavior policy and the update mode moves the graphs that

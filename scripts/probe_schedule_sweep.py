@@ -56,6 +56,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.league import load_actor_snapshot
 from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.ppo import (
@@ -75,7 +76,7 @@ from kaggriculture.production import (
 )
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, slice_trajectories
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
@@ -291,9 +292,9 @@ def main() -> None:
         ):
             raise ValueError(f"schedule candidate {label!r} must keep actor and critic NextLat")
 
-        candidate_dynamics = StructuredDynamics(model_config).to(device)
+        candidate_dynamics = ActorDynamics(model_config).to(device)
         candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
-        candidate_dynamics.load_state_dict(member_state["structured_dynamics"])
+        candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
         candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config

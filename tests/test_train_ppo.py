@@ -936,7 +936,7 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "actor_updates": 1,
             "actor_minibatches_intended": 1,
             "critic_updates": 1,
-            "first_minibatch_approx_kl": 0.0,
+            "first_minibatch_component_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
         },
@@ -1375,7 +1375,7 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
             "actor_updates": 1,
             "actor_minibatches_intended": 1,
             "critic_updates": 1,
-            "first_minibatch_approx_kl": 0.0,
+            "first_minibatch_component_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
         },
@@ -1793,6 +1793,8 @@ def test_warm_start_record_carries_the_warmup_count_and_clone_source(tmp_path) -
 
 
 def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -> None:
+    from dataclasses import replace
+
     from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
     from kaggriculture.provenance import source_identity
 
@@ -1819,10 +1821,18 @@ def test_initial_actor_loads_pretrained_weights_and_binds_provenance(tmp_path) -
         },
         artifact,
     )
-    actor = FarmActor(config)
+    changed = replace(
+        config,
+        scalar_value=not config.scalar_value,
+        value_atoms=config.value_atoms + 2,
+        value_min=-1.5,
+        value_max=1.5,
+        value_sigma_ratio=0.5,
+    )
+    actor = FarmActor(changed)
 
     provenance = module._load_initial_actor(
-        artifact, actor, CONV_ENTITY, config, torch.device("cpu")
+        artifact, actor, CONV_ENTITY, changed, torch.device("cpu")
     )
 
     assert all(
@@ -1877,6 +1887,7 @@ def test_critic_only_warm_start_preserves_compiled_actor_policy(tmp_path) -> Non
             # start from the same BC clone as a categorical one rather than
             # needing its own.
             scalar_value=True,
+            value_sigma_ratio=0.75,
         )
         actor = StructuredActor(changed).eval()
     artifact = _actor_artifact(
@@ -1911,7 +1922,7 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
 
     module = _training_script()
     healthy = {
-        "first_minibatch_approx_kl": MAX_FIRST_MINIBATCH_KL,
+        "first_minibatch_component_kl": MAX_FIRST_MINIBATCH_KL,
         "value_target_saturated_fraction": MAX_VALUE_TARGET_SATURATED_FRACTION,
         "actor_updates": 113,
         "actor_minibatches_intended": 113,
@@ -1926,7 +1937,7 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
 
     with pytest.raises(RuntimeError, match="first-minibatch KL"):
         module._gate_update_metrics(
-            {**healthy, "first_minibatch_approx_kl": MAX_FIRST_MINIBATCH_KL * 1.01},
+            {**healthy, "first_minibatch_component_kl": MAX_FIRST_MINIBATCH_KL * 1.01},
             warmup_active=False,
         )
     with pytest.raises(RuntimeError, match="saturated the critic support"):
@@ -1963,7 +1974,7 @@ def test_sharp_clone_entropy_is_telemetry_not_a_stop_condition() -> None:
     """A faithful BC clone may begin sharp while already playing well."""
     module = _training_script()
     healthy = {
-        "first_minibatch_approx_kl": 0.0,
+        "first_minibatch_component_kl": 0.0,
         "value_target_saturated_fraction": 0.0,
         "actor_updates": 113,
         "actor_minibatches_intended": 113,
@@ -2243,7 +2254,7 @@ def _run_population_main(
             "actor_updates": 1,
             "actor_minibatches_intended": 1,
             "critic_updates": 1,
-            "first_minibatch_approx_kl": 0.0,
+            "first_minibatch_component_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
             "monte_carlo_r_squared": 0.2,
@@ -2311,7 +2322,7 @@ def test_runner_enters_joint_training_despite_poor_predictor_persistence(
             "actor_updates": 0 if actor_epochs == 0 else 1,
             "actor_minibatches_intended": 1,
             "critic_updates": 1,
-            "first_minibatch_approx_kl": 0.0,
+            "first_minibatch_component_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
             # Prior-wave evidence releases the actor after the warmup floor.
@@ -2658,6 +2669,23 @@ def test_autocull_either_proxy_improvement_resets_full_patience(improvement) -> 
     assert guard.culled
 
 
+def test_autocull_small_loss_improvement_resets_patience_but_noise_does_not() -> None:
+    module = _training_script()
+    guard = module.OnlinePlateauGuard()
+    for _ in range(49):
+        _autocull_observation(guard, loss=0.005)
+    improved = _autocull_observation(guard, loss=0.0025)
+    assert improved["stale_observations"] == 0
+    assert not guard.culled
+    # A tiny decrease below the newly established reference is not progress.
+    tiny_decrease = improved["reference"]["value_loss"] * 0.9999
+    for _ in range(29):
+        _autocull_observation(guard, loss=tiny_decrease)
+        assert not guard.culled
+    _autocull_observation(guard, loss=tiny_decrease)
+    assert guard.culled
+
+
 def test_autocull_discards_frozen_waves_and_warmup_extrema() -> None:
     module = _training_script()
     guard = module.OnlinePlateauGuard()
@@ -2768,7 +2796,7 @@ def test_autocull_terminal_boundary_commits_before_exit_and_stays_terminal_on_re
             "actor_updates": 1,
             "actor_minibatches_intended": 1,
             "updates": 1,
-            "first_minibatch_approx_kl": 0.0,
+            "first_minibatch_component_kl": 0.0,
             "value_target_saturated_fraction": 0.0,
             "entropy": 0.2,
             "money_mean": 100_000.0,

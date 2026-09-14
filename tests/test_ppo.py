@@ -13,6 +13,7 @@ import torch._functorch.config
 import kaggriculture.ppo
 from kaggriculture import telemetry
 from kaggriculture.actions import MarketKind
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import EPISODE_STEPS, TURNS_PER_DAY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.policy import component_logprobs
@@ -64,25 +65,15 @@ from kaggriculture.rollout import (
 from kaggriculture.structured import (
     FusedFeedForward,
     StructuredActor,
-    StructuredBelief,
     StructuredConfig,
     StructuredCritic,
+    StructuredDecisionBelief,
 )
 from kaggriculture.structured_dynamics import (
     StructuredCriticDynamics,
-    StructuredDynamics,
     StructuredHorizonPlan,
     structured_horizon_plan,
 )
-
-
-def test_structured_actor_gradient_ratio_is_removed() -> None:
-    assert not hasattr(PpoConfig(), "structured_actor_gradient_ratio")
-
-
-def test_entropy_bonus_is_not_configurable() -> None:
-    """Entropy is telemetry and never enters the optimized objective."""
-    assert not hasattr(PpoConfig(), "entropy_coefficient")
 
 
 def test_rollout_action_masks_are_validated_once_before_replay() -> None:
@@ -122,6 +113,18 @@ def test_out_of_range_gamma_is_rejected() -> None:
         _validate_config(PpoConfig(gamma=1.5))
     with pytest.raises(ValueError, match="gamma must be finite"):
         _validate_config(PpoConfig(gamma=0.0))
+
+
+def test_unknown_policy_loss_reduction_is_rejected() -> None:
+    with pytest.raises(ValueError, match="policy loss reduction"):
+        _validate_config(PpoConfig(policy_loss_reduction="joint"))
+
+
+def test_invalid_policy_ratio_scope_is_rejected() -> None:
+    with pytest.raises(ValueError, match="policy ratio scope"):
+        _validate_config(PpoConfig(policy_ratio_scope="heads"))
+    with pytest.raises(ValueError, match="requires state policy loss reduction"):
+        _validate_config(PpoConfig(policy_ratio_scope="joint", policy_loss_reduction="components"))
 
 
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
@@ -534,7 +537,7 @@ def test_component_clipping_preserves_individual_factors_and_weighted_gradients(
         "_replayed_component_logprobs",
         lambda *args: (new, ignored, ignored, torch.ones_like(new), ignored, ignored),
     )
-    objective, _, kl, clipped = kaggriculture.ppo._actor_minibatch_terms(
+    objective, _, kl, clipped, _ = kaggriculture.ppo._actor_minibatch_terms(
         None,
         new,
         inactive,
@@ -574,6 +577,219 @@ def test_component_clipping_preserves_individual_factors_and_weighted_gradients(
     assert actual_gradient[1, 0] == 0 and actual_gradient[1, 1] < 0
     assert actual_gradient[2, 0] > 0 and actual_gradient[2, 1] == 0
     assert actual_gradient[3, 0] > 0 and actual_gradient[3, 1] == 0
+
+
+def test_joint_clipping_masks_inactive_factors_and_nan_padding_before_summing() -> None:
+    # All three conditional ratios are individually inside the band, while the
+    # joint action is outside it in both directions. The second slot represents
+    # post-STOP/inactive decisions, and the final row is physical batch padding.
+    factors = tuple(
+        torch.tensor(
+            [
+                [math.log(1.1), float("nan")],
+                [math.log(0.9), float("nan")],
+                [math.log(1.1), float("nan")],
+                [float("nan"), float("nan")],
+            ],
+            requires_grad=True,
+        )
+        for _ in range(3)
+    )
+    active = tuple(torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 1.0]]) for _ in factors)
+    old = tuple(torch.zeros_like(factor) for factor in factors)
+    entropies = tuple(
+        torch.tensor([[2.0, float("nan")]] * 3 + [[float("nan"), float("nan")]]) for _ in factors
+    )
+    advantages = torch.tensor([1.0, -1.0, -2.0, float("nan")])
+    weights = torch.tensor([1.0, 0.5, 2.0, 0.0])
+    objective, entropy, kl, clipped, component_kl = kaggriculture.ppo._policy_sums(
+        factors,
+        old,
+        active,
+        entropies,
+        advantages,
+        0.8,
+        1.28,
+        sample_weight=weights,
+        policy_ratio_scope="joint",
+    )
+    assert float(objective.detach()) == pytest.approx(1.28 - 0.5 * 0.8 - 4 * 1.1**3)
+    assert float(entropy) == pytest.approx(2 * 3 * 3.5)
+    assert float(clipped) == pytest.approx(3.5)
+    expected_kl = 3 * (1.1**3 - 1 - 3 * math.log(1.1)) + 0.5 * (0.9**3 - 1 - 3 * math.log(0.9))
+    assert float(kl / weights.sum()) == pytest.approx(expected_kl / 3.5, rel=1e-5)
+    expected_component_kl = 3 * (3 * (0.1 - math.log(1.1)) + 0.5 * (-0.1 - math.log(0.9)))
+    assert float(component_kl) == pytest.approx(expected_component_kl, rel=1e-5)
+    gradients = torch.autograd.grad(-objective, factors)
+    for gradient in gradients:
+        torch.testing.assert_close(
+            gradient,
+            torch.tensor([[0.0, 0.0], [0.0, 0.0], [4 * 1.1**3, 0.0], [0.0, 0.0]]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("reduction", "scope"),
+    [("components", "components"), ("states", "components"), ("states", "joint")],
+)
+def test_policy_loss_reduction_preserves_clipping_and_excludes_padded_states(
+    reduction: str, scope: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise real PPO backward and reporting across unequal, padded batches."""
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(actor, games=1, seed_start=95, episode_steps=6, sampling_seed=10)
+    rollout.valid[:] = False
+    rollout.valid[0, :5] = True
+    rollout.rewards[0, :5] = [1.0, -3.0, 2.0, -2.0, 1.0]
+    rollout.unit_active[:] = False
+    rollout.market_active[:] = False
+    rollout.market_quantity_active[:] = False
+    rollout.unit_active[0, :5, 0] = True
+    rollout.unit_active[0, [1, 2, 3], 1] = True
+    rollout.market_active[0, [1, 3], 0] = True
+    config = PpoConfig(
+        epochs=1,
+        minibatch_size=3,
+        target_kl=10.0,
+        use_bfloat16=False,
+        policy_loss_reduction=reduction,
+        policy_ratio_scope=scope,
+    )
+    device = torch.device("cpu")
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged["unit_actions"] = _stage_tensor(rollout.unit_actions, device)
+    values = replay_behavior_values(critic, rollout.architecture, staged).numpy()
+    prepared = prepare_advantages(rollout, values.reshape(rollout.valid.shape), config)
+    indices = torch.arange(5)
+    actor.eval()
+    replayed = kaggriculture.ppo._replayed_component_logprobs(
+        actor,
+        *(
+            _stage_tensor(getattr(rollout, name), device)[indices]
+            for name in (
+                "unit_actions",
+                "market_kinds",
+                "market_quantities",
+                "unit_masks",
+                "market_kind_masks",
+                "market_quantity_masks",
+            )
+        ),
+        False,
+        *_actor_batch_args(rollout.architecture, staged, indices),
+    )
+    # Unequal state activity separates component and joint clipping, and makes
+    # component-count versus state-count diagnostic denominators observable.
+    ratios = (1.6, 0.5, 1.1)
+    loss_per_state = torch.zeros(5)
+    component_counts = torch.zeros(5)
+    entropy_sum = torch.zeros(())
+    kl_sum = torch.zeros(())
+    clipped_sum = torch.zeros(())
+    total_log_ratio = torch.zeros(5)
+    for new, entropy, old_name, active_name, ratio in zip(
+        replayed[:3],
+        replayed[3:],
+        ("old_unit_logprobs", "old_market_kind_logprobs", "old_market_quantity_logprobs"),
+        ("unit_active", "market_active", "market_quantity_active"),
+        ratios,
+        strict=True,
+    ):
+        desired_ratio = torch.full_like(new, ratio)
+        if active_name == "unit_active":
+            desired_ratio[:, 0] = 1.15
+        old = new.detach() - desired_ratio.log()
+        getattr(rollout, old_name)[0, :5] = old.numpy()
+        active = torch.from_numpy(getattr(rollout, active_name)[0, :5]).bool()
+        actual_ratio = (new - old).exp()
+        advantage = torch.from_numpy(prepared.advantages[0, :5])[:, None]
+        per_component = torch.maximum(
+            -advantage * actual_ratio,
+            -advantage * actual_ratio.clamp(config.clip_low, config.clip_high),
+        )
+        loss_per_state = loss_per_state + torch.where(active, per_component, 0.0).sum(-1)
+        total_log_ratio = total_log_ratio + torch.where(active, new - old, 0.0).sum(-1)
+        component_counts += active.sum(-1)
+        entropy_sum += torch.where(active, entropy.detach(), 0.0).sum()
+        kl_sum += torch.where(active, actual_ratio.detach() - 1 - (new - old).detach(), 0.0).sum()
+        clipped_sum += (
+            active & ((actual_ratio < config.clip_low) | (actual_ratio > config.clip_high))
+        ).sum()
+    component_kl_sum = kl_sum.clone()
+    if scope == "joint":
+        ratio = total_log_ratio.exp()
+        advantage = torch.from_numpy(prepared.advantages[0, :5])
+        loss_per_state = torch.maximum(
+            -advantage * ratio, -advantage * ratio.clamp(config.clip_low, config.clip_high)
+        )
+        kl_per_state = ratio.detach() - 1 - total_log_ratio.detach()
+        kl_sum = kl_per_state.sum()
+        clipped_sum = ((ratio < config.clip_low) | (ratio > config.clip_high)).sum()
+
+    parameters = tuple(actor.parameters())
+
+    def flatten_gradients(gradients):
+        return torch.cat(
+            [
+                (torch.zeros_like(parameter) if gradient is None else gradient).reshape(-1)
+                for parameter, gradient in zip(parameters, gradients, strict=True)
+            ]
+        )
+
+    # Keep the actor fixed while recording actual PPO gradients, so the
+    # independent reference can evaluate both minibatches from this one graph.
+    actor_optimizer = torch.optim.SGD(parameters, lr=config.actor_learning_rate)
+    critic_optimizer = torch.optim.SGD(critic.parameters(), lr=config.critic_learning_rate)
+    observed_gradients = []
+
+    def record_gradients(closure=None):
+        observed_gradients.append(flatten_gradients(parameter.grad for parameter in parameters))
+
+    monkeypatch.setattr(actor_optimizer, "step", record_gradients)
+    shuffled = np.random.default_rng(11).permutation(np.arange(5))
+    expected_gradients = []
+    for selected in (shuffled[:3], shuffled[3:]):
+        denominator = len(selected) if reduction == "states" else component_counts[selected].sum()
+        expected_gradients.append(
+            flatten_gradients(
+                torch.autograd.grad(
+                    loss_per_state[selected].sum() / denominator,
+                    parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+            )
+        )
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(11),
+    )
+    assert metrics["actor_updates"] == 2
+    for observed, expected in zip(observed_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(observed, expected, atol=2e-6, rtol=2e-4)
+    denominator = 5 if reduction == "states" else component_counts.sum()
+    assert metrics["policy_loss"] == pytest.approx(
+        float(loss_per_state.sum().detach() / denominator), abs=2e-6
+    )
+    assert metrics["entropy"] == pytest.approx(float(entropy_sum / component_counts.sum()))
+    diagnostic_denominator = 5 if scope == "joint" else component_counts.sum()
+    assert metrics["approx_kl"] == pytest.approx(float(kl_sum / diagnostic_denominator), rel=1e-5)
+    assert metrics["component_kl"] == pytest.approx(
+        float(component_kl_sum / component_counts.sum()), rel=1e-5
+    )
+    assert metrics["clip_fraction"] == pytest.approx(float(clipped_sum / diagnostic_denominator))
+    if scope == "joint":
+        batch_kls = [
+            float(kl_per_state[selected].mean()) for selected in (shuffled[:3], shuffled[3:])
+        ]
+        assert metrics["first_minibatch_approx_kl"] == pytest.approx(batch_kls[0], rel=1e-5)
+        assert metrics["max_approx_kl"] == pytest.approx(max(batch_kls), rel=1e-5)
+    assert 0.0 < metrics["clip_fraction"] < 1.0
 
 
 def test_optimizer_warmup_is_checkpointed_in_param_group() -> None:
@@ -1153,34 +1369,21 @@ def test_unchanged_on_policy_first_minibatch_has_unit_ratio() -> None:
     assert metrics["max_approx_kl"] == pytest.approx(0.0, abs=1e-8)
 
 
-def test_over_target_sampler_kl_stops_actor_before_first_step(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stale sampler likelihood rejects the gradient and does not refresh caches."""
+def test_over_target_sampler_kl_stops_actor_before_first_step() -> None:
+    """Reject stale actor likelihoods while the critic still fits real targets."""
     actor, critic = _small_update_models()
     rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
+    rollout.rewards[:, -1] = np.float32(1.0)
     for name in (
         "old_unit_logprobs",
         "old_market_kind_logprobs",
         "old_market_quantity_logprobs",
     ):
         getattr(rollout, name)[...] -= 1.0
-    genuine_refresh = kaggriculture.ppo.refresh_fused_mlp_fp8
-    actor_refreshes: list[bool | None] = []
-
-    def record_actor_refresh(module, *, bootstrap_down=None):
-        if module is actor:
-            actor_refreshes.append(bootstrap_down)
-        genuine_refresh(module, bootstrap_down=bootstrap_down)
-
-    monkeypatch.setattr(kaggriculture.ppo, "refresh_fused_mlp_fp8", record_actor_refresh)
     config = PpoConfig(epochs=2, minibatch_size=8, target_kl=1e-4, use_bfloat16=False)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     actor_before = {
         name: parameter.detach().clone() for name, parameter in actor.named_parameters()
-    }
-    critic_before = {
-        name: parameter.detach().clone() for name, parameter in critic.named_parameters()
     }
 
     metrics = update_ppo(
@@ -1196,15 +1399,55 @@ def test_over_target_sampler_kl_stops_actor_before_first_step(
     assert metrics["updates"] == config.epochs
     assert metrics["actor_updates"] == 0
     assert metrics["kl_early_stop"] == 1
-    assert actor_refreshes == [None]
     assert metrics["first_minibatch_approx_kl"] > config.target_kl
     assert metrics["max_approx_kl"] > config.target_kl
     for name, parameter in actor.named_parameters():
         assert torch.equal(parameter, actor_before[name]), name
-    assert any(
-        not torch.equal(parameter, critic_before[name])
-        for name, parameter in critic.named_parameters()
+    assert metrics["value_loss_last_epoch"] < metrics["value_loss_first_epoch"]
+
+
+@pytest.mark.parametrize("scope", ["components", "joint"])
+def test_joint_kl_gate_rejects_action_that_component_kl_accepts(scope: str) -> None:
+    actor, critic = _small_update_models()
+    rollout = collect_self_play(actor, games=1, seed_start=93, episode_steps=3, sampling_seed=8)
+    rollout.unit_active[:] = False
+    rollout.unit_active[..., :2] = True
+    rollout.market_active[:] = False
+    rollout.market_quantity_active[:] = False
+    rollout.old_unit_logprobs -= np.float32(0.01)
+    config = PpoConfig(
+        epochs=1,
+        minibatch_size=1 << 12,
+        target_kl=1e-4,
+        use_bfloat16=False,
+        policy_loss_reduction="states",
+        policy_ratio_scope=scope,
     )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(9),
+    )
+    expected_component_kl = math.expm1(0.01) - 0.01
+    expected_scoped_kl = math.expm1(0.02) - 0.02 if scope == "joint" else expected_component_kl
+    assert metrics["first_minibatch_component_kl"] == pytest.approx(expected_component_kl, rel=2e-3)
+    assert metrics["first_minibatch_approx_kl"] == pytest.approx(expected_scoped_kl, rel=2e-3)
+    assert metrics["max_approx_kl"] == pytest.approx(expected_scoped_kl, rel=2e-3)
+    assert metrics["kl_early_stop"] == int(scope == "joint")
+    assert metrics["actor_updates"] == int(scope == "components")
+    assert metrics["critic_updates"] == 1
+    if scope == "joint":
+        assert metrics["approx_kl"] == 0.0
+        for name, parameter in actor.named_parameters():
+            assert torch.equal(parameter, before[name]), name
+    else:
+        assert metrics["approx_kl"] == pytest.approx(expected_component_kl, rel=2e-3)
 
 
 def test_over_target_kl_still_steps_the_actor_predictor() -> None:
@@ -1224,11 +1467,10 @@ def test_over_target_kl_still_steps_the_actor_predictor() -> None:
         use_bfloat16=False,
         structured_decision_coefficient=0.5,
     )
-    dynamics = StructuredDynamics(_small_structured_config())
+    dynamics = ActorDynamics(_small_structured_config())
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, config)
     actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
-    dynamics_before = {name: value.detach().clone() for name, value in dynamics.named_parameters()}
 
     metrics = update_ppo(
         actor,
@@ -1249,9 +1491,7 @@ def test_over_target_kl_still_steps_the_actor_predictor() -> None:
     assert metrics["structured_actor_predictor_updates"] >= 1
     assert metrics["structured_actor_auxiliary_updates"] == 0
     assert all(torch.equal(value, actor_before[name]) for name, value in actor.named_parameters())
-    assert any(
-        not torch.equal(value, dynamics_before[name]) for name, value in dynamics.named_parameters()
-    )
+    assert all(state["step"] >= 1 for state in dynamics_optimizer.state.values() if "step" in state)
 
 
 def test_one_ppo_update_is_finite() -> None:
@@ -1531,7 +1771,12 @@ def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     a five-hundred-iteration run to say so would be strictly less informative.
     """
     model_config = ModelConfig(
-        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+        cnn_width=16,
+        cnn_blocks=1,
+        model_dim=32,
+        transformer_layers=3,
+        attention_heads=4,
+        scalar_value=False,
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
@@ -2040,7 +2285,7 @@ def test_fused_predictors_use_updated_weights_after_ppo(phase: str) -> None:
         structured_critic_latent_coefficient=0.5,
         structured_critic_horizon=1,
     )
-    actor_dynamics = StructuredDynamics(predictor_config).cuda()
+    actor_dynamics = ActorDynamics(predictor_config).cuda()
     critic_dynamics = StructuredCriticDynamics(predictor_config).cuda()
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     actor_dynamics_optimizer = make_structured_dynamics_optimizer(actor_dynamics, config)
@@ -2090,7 +2335,7 @@ def test_fused_predictors_use_updated_weights_after_ppo(phase: str) -> None:
     )
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         actor_belief_forward = torch.compile(
-            actor.forward_with_belief, mode="default", fullgraph=True
+            actor.forward_with_auxiliary_belief, mode="default", fullgraph=True
         )
         critic_belief_forward = torch.compile(
             critic.forward_with_belief, mode="default", fullgraph=True
@@ -2104,14 +2349,9 @@ def test_fused_predictors_use_updated_weights_after_ppo(phase: str) -> None:
             strict=True,
         ):
             assert not torch.equal(dynamics.transition.ffn.up_weight, master_before)
-            kwargs = (
-                {"active_fields": (False,) * 5 + (True, True)}
-                if isinstance(dynamics, StructuredDynamics)
-                else {}
-            )
             # The next training forward must remain usable after the step.
             predict = torch.compile(dynamics, mode="default", fullgraph=True)
-            trained_prediction = predict(belief, *actions, **kwargs)
+            trained_prediction = predict(belief, *actions)
             assert all(torch.isfinite(field).all() for field in trained_prediction)
             # Check consumer-visible BF16 predictions against a checkpoint reload,
             # whose projections come from the updated master weights, not caches.
@@ -2120,8 +2360,8 @@ def test_fused_predictors_use_updated_weights_after_ppo(phase: str) -> None:
             reference.eval()
             dynamics.eval()
             predict_reference = torch.compile(reference, mode="default", fullgraph=True)
-            actual = predict(belief, *actions, **kwargs)
-            expected = predict_reference(belief, *actions, **kwargs)
+            actual = predict(belief, *actions)
+            expected = predict_reference(belief, *actions)
             for actual_field, expected_field in zip(actual, expected, strict=True):
                 torch.testing.assert_close(actual_field, expected_field, rtol=0.0, atol=0.0)
 
@@ -2144,36 +2384,6 @@ def test_structured_update_replay_parity_covers_every_component() -> None:
         assert parity[f"update_replay_{component}_ratio_max_abs_error"] < 1e-4
     for name, parameter in actor.named_parameters():
         torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
-
-
-def test_structured_update_ppo_trains_both_networks() -> None:
-    actor, rollout = _structured_rollout_with_quantity_orders(seed_start=203, sampling_seed=23)
-    critic = StructuredCritic(_small_structured_config())
-    config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
-    critic_before = {name: value.detach().clone() for name, value in critic.named_parameters()}
-
-    metrics = update_ppo(
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
-        rollout,
-        config,
-        generator=np.random.default_rng(25),
-    )
-
-    assert metrics["states"] == rollout.state_count
-    assert metrics["actor_updates"] >= 1
-    assert math.isfinite(metrics["value_loss"])
-    assert metrics["first_minibatch_approx_kl"] == pytest.approx(0.0, abs=1e-6)
-    assert any(
-        not torch.equal(value, actor_before[name]) for name, value in actor.named_parameters()
-    )
-    assert any(
-        not torch.equal(value, critic_before[name]) for name, value in critic.named_parameters()
-    )
 
 
 def test_structured_transition_order_never_crosses_trajectory_or_terminal_boundaries() -> None:
@@ -2220,7 +2430,7 @@ def test_structured_window_loss_matches_generic_masked_unroll(
         structured_decision_coefficient=coefficients[1],
         structured_decision_horizon=2,
     )
-    dynamics = StructuredDynamics(_small_structured_config()).cuda()
+    dynamics = ActorDynamics(_small_structured_config()).cuda()
     device = torch.device("cuda")
     staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
     staged |= {
@@ -2300,7 +2510,9 @@ def test_structured_window_loss_matches_generic_masked_unroll(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy() -> None:
+def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     actor, rollout = _structured_rollout_with_quantity_orders(
         seed_start=207, sampling_seed=29, device="cuda"
     )
@@ -2320,7 +2532,7 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy()
         structured_decision_horizon=2,
         nextlat_max_gradient_norm=1.0e-4,
     )
-    dynamics = StructuredDynamics(_small_structured_config()).cuda()
+    dynamics = ActorDynamics(_small_structured_config()).cuda()
     control_optimizers = make_optimizers(control_actor, control_critic, control_config)
     active_optimizers = make_optimizers(active_actor, active_critic, active_config)
     dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, active_config)
@@ -2353,6 +2565,27 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy()
         control_config,
         generator=control_generator,
     )
+    backward_calls = 0
+    warming = False
+    original_backward = torch.Tensor.backward
+    original_warm = kaggriculture.ppo._warm_actor_update_graphs
+
+    def count_backward(tensor, *args, **kwargs):
+        nonlocal backward_calls
+        if not warming:
+            backward_calls += 1
+        return original_backward(tensor, *args, **kwargs)
+
+    def warm_graphs(*args, **kwargs):
+        nonlocal warming
+        warming = True
+        try:
+            return original_warm(*args, **kwargs)
+        finally:
+            warming = False
+
+    monkeypatch.setattr(torch.Tensor, "backward", count_backward)
+    monkeypatch.setattr(kaggriculture.ppo, "_warm_actor_update_graphs", warm_graphs)
     active_metrics = update_ppo(
         active_actor,
         active_critic,
@@ -2364,6 +2597,9 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy()
         structured_dynamics_optimizer=dynamics_optimizer,
         structured_actor_auxiliary=True,
         auxiliary_generator=np.random.default_rng(32),
+    )
+    assert backward_calls == (
+        active_metrics["structured_actor_predictor_updates"] + active_metrics["updates"]
     )
 
     assert np.random.default_rng(31).bit_generator.state == active_generator.bit_generator.state
@@ -2391,9 +2627,6 @@ def test_active_structured_auxiliary_clips_nextlat_without_clipping_the_policy()
         "structured_actor_residual_ratio",
     ):
         assert math.isfinite(active_metrics[name])
-    assert active_metrics["structured_preupdate_decision"] > 0.0
-    assert active_metrics["structured_preupdate_latent"] > 0.0
-    assert active_metrics["structured_actor_combined_gradient_norm"] > 0.0
     assert any(
         not torch.equal(value, actor_before[name])
         for name, value in active_actor.named_parameters()
@@ -2417,7 +2650,7 @@ def test_structured_predictor_trains_during_critic_only_warmup_without_actor_gra
         use_bfloat16=True,
         structured_latent_coefficient=0.5,
     )
-    dynamics = StructuredDynamics(_small_structured_config()).cuda()
+    dynamics = ActorDynamics(_small_structured_config()).cuda()
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, config)
     actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
@@ -2478,7 +2711,7 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
         structured_critic_value_coefficient=0.5,
         structured_critic_horizon=1,
     )
-    actor_dynamics = StructuredDynamics(_small_structured_config()).cuda()
+    actor_dynamics = ActorDynamics(_small_structured_config()).cuda()
     critic_dynamics = StructuredCriticDynamics(_small_structured_config()).cuda()
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     actor_dynamics_optimizer = make_structured_dynamics_optimizer(actor_dynamics, config)
@@ -2600,13 +2833,13 @@ def test_actor_and_critic_nextlat_clip_only_the_auxiliary(
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("coefficients", [(1.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
-def test_actor_nextlat_only_differentiates_source_decisions_and_predictor(
+def test_actor_nextlat_only_differentiates_source_bottleneck_and_predictor(
     coefficients: tuple[float, float],
 ) -> None:
     actor, rollout = _structured_rollout_with_quantity_orders(
         seed_start=222, sampling_seed=50, device="cuda"
     )
-    dynamics = StructuredDynamics(_small_structured_config()).cuda()
+    dynamics = ActorDynamics(_small_structured_config()).cuda()
     config = PpoConfig(
         structured_latent_coefficient=coefficients[0],
         structured_decision_coefficient=coefficients[1],
@@ -2634,10 +2867,9 @@ def test_actor_nextlat_only_differentiates_source_decisions_and_predictor(
     indices = torch.from_numpy(window).to(device)
     (inputs,) = _actor_batch_args(STRUCTURED, staged, indices)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        _, actor_belief = actor.forward_with_belief(inputs)
-    # Independent leaves distinguish direct world-field/teacher leakage from
-    # the legitimate trunk gradient flowing through the source decision heads.
-    belief = StructuredBelief(*(field.detach().requires_grad_() for field in actor_belief))
+        _, actor_belief = actor.forward_with_auxiliary_belief(inputs)
+    # Independent leaves expose auxiliary gradient leakage into successor targets.
+    belief = StructuredDecisionBelief(*(field.detach().requires_grad_() for field in actor_belief))
     loss, terms = _structured_auxiliary_terms(
         actor,
         dynamics,
@@ -2653,13 +2885,10 @@ def test_actor_nextlat_only_differentiates_source_decisions_and_predictor(
     loss.backward()
 
     assert terms.eligible == 1
-    for name, field in zip(StructuredBelief._fields, belief, strict=True):
-        if name in ("unit_decisions", "market_decisions"):
-            assert field.grad is not None
-            assert torch.count_nonzero(field.grad[1]) == 0
-        else:
-            assert field.grad is None
-    assert torch.count_nonzero(belief.unit_decisions.grad[0]) > 0
+    for field in belief:
+        assert field.grad is not None
+        assert torch.count_nonzero(field.grad[1]) == 0
+        assert torch.count_nonzero(field.grad[0]) > 0
     assert any(
         parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
         for parameter in dynamics.parameters()
@@ -2777,7 +3006,7 @@ def test_nonfinite_combined_auxiliary_loss_does_not_advance_source_optimizer(
         structured_critic_latent_coefficient=0.5 if not actor_active else 0.0,
     )
     dynamics = (
-        StructuredDynamics(_small_structured_config())
+        ActorDynamics(_small_structured_config())
         if actor_active
         else StructuredCriticDynamics(_small_structured_config())
     )
@@ -2844,7 +3073,7 @@ def test_ppo_optimizers_never_apply_weight_decay(optimizer: str) -> None:
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    dynamics = StructuredDynamics(_small_structured_config())
+    dynamics = ActorDynamics(_small_structured_config())
     config = PpoConfig(optimizer=optimizer)
 
     optimizers = (
@@ -2859,7 +3088,7 @@ def test_ppo_optimizers_never_apply_weight_decay(optimizer: str) -> None:
 
 @pytest.mark.parametrize("optimizer", ["adamw", "normuon"])
 def test_structured_predictor_optimizers_keep_independent_base_rates(optimizer: str) -> None:
-    actor_dynamics = StructuredDynamics(_small_structured_config())
+    actor_dynamics = ActorDynamics(_small_structured_config())
     critic_dynamics = StructuredCriticDynamics(_small_structured_config())
     config = PpoConfig(
         optimizer=optimizer,
@@ -3024,115 +3253,6 @@ def test_streamed_fit_explained_variance_matches_the_array_form() -> None:
     # measured is the honest answer.
     assert _fit_explained_variance(_fit_sums(targets[:1], predictions[:1]), 1) == 0.0
     assert _fit_explained_variance(_fit_sums(targets[:0], predictions[:0]), 0) == 0.0
-
-
-def test_the_critic_fit_reading_is_the_only_one_that_can_see_a_working_refit() -> None:
-    """Why a third explained variance had to exist beside the conventional one.
-
-    `lambda_return_explained_variance` is scored against `advantages + values`
-    using those same pre-update `values`, so its residual is identically the
-    advantage and the whole number is the algebra `1 - Var(A)/Var(G_lambda)` --
-    which this test recomputes from the two standard deviations the update
-    already reports, to pin that it is an identity and not a measurement of any
-    fit. Nothing the critic learns during the update can move it, and it rises
-    on its own whenever the critic's predictions merely gain variance.
-
-    So a critic here refits its targets well enough to explain a third of their
-    variance while that conventional reading sits near zero. Quoting it as
-    "explained variance" is what made a working critic look broken; the two
-    `critic_fit_explained_variance_*` readings, taken from the critic's own
-    predictions during the update, are what say the regression worked. They are
-    reported as a pair because the last epoch scores states it has already been
-    fitted to and the first does not, so only the gap between them separates a
-    critic that is fitting from one that is memorizing the batch.
-    """
-    model_config = ModelConfig(
-        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
-    )
-    # Pinned because the readings below are compared against thresholds, and an
-    # unseeded init makes those a property of whichever tests ran first: this
-    # file seeds nothing, so the global stream's position when it arrives here
-    # decides the numbers. It previously drew a last-epoch fit of 0.052 -- below
-    # this test's own floor -- purely because tests were added above it.
-    torch.manual_seed(6)
-    actor = FarmActor(model_config)
-    critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=32, sampling_seed=3)
-    # A fresh game's shaped rewards are all around 1e-9, which leaves the
-    # targets with no variance for a critic to explain. This is the reward
-    # scale a real episode reaches.
-    rollout.rewards[:] = (
-        np.random.default_rng(11).normal(0.0, 0.3, size=rollout.rewards.shape).astype(np.float32)
-    )
-    # Warmup is off and the critic learning rate is an order of magnitude above
-    # production because 64 states have to be fitted inside one test: the
-    # default 32-step warmup would not have finished ramping before the update
-    # ends. `critic_epochs` above `epochs` is exactly the critic-only refit the
-    # production warm-start phase runs.
-    #
-    # The rate is in NorMuon units, where it is the fraction of itself a matrix
-    # moves per step; the 3e-3 this read under AdamW was an absolute per-element
-    # step, worth `3e-3 * sqrt(fan_in)` relative at this model's width of 16.
-    # Keeping the same relative step is what keeps this a test of the metrics
-    # rather than of the optimizer.
-    config = PpoConfig(
-        epochs=1,
-        critic_epochs=24,
-        minibatch_size=32,
-        use_bfloat16=False,
-        lr_warmup_steps=0,
-        critic_learning_rate=1.2e-2,
-    )
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-
-    # A randomly initialized distributional critic predicts one constant for
-    # every state, which makes `Var(A)` exactly `Var(G_lambda)` and the
-    # conventional reading exactly zero -- true, but degenerate, and it would
-    # let the identity below hold as 0 == 0. One discarded update moves the
-    # critic off that constant so the identity is checked against real numbers.
-    update_ppo(
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
-        rollout,
-        config,
-        generator=np.random.default_rng(4),
-    )
-    metrics = update_ppo(
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
-        rollout,
-        config,
-        generator=np.random.default_rng(5),
-    )
-
-    assert metrics["value_prediction_std"] > 0.0
-    # The policy-lambda EV is an algebraic identity of A and G_policy, not a
-    # critic-fit score. The fit reading is the one that can see a working
-    # refit; this test keeps them distinct.
-
-    # The fit reading is materially positive on a critic the conventional
-    # reading calls weak, and their separation is what the pair exists for.
-    # The long discounted suffix increases the target's explained variance;
-    # this pinned fixture reads a 2.66x separation. A factor of two still fails
-    # if the fit reading collapses toward the algebraic identity without
-    # encoding an exact threshold for one sampled return distribution.
-    assert metrics["critic_fit_explained_variance_last_epoch"] > 0.1
-    assert metrics["critic_fit_explained_variance_last_epoch"] > 2.0 * abs(
-        metrics["lambda_return_explained_variance"]
-    )
-
-    # Twenty-four critic epochs over 64 states is deliberately the memorizing
-    # end of the scale, so the in-sample reading must sit above the epoch that
-    # scored those states before this update had fitted them. Equality would
-    # mean the pair carries one number twice.
-    assert (
-        metrics["critic_fit_explained_variance_last_epoch"]
-        > metrics["critic_fit_explained_variance_first_epoch"]
-    )
 
 
 def test_advantage_statistics_match_the_surrogate_advantages() -> None:

@@ -20,9 +20,14 @@ import numpy as np
 import torch
 import torch._dynamo
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig, parameter_count
-from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
+from kaggriculture.modelargs import (
+    CALIBRATED_MODEL_FIELDS,
+    add_model_config_arguments,
+    model_config_from_args,
+)
 from kaggriculture.ppo import (
     MAX_FIRST_MINIBATCH_KL,
     MAX_UPDATE_REPLAY_KL,
@@ -60,10 +65,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.structured_dynamics import (
-    StructuredCriticDynamics,
-    StructuredDynamics,
-)
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.training import rollout_diagnostics
 
@@ -206,6 +208,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
+    parser.add_argument(
+        "--policy-loss-reduction",
+        choices=("components", "states"),
+        default=_PRODUCTION_PPO["policy_loss_reduction"],
+    )
+    parser.add_argument(
+        "--policy-ratio-scope",
+        choices=("components", "joint"),
+        default=_PRODUCTION_PPO["policy_ratio_scope"],
+    )
+    parser.add_argument(
+        "--structured-latent-coefficient",
+        type=float,
+        default=_PRODUCTION_PPO["structured_latent_coefficient"],
+    )
+    parser.add_argument(
+        "--structured-decision-coefficient",
+        type=float,
+        default=_PRODUCTION_PPO["structured_decision_coefficient"],
+    )
     parser.add_argument(
         "--max-update-replay-kl",
         type=float,
@@ -487,6 +509,10 @@ def main() -> None:
             "critic_epochs": args.critic_epochs,
             "minibatch_size": args.minibatch_size,
             "target_kl": args.target_kl,
+            "policy_loss_reduction": args.policy_loss_reduction,
+            "policy_ratio_scope": args.policy_ratio_scope,
+            "structured_latent_coefficient": args.structured_latent_coefficient,
+            "structured_decision_coefficient": args.structured_decision_coefficient,
             "use_bfloat16": not args.no_bfloat16,
             "update_compile_mode": args.update_compile_mode,
         }
@@ -572,25 +598,36 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
             torch.cuda.empty_cache()
-        if args.init_actor_from is None:
-            actor = architecture.actor_class(model_config).to(device)
-        else:
-            actor, _ = load_actor_artifact(args.init_actor_from, device=device)
-            if actor.config.to_dict() != model_config.to_dict():
+        actor = architecture.actor_class(model_config).to(device)
+        if args.init_actor_from is not None:
+            pretrained, _ = load_actor_artifact(args.init_actor_from, device=device)
+            artifact_config = pretrained.config.to_dict()
+            expected_config = model_config.to_dict()
+            # A pretrained actor does not constrain its fresh critic's readout.
+            for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
+                artifact_config.pop(name)
+                expected_config.pop(name)
+            if isinstance(model_config, StructuredConfig):
+                for name in ("critic_core_layers", "critic_latents", "critic_state_read"):
+                    artifact_config.pop(name)
+                    expected_config.pop(name)
+            if artifact_config != expected_config:
                 raise ValueError("initial actor model configuration does not match benchmark")
+            actor.load_state_dict(pretrained.state_dict())
+            del pretrained
         critic = architecture.critic_class(model_config).to(device)
-        # Match production construction order: predictor initialization must not
-        # perturb the actor/critic parameters a benchmark case starts from.
-        structured_dynamics = (
-            StructuredDynamics(model_config).to(device)
-            if isinstance(model_config, StructuredConfig)
-            and ppo_config.structured_actor_auxiliary_active
-            else None
-        )
+        # Keep critic and critic-predictor initialization independent of whether
+        # the optional actor predictor is enabled.
         structured_critic_dynamics = (
             StructuredCriticDynamics(model_config).to(device)
             if isinstance(model_config, StructuredConfig)
             and ppo_config.structured_critic_auxiliary_active
+            else None
+        )
+        structured_dynamics = (
+            ActorDynamics(model_config).to(device)
+            if isinstance(model_config, StructuredConfig)
+            and ppo_config.structured_actor_auxiliary_active
             else None
         )
         frozen_opponent_state = {
@@ -755,7 +792,7 @@ def main() -> None:
             # inflated KL at unchanged weights trips the trust region on
             # minibatch zero, so checking update counts first would report the
             # symptom instead of the cause.
-            first_minibatch_kl = float(update_metrics["first_minibatch_approx_kl"])
+            first_minibatch_kl = float(update_metrics["first_minibatch_component_kl"])
             if first_minibatch_kl > args.max_first_minibatch_kl:
                 raise RuntimeError(
                     "first-minibatch KL at unchanged weights exceeded "

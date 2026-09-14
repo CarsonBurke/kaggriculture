@@ -31,6 +31,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.league import load_actor_snapshot
 from kaggriculture.ppo import (
     PpoConfig,
@@ -49,7 +50,7 @@ from kaggriculture.production import (
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, collect_self_play_rust
 from kaggriculture.structured import StructuredConfig
-from kaggriculture.structured_dynamics import StructuredCriticDynamics, StructuredDynamics
+from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
@@ -211,9 +212,9 @@ def main() -> None:
     for rate in args.learning_rates:
         candidate_actor = copy.deepcopy(actor)
         candidate_critic = copy.deepcopy(critic)
-        candidate_dynamics = StructuredDynamics(model_config).to(device)
+        candidate_dynamics = ActorDynamics(model_config).to(device)
         candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
-        candidate_dynamics.load_state_dict(member_state["structured_dynamics"])
+        candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
         candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         # lr_warmup_steps is zeroed so the measured rate is the rate applied on
         # every one of the 113 steps. With warmup left on, the early steps run

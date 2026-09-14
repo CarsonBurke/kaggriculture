@@ -27,21 +27,17 @@ from kaggriculture.structured import (
     FeedForward,
     FusedFeedForward,
     StructuredActor,
-    StructuredBelief,
     StructuredConfig,
     StructuredCritic,
     StructuredCriticBelief,
-    StructuredDecisionBelief,
     StructuredInputs,
     refresh_fused_mlp_fp8,
     stack_structured,
 )
 from kaggriculture.structured_dynamics import (
     StructuredCriticDynamics,
-    StructuredDynamics,
     _latent_smooth_l1,
     structured_critic_window_loss,
-    structured_horizon_loss,
 )
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
@@ -592,62 +588,126 @@ def test_structured_actor_exposes_typed_training_belief(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("fuse_unit_decoder", [False, True])
+@pytest.mark.parametrize("fuse_market_decoder", [False, True])
 @torch.autocast("cuda", dtype=torch.bfloat16)
-def test_actor_nextlat_predicts_heads_without_world_inputs_or_targets(
+def test_actor_auxiliary_export_preserves_policy_and_checkpoint(
     real_inputs: StructuredInputs,
+    fuse_unit_decoder: bool,
+    fuse_market_decoder: bool,
 ) -> None:
     torch.manual_seed(94)
-    actor = StructuredActor(_tiny_config()).cuda()
-    dynamics = StructuredDynamics(actor.config).cuda()
+    config = replace(
+        _tiny_config(),
+        fuse_unit_decoder=fuse_unit_decoder,
+        fuse_market_decoder=fuse_market_decoder,
+    )
+    actor = StructuredActor(config).cuda()
+    checkpoint = copy.deepcopy(actor.state_dict())
     inputs = StructuredInputs(*(value[:3].cuda() for value in real_inputs))
-    _, belief = actor.forward_with_belief(inputs)
-    source = StructuredBelief(*(value.detach().requires_grad_() for value in belief))
-    target = StructuredBelief(*(value.detach().clone().requires_grad_() for value in belief))
-    factors = {
-        "episode_index": torch.zeros(3, dtype=torch.long, device="cuda"),
-        "step": torch.arange(3, device="cuda"),
-        "unit_actions": torch.zeros(3, MAX_UNITS, dtype=torch.long, device="cuda"),
-        "market_kinds": torch.zeros(3, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
-        "market_quantities": torch.zeros(3, MAX_MARKET_ORDERS, dtype=torch.long, device="cuda"),
-    }
+    expected, bc_belief = actor.forward_with_belief(inputs)
+    output, belief = actor.forward_with_auxiliary_belief(inputs)
 
-    def loss(current, teacher):
-        return structured_horizon_loss(
-            dynamics,
-            current,
-            inputs,
-            factors,
-            decode=None,
-            decision_horizon=0,
-            latent_horizon=2,
-            patch_horizon=0,
-            own_patches_active=False,
-            target_belief=teacher,
-        ).latent
-
-    actual = loss(source, target)
-    changed_source = StructuredBelief(*(value * -100 for value in source[:5]), *source[5:])
-    changed_target = StructuredBelief(*(value * 100 for value in target[:5]), *target[5:])
-    torch.testing.assert_close(loss(changed_source, changed_target), actual, rtol=0, atol=0)
-    decisions = StructuredDecisionBelief(source.unit_decisions, source.market_decisions)
-    decision_targets = StructuredDecisionBelief(target.unit_decisions, target.market_decisions)
-    compact_loss = loss(decisions, decision_targets)
-    torch.testing.assert_close(compact_loss, actual, rtol=0, atol=0)
-    differentiated = (*decisions, *dynamics.parameters())
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    # Rematerializing the auxiliary-enabled trunk must preserve ordinary PPO
+    # gradients, not merely its forward values.
+    parameters = tuple(actor.parameters())
     expected_gradients = torch.autograd.grad(
-        actual, differentiated, retain_graph=True, allow_unused=True
+        sum(value.float().square().mean() for value in expected),
+        parameters,
+        allow_unused=True,
     )
-    compact_gradients = torch.autograd.grad(
-        compact_loss, differentiated, retain_graph=True, allow_unused=True
+    actual_gradients = torch.autograd.grad(
+        sum(value.float().square().mean() for value in output),
+        parameters,
+        allow_unused=True,
     )
-    torch.testing.assert_close(compact_gradients, expected_gradients, rtol=0, atol=0)
-    actual.backward()
-    assert all(value.grad is None for value in source[:5])
-    assert all(value.grad is None for value in target)
-    assert source.unit_decisions.grad[0].abs().sum() > 0
-    assert source.market_decisions.grad[0].abs().sum() > 0
-    assert dynamics.action.unit_action.weight.grad.abs().sum() > 0
-    assert source.unit_decisions.grad[-1].count_nonzero() == 0
+    torch.testing.assert_close(actual_gradients, expected_gradients, rtol=0, atol=0)
+    torch.testing.assert_close(belief.unit_decisions, bc_belief.unit_decisions, rtol=0, atol=0)
+    torch.testing.assert_close(belief.market_decisions, bc_belief.market_decisions, rtol=0, atol=0)
+    assert all(value.requires_grad for value in belief)
+    assert all(value.requires_grad for value in bc_belief)
+    torch.testing.assert_close(actor.auxiliary_belief(inputs), belief, rtol=0, atol=0)
+
+    # Auxiliary calls must leave the original checkpoint contract and ordinary
+    # inference intact, rather than registering a copied or nested decoder.
+    actor.load_state_dict(checkpoint, strict=True)
+    restored = StructuredActor(config).cuda()
+    restored.load_state_dict(actor.state_dict(), strict=True)
+    torch.testing.assert_close(restored(inputs), expected, rtol=0, atol=0)
+    torch.testing.assert_close(actor(inputs), expected, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("fused_mlp", [False, True])
+@torch.autocast("cuda", dtype=torch.bfloat16)
+def test_actor_auxiliary_frozen_decode_keeps_combined_policy_gradients(
+    real_inputs: StructuredInputs, fused_mlp: bool
+) -> None:
+    torch.manual_seed(95)
+    config = replace(
+        _tiny_config(),
+        model_dim=128,
+        attention_heads=4,
+        fused_mlp=fused_mlp,
+        fuse_unit_decoder=fused_mlp,
+        fuse_market_decoder=fused_mlp,
+    )
+    actor = StructuredActor(config).cuda().train()
+    if fused_mlp:
+        refresh_fused_mlp_fp8(actor, bootstrap_down=True)
+    inputs = StructuredInputs(*(value[:3].cuda() for value in real_inputs))
+    output, belief = actor.forward_with_auxiliary_belief(inputs)
+    predicted = -torch.cat(belief, dim=1)
+    predicted.retain_grad()
+    heads = DecodeHeads.from_actor(actor, normalized_units=True)
+    frozen_decode = torch.compile(
+        heads.decode, fullgraph=True, options=policy_compile_options("default")
+    )
+    student = frozen_decode(predicted)
+    teacher = heads.decode(torch.cat(tuple(value.detach() for value in belief), dim=1))
+    kinds = teacher.market_kind_logits.argmax(dim=-1)
+    student_logits = (
+        student.unit_logits,
+        student.market_kind_logits,
+        heads.quantity_logits(student.market_quantity_context, kinds),
+    )
+    teacher_logits = (
+        teacher.unit_logits,
+        teacher.market_kind_logits,
+        heads.quantity_logits(teacher.market_quantity_context, kinds),
+    )
+    auxiliary_loss = sum(
+        torch.nn.functional.kl_div(
+            current.log_softmax(dim=-1),
+            target.softmax(dim=-1),
+            reduction="batchmean",
+        )
+        for current, target in zip(student_logits, teacher_logits, strict=True)
+    )
+    policy_loss = sum(value.float().square().mean() for value in output)
+    decoder_parameters = tuple(
+        parameter
+        for name, parameter in actor.named_parameters()
+        if name.startswith(("unit_head.1.", "market_kind.", "market_quantity_"))
+    )
+    expected_gradients = torch.autograd.grad(
+        policy_loss, decoder_parameters, retain_graph=True, allow_unused=True
+    )
+    assert any(
+        gradient is not None and gradient.count_nonzero() > 0 for gradient in expected_gradients
+    )
+
+    (policy_loss + auxiliary_loss).backward()
+
+    assert predicted.grad is not None and predicted.grad.abs().sum() > 0
+    assert all(parameter.requires_grad for parameter in actor.parameters())
+    for parameter, expected_gradient in zip(decoder_parameters, expected_gradients, strict=True):
+        if expected_gradient is None:
+            assert parameter.grad is None
+        else:
+            torch.testing.assert_close(parameter.grad, expected_gradient, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -827,6 +887,73 @@ def test_structured_actor_gradients_reach_every_input_family(
         assert gradient is not None and gradient.abs().sum() > 0, f"no gradient into {name}"
 
 
+@pytest.mark.parametrize("actor_opponent_farm", [True, False])
+def test_actor_opponent_farm_gates_what_the_policy_can_see(
+    real_pairs: list[tuple[dict, dict]],
+    actor_opponent_farm: bool,
+) -> None:
+    """The knob is a contract about information, not a speed setting.
+
+    Disabled, the actor must be *exactly* invariant to the opponent half of the
+    tile tokens -- not approximately, since it never reads them. Enabled, it
+    must not be, or the knob would be measuring nothing. The centralized critic
+    keeps both farms either way, which is what makes it safe to gate: the value
+    function measurably uses the opponent board even where the policy does not.
+    """
+    torch.manual_seed(0)
+    config = replace(_tiny_config(), actor_opponent_farm=actor_opponent_farm)
+    actor = StructuredActor(config).eval()
+    critic = StructuredCritic(config).eval()
+
+    rows = [
+        encode_structured_observation(observation, opponent["private"])
+        for observation, opponent in real_pairs
+    ]
+    stacked, extras = stack_structured(rows)
+    assert extras is not None
+    critic_inputs = stacked._replace(
+        products=torch.cat((stacked.products, extras.products), dim=-1),
+        animals=torch.cat((stacked.animals, extras.animals), dim=-1),
+        crops=torch.cat((stacked.crops, extras.crops), dim=-1),
+    )
+    # The value readout initializes to zero so a fresh critic predicts zero for
+    # every state; give it a readout before asking what it depends on.
+    torch.nn.init.normal_(critic.value_head.weight, std=0.01)
+
+    def permute_opponent_half(inputs: StructuredInputs) -> StructuredInputs:
+        """Reverse the batch order of the opponent farm's tokens.
+
+        Every marginal of the input survives; only the pairing between a state
+        and its own opponent's board is destroyed.
+        """
+        half = slice(structured.TILE_COUNT, 2 * structured.TILE_COUNT)
+        categorical = inputs.tile_categorical.clone()
+        continuous = inputs.tile_continuous.clone()
+        categorical[:, half] = inputs.tile_categorical[:, half].flip(0)
+        continuous[:, half] = inputs.tile_continuous[:, half].flip(0)
+        return inputs._replace(tile_categorical=categorical, tile_continuous=continuous)
+
+    with torch.no_grad():
+        first = actor(stacked)
+        second = actor(permute_opponent_half(stacked))
+        critic_arguments = (extras.unit_categorical, extras.unit_continuous, extras.unit_active)
+        critic_first = critic(critic_inputs, *critic_arguments)
+        critic_second = critic(permute_opponent_half(critic_inputs), *critic_arguments)
+
+    if actor_opponent_farm:
+        assert not torch.equal(first.unit_logits, second.unit_logits)
+        assert hasattr(actor.trunk, "opponent_queries")
+    else:
+        torch.testing.assert_close(first.unit_logits, second.unit_logits, rtol=0, atol=0)
+        torch.testing.assert_close(
+            first.market_kind_logits, second.market_kind_logits, rtol=0, atol=0
+        )
+        # The unused query bank must not reach the optimizer or the checkpoint.
+        assert not hasattr(actor.trunk, "opponent_queries")
+        assert "opponent_queries" not in actor.trunk.adam_learning_rate_multipliers
+    assert not torch.equal(critic_first, critic_second)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("zero_init_branches", [False, True])
@@ -848,14 +975,16 @@ def test_state_read_uses_context_content_without_query_shortcut(zero_init_branch
     assert not torch.allclose(first[0], first[1])
 
 
+@pytest.mark.parametrize("scalar_value", [False, True])
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.autocast("cuda", dtype=torch.bfloat16)
 def test_structured_critic_exposes_only_normalized_value_head_input(
     real_pairs: list[tuple[dict, dict]],
+    scalar_value: bool,
 ) -> None:
     torch.manual_seed(0)
-    config = replace(_tiny_config(), critic_latents=5)
+    config = replace(_tiny_config(), critic_latents=5, scalar_value=scalar_value)
     critic = StructuredCritic(config).cuda()
 
     rows = [
@@ -875,9 +1004,9 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
     )
 
     initial = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
-    assert initial.shape == (batch, config.value_atoms)
+    assert initial.shape == (batch, 1 if scalar_value else config.value_atoms)
     assert torch.isfinite(initial).all()
-    # Zero-initialized head starts at the uniform distribution: value 0.
+    # Either zero-initialized readout predicts value zero.
     assert float(critic.value(initial).detach().abs().max()) == pytest.approx(0.0, abs=1e-5)
 
     torch.nn.init.normal_(critic.value_head.weight, std=0.01)
@@ -904,7 +1033,11 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
     torch.testing.assert_close(belief.value_decision, normalized, rtol=0, atol=0)
     torch.testing.assert_close(
         actual,
-        softcap_value_logits(critic.value_head(belief.value_decision[:, 0])),
+        (
+            critic.value_head(belief.value_decision[:, 0])
+            if scalar_value
+            else softcap_value_logits(critic.value_head(belief.value_decision[:, 0]))
+        ),
         rtol=0,
         atol=0,
     )

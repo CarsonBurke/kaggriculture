@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     _STRUCTURED_AUXILIARY_METRICS,
@@ -28,7 +29,6 @@ from kaggriculture.ppo import (
 from kaggriculture.provenance import file_sha256, source_identity
 from kaggriculture.rollout import collect_self_play_rust
 from kaggriculture.structured import StructuredActor
-from kaggriculture.structured_dynamics import StructuredDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 
@@ -81,7 +81,7 @@ def _staged_rollout(rollout: Any, device: torch.device) -> dict[str, Tensor]:
 
 def _measure(
     actor: StructuredActor,
-    dynamics: StructuredDynamics,
+    dynamics: ActorDynamics,
     staged: dict[str, Tensor],
     windows: np.ndarray,
     *,
@@ -169,15 +169,15 @@ def main() -> None:
     state = checkpoint_agent_states(payload)[agent]
     if "structured_dynamics" not in state:
         raise ValueError("checkpoint has no structured dynamics predictor")
-    trained = StructuredDynamics(actor.config).to(device)
-    trained.load_state_dict(state["structured_dynamics"])
+    trained = ActorDynamics(actor.config).to(device)
+    trained.load_state_dict(state["structured_dynamics"], strict=True)
 
     devices = [device.index or 0] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(args.control_seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.control_seed)
-        control = StructuredDynamics(actor.config).to(device)
+        control = ActorDynamics(actor.config).to(device)
 
     rollout = collect_self_play_rust(
         actor,

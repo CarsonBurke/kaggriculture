@@ -13,8 +13,10 @@ selected. Passing a flag that belongs to another family is an error rather
 than a silent no-op, because an ignored ``--transformer-layers`` on a
 structured run would otherwise report a model that was never trained.
 
-The value-support fields are deliberately absent: they are calibrated with
-the reward scale, not tuned per run.
+The value bounds and atom count remain calibrated with the reward scale.
+Gaussian smoothing is tunable independently of that support: changing the bin
+count while retaining the same sigma/bin ratio also changes the return-space
+bandwidth (HL-Gauss, arXiv:2403.03950, section 5.1.2).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 from kaggriculture.registry import ARCHITECTURES, Architecture
 
-CALIBRATED_MODEL_FIELDS = frozenset(("value_atoms", "value_min", "value_max", "value_sigma_ratio"))
+CALIBRATED_MODEL_FIELDS = frozenset(("value_atoms", "value_min", "value_max"))
 
 
 def _flag(field_name: str) -> str:
@@ -72,6 +74,7 @@ def _field_parser(annotation: Any):
     if annotation is bool:
         return _parse_bool
     if origin is tuple and get_args(annotation) == (int, Ellipsis):
+
         def parse_tuple(value: str) -> tuple[int, ...]:
             try:
                 return tuple(int(part) for part in value.split(",") if part)
@@ -81,9 +84,10 @@ def _field_parser(annotation: Any):
                 ) from error
 
         return parse_tuple
-    if annotation in (int, str):
+    if annotation in (int, float, str):
         return annotation
     raise TypeError(f"unsupported model-config field type: {annotation!r}")
+
 
 def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
     """Add every family's structural flags, each defaulting to its dataclass value."""
