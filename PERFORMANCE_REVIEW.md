@@ -613,6 +613,199 @@ polynomial preserves the zero block and the Frobenius norm is unchanged.
 - **Telemetry/provenance hashing:** TensorBoard mirroring and journal hashing are incremental;
   provenance hashing is launch-time work. Neither is inside the environment or minibatch loop.
 
+## Memory-traffic pass (RTX 5090, 12.6 s steady iteration)
+
+The iteration is faster and differently shaped than the executive summary above:
+13.440 s steady total on `artifacts/benchmarks/baseline-sdpa-b1.jsonl` (rollout
+2.919 s, update 10.396 s, of which minibatch 9.06 s, behaviour replay 1.21 s,
+staging 0.07 s). Every number in this section is a matched pair from one frozen
+tree, one command, one flag apart, run adjacent through `mlq`.
+
+### The actor forward is 15x memory-bound
+
+`scripts/probe_forward_traffic.py` accounts every aten op under `FakeTensorMode`
+and a `TorchDispatchMode` on a fake CUDA device, so it allocates nothing and can
+size the production shape directly. At 6,400 rows in bf16 the actor forward is
+485.3 GFLOP against 58.30 GiB of traffic: a 2.32 ms compute floor against a
+34.93 ms traffic floor, **15.1x memory-bound**. The fp32 arm reads 136.84 GiB.
+
+| Call site | Traffic | Share |
+|---|---:|---:|
+| `trunk.farm_local` | 26.47 GiB | 45.4% |
+| `trunk.core` | 14.42 GiB | 24.7% |
+| `trunk.tiles` | 6.97 GiB | 12.0% |
+| `trunk.latent_read` | 2.34 GiB | 4.0% |
+| `unit_local_decoder` | 1.11 GiB | 1.9% |
+| `trunk.opponent_summary` | 0.86 GiB | 1.5% |
+
+This is an upper bound on unfused traffic, not a prediction of realized time:
+`aten.add` and `aten.mul` alone are 29.3 GiB (50%), and Inductor fuses most of
+that into neighbouring kernels. Its use is ranking, and it ranks one structural
+cost far above the rest.
+
+### P0 landed: the actor's opponent farm is 30% of its forward traffic
+
+Both farms run the shared `farm_local` blocks, and the opponent half reaches the
+rest of the actor only through eight summary tokens. Half of `farm_local`, half
+of `trunk.tiles`, and all of `opponent_summary` is 17.58 GiB -- **30.2%** of the
+actor forward.
+
+`scripts/ablate_opponent_farm.py` asks what the policy does with it. It permutes
+the opponent half across a batch of real states, which preserves every marginal
+and destroys only the pairing, and uses the same permutation of the actor's *own*
+farm as a positive control and a value-decorrelation ceiling for the critic.
+
+| Checkpoint | Opponent unit KL | Greedy actions changed | Own-farm KL | Own-farm changed |
+|---|---:|---:|---:|---:|
+| iteration 0 | 3.06e-5 | 0.19% | 4.12 | 64.8% |
+| iteration 110 | 1.70e-5 | 0.15% | 3.95 | 62.1% |
+| iteration 390 | 1.34e-5 | 0.04% | 3.80 | 59.9% |
+
+The insensitivity is present at random initialization and *grows* with training,
+so it is a property of the architecture, not a conclusion the policy reached.
+The critic is the opposite: its value shift against the decorrelation ceiling is
+0.34-0.55 for the opponent farm against 0.51-0.66 for its own, so the
+centralized critic genuinely uses both boards. The two trunks share no
+parameters, which is what makes the actor's half separable.
+
+`StructuredConfig.actor_opponent_farm` gates it. `private_columns` forces the
+path on regardless, so the critic is never affected.
+
+The whole-iteration benchmark was run twice per arm, on two trees that differ
+only in the peer's `value_atoms` 101-to-255 change, with identical workload
+shape (128 self-play + 64 league, 720 steps, one seed) in all four:
+
+| Metric | On (6886) | Off (6887) | On2 (6890) | Off2 (6889) |
+|---|---:|---:|---:|---:|
+| Steady iteration | 12.623 s | 12.079 s | 12.649 s | 10.647 s |
+| Steady update | 9.720 s | 9.167 s | 9.732 s | 8.254 s |
+| Steady rollout | 2.780 s | 2.789 s | 2.799 s | 2.293 s |
+| Iterations/hour | 285.2 | 298.0 | 284.6 | 338.1 |
+| Actor parameters | 975,358 | 929,238 | 975,358 | 929,238 |
+| Critic parameters | 868,125 | 868,125 | 868,125 | 868,125 |
+
+**Raw, the direction replicates and the magnitude does not:** -4.31% in the
+first pair, -15.83% in the second. Of the raw table only the parameter counts
+are exact. Two confounds account for the gap, and correcting for both makes the
+pairs agree to 0.03%; the reconciliation is below.
+
+Both confounds invalidate the first write-up of this result, which quoted
+-4.31% as "about six times the noise" on the strength of a 0.8-1.0% within-arm
+spread.
+
+*Within-arm spread is the wrong noise estimate.* Two consecutive steady
+iterations in one process share clock, cache, and allocator state, so their
+agreement measures nothing about the gap between two processes. This benchmark
+carries its own control for that: `structured_critic_auxiliary_seconds` must be
+invariant to this flag, since the critic's opponent path is forced on. It
+recorded 2.653, 2.656, 2.868, and 2.587 s across the four arms -- **10.9%**
+between two numbers that are required to be equal. That is the real floor, and
+it is larger than the first pair's entire effect.
+
+*The arms do not replay the same work.* The flag changes the policy, so the
+arms play different games and replay different amounts of work: active unit
+rows are 327,744/327,748 with the farm on against 309,015/309,000 with it off,
+**5.65% fewer rows**. That is a real consequence of the flag in an on-policy
+loop, and it belongs in a throughput claim, but it is not the same work going
+faster and must not be quoted as one.
+
+#### The paired measurement
+
+`scripts/bench_opponent_farm_pair.py` removes both confounds by construction:
+one identical 6,400-row batch, both arms interleaved in rotating order inside
+one process, plus an A/A null arm -- a second, independently built
+opponent-farm actor -- that measures the harness's own noise. Compiled
+`default`, bf16 autocast, 20 timed steps per arm
+(`artifacts/benchmarks/opponent-farm-paired.json`, mlq 6903):
+
+| Arm | Forward | Backward | Total | vs `on` |
+|---|---:|---:|---:|---:|
+| `on` | 36.32 ms | 80.82 ms | 116.35 ms | -- |
+| `off` | 25.97 ms | 57.46 ms | 83.15 ms | **-28.54%** |
+| `on-null` | 35.16 ms | 80.35 ms | 115.83 ms | -0.45% |
+
+The effect is 63x the null gap, and forward and backward agree independently
+(-28.5%, -28.9%). It also lands within two points of what the traffic probe
+predicted from bytes alone (-30.2%), which is the strongest evidence in this
+document that the actor really is bandwidth-bound: removing 30% of its bytes
+removed 28.5% of its time.
+
+#### Reconciling the whole-iteration arms
+
+Dividing each arm's phases by its own control factor makes the two pairs agree,
+and the agreement is checked against an invariant the correction did not use --
+`update_behavior_replay_seconds` is critic replay, so it must not move:
+
+| Phase | `on` | `on2` | `off` | `off2` | off arms differ | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Minibatch | 8.519 s | 8.518 s | 7.256 s | 7.254 s | 0.03% | **-14.83%** |
+| Behaviour replay | 1.104 s | 1.103 s | 1.117 s | 1.110 s | 0.59% | +0.89% |
+| Rollout | 2.781 s | 2.798 s | 2.581 s | 2.353 s | 9.70% | -11.56% |
+| Advantage + staging + finalize | 0.101 s | 0.103 s | 0.109 s | 0.103 s | 5.4% | +4.7% |
+| Opponent setup | 0.124 s | 0.118 s | 0.114 s | 0.103 s | 11.28% | -10.43% |
+| Iteration | 12.635 s | | 11.050 s | | | **-12.54%** |
+
+Two independent off arms agreeing to 0.03% on the minibatch, and a
+flag-invariant phase landing at +0.89%, is what makes the correction credible
+rather than curve-fitted. The defensible numbers:
+
+- **Actor forward plus backward, fixed batch: -28.54%** (paired, null -0.45%).
+- **Minibatch at equal replayed rows: -9.73%** (-14.83% of which 5.65% is fewer
+  rows). Independently reproduced by both pairs to 0.01%.
+- **Iteration, machine-corrected: -12.54%**, including the row reduction.
+- Rollout does improve, contradicting the first write-up's claim that it "did
+  not move": the flat +0.33% in the raw first pair was that arm's 8% slowness
+  cancelling a real gain. But the two off arms still differ by 9.70% here, so
+  the rollout share is only bounded, not measured -- somewhere near -8% to -16%.
+  The environment step is flag-invariant; the sampling forward is not.
+
+**The default is `True`.** Disabling it is a learning change, not a speedup: an
+actor that cannot see the opponent's board cannot learn to react to it, and the
+ablation cannot distinguish "this information is useless here" from "this path is
+too narrow to carry it". It is a ready A/B arm carrying roughly a 12% throughput
+credit, not a free win.
+
+### P1: the fused-attention head pad is a 6.5% structural tax
+
+`model_dim=80` over 4 heads gives head_dim 20, and the memory-efficient CUDA
+kernel requires a multiple of 8, so `_fused_attention` pads q/k/v to 24 and
+slices the result back. That is `aten.constant_pad_nd` at 3.78 GiB, **6.5%** of
+the actor forward, on tensors the kernel then reads in full. The remedy is not a
+code change but a shape choice: any `(model_dim, heads)` pair whose head_dim is a
+multiple of 8 removes the pad, the reverse slice, and the contiguity pressure on
+the GQA fold. It is a learning change and belongs in the next architecture sweep,
+not in a performance patch.
+
+### Rejected this pass: flash SDPA
+
+Forcing the flash backend won 2.6x on the isolated attention kernel and lost
+end-to-end. Matched arms (mlq 6866 flash, 6863 baseline) put
+`update_minibatch_seconds` at 9.390/9.208 against 9.144/8.979 -- **2.6% slower**.
+A replay-parity audit found no numerical win either: 5.14e-15 against 6.68e-15,
+both at the float floor under a 5e-3 bound. The working hypothesis, unproven, is
+that flash's stricter layout requirements combine with the GQA fold and the 20-to-24
+pad to force contiguous q/k/v copies that the efficient kernel avoids. The
+change was reverted; `src/kaggriculture/structured.py` is at HEAD for attention.
+
+### Confirmed healthy: the host/device data path
+
+Checked and found already at the limit, so that no one re-audits it: Rust-to-numpy
+is zero-copy through `try_readwrite()` (`rust/kagg_env/src/python.rs:105,123`);
+the host arena is pinned int8/fp16 (`rollout.py:174-192`); transport is a single
+fused uint8 upload; there is one D2H sync per wave (`rollout.py:749-752`) and
+guard readbacks are batched (`ppo.py:2320-2322,3427`). Staging runs at 45.9 GB/s,
+which is PCIe line rate. A serialization-format change here would be a
+regression.
+
+### Open, not scheduled: `FrozenActorPool.acquire` caches by slot
+
+`league.py:308-327` keys its cache on slot position rather than content, so a
+steady iteration reloads about eight frozen actors it already holds.
+`steady_opponent_setup_seconds_median` is 0.115-0.125 s, roughly 0.9% of the
+iteration. Left alone deliberately: the fix has to preserve the lane-identity
+invariant that Dynamo and the CUDA graphs depend on, and 0.9% does not buy that
+risk yet.
+
 ## Recommended implementation order
 
 1. Run the critic-epoch longitudinal A/B. This has the largest measured whole-iteration payoff and

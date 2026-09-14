@@ -2462,3 +2462,78 @@ Every item in 1-4 bumps `OBSERVATION_SCHEMA_VERSION`, which hard-rejects every
 existing BC artifact (`structured.py:113-116`), so they belong in one v4 rather
 than four.
 
+## HL-Gauss bandwidth revisit (2026-09-14)
+
+Actor NextLat was abandoned; its coefficients remain zero. The starting
+categorical arm is job 6914, `production-hlgauss-dreamer-p500-20260913`.
+Despite its name this is raw-return HL-Gauss, not a full Dreamer critic:
+255 atoms on `[-2.2,2.2]`, no symlog, no two-hot targets, and no EMA.
+
+The [HL-Gauss paper](https://arxiv.org/pdf/2403.03950), section 5.1.2,
+motivates tuning smoothing in return units independently of discretization.
+Moving from 101 to 255 atoms while retaining sigma/bin `0.75` narrowed the
+Gaussian from sigma `0.033` to `0.0129921`. The implementation otherwise
+matches integrated, normalized Gaussian labels and categorical cross-entropy.
+Its sigmoid logit cap is a separate repository choice, not prescribed by the
+paper; historical cap benefits do not establish current saturation.
+
+Job **6944** tests only sigma/bin **0.75 -> 3.0** (raw sigma **0.0519685**).
+The new shared `--value-sigma-ratio` flag avoids editing defaults for trials;
+actor-only BC loading permits the critic-only override. Actor, critic and
+head learning rates, optimizer, softcap, zero initialization, critic auxiliary
+1/1 plain sum, seed, BC checkpoint, 6400 minibatch, league and compilation
+modes remain matched. Current source explicitly records
+`actor_opponent_farm=True`, equivalent to the old always-on path.
+
+Frozen source: `ff0c0357999f15178673e70b86c2e13dab5357454b7a42c809e5320bed518f68`.
+Run: `runs/production-hlgauss-bandwidth3-p500-20260914`.
+Both trials had a 25-minute queue cap, concurrency one, and native autocull.
+The new trial completed **96 waves**, versus **119** for the old arm, then
+hit the cap without a numerical failure. Actor release moved **17 -> 16**.
+
+Matched waves **77-96**, arithmetic means of per-wave metrics:
+
+| Metric | Original HL | Wider HL | Change |
+|---|---:|---:|---:|
+| Pre-update Monte Carlo EV | 0.696181 | 0.713530 | +0.017349 |
+| Pre-update Monte Carlo MSE | 0.005698 | 0.005630 | -1.20% |
+| Combined critic gradient norm | 53.154845 | 52.720756 | -0.82% |
+| Online money | 51,216.59 | 52,069.70 | +1.67% |
+| Rollout entropy | 0.163572 | 0.156776 | lower |
+| Seconds/wave | 12.150965 | 14.142334 | +16.39% |
+| Value cross-entropy | 2.775750 | 3.025229 | different label entropy |
+
+The first ten frozen-actor waves remain nearly flat: mean rollout EV
+`0.001459 -> 0.001659`. Thus bandwidth alone does not explain the early
+mean-learning delay or solve the large critic gradients. Those gradients
+combine CE and the critic auxiliary; neither their norm nor small auxiliary
+losses identify objective interference.
+
+At the same wall-clock cap, final-20-wave EV is **0.713530 versus 0.753328**.
+Compilation costs differ and an unmanaged external GPU workload was present;
+both rollout and update were slower, so the entire slowdown cannot be
+attributed to smoothing. The realized compute-budget result nevertheless
+does not establish a win.
+
+Last external evaluations, wider checkpoint 83 versus original checkpoint
+102, scored starter **4/4 vs 4/4**, public-v27 **3/4 vs 4/4**, and public-v16
+**3/4 vs 0/4**. Each opponent uses only two paired seeds; these mixed,
+high-uncertainty results do not establish stronger play.
+
+**Not promoted.** Scalar remains the default and categorical sigma/bin stays
+`0.75`. This was a modest per-update improvement, not an optimal HL-Gauss
+configuration. Before another readout/optimizer change, measure marginal
+sharpening, raw cap derivatives, and separate CE/auxiliary parameter gradients;
+the present evidence cannot select the mechanism.
+
+Verification job **6943** passed three parser/warm-start regressions, including
+bit-identical compiled BF16 actor outputs after a critic smoothing override.
+Compiled Gaussian checks over 8193 targets in `[-2,2]` measured maximum mean
+bias `6.70e-6` at sigma/bin 3.0. Interior label entropy rises from approximately
+**1.2003 to 2.5222 nats**; CE includes that floor and conditional uncertainty,
+so raw CE is not a comparable scalar-error metric across the arms.
+
+Evidence: `artifacts/probes/hlgauss-bandwidth-20260914/{experiment,analysis,comparison,numerics}.json`.
+Latest recovery checkpoint is wave 83; the final actor snapshot is wave 96.
+The temporary numerical verifier was removed after success; job logs retain
+its measured output. No automatic retry or further trial was launched.

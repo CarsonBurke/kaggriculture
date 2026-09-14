@@ -11,6 +11,22 @@ checkpoint can bypass that initialization. An exact batched Rust simulator suppl
 high-throughput rollouts; the pinned Kaggle environment remains the parity
 oracle and final evaluator.
 
+The default critic uses categorical HL-Gauss cross-entropy with 255 linearly
+spaced, exactly mirrored bins on `[-2.2, 2.2]`, tail-stable Gaussian mass
+calculations, FP32 capped logits, and a paired expectation reduction.
+`--value-sigma-ratio` tunes Gaussian sigma in bin widths (default `3.0`,
+or `0.05197` in return units). The former `0.75` setting gives sigma `0.01299`.
+`--scalar-value true` selects the unclipped scalar half-squared-error ablation;
+the value-support and smoothing fields are inert in that mode.
+Smoothing is independent of the support and may differ from an actor-only BC
+checkpoint; a training resume still requires identical model configuration.
+The [HL-Gauss paper](https://arxiv.org/pdf/2403.03950), section 5.1.2, motivates
+tuning return-space bandwidth rather than assuming the same ratio remains
+appropriate after changing bin count. Compare rollout value accuracy and policy
+performance, not raw cross-entropy across smoothing settings: the interior
+label-entropy floor rises from about `1.2003` to `2.5222` nats for those ratios.
+The categorical arm uses neither symlog nor a critic EMA.
+
 Install development and training dependencies, then run the CPU-safe default
 validation path:
 
@@ -188,9 +204,11 @@ ms per step against 5.035 ms, a projected rollout phase of 6.76 s against
 current numerical contract; source-bound calibration must be regenerated after
 changing operators or compiler settings.
 
-PPO clips each active conditional action ratio independently. Policy loss, KL,
-clipping statistics, and entropy are means over genuine active components, not
-means of per-state means. The stopping threshold remains `target_kl = 0.03`.
+PPO clips each active conditional action ratio independently. By default, policy
+loss sums active component surrogates within each state and averages over valid
+states. KL, clipping statistics, and entropy remain means over genuine active
+components, not means of per-state means. The stopping threshold remains
+`target_kl = 0.03`.
 Static minibatch padding has zero
 loss/gradient/metric weight, and every epoch gets a fresh permutation. Auxiliary
 trajectory plans follow that permutation and exclude padding. The native horizon
@@ -246,30 +264,82 @@ execution removes that overhead without changing precision, batch size, or
 objectives; do not replace it with per-iteration `empty_cache()`, which discards
 the working set.
 
-NextLat jointly trains each updating source model and its independent predictor
-with one combined PPO/value-plus-auxiliary backward. At the normalized head-input
-boundary, actor and critic each mix `0.5*g_main + 0.5*||g_main||/||g_aux||*g_aux`,
-with the norms spanning all source fields and rows in that minibatch. This gives
-50/50 source-cotangent contributions, not equal scalar losses or a guarantee of
-equal parameter-gradient norms after the trunk Jacobian. A zero auxiliary
-cotangent preserves the main gradient; a zero main cotangent supplies no auxiliary
-representation update. Readout and predictor parameters retain their independent
-objectives. Production uses coefficient 1 for both SmoothL1 and decoded KL, at
-horizon 1. Successors and auxiliary readout weights remain stop-gradient.
-No second trunk traversal or Python parameter-gradient mixing is required.
+The production default is an HL-Gauss critic with **actor NextLat disabled** and
+plain-sum critic training: value loss plus coefficient-1 latent SmoothL1 and
+coefficient-1 decoded-value loss, at horizon 1. Critic source gradients are not
+norm-matched. For a scalar critic, decoded-value KL is unit-variance Gaussian KL
+(half squared mean error), not a degenerate one-category softmax. Distributional
+critics use categorical decoded KL over the same capped logits as their readout.
+
+Actor and critic use separate backbones and latent banks, with no shared
+parameters. The value loss remains attached through the critic's value decoder
+to its latent bottleneck and ViT; it never updates the actor backbone. Critic
+NextLat also trains its source backbone and predictor, but detaches its
+successor teacher and the value-head weights used for auxiliary decoding.
+Its categorical KL is teacher-to-student over the full value distribution.
+
+Actor NextLat is opt-in: set `--structured-latent-coefficient 1` and
+`--structured-decision-coefficient 1`. `ActorDynamics` jointly predicts the actor's
+shared post-`core_norm` latent bank (32 × 80 in production), before the unit and
+market entity decoders. Its input is the current bank and joint action; inactive
+unit actions and post-STOP market suffixes are masked. Latent SmoothL1 averages
+over every shared slot and feature of eligible contiguous successors, not over
+per-entity decision representations.
+
+Decoded KL passes the predicted bank through the **entire frozen entity decoder
+and policy readout**, using the same detached successor unit tokens, local tiles,
+economy tokens, and legality masks as the teacher. Cached successor decision
+tokens supply the teacher without another encoder/entity-decoder pass. Student
+and teacher final projections use identical FP32 arithmetic after BF16 entity
+decoding. Successor newborn-unit decisions and reached market roles participate;
+there is no entity-survival mask on the shared bank. This KL is conditional on
+successor entity context, not a standalone forecast of the full future policy.
+
+PPO and the auxiliary share one actor forward and one additive combined backward.
+Auxiliary actor gradients enter only the source shared bank; successor targets,
+side context, and all downstream decoder parameters are detached. Normal PPO
+gradients still train those decoders. There is no actor source-gradient balancing.
+
+The auxiliary-enabled actor trunk and frozen successor decoder use non-reentrant
+activation checkpointing: backward recomputes their intermediates rather than
+retaining both full activation graphs together. This trades compute for memory
+without splitting the PPO minibatch or adding optimizer steps/backward calls.
+
+This configuration remains experimental: contract tests establish gradient and
+execution correctness, not improved learning. The failed
+`production-nextlat-valid-p500-20260913` run used the removed decision-token
+attachment, not this shared-bank objective. Existing actor/BC parameter keys are
+unchanged, but old actor-predictor states are incompatible and rejected by strict
+loading. Warmup release still measures critic readiness, not predictor readiness;
+persistence scores remain diagnostic only.
+
+Both actor coefficients default to zero, so no actor predictor or predictor
+optimizer is constructed. `--structured-critic-gradient-balance` remains an
+experimental opt-in for critic-only 50/50 source-cotangent norm matching; the
+default is `--no-structured-critic-gradient-balance`.
+
+`--policy-loss-reduction states` is the default: each component ratio is clipped
+independently, then the summed surrogate is divided by valid states rather than
+active components. `components` retains the former control reduction. Padded
+rows contribute neither loss nor denominator. KL, entropy, and clipping
+diagnostics retain their component-normalized units, and learning rates are
+unchanged. PPO `approx_kl` uses the sampled-action estimator
+`exp(log_ratio) - 1 - log_ratio`, where `log_ratio = log_pi_new - log_pi_old`;
+it is not the full categorical KL used by critic NextLat.
 
 PPO has no patch, economy, or opponent-state prediction objectives. Its actor
-predictor reads decision representations and actions; its critic predictor reads
+predictor reads the shared latent bank and actions; its critic predictor reads
 the value representation and actions. Existing BC-only world-feature experiments
 remain separate from this PPO contract; they are not evidence for a world model.
-Actor critic-warmup and KL-stop phases still freeze the actor while fitting its
-predictor. Fresh-wave persistence scores are diagnostic only.
+When actor NextLat is enabled, critic-warmup and KL-stop phases still freeze the
+actor while fitting its predictor. Fresh-wave persistence scores are diagnostic
+only.
 
-PPO exports only unit/market decision beliefs across its compiled actor boundary;
-BC retains the full world-belief interface. Frozen actor predictor training uses
-a cached compiled BF16 belief-only forward, without unused policy logits. A
-released-actor backward warmup is discarded once per callable/configuration/shape,
-not once per frozen wave.
+PPO exports the shared bank and detached successor entity/teacher context across
+its compiled actor boundary; BC retains the full world-belief interface. Frozen
+actor predictor training uses a cached compiled BF16 belief-only forward,
+without unused policy logits. A released-actor backward warmup is discarded once
+per callable/configuration/shape, not once per frozen wave.
 
 Rollout statistics validate categorical support on existing host masks, avoiding
 two device-to-host boolean barriers per environment step. Unit/kind statistics
@@ -434,8 +504,9 @@ the shaping potential, including a potential-only baseline, grouped by opponent
 and time-to-go. High shaped-return explained variance alone is not evidence of
 long-horizon prediction. Every 25 iterations, gradient diagnostics report
 `structured_gradient_source_norm` and `structured_critic_gradient_source_norm`:
-NextLat's raw source-belief cotangent norms before balancing, not parameter-gradient
-norms or main/auxiliary cosine estimates. Observation does not change optimizer updates.
+the actor shared-bank and critic value-belief raw auxiliary cotangent norms,
+respectively. They are not parameter-gradient norms or main/auxiliary cosine
+estimates. Observation does not change optimizer updates.
 
 Fresh production training must be initialized from a BC actor through
 `--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no
@@ -510,8 +581,11 @@ unchanged; the full learning run measures the resulting optimization dynamics.
 
 Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
 plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup
-waves, either a 1000-money increase or a 0.01 value-loss decrease in the
-alpha-0.1 EMA resets patience. Thirty waves without either improvement force a
+waves, either a 1000-money increase or a value-loss decrease of
+`min(0.01, 1% of the reference loss)` in the alpha-0.1 EMA resets patience.
+The relative cap keeps small scalar-MSE improvements visible; raw MSE and
+HL-Gauss cross-entropy are not comparable strength metrics.
+Thirty waves without either improvement force a
 recovery checkpoint, emit `AUTOCULL`, and exit 75. State and configuration are
 checkpointed; use MLQ `--max-attempts 1`. These signals are not external
 strength: a collapsing policy can make value fitting easier and keep resetting
