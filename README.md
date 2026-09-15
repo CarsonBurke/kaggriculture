@@ -467,34 +467,36 @@ uses the actual terminal utility directly, and credit diagnostics omit the
 potential correction in this mode. Rollout composition rejects mixed reward
 modes; exact training resume requires the recorded reward mode to match.
 
-`--reward-mode terminal-outcome` also pays zero before termination, but replaces
-the final-bank margin with **+1 for a win, -1 for a loss, and 0 for a draw**.
+The default `--reward-mode terminal-outcome` pays zero before termination, then
+**+1 for a win, -1 for a loss, and 0 for a draw** instead of a final-bank margin.
 Win/draw comparisons follow the official floating-point bank scores. Native
 collection takes the sign of the terminal utility rather than comparing the
 separately rounded binary32 bank telemetry, which can turn close wins into ties.
 Credit diagnostics use the stored terminal outcome, without potential correction.
-This is an experimental override; the default remains dense shaped reward.
+Explicit `--reward-mode shaped` and `--reward-mode terminal-bank` remain available.
 
-The promoted dense VAPO temporal defaults are `--gamma 1`,
+The promoted VAPO temporal defaults are `--gamma 1`,
 `--actor-gae-lambda 0.972183588317107`, and `--critic-gae-lambda 1`.
 The actor value is `1 - 1 / (0.05 * 719)`, using VAPO's alpha `0.05` and the
 full game's 719 transitions. It is fixed for this game, not adapted per batch.
 
-The critic fits full, undiscounted Monte Carlo returns: for a complete trajectory,
-its shaped target at state `t` is `U[T] - P[t]`. Actor advantages instead use a
-shorter GAE trace, with geometric weight sum approximately 35.95 transitions,
+The critic fits full, undiscounted Monte Carlo returns: the default target at
+every valid state is the terminal win/loss/draw outcome. With explicit shaped
+reward, the target is instead `U[T] - P[t]`. Actor advantages use a shorter GAE
+trace, with geometric weight sum approximately 35.95 transitions,
 to reduce variance while relying on the critic for longer-term value. This is
 not a 36-turn planning cutoff; inaccurate critic predictions can bias the actor.
 Collection shaping, advantages, and value targets share gamma. Targets outside
 categorical support saturate at the outer atom, with the saturated fraction
 reported.
 
-These defaults were promoted from dense-reward trial **7010** at the user's
-direction. Reward utility, learning rates, architecture, PPO clipping, and
-auxiliaries are unchanged; this adopts VAPO's temporal settings, not every
-component of its training recipe. New direct, production, and calibrated
-launches inherit the defaults. Explicit experimental overrides and previously
-queued frozen commands retain their declared settings.
+The temporal settings were first promoted from dense-reward trial **7010**.
+The user subsequently selected **7122**, the HL-Gauss VAPO terminal-outcome LR3
+trial, as the new production default: terminal win/loss/draw reward and tripled
+actor/critic rates, retaining HL-Gauss, component PPO clipping/KL, architecture,
+and the existing auxiliary recipe. This adopts VAPO's temporal settings, not
+every component of its training recipe. New launches inherit the new defaults;
+explicit overrides and previously frozen commands retain their declared settings.
 
 The default trust region is `target_kl = 0.03` on the active-component mean KL.
 Its historical calibration does not establish the stopping frequency after
@@ -551,10 +553,11 @@ source-gradient regime from prior critic targets and optimizer moments. Older
 containers, including version 16, remain actor-readable when their observation
 schema matches, but are not resumable training states under the new objective.
 
-`credit_preupdate_*` reports critic error against terminal utility after removing
-the shaping potential, including a potential-only baseline, grouped by opponent
-and time-to-go. High shaped-return explained variance alone is not evidence of
-long-horizon prediction. Every 25 iterations, gradient diagnostics report
+`credit_preupdate_*` reports critic error against the rollout's terminal utility,
+grouped by opponent and time-to-go. Default outcome diagnostics use the stored
+terminal reward; shaped-mode diagnostics remove the known shaping potential and
+include a potential-only baseline. High shaped-return explained variance alone
+is not evidence of long-horizon prediction. Every 25 iterations, gradient diagnostics report
 `structured_gradient_source_norm` and `structured_critic_gradient_source_norm`:
 the actor head-input and critic value-belief raw auxiliary cotangent norms,
 respectively. They are not parameter-gradient norms or main/auxiliary cosine
@@ -562,8 +565,9 @@ estimates. Observation does not change optimizer updates.
 
 Fresh production training must be initialized from a BC actor through
 `--init-actor-from`. The actor enters RL with a fresh critic and optimizers, no
-persistent BC or KL term, and a critic-only warmup lasting at least ten
-iterations. Actor updates begin only after every member's previous fresh-wave
+persistent BC or KL term, and a critic-only warmup defaulting to a minimum of ten
+iterations (`--critic-warmup-iterations 10`). Actor updates begin only after
+that floor and after every member's previous fresh-wave
 pre-update Monte Carlo-return R-squared reaches 0.10; failure to reach
 that gate by iteration 40 stops the run instead of training against an unready
 baseline. Both production launchers reject a fresh random actor; `--resume`
@@ -578,9 +582,9 @@ float64 and uses strict intervals. Rounding fallback selects only positive mass;
 selected log-probabilities come from logits and the normalizer, without flooring
 underflowed probabilities.
 
-Actor and critic trunk base learning rates both default to `5e-5` (NorMuon
-matrices), with `1.75e-5` for their ordinary Adam parameter groups. Production
-sets the separate value-head Adam LR to approximately `1.45833e-4`, preserving
+Actor and critic trunk base learning rates both default to `1.5e-4` (NorMuon
+matrices), with `5.25e-5` for their ordinary Adam parameter groups. Production
+and the direct training CLI default the separate value-head Adam LR to `4.375e-4`, preserving
 its `25/3` boost over ordinary Adam groups. The raw training CLI accepts
 `--critic-head-lr` as an optional absolute override. Each group retains its own
 32-optimizer-step linear LR warmup and checkpointed state. NextLat predictors

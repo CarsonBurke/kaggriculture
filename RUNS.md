@@ -2858,3 +2858,69 @@ projections/FFNs. Static memory does not make projected KV reusable across
 independent layers. No architecture experiment has been queued here.
 Evidence and design constraints:
 `artifacts/probes/actor-head-joint-ablation-20260914/architecture-direction.json`.
+
+## Promoted terminal-outcome LR3 recipe and entity-only direction (2026-09-14)
+
+The user selected **7122**, HL-Gauss VAPO terminal-outcome LR3, as the best run
+so far. That selection is accepted directly; no new comparison was run to
+reconfirm it. Luna promoted the new-launch defaults:
+
+- Reward: terminal-only win/loss/draw **+1/-1/0**.
+- Actor/critic base LR: **0.00015**; ordinary Adam rate **0.0000525**.
+- Production/direct-CLI critic-head LR: **0.0004375**, via the existing formula.
+- Gamma **1**, actor lambda **0.972183588317107**, critic lambda **1** retained.
+- Minimum fresh-BC critic warmup **10 waves**. The readiness gate and 40-wave
+  deadline remain; this is distinct from 32 optimizer-step LR warmup.
+- HL-Gauss, component PPO ratios/KL, actor auxiliaries off and production critic
+  auxiliaries 1/1, architecture, and existing autocull remain unchanged.
+
+The production launcher's stale help advertising five warmup waves was corrected.
+Omitted fresh-BC warmup resolves to ten; explicit overrides remain usable.
+Resume restores its checkpoint's warmup state and receives no implicit warmup flag.
+Historical immutable jobs/snapshots are unchanged, and old reward modes remain
+explicit options. Checkpoint-following critic probes use their recorded reward
+mode and gamma rather than silently inheriting the new reward default.
+
+Verification: **11** focused reward/diagnostic/checkpoint-metadata tests passed;
+Ruff passed on twelve changed Python files. A separate non-model proof exercised
+direct and production CLI defaults, benchmark reward defaults, explicit old-mode
+and LR overrides, the ten-wave warmup floor/readiness gate, resume flag omission,
+and all 719 native game transitions. Default rewards were zero before terminal,
+then (-1,+1), (+1,-1), and (0,0) for the three win/loss/draw scenarios.
+
+### Revised architecture proposal: only 26 persistent entities
+
+This supersedes the earlier 32-token/six-scratch proposal. Keep exactly **16 unit
+and ten market-order tokens** as evolving state. Start with four rounds of
+entity self-attention, cross-attention to static memory, and one FFN per round,
+then feed actor heads directly from their corresponding tokens. Memory contains
+all 200 encoded farm tiles plus 20 economy tokens; remove generic core latents,
+opponent summary compression, and the separate output cross-decoders.
+Retain local farmer features at initialization and explicit ownership/position.
+
+A separate centralized critic follows the entity-workspace design and attention
+pools its final tokens into the normalized global value belief. Preserve the
+existing critic NextLat target on that pooled belief, not 26 new auxiliary
+targets. Keeping the existing sixteen private opponent-unit context tokens gives
+236 static critic-memory tokens while retaining only 26 evolving query tokens.
+
+For hardware alignment, compare 80/96/128 embedding widths, not extra entities.
+Four query heads give widths 20 (currently padded to 24), 24, and 32 respectively.
+An especially relevant candidate keeps the expensive 200-tile encoder at width
+80 and makes only the entity stream width 128. Its cross-attention can project
+80-wide memory directly to entity K/V without a separate widened-memory tensor.
+Current code explicitly selects memory-efficient SDPA; width 128 alone does not
+enable Flash. A historical isolated Flash win did not improve full update time.
+
+Static arithmetic, not runtime evidence: with four rounds and deliberately shared
+memory K/V, encoder-plus-reasoning MACs versus the current D80 actor are about
+0.816x for D80 throughout, 1.117x for D96 throughout, 1.859x for D128 throughout,
+and 1.104x for D80 tiles/D128 entities. Counts omit embeddings, normalization,
+gates, heads, layout/padding and backward. Shared K/V changes parameter sharing;
+per-round projections are a separate capacity control. Measure compiled BF16
+whole-update and rollout time, memory, and equal-budget learning rather than
+inferring speed from utilization or attention-pair counts.
+
+Architecture remains a proposal: no implementation, architecture benchmark or
+new architecture training job was launched. Evidence and calculation assumptions:
+`artifacts/probes/actor-head-joint-ablation-20260914/terminal-outcome-default-promotion.json`.
