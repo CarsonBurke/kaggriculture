@@ -74,11 +74,12 @@ def test_stage_rollout_includes_structured_unit_activity() -> None:
         states={"tile": np.ones((2, 3), dtype=np.float32)},
         unit_actions=np.zeros((2, 4), dtype=np.int64),
         unit_active=np.ones((2, 4), dtype=np.bool_),
+        market_active=np.ones((2, 4), dtype=np.bool_),
     )
 
     staged = module._stage_rollout(rollout, torch.device("cpu"))
 
-    assert set(staged) == {"tile", "unit_actions", "unit_active"}
+    assert set(staged) == {"tile", "unit_actions", "unit_active", "market_active"}
     assert staged["unit_active"].dtype == torch.bool
 
 

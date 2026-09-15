@@ -1473,6 +1473,7 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
         seed_start=230,
         sampling_seed=21,
         storage=arena,
+        reward_mode="terminal-bank",
     )
 
     assert rollout.architecture == STRUCTURED

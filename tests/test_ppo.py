@@ -2199,6 +2199,7 @@ def _structured_rollout_with_quantity_orders(
         seed_start=seed_start,
         episode_steps=EPISODE_STEPS if device == "cuda" else 8,
         sampling_seed=sampling_seed,
+        reward_mode="shaped",
         **(
             {"forward_autocast": True, "forward_mode": "inductor_graph"} if device == "cuda" else {}
         ),
