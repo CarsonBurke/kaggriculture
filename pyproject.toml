@@ -18,7 +18,7 @@ dev = [
 ]
 train = [
   "tensorboard>=2.18",
-  "torch>=2.8",
+  "torch>=2.13",
 ]
 
 [tool.hatch.build.targets.wheel]

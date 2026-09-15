@@ -1286,7 +1286,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "tensorboard", marker = "extra == 'train'", specifier = ">=2.18" },
-    { name = "torch", marker = "extra == 'train'", specifier = ">=2.8" },
+    { name = "torch", marker = "extra == 'train'", specifier = ">=2.13" },
 ]
 provides-extras = ["dev", "train"]
 
