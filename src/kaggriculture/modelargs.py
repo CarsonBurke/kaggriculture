@@ -45,11 +45,7 @@ CRITIC_ONLY_MODEL_FIELDS = frozenset(
 def actor_model_config(config: Any) -> dict[str, Any]:
     """Identity for actor-only loading, never training checkpoint recovery."""
     values = config if isinstance(config, dict) else config.to_dict()
-    return {
-        name: value
-        for name, value in values.items()
-        if name not in CRITIC_ONLY_MODEL_FIELDS
-    }
+    return {name: value for name, value in values.items() if name not in CRITIC_ONLY_MODEL_FIELDS}
 
 
 def _flag(field_name: str) -> str:

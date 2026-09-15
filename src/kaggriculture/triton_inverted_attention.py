@@ -19,11 +19,26 @@ from torch.autograd.function import once_differentiable
 
 @triton.jit
 def _column_lse_kernel(
-    query, key, query_valid, memory_valid, column_lse,
-    HQ: tl.constexpr, HKV: tl.constexpr, Q: tl.constexpr, M: tl.constexpr, D: tl.constexpr,
-    QS: tl.constexpr, KS: tl.constexpr, QMS: tl.constexpr, MMS: tl.constexpr,
-    HAS_MEMORY_MASK: tl.constexpr, SCALE: tl.constexpr,
-    BQ: tl.constexpr, BM: tl.constexpr, BD: tl.constexpr, PRECISION: tl.constexpr,
+    query,
+    key,
+    query_valid,
+    memory_valid,
+    column_lse,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    QMS: tl.constexpr,
+    MMS: tl.constexpr,
+    HAS_MEMORY_MASK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BQ: tl.constexpr,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
+    PRECISION: tl.constexpr,
 ):
     memory = tl.program_id(0) * BM + tl.arange(0, BM)
     lane = tl.program_id(1)
@@ -33,18 +48,16 @@ def _column_lse_kernel(
     qmask = tl.load(query_valid + batch * QMS[0] + rows * QMS[1], rows < Q, False)
     mmask = memory < M
     if HAS_MEMORY_MASK:
-        mmask = mmask & tl.load(
-            memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False
-        )
+        mmask = mmask & tl.load(memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False)
     q = tl.load(
-        query + batch * QS[0] + head * QS[1]
-        + rows[:, None] * QS[2] + features[None, :] * QS[3],
-        qmask[:, None] & (features[None, :] < D), 0,
+        query + batch * QS[0] + head * QS[1] + rows[:, None] * QS[2] + features[None, :] * QS[3],
+        qmask[:, None] & (features[None, :] < D),
+        0,
     )
     k = tl.load(
-        key + batch * KS[0] + kv_head * KS[1]
-        + memory[None, :] * KS[2] + features[:, None] * KS[3],
-        mmask[None, :] & (features[:, None] < D), 0,
+        key + batch * KS[0] + kv_head * KS[1] + memory[None, :] * KS[2] + features[:, None] * KS[3],
+        mmask[None, :] & (features[:, None] < D),
+        0,
     )
     scores = tl.dot(q, k, input_precision=PRECISION) * SCALE
     scores = tl.where(qmask[:, None] & mmask[None, :], scores, -float("inf"))
@@ -57,12 +70,30 @@ def _column_lse_kernel(
 
 @triton.jit
 def _output_kernel(
-    query, key, value, query_valid, memory_valid, column_lse,
-    output, output_fp32, row_lse,
-    HQ: tl.constexpr, HKV: tl.constexpr, Q: tl.constexpr, M: tl.constexpr, D: tl.constexpr,
-    QS: tl.constexpr, KS: tl.constexpr, VS: tl.constexpr,
-    QMS: tl.constexpr, MMS: tl.constexpr, HAS_MEMORY_MASK: tl.constexpr,
-    SCALE: tl.constexpr, BQ: tl.constexpr, BM: tl.constexpr, BD: tl.constexpr,
+    query,
+    key,
+    value,
+    query_valid,
+    memory_valid,
+    column_lse,
+    output,
+    output_fp32,
+    row_lse,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    QMS: tl.constexpr,
+    MMS: tl.constexpr,
+    HAS_MEMORY_MASK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BQ: tl.constexpr,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
     PRECISION: tl.constexpr,
 ):
     lane = tl.program_id(0)
@@ -71,9 +102,9 @@ def _output_kernel(
     rows, features = tl.arange(0, BQ), tl.arange(0, BD)
     qmask = tl.load(query_valid + batch * QMS[0] + rows * QMS[1], rows < Q, False)
     q = tl.load(
-        query + batch * QS[0] + head * QS[1]
-        + rows[:, None] * QS[2] + features[None, :] * QS[3],
-        qmask[:, None] & (features[None, :] < D), 0,
+        query + batch * QS[0] + head * QS[1] + rows[:, None] * QS[2] + features[None, :] * QS[3],
+        qmask[:, None] & (features[None, :] < D),
+        0,
     )
     maximum = tl.full((BQ,), -float("inf"), tl.float32)
     total = tl.zeros((BQ,), tl.float32)
@@ -86,14 +117,22 @@ def _output_kernel(
                 memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False
             )
         k = tl.load(
-            key + batch * KS[0] + kv_head * KS[1]
-            + memory[None, :] * KS[2] + features[:, None] * KS[3],
-            mmask[None, :] & (features[:, None] < D), 0,
+            key
+            + batch * KS[0]
+            + kv_head * KS[1]
+            + memory[None, :] * KS[2]
+            + features[:, None] * KS[3],
+            mmask[None, :] & (features[:, None] < D),
+            0,
         )
         v = tl.load(
-            value + batch * VS[0] + kv_head * VS[1]
-            + memory[:, None] * VS[2] + features[None, :] * VS[3],
-            mmask[:, None] & (features[None, :] < D), 0,
+            value
+            + batch * VS[0]
+            + kv_head * VS[1]
+            + memory[:, None] * VS[2]
+            + features[None, :] * VS[3],
+            mmask[:, None] & (features[None, :] < D),
+            0,
         ).to(tl.float32)
         column = tl.load(column_lse + lane * M + memory, memory < M, 0)
         logp = tl.dot(q, k, input_precision=PRECISION) * SCALE - column[None, :]
@@ -102,9 +141,7 @@ def _output_kernel(
         safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
         rescale = tl.exp(maximum - safe_maximum)
         weights = tl.exp(logp - safe_maximum[:, None])
-        numerator = numerator * rescale[:, None] + tl.dot(
-            weights, v, input_precision=PRECISION
-        )
+        numerator = numerator * rescale[:, None] + tl.dot(weights, v, input_precision=PRECISION)
         total = total * rescale + tl.sum(weights, 1)
         maximum = next_maximum
     denominator = tl.where(total > 0, total, 1.0)
@@ -119,12 +156,34 @@ def _output_kernel(
 
 @triton.jit
 def _backward_kv_kernel(
-    query, key, value, query_valid, memory_valid, gradient,
-    output_fp32, column_lse, row_lse, correction, key_gradient, value_gradient,
-    HQ: tl.constexpr, HKV: tl.constexpr, Q: tl.constexpr, M: tl.constexpr, D: tl.constexpr,
-    QS: tl.constexpr, KS: tl.constexpr, VS: tl.constexpr, GS: tl.constexpr,
-    QMS: tl.constexpr, MMS: tl.constexpr, HAS_MEMORY_MASK: tl.constexpr,
-    SCALE: tl.constexpr, BQ: tl.constexpr, BM: tl.constexpr, BD: tl.constexpr,
+    query,
+    key,
+    value,
+    query_valid,
+    memory_valid,
+    gradient,
+    output_fp32,
+    column_lse,
+    row_lse,
+    correction,
+    key_gradient,
+    value_gradient,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    GS: tl.constexpr,
+    QMS: tl.constexpr,
+    MMS: tl.constexpr,
+    HAS_MEMORY_MASK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BQ: tl.constexpr,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
     PRECISION: tl.constexpr,
 ):
     memory = tl.program_id(0) * BM + tl.arange(0, BM)
@@ -134,18 +193,20 @@ def _backward_kv_kernel(
     qmask = tl.load(query_valid + batch * QMS[0] + rows * QMS[1], rows < Q, False)
     mmask = memory < M
     if HAS_MEMORY_MASK:
-        mmask = mmask & tl.load(
-            memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False
-        )
+        mmask = mmask & tl.load(memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False)
     k = tl.load(
-        key + batch * KS[0] + kv_head * KS[1]
-        + memory[None, :] * KS[2] + features[:, None] * KS[3],
-        mmask[None, :] & (features[:, None] < D), 0,
+        key + batch * KS[0] + kv_head * KS[1] + memory[None, :] * KS[2] + features[:, None] * KS[3],
+        mmask[None, :] & (features[:, None] < D),
+        0,
     )
     v = tl.load(
-        value + batch * VS[0] + kv_head * VS[1]
-        + memory[None, :] * VS[2] + features[:, None] * VS[3],
-        mmask[None, :] & (features[:, None] < D), 0,
+        value
+        + batch * VS[0]
+        + kv_head * VS[1]
+        + memory[None, :] * VS[2]
+        + features[:, None] * VS[3],
+        mmask[None, :] & (features[:, None] < D),
+        0,
     ).to(tl.float32)
     dk = tl.zeros((BM, BD), tl.float32)
     dv = tl.zeros((BM, BD), tl.float32)
@@ -154,18 +215,27 @@ def _backward_kv_kernel(
         head = kv_head * (HQ // HKV) + group
         lane = batch * HQ + head
         q = tl.load(
-            query + batch * QS[0] + head * QS[1]
-            + rows[:, None] * QS[2] + features[None, :] * QS[3],
-            qmask[:, None] & (features[None, :] < D), 0,
+            query
+            + batch * QS[0]
+            + head * QS[1]
+            + rows[:, None] * QS[2]
+            + features[None, :] * QS[3],
+            qmask[:, None] & (features[None, :] < D),
+            0,
         )
         g = tl.load(
-            gradient + batch * GS[0] + head * GS[1]
-            + rows[:, None] * GS[2] + features[None, :] * GS[3],
-            qmask[:, None] & (features[None, :] < D), 0,
+            gradient
+            + batch * GS[0]
+            + head * GS[1]
+            + rows[:, None] * GS[2]
+            + features[None, :] * GS[3],
+            qmask[:, None] & (features[None, :] < D),
+            0,
         ).to(tl.float32)
         o = tl.load(
             output_fp32 + (lane * Q + rows[:, None]) * D + features[None, :],
-            qmask[:, None] & (features[None, :] < D), 0,
+            qmask[:, None] & (features[None, :] < D),
+            0,
         )
         delta = tl.sum(g * o, 1)
         column = tl.load(column_lse + lane * M + memory, memory < M, 0)
@@ -190,12 +260,33 @@ def _backward_kv_kernel(
 
 @triton.jit
 def _backward_q_kernel(
-    query, key, value, query_valid, memory_valid, gradient,
-    output_fp32, column_lse, row_lse, correction, query_gradient,
-    HQ: tl.constexpr, HKV: tl.constexpr, Q: tl.constexpr, M: tl.constexpr, D: tl.constexpr,
-    QS: tl.constexpr, KS: tl.constexpr, VS: tl.constexpr, GS: tl.constexpr,
-    QMS: tl.constexpr, MMS: tl.constexpr, HAS_MEMORY_MASK: tl.constexpr,
-    SCALE: tl.constexpr, BQ: tl.constexpr, BM: tl.constexpr, BD: tl.constexpr,
+    query,
+    key,
+    value,
+    query_valid,
+    memory_valid,
+    gradient,
+    output_fp32,
+    column_lse,
+    row_lse,
+    correction,
+    query_gradient,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    Q: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    GS: tl.constexpr,
+    QMS: tl.constexpr,
+    MMS: tl.constexpr,
+    HAS_MEMORY_MASK: tl.constexpr,
+    SCALE: tl.constexpr,
+    BQ: tl.constexpr,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
     PRECISION: tl.constexpr,
 ):
     lane = tl.program_id(0)
@@ -204,18 +295,19 @@ def _backward_q_kernel(
     rows, features = tl.arange(0, BQ), tl.arange(0, BD)
     qmask = tl.load(query_valid + batch * QMS[0] + rows * QMS[1], rows < Q, False)
     q = tl.load(
-        query + batch * QS[0] + head * QS[1]
-        + rows[:, None] * QS[2] + features[None, :] * QS[3],
-        qmask[:, None] & (features[None, :] < D), 0,
+        query + batch * QS[0] + head * QS[1] + rows[:, None] * QS[2] + features[None, :] * QS[3],
+        qmask[:, None] & (features[None, :] < D),
+        0,
     )
     g = tl.load(
-        gradient + batch * GS[0] + head * GS[1]
-        + rows[:, None] * GS[2] + features[None, :] * GS[3],
-        qmask[:, None] & (features[None, :] < D), 0,
+        gradient + batch * GS[0] + head * GS[1] + rows[:, None] * GS[2] + features[None, :] * GS[3],
+        qmask[:, None] & (features[None, :] < D),
+        0,
     ).to(tl.float32)
     o = tl.load(
         output_fp32 + (lane * Q + rows[:, None]) * D + features[None, :],
-        qmask[:, None] & (features[None, :] < D), 0,
+        qmask[:, None] & (features[None, :] < D),
+        0,
     )
     delta = tl.sum(g * o, 1)
     logmass = tl.load(row_lse + lane * Q + rows, rows < Q, 0)
@@ -228,14 +320,22 @@ def _backward_q_kernel(
                 memory_valid + batch * MMS[0] + memory * MMS[1], memory < M, False
             )
         k = tl.load(
-            key + batch * KS[0] + kv_head * KS[1]
-            + memory[None, :] * KS[2] + features[:, None] * KS[3],
-            mmask[None, :] & (features[:, None] < D), 0,
+            key
+            + batch * KS[0]
+            + kv_head * KS[1]
+            + memory[None, :] * KS[2]
+            + features[:, None] * KS[3],
+            mmask[None, :] & (features[:, None] < D),
+            0,
         )
         v = tl.load(
-            value + batch * VS[0] + kv_head * VS[1]
-            + memory[None, :] * VS[2] + features[:, None] * VS[3],
-            mmask[None, :] & (features[:, None] < D), 0,
+            value
+            + batch * VS[0]
+            + kv_head * VS[1]
+            + memory[None, :] * VS[2]
+            + features[:, None] * VS[3],
+            mmask[None, :] & (features[:, None] < D),
+            0,
         ).to(tl.float32)
         column = tl.load(column_lse + lane * M + memory, memory < M, 0)
         c = tl.load(correction + lane * M + memory, memory < M, 0)
@@ -251,15 +351,21 @@ def _backward_q_kernel(
 
 
 def _check_inputs(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    scale: float,
 ) -> None:
     if query.device.type != "cuda":
         raise ValueError("Inverted attention requires CUDA; no CPU fallback is provided")
     if query.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("Inverted attention requires BF16, FP16, or FP32 tensors")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise ValueError("Inverted attention requires [B,H,Q,D] queries and [B,Hkv,M,D] keys/values")
+        raise ValueError(
+            "Inverted attention requires [B,H,Q,D] queries and [B,Hkv,M,D] keys/values"
+        )
     if key.device != query.device or value.device != query.device:
         raise ValueError("Inverted attention queries, keys, and values must share a CUDA device")
     if key.dtype != query.dtype or value.dtype != query.dtype:
@@ -268,9 +374,13 @@ def _check_inputs(
     if any(size <= 0 for size in query.shape) or any(size <= 0 for size in key.shape):
         raise ValueError("Inverted attention dimensions must be positive")
     if slots > 128 or width > 128:
-        raise ValueError("Inverted attention supports at most 128 query slots and 128 head features")
+        raise ValueError(
+            "Inverted attention supports at most 128 query slots and 128 head features"
+        )
     if key.shape != value.shape or key.shape[0] != batch or key.shape[3] != width:
-        raise ValueError("Inverted attention keys/values must match each other and query batch/head width")
+        raise ValueError(
+            "Inverted attention keys/values must match each other and query batch/head width"
+        )
     if heads % key.shape[1]:
         raise ValueError("Inverted attention query heads must be divisible by KV heads")
     if query_valid.shape != (batch, slots):
@@ -281,23 +391,37 @@ def _check_inputs(
         if memory_valid.shape != (batch, key.shape[2]):
             raise ValueError("Inverted attention memory_valid must have shape [B,M]")
         if memory_valid.device != query.device or memory_valid.dtype != torch.bool:
-            raise TypeError("Inverted attention memory_valid must be boolean on the query CUDA device")
+            raise TypeError(
+                "Inverted attention memory_valid must be boolean on the query CUDA device"
+            )
     if not math.isfinite(scale):
         raise ValueError("Inverted attention scale must be finite")
 
 
 def _launch_options(
-    query: Tensor, key: Tensor, query_valid: Tensor, memory_valid: Tensor | None, scale: float,
+    query: Tensor,
+    key: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    scale: float,
 ) -> dict:
     block_q = max(16, triton.next_power_of_2(query.shape[2]))
     block_d = max(16, triton.next_power_of_2(query.shape[3]))
     return {
-        "HQ": query.shape[1], "HKV": key.shape[1], "Q": query.shape[2],
-        "M": key.shape[2], "D": query.shape[3],
-        "QS": query.stride(), "KS": key.stride(), "QMS": query_valid.stride(),
+        "HQ": query.shape[1],
+        "HKV": key.shape[1],
+        "Q": query.shape[2],
+        "M": key.shape[2],
+        "D": query.shape[3],
+        "QS": query.stride(),
+        "KS": key.stride(),
+        "QMS": query_valid.stride(),
         "MMS": memory_valid.stride() if memory_valid is not None else (0, 0),
-        "HAS_MEMORY_MASK": memory_valid is not None, "SCALE": scale,
-        "BQ": block_q, "BM": 32, "BD": block_d,
+        "HAS_MEMORY_MASK": memory_valid is not None,
+        "SCALE": scale,
+        "BQ": block_q,
+        "BM": 32,
+        "BD": block_d,
         # FP32 oracle calls use IEEE products; three TF32 products preserve FP32
         # probability accuracy on tensor cores for the BF16/FP16 training path.
         "PRECISION": "ieee" if query.dtype == torch.float32 else "tf32x3",
@@ -307,8 +431,12 @@ def _launch_options(
 
 @torch.library.custom_op("kaggriculture::inverted_attention", mutates_args=(), device_types="cuda")
 def _inverted_attention(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    scale: float,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     _check_inputs(query, key, value, query_valid, memory_valid, scale)
     output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
@@ -323,16 +451,29 @@ def _inverted_attention(
         query, key, query_valid, memory_valid, column_lse, **options
     )
     _output_kernel[(lanes,)](
-        query, key, value, query_valid, memory_valid, column_lse,
-        output, output_fp32, row_lse, VS=value.stride(), **options
+        query,
+        key,
+        value,
+        query_valid,
+        memory_valid,
+        column_lse,
+        output,
+        output_fp32,
+        row_lse,
+        VS=value.stride(),
+        **options,
     )
     return output, output_fp32, column_lse, row_lse
 
 
 @_inverted_attention.register_fake
 def _fake_inverted_attention(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    scale: float,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     _check_inputs(query, key, value, query_valid, memory_valid, scale)
     return (
@@ -349,35 +490,70 @@ def _fake_inverted_attention(
     "kaggriculture::inverted_attention_backward", mutates_args=(), device_types="cuda"
 )
 def _inverted_attention_backward(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, gradient: Tensor,
-    output_fp32: Tensor, column_lse: Tensor, row_lse: Tensor, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    gradient: Tensor,
+    output_fp32: Tensor,
+    column_lse: Tensor,
+    row_lse: Tensor,
+    scale: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     query_gradient = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     key_gradient = torch.empty(key.shape, dtype=key.dtype, device=key.device)
     value_gradient = torch.empty(value.shape, dtype=value.dtype, device=value.device)
     correction = torch.empty(column_lse.shape, dtype=torch.float32, device=query.device)
     options = _launch_options(query, key, query_valid, memory_valid, scale)
-    _backward_kv_kernel[(
-        triton.cdiv(key.shape[2], options["BM"]), key.shape[0] * key.shape[1]
-    )](
-        query, key, value, query_valid, memory_valid, gradient,
-        output_fp32, column_lse, row_lse, correction, key_gradient, value_gradient,
-        VS=value.stride(), GS=gradient.stride(), **options
+    _backward_kv_kernel[(triton.cdiv(key.shape[2], options["BM"]), key.shape[0] * key.shape[1])](
+        query,
+        key,
+        value,
+        query_valid,
+        memory_valid,
+        gradient,
+        output_fp32,
+        column_lse,
+        row_lse,
+        correction,
+        key_gradient,
+        value_gradient,
+        VS=value.stride(),
+        GS=gradient.stride(),
+        **options,
     )
     _backward_q_kernel[(query.shape[0] * query.shape[1],)](
-        query, key, value, query_valid, memory_valid, gradient,
-        output_fp32, column_lse, row_lse, correction, query_gradient,
-        VS=value.stride(), GS=gradient.stride(), **options
+        query,
+        key,
+        value,
+        query_valid,
+        memory_valid,
+        gradient,
+        output_fp32,
+        column_lse,
+        row_lse,
+        correction,
+        query_gradient,
+        VS=value.stride(),
+        GS=gradient.stride(),
+        **options,
     )
     return query_gradient, key_gradient, value_gradient
 
 
 @_inverted_attention_backward.register_fake
 def _fake_inverted_attention_backward(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, gradient: Tensor,
-    output_fp32: Tensor, column_lse: Tensor, row_lse: Tensor, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    gradient: Tensor,
+    output_fp32: Tensor,
+    column_lse: Tensor,
+    row_lse: Tensor,
+    scale: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     return (
         torch.empty(query.shape, dtype=query.dtype, device=query.device),
@@ -402,7 +578,8 @@ def _setup_context(
 
 @once_differentiable
 def _backward(
-    ctx: object, gradient: Tensor,
+    ctx: object,
+    gradient: Tensor,
     _output_fp32_gradient: Tensor | None,
     _column_lse_gradient: Tensor | None,
     _row_lse_gradient: Tensor | None,
@@ -411,19 +588,38 @@ def _backward(
         ctx.saved_tensors  # type: ignore[attr-defined]
     )
     dq, dk, dv = _inverted_attention_backward(
-        query, key, value, query_valid, memory_valid, gradient,
-        output_fp32, column_lse, row_lse, ctx.scale,  # type: ignore[attr-defined]
+        query,
+        key,
+        value,
+        query_valid,
+        memory_valid,
+        gradient,
+        output_fp32,
+        column_lse,
+        row_lse,
+        ctx.scale,  # type: ignore[attr-defined]
     )
     needs = ctx.needs_input_grad  # type: ignore[attr-defined]
-    return dq if needs[0] else None, dk if needs[1] else None, dv if needs[2] else None, None, None, None
+    return (
+        dq if needs[0] else None,
+        dk if needs[1] else None,
+        dv if needs[2] else None,
+        None,
+        None,
+        None,
+    )
 
 
 _inverted_attention.register_autograd(_backward, setup_context=_setup_context)
 
 
 def inverted_attention(
-    query: Tensor, key: Tensor, value: Tensor,
-    query_valid: Tensor, memory_valid: Tensor | None, scale: float,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_valid: Tensor,
+    memory_valid: Tensor | None,
+    scale: float,
 ) -> Tensor:
     """Apply query-competitive attention, then normalize each row over memory.
 
