@@ -5,7 +5,10 @@ import torch
 
 from kaggriculture.triton_inverted_attention import inverted_attention
 
-pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 
 def _oracle(query, key, value, query_valid, memory_valid, scale):
@@ -17,13 +20,15 @@ def _oracle(query, key, value, query_valid, memory_valid, scale):
     valid = query_valid[:, None, :, None]
     if memory_valid is not None:
         valid = valid & memory_valid[:, None, None, :]
-    scores = scores.masked_fill(~valid, -torch.inf)
+    scores = scores.masked_fill(~valid, -1e4)
     maximum = scores.amax(dim=-2, keepdim=True)
-    maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
     weights = torch.where(valid, (scores - maximum).exp(), 0.0)
-    weights = weights / weights.sum(dim=-2, keepdim=True).clamp_min(1.0)
+    query_mass = weights.sum(dim=-2, keepdim=True)
+    query_mass = torch.where(query_mass < 1.0, torch.ones_like(query_mass), query_mass)
+    weights = weights / query_mass
     mass = weights.sum(dim=-1, keepdim=True)
-    weights = weights / mass.clamp_min(torch.finfo(torch.float64).tiny)
+    mass = torch.where(mass > 0.0, mass, torch.ones_like(mass))
+    weights = weights / mass
     return (weights @ value).to(query.dtype)
 
 
@@ -59,7 +64,9 @@ def test_grouped_inverted_attention_matches_masked_oracle_and_gradients(dtype):
     actual_gradients = torch.autograd.grad(actual, (query, key, value), cotangent)
     expected_gradients = torch.autograd.grad(expected, expected_inputs, cotangent)
     tolerance = 0.02 if dtype == torch.bfloat16 else 0.0002
-    for observed, reference in zip((actual, *actual_gradients), (expected, *expected_gradients), strict=True):
+    for observed, reference in zip(
+        (actual, *actual_gradients), (expected, *expected_gradients), strict=True
+    ):
         difference = (observed.float() - reference.float()).norm()
         assert difference <= tolerance * reference.float().norm().clamp_min(1e-12)
         assert torch.isfinite(observed).all()
