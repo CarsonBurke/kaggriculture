@@ -498,6 +498,7 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         "kaggriculture/actions.py",
         "kaggriculture/constants.py",
         "kaggriculture/encoding.py",
+        "kaggriculture/entity.py",
         "kaggriculture/inference.py",
         "kaggriculture/evaluation.py",
         "kaggriculture/model.py",
