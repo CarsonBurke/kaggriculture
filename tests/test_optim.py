@@ -571,17 +571,15 @@ def test_lookup_updates_ignore_other_rows_even_with_a_tied_projection() -> None:
         torch.testing.assert_close(
             module.vocabulary.weight[0], isolated.vocabulary.weight[0], rtol=0, atol=0
         )
-
-
 def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
     actor, critic = _production_modules()
     config = PpoConfig()
     assert config.optimizer == "normuon"
-    assert config.actor_learning_rate == 5.0e-5
+    assert config.actor_learning_rate == 1.5e-4
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     for optimizer, learning_rate in (
-        (actor_optimizer, 5.0e-5),
-        (critic_optimizer, 5.0e-5),
+        (actor_optimizer, 1.5e-4),
+        (critic_optimizer, 1.5e-4),
     ):
         assert isinstance(optimizer, NorMuon)
         rates = {

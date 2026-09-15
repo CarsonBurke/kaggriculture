@@ -1569,7 +1569,9 @@ def test_one_ppo_update_is_finite() -> None:
     )
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
-    rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    rollout = collect_self_play(
+        actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3, reward_mode="shaped"
+    )
     # Eight steps of a fresh game leaves both banks equal and every shaped
     # reward at around 1e-9, where any relation between target statistics holds
     # to any absolute tolerance. Give the fixture the reward scale a real
@@ -3777,6 +3779,7 @@ def test_credit_diagnostics_distinguish_potential_fit_from_terminal_skill() -> N
     terminal = np.broadcast_to(utility[:, None], valid.shape)
     returns = terminal - potential
     rollout = SimpleNamespace(
+        reward_mode="shaped",
         valid=valid,
         final_money=np.array([9000.0, 1000.0]),
         opponent_money=np.array([1000.0, 9000.0]),
@@ -3807,6 +3810,7 @@ def test_credit_diagnostics_distinguish_potential_fit_from_terminal_skill() -> N
 def test_credit_diagnostics_score_terminal_outcomes_without_rounding_banks() -> None:
     valid = np.asarray([[True, True, True], [True, True, False], [True, False, False]])
     rollout = SimpleNamespace(
+        reward_mode="terminal-outcome",
         valid=valid,
         # Float32 money telemetry can report a draw despite an exact win/loss.
         final_money=np.full(3, 2**24, dtype=np.float32),
@@ -3814,9 +3818,7 @@ def test_credit_diagnostics_score_terminal_outcomes_without_rounding_banks() -> 
         rewards=np.asarray([[0.0, 0.0, 1.0], [0.0, -1.0, 9.0], [0.0, 9.0, 9.0]]),
     )
     returns = np.asarray([[0.25, 0.5, 1.0], [-0.5, -1.0, 0.0], [0.0, 0.0, 0.0]])
-    perfect = _credit_quality_metrics(
-        rollout, returns, returns, valid, 0.5, None, reward_mode="terminal-outcome"
-    )
+    perfect = _credit_quality_metrics(rollout, returns, returns, valid, 0.5, None)
     baseline = _credit_quality_metrics(
         rollout,
         returns,
@@ -3824,7 +3826,6 @@ def test_credit_diagnostics_score_terminal_outcomes_without_rounding_banks() -> 
         valid,
         0.5,
         None,
-        reward_mode="terminal-outcome",
     )
     assert perfect["credit_preupdate_all_all_terminal_residual_mse"] == 0.0
     assert perfect[

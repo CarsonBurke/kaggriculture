@@ -208,11 +208,9 @@ UPDATE_COMPILE_MODES = (
 
 @dataclass(frozen=True)
 class PpoConfig:
-    # Actor and critic share a 5e-5 base rate. The 3e-5 critic did not reach
-    # readiness within 40 waves even with its value-head boost; raising both
-    # rates is a requested experiment, not evidence of recovered policy strength.
-    actor_learning_rate: float = 5.0e-5
-    critic_learning_rate: float = 5.0e-5
+    # Promoted HL-Gauss VAPO terminal-outcome LR3 recipe.
+    actor_learning_rate: float = 1.5e-4
+    critic_learning_rate: float = 1.5e-4
     # Optional absolute LR for value_head only, independent of trunk Adam gains.
     critic_head_learning_rate: float | None = None
     lr_warmup_steps: int = 32
@@ -300,8 +298,8 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # Collection and PPO share gamma. At the default gamma one, potential
-    # shaping telescopes to the undiscounted final-bank margin.
+    # Collection and PPO share gamma. At the default gamma one, terminal
+    # win/loss/draw rewards retain the undiscounted game outcome.
     # The critic fits full Monte Carlo returns; the actor's shorter GAE trace
     # uses that critic to carry long-term credit with lower variance.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
@@ -2796,14 +2794,13 @@ def _credit_quality_metrics(
     valid: np.ndarray,
     gamma: float,
     groups: Mapping[str, np.ndarray] | None,
-    *,
-    reward_mode: str = "shaped",
 ) -> dict[str, float | int]:
     """Preupdate terminal prediction, removing the known shaping potential.
 
     G_t = gamma**(T-t-1) U_T - Phi_t. Recover Phi only for these
     diagnostics; neither the terminal outcome nor this reconstruction is staged.
     """
+    reward_mode = rollout.reward_mode
     remaining = rollout.valid.sum(axis=1)[:, None] - np.arange(valid.shape[1])[None, :]
     if reward_mode == "terminal-outcome":
         # Completed trajectories contain the exact native outcome in their last
@@ -4301,7 +4298,6 @@ def update_ppo(
             owned_valid,
             config.gamma,
             diagnostic_groups,
-            reward_mode=rollout.reward_mode,
         )
     )
     if actor_predictor_active:

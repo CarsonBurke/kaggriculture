@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         "--critic-warmup-iterations",
         type=int,
         help="minimum critic-only iterations before the adaptive readiness gate "
-        "(default: 5; maximum: 40)",
+        "(default: 10; maximum: 40)",
     )
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--max-hours", type=float, default=0.0)

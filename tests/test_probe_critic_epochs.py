@@ -61,13 +61,12 @@ def test_parser_requires_exactly_one_source() -> None:
     module = _probe()
 
     assert module.parse_args(["--actor", "actor.pt"]).actor == Path("actor.pt")
-    assert module.parse_args(["--checkpoint", "checkpoint.pt"]).checkpoint == Path(
-        "checkpoint.pt"
-    )
+    assert module.parse_args(["--checkpoint", "checkpoint.pt"]).checkpoint == Path("checkpoint.pt")
     with pytest.raises(SystemExit):
         module.parse_args([])
     with pytest.raises(SystemExit):
         module.parse_args(["--actor", "actor.pt", "--checkpoint", "checkpoint.pt"])
+
 
 def test_stage_rollout_includes_structured_unit_activity() -> None:
     module = _probe()
@@ -133,6 +132,10 @@ def test_checkpoint_mode_rejects_synthetic_warmup(monkeypatch: pytest.MonkeyPatc
         ({"agents": []}, "single-learner"),
         ({"critic": {}}, "critic_optimizer, ppo_config"),
         ({"critic": {}, "critic_optimizer": {}}, "ppo_config"),
+        (
+            {"critic": {}, "critic_optimizer": {}, "ppo_config": {}},
+            "recorded reward mode",
+        ),
     ],
 )
 def test_checkpoint_loader_rejects_incomplete_or_population_state(

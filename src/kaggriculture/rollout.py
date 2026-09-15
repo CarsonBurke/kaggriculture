@@ -20,6 +20,7 @@ from kaggriculture.constants import (
     BOARD_SIZE,
     CROPS,
     DEFAULT_REWARD_GAMMA,
+    DEFAULT_REWARD_MODE,
     EPISODE_STEPS,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
@@ -115,7 +116,7 @@ class RolloutBatch:
     learner_stochastic: bool
     entropy_sums: np.ndarray
     elapsed_seconds: float
-    reward_mode: str = "shaped"
+    reward_mode: str = DEFAULT_REWARD_MODE
 
     @property
     def trajectories(self) -> int:
@@ -271,7 +272,7 @@ def _finish_rollout(
     entropy_sums: np.ndarray,
     learner_stochastic: bool,
     started: float,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
 ) -> RolloutBatch:
     return RolloutBatch(
         architecture=architecture,
@@ -1653,7 +1654,7 @@ def _validate_reward_mode(reward_mode: str) -> None:
 
 
 def _native_pair_rewards(
-    sampled: dict[str, Any], gamma: float, reward_mode: str = "shaped"
+    sampled: dict[str, Any], gamma: float, reward_mode: str = DEFAULT_REWARD_MODE
 ) -> np.ndarray:
     """Build paired rewards from native terminal flags, utilities, and potentials."""
     _validate_reward_gamma(gamma)
@@ -1773,7 +1774,7 @@ def _native_batch(
     learner_stochastic: bool,
     started: float,
     orientations: np.ndarray | None = None,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
 ) -> RolloutBatch:
 
     state_names = set(_state_field_specs(architecture))
@@ -1810,7 +1811,7 @@ def _collect_mixed_play_rust_wave(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     # Matches `temperature` above, so a caller that omits it gets the symmetric
     # wave production runs. It defaulted to 0.8 while training sharpened its
     # league seats, and that default silently reached instruments which never
@@ -2440,7 +2441,7 @@ def collect_mixed_play_rust(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     opponent_temperature: float = 1.0,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
@@ -2533,7 +2534,7 @@ def collect_population_play_rust(
     episode_steps: int = EPISODE_STEPS,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -2769,7 +2770,7 @@ def collect_self_play_rust(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -2805,7 +2806,7 @@ def collect_frozen_opponents_play_rust(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     opponent_temperature: float = 0.8,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
@@ -2851,7 +2852,7 @@ def collect_frozen_opponent_play_rust(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,
@@ -2888,7 +2889,7 @@ def collect_self_play(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     sampling_seed: int = 0,
 ) -> RolloutBatch:
     """Collect both valid on-policy trajectories from every self-play game."""
@@ -3013,7 +3014,7 @@ def collect_frozen_opponent_play(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,

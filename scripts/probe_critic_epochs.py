@@ -74,6 +74,7 @@ import torch
 import torch._dynamo
 from torch import Tensor
 
+from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
@@ -105,6 +106,7 @@ from kaggriculture.production import (
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import (
+    REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
     RolloutBatch,
     allocate_rollout_storage,
@@ -378,6 +380,7 @@ def _evaluate(
 def _collect(
     actor: torch.nn.Module,
     args: argparse.Namespace,
+    config: PpoConfig,
     seed_start: int,
     arena: dict[str, np.ndarray],
 ) -> RolloutBatch:
@@ -386,6 +389,8 @@ def _collect(
         games=args.games,
         seed_start=seed_start,
         episode_steps=args.episode_steps,
+        gamma=config.gamma,
+        reward_mode=args.reward_mode,
         sampling_seed=seed_start ^ 0x5EED,
         forward_mode=args.rollout_forward_mode,
         forward_autocast=not args.no_rollout_bfloat16,
@@ -418,7 +423,7 @@ def _warm_critic(
     """
     records: list[dict[str, float]] = []
     for iteration in range(args.warmup_iterations):
-        rollout = _collect(actor, args, repeat_seed + 1024 * (iteration + 1), arena)
+        rollout = _collect(actor, args, config, repeat_seed + 1024 * (iteration + 1), arena)
         staged = _stage_rollout(rollout, device)
         target_stats = _stage_value_targets(
             rollout,
@@ -523,7 +528,7 @@ def _run_repeat(
         device=device,
     )
 
-    rollout = _collect(actor, args, repeat_seed, arena)
+    rollout = _collect(actor, args, config, repeat_seed, arena)
     staged = _stage_rollout(rollout, device)
     target_stats = _stage_value_targets(
         rollout,
@@ -807,6 +812,9 @@ def _load_checkpoint_state(path: Path) -> dict[str, Any]:
     missing = [key for key in ("critic", "critic_optimizer", "ppo_config") if key not in payload]
     if missing:
         raise ValueError(f"checkpoint is missing required state: {', '.join(missing)}")
+    training_data = payload.get("training_data_config")
+    if not isinstance(training_data, dict) or training_data.get("reward_mode") not in REWARD_MODES:
+        raise ValueError("checkpoint is missing a valid recorded reward mode")
     return payload
 
 
@@ -827,6 +835,11 @@ def main() -> None:
 
     checkpoint_state = (
         _load_checkpoint_state(args.checkpoint) if args.checkpoint is not None else None
+    )
+    args.reward_mode = (
+        checkpoint_state["training_data_config"]["reward_mode"]
+        if checkpoint_state is not None
+        else DEFAULT_REWARD_MODE
     )
     device = torch.device("cuda")
     if not torch.cuda.is_available():
@@ -908,6 +921,8 @@ def main() -> None:
         "configuration": {
             "games": args.games,
             "episode_steps": args.episode_steps,
+            "reward_mode": args.reward_mode,
+            "gamma": config.gamma,
             "critic_epochs": args.critic_epochs,
             "repeats": args.repeats,
             "holdout_fraction": args.holdout_fraction,

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.evaluation import DEVELOPMENT_SEED_START
 from kaggriculture.provenance import repository_root
 from kaggriculture.registry import STRUCTURED
@@ -259,7 +260,7 @@ def build_training_command(
     resume_checkpoint: Path | None = None,
     initial_actors: Sequence[Path] = (),
     critic_warmup_iterations: int | None = None,
-    reward_mode: str = "shaped",
+    reward_mode: str = DEFAULT_REWARD_MODE,
 ) -> list[str]:
     """Build the exact production train_ppo.py invocation."""
     if (expected_source_digest is None) != (calibration_decision is None):

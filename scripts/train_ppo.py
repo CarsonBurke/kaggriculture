@@ -30,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.compilewatch import CompileWatch
+from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.evaluation import (
     DEVELOPMENT_SEED_START,
     ONLINE_RL_SEED_START,
@@ -84,6 +85,7 @@ from kaggriculture.production import (
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
+    production_ppo_config,
 )
 from kaggriculture.provenance import (
     CALIBRATION_KNOBS,
@@ -398,7 +400,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--critic-head-lr",
         type=float,
-        default=PpoConfig.critic_head_learning_rate,
+        default=production_ppo_config(update_compile_mode=PpoConfig.update_compile_mode)[
+            "critic_head_learning_rate"
+        ],
         help="absolute value-head LR override; other critic parameters retain their existing rates",
     )
     parser.add_argument("--lr-warmup-steps", type=int, default=32)
@@ -421,7 +425,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-mode",
         choices=REWARD_MODES,
-        default="shaped",
+        default=DEFAULT_REWARD_MODE,
         help="potential shaping, terminal bank margin, or terminal win/loss/draw",
     )
     parser.add_argument(

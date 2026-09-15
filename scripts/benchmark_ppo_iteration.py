@@ -21,6 +21,7 @@ import torch
 import torch._dynamo
 
 from kaggriculture.actor_dynamics import ActorDynamics
+from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
@@ -208,7 +209,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
-    parser.add_argument("--reward-mode", choices=REWARD_MODES, default="shaped")
+    parser.add_argument("--reward-mode", choices=REWARD_MODES, default=DEFAULT_REWARD_MODE)
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
     parser.add_argument(
         "--policy-loss-reduction",

@@ -1043,6 +1043,7 @@ def test_native_frozen_opponent_rollout_records_only_current_seats() -> None:
         games=2,
         seed_start=130,
         sampling_seed=8,
+        reward_mode="shaped",
     )
 
     assert rollout.trajectories == 2
@@ -1404,7 +1405,9 @@ def test_structured_self_play_rollout_replays_from_stored_states() -> None:
     actor = StructuredActor(_small_structured_config())
     _force_quantity_orders(actor)
 
-    rollout = collect_self_play(actor, games=1, seed_start=210, episode_steps=8, sampling_seed=13)
+    rollout = collect_self_play(
+        actor, games=1, seed_start=210, episode_steps=8, sampling_seed=13, reward_mode="shaped"
+    )
 
     assert rollout.architecture == STRUCTURED
     assert (rollout.trajectories, rollout.horizon, rollout.state_count) == (2, 7, 14)
