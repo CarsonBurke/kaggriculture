@@ -518,8 +518,11 @@ def test_production_lookup_and_head_roles_are_not_hidden_matrices() -> None:
         for name, child in module.named_modules():
             if isinstance(child, torch.nn.Embedding):
                 assert id(child.weight) in vector_ids, name
-        for query in (module.trunk.opponent_queries, module.trunk.latent_queries):
-            assert id(query) in vector_ids
+        for name in ("opponent_queries", "latent_queries", "market_queries"):
+            query = getattr(module.trunk, name, None)
+            if query is not None:
+                parameter = query.weight if isinstance(query, torch.nn.Embedding) else query
+                assert id(parameter) in vector_ids
         if hasattr(module, "value_query"):
             assert id(module.value_query) in vector_ids
             assert id(module.value_head.weight) in vector_ids
@@ -527,7 +530,9 @@ def test_production_lookup_and_head_roles_are_not_hidden_matrices() -> None:
             assert id(module.unit_head[-1].weight) in vector_ids
             assert id(module.market_kind.weight) in vector_ids
             assert id(module.market_quantity_bias) in vector_ids
-        assert id(module.trunk.core[0].attention.query.weight) in matrix_ids
+        core = module.trunk.core[0]
+        attention = core.attention if hasattr(core, "attention") else core.self_attention
+        assert id(attention.query.weight) in matrix_ids
 
 
 def test_convolution_weights_remain_hidden_matrices() -> None:
@@ -579,9 +584,9 @@ def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
     assert config.optimizer == "normuon"
     assert config.actor_learning_rate == 1.5e-4
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    for optimizer, learning_rate in (
-        (actor_optimizer, 1.5e-4),
-        (critic_optimizer, 1.5e-4),
+    for module, optimizer, learning_rate in (
+        (actor, actor_optimizer, 1.5e-4),
+        (critic, critic_optimizer, 1.5e-4),
     ):
         assert isinstance(optimizer, NorMuon)
         rates = {
@@ -591,9 +596,10 @@ def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
         adam_rate = learning_rate * PpoConfig().adam_learning_rate_ratio
         assert rates[("normuon", None)] == pytest.approx(learning_rate)
         assert rates[("adam", 1.0)] == pytest.approx(adam_rate)
-        # Query banks initialized at 0.02 RMS take 0.02 of the shared Adam
-        # rate, so every Adam parameter moves by the same fraction of itself.
-        assert rates[("adam", 0.02)] == pytest.approx(adam_rate * 0.02)
+        if hasattr(module.trunk, "opponent_queries"):
+            # Query banks initialized at 0.02 RMS take 0.02 of the shared Adam
+            # rate, so every Adam parameter moves by the same fraction of itself.
+            assert rates[("adam", 0.02)] == pytest.approx(adam_rate * 0.02)
         # `_optimizer_step` drives the warmup through this metadata.
         for group in optimizer.param_groups:
             assert group["base_lr"] == pytest.approx(group["lr"])
