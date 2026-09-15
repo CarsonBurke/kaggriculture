@@ -629,9 +629,7 @@ def test_frozen_entity_opponents_allow_inverted_critic_without_mutating_snapshot
         torch.save(payload, snapshot.path)
     digest = snapshot_sha256(snapshot.path)
     inverted = replace(config, critic_inverted_attention=True)
-    loaded = load_actor_snapshot(
-        snapshot.path, expected_model_config=inverted, device="cuda"
-    )
+    loaded = load_actor_snapshot(snapshot.path, expected_model_config=inverted, device="cuda")
     pooled = FrozenActorPool(inverted, "cuda").acquire([snapshot.path])[0]
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         expected = _compiled(actor)(inputs)
@@ -642,9 +640,7 @@ def test_frozen_entity_opponents_allow_inverted_critic_without_mutating_snapshot
     assert snapshot_sha256(snapshot.path) == digest
     incompatible = replace(inverted, attention_kv_heads=1)
     with pytest.raises(ValueError, match="model configuration"):
-        load_actor_snapshot(
-            snapshot.path, expected_model_config=incompatible, device="cuda"
-        )
+        load_actor_snapshot(snapshot.path, expected_model_config=incompatible, device="cuda")
 
 
 def test_inverted_critic_recovery_binds_full_configuration(config, tmp_path):
@@ -739,8 +735,18 @@ def test_native_population_policy_is_invariant_to_critic_configuration(config, n
         np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
 
 
-@pytest.mark.parametrize("compile_mode", ["default", "reduce-overhead"])
-def test_native_full_horizon_ppo_replay_and_update(config, native_rollout, compile_mode):
+@pytest.mark.parametrize(
+    ("compile_mode", "critic_inverted_attention"),
+    [
+        pytest.param("default", False, id="default"),
+        pytest.param("reduce-overhead", False, id="reduce-overhead"),
+        pytest.param("reduce-overhead", True, id="inverted-reduce-overhead"),
+    ],
+)
+def test_native_full_horizon_ppo_replay_and_update(
+    config, native_rollout, compile_mode, critic_inverted_attention
+):
+    config = replace(config, critic_inverted_attention=critic_inverted_attention)
     behavior_actor, rollout = native_rollout
     actor = EntityActor(config).cuda().eval()
     actor.load_state_dict(behavior_actor.state_dict())
