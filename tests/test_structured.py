@@ -10,6 +10,7 @@ from kaggle_environments import make
 
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
+from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.latent_dynamics import DecodeHeads
 from kaggriculture.model import (
@@ -21,7 +22,12 @@ from kaggriculture.model import (
 )
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.registry import resolve_architecture
-from kaggriculture.rollout import _StackedActorEnsemble
+from kaggriculture.rollout import (
+    _CapturedStep,
+    _league_layout,
+    _stacked_actor_ensemble,
+    _StackedActorEnsemble,
+)
 from kaggriculture.structured import (
     Attention,
     FeedForward,
@@ -511,6 +517,75 @@ def test_hardware_native_structured_ensemble_compiles_batched_forward(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_bucketed_ensemble_layouts_reuse_compilation_and_reload_captured_policies(
+    real_inputs: StructuredInputs,
+) -> None:
+    torch.manual_seed(41)
+    models = [StructuredActor(_tiny_config()).cuda().eval() for _ in range(4)]
+    inputs = StructuredInputs(*(field.cuda() for field in real_inputs))
+    watch = CompileWatch()
+    try:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for index, (lanes, width) in enumerate(((3, 5), (4, 7), (3, 8), (4, 6))):
+                selected = [models[(index + lane) % len(models)] for lane in range(lanes)]
+                padded_lanes, padded_width = _league_layout(
+                    lanes, width, device=torch.device("cuda"), mode="inductor_graph"
+                )
+                rows = (
+                    torch.arange(padded_lanes * padded_width, device="cuda")
+                    % inputs.unit_active.shape[0]
+                )
+                lane_inputs = StructuredInputs(
+                    *(
+                        field[rows].view(padded_lanes, padded_width, *field.shape[1:])
+                        for field in inputs
+                    )
+                )
+                ensemble = _stacked_actor_ensemble(
+                    selected + selected[:1] * (padded_lanes - lanes), namespace=1_000_037
+                )
+                ensemble(lane_inputs, mode="inductor_graph")
+                events, _ = watch.drain()
+                if index:
+                    assert not events, [event.describe() for event in events]
+                else:
+                    assert events, "the first forward must compile, not fall back to eager"
+                captured = _CapturedStep(
+                    lambda ensemble=ensemble, lane_inputs=lane_inputs: ensemble(
+                        lane_inputs, mode="inductor_graph"
+                    )
+                )
+                try:
+                    # Both same-shape refills and count changes must expose the
+                    # newly selected policy, including through an existing graph.
+                    for policies in (selected, selected[::-1]):
+                        ensemble.load(policies + policies[:1] * (padded_lanes - lanes))
+                        actual = captured()
+                        expected = [
+                            model(StructuredInputs(*(field[lane, :width] for field in lane_inputs)))
+                            for lane, model in enumerate(policies)
+                        ]
+                        for component, references in zip(
+                            actual, zip(*expected, strict=True), strict=True
+                        ):
+                            torch.testing.assert_close(
+                                component[:lanes, :width],
+                                torch.stack(references),
+                                rtol=1e-2,
+                                atol=1e-2,
+                                check_dtype=False,
+                            )
+                        del actual
+                finally:
+                    captured.close()
+                events, _ = watch.drain()
+                assert not events, [event.describe() for event in events]
+    finally:
+        watch.close()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hardware_native_mlp_supports_frozen_ensemble_vmap() -> None:
     torch.manual_seed(0)
     values = torch.randn(3, 2, 4, 128, device="cuda", dtype=torch.bfloat16)
@@ -782,6 +857,8 @@ def test_structured_model_arguments_parse_typed_regression_fields() -> None:
             "all",
             "--zero-init-branches",
             "true",
+            "--per-entity-critic",
+            "true",
         ]
     )
 
@@ -792,6 +869,7 @@ def test_structured_model_arguments_parse_typed_regression_fields() -> None:
     assert config.global_refresh_layers == (2, 5)
     assert config.global_refresh_context == "all"
     assert config.zero_init_branches is True
+    assert config.per_entity_critic is True
 
 
 def test_structured_farm_batch_matches_separate_canonical_encoding(
@@ -976,15 +1054,21 @@ def test_state_read_uses_context_content_without_query_shortcut(zero_init_branch
 
 
 @pytest.mark.parametrize("scalar_value", [False, True])
+@pytest.mark.parametrize("per_entity_critic", [False, True])
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.autocast("cuda", dtype=torch.bfloat16)
 def test_structured_critic_exposes_only_normalized_value_head_input(
     real_pairs: list[tuple[dict, dict]],
     scalar_value: bool,
+    per_entity_critic: bool,
 ) -> None:
     torch.manual_seed(0)
-    config = replace(_tiny_config(), critic_latents=5, scalar_value=scalar_value)
+    config = replace(
+        _tiny_config(),
+        critic_latents=5,
+        scalar_value=scalar_value,
+        per_entity_critic=per_entity_critic,
+    )
     critic = StructuredCritic(config).cuda()
 
     rows = [
@@ -1003,86 +1087,111 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
         crops=torch.cat((stacked.crops, extras.crops), dim=-1),
     )
 
-    initial = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        initial = critic(
+            inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active
+        )
     assert initial.shape == (batch, 1 if scalar_value else config.value_atoms)
     assert torch.isfinite(initial).all()
     # Either zero-initialized readout predicts value zero.
     assert float(critic.value(initial).detach().abs().max()) == pytest.approx(0.0, abs=1e-5)
 
     torch.nn.init.normal_(critic.value_head.weight, std=0.01)
-    expected = critic(inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active)
-    raw_value = []
-    handle = critic.value_norm.register_forward_pre_hook(
-        lambda _module, arguments: raw_value.append(arguments[0])
-    )
-    try:
-        actual, belief = critic.forward_with_belief(
-            inputs,
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = critic(
+            inputs, extras.unit_categorical, extras.unit_continuous, extras.unit_active
+        )
+        raw_value = []
+        handle = critic.value_norm.register_forward_pre_hook(
+            lambda _module, arguments: raw_value.append(arguments[0])
+        )
+        try:
+            actual, belief = critic.forward_with_belief(
+                inputs,
+                extras.unit_categorical,
+                extras.unit_continuous,
+                extras.unit_active,
+            )
+        finally:
+            handle.remove()
+        assert torch.equal(actual, expected)
+        assert belief._fields == ("value_decision",)
+        with torch.autocast("cuda", enabled=False):
+            normalized = torch.nn.functional.rms_norm(
+                raw_value[0], (config.model_dim,), critic.value_norm.weight, eps=1e-5
+            )
+        torch.testing.assert_close(belief.value_decision, normalized, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual,
+            (
+                critic.value_head(belief.value_decision[:, 0])
+                if scalar_value
+                else softcap_value_logits(critic.value_head(belief.value_decision[:, 0]))
+            ),
+            rtol=0,
+            atol=0,
+        )
+        slots = 1 + MAX_UNITS + MAX_MARKET_ORDERS if per_entity_critic else 1
+        assert belief.value_decision.shape == (batch, slots, config.model_dim)
+        if per_entity_critic:
+            entity_logits = critic.decode_entity_belief(belief)
+            assert entity_logits.shape == (
+                batch,
+                slots - 1,
+                1 if scalar_value else config.value_atoms,
+            )
+            torch.testing.assert_close(
+                critic.value(entity_logits),
+                critic.value(
+                    critic.value_head(belief.value_decision[:, 1:])
+                    if scalar_value
+                    else softcap_value_logits(critic.value_head(belief.value_decision[:, 1:]))
+                ),
+                rtol=0,
+                atol=0,
+            )
+            assert not torch.equal(entity_logits[:, 0], entity_logits[:, 1])
+
+        product_values = inputs.products.clone()
+        product_values[..., -1] += 0.25
+        _, product_belief = critic.forward_with_belief(
+            inputs._replace(products=product_values),
             extras.unit_categorical,
             extras.unit_continuous,
             extras.unit_active,
         )
-    finally:
-        handle.remove()
-    assert torch.equal(actual, expected)
-    assert belief._fields == ("value_decision",)
-    with torch.autocast("cuda", enabled=False):
-        normalized = torch.nn.functional.rms_norm(
-            raw_value[0], (config.model_dim,), critic.value_norm.weight, eps=1e-5
+        assert not torch.equal(product_belief.value_decision, belief.value_decision)
+
+        animal_values = inputs.animals.clone()
+        animal_values[..., -1] += 0.25
+        _, animal_belief = critic.forward_with_belief(
+            inputs._replace(animals=animal_values),
+            extras.unit_categorical,
+            extras.unit_continuous,
+            extras.unit_active,
         )
-    torch.testing.assert_close(belief.value_decision, normalized, rtol=0, atol=0)
-    torch.testing.assert_close(
-        actual,
-        (
-            critic.value_head(belief.value_decision[:, 0])
-            if scalar_value
-            else softcap_value_logits(critic.value_head(belief.value_decision[:, 0]))
-        ),
-        rtol=0,
-        atol=0,
-    )
-    assert belief.value_decision.shape == (batch, 1, config.model_dim)
+        assert not torch.equal(animal_belief.value_decision, belief.value_decision)
 
-    product_values = inputs.products.clone()
-    product_values[..., -1] += 0.25
-    _, product_belief = critic.forward_with_belief(
-        inputs._replace(products=product_values),
-        extras.unit_categorical,
-        extras.unit_continuous,
-        extras.unit_active,
-    )
-    assert not torch.equal(product_belief.value_decision, belief.value_decision)
+        crop_values = inputs.crops.clone()
+        crop_values[..., -1] += 0.25
+        _, crop_belief = critic.forward_with_belief(
+            inputs._replace(crops=crop_values),
+            extras.unit_categorical,
+            extras.unit_continuous,
+            extras.unit_active,
+        )
+        assert not torch.equal(crop_belief.value_decision, belief.value_decision)
 
-    animal_values = inputs.animals.clone()
-    animal_values[..., -1] += 0.25
-    _, animal_belief = critic.forward_with_belief(
-        inputs._replace(animals=animal_values),
-        extras.unit_categorical,
-        extras.unit_continuous,
-        extras.unit_active,
-    )
-    assert not torch.equal(animal_belief.value_decision, belief.value_decision)
-
-    crop_values = inputs.crops.clone()
-    crop_values[..., -1] += 0.25
-    _, crop_belief = critic.forward_with_belief(
-        inputs._replace(crops=crop_values),
-        extras.unit_categorical,
-        extras.unit_continuous,
-        extras.unit_active,
-    )
-    assert not torch.equal(crop_belief.value_decision, belief.value_decision)
-
-    assert extras.unit_active.any()
-    opponent_unit_continuous = extras.unit_continuous.clone()
-    opponent_unit_continuous[extras.unit_active] += 0.25
-    _, unit_belief = critic.forward_with_belief(
-        inputs,
-        extras.unit_categorical,
-        opponent_unit_continuous,
-        extras.unit_active,
-    )
-    assert not torch.equal(unit_belief.value_decision, belief.value_decision)
+        assert extras.unit_active.any()
+        opponent_unit_continuous = extras.unit_continuous.clone()
+        opponent_unit_continuous[extras.unit_active] += 0.25
+        _, unit_belief = critic.forward_with_belief(
+            inputs,
+            extras.unit_categorical,
+            opponent_unit_continuous,
+            extras.unit_active,
+        )
+        assert not torch.equal(unit_belief.value_decision, belief.value_decision)
 
 
 @pytest.mark.cuda

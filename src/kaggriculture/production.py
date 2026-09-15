@@ -11,6 +11,7 @@ from typing import Any
 from kaggriculture.evaluation import DEVELOPMENT_SEED_START
 from kaggriculture.provenance import repository_root
 from kaggriculture.registry import STRUCTURED
+from kaggriculture.rollout import REWARD_MODES
 
 PRODUCTION_ARCHITECTURE = STRUCTURED
 PRODUCTION_CRITIC_WARMUP_ITERATIONS = 10
@@ -258,10 +259,13 @@ def build_training_command(
     resume_checkpoint: Path | None = None,
     initial_actors: Sequence[Path] = (),
     critic_warmup_iterations: int | None = None,
+    reward_mode: str = "shaped",
 ) -> list[str]:
     """Build the exact production train_ppo.py invocation."""
     if (expected_source_digest is None) != (calibration_decision is None):
         raise ValueError("source digest and calibration decision must be provided together")
+    if reward_mode not in REWARD_MODES:
+        raise ValueError(f"reward mode must be one of {REWARD_MODES}")
     # A warm start initializes iteration zero; a resume continues a run that
     # already has an actor. train_ppo rejects the pair, and it must fail here
     # rather than after the launcher has already rewritten the run's evidence.
@@ -321,6 +325,8 @@ def build_training_command(
         str(max_hours),
         "--seed",
         str(seed),
+        "--reward-mode",
+        reward_mode,
     ]
     if expected_source_digest is not None and calibration_decision is not None:
         command.extend(
@@ -418,6 +424,8 @@ def build_training_command(
             str(model["critic_latents"]),
             "--scalar-value",
             str(model["scalar_value"]).lower(),
+            "--per-entity-critic",
+            str(model["per_entity_critic"]).lower(),
             "--value-sigma-ratio",
             str(model["value_sigma_ratio"]),
             "--actor-lr",

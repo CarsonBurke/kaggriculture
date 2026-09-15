@@ -18,11 +18,12 @@ from kaggriculture.actor_dynamics import (
     actor_horizon_loss,
     actor_window_loss,
 )
-from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, EPISODE_STEPS, STARTING_MONEY
 from kaggriculture.model import (
     DistributionalCritic,
     FarmActor,
     distributional_value_loss,
+    hl_gauss_value_targets,
     policy_compile_options,
     scalar_value_loss,
 )
@@ -53,9 +54,9 @@ from kaggriculture.structured_dynamics import (
 Critic = DistributionalCritic | StructuredCritic
 Actor = FarmActor | StructuredActor
 
-#: Dense investment costs and delayed proceeds must share the full return.
-#: Both objectives default to lambda one; explicit overrides remain available.
-DEFAULT_ACTOR_GAE_LAMBDA = 1.0
+#: VAPO temporal defaults: Monte Carlo critic targets, shorter actor GAE traces.
+#: Actor lambda uses alpha=0.05 and the full game's EPISODE_STEPS - 1 transitions.
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (0.05 * (EPISODE_STEPS - 1))
 DEFAULT_CRITIC_GAE_LAMBDA = 1.0
 
 #: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
@@ -299,13 +300,10 @@ class PpoConfig:
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
     #
-    # Discount-correct shaping uses this same gamma during collection:
-    # nonterminal rewards are gamma * Phi(next) - Phi(current), while terminal
-    # bank utility is paid separately. The fixed-horizon discounted return
-    # therefore preserves the terminal objective without forcing gamma one.
-    #
-    # Preserve delayed investment payoffs in both policy and value targets.
-    # Explicit actor/critic overrides still permit controlled GAE comparisons.
+    # Collection and PPO share gamma. At the default gamma one, potential
+    # shaping telescopes to the undiscounted final-bank margin.
+    # The critic fits full Monte Carlo returns; the actor's shorter GAE trace
+    # uses that critic to carry long-term credit with lower variance.
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     critic_gae_lambda: float = DEFAULT_CRITIC_GAE_LAMBDA
     gamma: float = DEFAULT_REWARD_GAMMA
@@ -438,7 +436,7 @@ def generalized_advantage_and_targets(
     """Compute lambda-GAE advantages and the matching lambda-return ``A + V``.
 
     Callers pick the lambda: the actor uses `PpoConfig.actor_gae_lambda`, the
-    critic uses `PpoConfig.critic_gae_lambda`. Both default to lambda one.
+    critic uses `PpoConfig.critic_gae_lambda` (one for Monte Carlo targets).
     This helper is the recurrence only.
     """
     if rewards.shape != values.shape or valid.shape != values.shape:
@@ -768,6 +766,7 @@ def _replayed_value_chunk(
     critic: Critic,
     autocast_enabled: bool,
     *critic_args: Any,
+    include_entities: bool = False,
 ) -> Tensor:
     """One critic value forward over a chunk of stored state features.
 
@@ -781,7 +780,15 @@ def _replayed_value_chunk(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        critic_logits = critic(*critic_args)
+        if include_entities:
+            if not isinstance(critic, StructuredCritic) or not critic.config.per_entity_critic:
+                raise ValueError("entity replay requires a per-entity structured critic")
+            global_logits, belief = critic.forward_with_belief(*critic_args)
+            critic_logits = torch.cat(
+                (global_logits[:, None], critic.decode_entity_belief(belief)), dim=1
+            )
+        else:
+            critic_logits = critic(*critic_args)
     return critic.value(critic_logits)
 
 
@@ -801,6 +808,7 @@ def replay_behavior_values(
     chunk_size: int = 4096,
     compile_mode: str = UNCOMPILED_UPDATE_COMPILE_MODE,
     autocast_enabled: bool = False,
+    include_entities: bool = False,
 ) -> Tensor:
     """Replay behavior-time value predictions from stored state features.
 
@@ -817,6 +825,9 @@ def replay_behavior_values(
     subset of the wave's trajectories, and every other row's prediction would
     be this member's critic reading a state its own policy never visited --
     which the advantage mask discards anyway, so the pass never computes it.
+
+    With ``include_entities=True`` explicitly returns (rows, 1 + units + orders),
+    global first. The default remains (rows,), even for an entity critic.
     """
     if chunk_size < 1:
         raise ValueError("chunk size must be positive")
@@ -841,7 +852,12 @@ def replay_behavior_values(
     critic.eval()
     try:
         values = [
-            forward(critic, autocast_enabled, *_critic_batch_args(architecture, staged, chunk))
+            forward(
+                critic,
+                autocast_enabled,
+                *_critic_batch_args(architecture, staged, chunk),
+                include_entities=include_entities,
+            )
             for chunk in chunks
         ]
     finally:
@@ -875,6 +891,7 @@ def _owned_behavior_values(
     *,
     compile_mode: str,
     autocast_enabled: bool,
+    include_entities: bool = False,
 ) -> np.ndarray:
     """Behavior-time value predictions on the rollout grid, replayed for `rows`.
 
@@ -899,14 +916,16 @@ def _owned_behavior_values(
             states=states,
             compile_mode=compile_mode,
             autocast_enabled=autocast_enabled,
+            include_entities=include_entities,
         )
         .cpu()
         .numpy()
     )
+    shape = (*rollout.rewards.shape, *replayed.shape[1:])
     if rows is None:
-        return replayed.reshape(rollout.rewards.shape)
-    grid = np.zeros(rollout.rewards.shape, dtype=replayed.dtype)
-    grid[rows] = replayed.reshape(-1, horizon)
+        return replayed.reshape(shape)
+    grid = np.zeros(shape, dtype=replayed.dtype)
+    grid[rows] = replayed.reshape(-1, horizon, *replayed.shape[1:])
     return grid
 
 
@@ -972,6 +991,29 @@ def prepare_advantages(
         raw_advantage_mean=raw_mean,
         raw_advantage_std=raw_std,
     )
+
+
+def prepare_entity_advantages(
+    returns: np.ndarray,
+    values: np.ndarray,
+    active: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """MAPPO whitening over active entities, counting each market order once.
+
+    ``active`` already includes owned valid states; inactive NaNs are never
+    read by the moments or returned to the actor. Both market heads reuse the
+    one order advantage, not a separately normalized quantity baseline.
+    """
+    if values.shape != active.shape or returns.shape != values.shape[:-1]:
+        raise ValueError("entity values and active masks must match the return grid")
+    advantages = np.zeros_like(values, dtype=np.float32)
+    np.subtract(returns[..., None], values, out=advantages, where=active)
+    selected = advantages[active]
+    if not selected.size or not np.isfinite(selected).all():
+        raise ValueError("active entity advantages must be nonempty and finite")
+    mean, std = float(selected.mean()), float(selected.std())
+    advantages[active] = (selected - mean) / (std + 1e-5)
+    return advantages, mean, std
 
 
 def _initialize_optimizer_schedule(
@@ -1109,6 +1151,17 @@ def _batch_tensor(
 ) -> Tensor:
     selected = staged[indices] if isinstance(indices, slice) else staged.index_select(0, indices)
     return selected if dtype is None or selected.dtype == dtype else selected.to(dtype=dtype)
+
+
+def _entity_active_batch(staged: dict[str, Tensor], indices: Tensor | slice) -> Tensor:
+    """Owned action entities, units then market orders; quantities are not agents."""
+    return torch.cat(
+        (
+            _batch_tensor(staged["unit_active"], indices, torch.bool),
+            _batch_tensor(staged["market_active"], indices, torch.bool),
+        ),
+        dim=-1,
+    )
 
 
 def _fixed_minibatch_positions(
@@ -1687,13 +1740,38 @@ def _value_objective(
     value_targets: Tensor,
     *,
     sample_weight: Tensor | None = None,
+    head_active: Tensor | None = None,
 ) -> Tensor:
     """The critic's per-minibatch objective, in whichever parameterization it has.
 
     The scalar branch reads the prediction back through `critic.value`, which is
     a squeeze there, so both branches spend exactly one readout.
     """
-    if critic.config.scalar_value:
+    if head_active is not None:
+        # Sanitize before nonlinear losses; multiplying inactive NaNs by zero
+        # afterwards does not protect either the objective or its backward.
+        valid = head_active.bool()
+        if sample_weight is not None:
+            valid = valid & sample_weight[:, None].bool()
+        critic_logits = torch.where(valid[..., None], critic_logits, 0.0)
+        value_targets = torch.where(valid.any(dim=-1), value_targets, 0.0)
+        if critic.config.scalar_value:
+            per_state = scalar_value_loss(
+                critic.value(critic_logits), value_targets[:, None].expand_as(valid)
+            )
+        else:
+            # The return is shared: build the HL label once per state, not
+            # once per head. Only the predicted distributions differ.
+            projected = hl_gauss_value_targets(
+                value_targets.detach(),
+                critic.support,
+                sigma_ratio=critic.config.value_sigma_ratio,
+                validate=False,
+            )
+            per_state = -(projected[:, None] * critic_logits.float().log_softmax(dim=-1)).sum(
+                dim=-1
+            )
+    elif critic.config.scalar_value:
         per_state = scalar_value_loss(critic.value(critic_logits), value_targets)
     else:
         per_state = distributional_value_loss(
@@ -1702,6 +1780,10 @@ def _value_objective(
             critic.support,
             sigma_ratio=critic.config.value_sigma_ratio,
             validate=False,
+        )
+    if head_active is not None:
+        per_state = torch.where(valid, per_state, 0.0).sum(dim=-1) / (
+            head_active.sum(dim=-1).clamp_min(1)
         )
     if sample_weight is None:
         return per_state.mean()
@@ -1714,6 +1796,7 @@ def _critic_logits_and_loss(
     autocast_enabled: bool,
     *critic_args: Any,
     sample_weight: Tensor | None = None,
+    entity_active: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The shared critic forward and value objective."""
     with torch.autocast(
@@ -1721,10 +1804,45 @@ def _critic_logits_and_loss(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        critic_logits = critic(*critic_args)
+        if isinstance(critic, StructuredCritic) and critic.config.per_entity_critic:
+            critic_logits, belief = critic.forward_with_belief(*critic_args)
+            entity_logits = critic.decode_entity_belief(belief)
+        else:
+            critic_logits = critic(*critic_args)
+            entity_logits = None
     return (
-        _value_objective(critic, critic_logits, value_targets, sample_weight=sample_weight),
+        _critic_readout_objective(
+            critic,
+            critic_logits,
+            entity_logits,
+            value_targets,
+            sample_weight=sample_weight,
+            entity_active=entity_active,
+        ),
         critic_logits,
+    )
+
+
+def _critic_readout_objective(
+    critic: Critic,
+    global_logits: Tensor,
+    entity_logits: Tensor | None,
+    value_targets: Tensor,
+    *,
+    sample_weight: Tensor | None,
+    entity_active: Tensor | None,
+) -> Tensor:
+    if entity_logits is None:
+        return _value_objective(critic, global_logits, value_targets, sample_weight=sample_weight)
+    if entity_active is None:
+        raise ValueError("per-entity critic training requires active entity masks")
+    head_active = torch.cat((torch.ones_like(entity_active[:, :1]), entity_active), dim=-1)
+    return _value_objective(
+        critic,
+        torch.cat((global_logits[:, None], entity_logits), dim=1),
+        value_targets,
+        sample_weight=sample_weight,
+        head_active=head_active,
     )
 
 
@@ -1734,10 +1852,16 @@ def _critic_minibatch_objective(
     autocast_enabled: bool,
     *critic_args: Any,
     sample_weight: Tensor | None = None,
+    entity_active: Tensor | None = None,
 ) -> Tensor:
     """One critic minibatch without the value telemetry scoring epochs need."""
     loss, _critic_logits = _critic_logits_and_loss(
-        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
+        critic,
+        value_targets,
+        autocast_enabled,
+        *critic_args,
+        sample_weight=sample_weight,
+        entity_active=entity_active,
     )
     return loss
 
@@ -1748,6 +1872,7 @@ def _critic_minibatch_loss(
     autocast_enabled: bool,
     *critic_args: Any,
     sample_weight: Tensor | None = None,
+    entity_active: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """One critic minibatch: the distributional loss and the mean it implies.
 
@@ -1756,7 +1881,12 @@ def _critic_minibatch_loss(
     `_critic_minibatch_objective`, avoiding the softmax and support reduction.
     """
     loss, critic_logits = _critic_logits_and_loss(
-        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
+        critic,
+        value_targets,
+        autocast_enabled,
+        *critic_args,
+        sample_weight=sample_weight,
+        entity_active=entity_active,
     )
     return loss, critic.value(critic_logits).detach()
 
@@ -1767,6 +1897,7 @@ def _critic_minibatch_fit_terms(
     autocast_enabled: bool,
     *critic_args: Any,
     sample_weight: Tensor | None = None,
+    entity_active: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Critic loss plus float64 target/residual moments for a scoring epoch.
 
@@ -1775,7 +1906,12 @@ def _critic_minibatch_fit_terms(
     a full minibatch and materializing five eager float64 intermediates.
     """
     loss, predictions = _critic_minibatch_loss(
-        critic, value_targets, autocast_enabled, *critic_args, sample_weight=sample_weight
+        critic,
+        value_targets,
+        autocast_enabled,
+        *critic_args,
+        sample_weight=sample_weight,
+        entity_active=entity_active,
     )
     targets = value_targets.double()
     residuals = targets - predictions.double()
@@ -1790,6 +1926,7 @@ def _structured_critic_minibatch_fit_terms(
     *critic_args: Any,
     sample_weight: Tensor | None = None,
     balance_auxiliary: bool = False,
+    entity_active: Tensor | None = None,
 ) -> tuple[Tensor, ...]:
     """Critic loss, fit moments, and belief from one forward."""
     with torch.autocast(
@@ -1799,12 +1936,30 @@ def _structured_critic_minibatch_fit_terms(
     ):
         belief = critic.encode_belief(*critic_args)
         primary_belief = belief
+        if critic.config.per_entity_critic:
+            belief = StructuredCriticBelief(belief.value_decision[:, :1])
         if balance_auxiliary:
+            if critic.config.per_entity_critic:
+                primary_belief_entities = primary_belief.value_decision[:, 1:]
             primary, auxiliary = _BalancedSource.apply(belief.value_decision)
             primary_belief = StructuredCriticBelief(primary)
+            if critic.config.per_entity_critic:
+                primary_belief = StructuredCriticBelief(
+                    torch.cat((primary, primary_belief_entities), dim=1)
+                )
             belief = StructuredCriticBelief(auxiliary)
         critic_logits = critic.decode_belief(primary_belief)
-    loss = _value_objective(critic, critic_logits, value_targets, sample_weight=sample_weight)
+        entity_logits = (
+            critic.decode_entity_belief(primary_belief) if critic.config.per_entity_critic else None
+        )
+    loss = _critic_readout_objective(
+        critic,
+        critic_logits,
+        entity_logits,
+        value_targets,
+        sample_weight=sample_weight,
+        entity_active=entity_active,
+    )
     predictions = critic.value(critic_logits).detach()
     targets = value_targets.double()
     residuals = targets - predictions.double()
@@ -2147,13 +2302,22 @@ def _component_policy_sums(
     entropy_sum = torch.zeros_like(objective)
     kl = torch.zeros_like(objective)
     clipped = torch.zeros_like(objective)
-    for new, old, mask, entropy in zip(new_logprobs, old_logprobs, active, entropies, strict=True):
+    if advantages.ndim == 1:
+        component_advantages = (advantages, advantages, advantages)
+    else:
+        unit_count = new_logprobs[0].shape[-1]
+        unit_advantages = advantages[:, :unit_count]
+        order_advantages = advantages[:, unit_count:]
+        component_advantages = (unit_advantages, order_advantages, order_advantages)
+    for new, old, mask, entropy, advantage in zip(
+        new_logprobs, old_logprobs, active, entropies, component_advantages, strict=True
+    ):
         weight = mask.float()
         if sample_weight is not None:
             weight = torch.where(sample_weight[:, None].bool(), weight, 0.0)
             weight = weight * sample_weight[:, None]
         component_objective, component_kl, component_clipped = _clipped_surrogate_sums(
-            new, old, advantages, weight, clip_low, clip_high
+            new, old, advantage, weight, clip_low, clip_high
         )
         objective = objective + component_objective
         kl = kl + component_kl
@@ -2189,6 +2353,8 @@ def _policy_sums(
         return *terms, terms[2]
     if policy_ratio_scope != "joint":
         raise ValueError("policy ratio scope must be 'components' or 'joint'")
+    if advantages.ndim != 1:
+        raise ValueError("joint policy ratios require scalar state advantages")
 
     state_weight = (
         torch.ones_like(advantages, dtype=torch.float32) if sample_weight is None else sample_weight
@@ -2230,7 +2396,9 @@ def _clipped_surrogate_sums(
     """Return weighted per-component PPO objective, k3 KL, and clipped count."""
     valid = active.bool()
     log_ratio = torch.where(valid, new_logprobs.float() - old_logprobs.float(), 0.0)
-    expanded_advantage = torch.where(valid, advantages.float()[:, None], 0.0)
+    expanded_advantage = torch.where(
+        valid, advantages.float()[:, None] if advantages.ndim == 1 else advantages.float(), 0.0
+    )
     effective_log_ratio = torch.where(
         expanded_advantage >= 0.0,
         log_ratio.clamp_max(math.log(clip_high)),
@@ -2600,6 +2768,8 @@ def _structured_critic_auxiliary_terms(
                 _, belief = critic.forward_with_belief(*critic_args)
         else:
             raise ValueError("belief indices and inverse must be supplied together")
+        if critic.config.per_entity_critic:
+            belief = StructuredCriticBelief(belief.value_decision[:, :1])
         loss_function = (
             structured_critic_window_loss if complete_windows else structured_critic_horizon_loss
         )
@@ -2626,6 +2796,8 @@ def _credit_quality_metrics(
     valid: np.ndarray,
     gamma: float,
     groups: Mapping[str, np.ndarray] | None,
+    *,
+    reward_mode: str = "shaped",
 ) -> dict[str, float | int]:
     """Preupdate terminal prediction, removing the known shaping potential.
 
@@ -2633,11 +2805,18 @@ def _credit_quality_metrics(
     diagnostics; neither the terminal outcome nor this reconstruction is staged.
     """
     remaining = rollout.valid.sum(axis=1)[:, None] - np.arange(valid.shape[1])[None, :]
-    own = rollout.final_money.astype(np.float64)
-    opponent = rollout.opponent_money.astype(np.float64)
-    terminal = (own - opponent) / (own + opponent + 2.0 * STARTING_MONEY)
+    if reward_mode == "terminal-outcome":
+        # Completed trajectories contain the exact native outcome in their last
+        # valid reward; comparing stored f32 banks can turn close wins into ties.
+        terminal = rollout.rewards[np.arange(valid.shape[0]), remaining[:, 0] - 1].astype(
+            np.float64
+        )
+    else:
+        own = rollout.final_money.astype(np.float64)
+        opponent = rollout.opponent_money.astype(np.float64)
+        terminal = (own - opponent) / (own + opponent + 2.0 * STARTING_MONEY)
     target = np.power(gamma, np.maximum(remaining - 1, 0)) * terminal[:, None]
-    potential = target - monte_carlo
+    potential = target - monte_carlo if reward_mode == "shaped" else 0.0
     prediction = values + potential
     partitions = {"all": np.ones(valid.shape[0], dtype=bool), **(groups or {})}
     bins = (
@@ -2767,6 +2946,7 @@ def _warm_actor_update_graphs(
         auxiliary_active,
         autocast_enabled,
         tuple(indices.shape),
+        tuple(staged["advantages"].shape[1:]),
         None if plan is None else (tuple(plan.indices.shape), tuple(plan.eligible.shape)),
     )
     warmed = getattr(actor, "_kaggriculture_warmed_update_graphs", None)
@@ -2878,6 +3058,12 @@ def update_ppo(
     arrays.
     """
     _validate_config(config)
+    entity_critic = isinstance(critic, StructuredCritic) and critic.config.per_entity_critic
+    if entity_critic:
+        if config.actor_gae_lambda != 1.0 or config.critic_gae_lambda != 1.0:
+            raise ValueError("per-entity critic requires actor and critic GAE lambda one")
+        if config.policy_ratio_scope != "components":
+            raise ValueError("per-entity critic requires component policy ratio scope")
     if not rollout.learner_stochastic:
         raise ValueError("PPO updates require stochastic learner collection")
     _validate_structured_auxiliary_modules(actor, structured_dynamics, config)
@@ -3032,7 +3218,11 @@ def update_ppo(
         rows,
         compile_mode=compile_mode,
         autocast_enabled=autocast_enabled,
+        include_entities=entity_critic,
     )
+    entity_values = behavior_values[..., 1:] if entity_critic else None
+    if entity_critic:
+        behavior_values = behavior_values[..., 0]
     mark_phase("update_behavior_replay_seconds")
     if structured_dynamics is not None:
         structured_dynamics.train()
@@ -3069,7 +3259,21 @@ def update_ppo(
             (valid_value_targets < value_support[0]) | (valid_value_targets > value_support[-1])
         )
         value_targets = np.clip(prepared.value_targets, value_support[0], value_support[-1])
-    staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
+    entity_metrics: dict[str, float] = {}
+    if entity_values is not None:
+        entity_active = np.concatenate((rollout.unit_active, rollout.market_active), axis=-1)
+        entity_active = entity_active & owned_valid[..., None]
+        entity_advantages, entity_mean, entity_std = prepare_entity_advantages(
+            prepared.monte_carlo_returns, entity_values, entity_active
+        )
+        staged["advantages"] = _stage_tensor(entity_advantages, device)
+        entity_metrics = {
+            "entity_advantage_mean": entity_mean,
+            "entity_advantage_std": entity_std,
+            "entity_value_std": float(entity_values[entity_active].std()),
+        }
+    else:
+        staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
     staged["value_targets"] = torch.from_numpy(value_targets.reshape(-1)).to(device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -3592,6 +3796,9 @@ def update_ppo(
             critic_gradient_diagnostic = (
                 diagnostic_gradients and critic_predictor_active and not critic_predictor_updates
             )
+            minibatch_entity_active = (
+                _entity_active_batch(staged, indices) if entity_critic else None
+            )
             if critic_predictor_active or epoch_index == 0 or epoch_index == critic_epochs - 1:
                 critic_pack = critic_fit_terms_fn(
                     critic,
@@ -3599,6 +3806,7 @@ def update_ppo(
                     autocast_enabled,
                     *critic_args,
                     sample_weight=sample_weight,
+                    entity_active=minibatch_entity_active,
                     **(
                         {
                             "balance_auxiliary": critic_auxiliary_active
@@ -3626,6 +3834,7 @@ def update_ppo(
                     autocast_enabled,
                     *critic_args,
                     sample_weight=sample_weight,
+                    entity_active=minibatch_entity_active,
                 )
             if critic_predictor_active:
                 assert isinstance(critic, StructuredCritic)
@@ -4010,6 +4219,7 @@ def update_ppo(
         ),
         "advantage_mean": prepared.raw_advantage_mean,
         "advantage_std": prepared.raw_advantage_std,
+        **entity_metrics,
         "value_target_mean": float(prepared.value_targets[owned_valid].mean()),
         "value_target_std": float(prepared.value_targets[owned_valid].std()),
         "value_target_min": float(prepared.value_targets[owned_valid].min()),
@@ -4091,6 +4301,7 @@ def update_ppo(
             owned_valid,
             config.gamma,
             diagnostic_groups,
+            reward_mode=rollout.reward_mode,
         )
     )
     if actor_predictor_active:

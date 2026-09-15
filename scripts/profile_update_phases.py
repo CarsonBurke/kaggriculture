@@ -39,6 +39,7 @@ from kaggriculture.ppo import (
     _cached_update_callable,
     _critic_batch_args,
     _critic_minibatch_fit_terms,
+    _entity_active_batch,
     _optimizer_step,
     _replayed_value_chunk,
     _stage_tensor,
@@ -270,7 +271,12 @@ def main() -> None:
     minibatch = valid_indices.size // -(-valid_indices.size // ppo_config.minibatch_size)
     host_indices = generator.permutation(valid_indices)[:minibatch]
     indices = torch.from_numpy(host_indices).to(device)
-    staged["advantages"] = torch.zeros(flat_valid.size, device=device)
+    entity_critic = getattr(critic.config, "per_entity_critic", False)
+    staged["advantages"] = (
+        torch.zeros_like(_entity_active_batch(staged, slice(None)), dtype=torch.float32)
+        if entity_critic
+        else torch.zeros(flat_valid.size, device=device)
+    )
     staged["value_targets"] = torch.zeros(flat_valid.size, device=device)
     autocast_enabled = ppo_config.use_bfloat16
     mode = args.update_compile_mode
@@ -317,6 +323,7 @@ def main() -> None:
         component_count if ppo_config.policy_loss_reduction == "components" else indices.numel()
     )
     value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
+    entity_active = _entity_active_batch(staged, indices) if entity_critic else None
 
     def actor_forward():
         return actor_terms(
@@ -350,7 +357,9 @@ def main() -> None:
         _optimizer_step(actor_optimizer, ppo_config.actor_learning_rate, ppo_config.lr_warmup_steps)
 
     def critic_forward():
-        return critic_terms(critic, value_targets, autocast_enabled, *critic_args)
+        return critic_terms(
+            critic, value_targets, autocast_enabled, *critic_args, entity_active=entity_active
+        )
 
     def critic_forward_backward():
         critic_optimizer.zero_grad(set_to_none=True)

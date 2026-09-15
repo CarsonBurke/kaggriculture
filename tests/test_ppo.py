@@ -50,6 +50,7 @@ from kaggriculture.ppo import (
     make_optimizers,
     make_structured_dynamics_optimizer,
     prepare_advantages,
+    prepare_entity_advantages,
     replay_behavior_values,
     set_lr_cooldown,
     update_ppo,
@@ -74,6 +75,74 @@ from kaggriculture.structured_dynamics import (
     StructuredHorizonPlan,
     structured_horizon_plan,
 )
+
+
+def test_entity_advantages_normalize_owned_active_entities_only() -> None:
+    returns = np.array([[2.0, np.nan]], dtype=np.float32)
+    values = np.array([[[0.0, 1.0, np.nan], [np.nan, np.nan, np.nan]]], dtype=np.float32)
+    active = np.array([[[True, True, False], [False, False, False]]])
+    advantages, mean, std = prepare_entity_advantages(returns, values, active)
+    assert (mean, std) == (1.5, 0.5)
+    np.testing.assert_allclose(advantages[active], [0.5 / 0.50001, -0.5 / 0.50001])
+    assert np.isfinite(advantages).all()
+    assert np.count_nonzero(advantages[~active]) == 0
+    values[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="active entity advantages"):
+        prepare_entity_advantages(returns, values, active)
+
+
+def test_entity_values_route_distinct_unit_and_shared_order_policy_gradients() -> None:
+    # Same return, different predictions: each unit and order has its own
+    # baseline; a quantity decision reuses its order's advantage.
+    advantages, _, _ = prepare_entity_advantages(
+        np.array([2.0], dtype=np.float32),
+        np.array([[0.0, 1.0, 3.0, np.nan]], dtype=np.float32),
+        np.array([[True, True, True, False]]),
+    )
+    new = tuple(torch.zeros(1, 2, requires_grad=True) for _ in range(3))
+    old = tuple(torch.zeros_like(value) for value in new)
+    masks = (
+        torch.tensor([[True, True]]),
+        torch.tensor([[True, False]]),
+        torch.tensor([[True, False]]),
+    )
+    objective, _, kl, _, parity_kl = kaggriculture.ppo._policy_sums(
+        new, old, masks, old, torch.from_numpy(advantages), 0.8, 1.2
+    )
+    (-objective).backward()
+    expected = torch.from_numpy(advantages)
+    torch.testing.assert_close(new[0].grad, -expected[:, :2])
+    torch.testing.assert_close(new[1].grad, -expected[:, 2:])
+    torch.testing.assert_close(new[2].grad, new[1].grad)
+    assert new[0].grad[0, 0] != new[0].grad[0, 1]
+    assert kl == parity_kl == 0
+
+
+def test_entity_primary_loss_is_state_mean_not_head_count_weighted() -> None:
+    critic = StructuredCritic(replace(_small_structured_config(), scalar_value=True))
+    logits = torch.tensor(
+        [
+            [[1.0], [3.0], [float("nan")]],
+            [[2.0], [float("nan")], [float("nan")]],
+            [[float("nan")], [float("nan")], [float("nan")]],
+        ],
+        requires_grad=True,
+    )
+    active = torch.tensor([[True, True, False], [True, False, False], [True, True, True]])
+    loss = kaggriculture.ppo._value_objective(
+        critic,
+        logits,
+        torch.tensor([0.0, 0.0, float("nan")]),
+        sample_weight=torch.tensor([1.0, 2.0, 0.0]),
+        head_active=active,
+    )
+    # State losses: mean(.5, 4.5)=2.5; 2.0. Wrapped padding has no loss.
+    torch.testing.assert_close(loss, torch.tensor((2.5 + 2.0 * 2.0) / 3.0))
+    loss.backward()
+    torch.testing.assert_close(
+        logits.grad.squeeze(-1),
+        torch.tensor([[1.0 / 6, 0.5, 0.0], [4.0 / 3, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+    )
 
 
 def test_rollout_action_masks_are_validated_once_before_replay() -> None:
@@ -1414,7 +1483,7 @@ def test_joint_kl_gate_rejects_action_that_component_kl_accepts(scope: str) -> N
     rollout.unit_active[..., :2] = True
     rollout.market_active[:] = False
     rollout.market_quantity_active[:] = False
-    rollout.old_unit_logprobs -= np.float32(0.01)
+    rollout.old_unit_logprobs[...] -= np.float32(0.01)
     config = PpoConfig(
         epochs=1,
         minibatch_size=1 << 12,
@@ -1441,7 +1510,7 @@ def test_joint_kl_gate_rejects_action_that_component_kl_accepts(scope: str) -> N
     assert metrics["max_approx_kl"] == pytest.approx(expected_scoped_kl, rel=2e-3)
     assert metrics["kl_early_stop"] == int(scope == "joint")
     assert metrics["actor_updates"] == int(scope == "components")
-    assert metrics["critic_updates"] == 1
+    assert metrics["updates"] == 1
     if scope == "joint":
         assert metrics["approx_kl"] == 0.0
         for name, parameter in actor.named_parameters():
@@ -2897,12 +2966,17 @@ def test_actor_nextlat_only_differentiates_source_bottleneck_and_predictor(
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("per_entity_critic", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_critic_auxiliary_trains_source_and_predictor_without_value_teacher_gradients() -> None:
+def test_critic_auxiliary_trains_source_and_predictor_without_value_teacher_gradients(
+    per_entity_critic: bool,
+) -> None:
     _actor, rollout = _structured_rollout_with_quantity_orders(
         seed_start=223, sampling_seed=51, device="cuda"
     )
-    critic = StructuredCritic(_small_structured_config()).cuda()
+    critic = StructuredCritic(
+        replace(_small_structured_config(), per_entity_critic=per_entity_critic)
+    ).cuda()
     dynamics = StructuredCriticDynamics(_small_structured_config()).cuda()
     config = PpoConfig(
         structured_critic_latent_coefficient=1.0,
@@ -2957,7 +3031,140 @@ def test_critic_auxiliary_trains_source_and_predictor_without_value_teacher_grad
         for parameter in dynamics.parameters()
     )
     assert torch.count_nonzero(belief.value_decision.grad[0]) > 0
+    if per_entity_critic:
+        assert torch.count_nonzero(belief.value_decision.grad[:, 1:]) == 0
     assert torch.count_nonzero(belief.value_decision.grad[1]) == 0
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_entity_critic_warmup_and_actor_update_keep_auxiliary_global() -> None:
+    torch.manual_seed(37)
+    actor, rollout = _structured_rollout_with_quantity_orders(
+        seed_start=231, sampling_seed=59, device="cuda"
+    )
+    model_config = replace(_small_structured_config(), per_entity_critic=True)
+    critic = StructuredCritic(model_config).cuda()
+
+    class GlobalOnlyDynamics(StructuredCriticDynamics):
+        def forward(self, belief, *args):
+            assert belief.value_decision.shape[1] == 1
+            return super().forward(belief, *args)
+
+    dynamics = GlobalOnlyDynamics(model_config).cuda()
+    config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=1536,
+        lr_warmup_steps=0,
+        target_kl=1.0,
+        use_bfloat16=True,
+        update_compile_mode="default",
+        policy_loss_reduction="states",
+        actor_gae_lambda=1.0,
+        structured_critic_latent_coefficient=1.0,
+        structured_critic_value_coefficient=1.0,
+        structured_critic_horizon=1,
+    )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, config)
+    actor_before = {name: value.detach().clone() for name, value in actor.named_parameters()}
+    assert {id(value) for value in actor.parameters()}.isdisjoint(
+        id(value) for value in critic.parameters()
+    )
+    warmup = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(60),
+        actor_epochs=0,
+        structured_critic_dynamics=dynamics,
+        structured_critic_dynamics_optimizer=dynamics_optimizer,
+        auxiliary_generator=np.random.default_rng(61),
+    )
+    assert warmup["actor_updates"] == 0
+    for name, value in actor.named_parameters():
+        torch.testing.assert_close(value, actor_before[name], rtol=0, atol=0)
+    assert torch.count_nonzero(critic.value_head.weight) > 0
+
+    # The frozen actor still owns this behavior wave. Replaying after critic
+    # warmup now supplies learned, distinct entity baselines to its first step.
+    device = torch.device("cuda")
+    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
+    staged["unit_actions"] = _stage_tensor(rollout.unit_actions, device)
+    staged["unit_active"] = _stage_tensor(rollout.unit_active, device)
+    rows = torch.from_numpy(np.flatnonzero(rollout.valid.reshape(-1))[:8]).cuda()
+    global_values = replay_behavior_values(
+        critic,
+        STRUCTURED,
+        staged,
+        states=rows,
+        chunk_size=8,
+        compile_mode="default",
+        autocast_enabled=True,
+    )
+    all_values = replay_behavior_values(
+        critic,
+        STRUCTURED,
+        staged,
+        states=rows,
+        chunk_size=8,
+        compile_mode="default",
+        autocast_enabled=True,
+        include_entities=True,
+    )
+    assert all_values.shape == (
+        8,
+        1 + rollout.unit_active.shape[-1] + rollout.market_active.shape[-1],
+    )
+    torch.testing.assert_close(global_values, all_values[:, 0], rtol=0, atol=0)
+    queries_before = critic.entity_queries.weight.detach().clone()
+    head_before = critic.value_head.weight.detach().clone()
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(62),
+        structured_critic_dynamics=dynamics,
+        structured_critic_dynamics_optimizer=dynamics_optimizer,
+        auxiliary_generator=np.random.default_rng(63),
+        diagnostic_gradients=True,
+    )
+    assert metrics["actor_updates"] > 0
+    assert metrics["structured_critic_predictor_updates"] > 0
+    assert metrics["entity_value_std"] > 0
+    assert not torch.equal(critic.entity_queries.weight, queries_before)
+    assert not torch.equal(critic.value_head.weight, head_before)
+    assert any(
+        not torch.equal(value, actor_before[name]) for name, value in actor.named_parameters()
+    )
+
+
+@pytest.mark.parametrize(
+    "config,reason",
+    [
+        (PpoConfig(actor_gae_lambda=0.95), "GAE lambda one"),
+        (PpoConfig(actor_gae_lambda=1.0, critic_gae_lambda=0.95), "GAE lambda one"),
+        (
+            PpoConfig(
+                actor_gae_lambda=1.0,
+                policy_ratio_scope="joint",
+                policy_loss_reduction="states",
+            ),
+            "component policy",
+        ),
+    ],
+)
+def test_entity_critic_refuses_undefined_temporal_or_joint_advantages(config, reason) -> None:
+    critic = StructuredCritic(replace(_small_structured_config(), per_entity_critic=True))
+    with pytest.raises(ValueError, match=reason):
+        update_ppo(None, critic, None, None, None, config, generator=np.random.default_rng(64))
 
 
 def test_optimizer_ownership_requires_exact_disjoint_pairs() -> None:
@@ -3595,6 +3802,40 @@ def test_credit_diagnostics_distinguish_potential_fit_from_terminal_skill() -> N
     assert baseline["credit_preupdate_all_ttg_33_128_states"] == 16
     assert baseline["credit_preupdate_league_all_states"] == 40
     assert all(math.isfinite(value) for value in baseline.values())
+
+
+def test_credit_diagnostics_score_terminal_outcomes_without_rounding_banks() -> None:
+    valid = np.asarray([[True, True, True], [True, True, False], [True, False, False]])
+    rollout = SimpleNamespace(
+        valid=valid,
+        # Float32 money telemetry can report a draw despite an exact win/loss.
+        final_money=np.full(3, 2**24, dtype=np.float32),
+        opponent_money=np.full(3, 2**24, dtype=np.float32),
+        rewards=np.asarray([[0.0, 0.0, 1.0], [0.0, -1.0, 9.0], [0.0, 9.0, 9.0]]),
+    )
+    returns = np.asarray([[0.25, 0.5, 1.0], [-0.5, -1.0, 0.0], [0.0, 0.0, 0.0]])
+    perfect = _credit_quality_metrics(
+        rollout, returns, returns, valid, 0.5, None, reward_mode="terminal-outcome"
+    )
+    baseline = _credit_quality_metrics(
+        rollout,
+        returns,
+        np.zeros_like(returns),
+        valid,
+        0.5,
+        None,
+        reward_mode="terminal-outcome",
+    )
+    assert perfect["credit_preupdate_all_all_terminal_residual_mse"] == 0.0
+    assert perfect[
+        "credit_preupdate_all_all_terminal_residual_explained_variance"
+    ] == pytest.approx(1.0)
+    assert baseline["credit_preupdate_all_all_terminal_residual_mse"] == pytest.approx(
+        np.square(returns[valid]).mean()
+    )
+    assert baseline["credit_preupdate_all_all_terminal_target_variance"] == pytest.approx(
+        returns[valid].var()
+    )
 
 
 @pytest.mark.parametrize("compiled", [False, True])

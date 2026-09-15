@@ -95,8 +95,10 @@ from kaggriculture.provenance import (
 )
 from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, STRUCTURED, resolve_architecture
 from kaggriculture.rollout import (
+    REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
     RolloutBatch,
+    _league_layout,
     allocate_rollout_storage,
     collect_mixed_play_rust,
     collect_population_play_rust,
@@ -414,22 +416,28 @@ def parse_args() -> argparse.Namespace:
         "--gamma",
         type=float,
         default=PpoConfig.gamma,
-        help="shared reward-shaping and PPO discount; defaults to 0.997",
+        help=f"shared reward-shaping and PPO discount; defaults to {PpoConfig.gamma}",
+    )
+    parser.add_argument(
+        "--reward-mode",
+        choices=REWARD_MODES,
+        default="shaped",
+        help="potential shaping, terminal bank margin, or terminal win/loss/draw",
     )
     parser.add_argument(
         "--actor-gae-lambda",
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            "policy GAE lambda; defaults to 1.0 to retain delayed investment "
-            "payoffs. Critic targets use --critic-gae-lambda"
+            f"policy GAE lambda; defaults to {DEFAULT_ACTOR_GAE_LAMBDA:.8f} "
+            "(VAPO alpha=0.05 over 719 transitions). Critic targets use --critic-gae-lambda"
         ),
     )
     parser.add_argument(
         "--critic-gae-lambda",
         type=float,
         default=DEFAULT_CRITIC_GAE_LAMBDA,
-        help="critic GAE lambda; defaults to 1.0 (discounted Monte Carlo return)",
+        help="critic GAE lambda; defaults to 1.0 (Monte Carlo return at the selected gamma)",
     )
     parser.add_argument(
         "--normalize-advantages",
@@ -612,9 +620,9 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "abort the run if anything compiles once the actor is released and "
-            "the neural league layout is unchanged from the previous wave. "
-            "Newly selected neural lane counts or widths compile on first use; "
-            "previously seen layouts reuse persistent compiled callables. "
+            "neural ensemble bucket is unchanged from the previous wave. "
+            "New buckets compile on first use; changed opponent assignments "
+            "within a bucket reuse the same compiled callable. "
             "Compiles in settled waves indicate a guard failure or a frame "
             "the warmups missed, and their wall time is recorded per wave"
         ),
@@ -918,7 +926,12 @@ def _load_initial_actor(
         artifact_config.pop(name)
         expected_config.pop(name)
     if isinstance(model_config, StructuredConfig):
-        for name in ("critic_core_layers", "critic_latents", "critic_state_read"):
+        for name in (
+            "critic_core_layers",
+            "critic_latents",
+            "critic_state_read",
+            "per_entity_critic",
+        ):
             artifact_config.pop(name)
             expected_config.pop(name)
     if artifact_config != expected_config:
@@ -1816,6 +1829,7 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         "league_builtin_lanes": args.league_builtin_lanes,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
+        "reward_mode": args.reward_mode,
         # Both calibrated knobs are modes, and both are cross-checked against the
         # calibration decision by name (`provenance.CALIBRATION_KNOBS`), so the
         # record stores the mode itself rather than any boolean projection of it.
@@ -3067,6 +3081,7 @@ def main() -> None:
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
                 gamma=args.gamma,
+                reward_mode=args.reward_mode,
                 sampling_seed=sampling_seed,
                 forward_mode=args.rollout_forward_mode,
                 forward_autocast=args.rollout_bfloat16,
@@ -3136,18 +3151,19 @@ def main() -> None:
                     seed_start=next_seed + args.games,
                 )
                 opponent_checkpoint = ",".join(row.label for row in selections)
-            # Only assigned neural lanes enter the ensemble. Built-in contests
-            # can change this geometry even after the snapshot pool is full.
-            # Previously seen layouts reuse their persistent compiled callable;
-            # a new layout pays its first compile when it is actually selected.
+            # Track the collector's physical inference bucket, not raw neural
+            # assignments. Changing opponents within a bucket must not excuse
+            # a new compile. Built-ins never occupy neural lanes.
             neural_counts = (
                 np.bincount(assignments, minlength=len(selections))[: len(opponents)]
                 if assignments is not None
                 else np.empty(0, dtype=np.int64)
             )
-            lane_signature = (
+            lane_signature = _league_layout(
                 int(np.count_nonzero(neural_counts)),
                 int(neural_counts.max(initial=0)),
+                device=device,
+                mode=args.rollout_forward_mode,
             )
             # Self-play and league games advance in one native wave, so the
             # learner forward covers every current-policy row at once and the
@@ -3163,6 +3179,7 @@ def main() -> None:
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
                 gamma=args.gamma,
+                reward_mode=args.reward_mode,
                 # Every league seat decodes exactly as the learner does.
                 # Sharpening them instead -- active lanes at 0.8, historical ones
                 # at argmax -- handed the learner an opponent that was a strictly
@@ -3371,8 +3388,8 @@ def main() -> None:
         #    actor optimizer and its objective have traced -- its forward and
         #    backward are warmed while frozen, but the release wave is still the
         #    first to step the actor, so it keeps a one-wave grace;
-        #  * this wave's league lane layout repeats the previous one, so the
-        #    collector's only legitimately moving shape has stopped moving.
+        #  * this wave's neural inference bucket repeats the previous one,
+        #    regardless of changes to the opponents or their game counts.
         # Everything else -- minibatch rows, replay chunks, rollout batch,
         # episode horizon -- is fixed by configuration from wave one, and every
         # frame is warmed in wave one, so a settled wave must compile nothing at

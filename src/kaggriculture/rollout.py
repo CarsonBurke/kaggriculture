@@ -32,6 +32,7 @@ from kaggriculture.encoding import (
     UNIT_FEATURES,
     pair_potential,
     shaped_pair_reward,
+    terminal_bank_pair_reward,
     terminal_pair_utility,
 )
 from kaggriculture.model import ActorOutput, FarmActor, policy_compile_options
@@ -73,6 +74,7 @@ _POPULATION_PAIRING_SEED_SALT = 0x5041_4952
 # from the network, anything else hands the row to the named engine reference
 # agent inside Rust. Mirrors `BuiltinAgent::from_code` in rust/kagg_env.
 BUILTIN_AGENT_CODES = {name: code for code, name in enumerate(BUILTIN_AGENT_ORDER, start=1)}
+REWARD_MODES = ("shaped", "terminal-bank", "terminal-outcome")
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,7 @@ class RolloutBatch:
     learner_stochastic: bool
     entropy_sums: np.ndarray
     elapsed_seconds: float
+    reward_mode: str = "shaped"
 
     @property
     def trajectories(self) -> int:
@@ -268,9 +271,11 @@ def _finish_rollout(
     entropy_sums: np.ndarray,
     learner_stochastic: bool,
     started: float,
+    reward_mode: str = "shaped",
 ) -> RolloutBatch:
     return RolloutBatch(
         architecture=architecture,
+        reward_mode=reward_mode,
         states={name: _trajectory_first(fields[name]) for name in _state_field_specs(architecture)},
         **{
             name: _trajectory_first(fields[name], dtype)
@@ -1291,10 +1296,6 @@ class _StackedActorEnsemble:
             else FarmActor(first.config)
         ).to("meta")
         self.template.eval()
-        # Each compiled lane layout gets its own code object below, so the
-        # ensemble no longer shares `_forward.__code__` across widths and
-        # Dynamo's per-code recompile budget is never the binding constraint.
-
         # The stacked tensors outlive any inference-mode region the collector
         # runs under; inference tensors would reject the in-place `load`
         # refills on later calls made outside that region.
@@ -1333,16 +1334,7 @@ class _StackedActorEnsemble:
         return torch.vmap(run)(self.params, self.buffers, *inputs)
 
     def _layout_forward(self, tag: str) -> Any:
-        """A bound `_forward` with its own code object, named after its layout.
-
-        Dynamo's cache and its recompile budget are keyed by code object, not by
-        compiled callable, so every lane layout sharing `_forward.__code__` made
-        each new width a *recompile* of the same frame: with the budget raised to
-        survive it, that hid genuine shape churn among legitimate layout
-        specializations, and without the bump the collector fell back to eager
-        after eight widths. A distinct code object per layout makes each one its
-        own first compile, which is what it actually is.
-        """
+        """Give each physical layout its own Dynamo frame and recompile budget."""
         template = _StackedActorEnsemble._forward
         name = f"_forward_{tag}"
         return types.FunctionType(
@@ -1376,10 +1368,8 @@ class _StackedActorEnsemble:
         leading = _leading_tensor(inputs)
         if mode not in COMPILED_ROLLOUT_FORWARD_MODES or leading.device.type != "cuda":
             return self._forward(*inputs)
-        # One compiled callable per lane width and mode, each wrapping its own
-        # code object: league assignments change the padded width between waves,
-        # and the widths are genuinely different graphs rather than one graph
-        # being respecialized.
+        # Each physical width keeps a persistent callable. League staging
+        # buckets changing assignments before they reach this exact-shape API.
         key = (mode, leading.shape[1])
         compiled = self._compiled.get(key)
         if compiled is None:
@@ -1408,18 +1398,11 @@ def _stacked_actor_ensemble(
     models: Sequence[FarmActor | StructuredActor],
     namespace: int = 0,
 ) -> _StackedActorEnsemble:
-    """Fetch or build the persistent stacked ensemble for this lane shape.
+    """Reuse one stacked ensemble per owner, architecture and physical lane count.
 
-    The key deliberately excludes *which* models are stacked. Keying on model
-    identity built a fresh instance -- and therefore fresh stacked tensors --
-    every time the league selection changed, which is most waves: the compiled
-    forward bakes those tensors' addresses via `mark_static_address`, so each
-    new instance re-traced the graph inside the wave that built it. Reusing one
-    instance per `(namespace, architecture, lane count, device, dtypes)` on
-    each collector thread preserves compiled addresses across sequential waves.
-    Different threads own different mutable weights: an acquisition elsewhere
-    cannot refill a live wave's ensemble. `namespace` separates independent
-    owners on one thread.
+    Refilling weights preserves the addresses read by compiled/captured graphs.
+    Different threads and namespaces retain independent mutable weights, so
+    overlapping collectors cannot overwrite one another's policies.
     """
     cache_key = (
         namespace,
@@ -1442,6 +1425,13 @@ def _stacked_actor_ensemble(
     return ensemble
 
 
+def _league_layout(lanes: int, width: int, *, device: torch.device, mode: str) -> tuple[int, int]:
+    """Bucket compiled neural forwards without changing physical game rows."""
+    if not lanes or device.type != "cuda" or mode not in COMPILED_ROLLOUT_FORWARD_MODES:
+        return lanes, width
+    return 1 << (lanes - 1).bit_length(), 1 << (width - 1).bit_length()
+
+
 @torch.inference_mode()
 def _warmup_league_layout(
     ensemble: _StackedActorEnsemble,
@@ -1452,15 +1442,11 @@ def _warmup_league_layout(
     mode: str,
     autocast: bool,
 ) -> None:
-    """Compile this wave's league layout before its captured step loop opens.
+    """Warm the selected inference bucket before its captured step loop opens.
 
-    Only Inductor without its own graph pool is prewarmed. The forward runs on
-    the persistent ensemble the wave itself will call, over zero-filled lane
-    views: warming a throwaway stack instead compiles against tensor addresses
-    the wave never uses, so the wave re-traced anyway and the warmup was pure
-    cost -- that, not the width formula, is why the earlier loop over every
-    lane count bought nothing. No game advances and no policy draw occurs, and
-    an already-compiled layout costs one stacked forward, about 2 ms.
+    Use the persistent ensemble and its real parameter addresses, not a
+    throwaway stack. No game advances and no policy draw occurs. A previously
+    compiled bucket needs only one forward to initialize runtime resources.
     """
     device = next(iter(ensemble.params.values())).device
     if mode != "inductor_graph" or device.type != "cuda" or lanes < 1 or width < 1:
@@ -1661,9 +1647,32 @@ def _validate_reward_gamma(gamma: float) -> None:
         raise ValueError("reward gamma must be finite and in (0, 1]")
 
 
-def _native_pair_rewards(sampled: dict[str, Any], gamma: float) -> np.ndarray:
-    """Build discounted shaping rewards from native state potentials."""
+def _validate_reward_mode(reward_mode: str) -> None:
+    if reward_mode not in REWARD_MODES:
+        raise ValueError(f"unknown reward mode {reward_mode!r}")
+
+
+def _native_pair_rewards(
+    sampled: dict[str, Any], gamma: float, reward_mode: str = "shaped"
+) -> np.ndarray:
+    """Build paired rewards from native terminal flags, utilities, and potentials."""
     _validate_reward_gamma(gamma)
+    _validate_reward_mode(reward_mode)
+    if reward_mode != "shaped":
+        dones = np.asarray(sampled["dones"], dtype=np.bool_)
+        rewards = np.zeros((dones.shape[0], 2), dtype=np.float32)
+        if dones.any():
+            utilities = np.asarray(sampled["terminal_utilities"], dtype=np.float32)
+            rewards[dones, 0] = utilities[dones]
+            if reward_mode == "terminal-outcome":
+                # Official scores are float(bank), i.e. f64, not raw integers.
+                # Native utilities subtract those scores before the f32 cast;
+                # separately rounded f32 banks can falsely tie. The i64 bank
+                # bound keeps every nonzero normalized f64 score gap above
+                # f32 underflow, so its sign preserves official wins and ties.
+                np.sign(rewards[:, 0], out=rewards[:, 0])
+        np.negative(rewards[:, 0], out=rewards[:, 1])
+        return rewards
     previous = np.asarray(sampled["previous_potentials"], dtype=np.float32)
     following = np.asarray(sampled["potentials"], dtype=np.float32)
     dones = np.asarray(sampled["dones"], dtype=np.bool_)
@@ -1764,6 +1773,7 @@ def _native_batch(
     learner_stochastic: bool,
     started: float,
     orientations: np.ndarray | None = None,
+    reward_mode: str = "shaped",
 ) -> RolloutBatch:
 
     state_names = set(_state_field_specs(architecture))
@@ -1771,6 +1781,7 @@ def _native_batch(
         orientations = np.zeros(agents.shape[0], dtype=np.int8)
     return RolloutBatch(
         architecture=architecture,
+        reward_mode=reward_mode,
         states={name: array for name, array in fields.items() if name in state_names},
         **{name: array for name, array in fields.items() if name not in state_names},
         episode_seeds=episode_seeds,
@@ -1799,6 +1810,7 @@ def _collect_mixed_play_rust_wave(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     # Matches `temperature` above, so a caller that omits it gets the symmetric
     # wave production runs. It defaulted to 0.8 while training sharpened its
     # league seats, and that default silently reached instruments which never
@@ -1860,6 +1872,7 @@ def _collect_mixed_play_rust_wave(
         raise ValueError("too many frozen opponents for native head identifiers")
     _validate_learner_temperature(temperature)
     _validate_reward_gamma(gamma)
+    _validate_reward_mode(reward_mode)
     if opponent_temperatures is None:
         frozen_temperatures = np.full(len(opponents), opponent_temperature, dtype=np.float32)
     else:
@@ -2013,12 +2026,17 @@ def _collect_mixed_play_rust_wave(
         )
         active_indices = [index for index, group in enumerate(frozen_groups) if group.size]
         active_groups = [frozen_groups[index] for index in active_indices]
-        # Pad only neural lanes to the widest neural group. Built-in groups
-        # neither consume a model slot nor increase its width. Replicated rows
-        # are discarded on scatter; physical sampling rows remain unchanged.
-        lanes = len(active_indices)
-        lane_width = max((group.size for group in active_groups), default=0)
-        lane_rows = np.empty((lanes, lane_width), dtype=np.int64)
+        # Bucket only the neural inference buffers. Padding duplicates real
+        # inputs/weights, but is never scattered or sampled as a physical row.
+        lanes, lane_width = _league_layout(
+            len(active_indices),
+            max((group.size for group in active_groups), default=0),
+            device=device,
+            mode=forward_mode,
+        )
+        lane_rows = np.full(
+            (lanes, lane_width), active_groups[0][0] if active_groups else 0, dtype=np.int64
+        )
         lane_valid = np.zeros((lanes, lane_width), dtype=np.bool_)
         for lane, group in enumerate(active_groups):
             lane_rows[lane, : group.size] = group
@@ -2033,13 +2051,14 @@ def _collect_mixed_play_rust_wave(
         # Resolve padding on the host once. CUDA boolean indexing would compact
         # dynamically (and synchronize) every step, and cannot be captured.
         lane_valid_indices = torch.as_tensor(np.flatnonzero(lane_valid_flat), device=device)
+        padded_indices = active_indices + active_indices[:1] * (lanes - len(active_indices))
         ensemble = (
-            _stacked_actor_ensemble([opponents[index] for index in active_indices])
+            _stacked_actor_ensemble([opponents[index] for index in padded_indices])
             if active_indices
             else None
         )
-        # Structured mixed play gathers eleven token tensors for the learner
-        # and, when present, eleven more for the lane ensemble on every step.
+        # Structured mixed play gathers token tensors for the learner and,
+        # when present, the lane ensemble on every step.
         # Fixed destinations keep those CUDA addresses stable and replace the
         # per-step allocator traffic with index_select writes into owned memory.
         if architecture == STRUCTURED:
@@ -2326,7 +2345,7 @@ def _collect_mixed_play_rust_wave(
                 # next loop head. Bootstrap runs above; the final step never
                 # queues a speculative extra forward.
                 pending_outputs = step_graph()
-        rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
+        rewards = _native_pair_rewards(sampled, gamma, reward_mode).reshape(-1)
         _store_native_wave(
             architecture,
             fields,
@@ -2403,6 +2422,7 @@ def _collect_mixed_play_rust_wave(
         entropy_sums=entropy_sums,
         learner_stochastic=not deterministic,
         started=started,
+        reward_mode=reward_mode,
     )
 
 
@@ -2420,6 +2440,7 @@ def collect_mixed_play_rust(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     opponent_temperature: float = 1.0,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
@@ -2443,6 +2464,7 @@ def collect_mixed_play_rust(
         deterministic=deterministic,
         temperature=temperature,
         gamma=gamma,
+        reward_mode=reward_mode,
         opponent_temperature=opponent_temperature,
         opponent_temperatures=opponent_temperatures,
         deterministic_opponent=deterministic_opponent,
@@ -2511,6 +2533,7 @@ def collect_population_play_rust(
     episode_steps: int = EPISODE_STEPS,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -2556,6 +2579,7 @@ def collect_population_play_rust(
         raise ValueError("the native simulator currently supports the competition horizon 720")
     _validate_learner_temperature(temperature)
     _validate_reward_gamma(gamma)
+    _validate_reward_mode(reward_mode)
     pairings = population_pairings(
         population,
         games,
@@ -2682,7 +2706,7 @@ def collect_population_play_rust(
             builtin_agents,
             sampled,
         )
-        rewards = _native_pair_rewards(sampled, gamma).reshape(-1)
+        rewards = _native_pair_rewards(sampled, gamma, reward_mode).reshape(-1)
         # Storage keeps the unit factors in oriented space so the replay path
         # reads features, masks and actions out of one label space. The stored
         # log-probabilities need no remap: P(oriented index i) and P(the real
@@ -2732,6 +2756,7 @@ def collect_population_play_rust(
         learner_stochastic=True,
         entropy_sums=entropy_sums,
         started=started,
+        reward_mode=reward_mode,
     )
 
 
@@ -2744,6 +2769,7 @@ def collect_self_play_rust(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     sampling_seed: int = 0,
     forward_mode: str = "cudagraphs",
     forward_autocast: bool = False,
@@ -2761,6 +2787,7 @@ def collect_self_play_rust(
         deterministic=deterministic,
         temperature=temperature,
         gamma=gamma,
+        reward_mode=reward_mode,
         sampling_seed=sampling_seed,
         forward_mode=forward_mode,
         forward_autocast=forward_autocast,
@@ -2778,6 +2805,7 @@ def collect_frozen_opponents_play_rust(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     opponent_temperature: float = 0.8,
     opponent_temperatures: Sequence[float] | np.ndarray | None = None,
     deterministic_opponent: bool = False,
@@ -2802,6 +2830,7 @@ def collect_frozen_opponents_play_rust(
         deterministic=deterministic,
         temperature=temperature,
         gamma=gamma,
+        reward_mode=reward_mode,
         opponent_temperature=opponent_temperature,
         opponent_temperatures=opponent_temperatures,
         deterministic_opponent=deterministic_opponent,
@@ -2822,6 +2851,7 @@ def collect_frozen_opponent_play_rust(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,
@@ -2839,6 +2869,7 @@ def collect_frozen_opponent_play_rust(
         episode_steps=episode_steps,
         temperature=temperature,
         gamma=gamma,
+        reward_mode=reward_mode,
         opponent_temperature=opponent_temperature,
         deterministic_opponent=deterministic_opponent,
         deterministic=deterministic,
@@ -2857,6 +2888,7 @@ def collect_self_play(
     deterministic: bool = False,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     sampling_seed: int = 0,
 ) -> RolloutBatch:
     """Collect both valid on-policy trajectories from every self-play game."""
@@ -2866,6 +2898,7 @@ def collect_self_play(
         raise ValueError("episode_steps must be at least two")
     _validate_learner_temperature(temperature)
     _validate_reward_gamma(gamma)
+    _validate_reward_mode(reward_mode)
     started = time.perf_counter()
     actor.eval()
     architecture = architecture_of(actor).name
@@ -2879,9 +2912,13 @@ def collect_self_play(
         for index in range(games)
     ]
     states = [environment.reset(2) for environment in environments]
-    potentials = np.asarray(
-        [pair_potential(state[0].observation, state[1].observation) for state in states],
-        dtype=np.float32,
+    potentials = (
+        np.asarray(
+            [pair_potential(state[0].observation, state[1].observation) for state in states],
+            dtype=np.float32,
+        )
+        if reward_mode == "shaped"
+        else np.zeros(games, dtype=np.float32)
     )
     fields = _new_fields(architecture)
     trajectories = games * 2
@@ -2922,15 +2959,24 @@ def collect_self_play(
                 utility = terminal_pair_utility(
                     next_state[0].observation, next_state[1].observation
                 )
+                if reward_mode == "terminal-outcome":
+                    utility = float(np.sign(utility))
                 next_potential = np.float32(0.0)
-                pair_rewards = shaped_pair_reward(
-                    potentials[game], None, terminal_utility=utility, gamma=gamma
+                pair_rewards = (
+                    shaped_pair_reward(
+                        potentials[game], None, terminal_utility=utility, gamma=gamma
+                    )
+                    if reward_mode == "shaped"
+                    else terminal_bank_pair_reward(utility)
                 )
-            else:
+            elif reward_mode == "shaped":
                 next_potential = np.float32(
                     pair_potential(next_state[0].observation, next_state[1].observation)
                 )
                 pair_rewards = shaped_pair_reward(potentials[game], next_potential, gamma=gamma)
+            else:
+                next_potential = np.float32(0.0)
+                pair_rewards = (0.0, -0.0)
             potentials[game] = next_potential
             step_rewards[offset : offset + 2] = pair_rewards
         fields["rewards"].append(step_rewards)
@@ -2954,6 +3000,7 @@ def collect_self_play(
         agents=np.zeros(trajectories, dtype=np.int64),
         entropy_sums=entropy_sums,
         started=started,
+        reward_mode=reward_mode,
     )
 
 
@@ -2966,6 +3013,7 @@ def collect_frozen_opponent_play(
     episode_steps: int = 720,
     temperature: float = 1.0,
     gamma: float = DEFAULT_REWARD_GAMMA,
+    reward_mode: str = "shaped",
     opponent_temperature: float = 0.8,
     deterministic_opponent: bool = False,
     deterministic: bool = False,
@@ -2978,6 +3026,7 @@ def collect_frozen_opponent_play(
         raise ValueError("episode_steps must be at least two")
     _validate_learner_temperature(temperature)
     _validate_reward_gamma(gamma)
+    _validate_reward_mode(reward_mode)
     started = time.perf_counter()
     actor.eval()
     opponent.eval()
@@ -2997,9 +3046,13 @@ def collect_frozen_opponent_play(
     ]
     states = [environment.reset(2) for environment in environments]
     seats = np.asarray([(seed_start + index) % 2 for index in range(games)], dtype=np.int8)
-    potentials = np.asarray(
-        [pair_potential(state[0].observation, state[1].observation) for state in states],
-        dtype=np.float32,
+    potentials = (
+        np.asarray(
+            [pair_potential(state[0].observation, state[1].observation) for state in states],
+            dtype=np.float32,
+        )
+        if reward_mode == "shaped"
+        else np.zeros(games, dtype=np.float32)
     )
     fields = _new_fields(architecture)
     final_money = np.zeros(games, dtype=np.float32)
@@ -3052,15 +3105,24 @@ def collect_frozen_opponent_play(
                 utility = terminal_pair_utility(
                     next_state[0].observation, next_state[1].observation
                 )
+                if reward_mode == "terminal-outcome":
+                    utility = float(np.sign(utility))
                 next_potential = np.float32(0.0)
-                pair_rewards = shaped_pair_reward(
-                    potentials[game], None, terminal_utility=utility, gamma=gamma
+                pair_rewards = (
+                    shaped_pair_reward(
+                        potentials[game], None, terminal_utility=utility, gamma=gamma
+                    )
+                    if reward_mode == "shaped"
+                    else terminal_bank_pair_reward(utility)
                 )
-            else:
+            elif reward_mode == "shaped":
                 next_potential = np.float32(
                     pair_potential(next_state[0].observation, next_state[1].observation)
                 )
                 pair_rewards = shaped_pair_reward(potentials[game], next_potential, gamma=gamma)
+            else:
+                next_potential = np.float32(0.0)
+                pair_rewards = (0.0, -0.0)
             potentials[game] = next_potential
             step_rewards[game] = pair_rewards[int(seat)]
         fields["rewards"].append(step_rewards)
@@ -3082,6 +3144,7 @@ def collect_frozen_opponent_play(
         entropy_sums=entropy_sums,
         learner_stochastic=not deterministic,
         started=started,
+        reward_mode=reward_mode,
     )
 
 
@@ -3101,12 +3164,15 @@ def _combined_rollout_metadata(batches: list[RolloutBatch]) -> dict[str, Any]:
     provenance = {batch.learner_stochastic for batch in batches}
     if len(provenance) != 1:
         raise ValueError("rollout learner sampling provenance must match")
+    if len({batch.reward_mode for batch in batches}) != 1:
+        raise ValueError("rollout reward modes must match")
     combined: dict[str, Any] = {
         field: np.concatenate([getattr(batch, field) for batch in batches], axis=0)
         for field in _TRAJECTORY_METADATA_FIELDS
     }
     combined["elapsed_seconds"] = sum(batch.elapsed_seconds for batch in batches)
     combined["learner_stochastic"] = batches[0].learner_stochastic
+    combined["reward_mode"] = batches[0].reward_mode
     return combined
 
 
@@ -3125,6 +3191,7 @@ def slice_trajectories(batch: RolloutBatch, start: int, stop: int) -> RolloutBat
         **{field: getattr(batch, field)[start:stop] for field in _SHARED_ROLLOUT_FIELDS},
         **{field: getattr(batch, field)[start:stop] for field in _TRAJECTORY_METADATA_FIELDS},
         learner_stochastic=batch.learner_stochastic,
+        reward_mode=batch.reward_mode,
         elapsed_seconds=batch.elapsed_seconds,
     )
 

@@ -2537,3 +2537,324 @@ Evidence: `artifacts/probes/hlgauss-bandwidth-20260914/{experiment,analysis,comp
 Latest recovery checkpoint is wave 83; the final actor snapshot is wave 96.
 The temporary numerical verifier was removed after success; job logs retain
 its measured output. No automatic retry or further trial was launched.
+
+## Promoted HL-Gauss state-mean baseline (2026-09-14)
+
+The user subsequently promoted the wider HL-Gauss critic and the active
+state-mean run as the new baseline. This supersedes the non-promotion decision
+above: defaults are now categorical HL-Gauss, 255 atoms on `[-2.2, 2.2]`,
+sigma/bin `3.0`, and state-mean component-clipped PPO. Actor NextLat remains
+off; critic latent and decoded-value auxiliaries remain coefficient 1 each,
+plain sum, horizon 1. The critic and actor have independent weights.
+
+Job **6946**, frozen source
+`ce9f9fb0d05dca755f8587522398bfcfef4b42344b76efecb81b50e3479063a5`,
+completed **97 waves** at its **25-minute cap**, with actor release at wave
+**16**. Relative to job 6944, only the PPO policy-loss denominator changed
+from active components to valid states. Final 20-wave arithmetic means:
+
+| Metric | State-mean baseline |
+|---|---:|
+| Value-target correlation | 0.835445 |
+| Pre-update Monte Carlo EV | 0.697190 |
+| Pre-update Monte Carlo MSE | 0.005665 |
+| Combined critic gradient norm | 44.889176 |
+| Online money | 52,816.78 |
+| Rollout entropy | 0.156943 |
+| Seconds/wave | 13.946455 |
+
+At matched waves 77-96, component/state means were correlation
+**0.845115 / 0.835309**, MC EV **0.713530 / 0.696841**, and money
+**52,069.70 / 52,798.89**. These are single-seed online comparisons,
+not evidence of an external win-rate improvement. Promotion is the user's
+baseline choice, not a claim that every measured metric improved.
+
+Verification job **6945** passed **50 regressions**, including compiled BF16
+warm-start compatibility and critic auxiliary gradients. A separate compiled
+gradient check on a trained critic checkpoint confirmed nonzero value-head,
+latent-query, and first/last ViT gradients, with no actor gradient or shared
+parameters. Its artificial targets establish attachment, not the magnitude
+or direction of training gradients.
+
+Run: `runs/production-hlgauss-state-mean-p500-20260914`.
+Evidence: `artifacts/probes/hlgauss-state-mean-20260914/`, including
+`experiment.json`, `comparison.json`, and `verification.json`.
+Latest external evaluations used checkpoint 82: starter **4/4**, public-v27
+**4/4**, public-v16 **2/4**. Each used two paired seeds; the final actor
+snapshot is wave 97, not the externally evaluated checkpoint.
+
+## Priority threefold learning-rate ablation (2026-09-14)
+
+Job **6947** used the exact frozen baseline source `ce9f9fb0d05dca755f8587522398bfcfef4b42344b76efecb81b50e3479063a5`,
+with actor and critic rates **0.00005 -> 0.00015**, critic-head rate
+**0.0001458333333 -> 0.0004375**, and the inherited critic-predictor rate
+tripled accordingly. Actor auxiliary remained off. Priority **1**, concurrency
+**1**, hard **25-minute cap**, no retry. The run completed **98 waves**, with
+actor release at **11**, versus baseline release **16**.
+
+| Final-20-wave mean | Baseline | 3x LR |
+|---|---:|---:|
+| Value-target correlation | 0.835445 | 0.938391 |
+| Monte Carlo EV | 0.697190 | 0.879801 |
+| Monte Carlo MSE | 0.005665 | 0.002677 |
+| Combined critic gradient norm | 44.889176 | 154.276475 |
+| Online money | 52,816.78 | 36,257.20 |
+| Entropy | 0.156943 | 0.360701 |
+
+The critic fits its on-policy targets better, but observed play is worse.
+Latest external checkpoint **83** scored starter **4/4**, public-v27 **0/4**,
+public-v16 **0/4**, versus baseline checkpoint 82's **4/4, 4/4, 2/4**.
+Each opponent still has only two paired seeds. The value metrics use each
+policy's own changing state distribution, not a shared held-out dataset.
+This arm is not promoted; all other ablations retain the baseline rates.
+
+Run: `runs/production-hlgauss-state-mean-lr3-p500-20260914`.
+Evidence: `artifacts/probes/hlgauss-state-mean-lr3-20260914/experiment.json`.
+
+## Promoted dense VAPO temporal defaults (2026-09-14)
+
+The user identified dense-reward trial **7010** as the winner and promoted its
+temporal settings for future runs. This supersedes the gamma/lambda defaults
+of baseline 6946; the rest of that baseline remains unchanged.
+
+| Setting | Previous baseline | Promoted default |
+|---|---:|---:|
+| Reward | Dense bounded-margin potential shaping | Unchanged |
+| Gamma | 0.997 | 1.0 |
+| Actor GAE lambda | 1.0 | 0.972183588317107 |
+| Critic GAE lambda | 1.0 | 1.0 |
+
+Actor lambda is `1 - 1 / (0.05 * 719)`. The critic learns undiscounted Monte
+Carlo shaped returns; the actor uses a shorter GAE trace and the critic's
+intermediate predictions for lower-variance credit. Terminal utility remains
+the normalized final-bank margin, not binary win/loss. Base learning rates,
+HL-Gauss sigma/bin 3, state-mean component clipping, actor auxiliary off, and
+critic auxiliaries at 1 each remain unchanged.
+
+Promotion was the user's decision during the trial. Existing queued ablations
+retain their frozen commands; future launchers inherit the shared defaults unless explicitly
+overridden. The per-entity critic experiment still requires an explicit
+`--actor-gae-lambda 1`; it is not silently combined with VAPO's shorter trace.
+
+Run: `runs/production-hlgauss-vapo-dense-p500-20260914`.
+Trial command and source provenance:
+`artifacts/probes/actor-head-joint-ablation-20260914/vapo-trials.json`.
+
+The trial subsequently finished **101 waves** at its **25-minute cap**.
+Exit 143 is the intended MLQ timeout, not a numerical crash. Actor release
+was wave **13**, versus **16** in baseline 6946. Final 20-wave means:
+
+| Metric | Previous baseline | Dense VAPO |
+|---|---:|---:|
+| Online money | 52,816.78 | 66,031.57 |
+| Entropy | 0.156943 | 0.135017 |
+| Seconds/wave | 13.946455 | 12.860979 |
+| Value-target correlation | 0.835445 | 0.745910 |
+| Monte Carlo EV | 0.697190 | 0.555210 |
+| Monte Carlo MSE | 0.005665 | 0.042179 |
+| Critic gradient norm | 44.889176 | 32.396110 |
+
+Online money increased **25.02%**. Critic target scales change with gamma, and
+each policy visits its own state distribution: raw MSE is not a matched
+critic-quality comparison. Latest external checkpoint **85** scored starter
+**100%**, public-v27 **100%**, and public-v16 **75%**, each over four games
+(two paired seeds). Baseline checkpoint 82 scored **100%, 100%, 50%**.
+The final actor snapshot is wave **101**, not the externally evaluated checkpoint.
+
+Final evidence:
+`artifacts/probes/actor-head-joint-ablation-20260914/vapo-dense-results.json`.
+
+### Joint and terminal-only migrated onto VAPO
+
+The user subsequently requested the full VAPO temporal settings for both queued
+ablations, superseding the earlier decision to retain their original commands.
+Cancelled joint trial **6986** is replaced by fresh trial **7072**; queued
+terminal-only trial **7004** was cancelled before start and replaced by **7073**.
+Both use gamma **1**, actor lambda **0.972183588317107**, and critic lambda **1**.
+Joint retains dense reward; terminal-only retains sparse final-bank margin.
+The prior requirement to first demonstrate learning with terminal-only at the
+old temporal settings no longer applies.
+
+Both replacements retain the original validated frozen source for their arm,
+BC initialization, seed, learning rates, workload, and autocull policy. Each has
+an exclusive **25-minute cap**, priority **0**, and one attempt. Frozen-source
+CLI parsing and the accepted MLQ commands were checked before recording them.
+These jobs were queued, not completed, when this entry was written.
+
+Commands, source digests, environment, and exact argument differences:
+`artifacts/probes/actor-head-joint-ablation-20260914/vapo-migrated-ablations.json`.
+
+### Threefold learning rates on the promoted dense VAPO base
+
+Requested trial **7074** changes only learning rates relative to dense VAPO
+**7010**: actor/critic **0.00005 -> 0.00015**, critic head
+**0.0001458333333 -> 0.0004375**, with the critic predictor inheriting the
+tripled critic rate. Gamma **1**, actor lambda **0.972183588317107**, critic
+lambda **1**, dense shaping, and actor auxiliary off remain unchanged.
+It uses the exact frozen source and BC initialization of 7010, a fresh run
+directory, priority **0**, exclusive GPU use, and a hard **25-minute cap**.
+Existing autocull is unchanged; no retries. This is distinct from old trial
+6947, which used gamma 0.997 and actor lambda 1.
+
+After the requested comparisons finish, the next candidate is two critic
+epochs per wave with one actor epoch at base VAPO rates. It trades fewer
+rollout waves for better-fitted intermediate values; external play and
+time-to-go credit diagnostics must justify the extra compute. It has not
+been queued ahead of the requested trials.
+
+Command, exact argument differences, parsed configuration, and followup rationale:
+`artifacts/probes/actor-head-joint-ablation-20260914/vapo-lr3.json`.
+
+### Per-entity critic result
+
+Trial **7003** completed **60 waves** at its hard **25-minute cap**; exit 143
+was the intended timeout. Actor release was wave **28**. It retained the
+original gamma **0.997**, actor/critic lambda **1/1**, and active-entity
+advantage normalization; it was not a VAPO-configured trial.
+
+Final 20-wave means: online money **45,029.64**, value-target correlation
+**0.624903**, Monte Carlo EV **0.386550**, and seconds/wave **16.214902**.
+Original baseline 6946 completed 97 waves, released at 16, and averaged
+money **52,816.78** over its final 20 waves. These are equal-cap comparisons,
+not matched training ages or state distributions.
+
+Latest external checkpoint **55** scored **100%** against starter, **100%**
+against public-v27, and **0%** against public-v16, each over four games.
+The final actor snapshot is wave **60**. No promotion: this arm did not
+improve the observed equal-budget results. Dense VAPO remains the default.
+Evidence: `artifacts/probes/actor-head-joint-ablation-20260914/per-entity-results.json`.
+
+## Neural league compilation buckets (2026-09-14)
+
+Compiled mixed-play inference now rounds neural lane counts and per-lane widths
+to powers of two. Padding duplicates existing inputs and actor weights, and its
+outputs are discarded before sampling. Opponent selection, physical games,
+stored training rows, and recovery checkpoint cadence are unchanged. The late
+compile guard now compares physical buckets, not raw assignment counts.
+
+The full-production-model benchmark replayed the 31-layout sequence from
+terminal-bank job **7073**, with fixed checkpoint weights/inputs and BF16 autocast.
+Baseline **7083** versus bucketed **7086**, each with separate cold caches:
+
+| Measurement | Exact layouts | Bucketed layouts |
+|---|---:|---:|
+| Compiled graphs | 12 | 6 |
+| Reported compilation time | 203.30 s | 105.04 s |
+| Isolated benchmark wall time | 237.73 s | 129.02 s |
+| Projected frozen-forward GPU time over 31 x 719 steps | 13.79 s | 14.62 s |
+| Generated compiler cache footprint after matched validation workloads | 525.93 MB | 284.81 MB |
+
+All **558** forward/captured-replay head comparisons were bitwise identical,
+including changed-weight refills. Full-wave jobs **7087/7088** and **7090/7091**
+also matched every stored array exactly: 128 self-play plus 64 league games,
+719 decisions, and 230,080 stored states per wave. The latter pair exercised
+four layouts and then four cached waves; cached totals were **10.31 versus
+10.14 seconds**, with zero compilation events in either arm. This single paired
+measurement establishes no steady-state speedup, but showed no rollout slowdown.
+No PPO update or learning-quality improvement is claimed.
+
+The cache figures are apparent generated bytes in isolated tmpfs caches, not
+physical SSD-write measurements. Production job 7073 used `TMPDIR=/var/tmp`,
+which is NVMe-backed here. Checkpoint writes were not changed.
+
+Regression job **7089** passed eight focused tests. Disabling bucketing in a
+separate negative-control process made the new regression fail on repeated
+compilation as intended. A symbolic-shape prototype was rejected after native
+PyTorch vmap batching rules specialized dynamic sizes; no eager fallback or
+relaxed compiler checks remain.
+
+MLQ remains globally paused. Training jobs **7074**, **7081**, and **7082** were
+held only during benchmark admission and restored to queued state without any
+attempt starting. Their immutable source snapshots are unchanged and do not
+automatically receive this working-tree optimization.
+
+Evidence: `artifacts/probes/league-layout-compile/summary.json` and its linked raw
+benchmark, full-wave, and regression reports.
+
+### Queued adoption
+
+Replaced **7074 → 7093** (dense LR3), **7081 → 7094** (terminal-bank,
+resume iteration 28), and **7082 → 7095** (joint clip/KL, resume iteration 33).
+Each replacement freezes its original experimental source plus only the
+compile-layout backport in `rollout.py` and `train_ppo.py`; model architecture,
+reward, optimization settings, 25-minute limits, dependencies, and output
+directories are preserved. Parsed CLI configurations match apart from the
+explicitly migrated resume paths.
+
+Original checkpoints and source snapshots remain unchanged. Migrated checkpoint
+copies record original source identities and checkpoint hashes, candidate source
+identities, and the compile evidence. Every original non-source payload field
+compares exactly after serialization, including optimizer and RNG state; all
+league sidecar hashes match their checkpoint manifests. Checkpoint format and
+candidate source identity checks pass.
+
+During preparation, another queue operation held the original jobs and started
+job 7092. Replacement jobs preserve those individual holds with zero attempts.
+Admission was paused only for replacement and restored to its observed unpaused
+state; job 7092 was not interrupted. No training was launched by this adoption.
+
+Evidence and exact source identities:
+`artifacts/probes/queued-compile-adoption-20260914/manifest.json`.
+
+## Joint and terminal reward trials at threefold learning rates (2026-09-14)
+
+Current dense VAPO defaults remain unchanged. Three fresh BC-initialized trials
+use actor/critic learning rates **0.00015** and critic-head rate **0.0004375**;
+the critic predictor inherits the tripled critic rate.
+
+| MLQ job | Policy ratio / KL scope | Reward |
+|---|---|---|
+| 7120 | Joint | Dense shaped bank margin |
+| 7121 | Components | Terminal-only bank margin |
+| 7122 | Components | Terminal-only win/loss/draw: +1/-1/0 |
+
+All three use the same frozen source
+`b7b54cedfab2e314e84401e01469c4e01ae4040f514c3b5befbfc40ed81979c9`,
+including league compilation buckets. Gamma **1**, actor lambda
+**0.972183588317107**, critic lambda **1**, architecture, seed, BC initialization,
+critic warmup/readiness, compiled BF16 execution, and external evaluation are
+held constant. These are fresh trials, not checkpoint continuations. Each has
+an exclusive **25-minute cap**, priority **0**, and one attempt.
+
+Existing autocull remains unchanged: after 20 actor-active warmup waves, either
+money EMA +1000 or value-loss EMA improvement of min(0.01, 1% of reference loss)
+resets 30-wave patience, with EMA alpha 0.1. Money is not the new outcome
+objective, and easier value fitting is not evidence of stronger play; use
+external results to judge the win/loss/draw arm.
+
+Verification: eight focused reward, native full-horizon, credit-diagnostic,
+and production-parser checks passed; affected Python files passed Ruff.
+A separate frozen-source native scenario exercised all 719 transitions:
+terminal scores (520,3000), (3000,520), and (3000,3000) produced outcome rewards
+(-1,+1), (+1,-1), and (0,0), with all earlier outcome rewards zero.
+All frozen launch commands parsed and MLQ accepted the declared limits.
+Job 7120 was running and 7121/7122 queued when this entry was recorded;
+no learning result is claimed yet.
+
+Commands and provenance:
+`artifacts/probes/actor-head-joint-ablation-20260914/vapo-lr3-reward-trials.json`.
+Native scenario:
+`artifacts/probes/actor-head-joint-ablation-20260914/terminal-outcome-verification.json`.
+
+### Next architecture direction (proposal, not implemented)
+
+SAM3's image decoder repeatedly evolves object queries through self-attention,
+prompt cross-attention, image cross-attention, and an FFN while retaining fixed
+encoded image memory. Our default actor instead reads observation memory into
+32 generic latents once; eight core layers reinject the same initial encoding,
+not fresh map evidence, before separate farmer and market decoding.
+
+The proposed controlled sequence is actor-only repeated full-memory reads,
+then a matched 32-slot workspace containing 16 units, ten market-order slots,
+and six scratch slots. Keep the spatial encoder, local farmer detail, explicit
+economy tokens, opponent summary, global modulation, and independent centralized
+critic unchanged. Dedicated exogenous conditioning, removing scratch slots, or
+map writeback are later hypotheses, not simultaneous changes.
+
+This requires deliberate architecture-specific initialization: strict BC loading
+cannot preserve a changed entity workspace merely because tensor sizes match.
+Compare equal wall time and equal environment steps, accounting for extra KV
+projections/FFNs. Static memory does not make projected KV reusable across
+independent layers. No architecture experiment has been queued here.
+Evidence and design constraints:
+`artifacts/probes/actor-head-joint-ablation-20260914/architecture-direction.json`.

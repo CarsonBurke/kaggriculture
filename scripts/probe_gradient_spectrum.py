@@ -98,9 +98,9 @@ gradients are also far from flat -- stable rank 2.7-3.3 out of 96 for linear
 weights, top-over-median singular value 48-62 -- so flattening spends the step
 budget on a tail that is entirely noise.  That is precisely the low-SNR,
 episode-level regime arXiv 2607.16169 reports Muon failing in, and this probe's
-historical reward used `gamma = 1.0`. Current training uses discount-correct
-potential shaping at `gamma = 0.997`; the old probe remains evidence about
-optimizer scale, not a measurement of the new return distribution.
+historical reward used `gamma = 1.0`. Current training also uses gamma one,
+but now uses bounded-margin potential shaping and decoupled VAPO GAE. The old
+probe remains optimizer-scale evidence, not a measurement of these targets.
 
 The update path leaves the policy and critic gradients unclipped. This probe
 therefore reports raw minibatch gradient norms without a clip-pressure metric.
@@ -140,6 +140,7 @@ from kaggriculture.ppo import (
     _stage_tensor,
     _validate_staged_action_masks,
     prepare_advantages,
+    prepare_entity_advantages,
     replay_behavior_values,
 )
 from kaggriculture.production import (
@@ -930,6 +931,7 @@ def main() -> None:
 
     autocast_enabled = config.use_bfloat16
     compile_mode = _device_compile_mode(config.update_compile_mode, device)
+    entity_critic = getattr(critic.config, "per_entity_critic", False)
     behavior_values = (
         replay_behavior_values(
             critic,
@@ -937,13 +939,29 @@ def main() -> None:
             staged,
             compile_mode=compile_mode,
             autocast_enabled=autocast_enabled,
+            include_entities=entity_critic,
         )
         .cpu()
         .numpy()
-        .reshape(rollout.rewards.shape)
     )
+    if entity_critic:
+        replayed = behavior_values.reshape(*rollout.rewards.shape, -1)
+        behavior_values = replayed[..., 0]
+    else:
+        behavior_values = behavior_values.reshape(rollout.rewards.shape)
     prepared = prepare_advantages(rollout, behavior_values, config)
-    staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
+    if entity_critic:
+        entity_active = np.concatenate((rollout.unit_active, rollout.market_active), axis=-1)
+        advantages, _raw_mean, _raw_std = prepare_entity_advantages(
+            prepared.monte_carlo_returns,
+            replayed[..., 1:],
+            entity_active & rollout.valid[..., None],
+        )
+        staged["advantages"] = torch.from_numpy(advantages.reshape(-1, advantages.shape[-1])).to(
+            device
+        )
+    else:
+        staged["advantages"] = torch.from_numpy(prepared.advantages.reshape(-1)).to(device)
     actor.eval()
 
     parameters, matrices = tracked_matrices(actor)

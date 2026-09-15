@@ -104,6 +104,8 @@ class StructuredConfig:
     critic_latents: int = 0
     # Critic reads seed residual content from observations, not learned queries.
     critic_state_read: bool = False
+    # Shared centralized decoder/readout, with one baseline per acting entity.
+    per_entity_critic: bool = False
     # The actor's view of the opponent's board. Both farms run the shared
     # `farm_local` blocks and the opponent half reaches the rest of the actor
     # only as `opponent_summary`, so it is 30% of the actor's forward bytes at
@@ -1119,7 +1121,7 @@ class StructuredDecisionBelief(NamedTuple):
 class StructuredCriticBelief(NamedTuple):
     """The normalized representation consumed by the critic's final value head."""
 
-    value_decision: Tensor
+    value_decision: Tensor  # (B, N, D): global first, optionally units then orders.
 
 
 class StructuredActor(nn.Module):
@@ -1345,6 +1347,8 @@ class StructuredCritic(nn.Module):
         self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
+        if config.per_entity_critic:
+            self.entity_queries = nn.Embedding(MAX_UNITS + MAX_MARKET_ORDERS, config.model_dim)
         self.register_buffer(
             "support",
             categorical_value_support(config.value_min, config.value_max, config.value_atoms),
@@ -1377,15 +1381,28 @@ class StructuredCritic(nn.Module):
             opponent_units=opponent_units,
             opponent_units_active=opponent_unit_active,
         )
-        value_hidden = self.value_decoder(
-            self.value_query.unsqueeze(0).expand(batch, -1, -1),
-            trunk.latents,
-        )
+        queries = self.value_query.unsqueeze(0).expand(batch, -1, -1)
+        if self.config.per_entity_critic:
+            unit_queries = trunk.unit_tokens + self.entity_queries.weight[:MAX_UNITS]
+            market_queries = (
+                _token_mean(trunk.economy_tokens)[:, None, :]
+                + self.entity_queries.weight[MAX_UNITS:]
+            )
+            queries = torch.cat((queries, unit_queries, market_queries), dim=1)
+        value_hidden = self.value_decoder(queries, trunk.latents)
         value_hidden = self.value_norm(value_hidden)
         return StructuredCriticBelief(value_decision=value_hidden)
 
     def decode_belief(self, belief: StructuredCriticBelief) -> Tensor:
+        """Global logits (B, bins), including when the belief has entity slots."""
         readout = self.value_head(belief.value_decision[:, 0])
+        return (readout if self.config.scalar_value else softcap_value_logits(readout)).contiguous()
+
+    def decode_entity_belief(self, belief: StructuredCriticBelief) -> Tensor:
+        """Entity logits (B, MAX_UNITS + MAX_MARKET_ORDERS, bins), never global."""
+        if not self.config.per_entity_critic:
+            raise ValueError("entity values require per_entity_critic")
+        readout = self.value_head(belief.value_decision[:, 1:])
         return (readout if self.config.scalar_value else softcap_value_logits(readout)).contiguous()
 
     def forward_with_belief(
@@ -1395,6 +1412,7 @@ class StructuredCritic(nn.Module):
         opponent_unit_continuous: Tensor,
         opponent_unit_active: Tensor,
     ) -> tuple[Tensor, StructuredCriticBelief]:
+        """One private trunk pass; global logits plus every normalized head input."""
         belief = self.encode_belief(
             inputs, opponent_unit_categorical, opponent_unit_continuous, opponent_unit_active
         )

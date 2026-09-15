@@ -130,12 +130,14 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
         update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
         initial_actors=(actor,),
         critic_warmup_iterations=PRODUCTION_CRITIC_WARMUP_ITERATIONS,
+        reward_mode="terminal-outcome",
     )
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", *command[2:]])
 
     args = training.parse_args()
     training._validate_args(args)
 
+    assert args.reward_mode == "terminal-outcome"
     assert args.architecture == STRUCTURED == PRODUCTION_ARCHITECTURE
     assert model_config_from_args(
         resolve_architecture(args.architecture), args

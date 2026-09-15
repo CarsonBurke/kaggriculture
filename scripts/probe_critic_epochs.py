@@ -84,6 +84,7 @@ from kaggriculture.ppo import (
     _critic_minibatch_fit_terms,
     _critic_minibatch_objective,
     _device_compile_mode,
+    _entity_active_batch,
     _fit_explained_variance,
     _fit_moment_mapping,
     _fixed_minibatch_positions,
@@ -135,7 +136,7 @@ def _production_critic_minibatches_per_epoch(minibatch_size: int) -> int:
 #: Rollout fields outside ``states`` that critic replay needs. ``unit_active``
 #: is a structured actor input reused by the centralized critic; unit actions
 #: supply only the flattened row count used while constructing value targets.
-_CRITIC_SHARED_FIELDS = ("unit_actions", "unit_active")
+_CRITIC_SHARED_FIELDS = ("unit_actions", "unit_active", "market_active")
 
 
 def _synchronize(device: torch.device) -> None:
@@ -283,7 +284,17 @@ def _critic_epoch(
         critic_args = _critic_batch_args(architecture, staged, batch)
         value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
         critic_optimizer.zero_grad(set_to_none=True)
-        value_loss = loss_fn(critic, value_targets, autocast_enabled, *critic_args)
+        value_loss = loss_fn(
+            critic,
+            value_targets,
+            autocast_enabled,
+            *critic_args,
+            entity_active=(
+                _entity_active_batch(staged, batch)
+                if getattr(critic.config, "per_entity_critic", False)
+                else None
+            ),
+        )
         value_loss.backward()
         if gateable:
             critic_skip = (~torch.isfinite(value_loss.detach())).float()
@@ -343,7 +354,15 @@ def _evaluate(
             critic_args = _critic_batch_args(architecture, staged, batch)
             value_targets = _batch_tensor(staged["value_targets"], batch, torch.float32)
             value_loss, moments = _critic_minibatch_fit_terms(
-                critic, value_targets, autocast_enabled, *critic_args
+                critic,
+                value_targets,
+                autocast_enabled,
+                *critic_args,
+                entity_active=(
+                    _entity_active_batch(staged, batch)
+                    if getattr(critic.config, "per_entity_critic", False)
+                    else None
+                ),
             )
             sums += moments
             loss_total += value_loss.double() * batch.numel()

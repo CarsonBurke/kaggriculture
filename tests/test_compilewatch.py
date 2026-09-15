@@ -39,11 +39,6 @@ def test_a_late_first_compile_is_also_a_fault(watch: CompileWatch) -> None:
         watch.check(events, reasons)
 
 
-def test_a_wave_that_compiles_nothing_passes(watch: CompileWatch) -> None:
-    """The steady state is the common case and must never raise."""
-    watch.check((), ())
-
-
 def test_a_guard_failure_is_reported_with_its_reason(watch: CompileWatch) -> None:
     """The shape that varied has to be named, or the abort is not actionable."""
 

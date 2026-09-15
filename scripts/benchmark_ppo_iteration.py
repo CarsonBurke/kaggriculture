@@ -59,6 +59,7 @@ from kaggriculture.rollout import (
     _ANIMAL_STOCK_COLUMNS,
     _CROP_SEED_COLUMNS,
     _PRODUCT_STOCK_COLUMNS,
+    REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
     allocate_rollout_storage,
     collect_mixed_play_rust,
@@ -207,6 +208,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
+    parser.add_argument("--reward-mode", choices=REWARD_MODES, default="shaped")
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
     parser.add_argument(
         "--policy-loss-reduction",
@@ -715,6 +717,7 @@ def main() -> None:
                 seed_start=wave_seed_start,
                 episode_steps=PRODUCTION_EPISODE_STEPS,
                 temperature=args.temperature,
+                reward_mode=args.reward_mode,
                 opponent_temperature=args.temperature,
                 sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
                 # The frozen league ensemble follows the learner. Since the

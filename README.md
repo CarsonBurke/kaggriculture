@@ -279,64 +279,82 @@ successor teacher and the value-head weights used for auxiliary decoding.
 Its categorical KL is teacher-to-student over the full value distribution.
 
 Actor NextLat is opt-in: set `--structured-latent-coefficient 1` and
-`--structured-decision-coefficient 1`. `ActorDynamics` jointly predicts the actor's
-shared post-`core_norm` latent bank (32 × 80 in production), before the unit and
-market entity decoders. Its input is the current bank and joint action; inactive
-unit actions and post-STOP market suffixes are masked. Latent SmoothL1 averages
-over every shared slot and feature of eligible contiguous successors, not over
-per-entity decision representations.
+`--structured-decision-coefficient 1`. `ActorDynamics` jointly predicts the
+normalized unit and market decision representations immediately before the final
+policy projections, after the entity decoders. Its input is these representations
+and the joint action; inactive unit actions and post-STOP market suffixes are
+masked. Latent SmoothL1 averages over valid successor coordinates, not separate
+family means. Unit targets require cumulative survival across the prediction
+horizon; newborn successor units are excluded. Reached successor market orders
+participate in the loss.
 
-Decoded KL passes the predicted bank through the **entire frozen entity decoder
-and policy readout**, using the same detached successor unit tokens, local tiles,
-economy tokens, and legality masks as the teacher. Cached successor decision
-tokens supply the teacher without another encoder/entity-decoder pass. Student
-and teacher final projections use identical FP32 arithmetic after BF16 entity
-decoding. Successor newborn-unit decisions and reached market roles participate;
-there is no entity-survival mask on the shared bank. This KL is conditional on
-successor entity context, not a standalone forecast of the full future policy.
+Decoded teacher-to-student KL uses only the **frozen final policy projections**,
+not a replay of the entity decoder. Cached, detached successor head-input
+representations supply the teacher. Student and teacher projections use identical
+FP32 arithmetic with successor legality and activity masks. The KL pools active
+unit, market-kind, and market-quantity decisions. Setting both actor coefficients
+to `0.3333333333333333` divides the complete auxiliary objective by three policy
+head families; it does not replace the internal coordinate or decision means.
 
 PPO and the auxiliary share one actor forward and one additive combined backward.
-Auxiliary actor gradients enter only the source shared bank; successor targets,
-side context, and all downstream decoder parameters are detached. Normal PPO
-gradients still train those decoders. There is no actor source-gradient balancing.
+Auxiliary gradients enter the live source head-input representations and flow
+through their entity decoders and actor trunk; successor targets and auxiliary
+readout weights are detached. Normal PPO gradients still train the final policy
+projections. There is no actor source-gradient balancing.
 
-The auxiliary-enabled actor trunk and frozen successor decoder use non-reentrant
-activation checkpointing: backward recomputes their intermediates rather than
-retaining both full activation graphs together. This trades compute for memory
-without splitting the PPO minibatch or adding optimizer steps/backward calls.
+The auxiliary-enabled actor trunk uses non-reentrant activation checkpointing:
+backward recomputes its intermediates without splitting the PPO minibatch or
+adding optimizer steps/backward calls.
 
 This configuration remains experimental: contract tests establish gradient and
-execution correctness, not improved learning. The failed
-`production-nextlat-valid-p500-20260913` run used the removed decision-token
-attachment, not this shared-bank objective. Existing actor/BC parameter keys are
-unchanged, but old actor-predictor states are incompatible and rejected by strict
-loading. Warmup release still measures critic readiness, not predictor readiness;
-persistence scores remain diagnostic only.
+execution correctness, not improved learning. Actor/BC parameter keys are
+unchanged, but predictor states from different attachment architectures are not
+interchangeable. Warmup release still measures critic readiness, not predictor
+readiness; persistence scores remain diagnostic only.
 
 Both actor coefficients default to zero, so no actor predictor or predictor
 optimizer is constructed. `--structured-critic-gradient-balance` remains an
 experimental opt-in for critic-only 50/50 source-cotangent norm matching; the
 default is `--no-structured-critic-gradient-balance`.
 
-`--policy-loss-reduction states` is the default: each component ratio is clipped
-independently, then the summed surrogate is divided by valid states rather than
-active components. `components` retains the former control reduction. Padded
-rows contribute neither loss nor denominator. KL, entropy, and clipping
-diagnostics retain their component-normalized units, and learning rates are
-unchanged. PPO `approx_kl` uses the sampled-action estimator
-`exp(log_ratio) - 1 - log_ratio`, where `log_ratio = log_pi_new - log_pi_old`;
-it is not the full categorical KL used by critic NextLat.
+`--policy-loss-reduction states` is the default. With the default
+`--policy-ratio-scope components`, each component ratio is clipped independently,
+then the summed surrogate is divided by valid states rather than active
+components. `--policy-loss-reduction components` retains the former control
+reduction. Padded rows contribute neither loss nor denominator. KL, entropy, and
+clipping diagnostics retain their component-normalized units.
+
+`--policy-ratio-scope joint` requires state reduction. It sums active conditional
+action log-ratios per state, applies one PPO clip to the resulting joint ratio,
+and uses state-mean joint KL for the trust-region stop. The configured KL threshold
+is unchanged, so this is a tighter trust-region experiment, not a calibrated
+equivalent of component clipping. Entropy and `component_kl` remain
+component-normalized; sampler parity always uses component KL.
+
+PPO `approx_kl` uses the sampled-action estimator
+`exp(log_ratio) - 1 - log_ratio`, where `log_ratio = log_pi_new - log_pi_old`,
+at the selected ratio scope. It is not the full categorical KL used by NextLat.
+
+`--per-entity-critic true` adds centralized value predictions for owned units and
+market orders alongside the global value. Active entity advantages are normalized
+over owned unit/order entries; market-kind and quantity decisions share their
+order's advantage. All predictions use the same team return target, with primary
+critic loss averaged over active global/entity slots within each state. Global
+critic diagnostics and critic NextLat retain the global value representation.
+This experiment requires both GAE lambdas to be one and component ratio scope:
+pass `--actor-gae-lambda 1` explicitly to override the promoted VAPO default.
+It cannot be combined with a shorter actor trace or joint ratios.
 
 PPO has no patch, economy, or opponent-state prediction objectives. Its actor
-predictor reads the shared latent bank and actions; its critic predictor reads
-the value representation and actions. Existing BC-only world-feature experiments
+predictor reads unit/market head-input representations and actions; its critic
+predictor reads the value representation and actions. Existing BC-only world-feature experiments
 remain separate from this PPO contract; they are not evidence for a world model.
 When actor NextLat is enabled, critic-warmup and KL-stop phases still freeze the
 actor while fitting its predictor. Fresh-wave persistence scores are diagnostic
 only.
 
-PPO exports the shared bank and detached successor entity/teacher context across
-its compiled actor boundary; BC retains the full world-belief interface. Frozen
+PPO exports the unit and market head-input representations across its compiled
+actor boundary; BC retains the full world-belief interface. Frozen
 actor predictor training uses a cached compiled BF16 belief-only forward,
 without unused policy logits. A released-actor backward warmup is discarded once
 per callable/configuration/shape, not once per frozen wave.
@@ -345,8 +363,12 @@ Rollout statistics validate categorical support on existing host masks, avoiding
 two device-to-host boolean barriers per environment step. Unit/kind statistics
 and entropy packing are compiled; native quantity likelihoods no longer make an
 unnecessary GPU roundtrip. Built-in league agents occupy no neural ensemble
-slots. Only encountered neural lane/width layouts compile; a new layout can still
-incur first-use compilation rather than precompiling every reachable layout.
+slots. Compiled neural inference rounds lane counts and per-lane widths up to
+powers of two, reusing fewer compiled layouts as opponent assignments change.
+Extra rows and lanes duplicate valid inputs/weights and are discarded before
+sampling; opponent selection, physical games, and training rows are unchanged.
+Only encountered buckets compile, not every reachable layout in advance.
+The compile guard tracks these physical buckets rather than raw assignment counts.
 Mutable ensemble weights are thread-owned. Native paired encoding computes each
 physical farm's public tile features once and reuses them for the opposite seat.
 The source-bound 2026-09-12 probe in
@@ -412,13 +434,13 @@ r[0,T-1] = U[T] - P[T-1]        # terminal; terminal shaping potential is zero
 r[1,t] = -r[0,t]
 ```
 
-The production discount is `gamma = 0.997`. From the symmetric initial state
-`P[0] = 0`, the discounted complete return is
-`gamma^(T-1) * U[T]`. Every game has the same horizon, so this factor cannot
-change the ordering of terminal outcomes. The intermediate potential cancels
-without requiring gamma one, adding dense credit assignment without an
-early-lead or time-average occupancy objective. Every transition, including the
-terminal transition, sums to exactly zero.
+The production discount is `gamma = 1`. From the symmetric initial state
+`P[0] = 0`, the complete shaped return is exactly the final-bank margin `U[T]`,
+up to binary32 accumulation error. Intermediate potential differences cancel;
+there is no early-lead or time-average occupancy objective. Every transition,
+including the terminal transition, sums to exactly zero. Explicit gamma
+overrides remain discount-correct: the complete discounted return becomes
+`gamma^(T-1) * U[T]` at the fixed episode horizon.
 
 Potential and terminal utility use the same bounded, zero-sum margin function.
 The `2*k` denominator regularizes the slope near ruin: `3000` versus `0`
@@ -438,20 +460,50 @@ Rust supplies binary32 potentials and terminal utility; one Python reward
 implementation applies the same configurable gamma to native and interpreted
 rollouts.
 
-Actor and critic GAE both default to lambda 1, retaining discounted delayed
-investment payoffs instead of additionally attenuating them by `lambda^delay`.
-Explicit actor/critic lambda overrides remain available. Advantages, value
-targets, and collection shaping share gamma. Targets outside categorical
-support saturate at its outer atom, with the saturated fraction reported.
+`--reward-mode terminal-bank` removes shaping: nonterminal rewards are exactly
+zero and each terminal transition pays the same signed final-bank margin used by
+the shaped mode. It does not switch to binary win/loss or raw money. Collection
+uses the actual terminal utility directly, and credit diagnostics omit the
+potential correction in this mode. Rollout composition rejects mixed reward
+modes; exact training resume requires the recorded reward mode to match.
 
-The trust region is `target_kl = 0.03` on the active-component mean KL.
+`--reward-mode terminal-outcome` also pays zero before termination, but replaces
+the final-bank margin with **+1 for a win, -1 for a loss, and 0 for a draw**.
+Win/draw comparisons follow the official floating-point bank scores. Native
+collection takes the sign of the terminal utility rather than comparing the
+separately rounded binary32 bank telemetry, which can turn close wins into ties.
+Credit diagnostics use the stored terminal outcome, without potential correction.
+This is an experimental override; the default remains dense shaped reward.
+
+The promoted dense VAPO temporal defaults are `--gamma 1`,
+`--actor-gae-lambda 0.972183588317107`, and `--critic-gae-lambda 1`.
+The actor value is `1 - 1 / (0.05 * 719)`, using VAPO's alpha `0.05` and the
+full game's 719 transitions. It is fixed for this game, not adapted per batch.
+
+The critic fits full, undiscounted Monte Carlo returns: for a complete trajectory,
+its shaped target at state `t` is `U[T] - P[t]`. Actor advantages instead use a
+shorter GAE trace, with geometric weight sum approximately 35.95 transitions,
+to reduce variance while relying on the critic for longer-term value. This is
+not a 36-turn planning cutoff; inaccurate critic predictions can bias the actor.
+Collection shaping, advantages, and value targets share gamma. Targets outside
+categorical support saturate at the outer atom, with the saturated fraction
+reported.
+
+These defaults were promoted from dense-reward trial **7010** at the user's
+direction. Reward utility, learning rates, architecture, PPO clipping, and
+auxiliaries are unchanged; this adopts VAPO's temporal settings, not every
+component of its training recipe. New direct, production, and calibrated
+launches inherit the defaults. Explicit experimental overrides and previously
+queued frozen commands retain their declared settings.
+
+The default trust region is `target_kl = 0.03` on the active-component mean KL.
 Its historical calibration does not establish the stopping frequency after
 changing rewards and auxiliary balance; measure accepted minibatches explicitly.
 
 Entropy is measured but not optimized. The main actor objective is clipped PPO;
-production jointly optimizes a one-step future-policy KL auxiliary. The critic
-jointly optimizes one-step latent and decoded-value prediction auxiliaries. Production
-uses one learner with 128 self-play games and 64 league games per wave (320
+production leaves the actor future-policy auxiliary off unless explicitly enabled.
+The critic jointly optimizes one-step latent and decoded-value prediction
+auxiliaries. Production uses one learner with 128 self-play games and 64 league games per wave (320
 learner trajectories). Stale matchup evidence for built-ins and snapshots decays
 toward 0.5 alike, so formerly easy opponents can become contested again.
 
@@ -504,7 +556,7 @@ the shaping potential, including a potential-only baseline, grouped by opponent
 and time-to-go. High shaped-return explained variance alone is not evidence of
 long-horizon prediction. Every 25 iterations, gradient diagnostics report
 `structured_gradient_source_norm` and `structured_critic_gradient_source_norm`:
-the actor shared-bank and critic value-belief raw auxiliary cotangent norms,
+the actor head-input and critic value-belief raw auxiliary cotangent norms,
 respectively. They are not parameter-gradient norms or main/auxiliary cosine
 estimates. Observation does not change optimizer updates.
 

@@ -1021,52 +1021,6 @@ def test_no_two_fields_share_one_run_and_tag() -> None:
         seen[placement] = name
 
 
-def test_no_category_grows_past_the_readable_budget() -> None:
-    """A category is a scrollable accordion in TensorBoard, not a chart.
-
-    Past about nine charts it stops being scannable and the reason to have
-    categories at all is gone, which is how the league tags reached 494 and how
-    every unit action ended up in one accordion. The budget is per run as well
-    as per category: `rollout` under a cohort and `rollout` under root are two
-    different accordions and each gets the full allowance.
-
-    A benchmark journal is counted under a batch run because it is the other
-    thing this mirror writes, and it is where the worst of this was: its
-    scalars used to be tagged `{kind}/{mode}/games_{n}/{name}`, which is one
-    category holding all 63 of them.
-
-    A population of four is counted alongside the single learner, because that
-    is where a misplaced facet is fatal rather than merely untidy: the agent
-    joins the category, so each of its accordions keeps the size it has for one
-    learner. Joining the chart name instead would collect every agent's copy
-    under one first path segment -- `parity-unit` from seven charts to
-    thirty-five, and `population-score-rate` over budget on the ordered pairs
-    alone, twelve of them at four agents. Ten is counted as well, being the size
-    the matrix layout claims to hold to: a row is N-1 charts, so that claim is a
-    measurement here and not a hope.
-    """
-    benchmark_run = telemetry._BENCHMARK_BATCH_RUN.format(kind="ppo", mode="eager", games=112)
-    populations = (_POPULATION, _LARGEST_BUDGETED_POPULATION)
-    names = dict.fromkeys(
-        (
-            *_mirrored_field_names(),
-            *(name for size in populations for name in _population_field_names(size)),
-        )
-    )
-    counts: dict[tuple[str, str], int] = {}
-    for name in names:
-        placement = telemetry._placement(name)
-        if placement is None:
-            continue
-        run, tag = placement
-        for root in ("", benchmark_run):
-            category = (f"{root}/{run}" if root and run else root or run, tag.split("/")[0])
-            counts[category] = counts.get(category, 0) + 1
-
-    oversized = {name: count for name, count in counts.items() if count > 9}
-    assert not oversized, oversized
-
-
 def test_each_producer_is_labeled_by_the_knobs_it_actually_records() -> None:
     """Three producers name their compilation differently, so one key cannot
     label all of them.

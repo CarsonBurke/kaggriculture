@@ -1,15 +1,14 @@
 """Account for every `torch.compile` entry a run pays for, and refuse late ones.
 
-Update minibatch and rollout row counts are fixed by configuration. Frozen
-league execution additionally specializes on the assigned neural lane count
-and padded width. The collector compiles only the layout a wave actually uses,
-before opening its captured step loop; its persistent ensemble caches reuse
-previously seen layouts instead of precompiling an unvisited shape family.
+Update minibatch and rollout row counts are fixed by configuration. Compiled
+frozen-league inference buckets its neural lane count and padded width to
+powers of two. Only encountered buckets compile before the captured step loop;
+persistent ensembles reuse each bucket across changed opponent assignments.
 The update still warms the released actor's forward and backward while the
 actor is frozen (`ppo.py::_warm_actor_update_graphs`).
 
-First-use league layouts can therefore compile after wave one. The caller
-withholds changed-layout and warmup-transition waves from the settled-wave
+First-use league buckets can therefore compile after wave one. The caller
+withholds changed-bucket and warmup-transition waves from the settled-wave
 contract; this module distinguishes the events it records:
 
 * A **recompile** is a guard failure -- a frame already compiled for one set of
@@ -19,7 +18,7 @@ contract; this module distinguishes the events it records:
   `recompiles` logging artifact carries the reason, which is why that artifact
   is enabled and captured rather than reconstructed.
 * A **late first compile** (`cache_size == 0`) is a previously unseen frame or
-  shape. This is expected when the selected league layout changes, but a fault
+  shape. This is expected when the selected league bucket changes, but a fault
   when the caller holds the wave to the settled-shape contract.
 
 Both are only faults once a wave can be held to the contract: the caller

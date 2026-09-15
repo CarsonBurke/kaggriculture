@@ -507,6 +507,8 @@ _TRAINING_TAGS = {
     # the four that pushed `actor` past the point of being scannable.
     "approx_kl": "trust-region/approx_kl",
     "max_approx_kl": "trust-region/max_approx_kl",
+    "component_kl": "trust-region/component_kl",
+    "max_component_kl": "trust-region/max_component_kl",
     "clip_fraction": "trust-region/clip_fraction",
     "kl_early_stop": "trust-region/kl_early_stop",
     # `critic` is how well the critic is fitting; `value` is what it and its
@@ -603,7 +605,7 @@ _TRAINING_TAGS = {
     # trust region never sees it, because the update replays its own behavior
     # likelihoods -- so it belongs beside the audit rather than beside the KL.
     "first_minibatch_component_kl": "parity/first_minibatch_kl",
-    "first_minibatch_approx_kl": "ppo/first_minibatch_kl",
+    "first_minibatch_approx_kl": "trust-region/first_minibatch_kl",
     # Placed explicitly so the per-head prefix rule does not route it into the
     # `parity/<head>` runs, where it would share a chart with the per-head and
     # joint sampling-versus-replay divergences. It measures the replay against

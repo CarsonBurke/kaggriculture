@@ -359,3 +359,12 @@ def shaped_pair_reward(
         reward_zero = np.float32(utility - previous)
     result = float(reward_zero)
     return result, -result
+
+
+def terminal_bank_pair_reward(terminal_utility: float | None = None) -> tuple[float, float]:
+    """Pay only the final bank utility, with no potential or terminal correction."""
+    utility = np.float32(0.0 if terminal_utility is None else terminal_utility)
+    if not np.isfinite(utility):
+        raise ValueError("terminal utility must be finite")
+    result = float(utility)
+    return result, -result

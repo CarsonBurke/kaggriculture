@@ -22,6 +22,7 @@ from kaggriculture.encoding import (
     liquidation_value,
     pair_potential,
     shaped_pair_reward,
+    terminal_bank_pair_reward,
     terminal_pair_utility,
 )
 
@@ -168,7 +169,7 @@ def test_liquidation_margin_tracks_relative_not_absolute_wealth() -> None:
 
 
 def test_discounted_shaped_rewards_preserve_terminal_utility_and_zero_sum() -> None:
-    gamma = float(np.float32(DEFAULT_REWARD_GAMMA))
+    gamma = float(np.float32(0.91))
     zero, one = _observations()
     zero["farms"][0]["money"] = 9000
     one["farms"][1]["money"] = 3000
@@ -205,6 +206,34 @@ def test_shaped_rewards_match_binary32_subtraction() -> None:
     # Both inputs narrow to the same cached potential. A binary64 subtraction
     # would invent a tiny backend-specific reward here.
     assert shaped_pair_reward(0.5, 0.5 + 1e-8, gamma=1.0) == (0.0, -0.0)
+
+
+def test_terminal_bank_reward_pays_cash_utility_without_potential_correction() -> None:
+    zero, one = _observations()
+    zero["farms"][0]["money"] = 9000
+    one["farms"][1]["money"] = 3000
+    zero["private"]["shed"]["WHEAT"] = 80
+    potential = pair_potential(zero, one)
+    utility = terminal_pair_utility(zero, one)
+    assert potential != utility
+    gamma = float(np.float32(DEFAULT_REWARD_GAMMA))
+    rewards = np.asarray(
+        [
+            terminal_bank_pair_reward(),
+            terminal_bank_pair_reward(),
+            terminal_bank_pair_reward(utility),
+        ]
+    )
+    np.testing.assert_array_equal(rewards[:-1], 0.0)
+    np.testing.assert_array_equal(rewards[:, 0], -rewards[:, 1])
+    assert rewards[-1, 0] == float(np.float32(utility))
+    assert (
+        rewards[-1, 0]
+        != shaped_pair_reward(potential, None, terminal_utility=utility, gamma=gamma)[0]
+    )
+    discounted = (rewards * np.asarray([1.0, gamma, gamma**2])[:, None]).sum(axis=0)
+    expected = gamma**2 * float(np.float32(utility))
+    np.testing.assert_array_equal(discounted, [expected, -expected])
 
 
 def test_encoding_exposes_shed_pressure_and_exact_crop_decay_phase() -> None:

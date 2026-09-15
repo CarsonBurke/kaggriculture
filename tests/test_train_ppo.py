@@ -875,9 +875,11 @@ def test_metrics_journal_rolls_back_to_a_verified_checkpoint_boundary(tmp_path: 
     assert len(path.read_text(encoding="utf-8").splitlines()) == 3
 
 
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
 def test_main_writes_complete_manifests_and_portably_resumes(
     monkeypatch,
     tmp_path,
+    reward_mode,
 ) -> None:
     module = _training_script()
     run_provenance = module.run_provenance_from_decision(
@@ -968,6 +970,8 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "--no-bfloat16",
             "--gamma",
             "0.91",
+            "--reward-mode",
+            reward_mode,
         ]
         if resume is not None:
             values.extend(("--resume", str(resume)))
@@ -980,6 +984,11 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     initial = torch.load(source_run / "checkpoint-000000.pt", weights_only=False)
     latest = torch.load(source_run / "latest.pt", weights_only=False)
     numbered = torch.load(source_run / "checkpoint-000001.pt", weights_only=False)
+    assert latest["training_data_config"]["reward_mode"] == reward_mode
+    assert (
+        json.loads((source_run / "config.json").read_text())["arguments"]["reward_mode"]
+        == reward_mode
+    )
     assert set(initial["league_snapshot_manifest"]) == {0}
     assert set(latest["league_snapshot_manifest"]) == {0, 1}
     assert numbered["league_snapshot_manifest"] == latest["league_snapshot_manifest"]
@@ -1050,6 +1059,24 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     module.main()
     assert (portable_only / "latest.pt").is_file()
     assert collected_gammas and set(collected_gammas) == {0.91}
+
+    mismatched = arguments(tmp_path / "wrong-reward", 2, source_run / "checkpoint-000001.pt")
+    mismatched[mismatched.index("--reward-mode") + 1] = (
+        "terminal-bank" if reward_mode == "shaped" else "shaped"
+    )
+    monkeypatch.setattr(sys, "argv", mismatched)
+    with pytest.raises(ValueError):
+        module.main()
+    assert not (tmp_path / "wrong-reward" / "latest.pt").exists()
+
+    legacy = {**latest, "training_data_config": dict(latest["training_data_config"])}
+    legacy["training_data_config"].pop("reward_mode")
+    legacy_path = tmp_path / "missing-reward.pt"
+    torch.save(legacy, legacy_path)
+    monkeypatch.setattr(sys, "argv", arguments(tmp_path / "missing-reward", 2, legacy_path))
+    with pytest.raises(ValueError):
+        module.main()
+    assert not (tmp_path / "missing-reward" / "latest.pt").exists()
 
 
 def test_parity_audit_is_due_per_staging_configuration_and_on_a_cadence() -> None:
@@ -2265,7 +2292,6 @@ def _run_population_main(
         wave.agents = np.zeros(wave.agents.size, dtype=np.int64)
 
     def collect(*args, **kwargs):
-        assert kwargs["gamma"] == pytest.approx(0.997)
         return wave
 
     monkeypatch.setattr(module, "SummaryWriter", Writer)

@@ -4,7 +4,6 @@ import gc
 import threading
 import weakref
 from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -28,6 +27,8 @@ from kaggriculture.encoding import (
     GLOBAL_FEATURES,
     UNIT_FEATURES,
     pair_potential,
+    shaped_pair_reward,
+    terminal_bank_pair_reward,
     terminal_pair_utility,
 )
 from kaggriculture.model import ActorOutput, FarmActor, ModelConfig
@@ -50,7 +51,6 @@ from kaggriculture.rollout import (
     _gumbel_utilities,
     _native_pair_rewards,
     _stacked_actor_ensemble,
-    _StackedActorEnsemble,
     _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
@@ -67,38 +67,6 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredInputs
-
-
-def test_each_lane_layout_compiles_through_its_own_frame() -> None:
-    """Dynamo's cache and recompile budget are keyed by code object.
-
-    While every lane width shared one `_forward.__code__`, each new width was
-    recorded as a recompile of that frame, so the collector needed its recompile
-    budget raised to avoid silently falling back to eager after eight widths --
-    and real shape churn was indistinguishable from a new league layout. The
-    per-layout frame must be a distinct code object that computes the same
-    stacked forward.
-    """
-    template = torch.nn.Linear(3, 2)
-    lanes = [torch.nn.Linear(3, 2) for _ in range(2)]
-    ensemble = SimpleNamespace(
-        template=template.to("meta"),
-        params={
-            name: torch.stack([dict(lane.named_parameters())[name] for lane in lanes])
-            for name, _ in template.named_parameters()
-        },
-        buffers={},
-    )
-    inputs = torch.randn(2, 4, 3)
-
-    narrow = _StackedActorEnsemble._layout_forward(ensemble, "inductor_w3")
-    wide = _StackedActorEnsemble._layout_forward(ensemble, "inductor_w5")
-
-    assert narrow.__func__.__code__ is not wide.__func__.__code__
-    assert narrow.__func__.__code__.co_name == "_forward_inductor_w3"
-    reference = _StackedActorEnsemble._forward(ensemble, inputs)
-    torch.testing.assert_close(narrow(inputs), reference)
-    torch.testing.assert_close(wide(inputs), reference)
 
 
 class _NearOneGenerator:
@@ -125,6 +93,9 @@ def _assert_zero_sum_reward_contract(
     # Each stored reward rounds one potential difference to binary32. Summing
     # 719 of them therefore telescopes only to binary32 accumulation accuracy.
     terminal_scores = _terminal_bank_margin(rollout.final_money, rollout.opponent_money)
+    if rollout.reward_mode == "terminal-bank":
+        np.testing.assert_array_equal(rollout.rewards[:, :-1], 0.0)
+        np.testing.assert_array_equal(rollout.rewards[:, -1], terminal_scores.astype(np.float32))
     np.testing.assert_allclose(
         _discounted_returns(rollout.rewards, gamma),
         float(np.float32(gamma)) ** (rollout.horizon - 1) * terminal_scores,
@@ -705,16 +676,18 @@ def test_every_public_native_collector_rejects_an_unknown_forward_mode_immediate
 
 @pytest.mark.parametrize("collector", (collect_self_play, collect_self_play_rust))
 @pytest.mark.parametrize("gamma", (0.0, 1.01, float("nan")))
-def test_collectors_reject_invalid_reward_gamma(collector, gamma: float) -> None:
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_collectors_reject_invalid_reward_gamma(collector, gamma: float, reward_mode: str) -> None:
     config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
 
     with pytest.raises(ValueError, match="reward gamma must be finite"):
-        collector(FarmActor(config), games=1, seed_start=1, gamma=gamma)
+        collector(FarmActor(config), games=1, seed_start=1, gamma=gamma, reward_mode=reward_mode)
 
 
-def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None:
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_short_self_play_rollout_preserves_discounted_terminal_utility(reward_mode: str) -> None:
     config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
@@ -728,6 +701,7 @@ def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None
         episode_steps=8,
         deterministic=False,
         gamma=gamma,
+        reward_mode=reward_mode,
         sampling_seed=9,
     )
 
@@ -736,6 +710,7 @@ def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None
     assert rollout.state_count == 28
     assert rollout.states["board"].shape[:2] == (4, 7)
     assert rollout.unit_masks.shape[:2] == (4, 7)
+    _assert_zero_sum_reward_contract(rollout, gamma=gamma)
     terminal_scores = _terminal_bank_margin(rollout.final_money, rollout.opponent_money)
     np.testing.assert_allclose(
         _discounted_returns(rollout.rewards, gamma),
@@ -747,14 +722,17 @@ def test_short_self_play_rollout_preserves_discounted_terminal_utility() -> None
     assert rollout.episode_seeds.tolist() == [50, 50, 51, 51]
 
 
-def test_frozen_opponent_rollout_and_concatenation() -> None:
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_frozen_opponent_rollout_and_concatenation(reward_mode: str) -> None:
     config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
     )
     actor = FarmActor(config)
     opponent = FarmActor(config)
     opponent.load_state_dict(actor.state_dict())
-    self_play = collect_self_play(actor, games=1, seed_start=70, episode_steps=8, sampling_seed=1)
+    self_play = collect_self_play(
+        actor, games=1, seed_start=70, episode_steps=8, sampling_seed=1, reward_mode=reward_mode
+    )
     league = collect_frozen_opponent_play(
         actor,
         opponent,
@@ -762,6 +740,7 @@ def test_frozen_opponent_rollout_and_concatenation() -> None:
         seed_start=80,
         episode_steps=8,
         sampling_seed=2,
+        reward_mode=reward_mode,
     )
 
     combined = concatenate_rollouts([self_play, league])
@@ -770,6 +749,11 @@ def test_frozen_opponent_rollout_and_concatenation() -> None:
     assert league.seats.tolist() == [0, 1]
     assert combined.trajectories == 4
     assert combined.horizon == 7
+    _assert_zero_sum_reward_contract(combined)
+    assert slice_trajectories(combined, 0, 1).reward_mode == reward_mode
+    other_mode = "terminal-bank" if reward_mode == "shaped" else "shaped"
+    with pytest.raises(ValueError):
+        concatenate_rollouts([self_play, replace(league, reward_mode=other_mode)])
 
 
 def test_concatenation_weights_entropy_by_active_policy_components() -> None:
@@ -923,7 +907,8 @@ def test_stored_behavior_likelihoods_replay_from_identical_features() -> None:
 
 
 @pytest.mark.parametrize("collector", [collect_self_play_rust])
-def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_native_self_play_rollout_is_complete_and_replayable(collector, reward_mode: str) -> None:
     config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
@@ -941,7 +926,7 @@ def test_native_self_play_rollout_is_complete_and_replayable(collector) -> None:
         actor.market_quantity_bias.fill_(-50.0)
         actor.market_quantity_bias[MarketKind.BUY_SEED_WHEAT, -1] = 50.0
 
-    rollout = collector(actor, games=1, seed_start=121, sampling_seed=7)
+    rollout = collector(actor, games=1, seed_start=121, sampling_seed=7, reward_mode=reward_mode)
 
     assert rollout.trajectories == 2
     assert rollout.horizon == 719
@@ -1256,9 +1241,12 @@ def test_arena_collection_merges_adjacent_batches_without_copying() -> None:
     np.testing.assert_array_equal(merged.seats, np.concatenate([first.seats, second.seats]))
     with pytest.raises(ValueError, match="not adjacent views"):
         merge_contiguous_rollouts(arena, [second, first])
+    with pytest.raises(ValueError):
+        merge_contiguous_rollouts(arena, [first, replace(second, reward_mode="terminal-bank")])
 
 
-def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena(reward_mode: str) -> None:
     config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
@@ -1279,6 +1267,7 @@ def test_mixed_wave_stores_self_play_then_league_rows_in_one_arena() -> None:
         seed_start=130,
         sampling_seed=8,
         storage=arena,
+        reward_mode=reward_mode,
     )
 
     assert (rollout.trajectories, rollout.horizon, rollout.state_count) == (4, 719, 2876)
@@ -1532,7 +1521,79 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
 
 
-def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> None:
+def test_native_terminal_bank_uses_actual_dones_without_reading_potentials() -> None:
+    sampled = {
+        "dones": np.asarray([False, True, False, True]),
+        # Nonterminal slots may retain arbitrary native output. They never pay.
+        "terminal_utilities": np.asarray([0.7, -0.25, -0.6, 0.125], dtype=np.float32),
+    }
+    rewards = _native_pair_rewards(sampled, DEFAULT_REWARD_GAMMA, "terminal-bank")
+    np.testing.assert_array_equal(
+        rewards, [[0.0, -0.0], [-0.25, 0.25], [0.0, -0.0], [0.125, -0.125]]
+    )
+
+
+def test_native_terminal_outcome_preserves_close_wins_losses_and_draws() -> None:
+    # These distinct official banks become identical if rounded separately to
+    # float32. Native utilities normalize their float64 difference first.
+    money = np.asarray(
+        [
+            [2**24 + 1, 2**24],
+            [2**24, 2**24 + 1],
+            [2**24, 2**24],
+            # Official float(bank) scores really do tie above float64's integer precision.
+            [2**53 + 1, 2**53],
+        ],
+        dtype=np.float64,
+    )
+    sampled = {
+        "dones": np.asarray([True, True, True, True, False]),
+        "terminal_utilities": np.asarray(
+            [*_terminal_bank_margin(money[:, 0], money[:, 1]), 0.75], dtype=np.float32
+        ),
+        "final_money": np.vstack((money, [9000.0, 1000.0])).astype(np.float32),
+    }
+    rewards = _native_pair_rewards(sampled, DEFAULT_REWARD_GAMMA, "terminal-outcome")
+    np.testing.assert_array_equal(
+        rewards, [[1.0, -1.0], [-1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+    )
+    assert rewards.dtype == np.float32
+
+
+def test_native_terminal_outcome_pays_only_at_production_terminal() -> None:
+    import json
+
+    from kaggriculture.production import PRODUCTION_EPISODE_STEPS
+
+    environment = load_native().BatchEnv(np.asarray([911, 911, 911], dtype=np.uint64))
+    unit = np.zeros((3, 2, MAX_UNITS), dtype=np.uint8)
+    kinds = np.zeros((3, 2, MAX_MARKET_ORDERS), dtype=np.uint8)
+    quantities = np.zeros((3, 2, MAX_MARKET_ORDERS), dtype=np.uint8)
+    # Buying retained inventory costs bank, not terminal liquidation value.
+    kinds[0, 0, 0] = kinds[1, 1, 0] = MarketKind.BUY_PRODUCT_WHEAT
+    quantities[0, 0, 0] = quantities[1, 1, 0] = 79
+    for step in range(PRODUCTION_EPISODE_STEPS - 1):
+        sampled = environment.step_factors(unit, kinds, quantities)
+        rewards = _native_pair_rewards(sampled, DEFAULT_REWARD_GAMMA, "terminal-outcome")
+        if step < PRODUCTION_EPISODE_STEPS - 2:
+            np.testing.assert_array_equal(sampled["dones"], False)
+            np.testing.assert_array_equal(rewards, 0.0)
+        kinds.fill(0)
+        quantities.fill(0)
+
+    np.testing.assert_array_equal(sampled["dones"], True)
+    np.testing.assert_array_equal(rewards, [[-1.0, 1.0], [1.0, -1.0], [0.0, 0.0]])
+    for game in range(3):
+        snapshot = json.loads(environment.snapshot_json(game))
+        # Snapshot rewards retain the official float64 terminal bank scores;
+        # unlike the native float32 transport banks, these preserve close ties.
+        scores = snapshot["rewards"]
+        outcome = float(scores[0] > scores[1]) - float(scores[0] < scores[1])
+        np.testing.assert_array_equal(rewards[game], [outcome, -outcome])
+
+
+@pytest.mark.parametrize("reward_mode", ("shaped", "terminal-bank"))
+def test_native_rewards_preserve_discounted_terminal_bank_utility(reward_mode: str) -> None:
     """Every step is antisymmetric and discounted return retains terminal utility."""
     import json
 
@@ -1568,18 +1629,36 @@ def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> No
             )
         assert np.all(np.abs(out["potentials"]) <= 1.0)
         assert np.all(np.abs(out["previous_potentials"]) <= 1.0)
-        rewards = _native_pair_rewards(out, gamma)
+        rewards = _native_pair_rewards(out, gamma, reward_mode)
         np.testing.assert_array_equal(rewards[:, 0], -rewards[:, 1])
         if np.asarray(out["dones"]).all():
             terminal_scores = _terminal_bank_margin(
                 np.asarray(out["final_money"])[:, 0],
                 np.asarray(out["final_money"])[:, 1],
             )
-            expected_zero = terminal_scores - out["previous_potentials"]
+            expected_zero = terminal_scores
+            if reward_mode == "shaped":
+                expected_zero = expected_zero - out["previous_potentials"]
         else:
-            expected_zero = gamma * out["potentials"] - out["previous_potentials"]
+            expected_zero = (
+                gamma * out["potentials"] - out["previous_potentials"]
+                if reward_mode == "shaped"
+                else np.zeros(1, dtype=np.float32)
+            )
+        terminal_utility = float(out["terminal_utilities"][0]) if out["dones"][0] else None
+        python_rewards = (
+            shaped_pair_reward(
+                float(out["previous_potentials"][0]),
+                None if out["dones"][0] else float(out["potentials"][0]),
+                terminal_utility=terminal_utility,
+                gamma=gamma,
+            )
+            if reward_mode == "shaped"
+            else terminal_bank_pair_reward(terminal_utility)
+        )
+        np.testing.assert_array_equal(rewards[0], python_rewards)
         np.testing.assert_allclose(rewards[:, 0], expected_zero, atol=1e-7)
-        returns += gamma**step * rewards[0]
+        returns += gamma**step * rewards[0].astype(np.float64)
         step += 1
         if np.asarray(out["dones"]).all():
             break
@@ -1604,6 +1683,13 @@ def test_native_shaped_rewards_preserve_discounted_terminal_bank_utility() -> No
     expected_zero = _terminal_bank_margin(money[0], money[1])
     expected_terminal = np.asarray([expected_zero, -expected_zero])
     assert terminal == pytest.approx(expected_zero, abs=1e-9)
+    if reward_mode == "terminal-bank":
+        assert rewards[0, 0] == float(np.float32(terminal))
+        assert out["previous_potentials"][0] != 0.0
+        assert rewards[0, 0] != np.float32(terminal) - out["previous_potentials"][0]
+        np.testing.assert_allclose(
+            returns, gamma ** (step - 1) * expected_terminal, rtol=1e-7, atol=0.0
+        )
     np.testing.assert_array_equal(out["potentials"], [0.0])
     np.testing.assert_allclose(returns, gamma ** (step - 1) * expected_terminal, atol=1e-6)
 
@@ -1692,8 +1778,8 @@ _POPULATION_GAMES = 6
 _POPULATION_SEED_START = 310
 
 
-@pytest.fixture(scope="module")
-def population_wave() -> tuple[list[FarmActor], dict[str, np.ndarray], RolloutBatch]:
+@pytest.fixture(scope="module", params=("shaped", "terminal-bank"))
+def population_wave(request) -> tuple[list[FarmActor], dict[str, np.ndarray], RolloutBatch]:
     """One collected population wave, shared by the properties that read it."""
     config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
@@ -1715,6 +1801,7 @@ def population_wave() -> tuple[list[FarmActor], dict[str, np.ndarray], RolloutBa
             seed_start=_POPULATION_SEED_START,
             sampling_seed=4,
             storage=arena,
+            reward_mode=request.param,
         )
     return actors, arena, rollout
 
@@ -1833,6 +1920,7 @@ def test_population_wave_rows_replay_through_the_member_that_sampled_them(
 def test_population_wave_rewards_are_zero_sum_within_every_game(population_wave) -> None:
     """Both learner rows receive exact opposite rewards at every transition."""
     _actors, _arena, rollout = population_wave
+    _assert_zero_sum_reward_contract(rollout)
 
     np.testing.assert_array_equal(rollout.final_money[::2], rollout.opponent_money[1::2])
     np.testing.assert_array_equal(rollout.final_money[1::2], rollout.opponent_money[::2])
