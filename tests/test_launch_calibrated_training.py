@@ -388,6 +388,14 @@ def _records(
         "episode_steps": 720,
         "physical_games_per_iteration": [games + league_games for games in game_counts],
         "repeats": repeats,
+        "profile": {
+            "repeat": None,
+            "trace_path": None,
+            "activities": [],
+            "record_shapes": False,
+            "profile_memory": False,
+            "excluded_from_steady_summary": False,
+        },
         "seed": seed,
         "temperature": 1.0,
         "precision": {
