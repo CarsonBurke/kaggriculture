@@ -32,7 +32,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import parameter_count
-from kaggriculture.modelargs import CALIBRATED_MODEL_FIELDS
+from kaggriculture.modelargs import actor_model_config
 from kaggriculture.ppo import (
     MAX_FIRST_MINIBATCH_KL,
     MAX_UPDATE_REPLAY_KL,
@@ -263,11 +263,8 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
     # CPU artifact deserialization/state snapshots are data, never CPU models.
     with torch.device(device):
         pretrained, payload = load_actor_artifact(args.init_actor_from, device=device)
-        expected = model_config.to_dict()
-        actual = pretrained.config.to_dict()
-        for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
-            expected.pop(name)
-            actual.pop(name)
+        expected = actor_model_config(model_config)
+        actual = actor_model_config(pretrained.config)
         if not isinstance(pretrained, architecture.actor_class) or actual != expected:
             raise ValueError("initial actor architecture/configuration does not match production")
         actor = architecture.actor_class(model_config)

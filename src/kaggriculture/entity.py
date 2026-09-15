@@ -58,6 +58,7 @@ class EntityConfig:
     zero_init_branches: bool = False
     fused_mlp: bool = False
     split_clock_token: bool = False
+    critic_inverted_attention: bool = False
     value_atoms: int = 255
     value_min: float = -2.2
     value_max: float = 2.2
@@ -133,11 +134,12 @@ class EntityMemory(nn.Module):
 class EntityMemoryRead(nn.Module):
     """Round-specific Q/output projections without another memory projection."""
 
-    def __init__(self, config: EntityConfig) -> None:
+    def __init__(self, config: EntityConfig, *, inverted: bool = False) -> None:
         super().__init__()
         self.heads = config.attention_heads
         self.kv_heads = config.attention_kv_heads
         self.head_dim = config.model_dim // self.heads
+        self.inverted = inverted
         self.query = Linear(config.model_dim, config.model_dim, bias=False)
         self.query_norm = RMSNorm(self.head_dim)
         self.output = Linear(config.model_dim, config.model_dim, bias=False)
@@ -145,21 +147,34 @@ class EntityMemoryRead(nn.Module):
             nn.init.zeros_(self.output.weight)
 
     def forward(
-        self, queries: Tensor, key: Tensor, value: Tensor, memory_valid: Tensor | None
+        self,
+        queries: Tensor,
+        key: Tensor,
+        value: Tensor,
+        memory_valid: Tensor | None,
+        query_valid: Tensor,
     ) -> Tensor:
         batch, tokens, width = queries.shape
         query = self.query(queries).view(batch, tokens, self.heads, self.head_dim)
         query = self.query_norm(query.transpose(1, 2))
         query, key, value = _sdpa_inputs(query, key, value)
-        mask = None if memory_valid is None else memory_valid[:, None, None, :]
-        attended = _fused_attention(
-            query,
-            key,
-            value,
-            mask,
-            enable_gqa=self.heads != self.kv_heads,
-            scale=self.head_dim**-0.5,
-        )
+        if self.inverted:
+            from kaggriculture.triton_inverted_attention import inverted_attention
+
+            # Keep GQA heads separate: query competition must not cross heads.
+            attended = inverted_attention(
+                query, key, value, query_valid, memory_valid, self.head_dim**-0.5
+            )
+        else:
+            mask = None if memory_valid is None else memory_valid[:, None, None, :]
+            attended = _fused_attention(
+                query,
+                key,
+                value,
+                mask,
+                enable_gqa=self.heads != self.kv_heads,
+                scale=self.head_dim**-0.5,
+            )
         attended = attended.to(queries.dtype).transpose(1, 2).reshape(batch, tokens, width)
         return self.output(attended)
 
@@ -167,13 +182,13 @@ class EntityMemoryRead(nn.Module):
 class EntityRound(nn.Module):
     """Self attention, fixed-memory cross attention, then exactly one FFN."""
 
-    def __init__(self, config: EntityConfig) -> None:
+    def __init__(self, config: EntityConfig, *, inverted: bool = False) -> None:
         super().__init__()
         self.self_norm = RMSNorm(config.model_dim)
         self.self_attention = Attention(config)
         self.self_gate = GatedResidual(config.model_dim)
         self.cross_norm = RMSNorm(config.model_dim)
-        self.cross_attention = EntityMemoryRead(config)
+        self.cross_attention = EntityMemoryRead(config, inverted=inverted)
         self.cross_gate = GatedResidual(config.model_dim)
         self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = FusedFeedForward(config) if config.fused_mlp else FeedForward(config)
@@ -215,7 +230,9 @@ class EntityRound(nn.Module):
             cross_input = cross_input * (1 + modulation[2][:, None]) + modulation[3][:, None]
         states = torch.where(
             valid,
-            self.cross_gate(states, self.cross_attention(cross_input, key, value, memory_valid)),
+            self.cross_gate(
+                states, self.cross_attention(cross_input, key, value, memory_valid, state_valid)
+            ),
             0.0,
         )
         ffn_input = self.ffn_norm(states)
@@ -238,7 +255,10 @@ class EntityTrunk(nn.Module):
         # Unit-RMS lookup rows follow existing market-query optimizer ownership.
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
         self.memory = EntityMemory(config)
-        self.core = nn.ModuleList(EntityRound(config) for _ in range(config.core_layers))
+        self.core = nn.ModuleList(
+            EntityRound(config, inverted=private_columns and config.critic_inverted_attention)
+            for _ in range(config.core_layers)
+        )
 
     def forward(
         self,

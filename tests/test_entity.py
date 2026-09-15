@@ -7,7 +7,9 @@ to benchmark_entity_architecture.py and the full production iteration pair.
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,6 +18,12 @@ import torch
 from kaggriculture.actor_dynamics import ActorDynamics, actor_window_loss
 from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, load_actor_artifact
+from kaggriculture.league import (
+    FrozenActorPool,
+    load_actor_snapshot,
+    save_actor_snapshot,
+    snapshot_sha256,
+)
 from kaggriculture.policy import component_selected_logprobs
 from kaggriculture.ppo import (
     MAX_FIRST_MINIBATCH_KL,
@@ -35,12 +43,13 @@ from kaggriculture.ppo import (
 from kaggriculture.production import production_ppo_config
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import ENTITY_ATTENTION
-from kaggriculture.rollout import collect_mixed_play_rust
+from kaggriculture.rollout import collect_mixed_play_rust, collect_population_play_rust
 from kaggriculture.structured import StructuredDecisionBelief
 from kaggriculture.structured_dynamics import (
     StructuredCriticDynamics,
     structured_critic_window_loss,
 )
+from kaggriculture.training import TrainingAgent, load_checkpoint, save_checkpoint
 
 pytestmark = [
     pytest.mark.cuda,
@@ -58,7 +67,8 @@ def native_rollout(config):
     if not torch.cuda.is_bf16_supported():
         pytest.fail("entity production contracts require CUDA BF16")
     torch.manual_seed(20260914)
-    actor = EntityActor(config).cuda().eval()
+    # Fresh inverted-critic learners must still play historical ordinary actors.
+    actor = EntityActor(replace(config, critic_inverted_attention=True)).cuda().eval()
     opponent = EntityActor(config).cuda().eval()
     opponent.load_state_dict(actor.state_dict())
     opponent.requires_grad_(False)
@@ -119,11 +129,54 @@ def _nonzero_finite_gradients(module):
     assert sum(float(gradient.float().abs().sum()) for gradient in gradients) > 0
 
 
+def test_inverted_critic_flag_preserves_actor_and_initialization(config, native_batch):
+    _, inputs, critic_args, factors = native_batch
+    inverted_config = replace(config, critic_inverted_attention=True)
+    torch.manual_seed(11)
+    actor = EntityActor(config).cuda().eval()
+    critic = EntityCritic(config).cuda().eval()
+    rng = torch.get_rng_state()
+    torch.manual_seed(11)
+    inverted_actor = EntityActor(inverted_config).cuda().eval()
+    inverted_critic = EntityCritic(inverted_config).cuda().eval()
+    assert torch.equal(torch.get_rng_state(), rng)
+    for ordinary, inverted in ((actor, inverted_actor), (critic, inverted_critic)):
+        assert dict(ordinary.named_parameters()).keys() == dict(inverted.named_parameters()).keys()
+        ordinary_state, inverted_state = ordinary.state_dict(), inverted.state_dict()
+        assert ordinary_state.keys() == inverted_state.keys()
+        for name, value in ordinary_state.items():
+            torch.testing.assert_close(value, inverted_state[name], rtol=0, atol=0)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = _compiled(actor)(inputs)
+        actual = _compiled(inverted_actor)(inputs)
+        for left, right in zip(expected, actual, strict=True):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actor.quantity_logits(expected.market_quantity_context, factors["market_kinds"]),
+            inverted_actor.quantity_logits(actual.market_quantity_context, factors["market_kinds"]),
+            rtol=0,
+            atol=0,
+        )
+        ordinary_value = _compiled(critic.encode_belief)(*critic_args).value_decision
+        inverted_value = _compiled(inverted_critic.encode_belief)(*critic_args).value_decision
+    assert torch.isfinite(inverted_value).all()
+    assert not torch.allclose(ordinary_value, inverted_value, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("zero_init_branches", [False, True])
-def test_one_query_critic_gqa_matches_repeated_kv_belief_and_gradients(config, zero_init_branches):
+@pytest.mark.parametrize("critic_inverted_attention", [False, True])
+def test_one_query_critic_gqa_matches_repeated_kv_belief_and_gradients(
+    config, zero_init_branches, critic_inverted_attention
+):
     """The production readout must preserve masking and summed GQA cotangents."""
     torch.manual_seed(13)
-    critic = EntityCritic(replace(config, zero_init_branches=zero_init_branches)).cuda()
+    critic = EntityCritic(
+        replace(
+            config,
+            zero_init_branches=zero_init_branches,
+            critic_inverted_attention=critic_inverted_attention,
+        )
+    ).cuda()
     batch = 8192
     context = torch.randn(batch, 26, 96, device="cuda", dtype=torch.bfloat16).requires_grad_()
     valid = torch.ones(batch, 26, device="cuda", dtype=torch.bool)
@@ -213,7 +266,11 @@ def test_one_query_critic_gqa_matches_repeated_kv_belief_and_gradients(config, z
     torch.testing.assert_close(unchanged, perturbed, rtol=0, atol=0)
 
 
-def test_inactive_units_cannot_change_live_policy_or_pooled_value(config, native_batch):
+@pytest.mark.parametrize("critic_inverted_attention", [False, True])
+def test_inactive_units_cannot_change_live_policy_or_pooled_value(
+    config, native_batch, critic_inverted_attention
+):
+    config = replace(config, critic_inverted_attention=critic_inverted_attention)
     _, inputs, critic_args, _ = native_batch
     torch.manual_seed(17)
     actor = EntityActor(config).cuda().eval()
@@ -277,7 +334,11 @@ def test_inactive_units_cannot_change_live_policy_or_pooled_value(config, native
     assert torch.count_nonzero(changed_belief.unit_decisions[inactive]) == 0
 
 
-def test_private_state_changes_critic_not_actor_and_has_live_gradients(config, native_batch):
+@pytest.mark.parametrize("critic_inverted_attention", [False, True])
+def test_private_state_changes_critic_not_actor_and_has_live_gradients(
+    config, native_batch, critic_inverted_attention
+):
+    config = replace(config, critic_inverted_attention=critic_inverted_attention)
     staged, inputs, critic_args, _ = native_batch
     torch.manual_seed(19)
     actor = EntityActor(config).cuda().eval()
@@ -480,8 +541,9 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
     assert critic.trunk.memory.key_value.weight.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize("historical_config", [False, True])
 def test_artifact_roundtrip_preserves_compiled_policy_and_rejects_missing_weights(
-    config, native_batch, tmp_path
+    config, native_batch, tmp_path, historical_config
 ):
     _, inputs, _, factors = native_batch
     torch.manual_seed(31)
@@ -494,6 +556,8 @@ def test_artifact_roundtrip_preserves_compiled_policy_and_rejects_missing_weight
         "source_identity": source_identity(),
         "run_provenance": None,
     }
+    if historical_config:
+        del payload["model_config"]["critic_inverted_attention"]
     artifact = tmp_path / "entity.pt"
     torch.save(payload, artifact)
     restored, _ = load_actor_artifact(artifact, device="cuda")
@@ -513,6 +577,105 @@ def test_artifact_roundtrip_preserves_compiled_policy_and_rejects_missing_weight
     torch.save(payload, artifact)
     with pytest.raises(RuntimeError, match="Missing key"):
         load_actor_artifact(artifact, device="cuda")
+
+
+def test_historical_actor_warm_start_accepts_inverted_critic_only(config, native_batch, tmp_path):
+    path = Path(__file__).parents[1] / "scripts" / "train_ppo.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_train_ppo", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _, inputs, _, _ = native_batch
+    pretrained = EntityActor(config).cuda().eval()
+    historical = config.to_dict()
+    del historical["critic_inverted_attention"]
+    artifact = tmp_path / "historical-bc.pt"
+    torch.save(
+        {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "architecture": ENTITY_ATTENTION,
+            "model_config": historical,
+            "actor": pretrained.state_dict(),
+            "source_identity": source_identity(),
+            "run_provenance": None,
+        },
+        artifact,
+    )
+    inverted = replace(config, critic_inverted_attention=True)
+    actor = EntityActor(inverted).cuda().eval()
+    module._load_initial_actor(artifact, actor, ENTITY_ATTENTION, inverted, torch.device("cuda"))
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = _compiled(pretrained)(inputs)
+        actual = _compiled(actor)(inputs)
+    for left, right in zip(expected, actual, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    incompatible = replace(inverted, zero_init_branches=not config.zero_init_branches)
+    with pytest.raises(ValueError, match="model configuration"):
+        module._load_initial_actor(
+            artifact, actor, ENTITY_ATTENTION, incompatible, torch.device("cuda")
+        )
+
+
+@pytest.mark.parametrize("historical_config", [False, True])
+def test_frozen_entity_opponents_allow_inverted_critic_without_mutating_snapshots(
+    config, native_batch, tmp_path, historical_config
+):
+    _, inputs, _, _ = native_batch
+    actor = EntityActor(config).cuda().eval()
+    snapshot = save_actor_snapshot(tmp_path, actor, 0)
+    if historical_config:
+        payload = torch.load(snapshot.path, map_location="cpu", weights_only=True)
+        del payload["model_config"]["critic_inverted_attention"]
+        torch.save(payload, snapshot.path)
+    digest = snapshot_sha256(snapshot.path)
+    inverted = replace(config, critic_inverted_attention=True)
+    loaded = load_actor_snapshot(
+        snapshot.path, expected_model_config=inverted, device="cuda"
+    )
+    pooled = FrozenActorPool(inverted, "cuda").acquire([snapshot.path])[0]
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = _compiled(actor)(inputs)
+        for opponent in (loaded, pooled):
+            actual = _compiled(opponent)(inputs)
+            for left, right in zip(expected, actual, strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert snapshot_sha256(snapshot.path) == digest
+    incompatible = replace(inverted, attention_kv_heads=1)
+    with pytest.raises(ValueError, match="model configuration"):
+        load_actor_snapshot(
+            snapshot.path, expected_model_config=incompatible, device="cuda"
+        )
+
+
+def test_inverted_critic_recovery_binds_full_configuration(config, tmp_path):
+    inverted = replace(config, critic_inverted_attention=True)
+    actor = EntityActor(inverted).cuda()
+    critic = EntityCritic(inverted).cuda()
+    ppo = PpoConfig()
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo)
+    agent = TrainingAgent(actor, critic, actor_optimizer, critic_optimizer)
+    path = tmp_path / "inverted-recovery.pt"
+    save_checkpoint(
+        path,
+        agents=[agent],
+        model_config=inverted,
+        ppo_config=ppo,
+        iteration=1,
+        next_seed=2,
+        metrics={},
+        source_identity=source_identity(),
+    )
+    payload = load_checkpoint(path, [agent], device=torch.device("cuda"))
+    assert payload["model_config"]["critic_inverted_attention"] is True
+    ordinary_actor = EntityActor(config).cuda()
+    ordinary_critic = EntityCritic(config).cuda()
+    before = {name: value.clone() for name, value in ordinary_actor.state_dict().items()}
+    with pytest.raises(ValueError, match="checkpoint model configuration"):
+        load_checkpoint(
+            path, [TrainingAgent(ordinary_actor, ordinary_critic)], device=torch.device("cuda")
+        )
+    for name, value in ordinary_actor.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
 
 def test_critic_checkpoint_roundtrip_rejects_old_pool_and_partial_readout(
@@ -546,6 +709,34 @@ def test_critic_checkpoint_roundtrip_rejects_old_pool_and_partial_readout(
     del partial_state["pool_attention.key_value.weight"]
     with pytest.raises(RuntimeError, match="Missing key"):
         restored.load_state_dict(partial_state, strict=True)
+
+
+def test_native_population_policy_is_invariant_to_critic_configuration(config, native_rollout):
+    actor, _ = native_rollout
+    matched = EntityActor(actor.config).cuda().eval()
+    historical = EntityActor(config).cuda().eval()
+    for member in (matched, historical):
+        member.load_state_dict(actor.state_dict())
+    arguments = {
+        "games": 2,
+        "seed_start": 20260918,
+        "sampling_seed": 20260919,
+        "episode_steps": 720,
+        "reward_mode": "terminal-outcome",
+        "forward_mode": "inductor_graph",
+        "forward_autocast": True,
+    }
+    expected = collect_population_play_rust([actor, matched], **arguments)
+    actual = collect_population_play_rust([actor, historical], **arguments)
+    for name in (
+        "unit_actions",
+        "market_kinds",
+        "market_quantities",
+        "rewards",
+        "valid",
+        "final_money",
+    ):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
 
 
 @pytest.mark.parametrize("compile_mode", ["default", "reduce-overhead"])

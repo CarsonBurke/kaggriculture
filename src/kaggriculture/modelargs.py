@@ -1,10 +1,10 @@
 """Architecture-aware model-configuration command line surface.
 
 Every entry point that constructs a model — PPO training, behavior cloning,
-the iteration benchmark — exposes the same structural hyperparameters, and
-they must agree exactly: warm-starting a run from a cloned actor compares
-``model_config`` dictionaries for equality, so a flag whose default silently
-differs between two scripts makes the artifact unusable.
+the iteration benchmark — exposes the same structural hyperparameters.
+Warm-starting from a cloned actor compares actor-affecting configuration;
+recovery checkpoints compare the complete model configuration, including
+critic-only fields.
 
 The flags therefore default to ``None`` and the dataclass defaults are the
 single source of truth: an entry point that receives no model flag builds
@@ -28,6 +28,28 @@ from typing import Any, get_args, get_origin, get_type_hints
 from kaggriculture.registry import ARCHITECTURES, Architecture
 
 CALIBRATED_MODEL_FIELDS = frozenset(("value_atoms", "value_min", "value_max"))
+CRITIC_ONLY_MODEL_FIELDS = frozenset(
+    (
+        "scalar_value",
+        "value_sigma_ratio",
+        *CALIBRATED_MODEL_FIELDS,
+        "critic_core_layers",
+        "critic_latents",
+        "critic_state_read",
+        "per_entity_critic",
+        "critic_inverted_attention",
+    )
+)
+
+
+def actor_model_config(config: Any) -> dict[str, Any]:
+    """Identity for actor-only loading, never training checkpoint recovery."""
+    values = config if isinstance(config, dict) else config.to_dict()
+    return {
+        name: value
+        for name, value in values.items()
+        if name not in CRITIC_ONLY_MODEL_FIELDS
+    }
 
 
 def _flag(field_name: str) -> str:

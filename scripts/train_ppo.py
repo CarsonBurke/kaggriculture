@@ -56,7 +56,7 @@ from kaggriculture.league import (
 )
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
-    CALIBRATED_MODEL_FIELDS,
+    actor_model_config,
     add_model_config_arguments,
     model_config_from_args,
 )
@@ -915,8 +915,8 @@ def _load_initial_actor(
 ) -> dict[str, object]:
     """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
 
-    The artifact must carry the same actor configuration; critic-only structured
-    fields may differ. The critic and both optimizers deliberately start fresh —
+    The artifact must carry the same actor configuration; critic-only fields
+    may differ. The critic and both optimizers deliberately start fresh —
     a clone brings no value function — and the pre-loop league snapshot seeds
     the archive with the pretrained policy automatically, so the learner must keep
     beating its own starting point.
@@ -925,22 +925,10 @@ def _load_initial_actor(
     artifact_architecture = resolve_architecture(payload)
     if artifact_architecture.name != architecture_name:
         raise ValueError("initial actor artifact architecture does not match arguments")
-    artifact_config = artifact_architecture.build_config(payload["model_config"]).to_dict()
-    expected_config = model_config.to_dict()
-    # A BC clone carries no critic. Readout kind, value buckets, and Gaussian
-    # smoothing may change without changing the actor's architecture or policy.
-    for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
-        artifact_config.pop(name)
-        expected_config.pop(name)
-    if isinstance(model_config, StructuredConfig):
-        for name in (
-            "critic_core_layers",
-            "critic_latents",
-            "critic_state_read",
-            "per_entity_critic",
-        ):
-            artifact_config.pop(name)
-            expected_config.pop(name)
+    artifact_config = actor_model_config(
+        artifact_architecture.build_config(payload["model_config"])
+    )
+    expected_config = actor_model_config(model_config)
     if artifact_config != expected_config:
         raise ValueError("initial actor artifact model configuration does not match arguments")
     actor.load_state_dict(pretrained.state_dict())

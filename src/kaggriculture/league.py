@@ -19,6 +19,7 @@ import torch
 
 from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
+from kaggriculture.modelargs import actor_model_config
 from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.registry import (
     Architecture,
@@ -131,9 +132,12 @@ def _load_payload(path: Path) -> dict[str, Any]:
     except ValueError as error:
         raise ValueError(f"league snapshot has an unknown architecture: {path}") from error
     expected_config = architecture.config_class().to_dict()
-    if set(payload["model_config"]) != set(expected_config) or any(
-        type(payload["model_config"][name]) is not type(default)
-        for name, default in expected_config.items()
+    # Historical entity snapshots predate this actor-inert critic ablation.
+    # Every other field remains required, and the immutable payload is untouched.
+    required_config = expected_config.keys() - {"critic_inverted_attention"}
+    if not required_config <= payload["model_config"].keys() <= expected_config.keys() or any(
+        type(value) is not type(expected_config[name])
+        for name, value in payload["model_config"].items()
     ):
         raise ValueError(f"league snapshot has invalid model configuration schema: {path}")
     if not all(
@@ -240,7 +244,7 @@ def _validated_snapshot_payload(
         ):
             raise ValueError(f"league snapshot architecture mismatch: {path}")
         expected = _model_config_dict(expected_model_config)
-        if payload["model_config"] != expected:
+        if actor_model_config(payload["model_config"]) != actor_model_config(expected):
             raise ValueError(f"league snapshot model configuration mismatch: {path}")
     try:
         config = architecture.build_config(payload["model_config"])

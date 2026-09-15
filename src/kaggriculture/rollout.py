@@ -38,6 +38,7 @@ from kaggriculture.encoding import (
 )
 from kaggriculture.entity import EntityActor
 from kaggriculture.model import ActorOutput, FarmActor, policy_compile_options
+from kaggriculture.modelargs import actor_model_config
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
 from kaggriculture.orientation import (
     orient_boards,
@@ -1910,8 +1911,9 @@ def _collect_mixed_play_rust_wave(
     device = next(actor.parameters()).device
     if any(next(opponent.parameters()).device != device for opponent in opponents):
         raise ValueError("current and all frozen models must use the same device")
+    actor_config = actor_model_config(actor.config)
     if any(
-        type(opponent) is not type(actor) or opponent.config != actor.config
+        type(opponent) is not type(actor) or actor_model_config(opponent.config) != actor_config
         for opponent in opponents
     ):
         raise ValueError("current and frozen actors must use the same model configuration")
@@ -2591,8 +2593,9 @@ def collect_population_play_rust(
     device = next(actors[0].parameters()).device
     if any(next(member.parameters()).device != device for member in actors):
         raise ValueError("every population member must use the same device")
+    actor_config = actor_model_config(actors[0].config)
     if any(
-        type(member) is not type(actors[0]) or member.config != actors[0].config
+        type(member) is not type(actors[0]) or actor_model_config(member.config) != actor_config
         for member in actors
     ):
         raise ValueError("every population member must use the same model configuration")

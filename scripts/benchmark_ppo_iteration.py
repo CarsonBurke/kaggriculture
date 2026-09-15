@@ -27,7 +27,7 @@ from kaggriculture.entity import EntityConfig
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
-    CALIBRATED_MODEL_FIELDS,
+    actor_model_config,
     add_model_config_arguments,
     model_config_from_args,
 )
@@ -638,17 +638,12 @@ def main() -> None:
         actor = architecture.actor_class(model_config).to(device)
         if args.init_actor_from is not None:
             pretrained, _ = load_actor_artifact(args.init_actor_from, device=device)
-            artifact_config = pretrained.config.to_dict()
-            expected_config = model_config.to_dict()
-            # A pretrained actor does not constrain its fresh critic's readout.
-            for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
-                artifact_config.pop(name)
-                expected_config.pop(name)
-            if isinstance(model_config, StructuredConfig):
-                for name in ("critic_core_layers", "critic_latents", "critic_state_read"):
-                    artifact_config.pop(name)
-                    expected_config.pop(name)
-            if artifact_config != expected_config:
+            artifact_config = actor_model_config(pretrained.config)
+            expected_config = actor_model_config(model_config)
+            if (
+                not isinstance(pretrained, architecture.actor_class)
+                or artifact_config != expected_config
+            ):
                 raise ValueError("initial actor model configuration does not match benchmark")
             actor.load_state_dict(pretrained.state_dict())
             del pretrained

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+from dataclasses import replace
+
 import pytest
 import torch
 from kaggle_environments import make
@@ -11,6 +14,12 @@ from kaggriculture.inference import (
     load_actor_artifact,
 )
 from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.modelargs import (
+    actor_model_config,
+    add_model_config_arguments,
+    model_config_arguments,
+    model_config_from_args,
+)
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
     ARCHITECTURES,
@@ -119,3 +128,33 @@ def test_structured_artifacts_reject_stale_observation_schema(
         config["observation_schema_version"] = version
     with pytest.raises(ValueError, match="stale structured observation schema"):
         getattr(family, builder)(config)
+
+
+def test_inverted_critic_cli_is_entity_only_and_roundtrips() -> None:
+    parser = argparse.ArgumentParser()
+    add_model_config_arguments(parser)
+    args = parser.parse_args(["--critic-inverted-attention", "true"])
+    family = resolve_architecture("entity-attention")
+    config = model_config_from_args(family, args)
+    assert config == replace(EntityConfig(), critic_inverted_attention=True)
+    explicit = parser.parse_args(model_config_arguments(family, config.to_dict()))
+    assert model_config_from_args(family, explicit) == config
+    for architecture in ("structured", "entity-cnn"):
+        with pytest.raises(ValueError, match="do not apply"):
+            model_config_from_args(resolve_architecture(architecture), args)
+
+
+def test_historical_entity_actor_identity_excludes_only_critic_fields() -> None:
+    family = resolve_architecture("entity-attention")
+    historical = EntityConfig().to_dict()
+    del historical["critic_inverted_attention"]
+    decoded = family.build_config(historical)
+    assert decoded == EntityConfig()
+    inverted = replace(decoded, critic_inverted_attention=True)
+    assert actor_model_config(decoded) == actor_model_config(inverted)
+    # Shared trunk and initialization settings still bind even with identical
+    # parameter shapes; they cannot be excused as fresh critic configuration.
+    for name in ("zero_init_branches", "global_modulation"):
+        changed = replace(inverted, **{name: not getattr(inverted, name)})
+        assert actor_model_config(decoded) != actor_model_config(changed)
+    assert decoded.to_dict() != inverted.to_dict()
