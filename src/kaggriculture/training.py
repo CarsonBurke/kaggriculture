@@ -19,6 +19,7 @@ import torch
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import QUANTITY_BINS
+from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.orientation import Orientation
@@ -34,9 +35,9 @@ from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
-AnyActor = FarmActor | StructuredActor
-AnyCritic = DistributionalCritic | StructuredCritic
-AnyModelConfig = ModelConfig | StructuredConfig
+AnyActor = FarmActor | StructuredActor | EntityActor
+AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic
+AnyModelConfig = ModelConfig | StructuredConfig | EntityConfig
 
 #: The base states every member owns. Structured learners may additionally own
 #: independent actor- and critic-side training-only predictors and optimizers.

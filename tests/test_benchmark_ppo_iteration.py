@@ -41,7 +41,7 @@ def test_completion_record_covers_the_exact_cartesian_product() -> None:
     }
 
 
-def test_unflagged_benchmark_builds_the_exact_structured_production_model(monkeypatch) -> None:
+def test_unflagged_benchmark_builds_the_exact_production_model(monkeypatch) -> None:
     """A calibration report is launch evidence only for the shipped architecture
     and exact production model configuration."""
     from kaggriculture.modelargs import model_config_from_args
@@ -50,8 +50,7 @@ def test_unflagged_benchmark_builds_the_exact_structured_production_model(monkey
         PRODUCTION_SELF_PLAY_GAMES,
         production_model_config,
     )
-    from kaggriculture.registry import STRUCTURED, resolve_architecture
-    from kaggriculture.structured import StructuredConfig
+    from kaggriculture.registry import resolve_architecture
 
     module = _script()
     monkeypatch.setattr(sys, "argv", ["benchmark_ppo_iteration.py"])
@@ -61,15 +60,10 @@ def test_unflagged_benchmark_builds_the_exact_structured_production_model(monkey
 
     assert not args.deterministic_training
     assert args.games == str(PRODUCTION_SELF_PLAY_GAMES)
-    assert args.architecture == STRUCTURED == PRODUCTION_ARCHITECTURE
-    assert config == StructuredConfig(**production_model_config())
-    assert config.model_dim == 80
-    assert config.ffn_multiplier == 2
-    assert config.global_refresh_layers == ()
-    assert config.fuse_market_decoder is True
-    assert config.fuse_unit_decoder is False
-    assert config.fused_mlp is False
-    assert config.global_modulation is True
+    assert args.architecture == PRODUCTION_ARCHITECTURE
+    assert config == resolve_architecture(PRODUCTION_ARCHITECTURE).build_config(
+        production_model_config()
+    )
 
 
 def test_benchmark_can_measure_the_deterministic_training_contract(monkeypatch) -> None:

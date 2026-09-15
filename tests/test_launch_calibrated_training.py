@@ -24,7 +24,6 @@ from kaggriculture.production import (
     production_ppo_config,
     resolve_resume_checkpoint,
 )
-from kaggriculture.registry import STRUCTURED
 
 
 def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
@@ -116,7 +115,6 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     load-bearing: it must parse, validate, and build the production model."""
     from kaggriculture.modelargs import model_config_from_args
     from kaggriculture.registry import resolve_architecture
-    from kaggriculture.structured import StructuredConfig
 
     training = _script("train_ppo.py")
     actor = tmp_path / "bc-actor.pt"
@@ -138,10 +136,10 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
     training._validate_args(args)
 
     assert args.reward_mode == "terminal-outcome"
-    assert args.architecture == STRUCTURED == PRODUCTION_ARCHITECTURE
+    assert args.architecture == PRODUCTION_ARCHITECTURE
     assert model_config_from_args(
         resolve_architecture(args.architecture), args
-    ) == StructuredConfig(**production_model_config())
+    ) == resolve_architecture(PRODUCTION_ARCHITECTURE).build_config(production_model_config())
     # The collection backend and precision move the sampled behavior policy the
     # parity gate bounds, and the update mode moves the graphs that consume it,
     # so the command must state all three rather than inherit a default. Each
@@ -371,7 +369,7 @@ def _records(
         # compares all of them across the chain, so a key this fixture omits is
         # a key nothing in this file exercises. The test at the end of this
         # module is what keeps the two in step.
-        "architecture": STRUCTURED,
+        "architecture": PRODUCTION_ARCHITECTURE,
         "rollout_forward_mode": rollout_forward_mode,
         "auxiliary_mode": "enabled",
         "initial_actor_sha256": None,
@@ -1224,7 +1222,7 @@ def test_main_persists_hashes_full_evidence_and_explicit_training_config(
         module.main()
 
     decision = json.loads((run_directory / "calibration-decision.json").read_text())
-    assert decision["architecture"] == "structured"
+    assert decision["architecture"] == PRODUCTION_ARCHITECTURE
     assert decision["model"] == production_model_config()
     # Every node of the chain is retained byte for byte and hashed, not just
     # the two ends: the decision cannot be re-derived from the outer pair.
@@ -1289,7 +1287,7 @@ def test_direct_launch_compiles_without_calibration_evidence(
 
     launch = json.loads((run_directory / "launch.json").read_text())
     assert launch["event"] == "direct_launch"
-    assert launch["architecture"] == "structured"
+    assert launch["architecture"] == PRODUCTION_ARCHITECTURE
     assert launch["model"] == production_model_config()
     # The direct launcher carries no bound calibration decision, so it takes the
     # independently recorded standing mode and precision for each phase.
@@ -1432,13 +1430,13 @@ def test_direct_fresh_launch_defaults_to_ten_critic_warmup_iterations(
 
     launch = json.loads((run_directory / "launch.json").read_text())
     command = launch["training_command"]
-    assert launch["architecture"] == "structured"
+    assert launch["architecture"] == PRODUCTION_ARCHITECTURE
     assert launch["model"] == production_model_config()
     assert launch["initial_actor"] == str(actor)
     assert launch["critic_warmup_iterations"] == 10
     assert command[command.index("--init-actor-from") + 1] == str(actor)
     assert command[command.index("--critic-warmup-iterations") + 1] == "10"
-    assert command[command.index("--architecture") + 1] == "structured"
+    assert command[command.index("--architecture") + 1] == PRODUCTION_ARCHITECTURE
 
 
 def test_calibrated_fresh_launch_requires_a_bc_actor(

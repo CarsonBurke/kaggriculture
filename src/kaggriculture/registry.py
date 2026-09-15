@@ -14,12 +14,14 @@ from typing import Any
 
 from torch import nn
 
+from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
 
 CONV_ENTITY = "entity-cnn"
 STRUCTURED = "structured"
+ENTITY_ATTENTION = "entity-attention"
 DEFAULT_ARCHITECTURE = CONV_ENTITY
 
 
@@ -31,6 +33,8 @@ class Architecture:
     config_class: type
     actor_class: type
     critic_class: type
+    structured_inputs: bool = False
+    full_belief: bool = False
 
     def build_actor(self, model_config: dict[str, Any]) -> nn.Module:
         return self.actor_class(self.build_config(model_config))
@@ -40,7 +44,7 @@ class Architecture:
 
     def build_config(self, model_config: dict[str, Any]) -> Any:
         """Decode a saved model configuration, rejecting stale observation schemas."""
-        if self.name == STRUCTURED and (
+        if self.structured_inputs and (
             model_config.get("observation_schema_version") != OBSERVATION_SCHEMA_VERSION
         ):
             raise ValueError(
@@ -61,6 +65,15 @@ ARCHITECTURES: dict[str, Architecture] = {
         config_class=StructuredConfig,
         actor_class=StructuredActor,
         critic_class=StructuredCritic,
+        structured_inputs=True,
+        full_belief=True,
+    ),
+    ENTITY_ATTENTION: Architecture(
+        name=ENTITY_ATTENTION,
+        config_class=EntityConfig,
+        actor_class=EntityActor,
+        critic_class=EntityCritic,
+        structured_inputs=True,
     ),
 }
 

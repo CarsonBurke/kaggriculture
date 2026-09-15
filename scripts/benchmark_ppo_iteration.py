@@ -13,6 +13,7 @@ import resource
 import statistics
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -22,6 +23,7 @@ import torch._dynamo
 
 from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import DEFAULT_REWARD_MODE
+from kaggriculture.entity import EntityConfig
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
@@ -178,6 +180,16 @@ def parse_args() -> argparse.Namespace:
         # 500-iteration run.
         help="full rollout+update iterations per size; first is cold, later repeats are steady",
     )
+    parser.add_argument(
+        "--profile-repeat",
+        type=int,
+        help="zero-based warm iteration to profile in full; requires --trace-path",
+    )
+    parser.add_argument(
+        "--trace-path",
+        type=Path,
+        help="Chrome CPU/CUDA trace for --profile-repeat (single --games size only)",
+    )
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument(
         "--init-actor-from",
@@ -196,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         "--architecture",
         choices=sorted(ARCHITECTURES),
         default=PRODUCTION_ARCHITECTURE,
-        help="actor/critic family; structured defaults to the exact production "
+        help="actor/critic family; the production family receives the exact production "
         "configuration, while other families retain their dataclass defaults",
     )
     add_model_config_arguments(parser)
@@ -483,6 +495,20 @@ def main() -> None:
         raise ValueError("on-policy PPO benchmarking requires --temperature 1.0")
     _validate_numerics_gates(args)
     device = torch.device(args.device)
+    if (args.profile_repeat is None) != (args.trace_path is None):
+        raise ValueError("--profile-repeat and --trace-path must be supplied together")
+    if args.profile_repeat is not None:
+        if device.type != "cuda":
+            raise ValueError("production iteration profiling requires CUDA")
+        if not 1 <= args.profile_repeat < args.repeats:
+            raise ValueError("--profile-repeat must be at least one and less than --repeats")
+        if args.repeats - 2 < 2:
+            raise ValueError("profiling requires at least two unprofiled steady iterations")
+        if len(game_counts) != 1:
+            raise ValueError("profiling requires one --games batch size for one complete trace")
+        args.trace_path = args.trace_path.expanduser().resolve()
+        if args.output is not None and args.trace_path == args.output.expanduser().resolve():
+            raise ValueError("--trace-path must differ from the JSONL --output path")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     if args.deterministic_training:
@@ -498,13 +524,13 @@ def main() -> None:
         torch.backends.cudnn.benchmark = not args.deterministic_training
 
     architecture = resolve_architecture(args.architecture)
-    model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
+    model_config: ModelConfig | StructuredConfig | EntityConfig = model_config_from_args(
+        architecture, args
+    )
     # The shipped structured case must inherit every production PPO field,
     # including both NextLat objectives. Other architecture sweeps cannot admit
     # typed structured predictors and retain their ordinary PPO schedule.
-    ppo_schedule = (
-        _PRODUCTION_PPO if isinstance(model_config, StructuredConfig) else asdict(PpoConfig())
-    )
+    ppo_schedule = _PRODUCTION_PPO if architecture.structured_inputs else asdict(PpoConfig())
     ppo_config = PpoConfig(
         **{
             **ppo_schedule,
@@ -553,6 +579,14 @@ def main() -> None:
             "episode_steps": PRODUCTION_EPISODE_STEPS,
             "physical_games_per_iteration": [games + args.league_games for games in game_counts],
             "repeats": args.repeats,
+            "profile": {
+                "repeat": args.profile_repeat,
+                "trace_path": None if args.trace_path is None else str(args.trace_path),
+                "activities": [] if args.profile_repeat is None else ["CPU", "CUDA"],
+                "record_shapes": args.profile_repeat is not None,
+                "profile_memory": args.profile_repeat is not None,
+                "excluded_from_steady_summary": args.profile_repeat is not None,
+            },
             "seed": args.seed,
             "initial_actor_sha256": initial_actor_digest,
             "auxiliary_mode": args.auxiliary_mode,
@@ -623,14 +657,12 @@ def main() -> None:
         # the optional actor predictor is enabled.
         structured_critic_dynamics = (
             StructuredCriticDynamics(model_config).to(device)
-            if isinstance(model_config, StructuredConfig)
-            and ppo_config.structured_critic_auxiliary_active
+            if architecture.structured_inputs and ppo_config.structured_critic_auxiliary_active
             else None
         )
         structured_dynamics = (
             ActorDynamics(model_config).to(device)
-            if isinstance(model_config, StructuredConfig)
-            and ppo_config.structured_actor_auxiliary_active
+            if architecture.structured_inputs and ppo_config.structured_actor_auxiliary_active
             else None
         )
         frozen_opponent_state = {
@@ -670,146 +702,191 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             _synchronize(device)
-            setup_started = time.perf_counter()
-
-            opponents = []
-            assignments = None
-            if args.league_games:
-                # Production reconstructs selected frozen actors from archive
-                # snapshots on every iteration. Keep that object lifecycle in
-                # the benchmark: compiled current actor/critic graphs persist,
-                # while frozen-policy wrappers are fresh each repeat.
-                opponents = [
-                    architecture.actor_class(model_config).to(device)
-                    for _ in range(args.league_opponents)
-                ]
-                for opponent in opponents:
-                    opponent.load_state_dict(frozen_opponent_state)
-                    opponent.requires_grad_(False)
-                assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
-                generator.shuffle(assignments)
-                # No per-lane temperature or determinism arrays: they existed to
-                # reproduce production's split between stochastic active lanes
-                # and argmax historical ones, and production is now uniform at
-                # the learner's temperature. Keeping them would benchmark a wave
-                # production no longer runs.
-            # Opponent reconstruction is a real per-iteration cost and belongs
-            # in the iteration total, but it is compile-invariant: the same
-            # module construction and state-dict load happens whichever way the
-            # knobs are set. Leaving it inside the rollout span made the
-            # measured rollout ratio (c + r_eager) / (c + r_compiled), which is
-            # biased toward 1.0 in both directions -- it shrinks a loss and a
-            # win alike. That was harmless while the blended total decided one
-            # knob; now that the rollout median decides its own knob against a
-            # 1.05 gate, a constant added to both sides is a thumb on the
-            # scale. Timed separately so the phase the knob turns on contains
-            # only what the knob changes.
-            _synchronize(device)
-            opponent_setup_seconds = time.perf_counter() - setup_started
-
-            wave_seed_start = seed_cursor
-            rollout_started = time.perf_counter()
-            rollout = collect_mixed_play_rust(
-                actor,
-                opponents,
-                self_play_games=self_play_games,
-                league_games=args.league_games,
-                opponent_indices=assignments,
-                seed_start=wave_seed_start,
-                episode_steps=PRODUCTION_EPISODE_STEPS,
-                temperature=args.temperature,
-                reward_mode=args.reward_mode,
-                opponent_temperature=args.temperature,
-                sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-                # The frozen league ensemble follows the learner. Since the
-                # mode became authoritative, `compile_models` decides only
-                # whether that stacked forward compiles, and the configuration
-                # measurement selected compiled both -- a compiled learner
-                # beside an eager ensemble is a mix nothing trains in.
-                forward_mode=args.rollout_forward_mode,
-                forward_autocast=args.rollout_bfloat16,
-                storage=arena,
-            )
-            seed_cursor += physical_games
-            _synchronize(device)
-            rollout_seconds = time.perf_counter() - rollout_started
-            del opponents
-
-            # Compare the actual sampler likelihoods against update replay before
-            # weights change. PPO keeps the stored sampler as its denominator;
-            # this separate audit measures numerical execution-path divergence.
-            parity_started = time.perf_counter()
-            parity = update_replay_parity(
-                actor,
-                rollout,
-                minibatch_size=ppo_config.minibatch_size,
-                compile_mode=ppo_config.update_compile_mode,
-                autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
-            )
-            _synchronize(device)
-            parity_seconds = time.perf_counter() - parity_started
-            for component in ("unit", "kind", "quantity"):
-                if parity[f"update_replay_{component}_active_count"] < 1:
-                    raise RuntimeError(f"update replay parity saw no active {component} components")
-            if parity["update_replay_max_kl"] > args.max_update_replay_kl:
-                raise RuntimeError(
-                    "sampling-vs-update policy divergence exceeded "
-                    f"{args.max_update_replay_kl}: {parity['update_replay_max_kl']}"
+            profiled = repeat == args.profile_repeat
+            # Only the selected full wave installs Kineto or record-function
+            # ranges. Normal timing runs never invoke profiler instrumentation.
+            with (
+                torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
                 )
-            if parity["update_replay_max_tail_fraction"] > args.max_update_replay_tail_fraction:
-                raise RuntimeError(
-                    "sampling-vs-update materially divergent component share exceeded "
-                    f"{args.max_update_replay_tail_fraction}: "
-                    f"{parity['update_replay_max_tail_fraction']}"
-                )
-            _verify_first_step_critic_state(rollout, self_play_games, wave_seed_start)
+                if profiled
+                else nullcontext()
+            ) as profiler:
+                with (
+                    torch.profiler.record_function("opponent_setup") if profiled else nullcontext()
+                ):
+                    setup_started = time.perf_counter()
 
-            update_started = time.perf_counter()
-            update_metrics = update_ppo(
-                actor,
-                critic,
-                actor_optimizer,
-                critic_optimizer,
-                rollout,
-                ppo_config,
-                generator=generator,
-                structured_dynamics=structured_dynamics,
-                structured_dynamics_optimizer=structured_dynamics_optimizer,
-                structured_actor_auxiliary=(
-                    structured_dynamics is not None and args.auxiliary_mode == "enabled"
-                ),
-                structured_critic_dynamics=structured_critic_dynamics,
-                structured_critic_dynamics_optimizer=structured_critic_dynamics_optimizer,
-                structured_critic_auxiliary=(
-                    structured_critic_dynamics is not None and args.auxiliary_mode == "enabled"
-                ),
-                auxiliary_generator=auxiliary_generator,
-                diagnostic_groups={
-                    "self_play": np.arange(rollout.trajectories) < self_play_games * 2,
-                    "league": np.arange(rollout.trajectories) >= self_play_games * 2,
-                },
-                diagnostic_gradients=repeat == 1,
-            )
-            _synchronize(device)
-            update_seconds = time.perf_counter() - update_started
-            # Gate the first-minibatch KL before the actor-update count: an
-            # inflated KL at unchanged weights trips the trust region on
-            # minibatch zero, so checking update counts first would report the
-            # symptom instead of the cause.
-            first_minibatch_kl = float(update_metrics["first_minibatch_component_kl"])
-            if first_minibatch_kl > args.max_first_minibatch_kl:
-                raise RuntimeError(
-                    "first-minibatch KL at unchanged weights exceeded "
-                    f"{args.max_first_minibatch_kl}: {first_minibatch_kl}"
-                )
-            saturated_fraction = float(update_metrics["value_target_saturated_fraction"])
-            if saturated_fraction > args.max_value_target_saturated_fraction:
-                raise RuntimeError(
-                    "value targets saturated the critic support beyond "
-                    f"{args.max_value_target_saturated_fraction}: {saturated_fraction}"
-                )
-            if int(update_metrics["actor_updates"]) < 1:
-                raise RuntimeError("benchmark iteration completed without an actor update")
+                    opponents = []
+                    assignments = None
+                    if args.league_games:
+                        # Production reconstructs selected frozen actors from archive
+                        # snapshots on every iteration. Keep that object lifecycle in
+                        # the benchmark: compiled current actor/critic graphs persist,
+                        # while frozen-policy wrappers are fresh each repeat.
+                        opponents = [
+                            architecture.actor_class(model_config).to(device)
+                            for _ in range(args.league_opponents)
+                        ]
+                        for opponent in opponents:
+                            opponent.load_state_dict(frozen_opponent_state)
+                            opponent.requires_grad_(False)
+                        assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
+                        generator.shuffle(assignments)
+                        # No per-lane temperature or determinism arrays: they existed to
+                        # reproduce production's split between stochastic active lanes
+                        # and argmax historical ones, and production is now uniform at
+                        # the learner's temperature. Keeping them would benchmark a wave
+                        # production no longer runs.
+                    # Opponent reconstruction is a real per-iteration cost and belongs
+                    # in the iteration total, but it is compile-invariant: the same
+                    # module construction and state-dict load happens whichever way the
+                    # knobs are set. Leaving it inside the rollout span made the
+                    # measured rollout ratio (c + r_eager) / (c + r_compiled), which is
+                    # biased toward 1.0 in both directions -- it shrinks a loss and a
+                    # win alike. That was harmless while the blended total decided one
+                    # knob; now that the rollout median decides its own knob against a
+                    # 1.05 gate, a constant added to both sides is a thumb on the
+                    # scale. Timed separately so the phase the knob turns on contains
+                    # only what the knob changes.
+                    _synchronize(device)
+                    opponent_setup_seconds = time.perf_counter() - setup_started
+
+                wave_seed_start = seed_cursor
+                with (
+                    torch.profiler.record_function("production_rollout")
+                    if profiled
+                    else nullcontext()
+                ):
+                    rollout_started = time.perf_counter()
+                    rollout = collect_mixed_play_rust(
+                        actor,
+                        opponents,
+                        self_play_games=self_play_games,
+                        league_games=args.league_games,
+                        opponent_indices=assignments,
+                        seed_start=wave_seed_start,
+                        episode_steps=PRODUCTION_EPISODE_STEPS,
+                        temperature=args.temperature,
+                        reward_mode=args.reward_mode,
+                        opponent_temperature=args.temperature,
+                        sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
+                        # The frozen league ensemble follows the learner. Since the
+                        # mode became authoritative, `compile_models` decides only
+                        # whether that stacked forward compiles, and the configuration
+                        # measurement selected compiled both -- a compiled learner
+                        # beside an eager ensemble is a mix nothing trains in.
+                        forward_mode=args.rollout_forward_mode,
+                        forward_autocast=args.rollout_bfloat16,
+                        storage=arena,
+                    )
+                    seed_cursor += physical_games
+                    _synchronize(device)
+                    rollout_seconds = time.perf_counter() - rollout_started
+                del opponents
+
+                # Compare the actual sampler likelihoods against update replay before
+                # weights change. PPO keeps the stored sampler as its denominator;
+                # this separate audit measures numerical execution-path divergence.
+                with (
+                    torch.profiler.record_function("update_replay_parity")
+                    if profiled
+                    else nullcontext()
+                ):
+                    parity_started = time.perf_counter()
+                    parity = update_replay_parity(
+                        actor,
+                        rollout,
+                        minibatch_size=ppo_config.minibatch_size,
+                        compile_mode=ppo_config.update_compile_mode,
+                        autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
+                    )
+                    _synchronize(device)
+                    parity_seconds = time.perf_counter() - parity_started
+                    for component in ("unit", "kind", "quantity"):
+                        if parity[f"update_replay_{component}_active_count"] < 1:
+                            raise RuntimeError(
+                                f"update replay parity saw no active {component} components"
+                            )
+                    if parity["update_replay_max_kl"] > args.max_update_replay_kl:
+                        raise RuntimeError(
+                            "sampling-vs-update policy divergence exceeded "
+                            f"{args.max_update_replay_kl}: {parity['update_replay_max_kl']}"
+                        )
+                    if (
+                        parity["update_replay_max_tail_fraction"]
+                        > args.max_update_replay_tail_fraction
+                    ):
+                        raise RuntimeError(
+                            "sampling-vs-update materially divergent component share exceeded "
+                            f"{args.max_update_replay_tail_fraction}: "
+                            f"{parity['update_replay_max_tail_fraction']}"
+                        )
+                    _verify_first_step_critic_state(rollout, self_play_games, wave_seed_start)
+
+                with (
+                    torch.profiler.record_function("production_ppo_update")
+                    if profiled
+                    else nullcontext()
+                ):
+                    update_started = time.perf_counter()
+                    update_metrics = update_ppo(
+                        actor,
+                        critic,
+                        actor_optimizer,
+                        critic_optimizer,
+                        rollout,
+                        ppo_config,
+                        generator=generator,
+                        structured_dynamics=structured_dynamics,
+                        structured_dynamics_optimizer=structured_dynamics_optimizer,
+                        structured_actor_auxiliary=(
+                            structured_dynamics is not None and args.auxiliary_mode == "enabled"
+                        ),
+                        structured_critic_dynamics=structured_critic_dynamics,
+                        structured_critic_dynamics_optimizer=structured_critic_dynamics_optimizer,
+                        structured_critic_auxiliary=(
+                            structured_critic_dynamics is not None
+                            and args.auxiliary_mode == "enabled"
+                        ),
+                        auxiliary_generator=auxiliary_generator,
+                        diagnostic_groups={
+                            "self_play": np.arange(rollout.trajectories) < self_play_games * 2,
+                            "league": np.arange(rollout.trajectories) >= self_play_games * 2,
+                        },
+                        diagnostic_gradients=repeat == 1,
+                    )
+                    _synchronize(device)
+                    update_seconds = time.perf_counter() - update_started
+                    # Gate the first-minibatch KL before the actor-update count: an
+                    # inflated KL at unchanged weights trips the trust region on
+                    # minibatch zero, so checking update counts first would report the
+                    # symptom instead of the cause.
+                    first_minibatch_kl = float(update_metrics["first_minibatch_component_kl"])
+                    if first_minibatch_kl > args.max_first_minibatch_kl:
+                        raise RuntimeError(
+                            "first-minibatch KL at unchanged weights exceeded "
+                            f"{args.max_first_minibatch_kl}: {first_minibatch_kl}"
+                        )
+                    saturated_fraction = float(update_metrics["value_target_saturated_fraction"])
+                    if saturated_fraction > args.max_value_target_saturated_fraction:
+                        raise RuntimeError(
+                            "value targets saturated the critic support beyond "
+                            f"{args.max_value_target_saturated_fraction}: {saturated_fraction}"
+                        )
+                    if int(update_metrics["actor_updates"]) < 1:
+                        raise RuntimeError("benchmark iteration completed without an actor update")
+            if profiled:
+                args.trace_path.parent.mkdir(parents=True, exist_ok=True)
+                profiler.export_chrome_trace(str(args.trace_path))
+            # Release captured events before subsequent steady waves.
+            del profiler
             # The parity gate is benchmark-only instrumentation; production
             # iterations are opponent reconstruction plus rollout plus update,
             # so the calibration decision must be based on exactly that. Setup
@@ -819,7 +896,11 @@ def main() -> None:
             diagnostics = rollout_diagnostics(rollout)
             payload = {
                 "event": "iteration",
-                "phase": "cold_start" if repeat == 0 else "steady_state",
+                "phase": "profiled"
+                if profiled
+                else ("cold_start" if repeat == 0 else "steady_state"),
+                "profiled": profiled,
+                "trace_path": str(args.trace_path) if profiled else None,
                 "repeat": repeat,
                 "self_play_games": self_play_games,
                 "league_games": args.league_games,
@@ -869,13 +950,14 @@ def main() -> None:
             del rollout
             gc.collect()
 
-        steady = repeat_payloads[1:]
+        steady = [item for item in repeat_payloads[1:] if not item["profiled"]]
         emit(
             {
                 "event": "batch_summary",
                 "self_play_games": self_play_games,
                 "league_games": args.league_games,
                 "physical_games": physical_games,
+                "steady_iterations": len(steady),
                 "cold_total_seconds": repeat_payloads[0]["total_seconds"],
                 "cold_iterations_per_hour": repeat_payloads[0]["iterations_per_hour"],
                 "cold_physical_games_per_rollout_second": repeat_payloads[0][

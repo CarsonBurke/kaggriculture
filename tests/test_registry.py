@@ -4,6 +4,7 @@ import pytest
 import torch
 from kaggle_environments import make
 
+from kaggriculture.entity import EntityConfig
 from kaggriculture.inference import (
     ACTOR_ARTIFACT_FORMAT_VERSION,
     CheckpointAgent,
@@ -87,17 +88,34 @@ def test_structured_artifact_loads_and_acts_on_a_real_observation(tmp_path) -> N
 def test_every_registered_family_round_trips_config() -> None:
     for architecture in ARCHITECTURES.values():
         config = architecture.config_class()
-        actor = architecture.build_actor(config.to_dict())
-        assert type(actor) is architecture.actor_class
+        assert architecture.build_config(config.to_dict()) == config
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads",
+    [
+        pytest.param(4, 4, id="mha"),
+        pytest.param(4, 8, id="more-kv-than-query-heads"),
+        pytest.param(4, 3, id="nondivisible-query-groups"),
+        pytest.param(5, 2, id="nondivisible-model-width"),
+    ],
+)
+def test_entity_config_rejects_attention_without_strict_gqa(heads, kv_heads) -> None:
+    with pytest.raises(ValueError):
+        EntityConfig(model_dim=96, attention_heads=heads, attention_kv_heads=kv_heads)
 
 
 @pytest.mark.parametrize("builder", ["build_actor", "build_critic"])
 @pytest.mark.parametrize("version", [None, 1])
-def test_structured_artifacts_reject_stale_observation_schema(builder, version) -> None:
-    config = StructuredConfig().to_dict()
+@pytest.mark.parametrize("architecture", ["structured", "entity-attention"])
+def test_structured_artifacts_reject_stale_observation_schema(
+    builder, version, architecture
+) -> None:
+    family = resolve_architecture(architecture)
+    config = family.config_class().to_dict()
     if version is None:
         del config["observation_schema_version"]
     else:
         config["observation_schema_version"] = version
     with pytest.raises(ValueError, match="stale structured observation schema"):
-        getattr(resolve_architecture("structured"), builder)(config)
+        getattr(family, builder)(config)

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import flex_attention
 from torch.utils.checkpoint import checkpoint
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
@@ -331,11 +332,14 @@ def _fused_attention(
     *,
     enable_gqa: bool,
     scale: float,
+    backend: SDPBackend | None = None,
 ) -> Tensor:
-    """One fused SDPA call, with the head width padded into kernel support.
+    """One fused attention call, with the head width padded into kernel support.
 
     `scale` is stated rather than defaulted: SDPA derives its default from the
     padded width, which is not the width this attention is defined over.
+    An explicit backend changes only the kernel; CUDA GQA still folds query
+    groups without materializing repeated K/V heads.
     """
     head_dim = query.shape[-1]
     remainder = head_dim % _FUSED_ATTENTION_HEAD_MULTIPLE if query.is_cuda else 0
@@ -344,8 +348,8 @@ def _fused_attention(
         query, key, value = (_pad_head_width(t, width) for t in (query, key, value))
     fold_gqa = query.is_cuda and enable_gqa
     if fold_gqa:
-        # The efficient kernel requires equal head counts. Fold each group into
-        # the query sequence instead of materializing repeated K/V heads.
+        # Fold each query-head group into the sequence. Besides supporting equal-
+        # head kernels, this avoids native GQA's expanded dK/dV intermediates.
         batch, heads, query_tokens, width = query.shape
         kv_heads = key.shape[1]
         grouped_tokens = (heads // kv_heads) * query_tokens
@@ -364,19 +368,74 @@ def _fused_attention(
                 batch, heads, query_tokens, key.shape[-2]
             ).reshape(batch, kv_heads, grouped_tokens, key.shape[-2])
         enable_gqa = False
-    # One CUDA backend for every batch and autograd context. cuDNN cannot
-    # handle the unit decoder's batches above 65,535 rows with arbitrary masks.
-    backend = SDPBackend.EFFICIENT_ATTENTION if query.is_cuda else SDPBackend.MATH
-    with sdpa_kernel(backend):
-        attended = nn.functional.scaled_dot_product_attention(
+    if (
+        backend is None
+        and fold_gqa
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and torch.is_grad_enabled()
+        and attention_mask is not None
+        and attention_mask.dtype == torch.bool
+        and attention_mask.ndim == 4
+        and attention_mask.shape[1:3] == (1, 1)
+    ):
+        # Fuse validity into dense scores; constructing sparse block metadata
+        # does not pay for these short sequences. The decoding heuristic is
+        # slower here. No-grad rollout retains SDPA's supported vmap batching.
+        key_valid = attention_mask[:, 0, 0, :]
+
+        def score_mod(score, b, h, q, k):
+            mask_batch = 0 if key_valid.shape[0] == 1 else b
+            return torch.where(key_valid[mask_batch, k], score, -float("inf"))
+
+        attended = flex_attention(
             query,
             key,
             value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
+            score_mod=score_mod,
             scale=scale,
-            enable_gqa=enable_gqa,
+            # The default 128-row backward tiles overpad the folded entity
+            # queries. Keep the measured short/narrow case within 64-row tiles;
+            # other geometries retain the backend's hardware heuristics.
+            kernel_options={
+                "BACKEND": "TRITON",
+                **(
+                    {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "BLOCK_M1": 64,
+                        "BLOCK_N1": 64,
+                        "BLOCK_M2": 64,
+                        "BLOCK_N2": 64,
+                    }
+                    if query.shape[-1] <= 32 and query.shape[-2] <= 64 and key.shape[-2] <= 256
+                    else {}
+                ),
+            },
         )
+    else:
+        # Prefer Flash for dense attention and cuDNN for arbitrary masks. Keep
+        # efficient CUDA for unsupported configurations, never a math fallback.
+        # Explicit benchmark backends remain exclusive and fail loudly.
+        backends: SDPBackend | list[SDPBackend]
+        if backend is not None:
+            backends = backend
+        elif query.is_cuda and query.dtype in (torch.float16, torch.bfloat16):
+            preferred = (
+                SDPBackend.FLASH_ATTENTION if attention_mask is None else SDPBackend.CUDNN_ATTENTION
+            )
+            backends = [preferred, SDPBackend.EFFICIENT_ATTENTION]
+        else:
+            backends = SDPBackend.EFFICIENT_ATTENTION if query.is_cuda else SDPBackend.MATH
+        with sdpa_kernel(backends, set_priority=True):
+            attended = nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
     if fold_gqa:
         attended = attended.reshape(batch, heads, query_tokens, attended.shape[-1])
     return attended[..., :head_dim] if remainder else attended

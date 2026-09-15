@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch._dynamo.utils import dynamo_timed, get_runtime_metrics_context
 
 from kaggriculture.compilewatch import CompileDriftError, CompileWatch
 
@@ -70,3 +71,14 @@ def test_draining_twice_does_not_repeat_events(watch: CompileWatch) -> None:
     assert len(first) == 1
     assert second == ()
     assert second_reasons == ()
+
+
+def test_runtime_cudagraph_recording_is_not_a_late_compile(watch: CompileWatch) -> None:
+    with dynamo_timed("cudagraphify", dynamo_compile_column_us="runtime_cudagraphify_time_us"):
+        pass
+    get_runtime_metrics_context().finish()
+
+    events, reasons = watch.drain()
+
+    watch.check(events, reasons)
+    assert events == ()

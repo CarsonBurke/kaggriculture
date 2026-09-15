@@ -41,6 +41,7 @@ from kaggriculture.constants import (
     market_price,
 )
 from kaggriculture.encoding import EncodedObservation, encode_observation
+from kaggriculture.entity import EntityActor
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.orientation import (
     Orientation,
@@ -49,6 +50,7 @@ from kaggriculture.orientation import (
     orient_unit_features,
     orient_unit_masks,
 )
+from kaggriculture.registry import architecture_of
 from kaggriculture.structured import StructuredActor, stack_structured
 from kaggriculture.tokens import StructuredObservation, encode_structured_observation
 
@@ -123,7 +125,9 @@ class PreparedQuantityHeads:
     bias: np.ndarray
 
 
-def prepare_quantity_heads(actor: FarmActor | StructuredActor) -> PreparedQuantityHeads:
+def prepare_quantity_heads(
+    actor: FarmActor | StructuredActor | EntityActor,
+) -> PreparedQuantityHeads:
     """Materialize quantity parameters once for repeated frozen-policy actions."""
 
     def frozen(parameter: Tensor) -> np.ndarray:
@@ -474,7 +478,7 @@ def _apply_ledger_order(
 
 @torch.inference_mode()
 def act_batch(
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     observations: list[dict[str, Any]],
     opponent_privates: list[dict[str, Any] | None] | None = None,
     *,
@@ -503,7 +507,7 @@ def act_batch(
     if len(opponent_privates) != len(observations):
         raise ValueError("opponent private-state count must match observations")
     device = next(actor.parameters()).device
-    if isinstance(actor, StructuredActor):
+    if architecture_of(actor).structured_inputs:
         if orientation is not Orientation.IDENTITY:
             raise NotImplementedError(
                 "orientations flip board surfaces, so only the convolutional "

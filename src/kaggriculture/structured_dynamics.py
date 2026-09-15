@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -32,6 +32,9 @@ from kaggriculture.structured import (
     StructuredInputs,
 )
 from kaggriculture.tokens import TILE_COUNT
+
+if TYPE_CHECKING:
+    from kaggriculture.entity import EntityConfig
 
 
 class PersistenceDynamics(nn.Module):
@@ -209,7 +212,7 @@ class StructuredDynamics(nn.Module):
 class StructuredCriticDynamics(nn.Module):
     """Predict only the normalized value-head input from itself and own actions."""
 
-    def __init__(self, config: StructuredConfig) -> None:
+    def __init__(self, config: StructuredConfig | EntityConfig) -> None:
         super().__init__()
         predictor_config = replace(config, zero_init_branches=False, global_modulation=False)
         self.action = StructuredActionEncoder(config.model_dim)

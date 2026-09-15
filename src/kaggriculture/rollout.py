@@ -36,6 +36,7 @@ from kaggriculture.encoding import (
     terminal_bank_pair_reward,
     terminal_pair_utility,
 )
+from kaggriculture.entity import EntityActor
 from kaggriculture.model import ActorOutput, FarmActor, policy_compile_options
 from kaggriculture.opponents import BUILTIN_AGENT_ORDER
 from kaggriculture.orientation import (
@@ -47,7 +48,7 @@ from kaggriculture.orientation import (
     seat_orientations,
 )
 from kaggriculture.policy import PolicyStep, act_batch, categorical_statistics
-from kaggriculture.registry import CONV_ENTITY, STRUCTURED, architecture_of
+from kaggriculture.registry import CONV_ENTITY, architecture_of, resolve_architecture
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredInputs
 from kaggriculture.tokens import (
@@ -173,7 +174,7 @@ def _state_field_specs(architecture: str) -> dict[str, tuple[tuple[int, ...], ty
             "units": ((MAX_UNITS, UNIT_FEATURES), np.float16),
             "unit_positions": ((MAX_UNITS, 2), np.int8),
         }
-    if architecture == STRUCTURED:
+    if resolve_architecture(architecture).structured_inputs:
         gathers = len(UNIT_TILE_GATHERS)
         return {
             "tile_categorical": ((2 * TILE_COUNT, N_TILE_CATEGORICAL), np.int8),
@@ -358,11 +359,11 @@ def _native_rollout_storage(
 
 
 def _quantity_heads(
-    actors: tuple[FarmActor | StructuredActor, ...],
+    actors: tuple[FarmActor | StructuredActor | EntityActor, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Materialize the small selected-kind quantity heads once per rollout."""
 
-    def parameter(actor: FarmActor | StructuredActor, name: str) -> np.ndarray:
+    def parameter(actor: FarmActor | StructuredActor | EntityActor, name: str) -> np.ndarray:
         value = getattr(actor, name)
         if hasattr(value, "weight"):
             value = value.weight
@@ -1209,7 +1210,9 @@ CAPTURED_ROLLOUT_FORWARD_MODES = ("graph", "inductor_graph")
 CAPTURING_ROLLOUT_FORWARD_MODES = ("cudagraphs", "inductor")
 
 
-def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cudagraphs") -> Any:
+def _cached_compiled_forward(
+    model: FarmActor | StructuredActor | EntityActor, mode: str = "cudagraphs"
+) -> Any:
     """Return the cached compiled collection forward for `mode`.
 
     CUDA convolution and GEMM kernels are not bitwise invariant across eager,
@@ -1251,7 +1254,7 @@ def _cached_compiled_forward(model: FarmActor | StructuredActor, mode: str = "cu
 
 
 def _rollout_model_forward(
-    model: FarmActor | StructuredActor,
+    model: FarmActor | StructuredActor | EntityActor,
     *inputs: Any,
     mode: str = "cudagraphs",
 ) -> ActorOutput | torch.Tensor:
@@ -1289,13 +1292,9 @@ class _StackedActorEnsemble:
     snapshot's.
     """
 
-    def __init__(self, models: Sequence[FarmActor | StructuredActor]) -> None:
+    def __init__(self, models: Sequence[FarmActor | StructuredActor | EntityActor]) -> None:
         first = models[0]
-        self.template = (
-            StructuredActor(first.config)
-            if isinstance(first, StructuredActor)
-            else FarmActor(first.config)
-        ).to("meta")
+        self.template = architecture_of(first).actor_class(first.config).to("meta")
         self.template.eval()
         # The stacked tensors outlive any inference-mode region the collector
         # runs under; inference tensors would reject the in-place `load`
@@ -1309,12 +1308,12 @@ class _StackedActorEnsemble:
 
     @staticmethod
     def _stacked(
-        source: str, models: Sequence[FarmActor | StructuredActor]
+        source: str, models: Sequence[FarmActor | StructuredActor | EntityActor]
     ) -> dict[str, torch.Tensor]:
         states = [dict(getattr(model, source)()) for model in models]
         return {name: torch.stack([state[name].detach() for state in states]) for name in states[0]}
 
-    def load(self, models: Sequence[FarmActor | StructuredActor]) -> None:
+    def load(self, models: Sequence[FarmActor | StructuredActor | EntityActor]) -> None:
         for source, stacked_group in (
             ("named_parameters", self.params),
             ("named_buffers", self.buffers),
@@ -1396,7 +1395,7 @@ _STACKED_ENSEMBLES = threading.local()
 
 
 def _stacked_actor_ensemble(
-    models: Sequence[FarmActor | StructuredActor],
+    models: Sequence[FarmActor | StructuredActor | EntityActor],
     namespace: int = 0,
 ) -> _StackedActorEnsemble:
     """Reuse one stacked ensemble per owner, architecture and physical lane count.
@@ -1799,8 +1798,8 @@ def _native_batch(
 
 @torch.inference_mode()
 def _collect_mixed_play_rust_wave(
-    actor: FarmActor | StructuredActor,
-    opponents: Sequence[FarmActor | StructuredActor] = (),
+    actor: FarmActor | StructuredActor | EntityActor,
+    opponents: Sequence[FarmActor | StructuredActor | EntityActor] = (),
     *,
     self_play_games: int = 0,
     league_games: int = 0,
@@ -1928,7 +1927,7 @@ def _collect_mixed_play_rust_wave(
     fields = _native_rollout_storage(storage, architecture, trajectories, horizon)
     floating_dtype = (
         next(actor.trunk.parameters()).dtype
-        if isinstance(actor, StructuredActor)
+        if architecture_of(actor).structured_inputs
         else next(actor.parameters()).dtype
     )
     encoded_wave = _native_wave(architecture, environment, device, floating_dtype)
@@ -2062,7 +2061,7 @@ def _collect_mixed_play_rust_wave(
         # when present, the lane ensemble on every step.
         # Fixed destinations keep those CUDA addresses stable and replace the
         # per-step allocator traffic with index_select writes into owned memory.
-        if architecture == STRUCTURED:
+        if resolve_architecture(architecture).structured_inputs:
             current_gather = _empty_selected_inputs(wave_inputs, (stored_rows.size,))
             if ensemble is not None:
                 lane_gather = _empty_selected_inputs(wave_inputs, (lanes, lane_width))
@@ -2429,8 +2428,8 @@ def _collect_mixed_play_rust_wave(
 
 @torch.inference_mode()
 def collect_mixed_play_rust(
-    actor: FarmActor | StructuredActor,
-    opponents: Sequence[FarmActor | StructuredActor] = (),
+    actor: FarmActor | StructuredActor | EntityActor,
+    opponents: Sequence[FarmActor | StructuredActor | EntityActor] = (),
     *,
     self_play_games: int = 0,
     league_games: int = 0,
@@ -2527,7 +2526,7 @@ def population_pairings(population: int, games: int, *, sampling_seed: int = 0) 
 
 @torch.inference_mode()
 def collect_population_play_rust(
-    actors: Sequence[FarmActor | StructuredActor],
+    actors: Sequence[FarmActor | StructuredActor | EntityActor],
     *,
     games: int,
     seed_start: int,
@@ -2762,7 +2761,7 @@ def collect_population_play_rust(
 
 
 def collect_self_play_rust(
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     *,
     games: int,
     seed_start: int,
@@ -2797,8 +2796,8 @@ def collect_self_play_rust(
 
 
 def collect_frozen_opponents_play_rust(
-    actor: FarmActor | StructuredActor,
-    opponents: Sequence[FarmActor | StructuredActor],
+    actor: FarmActor | StructuredActor | EntityActor,
+    opponents: Sequence[FarmActor | StructuredActor | EntityActor],
     *,
     games: int,
     opponent_indices: Sequence[int] | np.ndarray | None = None,
@@ -2844,8 +2843,8 @@ def collect_frozen_opponents_play_rust(
 
 
 def collect_frozen_opponent_play_rust(
-    actor: FarmActor | StructuredActor,
-    opponent: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
+    opponent: FarmActor | StructuredActor | EntityActor,
     *,
     games: int,
     seed_start: int,
@@ -2881,7 +2880,7 @@ def collect_frozen_opponent_play_rust(
 
 
 def collect_self_play(
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     *,
     games: int,
     seed_start: int,
@@ -3006,8 +3005,8 @@ def collect_self_play(
 
 
 def collect_frozen_opponent_play(
-    actor: FarmActor | StructuredActor,
-    opponent: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
+    opponent: FarmActor | StructuredActor | EntityActor,
     *,
     games: int,
     seed_start: int,

@@ -25,9 +25,10 @@ import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
+from kaggriculture.entity import EntityActor
 from kaggriculture.model import FarmActor
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
-from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, architecture_of, resolve_architecture
 from kaggriculture.rollout import _native_wave
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _instrument(actor: FarmActor | StructuredActor) -> None:
+def _instrument(actor: FarmActor | StructuredActor | EntityActor) -> None:
     """Wrap the forward's top-level sections in profiler scopes."""
 
     def scoped(name: str, module: torch.nn.Module) -> None:
@@ -68,25 +69,30 @@ def _instrument(actor: FarmActor | StructuredActor) -> None:
 
         module.forward = forward
 
-    if isinstance(actor, StructuredActor):
+    family = architecture_of(actor)
+    if family.structured_inputs:
         trunk = actor.trunk
         for name in ("tiles", "units", "economy"):
             scoped(f"tokenizer::{name}", getattr(trunk, name))
         for index, block in enumerate(trunk.farm_local):
             scoped(f"farm_block::{index:02d}", block)
-        scoped("section::opponent_summary", trunk.opponent_summary)
-        scoped("section::latent_read", trunk.latent_read)
+        if family.full_belief:
+            scoped("section::opponent_summary", trunk.opponent_summary)
+            scoped("section::latent_read", trunk.latent_read)
+        else:
+            scoped("section::memory", trunk.memory)
         for index, block in enumerate(trunk.core):
             scoped(f"core_block::{index:02d}", block)
-        for layer, block in actor.trunk.global_refresh.items():
-            scoped(f"refresh_block::{layer}", block)
-        for name in (
-            "unit_decoder",
-            "unit_local_decoder",
-            "market_decoder",
-            "market_economy_decoder",
-        ):
-            scoped(f"decoder::{name}", getattr(actor, name))
+        if family.full_belief:
+            for layer, block in actor.trunk.global_refresh.items():
+                scoped(f"refresh_block::{layer}", block)
+            for name in (
+                "unit_decoder",
+                "unit_local_decoder",
+                "market_decoder",
+                "market_economy_decoder",
+            ):
+                scoped(f"decoder::{name}", getattr(actor, name))
         return
 
     spatial, transformer = actor.spatial, actor.transformer
@@ -103,7 +109,9 @@ def _instrument(actor: FarmActor | StructuredActor) -> None:
         scoped(f"cnn::{name}", getattr(spatial, name))
 
 
-def _profile(actor: FarmActor | StructuredActor, inputs, autocast: bool, args) -> dict:
+def _profile(
+    actor: FarmActor | StructuredActor | EntityActor, inputs, autocast: bool, args
+) -> dict:
     device = torch.device(args.device)
     for _ in range(args.warmup):
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=autocast):

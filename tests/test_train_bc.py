@@ -20,7 +20,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import ModelConfig
 from kaggriculture.optim import NorMuon
-from kaggriculture.registry import CONV_ENTITY, STRUCTURED
+from kaggriculture.registry import CONV_ENTITY, ENTITY_ATTENTION, STRUCTURED
 from kaggriculture.structured import StructuredActor, StructuredConfig
 
 EPISODE_STEPS = 8
@@ -222,7 +222,7 @@ def test_encoded_episode_cache_reuses_provenance_bound_arrays(
     )
     actual_train, actual_holdout, _ = trainer.load_dataset(
         [dataset_dir],
-        architecture=architecture,
+        architecture=ENTITY_ATTENTION if architecture == STRUCTURED else architecture,
         holdout_seeds=1,
         encode_workers=1,
         encoded_cache=cache,
@@ -576,7 +576,7 @@ def test_production_clone_preset_uses_exact_warm_start_model(monkeypatch, tmp_pa
     assert args.epochs == 2
 
 
-def test_production_clone_preset_rejects_model_drift(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_production_clone_preset_rejects_model_drift(monkeypatch, tmp_path: Path) -> None:
     trainer = _load_trainer()
     monkeypatch.setattr(
         sys,
@@ -588,15 +588,13 @@ def test_production_clone_preset_rejects_model_drift(monkeypatch, tmp_path: Path
             "--output",
             str(tmp_path / "run"),
             "--production-model",
-            "--global-refresh-context",
-            "all",
+            "--model-dim",
+            "48",
         ],
     )
 
     with pytest.raises(SystemExit):
         trainer.parse_args()
-
-    assert "--production-model owns the production architecture" in capsys.readouterr().err
 
 
 def test_clone_help_formats_literal_percentages(monkeypatch, capsys) -> None:

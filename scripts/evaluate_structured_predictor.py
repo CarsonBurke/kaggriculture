@@ -19,6 +19,7 @@ from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.ppo import (
     _STRUCTURED_AUXILIARY_METRICS,
+    Actor,
     PpoConfig,
     _fixed_minibatch_positions,
     _stage_tensor,
@@ -27,8 +28,8 @@ from kaggriculture.ppo import (
     _structured_transition_order,
 )
 from kaggriculture.provenance import file_sha256, source_identity
+from kaggriculture.registry import architecture_of
 from kaggriculture.rollout import collect_self_play_rust
-from kaggriculture.structured import StructuredActor
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
 
@@ -80,7 +81,7 @@ def _staged_rollout(rollout: Any, device: torch.device) -> dict[str, Tensor]:
 
 
 def _measure(
-    actor: StructuredActor,
+    actor: Actor,
     dynamics: ActorDynamics,
     staged: dict[str, Tensor],
     windows: np.ndarray,
@@ -162,8 +163,8 @@ def main() -> None:
         device=device,
         agent=None if len(checkpoint_agent_states(payload)) == 1 else agent,
     )
-    if not isinstance(actor_module, StructuredActor):
-        raise ValueError("predictor evaluation requires a structured actor")
+    if not architecture_of(actor_module).structured_inputs:
+        raise ValueError("predictor evaluation requires a structured-input actor")
     actor = actor_module
     config = PpoConfig(**payload["ppo_config"])
     state = checkpoint_agent_states(payload)[agent]

@@ -210,6 +210,8 @@ def actor_artifact_from_checkpoint(
 def _cpu_portable_structured_state(
     model_config: Mapping[str, Any],
     state: Mapping[str, Tensor],
+    *,
+    architecture: str,
 ) -> tuple[dict[str, Any], dict[str, Tensor]]:
     """Convert bias-free fused MLP parameters into ordinary CPU Linear layers.
 
@@ -218,13 +220,12 @@ def _cpu_portable_structured_state(
     policy that can execute in Kaggle rather than treating CUDA evaluation as a
     proxy for it.
     """
+    family = resolve_architecture(architecture)
+    if not family.structured_inputs:
+        raise ValueError("CPU conversion applies only to structured-input actors")
     if not model_config.get("fused_mlp", False):
         raise ValueError("actor does not use fused structured MLPs")
-    fused_payload = {
-        "architecture": "structured",
-        "model_config": dict(model_config),
-    }
-    fused_actor = resolve_architecture(fused_payload).build_actor(dict(model_config))
+    fused_actor = family.build_actor(dict(model_config))
     fused_actor.load_state_dict(state, strict=True)
 
     converted: dict[str, Tensor] = {}
@@ -260,11 +261,7 @@ def _cpu_portable_structured_state(
 
     portable_config = dict(model_config)
     portable_config["fused_mlp"] = False
-    portable_payload = {
-        "architecture": "structured",
-        "model_config": portable_config,
-    }
-    portable_actor = resolve_architecture(portable_payload).build_actor(portable_config)
+    portable_actor = family.build_actor(portable_config)
     portable_actor.load_state_dict(converted, strict=True)
     return portable_config, converted
 
@@ -275,17 +272,16 @@ def cpu_portable_actor(
     agent: int | None = None,
 ) -> nn.Module:
     """Build the CPU policy that a fused structured checkpoint can submit."""
-    if resolve_architecture(dict(checkpoint)).name != "structured":
-        raise ValueError("CPU conversion applies only to structured actors")
+    family = resolve_architecture(dict(checkpoint))
     model_config = checkpoint.get("model_config")
     if not isinstance(model_config, Mapping):
         raise ValueError("actor is missing its model configuration")
     portable_config, portable_state = _cpu_portable_structured_state(
         model_config,
         checkpoint_actor_state(checkpoint, agent),
+        architecture=family.name,
     )
-    payload = {"architecture": "structured", "model_config": portable_config}
-    actor = resolve_architecture(payload).build_actor(portable_config)
+    actor = family.build_actor(portable_config)
     actor.load_state_dict(portable_state, strict=True)
     actor.eval()
     return actor
@@ -301,6 +297,7 @@ def cpu_portable_actor_artifact(
     portable_config, portable_state = _cpu_portable_structured_state(
         artifact["model_config"],
         artifact["actor"],
+        architecture=resolve_architecture(artifact).name,
     )
     return {
         **artifact,

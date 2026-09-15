@@ -33,11 +33,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
-from kaggriculture.ppo import _critic_batch_args, actor_forward_args
-from kaggriculture.production import production_model_config
-from kaggriculture.registry import STRUCTURED
+from kaggriculture.ppo import PpoConfig, _critic_batch_args, actor_forward_args
+from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
+from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import _state_field_specs
-from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 from kaggriculture.tokens import MAX_UNITS
 
 #: Call sites worth separating. Each is a module path prefix inside the trunk;
@@ -52,6 +51,7 @@ _CALL_SITES = (
     "trunk.economy",
     "trunk.latent_read",
     "trunk.core",
+    "trunk.memory",
     "unit_decoder",
     "unit_local_decoder",
     "market_decoder",
@@ -203,7 +203,7 @@ def _states(rows: int) -> dict[str, np.ndarray]:
     """
     states = {
         name: np.zeros((rows, *shape), dtype=dtype)
-        for name, (shape, dtype) in _state_field_specs(STRUCTURED).items()
+        for name, (shape, dtype) in _state_field_specs(PRODUCTION_ARCHITECTURE).items()
     }
     states["unit_active"] = np.ones((rows, MAX_UNITS), dtype=np.bool_)
     return states
@@ -211,7 +211,9 @@ def _states(rows: int) -> dict[str, np.ndarray]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=6400, help="states in one minibatch forward")
+    parser.add_argument(
+        "--rows", type=int, default=PpoConfig.minibatch_size, help="states in one minibatch forward"
+    )
     parser.add_argument("--model", choices=("actor", "critic"), default="actor")
     parser.add_argument("--bandwidth-gbps", type=float, default=1792.0, help="device HBM bandwidth")
     parser.add_argument(
@@ -231,7 +233,8 @@ def main() -> None:
     parser.add_argument("--report", type=argparse.FileType("w"))
     arguments = parser.parse_args()
 
-    config = StructuredConfig(**production_model_config())
+    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
+    config = architecture.build_config(production_model_config())
     dtype = getattr(torch, arguments.dtype)
     # Built at the target dtype rather than converted into it: under
     # `FakeTensorMode` a later `Module.to` cannot swap parameter storage.
@@ -242,18 +245,20 @@ def main() -> None:
         # parameter storage cannot be swapped after the fact.
         with device:
             model = (
-                StructuredActor(config) if arguments.model == "actor" else StructuredCritic(config)
+                architecture.actor_class(config)
+                if arguments.model == "actor"
+                else architecture.critic_class(config)
             )
         model.eval()
         stack: list[str] = []
         _attach_site_hooks(model, stack)
         states = _states(arguments.rows)
-        actor_args = actor_forward_args(STRUCTURED, states, device)
+        actor_args = actor_forward_args(architecture.name, states, device)
         if arguments.model == "actor":
             forward_args: tuple = actor_args
         else:
             forward_args = _critic_batch_args(
-                STRUCTURED,
+                architecture.name,
                 {name: torch.from_numpy(value).to(device=device) for name, value in states.items()},
                 slice(None),
                 actor_args=actor_args,

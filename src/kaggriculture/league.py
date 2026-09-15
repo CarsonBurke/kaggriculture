@@ -17,6 +17,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.opponents import BUILTIN_OPPONENTS
 from kaggriculture.registry import (
@@ -26,9 +27,9 @@ from kaggriculture.registry import (
 )
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 
-AnyActor = FarmActor | StructuredActor
-AnyCritic = DistributionalCritic | StructuredCritic
-AnyModelConfig = ModelConfig | StructuredConfig
+AnyActor = FarmActor | StructuredActor | EntityActor
+AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic
+AnyModelConfig = ModelConfig | StructuredConfig | EntityConfig
 
 LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
 _SNAPSHOT_NAME = re.compile(r"league-actor-(\d{8})\.pt")

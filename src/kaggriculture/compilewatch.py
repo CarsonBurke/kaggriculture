@@ -23,6 +23,10 @@ contract; this module distinguishes the events it records:
 
 Both are only faults once a wave can be held to the contract: the caller
 decides that boundary, and passes only settled waves to `check`.
+
+Torch also stores runtime overhead records (including CUDA graph recording)
+in the same metrics stream. Their `is_runtime` marker distinguishes them from
+compilation; they must not count as new frames or trigger the compile guard.
 """
 
 from __future__ import annotations
@@ -111,6 +115,7 @@ class CompileWatch:
                 seconds=(entry.duration_us or 0) / 1e6,
             )
             for entry in fresh
+            if not entry.is_runtime
         )
         return events, reasons
 

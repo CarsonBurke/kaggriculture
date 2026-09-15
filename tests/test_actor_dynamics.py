@@ -6,7 +6,12 @@ import torch
 from torch import nn
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS, MarketKind
-from kaggriculture.actor_dynamics import ActorDynamics, actor_horizon_loss, actor_window_loss
+from kaggriculture.actor_dynamics import (
+    ActorDynamics,
+    ActorHeadBelief,
+    actor_horizon_loss,
+    actor_window_loss,
+)
 from kaggriculture.constants import BOARD_SIZE, MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.latent_dynamics import DecodeHeads, DecodeMasks, _decision_kl
 from kaggriculture.structured import (
@@ -29,10 +34,10 @@ class _TensorTransition:
         self.scale = torch.tensor(0.2, requires_grad=True)
 
     def __call__(self, belief, unit_actions, *context):
-        return StructuredDecisionBelief(
+        return ActorHeadBelief(
             *(
-                value + self.scale * (value.sin() + unit_actions[:, :1, None].float())
-                for value in belief
+                value + (head + 1) * self.scale * (value.sin() + unit_actions[:, :1, None].float())
+                for head, value in enumerate(belief)
             )
         )
 
@@ -58,6 +63,7 @@ def _tensor_case(episodes, steps):
         "market_quantities": torch.zeros(rows, 1, dtype=torch.long),
         "market_active": torch.ones(rows, MAX_MARKET_ORDERS, dtype=torch.bool),
     }
+    factors["market_quantity_active"] = factors["market_active"].clone()
     return belief, inputs, factors
 
 
@@ -95,17 +101,29 @@ def test_head_dense_compact_window_match_independent_recursive_loss_and_gradient
     eligible_count = 0
     for start in (0, 3):
         for source in range(start, start + 2):
-            predicted = torch.cat(tuple(value[source] for value in belief), dim=0)
+            predicted = (
+                belief.unit_decisions[source],
+                belief.market_decisions[source],
+                belief.market_decisions[source],
+            )
             for offset in range(1, start + 3 - source):
                 target = source + offset
                 if episodes[target] != episodes[source] or steps[target] != steps[source] + offset:
                     break
                 action = factors["unit_actions"][target - 1].float()
-                predicted = predicted + dynamics.scale * (predicted.sin() + action)
+                predicted = tuple(
+                    value + (head + 1) * dynamics.scale * (value.sin() + action)
+                    for head, value in enumerate(predicted)
+                )
+                teachers = (
+                    belief.unit_decisions[target],
+                    belief.market_decisions[target],
+                    belief.market_decisions[target],
+                )
                 per_horizon[offset - 1].append(
-                    nn.functional.smooth_l1_loss(
-                        predicted,
-                        torch.cat(tuple(value[target].detach() for value in belief), dim=0),
+                    sum(
+                        nn.functional.smooth_l1_loss(value, teacher.detach())
+                        for value, teacher in zip(predicted, teachers, strict=True)
                     )
                 )
                 eligible_count += 1
@@ -158,25 +176,30 @@ def test_head_latent_targets_require_unbroken_unit_survival(availability):
     inputs = inputs._replace(unit_active=active)
     expected = []
     for offset in (1, 2):
-        errors = []
+        errors = [[], [], []]
         for source in range(3 - offset):
             target = source + offset
             surviving = active[source : target + 1].all(dim=0)
-            errors.extend(
+            for head_errors, current, teacher in zip(
+                errors,
                 (
+                    belief.unit_decisions[source, surviving],
+                    belief.market_decisions[source],
+                    belief.market_decisions[source],
+                ),
+                (
+                    belief.unit_decisions[target, surviving],
+                    belief.market_decisions[target],
+                    belief.market_decisions[target],
+                ),
+                strict=True,
+            ):
+                head_errors.append(
                     nn.functional.smooth_l1_loss(
-                        belief.unit_decisions[source, surviving],
-                        belief.unit_decisions[target, surviving].detach(),
-                        reduction="none",
-                    ).flatten(),
-                    nn.functional.smooth_l1_loss(
-                        belief.market_decisions[source],
-                        belief.market_decisions[target].detach(),
-                        reduction="none",
-                    ).flatten(),
+                        current, teacher.detach(), reduction="none"
+                    ).flatten()
                 )
-            )
-        expected.append(torch.cat(errors).mean())
+        expected.append(sum(torch.cat(values).mean() for values in errors))
     reference = torch.stack(expected).mean()
     plan = structured_horizon_plan(np.zeros(3, dtype=np.int64), np.arange(3), 2)
     results = [
@@ -210,7 +233,7 @@ def test_head_latent_targets_require_unbroken_unit_survival(availability):
 def test_head_controls_keep_joint_actions_paired_without_rng():
     class JointTransition:
         def __call__(self, belief, units, kinds, quantities, *context):
-            return StructuredDecisionBelief(
+            return type(belief)(
                 *(value + (units + 2 * kinds + 3 * quantities)[:, :1, None] for value in belief)
             )
 
@@ -249,13 +272,13 @@ def test_head_controls_keep_joint_actions_paired_without_rng():
 def cuda_case():
     torch.manual_seed(159)
     config = StructuredConfig(
-        model_dim=32,
+        model_dim=96,
         attention_heads=2,
         attention_kv_heads=2,
         latents=4,
         core_layers=1,
         farm_blocks=1,
-        quantity_rank=4,
+        quantity_rank=32,
     )
     actor = StructuredActor(config).cuda()
     with torch.no_grad():
@@ -324,10 +347,19 @@ def test_actor_losses_train_source_heads_and_predictor_without_teacher_gradients
         assert value.grad[:2].abs().sum() > 0
         assert value.grad[[2, 5]].count_nonzero() == 0
     assert all(parameter.grad is None for parameter in actor.parameters())
-    assert any(
-        parameter.grad is not None and parameter.grad.abs().sum() > 0
-        for parameter in dynamics.parameters()
-    )
+    for module in (
+        dynamics.unit_predictor,
+        dynamics.market_kind_predictor,
+        dynamics.market_quantity_predictor,
+        dynamics.action,
+        dynamics.action_projection,
+    ):
+        gradients = [
+            parameter.grad for parameter in module.parameters() if parameter.grad is not None
+        ]
+        assert gradients
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert sum(gradient.abs().sum() for gradient in gradients) > 0
 
 
 @pytest.mark.cuda
@@ -335,11 +367,11 @@ def test_actor_losses_train_source_heads_and_predictor_without_teacher_gradients
 @torch.autocast("cuda", dtype=torch.bfloat16)
 def test_joint_action_padding_is_inert_but_stop_and_active_heads_train():
     torch.manual_seed(915)
-    dynamics = ActorDynamics(StructuredConfig(model_dim=32, latents=4)).cuda()
-    belief = StructuredDecisionBelief(
+    dynamics = ActorDynamics(StructuredConfig(model_dim=96, latents=4)).cuda()
+    belief = ActorHeadBelief(
         *(
-            torch.randn(2, slots, 32, device="cuda", requires_grad=True)
-            for slots in (MAX_UNITS, MAX_MARKET_ORDERS)
+            torch.randn(2, slots, 96, device="cuda", requires_grad=True)
+            for slots in (MAX_UNITS, MAX_MARKET_ORDERS, MAX_MARKET_ORDERS)
         )
     )
     active = torch.zeros(2, MAX_UNITS, dtype=torch.bool, device="cuda")
@@ -364,7 +396,8 @@ def test_joint_action_padding_is_inert_but_stop_and_active_heads_train():
     other_kinds = kinds.clone()
     other_kinds[:, 2:] = MarketKind.BUY_SEED_WHEAT
     other_quantities = quantities.clone()
-    other_quantities[:, 2:] = N_QUANTITIES - 1
+    # HIRE and STOP do not carry quantities; neither may leak this arbitrary value.
+    other_quantities[:] = N_QUANTITIES - 1
     other = dynamics(
         belief,
         units.masked_fill(~active, N_UNIT_ACTIONS - 1),
@@ -374,10 +407,12 @@ def test_joint_action_padding_is_inert_but_stop_and_active_heads_train():
         active,
     )
     torch.testing.assert_close(other, predicted, rtol=0, atol=0)
+    assert predicted.unit_decisions[~active].count_nonzero() == 0
     sum(value.square().sum() for value in predicted).backward()
     assert belief.unit_decisions.grad[~active].count_nonzero() == 0
     assert (belief.unit_decisions.grad[active].abs().sum(-1) > 0).all()
-    assert (belief.market_decisions.grad.abs().sum(-1) > 0).all()
+    for value in belief[1:]:
+        assert (value.grad.abs().sum(-1) > 0).all()
     assert encoded[0].grad[~active].count_nonzero() == 0
     assert encoded[0].grad[active].abs().sum() > 0
     assert encoded[1].grad[:, 2:].count_nonzero() == 0
@@ -385,7 +420,22 @@ def test_joint_action_padding_is_inert_but_stop_and_active_heads_train():
     changed_units = units.clone()
     changed_units[:, 1] = N_UNIT_ACTIONS - 1
     changed = dynamics(belief, changed_units, kinds, quantities, categorical, active)
-    assert any(not torch.allclose(a, b) for a, b in zip(changed, predicted, strict=True))
+    assert all(not torch.equal(a, b) for a, b in zip(changed, predicted, strict=True))
+    # Moving a valid action between fixed slots must not collapse to a bag of actions.
+    swapped_units = changed_units.clone()
+    swapped_units[:, :2] = changed_units[:, :2].flip(1)
+    swapped = dynamics(belief, swapped_units, kinds, quantities, categorical, active)
+    assert all(not torch.equal(a, b) for a, b in zip(swapped, changed, strict=True))
+    quantified_kinds = kinds.clone()
+    quantified_kinds[:, 0] = MarketKind.BUY_SEED_WHEAT
+    quantified = dynamics(belief, units, quantified_kinds, quantities, categorical, active)
+    assert all(not torch.equal(a, b) for a, b in zip(quantified, predicted, strict=True))
+    quantified_values = quantities.clone()
+    quantified_values[:, 0] = N_QUANTITIES - 1
+    changed_quantity = dynamics(
+        belief, units, quantified_kinds, quantified_values, categorical, active
+    )
+    assert all(not torch.equal(a, b) for a, b in zip(changed_quantity, quantified, strict=True))
 
 
 @pytest.mark.cuda
@@ -421,6 +471,7 @@ def test_decoded_dense_compact_windows_match_surviving_head_reference(cuda_case)
     )
     heads = DecodeHeads.from_actor(actor, normalized_units=True)
     expected = []
+    expected_latent = []
     for offset in (1, 2):
         source = torch.tensor(
             [start + position for start in (0, 3) for position in range(3 - offset)], device="cuda"
@@ -452,10 +503,27 @@ def test_decoded_dense_compact_windows_match_surviving_head_reference(cuda_case)
             _decision_kl(predicted, truth, mask, active.float())
             for predicted, truth, mask, active in pairs
         ]
-        expected.append(sum(error for error, _ in errors) / sum(count for _, count in errors))
+        expected.append(sum(error / count.clamp_min(1) for error, count in errors))
+        head_errors = []
+        for current, truth, valid in (
+            (belief.unit_decisions[source], belief.unit_decisions[target], masks.unit_active),
+            (belief.market_decisions[source], belief.market_decisions[target], masks.market_active),
+            (
+                belief.market_decisions[source],
+                belief.market_decisions[target],
+                masks.market_quantity_active,
+            ),
+        ):
+            head_errors.append(nn.functional.smooth_l1_loss(current[valid], truth[valid].detach()))
+        expected_latent.append(sum(head_errors))
     expected_decision = torch.stack(expected).mean()
     for terms in results:
         torch.testing.assert_close(terms.decision, expected_decision, rtol=0.02, atol=2e-5)
+        torch.testing.assert_close(terms.latent, torch.stack(expected_latent).mean())
+        torch.testing.assert_close(
+            terms.decision,
+            terms.decision_unit + terms.decision_market_kind + terms.decision_market_quantity,
+        )
     # Compact padding and shrinking windows can select different CUDA kernels.
     for terms in results[1:]:
         torch.testing.assert_close(terms, results[0], rtol=0.02, atol=2e-5)
@@ -469,9 +537,8 @@ def test_exact_successor_heads_have_zero_kl_without_reencoding(cuda_case):
 
     class ExactSuccessor:
         def __call__(self, source, *actions):
-            return StructuredDecisionBelief(
-                *(value[torch.tensor([1, 2, 2, 4, 5, 5], device="cuda")] for value in belief)
-            )
+            successor = [value[torch.tensor([1, 2, 2, 4, 5, 5], device="cuda")] for value in belief]
+            return ActorHeadBelief(successor[0], successor[1], successor[1])
 
     def forbidden_trunk(*_args):
         raise AssertionError("auxiliary decoding must not reencode observations")
@@ -485,3 +552,159 @@ def test_exact_successor_heads_have_zero_kl_without_reencoding(cuda_case):
         hook.remove()
     torch.testing.assert_close(terms.latent, torch.zeros_like(terms.latent), rtol=0, atol=0)
     torch.testing.assert_close(terms.decision, torch.zeros_like(terms.decision), rtol=0, atol=1e-7)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("head", range(3), ids=("unit", "kind", "quantity"))
+@torch.autocast("cuda", dtype=torch.bfloat16)
+def test_head_predictors_have_independent_state_and_parameter_gradients(cuda_case, head):
+    actor, source, inputs, factors = cuda_case
+    dynamics = ActorDynamics(actor.config).cuda()
+    belief = ActorHeadBelief(
+        source.unit_decisions.detach().clone().requires_grad_(),
+        source.market_decisions.detach().clone().requires_grad_(),
+        source.market_decisions.detach().clone().requires_grad_(),
+    )
+    actions = tuple(factors[name] for name in ("unit_actions", "market_kinds", "market_quantities"))
+    predicted = dynamics(belief, *actions, inputs.unit_categorical, inputs.unit_active)
+    predicted[head].float().square().mean().backward()
+    predictors = (
+        dynamics.unit_predictor,
+        dynamics.market_kind_predictor,
+        dynamics.market_quantity_predictor,
+    )
+    for index, (state, predictor) in enumerate(zip(belief, predictors, strict=True)):
+        gradients = [parameter.grad for parameter in predictor.parameters()]
+        if index == head:
+            assert state.grad is not None and state.grad.abs().sum() > 0
+            assert all(
+                gradient is not None and torch.isfinite(gradient).all() for gradient in gradients
+            )
+            assert sum(gradient.abs().sum() for gradient in gradients) > 0
+        else:
+            assert state.grad is None or state.grad.count_nonzero() == 0
+            assert all(gradient is None or gradient.count_nonzero() == 0 for gradient in gradients)
+    for shared in (dynamics.action, dynamics.action_projection):
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in shared.parameters()
+        )
+    changed = belief._replace(
+        **{ActorHeadBelief._fields[head]: belief[head] + torch.randn_like(belief[head])}
+    )
+    other = dynamics(changed, *actions, inputs.unit_categorical, inputs.unit_active)
+    for index in range(3):
+        if index == head:
+            assert not torch.equal(other[index], predicted[index])
+        else:
+            torch.testing.assert_close(other[index], predicted[index], rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("head", range(3), ids=("unit", "kind", "quantity"))
+@pytest.mark.parametrize("objective", ("latent", "decision"))
+@torch.autocast("cuda", dtype=torch.bfloat16)
+def test_each_head_uses_its_successor_mask_and_frozen_matching_decoder(cuda_case, head, objective):
+    actor, belief, inputs, factors = cuda_case
+    # Source and successor activity deliberately disagree. Quantity eligibility
+    # also differs from kind eligibility, including a whole zero-quantity edge.
+    factors["market_quantity_active"][:, 0] = torch.tensor(
+        [False, True, False, True, False, True], device="cuda"
+    )
+    factors["market_quantity_masks"] = (
+        factors["market_quantity_active"].unsqueeze(-1).expand(-1, -1, N_QUANTITIES)
+    )
+    factors["market_active"][1::2, 1] = False
+    factors["market_kind_masks"] = (
+        factors["market_active"].unsqueeze(-1).expand(-1, -1, N_MARKET_KINDS)
+    )
+    target_index = torch.tensor([1, 2, 2, 4, 5, 5], device="cuda")
+    teacher = ActorHeadBelief(
+        belief.unit_decisions[target_index],
+        belief.market_decisions[target_index],
+        belief.market_decisions[target_index],
+    )
+    predicted = ActorHeadBelief(
+        *(
+            (value.detach() + (torch.randn_like(value) if index == head else 0)).requires_grad_()
+            for index, value in enumerate(teacher)
+        )
+    )
+
+    class FixedPrediction:
+        def __call__(self, _source, *_actions):
+            return predicted
+
+    terms = actor_horizon_loss(
+        FixedPrediction(),
+        actor,
+        belief,
+        inputs,
+        factors,
+        latent_horizon=int(objective == "latent"),
+        decision_horizon=int(objective == "decision"),
+    )
+    eligible = torch.tensor([True, True, False, True, True, False], device="cuda")
+    valid = (
+        inputs.unit_active & inputs.unit_active[target_index],
+        factors["market_active"][target_index],
+        factors["market_quantity_active"][target_index],
+    )
+    weights = tuple(mask & eligible[:, None] for mask in valid)
+    if objective == "latent":
+        expected = nn.functional.smooth_l1_loss(
+            predicted[head][weights[head]], teacher[head][weights[head]].detach()
+        )
+    else:
+        heads = DecodeHeads.from_actor(actor, normalized_units=True)
+        # Decode quantity from its own D96 state through D96->rank32 and the
+        # factorized kind-conditioned readout, never from the kind prediction.
+        student = heads.decode(torch.cat((predicted[0], predicted[1]), dim=1))
+        student_quantity = heads.decode(torch.cat((predicted[0], predicted[2]), dim=1))
+        truth = heads.decode(torch.cat((teacher[0].detach(), teacher[1].detach()), dim=1))
+        pairs = (
+            (student.unit_logits, truth.unit_logits, factors["unit_masks"][target_index]),
+            (
+                student.market_kind_logits,
+                truth.market_kind_logits,
+                factors["market_kind_masks"][target_index],
+            ),
+            (
+                heads.quantity_logits(
+                    student_quantity.market_quantity_context, factors["market_kinds"][target_index]
+                ),
+                heads.quantity_logits(
+                    truth.market_quantity_context, factors["market_kinds"][target_index]
+                ),
+                factors["market_quantity_masks"][target_index],
+            ),
+        )
+        total, count = _decision_kl(*pairs[head], weights[head].float())
+        expected = total / count.clamp_min(1)
+        diagnostics = (
+            terms.decision_unit,
+            terms.decision_market_kind,
+            terms.decision_market_quantity,
+        )
+        for index, diagnostic in enumerate(diagnostics):
+            torch.testing.assert_close(
+                diagnostic,
+                expected if index == head else torch.zeros_like(expected),
+                rtol=0.02,
+                atol=1e-7,
+            )
+    actual = getattr(terms, objective)
+    assert expected > 0
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=1e-7)
+    actual.backward()
+    gradient = predicted[head].grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert (gradient[weights[head]].abs().sum(-1) > 0).all()
+    assert gradient[~weights[head]].count_nonzero() == 0
+    for index, value in enumerate(predicted):
+        if index != head and value.grad is not None:
+            torch.testing.assert_close(value.grad, torch.zeros_like(value.grad), rtol=0, atol=1e-7)
+    assert all(value.grad is None for value in belief)
+    assert all(parameter.grad is None for parameter in actor.parameters())

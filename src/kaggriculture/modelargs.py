@@ -8,8 +8,8 @@ differs between two scripts makes the artifact unusable.
 
 The flags therefore default to ``None`` and the dataclass defaults are the
 single source of truth: an entry point that receives no model flag builds
-exactly ``ModelConfig()`` / ``StructuredConfig()``, whichever family was
-selected. Passing a flag that belongs to another family is an error rather
+the registered family's default configuration. Passing a flag that belongs
+to another family is an error rather
 than a silent no-op, because an ignored ``--transformer-layers`` on a
 structured run would otherwise report a model that was never trained.
 
@@ -96,7 +96,9 @@ def add_model_config_arguments(parser: argparse.ArgumentParser) -> None:
         for architecture in ARCHITECTURES.values()
     }
     for name, families in _families_by_field().items():
-        applies = "every architecture" if len(families) == len(ARCHITECTURES) else families[0]
+        applies = (
+            "every architecture" if len(families) == len(ARCHITECTURES) else ", ".join(families)
+        )
         field_types = {annotations[family][name] for family in families}
         if len(field_types) != 1:
             raise TypeError(f"model-config field {name!r} has inconsistent family types")
@@ -126,3 +128,18 @@ def model_config_from_args(architecture: Architecture, args: argparse.Namespace)
             f"{', '.join(sorted(foreign))} do not apply to the {architecture.name} architecture"
         )
     return architecture.config_class(**overrides)
+
+
+def model_config_arguments(architecture: Architecture, config: dict[str, Any]) -> list[str]:
+    """Serialize the family's actual structural fields for an explicit launch."""
+    arguments: list[str] = []
+    for name in model_config_fields(architecture):
+        value = config[name]
+        if isinstance(value, (tuple, list)):
+            encoded = ",".join(str(item) for item in value)
+        elif isinstance(value, bool):
+            encoded = str(value).lower()
+        else:
+            encoded = str(value)
+        arguments.extend((_flag(name), encoded))
+    return arguments

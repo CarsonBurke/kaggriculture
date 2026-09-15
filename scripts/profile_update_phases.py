@@ -1,55 +1,54 @@
 #!/usr/bin/env python3
-"""Attribute PPO update time to phases and, at production shape, to kernels.
+"""Profile the complete compiled production PPO update on fresh native waves.
 
-Two measurements from one collected production wave:
-
-1. Whole-update phase wall times (`update_*_seconds`) from two `update_ppo`
-   calls: the first pays compilation, the second is steady state.
-2. Isolated sections at exact production minibatch shape -- gathers, compiled
-   actor and critic forward/backward, gradient norms, optimizer steps, value
-   replay, and the joint NextLat trunk forward plus predictor step -- each
-   timed with CUDA events and, with `--kernels`, profiled to a per-kernel table.
-
-Kernel attribution is confined to one section at a time, so the profiler never
-sees more than a few thousand events.
+Run only through MLQ. The first --updates call is cold (including compilation),
+remaining calls are unprofiled steady updates. One additional fresh wave is
+updated under CPU+CUDA profiling; its instrumented wall time is NOT throughput.
+The Chrome trace is always exported beside --output. --kernels additionally
+includes leaf CUDA kernel and CPU self-time tables in the report.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
+import inspect
 import json
+import math
+import os
 import statistics
+import sys
 import time
-from collections.abc import Callable
+import traceback
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
+import torch._dynamo
+from benchmark_ppo_iteration import _hardware_identity, _verify_first_step_critic_state
 from torch.profiler import ProfilerActivity, profile
 
-from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.model import parameter_count
+from kaggriculture.modelargs import CALIBRATED_MODEL_FIELDS
 from kaggriculture.ppo import (
+    MAX_FIRST_MINIBATCH_KL,
+    MAX_UPDATE_REPLAY_KL,
+    MAX_UPDATE_REPLAY_TAIL_FRACTION,
+    MAX_VALUE_TARGET_SATURATED_FRACTION,
+    UPDATE_COMPILE_MODES,
     PpoConfig,
-    _actor_batch_args,
-    _actor_minibatch_terms,
-    _batch_tensor,
-    _cached_update_callable,
-    _critic_batch_args,
-    _critic_minibatch_fit_terms,
-    _entity_active_batch,
-    _optimizer_step,
-    _replayed_value_chunk,
-    _stage_tensor,
-    _structured_auxiliary_terms,
-    _structured_critic_auxiliary_terms,
+    _fixed_minibatch_positions,
     make_optimizers,
     make_structured_dynamics_optimizer,
+    replay_behavior_values,
     update_ppo,
+    update_replay_parity,
 )
 from kaggriculture.production import (
+    PRODUCTION_ARCHITECTURE,
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
@@ -57,13 +56,13 @@ from kaggriculture.production import (
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
+    PRODUCTION_UPDATE_COMPILE_MODE,
     production_model_config,
     production_ppo_config,
 )
-from kaggriculture.provenance import source_identity
-from kaggriculture.registry import STRUCTURED, resolve_architecture
+from kaggriculture.provenance import file_sha256, source_identity
+from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
-from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
 
@@ -72,438 +71,466 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=PRODUCTION_SELF_PLAY_GAMES)
     parser.add_argument("--league-games", type=int, default=PRODUCTION_LEAGUE_GAMES)
     parser.add_argument("--seed", type=int, default=20260812)
-    parser.add_argument("--init-actor-from", type=Path, default=None)
-    parser.add_argument("--update-compile-mode", default="default")
-    parser.add_argument("--updates", type=int, default=2, help="update_ppo calls to time")
-    parser.add_argument("--kernels", action="store_true", help="emit per-section kernel tables")
+    parser.add_argument("--init-actor-from", type=Path, required=True)
+    parser.add_argument(
+        "--minibatch-size",
+        type=int,
+        default=production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE)[
+            "minibatch_size"
+        ],
+    )
+    parser.add_argument(
+        "--update-compile-mode",
+        choices=[mode for mode in UPDATE_COMPILE_MODES if mode != "eager"],
+        default=PRODUCTION_UPDATE_COMPILE_MODE,
+    )
+    parser.add_argument(
+        "--updates",
+        type=int,
+        default=2,
+        help="unprofiled full updates, including one cold call; minimum two",
+    )
+    parser.add_argument("--kernels", action="store_true", help="include kernel and CPU tables")
     parser.add_argument("--top", type=int, default=30)
-    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
-def _synchronize() -> None:
-    torch.cuda.synchronize()
+def _save_report(path: Path, report: dict[str, Any]) -> None:
+    # Some diagnostic correlations are undefined; preserve standards-compliant JSON.
+    def finite(value):
+        if isinstance(value, dict):
+            return {key: finite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [finite(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(finite(report), indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
 
 
-def measure(fn: Callable[[], Any], *, warmup: int = 2, repeats: int = 5) -> dict[str, float]:
-    """Median CUDA-event and wall milliseconds of `fn` after warmup."""
-    for _ in range(warmup):
-        fn()
-    _synchronize()
-    device_ms: list[float] = []
-    wall_ms: list[float] = []
-    for _ in range(repeats):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        _synchronize()
-        wall_started = time.perf_counter()
-        start.record()
-        fn()
-        end.record()
-        _synchronize()
-        wall_ms.append((time.perf_counter() - wall_started) * 1000.0)
-        device_ms.append(start.elapsed_time(end))
-    return {"device_ms": statistics.median(device_ms), "wall_ms": statistics.median(wall_ms)}
-
-
-def kernel_table(fn: Callable[[], Any], top: int) -> dict[str, Any]:
-    """Top kernels by device time for one execution of `fn`."""
-    fn()
-    _synchronize()
-    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
-        fn()
-        _synchronize()
-    events = [
-        event
-        for event in prof.key_averages()
-        if event.self_device_time_total > 0 and event.device_type.name != "CPU"
-    ]
-    events.sort(key=lambda event: event.self_device_time_total, reverse=True)
-    total = sum(event.self_device_time_total for event in events)
-    launches = sum(event.count for event in events)
+def _memory() -> dict[str, int]:
+    stats = torch.cuda.memory_stats()
     return {
-        "device_total_ms": total / 1000.0,
-        "kernel_launches": launches,
-        "kernels": [
-            {
-                "name": event.key[:120],
-                "count": event.count,
-                "total_ms": event.self_device_time_total / 1000.0,
-                "share": event.self_device_time_total / max(total, 1.0),
-            }
-            for event in events[:top]
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "allocator_retries": stats.get("num_alloc_retries", 0),
+        "allocator_ooms": stats.get("num_ooms", 0),
+    }
+
+
+def kernel_table(prof, trace_path: Path, top: int) -> dict[str, Any]:
+    """Count actual Kineto kernel activities, never nested CPU device attribution."""
+    trace = json.loads(trace_path.read_text())
+    kernels: dict[str, dict[str, Any]] = {}
+    transfers: dict[str, dict[str, Any]] = {}
+    for event in trace["traceEvents"]:
+        if event.get("ph") != "X":
+            continue
+        category = event.get("cat")
+        if category == "kernel":
+            table = kernels
+        elif category in ("gpu_memcpy", "gpu_memset"):
+            table = transfers
+        else:
+            continue
+        row = table.setdefault(event["name"], {"name": event["name"], "count": 0, "total_ms": 0.0})
+        row["count"] += 1
+        row["total_ms"] += event["dur"] / 1000.0
+    if not kernels:
+        raise RuntimeError("profiler captured no CUDA kernel activities; attribution is invalid")
+    total = sum(row["total_ms"] for row in kernels.values())
+    ordered = sorted(kernels.values(), key=lambda row: row["total_ms"], reverse=True)
+    for row in ordered:
+        row["share"] = row["total_ms"] / total
+    cpu = sorted(
+        (event for event in prof.key_averages() if event.device_type.name == "CPU"),
+        key=lambda event: event.self_cpu_time_total,
+        reverse=True,
+    )
+    return {
+        "accounting": "Chrome trace cat=kernel complete CUDA activities; overlapping streams sum",
+        "kernel_device_total_ms": total,
+        "kernel_launches": sum(row["count"] for row in ordered),
+        "unique_kernel_names": len(ordered),
+        "kernels": ordered[:top],
+        "transfers_and_memsets": sorted(
+            transfers.values(), key=lambda row: row["total_ms"], reverse=True
+        )[:top],
+        "cpu_accounting": "exclusive CPU self times; thread overlap is not wall time",
+        "cpu_self_total_ms": sum(event.self_cpu_time_total for event in cpu) / 1000.0,
+        "cpu_overhead": [
+            {"name": event.key, "count": event.count, "self_ms": event.self_cpu_time_total / 1000.0}
+            for event in cpu[:top]
         ],
     }
 
 
-def main() -> None:
-    args = _parse_args()
+def _work_counts(metrics, rollout, config) -> dict[str, Any]:
+    _, counts = _fixed_minibatch_positions(int(metrics["states"]), config.minibatch_size)
+    actor_steps = int(metrics["actor_updates"])
+    # The KL-rejected candidate still executes a forward/backward, but no step.
+    actor_batches = actor_steps + int(metrics["kl_early_stop"])
+    critic_steps = int(metrics["updates"])
+    actor_row_counts = np.tile(counts, config.epochs)
+    replay_chunk = inspect.signature(replay_behavior_values).parameters["chunk_size"].default
+    replay_rows = rollout.trajectories * rollout.horizon
+    return {
+        "basis": "update_ppo counters plus its fixed padded minibatch partition",
+        "valid_states": int(metrics["states"]),
+        "minibatches_per_epoch": len(counts),
+        "valid_rows_per_minibatch": counts.tolist(),
+        "compiled_rows_per_minibatch": config.minibatch_size,
+        "actor_minibatches_intended": int(metrics["actor_minibatches_intended"]),
+        "actor_forward_backward_minibatches": actor_batches,
+        "actor_optimizer_steps": actor_steps,
+        "actor_optimizer_valid_rows": int(actor_row_counts[:actor_steps].sum()),
+        "actor_forward_backward_padded_rows": actor_batches * config.minibatch_size,
+        "critic_forward_backward_minibatches": critic_steps,
+        "critic_optimizer_steps": critic_steps,
+        "critic_optimizer_valid_rows": int(metrics["states"]) * int(metrics["epochs"]),
+        "critic_forward_backward_padded_rows": critic_steps * config.minibatch_size,
+        "actor_predictor_steps": 0,
+        "critic_predictor_steps": int(metrics["structured_critic_predictor_updates"]),
+        "critic_joint_auxiliary_updates": int(metrics["structured_critic_auxiliary_updates"]),
+        "behavior_value_replay_rows": replay_rows,
+        "behavior_value_replay_chunk_size": replay_chunk,
+        "behavior_value_replay_forward_chunks": math.ceil(replay_rows / replay_chunk),
+        "behavior_value_replay_padded_rows": math.ceil(replay_rows / replay_chunk) * replay_chunk,
+        "kl_early_stop": bool(metrics["kl_early_stop"]),
+    }
+
+
+def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
+    if args.updates < 2 or args.minibatch_size < 1 or args.top < 1:
+        raise ValueError("require --updates >= 2, positive --minibatch-size and --top")
+    if (args.games, args.league_games) != (PRODUCTION_SELF_PLAY_GAMES, PRODUCTION_LEAGUE_GAMES):
+        raise ValueError("this profiler requires the full production self-play/league geometry")
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        raise RuntimeError("native CUDA BF16 is required; no CPU or FP32 fallback")
+    if torch._dynamo.config.disable:
+        raise RuntimeError("TorchDynamo is disabled; compiled execution is required")
+    torch._dynamo.config.suppress_errors = False
+    torch._dynamo.reset()
     device = torch.device("cuda")
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-
-    architecture = resolve_architecture(STRUCTURED)
-    model_config = StructuredConfig(**production_model_config())
-    ppo_config = PpoConfig(
-        **cast(dict[str, Any], production_ppo_config(update_compile_mode=args.update_compile_mode))
+    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
+    model_config = architecture.build_config(production_model_config())
+    config = PpoConfig(
+        **{
+            **production_ppo_config(update_compile_mode=args.update_compile_mode),
+            "minibatch_size": args.minibatch_size,
+        }
     )
-    if args.init_actor_from is None:
-        actor = architecture.actor_class(model_config).to(device)
-    else:
-        actor, _ = load_actor_artifact(args.init_actor_from, device=device)
-    critic = architecture.critic_class(model_config).to(device)
-    dynamics = ActorDynamics(model_config).to(device)
-    critic_dynamics = StructuredCriticDynamics(model_config).to(device)
+    if not config.use_bfloat16 or config.structured_actor_auxiliary_active:
+        raise ValueError("production must use BF16 with actor NextLat off")
+    if (
+        config.structured_critic_latent_coefficient,
+        config.structured_critic_value_coefficient,
+    ) != (1.0, 1.0):
+        raise ValueError("production critic NextLat must remain enabled at 1/1")
+    if PRODUCTION_ROLLOUT_FORWARD_MODE != "inductor_graph":
+        raise ValueError("compiled CUDA-graph rollout is required")
+    report.update(
+        {
+            "source_identity": source_identity(),
+            "hardware": _hardware_identity(device),
+            "torch": torch.__version__,
+            "initial_actor_sha256": file_sha256(args.init_actor_from),
+            "architecture": architecture.name,
+            "model": model_config.to_dict(),
+            "ppo": asdict(config),
+            "rollout_forward_mode": PRODUCTION_ROLLOUT_FORWARD_MODE,
+            "rollout_bfloat16": True,
+            "episode_steps": PRODUCTION_EPISODE_STEPS,
+            "temperature": PRODUCTION_TEMPERATURE,
+            "precision_note": (
+                "BF16 compute; production FP32 parameters, heads and reductions retained"
+            ),
+            "phase": "constructing_cuda_models",
+        }
+    )
+    _save_report(args.output, report)
+    # Even constructors inside the artifact helper allocate directly on CUDA.
+    # CPU artifact deserialization/state snapshots are data, never CPU models.
+    with torch.device(device):
+        pretrained, payload = load_actor_artifact(args.init_actor_from, device=device)
+        expected = model_config.to_dict()
+        actual = pretrained.config.to_dict()
+        for name in ("scalar_value", "value_sigma_ratio", *CALIBRATED_MODEL_FIELDS):
+            expected.pop(name)
+            actual.pop(name)
+        if not isinstance(pretrained, architecture.actor_class) or actual != expected:
+            raise ValueError("initial actor architecture/configuration does not match production")
+        actor = architecture.actor_class(model_config)
+        actor.load_state_dict(pretrained.state_dict())
+        del pretrained, payload
+        critic = architecture.critic_class(model_config)
+        critic_dynamics = StructuredCriticDynamics(model_config)
+    for module in (actor, critic, critic_dynamics):
+        if any(
+            tensor.device.type != "cuda" for tensor in (*module.parameters(), *module.buffers())
+        ):
+            raise RuntimeError("model construction left a non-CUDA parameter or buffer")
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    critic_dynamics_optimizer = make_structured_dynamics_optimizer(critic_dynamics, config)
     frozen_state = {
         name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
     }
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
-    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, ppo_config)
-    critic_dynamics_optimizer = make_structured_dynamics_optimizer(critic_dynamics, ppo_config)
+    opponent_count = PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS
     generator = np.random.default_rng(args.seed)
     auxiliary_generator = np.random.default_rng(args.seed + 2)
-
-    opponents = [
-        architecture.actor_class(model_config).to(device)
-        for _ in range(PRODUCTION_LEAGUE_ACTIVE_OPPONENTS + PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS)
-    ]
-    for opponent in opponents:
-        opponent.load_state_dict(frozen_state)
-        opponent.requires_grad_(False)
-    assignments = np.arange(args.league_games, dtype=np.int64) % len(opponents)
-    generator.shuffle(assignments)
     arena = allocate_rollout_storage(
         architecture.name,
         args.games * 2 + args.league_games,
         PRODUCTION_EPISODE_STEPS - 1,
         pin_memory=True,
     )
-    _synchronize()
-    rollout_started = time.perf_counter()
-    rollout = collect_mixed_play_rust(
-        actor,
-        opponents,
-        self_play_games=args.games,
-        league_games=args.league_games,
-        opponent_indices=assignments,
-        seed_start=args.seed,
-        episode_steps=PRODUCTION_EPISODE_STEPS,
-        temperature=PRODUCTION_TEMPERATURE,
-        opponent_temperature=PRODUCTION_TEMPERATURE,
-        sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
-        forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
-        forward_autocast=True,
-        storage=arena,
+    report.update(
+        {
+            "actor_parameters": parameter_count(actor),
+            "critic_parameters": parameter_count(critic),
+            "critic_predictor_parameters": parameter_count(critic_dynamics),
+            "actor_predictor_parameters": 0,
+            "frozen_opponents": opponent_count,
+            "opponent_policy": "eight frozen copies of initial BC actor, reconstructed each wave",
+            "fresh_wave_policy": "new native seeds and current learner weights for every update",
+            "diagnostic_gradients": False,
+        }
     )
-    _synchronize()
-    report: dict[str, Any] = {
-        "source_digest": source_identity()["sha256"],
-        "torch": torch.__version__,
-        "device": torch.cuda.get_device_name(device),
-        "games": args.games,
-        "league_games": args.league_games,
-        "learner_states": rollout.state_count,
-        "actor_parameters": parameter_count(actor),
-        "critic_parameters": parameter_count(critic),
-        "rollout_seconds": time.perf_counter() - rollout_started,
-        "updates": [],
-    }
-    del opponents
-
-    phase_keys = (
-        "update_staging_seconds",
-        "update_behavior_replay_seconds",
-        "update_advantage_seconds",
-        "update_minibatch_seconds",
-        "update_finalize_seconds",
-        "actor_updates",
-        "updates",
-    )
-    for index in range(args.updates):
-        torch.cuda.reset_peak_memory_stats(device)
-        _synchronize()
-        started = time.perf_counter()
-        metrics = update_ppo(
-            actor,
-            critic,
-            actor_optimizer,
-            critic_optimizer,
-            rollout,
-            ppo_config,
-            generator=generator,
-            structured_dynamics=dynamics,
-            structured_dynamics_optimizer=dynamics_optimizer,
-            structured_critic_dynamics=critic_dynamics,
-            structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
-            auxiliary_generator=auxiliary_generator,
+    for index in range(args.updates + 1):
+        instrumented = index == args.updates
+        kind = (
+            "profiled_update"
+            if instrumented
+            else ("cold_update" if index == 0 else "steady_update")
         )
-        _synchronize()
-        record: dict[str, Any] = {key: metrics[key] for key in phase_keys if key in metrics}
-        record["update_seconds"] = time.perf_counter() - started
-        record["peak_cuda_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
-        record["phase"] = "cold" if index == 0 else "steady"
+        seed_start = args.seed + index * (args.games + args.league_games)
+        record: dict[str, Any] = {
+            "index": index,
+            "kind": kind,
+            "seed_start": seed_start,
+            "instrumented": instrumented,
+        }
         report["updates"].append(record)
-        print(json.dumps(record, sort_keys=True), flush=True)
-
-    # Isolated sections at exact production minibatch shape.
-    staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
-    staged |= {
-        name: _stage_tensor(getattr(rollout, name), device)
-        for name in (
-            "unit_actions",
-            "market_kinds",
-            "market_quantities",
-            "unit_masks",
-            "market_kind_masks",
-            "market_quantity_masks",
-            "unit_active",
-            "market_active",
-            "market_quantity_active",
-            "old_unit_logprobs",
-            "old_market_kind_logprobs",
-            "old_market_quantity_logprobs",
-        )
-    }
-    flat_valid = rollout.valid.reshape(-1)
-    valid_indices = np.flatnonzero(flat_valid)
-    minibatch = valid_indices.size // -(-valid_indices.size // ppo_config.minibatch_size)
-    host_indices = generator.permutation(valid_indices)[:minibatch]
-    indices = torch.from_numpy(host_indices).to(device)
-    entity_critic = getattr(critic.config, "per_entity_critic", False)
-    staged["advantages"] = (
-        torch.zeros_like(_entity_active_batch(staged, slice(None)), dtype=torch.float32)
-        if entity_critic
-        else torch.zeros(flat_valid.size, device=device)
-    )
-    staged["value_targets"] = torch.zeros(flat_valid.size, device=device)
-    autocast_enabled = ppo_config.use_bfloat16
-    mode = args.update_compile_mode
-    actor_terms = _cached_update_callable(
-        actor, "_kaggriculture_update_terms", _actor_minibatch_terms, mode
-    )
-    critic_terms = _cached_update_callable(
-        critic, "_kaggriculture_update_fit_terms", _critic_minibatch_fit_terms, mode
-    )
-    replay = _cached_update_callable(
-        critic, "_kaggriculture_value_replay", _replayed_value_chunk, mode
-    )
-    actor.eval()
-    critic.train()
-
-    def gather_actor():
-        return _actor_batch_args(STRUCTURED, staged, indices)
-
-    def gather_critic():
-        return _critic_batch_args(STRUCTURED, staged, indices, actor_args=gather_actor())
-
-    def gather_surrogate():
-        return (
-            _batch_tensor(staged["unit_actions"], indices, torch.long),
-            _batch_tensor(staged["market_kinds"], indices, torch.long),
-            _batch_tensor(staged["market_quantities"], indices, torch.long),
-            _batch_tensor(staged["unit_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
-            _batch_tensor(staged["unit_active"], indices, torch.float32),
-            _batch_tensor(staged["market_active"], indices, torch.float32),
-            _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
-            _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
-            _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
-            _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
-            _batch_tensor(staged["advantages"], indices, torch.float32),
-        )
-
-    actor_args = gather_actor()
-    critic_args = gather_critic()
-    surrogate = gather_surrogate()
-    component_count = max(1, int(sum(component.sum() for component in surrogate[6:9])))
-    policy_count = (
-        component_count if ppo_config.policy_loss_reduction == "components" else indices.numel()
-    )
-    value_targets = _batch_tensor(staged["value_targets"], indices, torch.float32)
-    entity_active = _entity_active_batch(staged, indices) if entity_critic else None
-
-    def actor_forward():
-        return actor_terms(
+        report["phase"] = f"{kind}:collecting_wave"
+        _save_report(args.output, report)
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        with torch.device(device):
+            opponents = [architecture.actor_class(model_config) for _ in range(opponent_count)]
+        for opponent in opponents:
+            opponent.load_state_dict(frozen_state)
+            opponent.requires_grad_(False)
+        assignments = np.arange(args.league_games, dtype=np.int64) % opponent_count
+        generator.shuffle(assignments)
+        torch.cuda.synchronize()
+        record["opponent_setup_seconds"] = time.perf_counter() - started
+        started = time.perf_counter()
+        rollout = collect_mixed_play_rust(
             actor,
-            *surrogate,
-            ppo_config.clip_low,
-            ppo_config.clip_high,
-            autocast_enabled,
-            *actor_args,
-            policy_ratio_scope=ppo_config.policy_ratio_scope,
+            opponents,
+            self_play_games=args.games,
+            league_games=args.league_games,
+            opponent_indices=assignments,
+            seed_start=seed_start,
+            episode_steps=PRODUCTION_EPISODE_STEPS,
+            temperature=PRODUCTION_TEMPERATURE,
+            opponent_temperature=PRODUCTION_TEMPERATURE,
+            sampling_seed=int(generator.integers(0, np.iinfo(np.int64).max)),
+            forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
+            forward_autocast=True,
+            storage=arena,
         )
-
-    def actor_forward_backward():
-        actor_optimizer.zero_grad(set_to_none=True)
-        policy_sum, _entropy, _kl, _clipped, _component_kl = actor_forward()
-        if not policy_sum.requires_grad:
-            raise RuntimeError(
-                "actor objective lost its graph: "
-                f"grad_enabled={torch.is_grad_enabled()} "
-                f"params_requiring_grad={sum(p.requires_grad for p in actor.parameters())} "
-                f"inference={policy_sum.is_inference()} training={actor.training}"
-            )
-        (-policy_sum / policy_count).backward()
-
-    def actor_norm():
-        return torch.nn.utils.get_total_norm(
-            [parameter.grad for parameter in actor.parameters() if parameter.grad is not None]
+        torch.cuda.synchronize()
+        record["rollout_seconds"] = time.perf_counter() - started
+        del opponent, opponents
+        record["wave_memory"] = _memory()
+        record.update(
+            {
+                "learner_states": rollout.state_count,
+                "trajectories": rollout.trajectories,
+                "transitions_per_trajectory": rollout.horizon,
+            }
         )
-
-    def actor_step():
-        _optimizer_step(actor_optimizer, ppo_config.actor_learning_rate, ppo_config.lr_warmup_steps)
-
-    def critic_forward():
-        return critic_terms(
-            critic, value_targets, autocast_enabled, *critic_args, entity_active=entity_active
-        )
-
-    def critic_forward_backward():
-        critic_optimizer.zero_grad(set_to_none=True)
-        loss, _moments = critic_forward()
-        loss.backward()
-
-    def critic_norm():
-        return torch.nn.utils.get_total_norm(
-            [parameter.grad for parameter in critic.parameters() if parameter.grad is not None]
-        )
-
-    def critic_step():
-        _optimizer_step(
-            critic_optimizer, ppo_config.critic_learning_rate, ppo_config.lr_warmup_steps
-        )
-
-    replay_args = _critic_batch_args(STRUCTURED, staged, slice(0, 4096))
-
-    @torch.inference_mode()
-    def replay_chunk():
-        was_training = critic.training
-        critic.eval()
-        try:
-            return replay(critic, autocast_enabled, *replay_args)
-        finally:
-            critic.train(was_training)
-
-    # Joint NextLat: the same PPO minibatch, one trunk pass, then p_ψ.
-    batch_indices = indices
-    report["predictor_batch"] = {"rows": int(host_indices.size)}
-    (belief_inputs,) = actor_args
-    critic_belief_args = critic_args
-
-    @torch.no_grad()
-    def actor_source_forward_eager():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-            return actor.forward_with_auxiliary_belief(belief_inputs)
-
-    @torch.no_grad()
-    def critic_source_forward_eager():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-            return critic.forward_with_belief(*critic_belief_args)
-
-    # The predictor sections pass `model_grad=False`, and that path takes its
-    # source belief under `torch.no_grad()`, so no
-    # gradient reaches the actor or critic no matter what `requires_grad` says.
-    # An earlier version froze both models here instead, while the sections were
-    # still being defined -- before any of them ran -- which left
-    # `actor_forward_backward` with a graphless surrogate and killed the
-    # profiler at its fifth section.
-
-    dynamics.train()
-    critic_dynamics.train()
-
-    def actor_predictor_batch():
-        dynamics_optimizer.zero_grad(set_to_none=True)
-        loss, _terms = _structured_auxiliary_terms(
+        expected_states = (args.games * 2 + args.league_games) * (PRODUCTION_EPISODE_STEPS - 1)
+        if rollout.state_count != expected_states:
+            raise RuntimeError("native collection did not produce the complete production wave")
+        report["phase"] = f"{kind}:replay_audit_outside_update"
+        _save_report(args.output, report)
+        started = time.perf_counter()
+        parity = update_replay_parity(
             actor,
-            dynamics,
-            staged,
-            batch_indices,
-            steps_per_trajectory=rollout.valid.shape[1],
-            config=ppo_config,
-            autocast_enabled=autocast_enabled,
-            model_grad=False,
-            complete_windows=False,
+            rollout,
+            minibatch_size=config.minibatch_size,
+            compile_mode=config.update_compile_mode,
+            autocast_enabled=True,
         )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(dynamics.parameters(), ppo_config.nextlat_max_gradient_norm)
-        _optimizer_step(
-            dynamics_optimizer,
-            ppo_config.resolved_structured_learning_rate,
-            ppo_config.lr_warmup_steps,
-        )
-
-    def critic_predictor_batch():
-        critic_dynamics_optimizer.zero_grad(set_to_none=True)
-        loss, _terms = _structured_critic_auxiliary_terms(
-            critic,
-            critic_dynamics,
-            staged,
-            batch_indices,
-            steps_per_trajectory=rollout.valid.shape[1],
-            config=ppo_config,
-            autocast_enabled=autocast_enabled,
-            model_grad=False,
-            complete_windows=False,
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            critic_dynamics.parameters(), ppo_config.nextlat_max_gradient_norm
-        )
-        _optimizer_step(
-            critic_dynamics_optimizer,
-            ppo_config.resolved_structured_critic_learning_rate,
-            ppo_config.lr_warmup_steps,
-        )
-
-    sections: dict[str, Callable[[], Any]] = {
-        "gather_actor": gather_actor,
-        "gather_critic_extra": gather_critic,
-        "gather_surrogate": gather_surrogate,
-        "actor_forward": actor_forward,
-        "actor_forward_backward": actor_forward_backward,
-        "actor_gradient_norm": actor_norm,
-        "actor_optimizer_step": actor_step,
-        "critic_forward": critic_forward,
-        "critic_forward_backward": critic_forward_backward,
-        "critic_gradient_norm": critic_norm,
-        "critic_optimizer_step": critic_step,
-        "value_replay_chunk_4096": replay_chunk,
-        "actor_source_forward_eager": actor_source_forward_eager,
-        "critic_source_forward_eager": critic_source_forward_eager,
-        "actor_predictor_batch": actor_predictor_batch,
-        "critic_predictor_batch": critic_predictor_batch,
-    }
-    # The optimizer sections need populated gradients; forward/backward sections
-    # leave them in place, and the steps below only move weights negligibly.
-    # Sections are ordered so gradients exist before the norm and step sections.
-    results: dict[str, Any] = {}
-    for name, fn in sections.items():
-        timing = measure(fn)
-        results[name] = timing
-        print(json.dumps({"section": name, **timing}), flush=True)
-    if args.kernels:
-        for name in (
-            "actor_forward_backward",
-            "critic_forward_backward",
-            "actor_optimizer_step",
-            "critic_optimizer_step",
-            "value_replay_chunk_4096",
-            "actor_source_forward_eager",
-            "critic_source_forward_eager",
-            "actor_predictor_batch",
-            "critic_predictor_batch",
+        _verify_first_step_critic_state(rollout, args.games, seed_start)
+        torch.cuda.synchronize()
+        record["replay_audit_seconds"] = time.perf_counter() - started
+        record["replay_checks"] = parity
+        for component in ("unit", "kind", "quantity"):
+            if parity[f"update_replay_{component}_active_count"] < 1:
+                raise RuntimeError(f"replay audit saw no active {component} components")
+        for key, limit in (
+            ("update_replay_max_kl", MAX_UPDATE_REPLAY_KL),
+            ("update_replay_max_tail_fraction", MAX_UPDATE_REPLAY_TAIL_FRACTION),
         ):
-            table = kernel_table(sections[name], args.top)
-            results[name]["kernels"] = table
-            print(json.dumps({"section": name, "kernel_table": table}), flush=True)
-    report["sections"] = results
-    report["minibatch_rows"] = minibatch
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, indent=2, sort_keys=True))
+            if not math.isfinite(parity[key]) or parity[key] > limit:
+                raise RuntimeError(f"replay audit failed {key}: {parity[key]} > {limit}")
+        torch.cuda.reset_peak_memory_stats()
+        record["memory_before_update"] = _memory()
+        report["phase"] = f"{kind}:update_ppo"
+        _save_report(args.output, report)
+
+        def run_update(rollout=rollout, record=record):
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            started = time.perf_counter()
+            start.record()
+            metrics = update_ppo(
+                actor,
+                critic,
+                actor_optimizer,
+                critic_optimizer,
+                rollout,
+                config,
+                generator=generator,
+                structured_actor_auxiliary=False,
+                structured_critic_dynamics=critic_dynamics,
+                structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
+                structured_critic_auxiliary=True,
+                auxiliary_generator=auxiliary_generator,
+                diagnostic_groups={
+                    "self_play": np.arange(rollout.trajectories) < args.games * 2,
+                    "league": np.arange(rollout.trajectories) >= args.games * 2,
+                },
+                diagnostic_gradients=False,
+            )
+            end.record()
+            torch.cuda.synchronize()
+            record["update_wall_seconds"] = time.perf_counter() - started
+            record["update_cuda_span_ms"] = start.elapsed_time(end)
+            record["update_metrics"] = metrics
+
+        if instrumented:
+            trace_path = args.output.with_suffix(".trace.json")
+            record["trace"] = str(trace_path.resolve())
+            record["timing_note"] = "instrumented CUDA/CPU spans; NOT throughput evidence"
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            try:
+                with prof:
+                    run_update()
+            finally:
+                prof.export_chrome_trace(str(trace_path))
+        else:
+            run_update()
+        metrics = record["update_metrics"]
+        record["work_counts"] = _work_counts(metrics, rollout, config)
+        record["memory_after_update"] = _memory()
+        record["allocator_retries_during_update"] = (
+            record["memory_after_update"]["allocator_retries"]
+            - record["memory_before_update"]["allocator_retries"]
+        )
+        _save_report(args.output, report)
+        if instrumented:
+            record["attribution"] = kernel_table(prof, trace_path, args.top if args.kernels else 0)
+            del prof
+        for key, limit in (
+            ("first_minibatch_component_kl", MAX_FIRST_MINIBATCH_KL),
+            ("value_target_saturated_fraction", MAX_VALUE_TARGET_SATURATED_FRACTION),
+        ):
+            if not math.isfinite(metrics[key]) or metrics[key] > limit:
+                raise RuntimeError(f"update failed {key}: {metrics[key]} > {limit}")
+        if (
+            metrics["actor_updates"] < 1
+            or metrics["structured_critic_predictor_updates"] != metrics["updates"]
+        ):
+            raise RuntimeError(
+                "update failed to execute actor and every joint critic predictor step"
+            )
+        _save_report(args.output, report)
+        print(
+            json.dumps(
+                {
+                    "event": kind,
+                    "index": index,
+                    "update_wall_seconds": record["update_wall_seconds"],
+                    "work_counts": record["work_counts"],
+                }
+            ),
+            flush=True,
+        )
+        del rollout
+        gc.collect()
+    steady = [
+        item["update_wall_seconds"] for item in report["updates"] if item["kind"] == "steady_update"
+    ]
+    report["unprofiled_summary"] = {
+        "cold_update_seconds": report["updates"][0]["update_wall_seconds"],
+        "steady_update_seconds": steady,
+        "steady_update_seconds_median": statistics.median(steady),
+        "note": "fresh waves; replay audit and profiler excluded; not a six-repeat calibration",
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "status": "running",
+        "phase": "initializing",
+        "updates": [],
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "profiler_options": {
+            "activities": ["CPU", "CUDA"],
+            "record_shapes": False,
+            "profile_memory": False,
+            "with_stack": False,
+        },
+    }
+    _save_report(args.output, report)
+    try:
+        _run(args, report)
+    except BaseException as error:
+        report.update(
+            {
+                "status": "error",
+                "error": str(error),
+                "error_type": type(error).__name__,
+                "traceback": traceback.format_exc(),
+            }
+        )
+        if torch.cuda.is_initialized():
+            try:
+                report["failure_memory"] = _memory()
+            except Exception as memory_error:
+                report["failure_memory_error"] = str(memory_error)
+        _save_report(args.output, report)
+        raise
+    report.update({"status": "complete", "phase": "complete"})
+    _save_report(args.output, report)
     print(json.dumps({"event": "done", "output": str(args.output)}), flush=True)
 
 

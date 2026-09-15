@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch import Tensor, nn
 
-from kaggriculture.actions import MarketKind
+from kaggriculture.actions import N_MARKET_KINDS, QUANTIFIED_MARKET_KINDS, MarketKind
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
 from kaggriculture.latent_dynamics import (
     DecodeHeads,
     DecodeKLTerms,
     DecodeMasks,
-    latent_decode_kl_terms,
+    _decision_kl,
+    _frozen_linear,
 )
 from kaggriculture.model import RMSNorm
 from kaggriculture.structured import (
-    Block,
     StructuredActor,
     StructuredConfig,
     StructuredDecisionBelief,
@@ -32,69 +31,106 @@ from kaggriculture.structured_dynamics import (
     _target_index,
 )
 
+if TYPE_CHECKING:
+    from kaggriculture.entity import EntityActor, EntityConfig
+
+
+class ActorHeadBelief(NamedTuple):
+    """Independent recurrence states at the three normalized actor head inputs."""
+
+    unit_decisions: Tensor
+    market_kind_decisions: Tensor
+    market_quantity_decisions: Tensor
+
+
+class _ActorHeadPredictor(nn.Module):
+    """NextLat residual MLP for one head, conditioned on the joint action."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        input_dim = 2 * width
+        hidden_dim = 128 * max(1, round(input_dim / 128))
+        # NextLat's LayerNorm(bias=False) implements affine RMS normalization.
+        self.norm_x = RMSNorm(input_dim, eps=1e-5)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, width, bias=False),
+        )
+
+    def forward(self, state: Tensor, action: Tensor) -> Tensor:
+        transition = torch.cat((action.unsqueeze(1).expand_as(state), state), dim=-1)
+        return state + self.mlp(self.norm_x(transition))
+
 
 class ActorDynamics(nn.Module):
-    """Shared residual transition of head-input slots under valid joint actions."""
+    """Three independent residual predictors sharing one valid joint-action code."""
 
-    def __init__(self, config: StructuredConfig) -> None:
+    def __init__(self, config: StructuredConfig | EntityConfig) -> None:
         super().__init__()
-        predictor_config = replace(config, zero_init_branches=False, global_modulation=False)
-        self.action = StructuredActionEncoder(config.model_dim)
-        self.type_identity = nn.Embedding(2, config.model_dim)
-        self.unit_identity = nn.Embedding(MAX_UNITS, config.model_dim)
-        self.market_identity = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
-        self.context_norm = RMSNorm(config.model_dim)
-        self.transition = Block(predictor_config)
+        width = config.model_dim
+        self.action = StructuredActionEncoder(width)
+        self.action_projection = nn.Linear(
+            (MAX_UNITS + MAX_MARKET_ORDERS) * width, width, bias=False
+        )
+        self.unit_predictor = _ActorHeadPredictor(width)
+        self.market_kind_predictor = _ActorHeadPredictor(width)
+        self.market_quantity_predictor = _ActorHeadPredictor(width)
+        self.register_buffer(
+            "quantified_market_kinds",
+            torch.tensor([kind in QUANTIFIED_MARKET_KINDS for kind in range(N_MARKET_KINDS)]),
+        )
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
         self,
-        belief: StructuredDecisionBelief,
+        belief: ActorHeadBelief,
         unit_actions: Tensor,
         market_kinds: Tensor,
         market_quantities: Tensor,
         unit_categorical: Tensor,
         unit_active: Tensor,
         unit_state_active: Tensor | None = None,
-    ) -> StructuredDecisionBelief:
-        state_active = unit_active.bool()
+    ) -> ActorHeadBelief:
+        action_active = unit_active.bool()
+        state_active = action_active
         if unit_state_active is not None:
             state_active = state_active & unit_state_active.bool()
         units = torch.where(state_active.unsqueeze(-1), belief.unit_decisions, 0.0)
-        market = belief.market_decisions
-        unit_action, market_action = self.action(
-            unit_actions, market_kinds, market_quantities, unit_categorical, unit_active
-        )
         stopped = (market_kinds == MarketKind.STOP.value).long()
         market_action_valid = stopped.cumsum(dim=1) - stopped == 0
-        # Every market queue role has a head-input state, even after this
-        # action's STOP. Actions include STOP itself, never subsequent slots.
-        # Newborn units have observed actions but no recursively predicted state.
-        context_valid = torch.cat(
-            (
-                state_active,
-                torch.ones_like(market_kinds, dtype=torch.bool),
-                unit_active.bool(),
-                market_action_valid,
-            ),
-            dim=1,
+        valid_kinds = torch.where(market_action_valid, market_kinds, MarketKind.STOP.value)
+        valid_quantities = torch.where(
+            market_action_valid & self.quantified_market_kinds[valid_kinds],
+            market_quantities,
+            0,
         )
-        context = torch.cat((units, market, unit_action, market_action), dim=1)
-        query = torch.cat(
-            (
-                units + self.unit_identity.weight + self.type_identity.weight[0],
-                market + self.market_identity.weight + self.type_identity.weight[1],
-            ),
-            dim=1,
+        unit_action, market_action = self.action(
+            torch.where(action_active, unit_actions, 0),
+            valid_kinds,
+            valid_quantities,
+            torch.where(action_active.unsqueeze(-1), unit_categorical, 0),
+            action_active,
         )
-        transitioned = self.transition(
-            query, context, context_norm=self.context_norm, context_valid=context_valid
+        # Include STOP itself, but no later queue slots or inactive unit tokens.
+        # A newborn unit's action is valid even without a recurrent source state.
+        action = self.action_projection(
+            torch.cat(
+                (
+                    torch.where(action_active.unsqueeze(-1), unit_action, 0.0),
+                    torch.where(market_action_valid.unsqueeze(-1), market_action, 0.0),
+                ),
+                dim=1,
+            ).flatten(1)
         )
-        unit_delta, market_delta = (transitioned - query).split(
-            (units.shape[1], market.shape[1]), dim=1
-        )
-        return StructuredDecisionBelief(
-            torch.where(state_active.unsqueeze(-1), units + unit_delta, 0.0),
-            market + market_delta,
+        return ActorHeadBelief(
+            torch.where(state_active.unsqueeze(-1), self.unit_predictor(units, action), 0.0),
+            self.market_kind_predictor(belief.market_kind_decisions, action),
+            self.market_quantity_predictor(belief.market_quantity_decisions, action),
         )
 
 
@@ -112,47 +148,71 @@ class ActorDynamicsTerms(NamedTuple):
 
 def _actor_decode_kl(
     heads: DecodeHeads,
-    predicted: StructuredDecisionBelief,
-    target: StructuredDecisionBelief,
+    predicted: ActorHeadBelief,
+    target: ActorHeadBelief,
     masks: DecodeMasks,
     eligible: Tensor,
 ) -> DecodeKLTerms:
-    """Teacher-to-student KL through detached final policy projections only."""
-    teacher = heads.decode(torch.cat(tuple(value.detach() for value in target), dim=1))
-    return latent_decode_kl_terms(
-        torch.cat(predicted, dim=1),
-        teacher.unit_logits,
-        teacher.market_kind_logits,
-        teacher.market_quantity_context,
-        heads,
-        masks,
-        eligible,
-    )
+    """Sum head-mean teacher-to-student KL through the matching frozen readouts."""
+    row = eligible.bool().unsqueeze(-1)
+    # Keep decode/KL numerics consistent with DecodeHeads.decode; predictor
+    # execution remains under the caller's autocast context.
+    with torch.autocast(device_type=predicted.unit_decisions.device.type, enabled=False):
+        unit_kl, unit_weight = _decision_kl(
+            _frozen_linear(heads.unit_projection, predicted.unit_decisions.float()),
+            _frozen_linear(heads.unit_projection, target.unit_decisions.detach().float()),
+            masks.unit_masks,
+            (row & masks.unit_active).float(),
+        )
+        kind_kl, kind_weight = _decision_kl(
+            _frozen_linear(heads.market_kind, predicted.market_kind_decisions.float()),
+            _frozen_linear(heads.market_kind, target.market_kind_decisions.detach().float()),
+            masks.market_kind_masks,
+            (row & masks.market_active).float(),
+        )
+        student_quantity = _frozen_linear(
+            heads.market_quantity_context, predicted.market_quantity_decisions.float()
+        )
+        teacher_quantity = _frozen_linear(
+            heads.market_quantity_context, target.market_quantity_decisions.detach().float()
+        )
+        quantity_kl, quantity_weight = _decision_kl(
+            heads.quantity_logits(student_quantity, masks.market_kinds),
+            heads.quantity_logits(teacher_quantity, masks.market_kinds),
+            masks.market_quantity_masks,
+            (row & masks.market_quantity_active).float(),
+        )
+        unit = unit_kl / unit_weight.clamp_min(1.0)
+        kind = kind_kl / kind_weight.clamp_min(1.0)
+        quantity = quantity_kl / quantity_weight.clamp_min(1.0)
+    return DecodeKLTerms(unit + kind + quantity, unit, kind, quantity)
 
 
 def _actor_latent_loss(
-    predicted: StructuredDecisionBelief,
-    target: StructuredDecisionBelief,
+    predicted: ActorHeadBelief,
+    target: ActorHeadBelief,
     eligible: Tensor,
     unit_valid: Tensor,
     market_valid: Tensor,
+    quantity_valid: Tensor,
 ) -> Tensor:
-    """Mean SmoothL1 over eligible latent coordinates, not family means."""
+    """Sum three independently normalized eligible-coordinate SmoothL1 means."""
     total = predicted.unit_decisions.new_zeros((), dtype=torch.float32)
-    elements = total
-    for current, teacher, valid in zip(predicted, target, (unit_valid, market_valid), strict=True):
+    for current, teacher, valid in zip(
+        predicted, target, (unit_valid, market_valid, quantity_valid), strict=True
+    ):
         error = nn.functional.smooth_l1_loss(
             current.float(), teacher.detach().float(), reduction="none"
         )
         weight = (eligible.bool().unsqueeze(-1) & valid.bool()).float().unsqueeze(-1)
-        total = total + (error * weight).sum()
-        elements = elements + weight.sum() * current.shape[-1]
-    return total / elements.clamp_min(1)
+        elements = weight.sum() * current.shape[-1]
+        total = total + (error * weight).sum() / elements.clamp_min(1)
+    return total
 
 
 def _actor_loss(
     dynamics: nn.Module,
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     belief: StructuredDecisionBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
@@ -180,8 +240,13 @@ def _actor_loss(
         raise ValueError("actor plan does not cover the requested horizon")
     all_rows = torch.arange(rows, device=belief.unit_decisions.device)
     source = all_rows if plan is None else plan.indices[0]
-    predicted = (
+    source_belief = (
         belief if plan is None else StructuredDecisionBelief(*(value[source] for value in belief))
+    )
+    predicted = ActorHeadBelief(
+        source_belief.unit_decisions,
+        source_belief.market_decisions,
+        source_belief.market_decisions,
     )
     surviving_units = inputs.unit_active[source].bool()
     heads = DecodeHeads.from_actor(actor, normalized_units=True) if decision_horizon else None
@@ -193,7 +258,7 @@ def _actor_loss(
             positions = width - offset
             source = all_rows.reshape(-1, width)[:, :positions].flatten()
             previous_width = width if offset == 1 else positions + 1
-            predicted = StructuredDecisionBelief(
+            predicted = ActorHeadBelief(
                 *(
                     value.reshape(-1, previous_width, *value.shape[1:])[:, :positions].flatten(0, 1)
                     for value in predicted
@@ -235,7 +300,9 @@ def _actor_loss(
         surviving_units = surviving_units & inputs.unit_active[target_index].bool()
         residual = residual + _belief_rms_ratio(predicted, previous, eligible)
         eligible_sum = eligible_sum + eligible.float().sum()
-        target = StructuredDecisionBelief(*(value.detach()[target_index] for value in belief))
+        target_units = belief.unit_decisions.detach()[target_index]
+        target_market = belief.market_decisions.detach()[target_index]
+        target = ActorHeadBelief(target_units, target_market, target_market)
         if offset <= latent_horizon:
             latent = latent + _actor_latent_loss(
                 predicted,
@@ -243,6 +310,7 @@ def _actor_loss(
                 eligible,
                 surviving_units,
                 factors["market_active"][target_index],
+                factors["market_quantity_active"][target_index],
             )
         if offset <= decision_horizon:
             masks = DecodeMasks(
@@ -273,7 +341,7 @@ def _actor_loss(
 
 def actor_horizon_loss(
     dynamics: nn.Module,
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     belief: StructuredDecisionBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],
@@ -298,7 +366,7 @@ def actor_horizon_loss(
 
 def actor_window_loss(
     dynamics: nn.Module,
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     belief: StructuredDecisionBelief,
     inputs: StructuredInputs,
     factors: dict[str, Tensor],

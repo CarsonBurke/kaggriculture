@@ -322,7 +322,7 @@ def test_fused_structured_state_rejects_hybrid_portable_keys() -> None:
     state["trunk.farm_local.0.ffn.input.weight"] = torch.zeros(256, 128)
 
     with pytest.raises(RuntimeError, match="Unexpected key"):
-        _cpu_portable_structured_state(config.to_dict(), state)
+        _cpu_portable_structured_state(config.to_dict(), state, architecture="structured")
 
 
 @pytest.mark.parametrize(

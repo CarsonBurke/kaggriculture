@@ -30,25 +30,14 @@ import numpy as np
 import torch
 
 from kaggriculture.inference import load_actor_artifact
-from kaggriculture.model import FarmActor
 from kaggriculture.policy import (
     categorical_statistics,
     mean_off_diagonal,
     population_disagreement,
 )
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.ppo import _actor_batch_args, _actor_forward_fields
+from kaggriculture.registry import architecture_of, resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_self_play_rust
-
-#: The actor's forward arguments with the dtype the update path feeds them at
-#: (`ppo.py:667-670`): the rollout arena stores features as fp16 to halve its
-#: upload, and the model's own parameters are fp32, so reading the arena straight
-#: into the forward fails on the first convolution.
-_FORWARD_FIELDS: tuple[tuple[str, torch.dtype], ...] = (
-    ("board", torch.float32),
-    ("global_features", torch.float32),
-    ("units", torch.float32),
-    ("unit_positions", torch.long),
-)
 
 #: The heads this scores, as (name, logit field, mask field, active field). The
 #: mask says which actions are legal at all and the active flag which decisions
@@ -60,7 +49,7 @@ _HEADS = (
 )
 
 
-def _load(path: Path, device: torch.device) -> tuple[FarmActor, str]:
+def _load(path: Path, device: torch.device) -> tuple[torch.nn.Module, str]:
     """Load either a training checkpoint or an exported actor artifact."""
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "actor" in payload and "architecture" in payload:
@@ -71,16 +60,15 @@ def _load(path: Path, device: torch.device) -> tuple[FarmActor, str]:
     else:
         actor, provenance = load_actor_artifact(path)
         architecture = provenance["architecture"]
-    assert isinstance(actor, FarmActor)
     return actor.to(device).eval(), architecture
 
 
-def _forward(actor: FarmActor, states: dict[str, torch.Tensor]) -> Any:
+def _forward(actor: torch.nn.Module, states: dict[str, torch.Tensor]) -> Any:
     with torch.inference_mode():
-        return actor(*(states[name] for name, _ in _FORWARD_FIELDS))
+        return actor(*_actor_batch_args(architecture_of(actor).name, states, slice(None)))
 
 
-def _head_entropies(actor: FarmActor, states: dict[str, torch.Tensor]) -> dict[str, float]:
+def _head_entropies(actor: torch.nn.Module, states: dict[str, torch.Tensor]) -> dict[str, float]:
     """Mean entropy per policy head over a fixed batch of states.
 
     Reported through the update path's own masked math (`categorical_statistics`)
@@ -101,13 +89,13 @@ def _head_entropies(actor: FarmActor, states: dict[str, torch.Tensor]) -> dict[s
     return entropies
 
 
-def _unit_logits(actor: FarmActor, states: dict[str, torch.Tensor]) -> torch.Tensor:
+def _unit_logits(actor: torch.nn.Module, states: dict[str, torch.Tensor]) -> torch.Tensor:
     """The unit head's raw logits on a fixed batch, for the disagreement matrix."""
     return _forward(actor, states).unit_logits
 
 
 def _rollout_states(
-    actor: FarmActor,
+    actor: torch.nn.Module,
     *,
     architecture: str,
     games: int,
@@ -137,7 +125,11 @@ def _rollout_states(
     valid = np.flatnonzero(np.asarray(rollout.valid).reshape(-1))
     index = np.random.default_rng(seed).permutation(valid)[:rows]
     fields: dict[str, tuple[np.ndarray, torch.dtype | None]] = {
-        name: (np.asarray(rollout.states[name]), dtype) for name, dtype in _FORWARD_FIELDS
+        name: (
+            np.asarray(rollout.unit_active if name == "unit_active" else rollout.states[name]),
+            dtype,
+        )
+        for name, dtype in _actor_forward_fields(architecture)
     }
     for _, _, mask_field, active_field in _HEADS:
         fields[mask_field] = (np.asarray(getattr(rollout, mask_field)), torch.bool)

@@ -40,7 +40,6 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from kaggriculture.ppo import actor_forward_args
-from kaggriculture.production import production_model_config
 from kaggriculture.registry import STRUCTURED
 from kaggriculture.rollout import _state_field_specs
 from kaggriculture.structured import StructuredActor, StructuredConfig
@@ -98,7 +97,7 @@ def _time_step(model, forward_args, dtype: torch.dtype) -> tuple[float, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=6400, help="states per minibatch, production")
+    parser.add_argument("--rows", type=int, default=6400, help="states per legacy D80 minibatch")
     parser.add_argument("--repeats", type=int, default=20, help="timed steps per arm")
     parser.add_argument("--warmup", type=int, default=4, help="untimed steps per arm")
     parser.add_argument("--seed", type=int, default=20260812)
@@ -114,7 +113,25 @@ def main() -> None:
     dtype = getattr(torch, arguments.dtype)
     torch.manual_seed(arguments.seed)
 
-    base = production_model_config()
+    # Historical D80 tile-memory ablation, independent of the production family.
+    base = StructuredConfig(
+        model_dim=80,
+        attention_heads=4,
+        attention_kv_heads=2,
+        ffn_multiplier=2,
+        farm_blocks=2,
+        opponent_latents=8,
+        latents=32,
+        core_layers=8,
+        quantity_rank=32,
+        input_reinject_layers=(1, 2, 3, 4, 5, 6, 7, 8),
+        core_skip_source=3,
+        core_skip_target=6,
+        mudd_lite=True,
+        fuse_market_decoder=True,
+        global_modulation=True,
+        zero_init_branches=False,
+    ).to_dict()
     # The null arm is a second `on` actor. Ordering puts it last so that any
     # monotone drift in machine state over the run counts against the null gap
     # rather than hiding inside it.

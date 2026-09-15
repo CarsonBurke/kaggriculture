@@ -571,6 +571,8 @@ def test_lookup_updates_ignore_other_rows_even_with_a_tied_projection() -> None:
         torch.testing.assert_close(
             module.vocabulary.weight[0], isolated.vocabulary.weight[0], rtol=0, atol=0
         )
+
+
 def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
     actor, critic = _production_modules()
     config = PpoConfig()
@@ -740,11 +742,25 @@ def test_an_unusable_weight_decay_is_rejected(value: float) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
+        ),
+    ],
+)
 @pytest.mark.parametrize("weight_decay", [0.0, 1.2])
 @pytest.mark.parametrize("shape", [(24, 24), (48, 16), (16, 48)])
 def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
     shape: tuple[int, int],
     weight_decay: float,
+    device: str,
 ) -> None:
     """One optimizer over many same-shaped matrices must not couple them.
 
@@ -755,12 +771,12 @@ def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
     on which other parameters happened to share its shape -- so compare a group
     of five against five optimizers holding one matrix each. Gated packed
     gradients must match ungated reference steps, including after a skipped
-    non-finite minibatch and when one matrix has no gradient.
+    non-finite minibatch, a NaN skip gate, a zero gradient, and a missing gradient.
     """
 
     torch.manual_seed(11)
     count = 5
-    together = [torch.nn.Parameter(torch.randn(shape)) for _ in range(count)]
+    together = [torch.nn.Parameter(torch.randn(shape, device=device)) for _ in range(count)]
     apart = [torch.nn.Parameter(parameter.detach().clone()) for parameter in together]
     grouped = NorMuon(
         together,
@@ -781,7 +797,7 @@ def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
     ]
 
     generator = torch.Generator().manual_seed(12)
-    for iteration, gate in enumerate((None, 0.0, 2.0, 0.0)):
+    for iteration, gate in enumerate((None, 0.0, 2.0, float("nan"), 0.0)):
         skipped = gate is not None and gate != 0
         original_gradients = []
         before = [parameter.detach().clone() for parameter in together]
@@ -789,16 +805,18 @@ def test_batching_a_shape_group_steps_each_matrix_as_if_it_were_alone(
         for index in range(count):
             gradient = (
                 None
-                if iteration == 3 and index == 2
-                else torch.full(shape, float("inf"))
+                if iteration == 4 and index == 2
+                else torch.full(shape, float("inf"), device=device)
                 if skipped
-                else torch.randn(shape, generator=generator)
+                else torch.zeros(shape, device=device)
+                if iteration == 1 and index == 0
+                else torch.randn(shape, generator=generator).to(device)
             )
             together[index].grad = gradient
             apart[index].grad = None if gradient is None else gradient.clone()
             original_gradients.append(None if gradient is None else gradient.clone())
         if gate is not None:
-            grouped.found_inf = torch.tensor(gate)
+            grouped.found_inf = torch.tensor(gate, device=device)
         grouped.step()
         if gate is not None:
             del grouped.found_inf

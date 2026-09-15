@@ -48,6 +48,7 @@ PACKAGE_FILES = (
     "actions.py",
     "constants.py",
     "encoding.py",
+    "entity.py",
     "inference.py",
     "evaluation.py",
     "model.py",

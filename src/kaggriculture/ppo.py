@@ -19,6 +19,7 @@ from kaggriculture.actor_dynamics import (
     actor_window_loss,
 )
 from kaggriculture.constants import DEFAULT_REWARD_GAMMA, EPISODE_STEPS, STARTING_MONEY
+from kaggriculture.entity import EntityActor, EntityCritic
 from kaggriculture.model import (
     DistributionalCritic,
     FarmActor,
@@ -30,7 +31,12 @@ from kaggriculture.model import (
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.policy import component_logprobs, component_selected_logprobs
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
-from kaggriculture.registry import CONV_ENTITY, STRUCTURED
+from kaggriculture.registry import (
+    CONV_ENTITY,
+    STRUCTURED,
+    architecture_of_config,
+    resolve_architecture,
+)
 from kaggriculture.rollout import RolloutBatch
 from kaggriculture.structured import (
     StructuredActor,
@@ -51,8 +57,8 @@ from kaggriculture.structured_dynamics import (
     structured_horizon_plan,
 )
 
-Critic = DistributionalCritic | StructuredCritic
-Actor = FarmActor | StructuredActor
+Critic = DistributionalCritic | StructuredCritic | EntityCritic
+Actor = FarmActor | StructuredActor | EntityActor
 
 #: VAPO temporal defaults: Monte Carlo critic targets, shorter actor GAE traces.
 #: Actor lambda uses alpha=0.05 and the full game's EPISODE_STEPS - 1 transitions.
@@ -251,8 +257,8 @@ class PpoConfig:
     # is a replay at a KL that does not bind.
     critic_epochs: int | None = None
     # Keep physical batches larger without consuming the last VRAM headroom.
-    # Balanced partitioning covers the full wave without a small final tail.
-    minibatch_size: int = 6400
+    # Fixed-shape partitioning covers the full wave; the final batch pads with zero weights.
+    minibatch_size: int = 8192
     # Component scope clips each conditional decision independently; joint scope
     # clips the product of all active conditional probabilities in one state.
     policy_ratio_scope: str = "components"
@@ -361,12 +367,13 @@ class PpoConfig:
     # shape, and inference artifacts on their historical paths. When active,
     # minibatches are contiguous episode runs so h_t and h_{t+1} come from one
     # trunk forward, as in NextLat.
+    # Actor terms sum independently normalized unit/kind/quantity head losses.
     structured_latent_coefficient: float = 0.0
     structured_decision_coefficient: float = 0.0
     structured_decision_horizon: int = 2
     # Predictor parameters live in a separate optimizer so they are not in the
     # actor/critic state dicts consumed by snapshots. They step on the same
-    # minibatches as the trunk, balancing main/auxiliary source cotangents 50/50.
+    # minibatches as the trunk, adding the configured auxiliary losses directly.
     # The source remains attached whenever its model updates; successor targets
     # and auxiliary readout weights are always stop-gradient.
     structured_learning_rate: float | None = None
@@ -563,7 +570,7 @@ def _validate_structured_auxiliary_modules(
     config: PpoConfig,
 ) -> None:
     active = config.structured_actor_auxiliary_active
-    if active and not isinstance(actor, StructuredActor):
+    if active and not architecture_of_config(actor.config).structured_inputs:
         raise ValueError("structured auxiliary coefficients require a structured actor")
     if active != (dynamics is not None):
         state = "requires" if active else "does not admit"
@@ -581,7 +588,7 @@ def _validate_structured_critic_auxiliary_modules(
     config: PpoConfig,
 ) -> None:
     active = config.structured_critic_auxiliary_active
-    if active and not isinstance(critic, StructuredCritic):
+    if active and not architecture_of_config(critic.config).structured_inputs:
         raise ValueError("structured critic auxiliary coefficients require a structured critic")
     if active != (dynamics is not None):
         state = "requires" if active else "does not admit"
@@ -650,11 +657,8 @@ _ACTOR_FORWARD_FIELDS: dict[str, tuple[tuple[str, torch.dtype], ...]] = {
 
 def _actor_forward_fields(architecture: str) -> tuple[tuple[str, torch.dtype], ...]:
     """The named architecture's forward fields, or a caller-actionable refusal."""
-    try:
-        return _ACTOR_FORWARD_FIELDS[architecture]
-    except KeyError:
-        known = ", ".join(sorted(_ACTOR_FORWARD_FIELDS))
-        raise ValueError(f"unknown actor architecture {architecture!r}; known: {known}") from None
+    family = resolve_architecture(architecture)
+    return _ACTOR_FORWARD_FIELDS[STRUCTURED if family.structured_inputs else CONV_ENTITY]
 
 
 def _actor_forward_tuple(architecture: str, batched: dict[str, Tensor]) -> tuple[Any, ...]:
@@ -779,7 +783,9 @@ def _replayed_value_chunk(
         enabled=autocast_enabled,
     ):
         if include_entities:
-            if not isinstance(critic, StructuredCritic) or not critic.config.per_entity_critic:
+            if not isinstance(critic, StructuredCritic) or not getattr(
+                critic.config, "per_entity_critic", False
+            ):
                 raise ValueError("entity replay requires a per-entity structured critic")
             global_logits, belief = critic.forward_with_belief(*critic_args)
             critic_logits = torch.cat(
@@ -849,18 +855,22 @@ def replay_behavior_values(
     was_training = critic.training
     critic.eval()
     try:
-        values = [
-            forward(
+        values = None
+        for index, chunk in enumerate(chunks):
+            _begin_update_graph_step(compile_mode, device)
+            chunk_values = forward(
                 critic,
                 autocast_enabled,
                 *_critic_batch_args(architecture, staged, chunk),
                 include_entities=include_entities,
             )
-            for chunk in chunks
-        ]
+            if values is None:
+                values = chunk_values.new_empty((chunk_count * chunk_size, *chunk_values.shape[1:]))
+            values[index * chunk_size : (index + 1) * chunk_size].copy_(chunk_values)
     finally:
         critic.train(was_training)
-    return torch.cat(values)[:row_count].float()
+    assert values is not None
+    return values[:row_count].float()
 
 
 def _owned_valid(rollout: RolloutBatch, rows: np.ndarray | None) -> np.ndarray:
@@ -1059,9 +1069,15 @@ def make_optimizers(
     critic_device = next(critic.parameters()).device
     if actor_device != critic_device:
         raise ValueError("actor and critic must use the same device")
-    if config.structured_actor_auxiliary_active and not isinstance(actor, StructuredActor):
+    if (
+        config.structured_actor_auxiliary_active
+        and not architecture_of_config(actor.config).structured_inputs
+    ):
         raise ValueError("structured auxiliary coefficients require a structured actor")
-    if config.structured_critic_auxiliary_active and not isinstance(critic, StructuredCritic):
+    if (
+        config.structured_critic_auxiliary_active
+        and not architecture_of_config(critic.config).structured_inputs
+    ):
         raise ValueError("structured critic auxiliary coefficients require a structured critic")
     if config.optimizer == "normuon":
         # One learning rate per network drives both halves: the matrices under
@@ -1453,6 +1469,7 @@ def replay_behavior_logprobs(
     positions, counts = _fixed_minibatch_positions(valid_indices.size, minibatch_size)
     staged_positions = torch.from_numpy(positions).to(device=device)
     for batch in range(positions.shape[0]):
+        _begin_update_graph_step(compile_mode, device)
         indices = ordered[staged_positions[batch]]
         unit_logprobs, kind_logprobs, quantity_logprobs = replay(
             actor,
@@ -1488,6 +1505,12 @@ def _device_compile_mode(mode: str, device: torch.device) -> str:
     return mode if device.type == "cuda" else UNCOMPILED_UPDATE_COMPILE_MODE
 
 
+def _begin_update_graph_step(mode: str, device: torch.device) -> None:
+    """Keep all compiled calls sharing live outputs in one logical iteration."""
+    if device.type == "cuda" and mode in ("reduce-overhead", "max-autotune"):
+        torch.compiler.cudagraph_mark_step_begin()
+
+
 def _cached_update_callable(module: torch.nn.Module, attribute: str, function, mode: str):
     """Compile an update computation, cached per module and mode.
 
@@ -1496,54 +1519,11 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function, m
     slot would hand back the first mode's artifact under a later mode's name,
     silently reporting one configuration's cost as another's.
 
-    Which mode is worth its cost is a measured question, not an assumed one. The
-    earlier version of this helper compiled with Inductor's default mode and
-    justified refusing CUDA graphs on the claim that capturing the update's
-    forward+backward "would permanently pin every minibatch's activations in
-    private pools". That is false, and false in the opposite direction. Measured
-    by `scripts/profile_update_backends.py` over its measured baseline schedule
-    -- 73 actor and 292 critic minibatches at 2048 -- as wall clock / peak
-    reserved / compile time:
-
-        eager                        41.444 s   11.34 GiB     0.8 s
-        default                      17.107 s   11.34 GiB    34.3 s
-        reduce-overhead              17.026 s    8.44 GiB    29.2 s
-        max-autotune                 16.152 s    8.43 GiB   522.6 s
-        max-autotune-no-cudagraphs   16.377 s   16.76 GiB   204.4 s
-
-    Compilation itself is worth 2.42x and is not optional. `max-autotune` is a
-    net loss despite being fastest: 0.955 s per iteration over a 500-iteration
-    run saves 8.0 minutes and costs 8.7 minutes compiling, and it is the same
-    trap as the collection knob -- a mode that wins the microbenchmark and loses
-    the run.
-
-    The memory column above is a warmup artifact, not a footprint, and an earlier
-    revision of this docstring drew a conclusion from it: that graph capture
-    reserves 2.9 GiB less because the graph pool is reused where the caching
-    allocator otherwise fragments. `scripts/sweep_update_batch.py` measures the
-    same schedule with a full untimed schedule discarded before
-    `reset_peak_memory_stats`, rather than a single warmup minibatch pair, and
-    reads 8.45 GiB for `default` against 8.47 GiB for `reduce-overhead` -- equal.
-    Its wall clock reproduces the table above to within 0.4%, so the two
-    harnesses disagree only about memory, and the 11.34 GiB is first-schedule
-    allocator growth that one warmup pair does not reach. Steady-state reserved
-    is the same in both modes; `reduce-overhead`'s only measured advantage is a
-    lower cold compile (29.0 s against 43.9 s at 4096 rows). Note also that
-    `max_memory_allocated` cannot be compared across these modes at all: CUDA
-    graph private pools are excluded from it, so capture reports 0.09 GiB
-    allocated against 8.47 GiB reserved. Only reserved is comparable.
-
-    What the modes cannot buy is launch overhead, because this path does not pay
-    any. Wall clock equals summed device time to within 0.4% at 2048 and 4096
-    rows in both compiled modes and in eager, and `reduce-overhead` removes 97.5%
-    of the host launch submissions -- 906 launch API calls per actor minibatch
-    down to 23 -- for a 0.2% change in wall clock. A compiled actor minibatch is
-    906 kernels over 55.4 ms of device time, about 61 us each, so the GPU is
-    saturated and the launches hide behind it. Compilation's 2.42x is fusion
-    doing less total device work, not fewer launches: eager runs 1967 actor
-    kernels over 143.6 ms against compiled's 907 over 56.2 ms. The consequence is
-    that this phase shortens only by reducing device work -- fusion, precision,
-    architecture, or fewer minibatches -- and not by launch-count engineering.
+    CUDA-graph modes require explicit minibatch boundaries: actor gradients
+    survive the critic's compiled calls until the guarded optimizer step.
+    Replay-only chunks own their copied results before advancing the boundary.
+    Measure modes on the actual model and schedule; historical launch-overhead
+    measurements on other architectures do not establish the best mode here.
 
     The compiled wrapper is attached outside the module hierarchy so checkpoints
     stay clean.
@@ -1667,7 +1647,7 @@ class _BalancedSource(torch.autograd.Function):
 
 
 def _structured_actor_minibatch_terms(
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     unit_actions: Tensor,
     market_kinds: Tensor,
     market_quantities: Tensor,
@@ -1802,7 +1782,9 @@ def _critic_logits_and_loss(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        if isinstance(critic, StructuredCritic) and critic.config.per_entity_critic:
+        if isinstance(critic, StructuredCritic) and getattr(
+            critic.config, "per_entity_critic", False
+        ):
             critic_logits, belief = critic.forward_with_belief(*critic_args)
             entity_logits = critic.decode_entity_belief(belief)
         else:
@@ -1918,7 +1900,7 @@ def _critic_minibatch_fit_terms(
 
 
 def _structured_critic_minibatch_fit_terms(
-    critic: StructuredCritic,
+    critic: StructuredCritic | EntityCritic,
     value_targets: Tensor,
     autocast_enabled: bool,
     *critic_args: Any,
@@ -1934,21 +1916,23 @@ def _structured_critic_minibatch_fit_terms(
     ):
         belief = critic.encode_belief(*critic_args)
         primary_belief = belief
-        if critic.config.per_entity_critic:
+        if getattr(critic.config, "per_entity_critic", False):
             belief = StructuredCriticBelief(belief.value_decision[:, :1])
         if balance_auxiliary:
-            if critic.config.per_entity_critic:
+            if getattr(critic.config, "per_entity_critic", False):
                 primary_belief_entities = primary_belief.value_decision[:, 1:]
             primary, auxiliary = _BalancedSource.apply(belief.value_decision)
             primary_belief = StructuredCriticBelief(primary)
-            if critic.config.per_entity_critic:
+            if getattr(critic.config, "per_entity_critic", False):
                 primary_belief = StructuredCriticBelief(
                     torch.cat((primary, primary_belief_entities), dim=1)
                 )
             belief = StructuredCriticBelief(auxiliary)
         critic_logits = critic.decode_belief(primary_belief)
         entity_logits = (
-            critic.decode_entity_belief(primary_belief) if critic.config.per_entity_critic else None
+            critic.decode_entity_belief(primary_belief)
+            if getattr(critic.config, "per_entity_critic", False)
+            else None
         )
     loss = _critic_readout_objective(
         critic,
@@ -2063,6 +2047,7 @@ def update_replay_parity(
     positions, counts = _fixed_minibatch_positions(valid_indices.size, minibatch_size)
     staged_positions = torch.from_numpy(positions).to(device=device)
     for batch in range(positions.shape[0]):
+        _begin_update_graph_step(compile_mode, device)
         indices = ordered[staged_positions[batch]]
         # The replay runs the padded shape so it compiles once, but this is an
         # audit: the wrapped tail's repeated rows are excluded from every sum so
@@ -2234,6 +2219,7 @@ def _replay_to_update_minibatch_kl(
         (np.arange(minibatch_size)[None, :] < counts[:, None]).astype(np.float32)
     ).to(device=device)
     for batch in range(positions.shape[0]):
+        _begin_update_graph_step(resolved_mode, device)
         indices = shuffled_device[staged_positions[batch]]
         component_count = int(
             flat_component_counts[shuffled[positions[batch, : counts[batch]]]].sum()
@@ -2612,7 +2598,7 @@ def _structured_transition_order(
 
 
 def _structured_auxiliary_terms(
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     dynamics: ActorDynamics,
     staged: dict[str, Tensor],
     indices: Tensor,
@@ -2717,7 +2703,7 @@ _STRUCTURED_CRITIC_AUXILIARY_METRICS = ("latent", "value", "eligible", "residual
 
 
 def _structured_critic_auxiliary_terms(
-    critic: StructuredCritic,
+    critic: StructuredCritic | EntityCritic,
     dynamics: StructuredCriticDynamics,
     staged: dict[str, Tensor],
     indices: Tensor,
@@ -2766,7 +2752,7 @@ def _structured_critic_auxiliary_terms(
                 _, belief = critic.forward_with_belief(*critic_args)
         else:
             raise ValueError("belief indices and inverse must be supplied together")
-        if critic.config.per_entity_critic:
+        if getattr(critic.config, "per_entity_critic", False):
             belief = StructuredCriticBelief(belief.value_decision[:, :1])
         loss_function = (
             structured_critic_window_loss if complete_windows else structured_critic_horizon_loss
@@ -2894,7 +2880,7 @@ def _elapsed_cuda_seconds(start: torch.cuda.Event | None, end: torch.cuda.Event 
 
 
 def _structured_actor_belief(
-    actor: StructuredActor, autocast_enabled: bool, inputs: StructuredInputs
+    actor: StructuredActor | EntityActor, autocast_enabled: bool, inputs: StructuredInputs
 ) -> StructuredDecisionBelief:
     with torch.autocast(
         device_type=inputs.tile_categorical.device.type,
@@ -2949,6 +2935,7 @@ def _warm_actor_update_graphs(
     warmed = getattr(actor, "_kaggriculture_warmed_update_graphs", None)
     if warmed is not None and key in warmed:
         return
+    _begin_update_graph_step(config.update_compile_mode, indices.device)
     actor_optimizer.zero_grad(set_to_none=True)
     if structured_dynamics is not None:
         structured_dynamics.zero_grad(set_to_none=True)
@@ -2989,7 +2976,7 @@ def _warm_actor_update_graphs(
         ).clamp_min(1)
     loss = -actor_pack[0] / policy_denominator
     if structured_terms_fn is not None:
-        assert isinstance(actor, StructuredActor)
+        assert architecture_of_config(actor.config).structured_inputs
         assert structured_dynamics is not None
         belief = StructuredDecisionBelief(*actor_pack[5:])
         auxiliary_loss, _ = structured_terms_fn(
@@ -3055,7 +3042,9 @@ def update_ppo(
     arrays.
     """
     _validate_config(config)
-    entity_critic = isinstance(critic, StructuredCritic) and critic.config.per_entity_critic
+    entity_critic = isinstance(critic, StructuredCritic) and getattr(
+        critic.config, "per_entity_critic", False
+    )
     if entity_critic:
         if config.actor_gae_lambda != 1.0 or config.critic_gae_lambda != 1.0:
             raise ValueError("per-entity critic requires actor and critic GAE lambda one")
@@ -3186,7 +3175,7 @@ def update_ppo(
     structured_terms_fn: Any = None
     structured_critic_terms_fn: Any = None
     if actor_predictor_active:
-        assert isinstance(actor, StructuredActor)
+        assert architecture_of_config(actor.config).structured_inputs
         assert structured_dynamics is not None
         assert structured_dynamics_optimizer is not None
         structured_terms_fn = _cached_update_callable(
@@ -3197,7 +3186,7 @@ def update_ppo(
         )
         structured_dynamics.zero_grad(set_to_none=True)
     if critic_predictor_active:
-        assert isinstance(critic, StructuredCritic)
+        assert architecture_of_config(critic.config).structured_inputs
         assert structured_critic_dynamics is not None
         assert structured_critic_dynamics_optimizer is not None
         structured_critic_terms_fn = _cached_update_callable(
@@ -3487,6 +3476,9 @@ def update_ppo(
             )
 
         for batch_number in range(minibatch_positions.shape[0]):
+            # Actor gradients and metrics remain live through critic backward
+            # and both optimizer steps, not merely one compiled invocation.
+            _begin_update_graph_step(compile_mode, device)
             host_indices = shuffled[minibatch_positions[batch_number]]
             indices = shuffled_device[staged_positions[batch_number]]
             horizon_plan = horizon_plans[batch_number] if horizon_plans else None
@@ -3583,7 +3575,7 @@ def update_ppo(
                 policy_loss = -policy_sum / policy_denominator
                 entropy_mean = entropy_sum / component_denominator
                 if actor_predictor_active:
-                    assert isinstance(actor, StructuredActor)
+                    assert architecture_of_config(actor.config).structured_inputs
                     assert structured_dynamics is not None
                     assert structured_dynamics_optimizer is not None
                     assert structured_terms_fn is not None
@@ -3695,7 +3687,7 @@ def update_ppo(
                 if guard_event is not None:
                     guard_event.record()
             elif actor_predictor_active:
-                assert isinstance(actor, StructuredActor)
+                assert architecture_of_config(actor.config).structured_inputs
                 assert structured_dynamics is not None
                 assert structured_dynamics_optimizer is not None
                 assert structured_terms_fn is not None
@@ -3834,7 +3826,7 @@ def update_ppo(
                     entity_active=minibatch_entity_active,
                 )
             if critic_predictor_active:
-                assert isinstance(critic, StructuredCritic)
+                assert architecture_of_config(critic.config).structured_inputs
                 assert structured_critic_dynamics is not None
                 assert structured_critic_dynamics_optimizer is not None
                 assert structured_critic_terms_fn is not None

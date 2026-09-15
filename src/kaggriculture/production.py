@@ -10,11 +10,12 @@ from typing import Any
 
 from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.evaluation import DEVELOPMENT_SEED_START
+from kaggriculture.modelargs import model_config_arguments
 from kaggriculture.provenance import repository_root
-from kaggriculture.registry import STRUCTURED
+from kaggriculture.registry import ENTITY_ATTENTION, resolve_architecture
 from kaggriculture.rollout import REWARD_MODES
 
-PRODUCTION_ARCHITECTURE = STRUCTURED
+PRODUCTION_ARCHITECTURE = ENTITY_ATTENTION
 PRODUCTION_CRITIC_WARMUP_ITERATIONS = 10
 PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 
@@ -124,53 +125,10 @@ PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
 
 
 def production_model_config() -> dict[str, Any]:
-    """Return the complete JSON-persisted structured production model contract."""
-    from kaggriculture.structured import StructuredConfig
+    """Return the complete JSON-persisted entity-attention production contract."""
+    from kaggriculture.entity import EntityConfig
 
-    config = StructuredConfig(
-        model_dim=80,
-        attention_heads=4,
-        attention_kv_heads=2,
-        ffn_multiplier=2,
-        farm_blocks=2,
-        opponent_latents=8,
-        latents=32,
-        core_layers=8,
-        quantity_rank=32,
-        global_refresh_layers=(),
-        global_refresh_context="none",
-        # nanogpt residual transports. Gates start at 0 so they are identity
-        # until trained: x0 into every core layer, U-net skip 3→6, late MUDD.
-        input_reinject_layers=(1, 2, 3, 4, 5, 6, 7, 8),
-        core_skip_source=3,
-        core_skip_target=6,
-        zero_init_branches=False,
-        mudd_lite=True,
-        fuse_market_decoder=True,
-        fuse_unit_decoder=False,
-        split_clock_token=False,
-        global_modulation=True,
-        fused_mlp=False,
-        critic_core_layers=0,
-        critic_latents=0,
-        # Stated rather than defaulted because it is the largest unresolved
-        # question about this architecture's cost: the opponent farm is 30% of
-        # the actor's forward bytes and the ablation in
-        # `scripts/ablate_opponent_farm.py` cannot find a policy that uses it.
-        # Production keeps it until a learning A/B says the score rate does not
-        # need it; the critic reads both farms either way.
-        actor_opponent_farm=True,
-        value_atoms=255,
-        value_min=-2.2,
-        value_max=2.2,
-        value_sigma_ratio=3.0,
-        scalar_value=False,
-    ).to_dict()
-    # Benchmark reports pass through JSON before the calibrated launcher reads
-    # them, so tuple-valued layer schedules are lists in the persisted contract.
-    return {
-        name: list(value) if isinstance(value, tuple) else value for name, value in config.items()
-    }
+    return EntityConfig().to_dict()
 
 
 def production_ppo_config(
@@ -178,7 +136,7 @@ def production_ppo_config(
 ) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    With 230,080 states, a 6400-row ceiling produces 36 balanced minibatches per
+    With 230,080 states, an 8192-row ceiling produces 29 fixed-shape minibatches per
     epoch. Production is one actor epoch and one critic epoch on the same wave:
     a second same-wave critic pass memorized holdout, and a second actor pass
     is a replay at a KL that does not bind. Actor and critic run on the same
@@ -377,58 +335,7 @@ def build_training_command(
             str(DEVELOPMENT_SEED_START),
             "--architecture",
             PRODUCTION_ARCHITECTURE,
-            "--model-dim",
-            str(model["model_dim"]),
-            "--attention-heads",
-            str(model["attention_heads"]),
-            "--attention-kv-heads",
-            str(model["attention_kv_heads"]),
-            "--ffn-multiplier",
-            str(model["ffn_multiplier"]),
-            "--farm-blocks",
-            str(model["farm_blocks"]),
-            "--opponent-latents",
-            str(model["opponent_latents"]),
-            "--latents",
-            str(model["latents"]),
-            "--core-layers",
-            str(model["core_layers"]),
-            "--quantity-rank",
-            str(model["quantity_rank"]),
-            "--global-refresh-layers",
-            ",".join(str(layer) for layer in model["global_refresh_layers"]),
-            "--global-refresh-context",
-            str(model["global_refresh_context"]),
-            "--input-reinject-layers",
-            ",".join(str(layer) for layer in model["input_reinject_layers"]),
-            "--core-skip-source",
-            str(model["core_skip_source"]),
-            "--core-skip-target",
-            str(model["core_skip_target"]),
-            "--zero-init-branches",
-            str(model["zero_init_branches"]).lower(),
-            "--mudd-lite",
-            str(model["mudd_lite"]).lower(),
-            "--fuse-market-decoder",
-            str(model["fuse_market_decoder"]).lower(),
-            "--fuse-unit-decoder",
-            str(model["fuse_unit_decoder"]).lower(),
-            "--split-clock-token",
-            str(model["split_clock_token"]).lower(),
-            "--global-modulation",
-            str(model["global_modulation"]).lower(),
-            "--fused-mlp",
-            str(model["fused_mlp"]).lower(),
-            "--critic-core-layers",
-            str(model["critic_core_layers"]),
-            "--critic-latents",
-            str(model["critic_latents"]),
-            "--scalar-value",
-            str(model["scalar_value"]).lower(),
-            "--per-entity-critic",
-            str(model["per_entity_critic"]).lower(),
-            "--value-sigma-ratio",
-            str(model["value_sigma_ratio"]),
+            *model_config_arguments(resolve_architecture(PRODUCTION_ARCHITECTURE), model),
             "--actor-lr",
             str(ppo["actor_learning_rate"]),
             "--critic-lr",

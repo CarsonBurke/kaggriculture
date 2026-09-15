@@ -49,7 +49,6 @@ from kaggriculture.production import (
 )
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, collect_self_play_rust
-from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
 
@@ -130,8 +129,8 @@ def main() -> None:
     )
     entry = resolve_architecture(state["architecture"])
     model_config = entry.build_config(state["model_config"])
-    if not isinstance(model_config, StructuredConfig):
-        raise ValueError("production auxiliary recovery requires a structured model")
+    if not entry.structured_inputs:
+        raise ValueError("production auxiliary recovery requires a structured-input model")
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
     actor.load_state_dict(member_state["actor"])

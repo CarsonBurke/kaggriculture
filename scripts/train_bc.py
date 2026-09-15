@@ -48,6 +48,7 @@ import numpy as np
 import torch
 
 from kaggriculture.encoding import encode_observation
+from kaggriculture.entity import EntityActor
 from kaggriculture.evaluation import validate_seed_interval
 from kaggriculture.inference import ACTOR_ARTIFACT_FORMAT_VERSION
 from kaggriculture.latent_dynamics import (
@@ -151,6 +152,10 @@ def _apply_production_model_defaults(
             "--production-model owns the production architecture; remove conflicting "
             + ", ".join(conflicts)
         )
+    try:
+        model_config_from_args(architecture, args)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
@@ -456,7 +461,9 @@ def _encoding_cache_schema(architecture: str) -> str:
         raise RuntimeError(f"source identity is missing encoding inputs: {missing}")
     payload = {
         "format_version": BC_ENCODING_CACHE_FORMAT_VERSION,
-        "architecture": architecture,
+        "architecture": STRUCTURED
+        if resolve_architecture(architecture).structured_inputs
+        else architecture,
         "files": {name: files[name] for name in sorted(_ENCODING_SOURCE_FILES)},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -515,7 +522,7 @@ def _encode_episode_file(
         )
         arrays["units"] = np.stack([row.units for row in encoded]).astype(np.float16)
         arrays["unit_positions"] = np.stack([row.unit_positions for row in encoded]).astype(np.int8)
-    elif architecture_name == STRUCTURED:
+    elif resolve_architecture(architecture_name).structured_inputs:
         encoded = [
             encode_structured_observation(entry["observation"], entry["opponent_private"])
             for entry in raw["observations"]
@@ -798,7 +805,7 @@ def _masked_mean(values: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
 
 
 def _clone_loss_from_output(
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     output: ActorOutput,
     factors: dict[str, torch.Tensor],
 ) -> torch.Tensor:
@@ -828,7 +835,7 @@ def _clone_loss_from_output(
 
 
 def _clone_loss(
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     actor_args: tuple[Any, ...],
     factors: dict[str, torch.Tensor],
     autocast: bool,
@@ -1020,7 +1027,7 @@ def _clone_and_structured_loss(
 @torch.no_grad()
 def evaluate(
     architecture: str,
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     tensors: DemonstrationTensors,
     *,
     batch_size: int,
@@ -1130,7 +1137,7 @@ def _structured_belief_diagnostics(
 
 def _artifact_payload(
     architecture: str,
-    actor: FarmActor | StructuredActor,
+    actor: FarmActor | StructuredActor | EntityActor,
     config: Any,
     metrics: dict[str, float],
     bc_provenance: dict[str, Any],
@@ -1393,10 +1400,13 @@ def train(
         raise ValueError("latent coefficients must be finite and nonnegative")
     entity_active = any(entity_coefficients)
     structured_active = any(structured_coefficients)
-    if entity_active and architecture == STRUCTURED:
-        raise ValueError("structured actors require the typed structured auxiliary")
-    if structured_active and architecture != STRUCTURED:
-        raise ValueError("structured auxiliary coefficients require --architecture structured")
+    family = resolve_architecture(architecture)
+    if entity_active and family.structured_inputs:
+        raise ValueError("convolutional latent auxiliary does not support structured-input actors")
+    if structured_active and not family.full_belief:
+        raise ValueError(
+            "legacy full-belief BC auxiliary coefficients require --architecture structured"
+        )
     if entity_active and structured_active:
         raise ValueError("entity and structured auxiliaries cannot be active together")
     if (structured_latent_coefficient or structured_decision_coefficient) and (
@@ -1778,7 +1788,7 @@ def train(
                 "seconds": time.perf_counter() - started,
                 **{f"holdout_{name}": value for name, value in holdout.items()},
             }
-            if architecture == STRUCTURED:
+            if resolve_architecture(architecture).full_belief:
                 if not isinstance(actor, StructuredActor):
                     raise TypeError("structured architecture resolved a non-structured actor")
                 record.update(

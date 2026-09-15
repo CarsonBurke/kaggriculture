@@ -49,6 +49,7 @@ from kaggriculture.constants import (
     PRODUCTS,
     QUANTITY_BINS,
 )
+from kaggriculture.entity import EntityActor
 from kaggriculture.inference import load_actor_artifact
 from kaggriculture.policy import (
     MarketLedger,
@@ -56,7 +57,7 @@ from kaggriculture.policy import (
     _ledger_kind_mask,
     _ledger_quantity_mask,
 )
-from kaggriculture.registry import STRUCTURED
+from kaggriculture.registry import STRUCTURED, architecture_of
 from kaggriculture.structured import StructuredActor
 
 # The sibling trainer owns the dataset encoding/staging contract.  Make its
@@ -149,9 +150,7 @@ def split_seed_sets(
             f"with {len(ordered)} seeds"
         )
     if not 0 < validation_holdout_seeds < holdout_seeds:
-        raise ValueError(
-            "validation_holdout_seeds must be positive and smaller than holdout_seeds"
-        )
+        raise ValueError("validation_holdout_seeds must be positive and smaller than holdout_seeds")
     boundary = len(ordered) - holdout_seeds
     held_out = ordered[boundary:]
     split = SeedSplit(
@@ -159,8 +158,10 @@ def split_seed_sets(
         validation=tuple(held_out[:validation_holdout_seeds]),
         test=tuple(held_out[validation_holdout_seeds:]),
     )
-    if (set(split.train) & set(split.validation)) or (set(split.train) & set(split.test)) or (
-        set(split.validation) & set(split.test)
+    if (
+        (set(split.train) & set(split.validation))
+        or (set(split.train) & set(split.test))
+        or (set(split.validation) & set(split.test))
     ):
         raise AssertionError("seed partitions overlap")
     return split
@@ -199,9 +200,7 @@ def _control_donors_for_slot(
         order = randomized[np.argsort(episode_seeds[randomized], kind="stable")]
         shifted = np.roll(order, -int(counts.max()))
         donor_by_member = dict(zip(order.tolist(), shifted.tolist(), strict=True))
-        candidate = np.asarray(
-            [donor_by_member[int(row)] for row in members], dtype=np.int64
-        )
+        candidate = np.asarray([donor_by_member[int(row)] for row in members], dtype=np.int64)
         if np.any(episode_seeds[candidate] == episode_seeds[members]):
             raise AssertionError("cross-seed donor construction failed")
         donors[members] = candidate
@@ -265,12 +264,8 @@ def construct_prefixes(
             else own_rows
         )
         sources[:, target_slot] = donors
-        prefix_kinds[:, target_slot, 1 : target_slot + 1] = kinds[
-            donors, :target_slot
-        ]
-        prefix_quantities[:, target_slot, 1 : target_slot + 1] = quantities[
-            donors, :target_slot
-        ]
+        prefix_kinds[:, target_slot, 1 : target_slot + 1] = kinds[donors, :target_slot]
+        prefix_quantities[:, target_slot, 1 : target_slot + 1] = quantities[donors, :target_slot]
     return PrefixBatch(prefix_kinds, prefix_quantities, sources)
 
 
@@ -329,8 +324,7 @@ def load_probe_dataset(
             raise ValueError(f"{manifest_path}: invalid JSON: {exc}") from exc
         if manifest.get("format_version") not in train_bc.SUPPORTED_DATASET_FORMAT_VERSIONS:
             raise ValueError(
-                f"{directory}: unsupported dataset format: "
-                f"{manifest.get('format_version')}"
+                f"{directory}: unsupported dataset format: {manifest.get('format_version')}"
             )
         manifest_episodes = manifest.get("episodes")
         if not isinstance(manifest_episodes, list) or not manifest_episodes:
@@ -450,11 +444,12 @@ def load_probe_dataset(
 
 class ResidualMarketDecoder(nn.Module):
     """A tiny shared recurrent decoder that only adds residual actor logits."""
+
     quantity_kind_gate: Tensor
     quantity_values: Tensor
     quantity_bias: Tensor
 
-    def __init__(self, actor: StructuredActor) -> None:
+    def __init__(self, actor: StructuredActor | EntityActor) -> None:
         super().__init__()
         width = int(actor.config.model_dim)
         quantity_rank = int(actor.config.quantity_rank)
@@ -553,7 +548,7 @@ class ResidualMarketDecoder(nn.Module):
 
 @torch.inference_mode()
 def cache_actor_features(
-    actor: StructuredActor,
+    actor: StructuredActor | EntityActor,
     split: LoadedSplit,
     *,
     batch_size: int,
@@ -575,12 +570,8 @@ def cache_actor_features(
         ):
             output, belief = actor.forward_with_belief(actor_args[0])
         cached["decisions"].append(belief.market_decisions.detach().to("cpu"))
-        cached["base_kind_logits"].append(
-            output.market_kind_logits.detach().to("cpu")
-        )
-        cached["base_quantity_context"].append(
-            output.market_quantity_context.detach().to("cpu")
-        )
+        cached["base_kind_logits"].append(output.market_kind_logits.detach().to("cpu"))
+        cached["base_quantity_context"].append(output.market_quantity_context.detach().to("cpu"))
     fields = {
         name: split.tensors.staged[name]
         for name in (
@@ -678,9 +669,7 @@ def train_paired_decoders(
     shuffled_model.to(device).train()
     optimizers = (
         torch.optim.AdamW(true_model.parameters(), lr=learning_rate, weight_decay=weight_decay),
-        torch.optim.AdamW(
-            shuffled_model.parameters(), lr=learning_rate, weight_decay=weight_decay
-        ),
+        torch.optim.AdamW(shuffled_model.parameters(), lr=learning_rate, weight_decay=weight_decay),
     )
     generator = torch.Generator(device="cpu").manual_seed(seed)
     history: list[dict[str, float]] = []
@@ -714,9 +703,7 @@ def train_paired_decoders(
                 quantity_logits = model.quantity_logits(quantity_context, kinds)
                 kind_nll = _masked_nll(kind_logits, kind_masks, kinds)
                 quantity_nll = _masked_nll(quantity_logits, quantity_masks, quantities)
-                loss_sum = (kind_nll * kind_active).sum() + (
-                    quantity_nll * quantity_active
-                ).sum()
+                loss_sum = (kind_nll * kind_active).sum() + (quantity_nll * quantity_active).sum()
                 loss = loss_sum / active_count
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(f"non-finite training loss in arm {arm}")
@@ -1043,14 +1030,10 @@ def _comparison_metrics(
             },
             "kind": {
                 "nll": delta(true_outputs.kind_nll, shuffled_outputs.kind_nll, ka),
-                "accuracy": delta(
-                    true_outputs.kind_correct, shuffled_outputs.kind_correct, ka
-                ),
+                "accuracy": delta(true_outputs.kind_correct, shuffled_outputs.kind_correct, ka),
             },
             "quantity": {
-                "nll": delta(
-                    true_outputs.quantity_nll, shuffled_outputs.quantity_nll, qa
-                ),
+                "nll": delta(true_outputs.quantity_nll, shuffled_outputs.quantity_nll, qa),
                 "accuracy": delta(
                     true_outputs.quantity_correct,
                     shuffled_outputs.quantity_correct,
@@ -1059,9 +1042,7 @@ def _comparison_metrics(
             },
         },
         "slot_0_true_minus_shuffled": {
-            "kind_nll": delta(
-                true_outputs.kind_nll, shuffled_outputs.kind_nll, slot_zero_kind
-            ),
+            "kind_nll": delta(true_outputs.kind_nll, shuffled_outputs.kind_nll, slot_zero_kind),
             "kind_accuracy": delta(
                 true_outputs.kind_correct,
                 shuffled_outputs.kind_correct,
@@ -1178,12 +1159,8 @@ def free_running_decode(
                 if shuffled and slot > 0
                 else own_rows
             )
-            prefix_kinds = np.full(
-                (rows, slot + 1), N_MARKET_KINDS, dtype=np.int64
-            )
-            prefix_quantities = np.full(
-                (rows, slot + 1), N_QUANTITIES, dtype=np.int64
-            )
+            prefix_kinds = np.full((rows, slot + 1), N_MARKET_KINDS, dtype=np.int64)
+            prefix_quantities = np.full((rows, slot + 1), N_QUANTITIES, dtype=np.int64)
             if slot > 0:
                 prefix_kinds[:, 1:] = kinds[donors, :slot]
                 prefix_quantities[:, 1:] = quantities[donors, :slot]
@@ -1209,9 +1186,7 @@ def free_running_decode(
 
         quantity_masks = np.zeros((rows, N_QUANTITIES), dtype=bool)
         quantity_active = np.zeros(rows, dtype=bool)
-        for row, (observation, raw_kind) in enumerate(
-            zip(observations, chosen_kinds, strict=True)
-        ):
+        for row, (observation, raw_kind) in enumerate(zip(observations, chosen_kinds, strict=True)):
             kind = MarketKind(int(raw_kind))
             if not still_active[row] or kind == MarketKind.STOP:
                 quantity_masks[row, 0] = True
@@ -1272,9 +1247,7 @@ def free_running_decode(
             else float((kinds == target_kinds)[kind_active].mean()),
             "quantity_accuracy": None
             if not quantity_active_targets.any()
-            else float(
-                (quantities == target_quantities)[quantity_active_targets].mean()
-            ),
+            else float((quantities == target_quantities)[quantity_active_targets].mean()),
             "exact_queue_match_rate": float(queue_match.mean()),
             "by_slot": by_slot,
         },
@@ -1328,9 +1301,7 @@ def _free_running_comparison(
         "active_decision_previously_correct_breakage_rate": None
         if not baseline_correct.any()
         else float((~true_correct[baseline_correct]).mean()),
-        "exact_queue_match_true_minus_shuffled": float(
-            true_queue.mean() - shuffled_queue.mean()
-        ),
+        "exact_queue_match_true_minus_shuffled": float(true_queue.mean() - shuffled_queue.mean()),
         "exact_queue_relative_error_reduction_vs_shuffled": relative_error_reduction(
             float(true_queue.mean()), float(shuffled_queue.mean())
         ),
@@ -1353,9 +1324,7 @@ def _prefix_control_report(prefixes: PrefixBatch, rows: int) -> dict[str, Any]:
     }
 
 
-def _count_and_split_report(
-    data: CachedSplit, records: Sequence[dict[str, Any]]
-) -> dict[str, Any]:
+def _count_and_split_report(data: CachedSplit, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {
         "rows": data.rows,
         "episodes": len(data.episodes),
@@ -1364,9 +1333,7 @@ def _count_and_split_report(
         "by_corpus": {
             str(record["path"]): {
                 "rows": int((data.corpus_index == index).sum()),
-                "episodes": sum(
-                    int(episode["corpus_index"] == index) for episode in data.episodes
-                ),
+                "episodes": sum(int(episode["corpus_index"] == index) for episode in data.episodes),
                 "seeds": sorted(
                     {
                         int(episode["seed"])
@@ -1426,9 +1393,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--encode-workers", type=int, default=8)
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--device", default="cuda", help="torch device, e.g. cuda or cpu")
-    parser.add_argument(
-        "--output", type=Path, required=True, help="deterministic JSON report path"
-    )
+    parser.add_argument("--output", type=Path, required=True, help="deterministic JSON report path")
     return parser.parse_args(argv)
 
 
@@ -1460,12 +1425,8 @@ def _measure_decoder_latency(
     indices = slice(0, 1)
     decisions = _to_device(data.decisions, indices, device, torch.float32)
     base_kind = _to_device(data.base_kind_logits, indices, device, torch.float32)
-    base_quantity = _to_device(
-        data.base_quantity_context, indices, device, torch.float32
-    )
-    prefix_kinds = torch.as_tensor(
-        prefixes.kinds[indices], device=device, dtype=torch.long
-    )
+    base_quantity = _to_device(data.base_quantity_context, indices, device, torch.float32)
+    prefix_kinds = torch.as_tensor(prefixes.kinds[indices], device=device, dtype=torch.long)
     prefix_quantities = torch.as_tensor(
         prefixes.quantities[indices], device=device, dtype=torch.long
     )
@@ -1524,8 +1485,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timings["dataset_load_and_encode_seconds"] = time.perf_counter() - started
 
     actor, artifact = load_actor_artifact(args.actor, device)
-    if not isinstance(actor, StructuredActor):
-        raise ValueError("market-prefix probe requires a structured actor artifact")
+    if not architecture_of(actor).structured_inputs:
+        raise ValueError("market-prefix probe requires a structured-input actor artifact")
     actor_autocast = device.type == "cuda" and bool(actor.config.fused_mlp)
     initial_model = ResidualMarketDecoder(actor)
     initial_state = copy.deepcopy(initial_model.state_dict())
@@ -1562,12 +1523,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             data.seed.numpy(),
         )
         prefixes[partition] = {
-            "true": construct_prefixes(
-                *prefix_arguments, shuffled=False, seed=shuffle_seed
-            ),
-            "shuffled": construct_prefixes(
-                *prefix_arguments, shuffled=True, seed=shuffle_seed
-            ),
+            "true": construct_prefixes(*prefix_arguments, shuffled=False, seed=shuffle_seed),
+            "shuffled": construct_prefixes(*prefix_arguments, shuffled=True, seed=shuffle_seed),
         }
 
     started = time.perf_counter()
@@ -1671,24 +1628,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "shuffled_prefix_repeat_identical": bool(
             np.array_equal(shuffled_free["kinds"], shuffled_repeat["kinds"])
-            and np.array_equal(
-                shuffled_free["quantities"], shuffled_repeat["quantities"]
-            )
+            and np.array_equal(shuffled_free["quantities"], shuffled_repeat["quantities"])
         ),
-        "comparison": _free_running_comparison(
-            true_free, shuffled_free, baseline_free, test
-        ),
+        "comparison": _free_running_comparison(true_free, shuffled_free, baseline_free, test),
     }
     timings["free_running_evaluation_seconds"] = time.perf_counter() - started
-    latency_ms = _measure_decoder_latency(
-        true_model, test, prefixes["test"]["true"], device
-    )
+    latency_ms = _measure_decoder_latency(true_model, test, prefixes["test"]["true"], device)
     timings["total_seconds"] = time.perf_counter() - total_started
 
     trainable_parameters = sum(parameter.numel() for parameter in true_model.parameters())
-    prefix_changed = prefixes["test"]["shuffled"].source_rows[:, 1:] != np.arange(
-        test.rows
-    )[:, None]
+    prefix_changed = (
+        prefixes["test"]["shuffled"].source_rows[:, 1:] != np.arange(test.rows)[:, None]
+    )
     result = {
         "format_version": 1,
         "experiment": "frozen_structured_actor_market_prefix_probe",
@@ -1719,16 +1670,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "shuffle_seed": shuffle_seed,
             "bootstrap_samples": args.bootstrap_samples,
             "shuffled_prefix_control_by_split": {
-                partition: _prefix_control_report(
-                    arm["shuffled"], cached[partition].rows
-                )
+                partition: _prefix_control_report(arm["shuffled"], cached[partition].rows)
                 for partition, arm in prefixes.items()
             },
             "frozen_actor_autocast_bfloat16": actor_autocast,
             "device": str(device),
-            "encoded_cache": None
-            if cache_root is None
-            else str(cache_root.expanduser().resolve()),
+            "encoded_cache": None if cache_root is None else str(cache_root.expanduser().resolve()),
             "shared_initialization": True,
             "common_minibatch_order": True,
             "reset_hidden_per_scored_slot": True,

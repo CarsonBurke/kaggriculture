@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.constants import DEFAULT_REWARD_MODE
+from kaggriculture.entity import EntityConfig
 from kaggriculture.evaluation import (
     DEVELOPMENT_SEED_START,
     ONLINE_RL_SEED_START,
@@ -95,7 +96,7 @@ from kaggriculture.provenance import (
     source_identity,
     validate_run_provenance,
 )
-from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, STRUCTURED, resolve_architecture
+from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
 from kaggriculture.rollout import (
     REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
@@ -541,14 +542,14 @@ def parse_args() -> argparse.Namespace:
         "--structured-latent-coefficient",
         type=float,
         default=PpoConfig.structured_latent_coefficient,
-        help="weight on shared post-core actor bottleneck SmoothL1",
+        help="weight on the sum of three independently normalized actor-head SmoothL1 losses",
     )
     parser.add_argument(
         "--structured-decision-coefficient",
         type=float,
         default=PpoConfig.structured_decision_coefficient,
-        help="weight on frozen entity-decoder KL with shared-bank prediction "
-        "and detached successor context",
+        help="weight on the sum of unit, market-kind and market-quantity teacher-to-student "
+        "KL means through frozen policy readouts",
     )
     parser.add_argument(
         "--structured-critic-latent-coefficient",
@@ -772,8 +773,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if not all(math.isfinite(value) and value >= 0.0 for value in structured_coefficients):
         raise ValueError("structured auxiliary coefficients must be finite and nonnegative")
     structured_active = any(structured_coefficients)
-    if structured_active and args.architecture != STRUCTURED:
-        raise ValueError("structured auxiliary coefficients require --architecture structured")
+    if structured_active and not resolve_architecture(args.architecture).structured_inputs:
+        raise ValueError(
+            "structured auxiliary coefficients require a structured-input architecture"
+        )
     structured_horizons = (
         args.structured_decision_horizon,
         args.structured_critic_horizon,
@@ -907,7 +910,7 @@ def _load_initial_actor(
     path: Path,
     actor: torch.nn.Module,
     architecture_name: str,
-    model_config: ModelConfig | StructuredConfig,
+    model_config: ModelConfig | StructuredConfig | EntityConfig,
     device: torch.device,
 ) -> dict[str, object]:
     """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
@@ -1956,7 +1959,7 @@ def _restore_league_archive(
     destination: Path,
     manifest: dict[int, str],
     current_iteration: int,
-    model_config: ModelConfig | StructuredConfig,
+    model_config: ModelConfig | StructuredConfig | EntityConfig,
 ) -> None:
     """Restore exactly the immutable archive bound to a training checkpoint."""
     source_directory = checkpoint.resolve().parent / "league"
@@ -2504,7 +2507,9 @@ def main() -> None:
         torch.backends.cudnn.benchmark = not args.deterministic_training
 
     architecture = resolve_architecture(args.architecture)
-    model_config: ModelConfig | StructuredConfig = model_config_from_args(architecture, args)
+    model_config: ModelConfig | StructuredConfig | EntityConfig = model_config_from_args(
+        architecture, args
+    )
     ppo_config = PpoConfig(
         actor_learning_rate=args.actor_lr,
         critic_learning_rate=args.critic_lr,
@@ -2558,14 +2563,12 @@ def main() -> None:
         # the actor auxiliary.
         member_critic_dynamics = (
             StructuredCriticDynamics(model_config).to(device)
-            if ppo_config.structured_critic_auxiliary_active
-            and isinstance(model_config, StructuredConfig)
+            if ppo_config.structured_critic_auxiliary_active and architecture.structured_inputs
             else None
         )
         member_dynamics = (
             ActorDynamics(model_config).to(device)
-            if ppo_config.structured_actor_auxiliary_active
-            and isinstance(model_config, StructuredConfig)
+            if ppo_config.structured_actor_auxiliary_active and architecture.structured_inputs
             else None
         )
         actor_optimizer, critic_optimizer = make_optimizers(
