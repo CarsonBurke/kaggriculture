@@ -3,7 +3,7 @@
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
 Production training is BC-initialized self-play PPO with DAPO's asymmetric clip
-band, discount-correct potential shaping, and full-return actor/critic GAE. A fresh
+band, terminal win/loss/draw rewards, and separate actor/critic GAE traces. A fresh
 production run must load one behavior-cloned actor, then fits its fresh critic
 for at least ten iterations and until every member's previous fresh-wave
 pre-update Monte Carlo-return R-squared reaches 0.10. Only an existing
@@ -26,6 +26,61 @@ appropriate after changing bin count. Compare rollout value accuracy and policy
 performance, not raw cross-entropy across smoothing settings: the interior
 label-entropy floor rises from about `1.2003` to `2.5222` nats for those ratios.
 The categorical arm uses neither symlog nor a critic EMA.
+
+The production model family is **`entity-attention`**, with width **96** for both
+encoded memory and entities. Two shared-weight local transformer blocks encode
+each 100-tile farm independently. Exactly **26 persistent states**—16 unit slots
+and ten market-order slots—perform four rounds of self-attention, static-memory
+cross-attention, and one FFN. Four query heads share two KV heads. Memory
+normalization and K/V projection happen once per forward and remain differentiable
+through every round. Economy-conditioned RMS scale/shift modulates each branch.
+
+Actor memory contains all **200 farm tiles plus 20 economy tokens**. Unit queries
+retain HERE/N/S/E/W local features; tile coordinates and ownership remain explicit.
+Inactive units are masked as attention keys and zeroed after every branch;
+all ten market slots remain valid before sampling. Final normalized unit/market
+states feed the existing policy heads directly, without generic latents, scratch
+tokens, opponent summaries, reinjection, MUDD, or separate output decoders.
+
+The independent centralized critic adds **16 private opponent-unit memory
+tokens** (236 total), but still evolves only 26 entities. One learned critic query
+uses projected **four-query-head/two-KV-head cross-attention** over the valid entity
+states. Its normalized `[B, 1, 96]` output feeds the HL-Gauss head and the existing
+critic NextLat target. There is no extra FFN, query residual shortcut, or persistent
+core token. Residual zero-initialization does not zero this standalone readout.
+Actor and critic share no parameters. Every attention layer in this production
+family, including critic NextLat, uses GQA; configurations with equal query/KV
+head counts are rejected.
+
+CUDA GQA folds query-head groups into the query sequence without repeating K/V.
+BF16 attention uses FlexAttention's standard Triton kernel for key-masked GQA
+updates, fusing validity into dense scores without dynamic sparse-block metadata.
+Unmasked calls prefer Flash; masked no-grad rollout prefers cuDNN, retaining its
+eight-opponent `vmap` batching (unsupported by this installed FlexAttention).
+The efficient CUDA kernel remains available for unsupported SDPA configurations.
+Short folded attention (head width up to32, up to64 queries and256 keys) uses
+64×64 Flex tiles; larger geometries retain backend heuristics. This avoids
+overpadding the entity queries with the default128-row backward tiles.
+Folding avoids native Flash GQA's expanded backward K/V intermediates. Masks remain
+part of the model: inactive entity states are zeroed after each reasoning branch,
+and excluded as attention keys. Removing masks is an architecture change, not an
+equivalent dense execution strategy.
+
+`inductor_graph` rollout already captures active-learner and batched frozen-policy
+inference together; native stepping and sampling remain outside that graph.
+For `reduce-overhead` or `max-autotune` updates, one explicit CUDA-graph iteration
+spans the complete PPO minibatch: actor gradients remain valid through critic
+backward and the guarded optimizer steps. Replay-only chunks copy their outputs
+before advancing the graph boundary. Graph modes are supported, not presumed
+faster; compare complete warm iterations on the actual architecture and schedule.
+
+Existing `entity-attention` BC actors remain compatible with this critic change.
+Old scalar-pool critic checkpoints are intentionally incompatible with the new
+readout: use their original frozen source to resume them, or initialize a fresh
+critic. Historical `structured` and `conv-entity` artifacts retain their own
+registered architectures; their weights are not compatible initialization for
+the entity family. Train an entity BC artifact with `--production-model` when
+migrating from those families.
 
 Install development and training dependencies, then run the CPU-safe default
 validation path:
@@ -271,34 +326,43 @@ norm-matched. For a scalar critic, decoded-value KL is unit-variance Gaussian KL
 (half squared mean error), not a degenerate one-category softmax. Distributional
 critics use categorical decoded KL over the same capped logits as their readout.
 
-Actor and critic use separate backbones and latent banks, with no shared
-parameters. The value loss remains attached through the critic's value decoder
-to its latent bottleneck and ViT; it never updates the actor backbone. Critic
+Actor and critic use separate backbones and entity states, with no shared
+parameters. The value loss remains attached through the critic's attention pool
+to its entity rounds and tile encoder; it never updates the actor backbone. Critic
 NextLat also trains its source backbone and predictor, but detaches its
 successor teacher and the value-head weights used for auxiliary decoding.
 Its categorical KL is teacher-to-student over the full value distribution.
 
 Actor NextLat is opt-in: set `--structured-latent-coefficient 1` and
-`--structured-decision-coefficient 1`. `ActorDynamics` jointly predicts the
-normalized unit and market decision representations immediately before the final
-policy projections, after the entity decoders. Its input is these representations
-and the joint action; inactive unit actions and post-STOP market suffixes are
-masked. Latent SmoothL1 averages over valid successor coordinates, not separate
-family means. Unit targets require cumulative survival across the prediction
-horizon; newborn successor units are excluded. Reached successor market orders
-participate in the loss.
+`--structured-decision-coefficient 1`, with `--structured-decision-horizon 1`
+for one-step prediction. `ActorDynamics` has independent unit-action, market-kind,
+and market-quantity residual MLP predictors. Each follows the NextLat reference:
+RMS-normalize the concatenated action/state, apply three bias-free linear layers
+with two GELUs, then add the predicted delta to the source state. At D96 the
+hidden width is 256. A shared, fixed-slot projection of the valid joint action
+conditions all three predictors; inactive units, post-STOP slots and quantities
+on non-quantified kinds cannot affect that action code.
+
+The sources are normalized head-input representations. In `entity-attention`
+these are final entity states; legacy `structured` uses decoder outputs. Kind
+and quantity share the source market state but evolve independently. Each head's
+SmoothL1 is independently normalized over eligible successor coordinates, and
+the three means are **summed**. Unit targets require cumulative survival;
+newborn successor units are excluded. Kind targets use reached successor orders,
+while quantity targets require successor quantity activity.
 
 Decoded teacher-to-student KL uses only the **frozen final policy projections**,
 not a replay of the entity decoder. Cached, detached successor head-input
 representations supply the teacher. Student and teacher projections use identical
-FP32 arithmetic with successor legality and activity masks. The KL pools active
-unit, market-kind, and market-quantity decisions. Setting both actor coefficients
-to `0.3333333333333333` divides the complete auxiliary objective by three policy
-head families; it does not replace the internal coordinate or decision means.
+FP32 arithmetic with successor legality and activity masks. Quantity decoding
+freezes its complete D96-to-rank32 factorized readout and uses the successor
+selected kind. The three independently normalized head KL means are **summed**.
+Thus coefficients 1/1 apply one latent and decoded objective per head, without
+an implicit division by three, extra cross-entropy, or gradient balancing.
 
 PPO and the auxiliary share one actor forward and one additive combined backward.
 Auxiliary gradients enter the live source head-input representations and flow
-through their entity decoders and actor trunk; successor targets and auxiliary
+through the actor trunk; successor targets and auxiliary
 readout weights are detached. Normal PPO gradients still train the final policy
 projections. There is no actor source-gradient balancing.
 
@@ -307,10 +371,12 @@ backward recomputes its intermediates without splitting the PPO minibatch or
 adding optimizer steps/backward calls.
 
 This configuration remains experimental: contract tests establish gradient and
-execution correctness, not improved learning. Actor/BC parameter keys are
-unchanged, but predictor states from different attachment architectures are not
-interchangeable. Warmup release still measures critic readiness, not predictor
-readiness; persistence scores remain diagnostic only.
+execution correctness, not improved learning. Actor/BC parameter keys are unchanged
+within each registered family, but weights and predictor states from different
+architectures are not interchangeable. Warmup release still measures critic
+readiness, not predictor readiness; persistence scores remain diagnostic only.
+Old shared-attention actor-predictor states are not compatible with these three
+MLPs; start fresh predictor state rather than silently migrating a resumed run.
 
 Both actor coefficients default to zero, so no actor predictor or predictor
 optimizer is constructed. `--structured-critic-gradient-balance` remains an
@@ -420,7 +486,8 @@ slots to reduce padding while retaining every former
 bucket boundary: padding never increases and there are still at most eight
 aligned shapes per minibatch size.
 
-Training uses discount-correct, exactly zero-sum potential shaping. Let `L[i,t]`
+The explicit `--reward-mode shaped` alternative uses discount-correct, exactly
+zero-sum potential shaping. Let `L[i,t]`
 be player `i`'s actual liquid assets: bank money plus the exact proceeds from
 selling every held product at the current market curve. With the game-defined
 starting bank `k = 3000`,
@@ -493,8 +560,9 @@ reported.
 The temporal settings were first promoted from dense-reward trial **7010**.
 The user subsequently selected **7122**, the HL-Gauss VAPO terminal-outcome LR3
 trial, as the new production default: terminal win/loss/draw reward and tripled
-actor/critic rates, retaining HL-Gauss, component PPO clipping/KL, architecture,
-and the existing auxiliary recipe. This adopts VAPO's temporal settings, not
+actor/critic rates, retaining HL-Gauss, component PPO clipping/KL,
+and the existing auxiliary recipe. The later entity-attention architecture
+promotion is separate. This adopts VAPO's temporal settings, not
 every component of its training recipe. New launches inherit the new defaults;
 explicit overrides and previously frozen commands retain their declared settings.
 
@@ -627,13 +695,18 @@ epsilon to nonzero momentum norms. Small PPO momenta therefore retain the same
 normalization as larger copies, up to floating-point error. Its tensors are
 float32; multiplication accuracy still follows the process-wide matmul setting.
 
-The default physical minibatch ceiling is 6400: a complete 230080-state
-production wave uses 36 balanced minibatches, with no dropped states or
-gradient accumulation. The measured 6400-row update is faster than 4800 while
-retaining VRAM headroom. Larger batches reduce optimizer steps per wave and
-change gradient statistics; they are not learning-equivalent merely because
-sample coverage is unchanged. Learning rates, objectives, and precision are
-unchanged; the full learning run measures the resulting optimization dynamics.
+The default physical minibatch ceiling is **8192**: a complete 230080-state
+production wave uses **29 fixed-shape minibatches**, with no dropped states or
+gradient accumulation: 28 full batches and 704 genuine rows in the last batch;
+its remaining 7488 rows have zero loss/gradient weight. This is the user's
+selected D96 setting; it retains VRAM headroom but is not a measured speed win.
+A matched six-repeat probe measured
+steady whole-iteration medians of 10.952 s at 6400 versus 11.196 s at 8192,
+with peak live memory 16.33 versus 19.99 GiB. All intended updates completed.
+Larger batches reduce optimizer steps per wave (36 to 29 here) and change gradient
+statistics; they are not learning-equivalent merely because sample coverage is
+unchanged. Learning rates, objectives, and precision are unchanged. Historical
+fixed-shape probes and explicit minibatch overrides retain their declared sizes.
 
 Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
 plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup

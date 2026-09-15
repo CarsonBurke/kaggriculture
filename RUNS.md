@@ -2921,6 +2921,753 @@ per-round projections are a separate capacity control. Measure compiled BF16
 whole-update and rollout time, memory, and equal-budget learning rather than
 inferring speed from utilization or attention-pair counts.
 
-Architecture remains a proposal: no implementation, architecture benchmark or
-new architecture training job was launched. Evidence and calculation assumptions:
+At this decision point the architecture was still a proposal; the implementation
+and measured execution are recorded below. Evidence and calculation assumptions:
 `artifacts/probes/actor-head-joint-ablation-20260914/terminal-outcome-default-promotion.json`.
+
+## D96 entity-attention implementation and campaign (2026-09-14)
+
+The user approved **96 for both memory and entities**, not a width sweep.
+`entity-attention` is now the production family. Actor and critic independently
+encode both farms with two shared-weight local blocks and evolve exactly
+16 unit plus ten market-order states through four self/cross/FFN rounds.
+Actor static memory has 220 tokens; centralized critic memory has 236, including
+16 private opponent units. RMS normalization and memory K/V projection are shared
+across rounds and evaluated once per forward, without detaching their gradients.
+Four query heads use two KV heads of width 24. Economy-conditioned RMS scale/shift,
+local unit tile features, ownership/position, and inactive-unit masking are retained.
+There are no generic/scratch latents, compressed opponent summaries, reinjection,
+MUDD, or output cross-decoders. Critic attention pooling retains one normalized
+96-wide NextLat value belief, with the existing coefficient-1/1 losses.
+
+Registry capabilities integrate BC, native rollout, physical frozen ensembles,
+PPO, optional actor dynamics, critic NextLat, checkpoint inference, and submission
+packaging. Historical families remain separately registered for old artifacts;
+new BC initialization is required. Full seven-field legacy BC auxiliary beliefs
+are intentionally unsupported for this family.
+
+Source: `057c9c480101ef1260ef606f9fac1ab0178f3abb432196bed0eacc018ceb99e0`.
+Launches, environment, artifact paths and benchmark commands:
+`artifacts/probes/entity-attention-d96-20260914/`.
+All jobs use MLQ, exclusive parallel limit 1, priority 0, one attempt and a
+25-minute cap. No CPU model execution or eager performance fallback is used.
+Eager BF16 is only the GPU benchmark's numerical correctness reference.
+
+Verification: 16 configuration/schema cases passed without constructing models;
+MLQ **7127** passed all six CUDA contract tests in 215.11 seconds, including
+inactive/private-state isolation, shared-KV gradients from all four rounds,
+compiled combined backward, strict artifact loading, full 719-transition native
+collection, replay gates and an actual PPO update. Ruff formatting/checks passed.
+
+MLQ **7128** completed the full matched two-epoch BC recipe: four provenance-matched
+v16 corpora, 299,104 training rows, 69,024 held-out rows, twelve held-out seeds per
+corpus, CUDA BF16 compilation and batch size 1024. Final held-out NLL was
+**0.00130696**, versus the historical BC artifact's **0.00172686**; unit/kind/
+quantity accuracy was **99.9889% / 99.8643% / 99.9656%**. This establishes compatible
+initialization, not improved game strength. Artifact:
+`runs/entity-attention-d96-bc-20260914/bc-actor.pt`.
+
+Matched fixed-state benchmark **7129**, six-repeat legacy/entity whole-iteration
+benchmarks **7130/7131**, and production PPO **7132** use that frozen source.
+PPO retains the promoted terminal-outcome LR3 recipe and full 128-self/64-league
+wave, ten-wave minimum critic warmup, readiness gate and existing autocull.
+Its CPU asynchronous external evaluator is disabled; official evaluation is
+performed separately with the compiled BF16 CUDA checkpoint evaluator.
+This difference must be retained when interpreting historical wall-time results.
+
+### Whole-iteration timing
+
+Both six-repeat full-shape benchmarks completed with all 36 actor, critic and
+predictor updates per wave. Medians below exclude the first cold iteration:
+
+| Metric | Legacy structured D80 | Entity-attention D96 |
+| --- | ---: | ---: |
+| Rollout | 2.66978 s | 2.28002 s |
+| PPO update | 9.31682 s | 8.47432 s |
+| Whole iteration | 12.09513 s | 10.80719 s |
+| Peak live CUDA memory | 21.10 GiB | 16.33 GiB |
+| Peak reserved CUDA memory | 21.75 GiB | 16.66 GiB |
+| First iteration, including cold work | 38.22934 s | 53.04079 s |
+
+Measured whole-iteration throughput improves **1.119x** (10.65% less time);
+rollout improves 1.171x and update 1.099x. This is a modest speedup, not the
+anticipated large multiplier. Live memory falls about 22.6%. Both arms use
+compatible BC artifacts, eight frozen opponents, identical production wave
+sizes/objectives and no skipped updates; their policy-generated states differ.
+The timing harness does not include production's evolving PFSP/built-in mix.
+Replay gates pass with zero tail fraction. Raw records and the extracted
+comparison are in `whole-iteration-comparison.json` beside the campaign launches.
+
+Fixed-state job 7129 stopped on its legacy raw-logit closeness assertion:
+maximum absolute difference 1.09375, including inactive/illegal outputs.
+Raw logits are not the categorical consumer contract. The corrected benchmark
+retains those diagnostics and gates legal-policy KL and tail probability mass
+using existing replay tolerances, without changing model code or precision.
+MLQ **7136** uses benchmark-only source revision
+`8e62a793406be015fe16211688920007578dc6086ac919a665e0e9515119f8ba`;
+the failed report remains preserved rather than overwritten.
+
+### Full training control and GPU activity
+
+PPO **7132** stopped through the unchanged autocull policy at **iteration 115**
+(exit 75), not a crash or an abbreviated training probe. Training elapsed time
+was **1283.51 seconds**. The readiness gate released actor training at iteration
+20; 96 actor-active waves completed. The final wave accepted all 36 actor,
+critic and critic-predictor updates. After 30 stale actor-active observations,
+EMA money was 34,898.51 versus its 48,897.63 reference and EMA value loss was
+3.00548 versus its 2.98493 reference.
+
+Final MC R² was **0.35354**, critic gradient norm **1.63808**, and money mean
+**34,388.90**. At the same 115-wave point, historical 7122 recorded MC R²
+0.35734, critic gradient norm 104.62317 and money mean 58,279.65.
+Different evolving matchups prevent treating training money as a matched external
+score. Lower critic gradient norms alone do not establish better prediction or
+policy quality. Full summaries, last-ten medians and caveats are saved in
+`training-comparison.json`. Final actor:
+`runs/production-entity-attention-d96-outcome-lr3-p500-20260914/league/league-actor-00000115.pt`.
+The first official evaluation submissions 7137/7138/7139 rejected the internal
+league-snapshot format before running games. Corrected MLQ **7140/7141/7142**
+evaluated the final recovery `checkpoint-000115.pt` with two paired development
+seeds each, using compiled BF16 CUDA inference and the pinned official engine.
+
+The additional `data/bc-v16-current-v27-64` corpus was used by **neither** this BC
+run nor its historical production BC initialization. Both used the same four
+mirror/starter/pass/random corpora to keep the architecture comparison controlled.
+
+An eight-second live GPU sample during training recorded seven observations at
+100% activity (mostly 473–478 W) and one at 59%; activity is not achieved FLOPs.
+Steady benchmark medians attribute 7.343 s to minibatch work, 1.037 s to behavior
+replay, 0.066 s to staging, 0.022 s to advantages and 0.010 s to finalization.
+The separate 2.087 s replay-parity audit is diagnostic benchmark overhead, not
+part of the timed PPO update or its 10.807 s whole-iteration total.
+The measured bottleneck is training computation, not host staging. No D96 kernel
+profile yet separates GEMM, attention, normalization and optimizer contributions.
+Evidence: `gpu-efficiency-observation.json`.
+
+### Fixed-state and official evaluation results
+
+Corrected fixed-state benchmark **7136** completed both architectures. It used
+the same 6,400 states/actions/masks from one full 230,080-state native wave:
+
+| Warm median wall time | Legacy D80 | Entity D96 |
+| --- | ---: | ---: |
+| Actor PPO forward/backward | 108.648 ms | 94.921 ms |
+| Critic HL-Gauss + NextLat forward/backward | 99.750 ms | 96.736 ms |
+| Behavior replay | 33.035 ms | 26.550 ms |
+
+These exclude optimizer work. Critic forward/backward improves only 3.1%, limiting
+the whole-update gain. Actor parameters fall from 975,358 to 800,810; critic
+parameters from 888,699 to 808,215. Legal-policy KL against the eager-BF16
+correctness reference stayed below 0.000895 for legacy and 0.000439 for entity,
+with zero tail probability mass. Compiled losses and gradients passed their
+checks. Small forward-only measurements are not the physical ensemble/CUDA-graph
+collector; use the whole-iteration pair for rollout throughput claims.
+Evidence: `fixed-benchmark-policy-parity.json` and `fixed-state-summary.json`.
+
+Final control official evaluation, four games per opponent:
+
+| Opponent | Wins / draws / losses | Candidate mean bank |
+| --- | ---: | ---: |
+| starter | 4 / 0 / 0 | 62,257.75 |
+| public-v27 | 0 / 0 / 4 | 44,942.00 |
+| public-v16 | 0 / 0 / 4 | 32,234.50 |
+
+All twelve games completed, with zero invalid games. This two-seed development
+panel is too small for a broad strength claim; it does not establish improved
+learning over historical 7122. Evidence: `official-evaluation-summary.json` and
+the three complete `evaluation-*.json` reports.
+
+## Independent per-head actor NextLat trial (2026-09-14)
+
+After the D96 control completed, the user requested actor NextLat again, one
+predictor per actor head, following `../NextLat`. This is not merely enabling
+the previous shared-attention predictor.
+
+`ActorDynamics` now has independent unit-action, market-kind and market-quantity
+residual MLPs. Each consumes `[joint_action_embedding, normalized_head_state]`,
+applies the reference's bias-free RMS normalization (eps 1e-5), then three
+bias-free linear layers with two GELUs, and adds the predicted delta to the
+source state. Reference projection-factor 1 gives hidden width **256** at D96.
+The reference calls its wrapper `LayerNorm`, but `bias=False` actually executes
+RMSNorm; the implementation follows that behavior. Linear/embedding
+initialization uses normal std 0.02.
+
+The RL adaptation encodes the complete valid joint action through the existing
+typed action embeddings and one fixed-slot flattened projection to D96. Inactive
+units and post-STOP slots are excluded; STOP itself remains, and quantities on
+non-quantified kinds are inert. One action code conditions all three independent
+predictors. Kind and quantity share the initial normalized market source but
+have separate recurrent predictions. The quantity auxiliary freezes the entire
+D96-to-rank32 factorized readout, conditioned on the successor selected kind.
+
+Each head has its own masked-coordinate SmoothL1 mean and masked-decision
+teacher-to-student KL mean. Both three-head sums receive coefficient **1**;
+horizon **1**, optional CE **0**, and no source-gradient balancing or implicit
+division by three. Quantity targets require successor quantity activity, not
+merely an active market slot. Unit survival and trajectory boundaries remain
+enforced. Sources and predictors train; successor teachers and auxiliary readout
+weights are detached. Actor/critic inference weights and critic NextLat are
+unchanged; old shared-attention predictor states are intentionally incompatible.
+
+MLQ **7143** passed **28 tests** in 103.91 seconds, including three-field
+recurrence, independent head gradients, frozen matching quantity decode,
+successor activity/ancestry, inert ignored actions, strict entity artifacts,
+full native rollout/PPO update, and combined fullgraph BF16 PPO plus actor and
+critic auxiliary backward. Ruff passed on the five affected Python files.
+
+Full trial **7144** uses immutable source
+`ba2e45d5dbd7438a05d145a26323c12916d993b6dc2f3023555de823fd2dcdd7`,
+the same D96 BC artifact, four corpora, seed, production wave geometry, LR3
+terminal-outcome recipe, critic NextLat and autocull as the control. Actor
+coefficients/horizon are explicitly 1/1/1; production actor-auxiliary defaults
+remain off. The additional v16-versus-v27 corpus is still excluded to isolate
+this change. MLQ limit 1, priority 0, one attempt, 25-minute cap.
+
+Reference file hashes and the exact contract are recorded in
+`artifacts/probes/entity-attention-d96-20260914/actor-head-nextlat-design.json`;
+launch/source evidence is in `actor-head-nextlat-trial-job.json`.
+Output: `runs/production-entity-attention-d96-actor-head-nextlat-p500-20260914`.
+
+### Cancelled trial: early policy collapse
+
+MLQ **7144** received a cancellation request and exited 143/SIGTERM after
+iteration **32**. Main did not issue that cancellation and did not restart it.
+This is a **partial, cancelled result**, not a completed 25-minute trial or
+autocull. The last logged training elapsed time was **409.58 seconds**, with
+13 actor-active waves starting at iteration 20.
+
+| Iteration 32 | Actor auxiliary off control | Three-head actor NextLat 1/1 |
+| --- | ---: | ---: |
+| Mean training bank | 53,873.11 | 15.17 |
+| MC R² | 0.18376 | -0.00124 |
+| Actor gradient norm | 1.44931 | 6.79757 |
+| Accepted actor minibatches | 36 / 36 | 20 / 36 |
+
+The actor auxiliary loss was **0.96666** (latent 0.31845, decoded 0.64811);
+the separately logged PPO loss was **-0.09904**. Its maximum minibatch KL was
+0.03142 and triggered the 0.03 actor-update stop. Separate combined/auxiliary
+metric aggregations must not be subtracted to reconstruct PPO loss, and scalar
+loss magnitudes alone do not establish gradient dominance.
+
+All 36 critic and predictor updates ran in the final wave, but fewer actor
+updates and radically different policy states make its ~10.68-second iteration
+unsuitable evidence of a compute speedup. The run shows rapid policy collapse
+under this unbalanced per-head 1/1 recipe, despite passing implementation
+contract tests. Actor NextLat remains **off by default**; no coefficient search,
+gradient-balancing change, or automatic restart was performed.
+
+Actor-only league snapshots through iteration 32 are preserved. The only full
+recovery checkpoint is initialization (`checkpoint-000000.pt`, also `latest.pt`);
+there is no trained optimizer/critic recovery checkpoint to resume at iteration
+32. No post-cancellation GPU evaluation was launched. Exact partial trajectory,
+per-head losses, equal-wave control and cancellation status:
+`artifacts/probes/entity-attention-d96-20260914/actor-head-nextlat-partial-results.json`.
+
+The user subsequently ended this actor-auxiliary direction and requested work
+on D96 execution efficiency and larger minibatches. Actor NextLat stays off;
+the experimental implementation is retained without enabling it in production.
+
+## 8192 default and learning-bottleneck analysis (2026-09-14)
+
+The user selected **8192** as the new default. `PpoConfig.minibatch_size` now
+owns that value for production/direct launchers and benchmarks; the forward
+traffic probe follows it. Explicit overrides and historical fixed-shape probes
+retain their declared sizes. Actor NextLat remains off, critic NextLat remains
+1/1, and learning rates/objectives/precision are unchanged.
+
+Six-repeat full production benchmarks **7145/7146** completed:
+
+| Steady median | 6400 | 8192 |
+| --- | ---: | ---: |
+| Whole iteration | 10.95245 s | 11.19621 s |
+| PPO update | 8.39137 s | 8.73563 s |
+| Actor/critic/predictor updates per wave | 36 each | 29 each |
+| Peak live VRAM | 16.33 GiB | 19.99 GiB |
+| Peak reserved VRAM | 16.66 GiB | 20.53 GiB |
+
+All intended updates and replay gates passed. This probe does **not** establish
+a speed advantage for 8192; the selection is explicit user direction.
+The 9600/11200 jobs **7147/7148** were cancelled before starting and not retried.
+No new full learning run was launched after the user switched to analysis.
+
+The partition is fixed-shape, not balanced: 28 full 8192 batches plus 704 genuine
+states in the last batch, padded with 7488 zero-weight rows. Every genuine state
+is used once. The last update normalizes over its genuine rows, so smaller-tail
+variance and 36→29 optimizer steps are prospective learning changes, not free
+throughput. Both historical architecture controls used 6400 and its 6080-row
+tail, so this new batching detail cannot explain their observed difference.
+Stale comments calling the partition balanced were corrected without changing
+partition behavior.
+
+Verification: five focused configuration/launcher tests passed; a non-model CLI
+proof checked inherited8192, explicit6400 and complete 230080-state coverage.
+The rewritten production profiler **7151** also completed cold, steady and
+instrumented full fresh-wave updates using the unflagged8192 default: all29
+actor/critic/predictor steps each time, zero allocator retries, ~19.99 GiB live.
+Steady unprofiled update was8.7015s. Actual CUDA kernel attribution recorded
+109364 launches; the largest attention-backward kernel consumed17.8% of summed
+kernel time, largest attention-forward kernel7.4%, custom RMS forward5.7%.
+These are instrumentation-derived kernel shares, not throughput or learning
+measurements. Source/runtime evidence:
+`artifacts/probes/entity-attention-performance-20260914/`.
+
+### Matched learning evidence
+
+The closest wall-time pair is entity115 at1283.507s and legacy104 at1283.207s,
+only0.300s apart. Entity completed3456 actor updates versus legacy3384, despite
+requiring19 rather than10 critic-only warmup waves. Delayed warmup alone does
+not explain the later gap.
+
+Trailing-ten medians ending at those checkpoints:
+
+| Metric | Legacy D80 | Entity D96 |
+| --- | ---: | ---: |
+| Training money mean | 51,061.23 | 34,721.13 |
+| Pre-update MC R² | 0.41973 | 0.33506 |
+| Critic gradient norm | 69.685 | 1.391 |
+| Actor component KL | 0.003744 | 0.001820 |
+| Terminal residual EV, last32 transitions | 0.63498 | 0.30197 |
+| Terminal residual EV,33–128 transitions left | 0.65218 | 0.37854 |
+| Terminal residual EV,513+ transitions left | 0.15974 | 0.14211 |
+
+These are different evolving policy-state distributions, not common-state
+critic evaluation. Nevertheless the deficit is especially late-game, not just
+long-horizon credit assignment. Lower gradient norms do not imply better fit.
+Neither control had KL early stops, target saturation or an entropy collapse.
+Entity policy drift was smaller under the same optimizer settings.
+
+Entity starts with more training money (64,308.66 versus48,540.81 on wave1),
+falls to25,589 at60, and stalls around35k; legacy also dips but recovers beyond50k.
+This is not simply economically weaker initial BC. Entity's late action mix
+has more hiring (21.5% versus17.7%), less selling (8.1% versus9.7%) and more
+harvesting (3.58% versus3.10%). These fractions suggest investigating spending
+and cash conversion, but do not establish profit mechanisms without per-step
+cash/inventory/price accounting.
+
+### Win rate and signed margin
+
+Official panels use the same two development seeds/both seats and hash-matched
+public opponents. Both models win4/12:4/4 starter,0/4 v27,0/4 v16.
+Legacy104 mean signed final margins versus starter/v27/v16 are
+90,203 / -51,107.25 / -67,193.75; entity115 gives
+58,790.75 / -76,110.50 / -94,497.00. Thus every margin is worse for entity.
+Summed final margin across the12 games is **-112,392 legacy versus-447,267 entity**.
+There is no observed hidden win-rate or final-margin advantage.
+
+This sum is not within-game time-integrated bank advantage, which was not logged.
+Legacy per-game banks were not retained, so its mean normalized terminal margin
+cannot be recovered from mean banks. Training `margin_abs_mean` is unsigned:
+larger losses increase it. Self-play signed margins cancel across both seats,
+and overall training score is mechanically0.4+0.2×league score.
+
+Only two independent seed clusters/opponent and repeated development exposure
+limit strength claims. Historical inference was portableCPU; entity evaluation
+used compiledBF16GPU, so the panel is not an inference-controlled architecture
+experiment. Training leagues also contain different learned opponents.
+
+### Architecture hypotheses, not demonstrated bugs
+
+The strongest readout hypothesis is the critic's scalar attention pool over
+action-shaped entity states versus legacy's dedicated learned value-query
+attention/FFN decoder over32 generic states. Global outcome information must
+now be computed inside those entity states before pooling; a normalized linear
+value head performs no subsequent relational computation. Active workspace is
+ten market slots plus active units—only11 states with one farmer—not always26.
+Four reasoning rounds, shared memory K/V and direct heads also change capacity;
+D96 is not uniformly larger than D80.
+
+Sparse ±1/0 outcome rewards and actor lambda0.97218 make reliable values crucial:
+the direct terminal contribution scales as lambda^distance (~0.060 at100,
+0.000211 at300 transitions). Accurate intermediate TD predictions can still
+carry long-range credit; this is not a hard36-step planning limit. One shared
+state advantage credits every sampled component, leaving a coordination problem.
+
+Critic NextLat additionally shapes the same pooled belief using own actions and
+detached successor targets. Possible interference with opponent-sensitive value
+information needs source-gradient norm/cosine and persistence diagnostics;
+coefficient1/1 or healthy total norms do not prove either benefit or conflict.
+
+Best next discriminating measurement, if authorized: fit both critic architectures
+to one frozen state/terminal-return dataset under the same continuation policy,
+with held-out episodes and time-to-go strata, especially the last32/128 transitions.
+Simply comparing existing critics against another policy's returns would confound
+representation quality with the different value functions they were trained to fit.
+Best isolated architecture hypothesis to test afterward: a critic-only learned
+value-query attention/FFN readout over the unchanged entity states. Keep actor,
+memory, rounds,8192,objectives and LR fixed. Consider more rounds only after
+locating remaining actor/critic capacity error; do not automatically raise LR
+because KL is smaller. No such architecture change was made during this analysis.
+Verified numeric evidence:
+`artifacts/probes/entity-attention-d96-20260914/learning-analysis-quantitative.json`.
+
+## Single-query GQA critic and attention backends (2026-09-15)
+
+The critic now reads its 26 entity states with one learned projected
+four-query-head/two-KV-head query, followed by RMS normalization and the existing
+HL255 head / critic NextLat consumer. No extra FFN, residual query shortcut, or
+persistent core token was added. The standalone readout must not inherit residual
+output-projection zero initialization: an explicit regression reproduced zero
+context gradients before that initialization exception was fixed.
+
+Actor parameters and BC initialization remain compatible. Scalar-pool critic
+checkpoints are deliberately incompatible; resume those with their frozen source
+or initialize the new critic. Production entity configurations reject MHA, and
+critic NextLat also uses GQA. The training dependency floor is now PyTorch2.13,
+matching the already locked and measured version.
+
+### Measurement contract
+
+CUDA BF16, compiled rollout/updates, D96/Hq4/Hkv2/head24, minibatch8192,
+128 self-play plus64 league games, eight frozen BC opponents, and all719 steps.
+Each wave retains230,080 genuine learner states and29 optimizer updates, including
+the704-state tail with7,488 zero-weight padding entries. Actor NextLat remains off;
+critic NextLat coefficients remain1/1. The actor initialization is
+`runs/entity-attention-d96-bc-20260914/bc-actor.pt`.
+
+After the user's runtime-budget correction, every performance/diagnostic job has
+a hard **120-second MLQ cap**, exclusive max-parallel-runs1, priority0, one attempt.
+Production probes use three full waves: one cold and two warm. Compilation,
+startup and diagnostic parity checks count against the cap; queue wait does not.
+Cold/profiled waves and diagnostic parity time are not steady production timing.
+Earlier six-wave results remain historical evidence, not the new probe policy.
+
+| Variant / MLQ job | Warm whole-wave median, s | Warm update median, s |
+|---|---:|---:|
+| Scalar-pool control /7157, five warm waves |11.140|8.658|
+| New GQA readout, folded efficient /7159, five warm waves |11.765|8.832|
+| Folded Flash unmasked + cuDNN masked /7185, five warm waves |10.919|8.500|
+| Same hybrid, short control /7192 |10.876|8.463|
+| Native CUDA embedding backward /7193 |11.501|8.661|
+| Joint positional-embedding gradient /7198 |10.876|8.308|
+| Integrated Flash/cuDNN dispatch /7201 |10.963|8.488|
+| Folded GQA Flex TRITON masked updates /7202 |10.438|8.064|
+| Native GQA Flex TRITON masked updates /7203 |11.003|8.262|
+| Folded GQA Flex AUTO masked updates /7207 |11.345|8.582|
+| Native GQA Flex AUTO masked updates /7208 |12.606|8.659|
+
+Flex rows retain Flash/cuDNN rollout; only masked gradient-enabled calls change.
+Their rollout fluctuations therefore cannot be attributed to Flex update kernels.
+The folded TRITON candidate improves whole-wave latency by4.79% against7201 and
+11.28% against the initial GQA efficient run. These are short single-seed
+measurements, not a claim of statistical certainty or better learning.
+
+### Why native Flash initially looked worse
+
+The original native-Flash-unmasked rollout timings were
+3.510,2.270,12.976,9.612,7.755 seconds. The apparent multi-second penalty was not
+reproduced; its cause is unestablished. Subsequent full-wave traces showed the
+same390,011 rollout kernels and719 CUDA-graph launches across efficient, native
+Flash and folded Flash: no observed eight-opponent loop fallback.
+
+Flash itself helps. Matched-layout CUDA-graph diagnostics measured farm attention
+forward at2.457ms efficient versus1.007ms folded Flash for B16384,Q100,K100.
+Native Flash GQA backward, however, expands dK/dV to query-head count and then
+reduces groups. At B8192,K220,Hq4,head24 those two BF16 intermediates total660MiB.
+Folding query groups avoids that expansion without repeating K/V. In profiled
+updates, Flash main-backward kernel time was1,587.7ms native versus552.3ms folded.
+Profiled timings establish attribution, not unprofiled throughput.
+
+### Masks and FlexAttention
+
+Production masks are key-validity vectors broadcast across heads and queries:
+26 keys for entity/readout attention and236 keys for critic memory. Their storage
+is small, but removing them changes the attention distribution. Inactive entity
+states are explicitly zeroed after each reasoning branch; merely deleting masks
+does not create persistent latent workspace. No mask-removal ablation was run.
+
+The selected Flex candidate fuses boolean validity into dense attention scores,
+without constructing dynamic sparse-block metadata. Standard TRITON beat AUTO
+and folded GQA beat native GQA in these update measurements. Masked no-grad rollout
+retains cuDNN: a compiled eight-lane Flex probe failed with
+`KeyError(TransformType.Vmap)` in the installed PyTorch2.13 higher-order operator.
+The rollout was not replaced with a loop or an eager/FP32 fallback.
+
+Correctness evidence:
+
+- 7166 reproduced the zero-initialized standalone readout gradient failure;
+ 7167 passed all13 entity/config contracts after the fix.
+- 7176 passed compiled Flash forward/gradient oracles; maximum relative gradient
+ L2 error0.003396 versus an independent FP32 GPU numerical reference.
+- 7196 passed cuDNN production-shape oracles, including Q1/K26 readout and
+ Q1/K27 critic NextLat; masked K/V gradients and perturbation invariance passed.
+- 7200 passed15 generic CUDA SDPA contracts, including head/query-specific masks,
+ fully masked rows, noncontiguous projections and padded head widths.
+- 7206 passed native and folded Flex oracles for entity, private-memory and value
+ attention, including fully masked rows and inactive-key perturbations. Maximum
+ relative gradient L2 error was0.003176 overall,0.002969 for folded Flex.
+ The first oracle7204 hit the test's specialization limit; resetting each
+ deliberately distinct case fixed the harness without relaxing model limits.
+
+Rejected codegen experiments were removed from working source; their immutable
+snapshots remain reproducible. Native embedding backward was slower. Joint
+positional gradients preserved forward outputs bit-for-bit and matched gradients
+within relative L2 error0.00001625, but produced no whole-wave gain. Pattern
+matching7194 reached the120-second cap before a measured wave. Long autotuning
+and superseded long probes were cancelled rather than extended.
+
+Evidence and exact frozen-source/job identities:
+`artifacts/probes/critic-gqa-readout-20260915/contract-verification.json`,
+`flash-kernel-diagnostic.json`, `flash-trace-analysis.json`,
+`short-probe-evidence.json`, and `flex-investigation-findings.json` in that same
+directory. These are performance and correctness experiments; they do not
+establish a learning improvement, and no new full training run is represented.
+
+### Integrated rerun and final contracts
+
+The unwrapped production benchmark7212 completed under the120-second cap:
+warm waves10.6084/10.5678 seconds, updates8.1770/8.1988 seconds. Medians are
+**10.5881 seconds/wave and8.1879 seconds/update**, a3.42% whole-wave latency
+reduction against the integrated Flash/cuDNN control7201. This reproduces the
+direction of the candidate result, not its exact4.79% magnitude.
+
+The final entity/config test batch7213 passed five cases before its120-second
+cap. Remaining contracts were partitioned rather than extending the cap:
+7215 passed the combined compiled PPO/actor-NextLat/critic-NextLat backward
+contract;7216 passed seven artifact, critic-checkpoint, full719-step PPO replay,
+and registry checks. Generic CUDA mask suite7214 passed all15 cases against
+the actual default dispatch. Two independent read-only reviews reported no
+concrete findings. Scoped Ruff checks and dependency lock resolution passed.
+
+A fresh efficient-only control7217 on the **same final frozen source** measured
+10.9083/10.9703 seconds/wave and8.4875/8.5154 seconds/update: medians10.9393
+and8.5015 seconds. Against that control the retained dispatch reduces whole-wave
+latency by **3.21%**, not the10–11% suggested by comparing against the earlier
+efficient run. The source of that earlier timing drift is unestablished; use
+the final matched control for the headline gain. This is a modest improvement,
+not the requested substantially faster whole-model result, so the conditional
+full training/comparison has not been launched.
+
+### CUDA-graph follow-up (2026-09-15)
+
+The active learner was already inside the mixed-wave inference CUDA graph,
+together with the eight-lane frozen-policy forward, gather/scatter, and stream
+join. A wave records once and replays for all719 real steps. Native stepping,
+preference generation, and policy-statistics transfer remain outside that graph.
+
+All follow-up GPU probes use exclusive MLQ admission, priority0, one attempt and
+a hard120-second limit. They retain192 physical games,320 learner trajectories,
+230080 genuine states, B8192,29 optimizer updates, actor auxiliary off and critic
+auxiliary1/1. Unless explicitly identified as an operator or inference-only
+diagnostic, timings include the full rollout and PPO workload.
+
+Enabling `reduce-overhead` initially failed:7218 and regression7221 reproduced
+actor gradient storage being recycled by a subsequent critic graph before the
+guarded actor optimizer consumed it. One explicit graph iteration now spans the
+entire PPO minibatch. Replay-only loops advance independently and behavior-value
+replay copies each result into owned output storage. Regression7222 passed;7220
+completed three full waves without the graph-lifetime warnings. Its warm median
+was10.5519s total and8.1134s update, versus10.5881s/8.1879s for the earlier
+compiled-default control. This is not evidence of a large graph speedup.
+
+Additional experiments were tested, then removed from production source:
+
+| Experiment | Evidence | Decision |
+|---|---|---|
+| Separate preference CUDA graph |7223:2 exact RNG contracts passed;7228:all rollout fields except elapsed time matched across the full230080-state wave | No repeatable whole-wave win |
+| Interleaved preference capture |7241:three warm samples per arm,2.3336s captured versus2.3982s uncaptured median; isolated7231/7232 full-wave comparison favored uncaptured10.3874s versus10.7330s | Timing variation exceeds a convincing gain |
+| Compiled NorMuon variance normalization |7233:72 production-shape numerical cases passed, maximum relative L2 error1.414e-7;7239:6 CUDA grouping/gating cases passed |7240 update8.2820s versus8.1105s sampler-only control; no accepted speedup |
+| Larger RMS row blocks |7235:update8.1516s, no improvement;7238:12 of6144000 BF16 outputs differ from the old reduction layout | Reject |
+| Re-enabled compiler pattern matcher |7242 reached120s before completing a measured wave, with cast emulation retained | No qualified result |
+
+The optimizer experiment first exhausted Dynamo's specialization cache.
+Guard logs7236 identified view `_base` ancestry, singleton batches, optional
+gates and square-shape equalities. Normalizing layout and detaching no-grad
+optimizer views fixed the test and full workload without raising cache limits
+or falling back to eager model execution. The implementation was nevertheless
+discarded because the measured performance did not justify it. The strengthened
+CUDA optimizer contract remains useful independently of that experiment.
+
+Independent read-only reviews of the retained PPO graph changes and the
+experimental sampling graph found no actionable defects. The permanent native
+graph regression exercises the original failure within a minibatch; the full
+production benchmark additionally exercises repeated graph replay over29
+minibatches per wave. Scoped Ruff checks passed.
+
+Exact commands, immutable source identities and detailed evidence are in
+`artifacts/probes/critic-gqa-readout-20260915/cuda-graph-investigation.json`
+and its referenced MLQ jobs. The preference equivalence hashes are in
+`full-rollout-sampling-equivalence.json`; interleaved inference timings are in
+`sampling-graph-interleaved.json`. These results alone make no learning claim.
+
+### Retained short-attention tuning and learning launch
+
+Flex's Blackwell backward defaults use128-row/column tiles for narrow heads.
+Uniform32×32 and64×64 candidates retained all masks and passed15 CUDA
+forward/backward contracts each (7245/7246). Six complete alternating waves in
+7247 separated the first invocation of each configuration from warm measurements:
+
+| Warm update | Backend defaults |64×64 tiles |
+|---|---:|---:|
+| First measured wave |8.1319s |7.9169s |
+| Second measured wave |8.0725s |7.9268s |
+| Median |8.1022s |7.9218s |
+
+That is a2.23% update-time reduction. Whole-wave medians were10.3273s versus
+10.2252s (0.99%), with rollout variation working against the tuned arm. The
+retained override applies only to padded head widths<=32, folded query
+lengths<=64 and key lengths<=256; other shapes use backend heuristics.
+
+The final unwrapped production benchmark7250 measured10.4204s total and8.1522s
+update medians, with no graph warnings. Final-source mask contracts7251 passed
+all15 cases, and native719-step graph/PPO regression7252 passed. Before the tile
+change,7249 also passed the native regression plus six CUDA optimizer
+grouping/gating cases. No large inference-graph speedup is claimed.
+
+The latest request authorized a full learning run once the execution path was
+credible. Following that validation, job7254 launched the500-iteration budget
+at `runs/production-entity-gqa-d96-outcome-graphs-b8192-20260915`, using immutable
+source digest `0a290af7ebb05af23043d857d1e3150b781853a6ce30e194bc4b42541c85ddf3`.
+It uses the existing BC actor, a fresh single-query critic, B8192, actor
+NextLat0/0, critic NextLat1/1, and `reduce-overhead` updates. Learning rates remain
+actor0.00015, critic0.00015 and critic head0.0004375; objective and GAE settings
+are unchanged. Each chunk has a25-minute MLQ cap and0.33-hour graceful boundary,
+with420-second checkpoints and the existing checkpointed plateau guard.
+
+The first launch7253 failed argument validation before training because an
+added optional source-digest flag requires a calibration-decision file. The
+corrected direct launch omits that unpaired flag, like the historical run;
+immutable-source provenance remains recorded. Job7254 completed19 iterations
+and released the actor at iteration18. Its first replay audit had maximum
+KL8.5335e-11 and zero tail violations. These establish live training, not a
+learning improvement. The historical comparison uses B6400 and scalar pooling,
+so it is descriptive rather than a controlled critic-only ablation.
+
+### Full learning outcome and held-out check
+
+Job7254 plateau-culled at iteration70, rather than exhausting its500-iteration
+budget. Reported training time was823.245s (13.72 minutes), and MLQ process time
+was834.054s. Exit75 is the configured intentional prune, not an execution crash.
+The actor had53 active iterations after release at18. The guard recorded30
+stale observations, with EMA money30085.37 and value loss2.99698 versus its
+reference39034.22/2.97701. No automatic restart was launched.
+
+The historical complete iteration immediately preceding that elapsed time was
+iteration73 at815.414s. Last20-iteration means were:
+
+| Online proxy | New run | Historical matched-time window |
+|---|---:|---:|
+| Money |28234.52 |25743.58 |
+| Value loss |2.99780 |3.00483 |
+| Monte Carlo R-squared |0.34575 |0.34560 |
+
+Those proxies do not establish a playing-strength improvement. Job7256 loaded
+the saved actors and evaluated each against the identical BC initializer on256
+reserved development seeds4000000–4000255. Both used CUDA BF16 compiled
+`inductor_graph` inference, temperature1, the full719-step native engine and
+balanced seats by seed parity—not both seats of each seed. Initializer SHA256
+matched between training runs. The nearest available historical recovery
+checkpoint was iteration76 at850.730s,27.485s beyond the new checkpoint.
+
+| Held-out native result versus BC | New iteration70 | Historical iteration76 |
+|---|---:|---:|
+| Wins / games |96 /256 |92 /256 |
+| Win rate |37.50% |35.94% |
+|95% Hoeffding interval |29.01–45.99% |27.45–44.43% |
+
+The paired score difference was+1.56 percentage points, with a conservative
+95% interval of−15.41 to+18.54 points: no demonstrated advantage over the
+historical policy. Both policies underperformed BC in this check. This is native
+development evidence, not Kaggle evaluator or submission-admission evidence.
+Do not promote the new checkpoint over BC on these results.
+
+The saved recovery artifact is
+`runs/production-entity-gqa-d96-outcome-graphs-b8192-20260915/checkpoint-000070.pt`
+(also `latest.pt`), SHA256
+`8ef0a2b050c2cd59fd6353ae52b36023d9deccb86a00306e329055a7ea5c87a4`.
+7255 read the version17 recovery payload;7256 strictly loaded critic and
+predictor state, confirmed optimizer/RNG and cull-state presence, and exercised
+the restored actor in complete games. A resumed optimizer step was not tested.
+Detailed results are in `learning-comparison.json` and
+`learning-native-evaluation.json` beside the graph investigation artifact.
+
+### User-directed continuation and initial-decline diagnosis
+
+The user requested continued training because the new entity policy is
+recovering better than its predecessor. The prior plateau-pruned outcome is not
+a conclusion that recovery had stopped: money EMA rose from28096.11 at
+iteration65 to30085.37 at70, but the guard still compared it against39034.22
+and therefore incremented patience throughout that recovery.
+
+Job7257 produced `checkpoint-000070-no-autocull.pt` beside the original
+checkpoint, changing only `training_data_config.autocull` to null. A recursive
+round-trip comparison verified exact equality of every other recovery field,
+including all model, optimizer, RNG, league and warm-start state. The original
+checkpoint remains unchanged. `continuation-checkpoint.json` records both
+digests and the explicit user authorization.
+
+Job7258 initially resumed that state into
+`runs/production-entity-gqa-d96-outcome-graphs-b8192-20260915-continued`.
+It keeps the500-total-iteration target, disables the per-process hours cutoff
+and the online plateau rule, and retains all other training/numerical guards.
+MLQ admits one job at a time, priority0, with a2-hour hard cap. Periodic recovery
+checkpoints remain420 seconds apart. The first resumed iteration71 completed
+29actor updates with maximum replay KL2.92452e-11. Reported elapsed time resets
+for each continuation process; add the original823.245s to measure accumulated
+training along a successfully continued checkpoint lineage.
+
+The matched iteration61–70 windows substantiate better recovery:
+
+| Metric | New entity | Previous entity |
+|---|---:|---:|
+| Self-play money |30227.06 |26696.15 |
+| League money |29178.82 |25827.22 |
+| League score |0.44844 |0.41406 |
+
+These are approximately13% improvements in both money measures. They remain
+online, moving-opponent measurements, not a controlled architecture ablation.
+
+The leading initial-decline hypothesis is immature long-horizon credit, rather
+than a numerical failure or entropy collapse:
+
+- Actor release at18 used prior-wave aggregate Monte Carlo R-squared0.10929.
+  During the first10actor-active waves, aggregate R-squared averaged0.20861,
+  yet explained variance with more than512steps remaining averaged only0.02107.
+- Actor GAE lambda0.972183588 gives a35.95-step geometric horizon in719-step
+  games. The direct terminal coefficient at719steps is1.59687e-9; early action
+  credit consequently depends heavily on successor-value estimates.
+- The32-step actor LR warmup counts optimizer minibatches, not rollout waves.
+  It ends on the third minibatch of the second actor-active wave. Critic-only
+  warmup does not consume the actor schedule, so this is not a shared-clock bug.
+- Entropy rises into the money trough and falls during recovery. The decline
+  also exists in self-play, so changing league composition cannot fully explain
+  it. Aggregate value accuracy alone cannot prove harmful action-conditional
+  advantage bias.
+
+Do not alter this continuation to test the hypothesis. The discriminating
+follow-up is a same-rollout, per-time-to-go comparison of current GAE versus
+Monte Carlo actor-gradient alignment, followed by a separate lambda1 ablation
+if warranted. That removes successor-value bootstrapping bias but increases
+variance; merely increasing critic warmup or lowering LR is not yet justified.
+Numeric windows, source interpretation and launch details are preserved in
+`initial-decline-diagnosis.json` and `continuation-launch.json`.
+
+The first continuation exposed a runtime-accounting defect: at iteration72,
+`CompileWatch` called three CUDA-graph runtime records late compilations. Torch
+stores runtime overhead in the same `CompilationMetrics` stream and marks those
+records `is_runtime=True`; they had no compiled frame or guard failure. The
+source fix excludes runtime records from compilation classification rather than
+disabling the late-compile guard. Job7259 reproduces the exact pre-fix failure
+using Torch's own runtime timer; job7260 passes all4compile-watch contracts,
+including genuine late-first-compile and guard-failure rejection.
+
+Only `src/kaggriculture/compilewatch.py` differs in frozen runtime source
+`10eccba60a93577b72390000e1a217902773758877e58a4b0edabf8d992ca489`.
+Job7261 explicitly rebound the uncullable iteration70 checkpoint to that source,
+verifying every other recovery field remained exactly equal. Job7262 then
+correctly rejected the prior continuation directory's conflicting old-source
+checkpoint70; no checkpoint was overwritten to bypass that check.
+
+Job7263 starts in a fresh directory,
+`runs/production-entity-gqa-d96-outcome-graphs-b8192-20260915-continued-runtime-fixed`,
+from `checkpoint-000070-no-autocull-compilewatch.pt`. It retains the same
+500-iteration target,2-hour MLQ cap, exclusive admission, BF16 compiled execution
+and disabled plateau stopping. The original and failed continuation records are
+preserved. Exact submission and source-rebind evidence are in
+`continuation-runtime-fixed-clean-launch.json` and
+`continuation-runtime-fix-checkpoint.json`.
+
+Verified job7263 through iteration74: iteration71 completed cold setup and its
+fresh replay audit; iterations72–74 each applied29actor updates with settled
+shapes and zero compiler events. Training continues beyond that verification
+boundary. The runtime fix changes neither gradients nor the actual compile
+guard's treatment of new frames.
