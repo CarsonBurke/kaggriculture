@@ -26,3 +26,5 @@ worktrees/
 
 # Cargo build tree for the native env extension
 .cargo-target/
+# Historical run archives
+runs_old/
