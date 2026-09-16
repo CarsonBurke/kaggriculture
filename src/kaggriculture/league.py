@@ -132,10 +132,7 @@ def _load_payload(path: Path) -> dict[str, Any]:
     except ValueError as error:
         raise ValueError(f"league snapshot has an unknown architecture: {path}") from error
     expected_config = architecture.config_class().to_dict()
-    # Historical entity snapshots predate this actor-inert critic ablation.
-    # Every other field remains required, and the immutable payload is untouched.
-    required_config = expected_config.keys() - {"critic_inverted_attention"}
-    if not required_config <= payload["model_config"].keys() <= expected_config.keys() or any(
+    if payload["model_config"].keys() != expected_config.keys() or any(
         type(value) is not type(expected_config[name])
         for name, value in payload["model_config"].items()
     ):

@@ -58,7 +58,12 @@ class EntityConfig:
     zero_init_branches: bool = False
     fused_mlp: bool = False
     split_clock_token: bool = False
-    critic_inverted_attention: bool = False
+    shared_memory_kv: bool = True
+    inter_attention_ffn: bool = False
+    unit_local_readout: bool = False
+    critic_readout_ffn: bool = False
+    unit_local_init: bool = True
+    tile_cross_rope: bool = False
     value_atoms: int = 255
     value_min: float = -2.2
     value_max: float = 2.2
@@ -110,36 +115,46 @@ class EntityConfig:
 
 
 class EntityMemory(nn.Module):
-    """One source-live normalization and K/V projection, shared by all rounds."""
+    """Normalize source memory once, then project shared or round-local K/V."""
 
-    def __init__(self, config: EntityConfig) -> None:
+    def __init__(self, config: EntityConfig, *, normalize: bool = True) -> None:
         super().__init__()
         self.kv_heads = config.attention_kv_heads
         self.head_dim = config.model_dim // config.attention_heads
-        self.norm = RMSNorm(config.model_dim)
+        self.norm = RMSNorm(config.model_dim) if normalize else None
         self.key_value = Linear(config.model_dim, 2 * self.kv_heads * self.head_dim, bias=False)
         self.key_norm = RMSNorm(self.head_dim)
 
-    def forward(self, memory: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, memory: Tensor, tile_rotation: tuple[Tensor, Tensor] | None = None
+    ) -> tuple[Tensor, Tensor]:
         batch, tokens, _width = memory.shape
         key, value = (
-            self.key_value(self.norm(memory))
+            self.key_value(self.norm(memory) if self.norm is not None else memory)
             .view(batch, tokens, 2, self.kv_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
             .unbind(dim=0)
         )
-        return self.key_norm(key), value
+        key = self.key_norm(key)
+        if tile_rotation is not None:
+            # Both farms use their own board coordinates; ownership stays encoded.
+            tiles = key[:, :, : 2 * TILE_COUNT].unflatten(-2, (2, TILE_COUNT))
+            cosine, sine = tile_rotation
+            tiles = tiles * cosine.to(key.dtype) + AxialRotaryEmbedding._rotate_pairs(
+                tiles
+            ) * sine.to(key.dtype)
+            key = torch.cat((tiles.flatten(-3, -2), key[:, :, 2 * TILE_COUNT :]), dim=-2)
+        return key, value
 
 
 class EntityMemoryRead(nn.Module):
     """Round-specific Q/output projections without another memory projection."""
 
-    def __init__(self, config: EntityConfig, *, inverted: bool = False) -> None:
+    def __init__(self, config: EntityConfig) -> None:
         super().__init__()
         self.heads = config.attention_heads
         self.kv_heads = config.attention_kv_heads
         self.head_dim = config.model_dim // self.heads
-        self.inverted = inverted
         self.query = Linear(config.model_dim, config.model_dim, bias=False)
         self.query_norm = RMSNorm(self.head_dim)
         self.output = Linear(config.model_dim, config.model_dim, bias=False)
@@ -152,49 +167,62 @@ class EntityMemoryRead(nn.Module):
         key: Tensor,
         value: Tensor,
         memory_valid: Tensor | None,
-        query_valid: Tensor,
+        unit_rotation: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         batch, tokens, width = queries.shape
         query = self.query(queries).view(batch, tokens, self.heads, self.head_dim)
         query = self.query_norm(query.transpose(1, 2))
+        if unit_rotation is not None:
+            # Market queries have no spatial coordinate and remain unrotated.
+            units = query[:, :, :MAX_UNITS]
+            cosine, sine = unit_rotation
+            units = units * cosine.to(query.dtype) + AxialRotaryEmbedding._rotate_pairs(
+                units
+            ) * sine.to(query.dtype)
+            query = torch.cat((units, query[:, :, MAX_UNITS:]), dim=-2)
         query, key, value = _sdpa_inputs(query, key, value)
-        if self.inverted:
-            from kaggriculture.triton_inverted_attention import inverted_attention
-
-            # Keep GQA heads separate: query competition must not cross heads.
-            attended = inverted_attention(
-                query, key, value, query_valid, memory_valid, self.head_dim**-0.5
-            )
-        else:
-            mask = None if memory_valid is None else memory_valid[:, None, None, :]
-            attended = _fused_attention(
-                query,
-                key,
-                value,
-                mask,
-                enable_gqa=self.heads != self.kv_heads,
-                scale=self.head_dim**-0.5,
-            )
+        mask = None if memory_valid is None else memory_valid[:, None, None, :]
+        attended = _fused_attention(
+            query,
+            key,
+            value,
+            mask,
+            enable_gqa=self.heads != self.kv_heads,
+            scale=self.head_dim**-0.5,
+        )
         attended = attended.to(queries.dtype).transpose(1, 2).reshape(batch, tokens, width)
         return self.output(attended)
 
 
 class EntityRound(nn.Module):
-    """Self attention, fixed-memory cross attention, then exactly one FFN."""
+    """Self attention and memory cross attention, each optionally followed by an FFN."""
 
-    def __init__(self, config: EntityConfig, *, inverted: bool = False) -> None:
+    def __init__(self, config: EntityConfig) -> None:
         super().__init__()
         self.self_norm = RMSNorm(config.model_dim)
         self.self_attention = Attention(config)
         self.self_gate = GatedResidual(config.model_dim)
         self.cross_norm = RMSNorm(config.model_dim)
-        self.cross_attention = EntityMemoryRead(config, inverted=inverted)
+        self.cross_attention = EntityMemoryRead(config)
         self.cross_gate = GatedResidual(config.model_dim)
         self.ffn_norm = RMSNorm(config.model_dim)
         self.ffn = FusedFeedForward(config) if config.fused_mlp else FeedForward(config)
         self.ffn_gate = GatedResidual(config.model_dim)
+        self.memory = None if config.shared_memory_kv else EntityMemory(config, normalize=False)
+        self.inter_ffn_norm = RMSNorm(config.model_dim) if config.inter_attention_ffn else None
+        self.inter_ffn = (
+            (FusedFeedForward(config) if config.fused_mlp else FeedForward(config))
+            if config.inter_attention_ffn
+            else None
+        )
+        self.inter_ffn_gate = (
+            GatedResidual(config.model_dim) if config.inter_attention_ffn else None
+        )
+        self.modulation_chunks = 8 if config.inter_attention_ffn else 6
         self.modulation = (
-            Linear(config.model_dim, 6 * config.model_dim) if config.global_modulation else None
+            Linear(config.model_dim, self.modulation_chunks * config.model_dim)
+            if config.global_modulation
+            else None
         )
         if self.modulation is not None:
             nn.init.zeros_(self.modulation.weight)
@@ -204,16 +232,26 @@ class EntityRound(nn.Module):
         self,
         states: Tensor,
         key: Tensor,
-        value: Tensor,
+        value: Tensor | None,
         state_valid: Tensor,
         memory_valid: Tensor | None,
         conditioning: Tensor | None,
+        *,
+        unit_rotation: tuple[Tensor, Tensor] | None = None,
+        tile_rotation: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
+        if self.memory is not None:
+            key, value = self.memory(key, tile_rotation)
+            states = states.to(key.dtype)
+        if value is None:
+            raise ValueError("shared entity round requires projected memory values")
         modulation = None
         if self.modulation is not None:
             if conditioning is None:
                 raise ValueError("conditioned entity round requires economy conditioning")
-            modulation = self.modulation(conditioning).to(states.dtype).chunk(6, dim=-1)
+            modulation = (
+                self.modulation(conditioning).to(states.dtype).chunk(self.modulation_chunks, dim=-1)
+            )
         valid = state_valid.unsqueeze(-1)
         self_input = self.self_norm(states)
         if modulation is not None:
@@ -225,13 +263,22 @@ class EntityRound(nn.Module):
             ),
             0.0,
         )
+        if self.inter_ffn is not None:
+            assert self.inter_ffn_norm is not None and self.inter_ffn_gate is not None
+            inter_input = self.inter_ffn_norm(states)
+            if modulation is not None:
+                # Append channels: the original self/cross/final-FFN order stays fixed.
+                inter_input = inter_input * (1 + modulation[6][:, None]) + modulation[7][:, None]
+            states = torch.where(
+                valid, self.inter_ffn_gate(states, self.inter_ffn(inter_input)), 0.0
+            )
         cross_input = self.cross_norm(states)
         if modulation is not None:
             cross_input = cross_input * (1 + modulation[2][:, None]) + modulation[3][:, None]
         states = torch.where(
             valid,
             self.cross_gate(
-                states, self.cross_attention(cross_input, key, value, memory_valid, state_valid)
+                states, self.cross_attention(cross_input, key, value, memory_valid, unit_rotation)
             ),
             0.0,
         )
@@ -248,17 +295,20 @@ class EntityTrunk(nn.Module):
         super().__init__()
         self.config = config
         self.tiles = TileEmbedder(config)
-        self.units = UnitEmbedder(config)
+        local_readout = config.unit_local_readout and not private_columns
+        self.units = UnitEmbedder(
+            config, local_init=config.unit_local_init, local_context=local_readout
+        )
         self.economy = EconomyEmbedder(config, private_columns=private_columns)
         self.rope = AxialRotaryEmbedding(config.model_dim // config.attention_heads)
         self.farm_local = nn.ModuleList(Block(config) for _ in range(config.farm_blocks))
         # Unit-RMS lookup rows follow existing market-query optimizer ownership.
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
-        self.memory = EntityMemory(config)
-        self.core = nn.ModuleList(
-            EntityRound(config, inverted=private_columns and config.critic_inverted_attention)
-            for _ in range(config.core_layers)
-        )
+        self.memory = EntityMemory(config) if config.shared_memory_kv else None
+        self.memory_norm = None if config.shared_memory_kv else RMSNorm(config.model_dim)
+        self.core = nn.ModuleList(EntityRound(config) for _ in range(config.core_layers))
+        self.unit_local_decoder = Block(config) if local_readout else None
+        self.local_context_norm = RMSNorm(config.model_dim) if local_readout else None
 
     def forward(
         self,
@@ -278,8 +328,12 @@ class EntityTrunk(nn.Module):
         for block in self.farm_local:
             farms = block(farms, query_rotation=rotation, key_rotation=rotation)
         tiles = farms.reshape(batch, 2 * TILE_COUNT, width)
-        local = self.units.local_tiles(
-            tiles[:, :TILE_COUNT], inputs.unit_tile_gather, inputs.unit_tile_gather_valid
+        local = (
+            self.units.local_tiles(
+                tiles[:, :TILE_COUNT], inputs.unit_tile_gather, inputs.unit_tile_gather_valid
+            )
+            if self.config.unit_local_init or self.unit_local_decoder is not None
+            else None
         )
         units = self.units(
             inputs.unit_categorical,
@@ -314,13 +368,49 @@ class EntityTrunk(nn.Module):
                 dim=1,
             )
             memory = torch.cat((memory, opponent_units), dim=1)
-        key, value = self.memory(memory)
-        # Lookup embeddings seed FP32 tensors under autocast; enter the round
-        # compute dtype once rather than promoting its adaptive RMS branches.
-        states = states.to(key.dtype)
+        unit_rotation = tile_rotation = None
+        if self.config.tile_cross_rope:
+            positions = torch.stack(
+                (inputs.unit_categorical[..., 3], inputs.unit_categorical[..., 2]), dim=-1
+            )
+            unit_rotation = self.rope.rotation(positions)
+            tile_rotation = (self.rope.cosine, self.rope.sine)
+        if self.memory is not None:
+            key, value = self.memory(memory, tile_rotation)
+            # Lookup embeddings seed FP32 tensors under autocast; enter the round
+            # compute dtype once rather than promoting its adaptive RMS branches.
+            states = states.to(key.dtype)
+        else:
+            # Normalize the common source once; only projected K/V are round-local.
+            assert self.memory_norm is not None
+            key, value = self.memory_norm(memory), None
         conditioning = economy_mean if self.config.global_modulation else None
         for block in self.core:
-            states = block(states, key, value, state_valid, memory_valid, conditioning)
+            states = block(
+                states,
+                key,
+                value,
+                state_valid,
+                memory_valid,
+                conditioning,
+                unit_rotation=unit_rotation,
+                tile_rotation=tile_rotation,
+            )
+        if self.unit_local_decoder is not None:
+            assert local is not None and self.local_context_norm is not None
+            units, markets = states.split((MAX_UNITS, MAX_MARKET_ORDERS), dim=1)
+            slots = local.shape[2]
+            local_valid = inputs.unit_tile_gather_valid.clone()
+            # Keep inactive rows safe for attention, then discard their decoded state.
+            local_valid[..., 0] |= ~inputs.unit_active
+            units = self.unit_local_decoder(
+                units.reshape(batch * MAX_UNITS, 1, width),
+                local.reshape(batch * MAX_UNITS, slots, width),
+                context_norm=self.local_context_norm,
+                context_valid=local_valid.reshape(batch * MAX_UNITS, slots),
+            ).view(batch, MAX_UNITS, width)
+            units = torch.where(inputs.unit_active.unsqueeze(-1), units, 0.0)
+            states = torch.cat((units, markets), dim=1)
         return states
 
 
@@ -415,6 +505,13 @@ class EntityCritic(nn.Module):
             replace(config, zero_init_branches=False) if config.zero_init_branches else config
         )
         self.pool_attention = Attention(readout_config)
+        self.value_ffn_norm = RMSNorm(config.model_dim) if config.critic_readout_ffn else None
+        self.value_ffn = (
+            (FusedFeedForward(config) if config.fused_mlp else FeedForward(config))
+            if config.critic_readout_ffn
+            else None
+        )
+        self.value_ffn_gate = GatedResidual(config.model_dim) if config.critic_readout_ffn else None
         self.value_norm = RMSNorm(config.model_dim, eps=1e-5)
         self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
@@ -433,11 +530,14 @@ class EntityCritic(nn.Module):
         opponent_unit_active: Tensor,
     ) -> StructuredCriticBelief:
         batch = inputs.tile_categorical.shape[0]
-        # All categorical/private continuous features remain present. Opponent
-        # tiles are already explicit memory, so only the gather relation is seeded.
-        relation_only = self.trunk.units.gather_relation.weight.expand(
-            batch, opponent_unit_categorical.shape[1], -1, -1
-        )
+        # Private categorical/continuous features stay present without local init.
+        # With it enabled, preserve the original relation-only opponent seed.
+        relation_only = None
+        if self.config.unit_local_init:
+            assert self.trunk.units.gather_relation is not None
+            relation_only = self.trunk.units.gather_relation.weight.expand(
+                batch, opponent_unit_categorical.shape[1], -1, -1
+            )
         opponent_units = self.trunk.units(
             opponent_unit_categorical,
             opponent_unit_continuous,
@@ -455,6 +555,9 @@ class EntityCritic(nn.Module):
         )
         query = self.value_query.unsqueeze(0).expand(batch, -1, -1)
         pooled = self.pool_attention(query, self.pool_norm(states), context_valid=valid)
+        if self.value_ffn is not None:
+            assert self.value_ffn_norm is not None and self.value_ffn_gate is not None
+            pooled = self.value_ffn_gate(pooled, self.value_ffn(self.value_ffn_norm(pooled)))
         return StructuredCriticBelief(self.value_norm(pooled))
 
     def decode_belief(self, belief: StructuredCriticBelief) -> Tensor:

@@ -362,6 +362,44 @@ def test_masked_attention_supports_production_unit_decoder_batch() -> None:
     assert torch.count_nonzero(actual[::8]) == 0
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_large_masked_attention_preserves_per_batch_masks_and_gradients() -> None:
+    """Cross the Flex grid-Y limit with a nondivisible final batch tile."""
+    torch.manual_seed(17)
+    batch, heads, kv_heads, width = 65537, 4, 2, 24
+    query = torch.randn(batch, heads, 1, width, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(batch, kv_heads, 5, width, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    query.requires_grad_()
+    key.requires_grad_()
+    value.requires_grad_()
+    mask = torch.rand(batch, 1, 1, 5, device="cuda") > 0.3
+    mask[::32768] = False
+    forward = torch.compile(
+        structured._fused_attention,
+        options=policy_compile_options("default"),
+        fullgraph=True,
+        dynamic=False,
+    )
+    actual = forward(query, key, value, mask, enable_gqa=True, scale=width**-0.5)
+    rq, rk, rv = (tensor.detach().float().requires_grad_() for tensor in (query, key, value))
+    scores = (rq @ rk.repeat_interleave(heads // kv_heads, dim=1).transpose(-2, -1)) * width**-0.5
+    scores = scores.masked_fill(~mask, -torch.inf)
+    scores = torch.where(mask.any(dim=-1, keepdim=True), scores, 0.0)
+    weights = scores.softmax(dim=-1).masked_fill(~mask, 0.0)
+    expected = weights @ rv.repeat_interleave(heads // kv_heads, dim=1)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream.float())
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    for tensor, reference in zip((query, key, value), (rq, rk, rv), strict=True):
+        assert tensor.grad is not None and reference.grad is not None
+        torch.testing.assert_close(tensor.grad.float(), reference.grad, rtol=3e-2, atol=3e-2)
+        assert torch.count_nonzero(tensor.grad[::32768]) == 0
+    assert torch.count_nonzero(actual[::32768]) == 0
+
+
 def test_hardware_native_mlp_rejects_cpu_execution() -> None:
     module = FusedFeedForward(
         replace(

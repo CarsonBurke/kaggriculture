@@ -37,7 +37,7 @@ CRITIC_ONLY_MODEL_FIELDS = frozenset(
         "critic_latents",
         "critic_state_read",
         "per_entity_critic",
-        "critic_inverted_attention",
+        "critic_readout_ffn",
     )
 )
 

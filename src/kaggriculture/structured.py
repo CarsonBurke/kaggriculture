@@ -324,6 +324,56 @@ def _pad_head_width(tensor: Tensor, width: int) -> Tensor:
     return tensor if extra == 0 else nn.functional.pad(tensor, (0, extra))
 
 
+def _masked_flex_attention(
+    query: Tensor, key: Tensor, value: Tensor, key_valid: Tensor, scale: float
+) -> Tensor:
+    # Flex maps batch to CUDA grid Y, whose limit is 65535. Flattened per-unit
+    # decoders exceed it at production minibatch sizes. Independent batch tiles
+    # preserve the same fused operator and gradients without copying K/V.
+    if query.shape[0] > 65535:
+        outputs = []
+        for start in range(0, query.shape[0], 32768):
+            stop = start + 32768
+            outputs.append(
+                _masked_flex_attention(
+                    query[start:stop],
+                    key if key.shape[0] == 1 else key[start:stop],
+                    value if value.shape[0] == 1 else value[start:stop],
+                    key_valid if key_valid.shape[0] == 1 else key_valid[start:stop],
+                    scale,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    def score_mod(score, b, h, q, k):
+        mask_batch = 0 if key_valid.shape[0] == 1 else b
+        return torch.where(key_valid[mask_batch, k], score, -float("inf"))
+
+    return flex_attention(
+        query,
+        key,
+        value,
+        score_mod=score_mod,
+        scale=scale,
+        # Default 128-row backward tiles overpad short folded entity queries.
+        kernel_options={
+            "BACKEND": "TRITON",
+            **(
+                {
+                    "BLOCK_M": 64,
+                    "BLOCK_N": 64,
+                    "BLOCK_M1": 64,
+                    "BLOCK_N1": 64,
+                    "BLOCK_M2": 64,
+                    "BLOCK_N2": 64,
+                }
+                if query.shape[-1] <= 32 and query.shape[-2] <= 64 and key.shape[-2] <= 256
+                else {}
+            ),
+        },
+    )
+
+
 def _fused_attention(
     query: Tensor,
     key: Tensor,
@@ -381,37 +431,7 @@ def _fused_attention(
         # Fuse validity into dense scores; constructing sparse block metadata
         # does not pay for these short sequences. The decoding heuristic is
         # slower here. No-grad rollout retains SDPA's supported vmap batching.
-        key_valid = attention_mask[:, 0, 0, :]
-
-        def score_mod(score, b, h, q, k):
-            mask_batch = 0 if key_valid.shape[0] == 1 else b
-            return torch.where(key_valid[mask_batch, k], score, -float("inf"))
-
-        attended = flex_attention(
-            query,
-            key,
-            value,
-            score_mod=score_mod,
-            scale=scale,
-            # The default 128-row backward tiles overpad the folded entity
-            # queries. Keep the measured short/narrow case within 64-row tiles;
-            # other geometries retain the backend's hardware heuristics.
-            kernel_options={
-                "BACKEND": "TRITON",
-                **(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 64,
-                        "BLOCK_M2": 64,
-                        "BLOCK_N2": 64,
-                    }
-                    if query.shape[-1] <= 32 and query.shape[-2] <= 64 and key.shape[-2] <= 256
-                    else {}
-                ),
-            },
-        )
+        attended = _masked_flex_attention(query, key, value, attention_mask[:, 0, 0, :], scale)
     else:
         # Prefer Flash for dense attention and cuDNN for arbitrary masks. Keep
         # efficient CUDA for unsupported configurations, never a math fallback.
@@ -803,7 +823,13 @@ class TileEmbedder(nn.Module):
 class UnitEmbedder(nn.Module):
     """Unit identity, execution slot, position, inventory, and local tiles."""
 
-    def __init__(self, config: StructuredConfig) -> None:
+    def __init__(
+        self,
+        config: StructuredConfig,
+        *,
+        local_init: bool = True,
+        local_context: bool = True,
+    ) -> None:
         super().__init__()
         width = config.model_dim
         self.role = nn.Embedding(len(UNIT_ROLES), width)
@@ -816,11 +842,17 @@ class UnitEmbedder(nn.Module):
             ReluSquared(),
             Linear(width, width),
         )
-        self.gather_relation = nn.Embedding(len(UNIT_TILE_GATHERS), width)
-        self.gather_projection = Linear(len(UNIT_TILE_GATHERS) * width, width, bias=False)
+        self.gather_relation = (
+            nn.Embedding(len(UNIT_TILE_GATHERS), width) if local_init or local_context else None
+        )
+        self.gather_projection = (
+            Linear(len(UNIT_TILE_GATHERS) * width, width, bias=False) if local_init else None
+        )
 
     def local_tiles(self, farm_tiles: Tensor, gather: Tensor, gather_valid: Tensor) -> Tensor:
         """Gather each unit's HERE/NSEW encoded tiles: [B, U, 5, width]."""
+        if self.gather_relation is None:
+            raise ValueError("unit embedder was constructed without local context")
         batch, units, slots = gather.shape
         width = farm_tiles.shape[-1]
         flat = gather.reshape(batch, units * slots, 1).expand(-1, -1, width)
@@ -833,11 +865,10 @@ class UnitEmbedder(nn.Module):
         categorical: Tensor,
         continuous: Tensor,
         active: Tensor,
-        local_tiles: Tensor,
+        local_tiles: Tensor | None,
         *,
         opponent: bool,
     ) -> Tensor:
-        batch, units, slots, width = local_tiles.shape
         embedded = (
             self.role(categorical[..., 0])
             + self.slot(categorical[..., 1])
@@ -845,8 +876,14 @@ class UnitEmbedder(nn.Module):
             + self.column(categorical[..., 3])
             + self.farm.weight[int(opponent)]
             + self.continuous(continuous.to(self.continuous[0].weight.dtype))
-            + self.gather_projection(local_tiles.reshape(batch, units, slots * width))
         )
+        if self.gather_projection is not None:
+            if local_tiles is None:
+                raise ValueError("local unit initialization requires gathered tiles")
+            batch, units, slots, width = local_tiles.shape
+            embedded = embedded + self.gather_projection(
+                local_tiles.reshape(batch, units, slots * width)
+            )
         return torch.where(active.unsqueeze(-1), embedded, 0.0)
 
 
