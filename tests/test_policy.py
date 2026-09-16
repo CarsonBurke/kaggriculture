@@ -4,13 +4,17 @@ import numpy as np
 import torch
 from kaggle_environments import make
 
-from kaggriculture.actions import MarketKind
-from kaggriculture.constants import PRODUCTS
-from kaggriculture.model import FarmActor, ModelConfig
-from kaggriculture.policy import (
+from kaggriculture.actions import (
+    MarketKind,
     MarketLedger,
     _apply_ledger_order,
     _ledger_quantity_mask,
+    market_kind_mask,
+    quantity_mask,
+)
+from kaggriculture.constants import PRODUCTS
+from kaggriculture.model import FarmActor, ModelConfig
+from kaggriculture.policy import (
     _sample_numpy_categorical,
     act_batch,
     component_logprobs,
@@ -234,9 +238,12 @@ def test_market_ledger_matches_dynamic_engine_fill_and_round_trip() -> None:
         inventory={item: observation["market"]["inventory"][item] for item in PRODUCTS},
     )
 
-    quantity_mask = _ledger_quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT, ledger)
-    assert quantity_mask[:95].all()
-    assert not quantity_mask[95:].any()
+    public_quantities = quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT)
+    ledger_quantities = _ledger_quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT, ledger)
+    assert market_kind_mask(observation)[MarketKind.BUY_PRODUCT_WHEAT]
+    assert public_quantities[:95].all()
+    assert not public_quantities[95:].any()
+    np.testing.assert_array_equal(ledger_quantities, public_quantities)
 
     _apply_ledger_order(observation, MarketKind.BUY_PRODUCT_WHEAT, 100, ledger)
     bought_state = environment.step(

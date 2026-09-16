@@ -32,7 +32,11 @@ from kaggriculture.actions import (
     N_UNIT_ACTIONS,
     QUANTIFIED_MARKET_KINDS,
     MarketKind,
+    MarketLedger,
     UnitAction,
+    _apply_ledger_order,
+    _ledger_kind_mask,
+    _ledger_quantity_mask,
     _unit_inventory,
     _unit_position,
     apply_unit_shed_effect,
@@ -46,7 +50,6 @@ from kaggriculture.constants import (
     ANIMALS,
     BOARD_SIZE,
     CROP_FIRST_YIELD_DAY,
-    MARKET_I0,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
     PRODUCTS,
@@ -55,16 +58,6 @@ from kaggriculture.constants import (
     SHED_CAPACITY,
     fibonacci_hire_cost,
     shed_access_tiles,
-)
-
-# Package-internal reuse of the sampler's ledger machinery: the projection must
-# evolve masks with byte-identical semantics to act_batch, so it shares the
-# exact helpers instead of reimplementing them.
-from kaggriculture.policy import (
-    MarketLedger,
-    _apply_ledger_order,
-    _ledger_kind_mask,
-    _ledger_quantity_mask,
 )
 
 _MOVE_NAMES = frozenset(("NORTH", "SOUTH", "EAST", "WEST"))
@@ -441,14 +434,7 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
     # The engine truncates each queue to maxMarketOrdersPerTurn before any
     # execution, so trailing extras are never read.
     orders = list(action.get("market") or [])[:MAX_MARKET_ORDERS]
-    market_inventory = (observation.get("market") or {}).get("inventory") or {}
-    ledger = MarketLedger(
-        money=float(farm.get("money", 0) or 0),
-        shed=remaining_shed,
-        hires=int(farm.get("hires_today", 0) or 0),
-        extra_land=max(0, len(farm.get("unlocked_quadrants") or []) - 1),
-        inventory={item: int(market_inventory.get(item, MARKET_I0)) for item in PRODUCTS},
-    )
+    ledger = MarketLedger.from_observation(observation, shed=remaining_shed)
     canonical_orders: list[list[Any]] = []
     market_kinds = np.full(MAX_MARKET_ORDERS, int(MarketKind.STOP), dtype=np.int8)
     market_quantities = np.zeros(MAX_MARKET_ORDERS, dtype=np.int8)

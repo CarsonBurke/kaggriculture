@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
@@ -15,15 +16,18 @@ from kaggriculture.constants import (
     CROP_MAX_YIELD,
     CROP_MAX_YIELD_DAY,
     LAND_PRICES,
+    MARKET_I0,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
     ONGOING_CROPS,
+    PRICE_FLOOR,
     PRIVATE_ITEMS,
     PRODUCTS,
     QUANTITY_BINS,
     SEED_COST,
     SHED_CAPACITY,
     fibonacci_hire_cost,
+    market_price,
     shed_access_tiles,
 )
 
@@ -97,7 +101,6 @@ class UnitAction(IntEnum):
     PLACE_MILK = 65
     PLACE_WOOL = 66
     PLACE_FERTILIZER = 67
-
 
     # The original unsuffixed names remain readable aliases for the largest
     # transfer, while masks expose every smaller coordination-friendly choice.
@@ -198,6 +201,38 @@ _SELL_PRODUCT = {
 QUANTIFIED_MARKET_KINDS = frozenset((*_BUY_SEED, *_BUY_PRODUCT, *_BUY_ANIMAL, *_SELL_PRODUCT))
 
 
+@dataclass
+class MarketLedger:
+    money: float
+    shed: dict[str, int]
+    hires: int
+    extra_land: int
+    inventory: dict[str, int]
+
+    @classmethod
+    def from_observation(
+        cls,
+        observation: dict[str, Any],
+        *,
+        shed: dict[str, int] | None = None,
+    ) -> MarketLedger:
+        """Initialize market state, retaining an optional post-unit shed ledger."""
+        player = int(observation.get("player", 0) or 0)
+        farms = observation.get("farms") or []
+        farm = farms[player] if player < len(farms) else {}
+        if shed is None:
+            snapshot_shed = (observation.get("private") or {}).get("shed") or {}
+            shed = {item: int(value or 0) for item, value in snapshot_shed.items()}
+        inventory = (observation.get("market") or {}).get("inventory") or {}
+        return cls(
+            money=float(farm.get("money", 0) or 0),
+            shed=shed,
+            hires=int(farm.get("hires_today", 0) or 0),
+            extra_land=max(0, len(farm.get("unlocked_quadrants") or []) - 1),
+            inventory={item: int(inventory.get(item, MARKET_I0)) for item in PRODUCTS},
+        )
+
+
 def _unit_position(farm: dict[str, Any], unit_index: int) -> tuple[int, int] | None:
     if unit_index == 0:
         raw = farm.get("farmer")
@@ -265,7 +300,6 @@ def unit_action_mask(
         for action, item in _PLACE_PRODUCT.items():
             mask[action] = shed_room > 0 and int(inventory.get(item, 0) or 0) > 0
 
-
     tile = tiles[y][x]
     if tile == "LOCKED":
         return mask
@@ -317,7 +351,7 @@ def unit_action_mask(
 
 
 def all_unit_action_masks(observation: dict[str, Any]) -> np.ndarray:
-    """Build sequential masks, reserving seeds for earlier sampled plant actions later."""
+    """Build independent snapshot masks without reserving resources between units."""
     masks = np.zeros((MAX_UNITS, N_UNIT_ACTIONS), dtype=np.bool_)
     player = int(observation.get("player", 0) or 0)
     farms = observation.get("farms") or []
@@ -331,7 +365,21 @@ def all_unit_action_masks(observation: dict[str, Any]) -> np.ndarray:
 
 
 def market_kind_mask(observation: dict[str, Any]) -> np.ndarray:
-    """Mask order types that are impossible before this turn's queue executes."""
+    """Return exact order-type legality for the observation snapshot, without a prefix."""
+    return _ledger_kind_mask(observation, MarketLedger.from_observation(observation))
+
+
+def quantity_mask(observation: dict[str, Any], kind_value: int) -> np.ndarray:
+    """Return snapshot quantity bins using cumulative per-unit market quotes."""
+    return _ledger_quantity_mask(
+        observation, MarketKind(kind_value), MarketLedger.from_observation(observation)
+    )
+
+
+def _ledger_kind_mask(
+    observation: dict[str, Any],
+    ledger: MarketLedger,
+) -> np.ndarray:
     mask = np.zeros(N_MARKET_KINDS, dtype=np.bool_)
     mask[MarketKind.STOP] = True
     player = int(observation.get("player", 0) or 0)
@@ -339,60 +387,96 @@ def market_kind_mask(observation: dict[str, Any]) -> np.ndarray:
     if player >= len(farms):
         return mask
     farm = farms[player]
-    private = observation.get("private") or {}
-    money = float(farm.get("money", 0) or 0)
-    shed = private.get("shed") or {}
-    market = observation.get("market") or {}
-    prices = market.get("prices") or {}
-
-    mask[MarketKind.HIRE] = len(
-        farm.get("hands") or []
-    ) < MAX_UNITS - 1 and money >= fibonacci_hire_cost(int(farm.get("hires_today", 0)))
-    bought_land = max(0, len(farm.get("unlocked_quadrants") or []) - 1)
-    mask[MarketKind.BUY_LAND] = bought_land < len(LAND_PRICES) and money >= LAND_PRICES[bought_land]
-    for kind, crop in _BUY_SEED.items():
-        mask[kind] = money >= SEED_COST[crop]
-    shed_room = SHED_CAPACITY - sum(int(value or 0) for value in shed.values())
+    mask[MarketKind.HIRE] = len(farm.get("hands") or []) + max(
+        0, ledger.hires - int(farm.get("hires_today", 0) or 0)
+    ) < MAX_UNITS - 1 and ledger.money >= fibonacci_hire_cost(ledger.hires)
+    mask[MarketKind.BUY_LAND] = (
+        ledger.extra_land < len(LAND_PRICES) and ledger.money >= LAND_PRICES[ledger.extra_land]
+    )
+    room = SHED_CAPACITY - sum(ledger.shed.values())
+    for raw_kind, crop in _BUY_SEED.items():
+        mask[raw_kind] = ledger.money >= SEED_COST[crop]
+    market_params = (observation.get("market") or {}).get("params")
     for kind, item in _BUY_PRODUCT.items():
-        mask[kind] = shed_room > 0 and money >= float(prices.get(item, 1) or 1)
+        quote = market_price(item, ledger.inventory[item] - 1, market_params)
+        mask[kind] = room > 0 and ledger.money >= quote
     for kind, animal in _BUY_ANIMAL.items():
-        mask[kind] = shed_room > 0 and money >= ANIMAL_COST[animal]
+        mask[kind] = room > 0 and ledger.money >= ANIMAL_COST[animal]
     for kind, product in _SELL_PRODUCT.items():
-        mask[kind] = int(shed.get(product, 0) or 0) > 0
+        mask[kind] = ledger.shed.get(product, 0) > 0
     return mask
 
 
-def quantity_mask(observation: dict[str, Any], kind_value: int) -> np.ndarray:
-    """Return valid quantity bins for a selected market order type."""
-    mask = np.zeros(N_QUANTITIES, dtype=np.bool_)
-    kind = MarketKind(kind_value)
+def _ledger_quantity_mask(
+    observation: dict[str, Any],
+    kind: MarketKind,
+    ledger: MarketLedger,
+) -> np.ndarray:
     if kind not in QUANTIFIED_MARKET_KINDS:
+        mask = np.zeros(N_QUANTITIES, dtype=np.bool_)
         mask[0] = True
         return mask
-    player = int(observation.get("player", 0) or 0)
-    farm = (observation.get("farms") or [])[player]
-    private = observation.get("private") or {}
-    shed = private.get("shed") or {}
-    money = float(farm.get("money", 0) or 0)
-
+    room = SHED_CAPACITY - sum(ledger.shed.values())
     if kind in _SELL_PRODUCT:
-        maximum = int(shed.get(_SELL_PRODUCT[kind], 0) or 0)
+        maximum = ledger.shed.get(_SELL_PRODUCT[kind], 0)
     elif kind in _BUY_SEED:
-        maximum = int(money // SEED_COST[_BUY_SEED[kind]])
+        maximum = int(ledger.money // SEED_COST[_BUY_SEED[kind]])
     elif kind in _BUY_ANIMAL:
-        room = SHED_CAPACITY - sum(int(value or 0) for value in shed.values())
-        maximum = min(room, int(money // ANIMAL_COST[_BUY_ANIMAL[kind]]))
+        maximum = min(room, int(ledger.money // ANIMAL_COST[_BUY_ANIMAL[kind]]))
     else:
         item = _BUY_PRODUCT[kind]
-        price = float(((observation.get("market") or {}).get("prices") or {}).get(item, 1))
-        room = SHED_CAPACITY - sum(int(value or 0) for value in shed.values())
-        maximum = min(room, int(money // max(1.0, price)))
+        market_params = (observation.get("market") or {}).get("params")
+        balance = ledger.money
+        inventory = ledger.inventory[item]
+        maximum = 0
+        while maximum < room:
+            quote = market_price(item, inventory - 1, market_params)
+            if balance < quote:
+                break
+            balance -= quote
+            inventory -= 1
+            maximum += 1
+    return np.asarray([quantity <= maximum for quantity in QUANTITY_BINS], dtype=np.bool_)
 
-    for index, quantity in enumerate(QUANTITY_BINS):
-        mask[index] = quantity <= maximum
-    if maximum > 0 and not mask.any():
-        mask[0] = True
-    return mask
+
+def _apply_ledger_order(
+    observation: dict[str, Any],
+    kind: MarketKind,
+    quantity: int,
+    ledger: MarketLedger,
+) -> None:
+    market_params = (observation.get("market") or {}).get("params")
+    if kind == MarketKind.HIRE:
+        ledger.money -= fibonacci_hire_cost(ledger.hires)
+        ledger.hires += 1
+    elif kind == MarketKind.BUY_LAND:
+        ledger.money -= LAND_PRICES[ledger.extra_land]
+        ledger.extra_land += 1
+    elif kind in _BUY_SEED:
+        ledger.money -= SEED_COST[_BUY_SEED[kind]] * quantity
+    elif kind in _BUY_PRODUCT:
+        item = _BUY_PRODUCT[kind]
+        for _ in range(quantity):
+            quote = market_price(item, ledger.inventory[item] - 1, market_params)
+            if ledger.money < quote or sum(ledger.shed.values()) >= SHED_CAPACITY:
+                break
+            ledger.money -= quote
+            ledger.shed[item] = ledger.shed.get(item, 0) + 1
+            ledger.inventory[item] -= 1
+    elif kind in _BUY_ANIMAL:
+        animal = _BUY_ANIMAL[kind]
+        ledger.money -= ANIMAL_COST[animal] * quantity
+        ledger.shed[animal] = ledger.shed.get(animal, 0) + quantity
+    elif kind in _SELL_PRODUCT:
+        item = _SELL_PRODUCT[kind]
+        for _ in range(quantity):
+            if ledger.shed.get(item, 0) <= 0:
+                break
+            quote = market_price(item, ledger.inventory[item], market_params)
+            ledger.shed[item] -= 1
+            ledger.money += quote
+            if quote > PRICE_FLOOR:
+                ledger.inventory[item] += 1
 
 
 def unit_action_command(
@@ -429,7 +513,6 @@ def unit_action_command(
         )
         room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed.values()))
         return ["PLACE", item, min(held, room)]
-
 
     if action in _PLANT_CROP:
         return ["PLANT", _PLANT_CROP[action]]
@@ -496,7 +579,6 @@ def apply_unit_shed_effect(
         quantity = min(room, max(0, int(raw_quantity or 0)))
         if quantity > 0:
             shed[item] = shed.get(item, 0) + quantity
-
 
 
 def apply_unit_tile_effect(

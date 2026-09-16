@@ -11,7 +11,11 @@ from kaggriculture.actions import (
     N_UNIT_ACTIONS,
     QUANTIFIED_MARKET_KINDS,
     MarketKind,
+    MarketLedger,
     UnitAction,
+    _apply_ledger_order,
+    _ledger_kind_mask,
+    _ledger_quantity_mask,
     apply_unit_shed_effect,
     apply_unit_tile_effect,
     compile_action,
@@ -30,12 +34,6 @@ from kaggriculture.constants import (
     PRODUCTS,
     QUANTITY_BINS,
     market_price,
-)
-from kaggriculture.policy import (
-    MarketLedger,
-    _apply_ledger_order,
-    _ledger_kind_mask,
-    _ledger_quantity_mask,
 )
 from kaggriculture.rust_env import load_native
 
@@ -70,6 +68,54 @@ def test_initial_market_mask_and_quantity_budget() -> None:
     assert len(QUANTITY_BINS) == 100
     assert quantities[:7].all()
     assert not quantities[7:].any()
+
+
+def test_market_masks_reject_unaffordable_next_unit_quote() -> None:
+    observation = _observation()
+    observation["market"]["inventory"]["WHEAT"] = 9538
+    observation["market"]["prices"]["WHEAT"] = 46
+    observation["farms"][0]["money"] = 46
+
+    assert not market_kind_mask(observation)[MarketKind.BUY_PRODUCT_WHEAT]
+    assert not quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT).any()
+
+    observation["farms"][0]["money"] = 47
+
+    assert market_kind_mask(observation)[MarketKind.BUY_PRODUCT_WHEAT]
+    quantities = quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT)
+    assert quantities[0]
+    assert not quantities[1:].any()
+
+
+@pytest.mark.parametrize(("money", "maximum"), [(49, 3), (50, 4)])
+def test_market_quantity_mask_uses_cumulative_custom_quotes(money: int, maximum: int) -> None:
+    observation = _observation()
+    observation["market"]["params"] = {
+        "WHEAT": {
+            **MARKET_PARAMS["WHEAT"],
+            "base": 10,
+            "I0": 100,
+            "T": 10,
+            "below_func": "linear",
+            "below_target": 1,
+        }
+    }
+    observation["market"]["inventory"]["WHEAT"] = 100
+    observation["market"]["prices"]["WHEAT"] = 10
+    observation["farms"][0]["money"] = money
+
+    # The first four purchase quotes are 11 + 12 + 13 + 14 = 50.
+    quantities = quantity_mask(observation, MarketKind.BUY_PRODUCT_WHEAT)
+
+    assert quantities[:maximum].all()
+    assert not quantities[maximum:].any()
+
+
+def test_market_kind_mask_without_acting_farm_only_allows_stop() -> None:
+    mask = market_kind_mask({})
+
+    assert mask[MarketKind.STOP]
+    assert not mask[1:].any()
 
 
 def test_compiler_stops_market_queue_and_preserves_unit_count() -> None:

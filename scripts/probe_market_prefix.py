@@ -39,24 +39,20 @@ from kaggriculture.actions import (
     N_QUANTITIES,
     QUANTIFIED_MARKET_KINDS,
     MarketKind,
+    MarketLedger,
+    _apply_ledger_order,
+    _ledger_kind_mask,
+    _ledger_quantity_mask,
     apply_unit_shed_effect,
     apply_unit_tile_effect,
     copy_tile_grid,
 )
 from kaggriculture.constants import (
-    MARKET_I0,
     MAX_MARKET_ORDERS,
-    PRODUCTS,
     QUANTITY_BINS,
 )
 from kaggriculture.entity import EntityActor
 from kaggriculture.inference import load_actor_artifact
-from kaggriculture.policy import (
-    MarketLedger,
-    _apply_ledger_order,
-    _ledger_kind_mask,
-    _ledger_quantity_mask,
-)
 from kaggriculture.registry import STRUCTURED, architecture_of
 from kaggriculture.structured import StructuredActor
 
@@ -1095,16 +1091,7 @@ def _initialize_ledgers(data: CachedSplit) -> list[MarketLedger]:
                 int(raw_action),
                 unit_tiles,
             )
-        inventory = (observation.get("market") or {}).get("inventory") or {}
-        ledgers.append(
-            MarketLedger(
-                money=float(farm.get("money", 0) or 0),
-                shed=remaining_shed,
-                hires=int(farm.get("hires_today", 0) or 0),
-                extra_land=max(0, len(farm.get("unlocked_quadrants") or []) - 1),
-                inventory={item: int(inventory.get(item, MARKET_I0)) for item in PRODUCTS},
-            )
-        )
+        ledgers.append(MarketLedger.from_observation(observation, shed=remaining_shed))
     return ledgers
 
 

@@ -16,29 +16,22 @@ from kaggriculture.actions import (
     N_UNIT_ACTIONS,
     QUANTIFIED_MARKET_KINDS,
     MarketKind,
+    MarketLedger,
     UnitAction,
+    _apply_ledger_order,
+    _ledger_kind_mask,
+    _ledger_quantity_mask,
     apply_unit_shed_effect,
     apply_unit_tile_effect,
     compile_action,
     copy_tile_grid,
-    market_kind_mask,
-    quantity_mask,
     unit_action_mask,
 )
 from kaggriculture.constants import (
-    ANIMAL_COST,
     CROPS,
-    LAND_PRICES,
-    MARKET_I0,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
-    PRICE_FLOOR,
-    PRODUCTS,
     QUANTITY_BINS,
-    SEED_COST,
-    SHED_CAPACITY,
-    fibonacci_hire_cost,
-    market_price,
 )
 from kaggriculture.encoding import EncodedObservation, encode_observation
 from kaggriculture.entity import EntityActor
@@ -53,26 +46,6 @@ from kaggriculture.orientation import (
 from kaggriculture.registry import architecture_of
 from kaggriculture.structured import StructuredActor, stack_structured
 from kaggriculture.tokens import StructuredObservation, encode_structured_observation
-
-_MARKET_SEED_ITEMS = dict(
-    zip(
-        range(MarketKind.BUY_SEED_WHEAT, MarketKind.BUY_SEED_MELON + 1),
-        CROPS,
-        strict=True,
-    )
-)
-_MARKET_PRODUCT_ITEMS = {
-    MarketKind.BUY_PRODUCT_WHEAT: "WHEAT",
-    MarketKind.BUY_PRODUCT_FERTILIZER: "FERTILIZER",
-}
-_MARKET_ANIMAL_ITEMS = {
-    MarketKind.BUY_ANIMAL_GOOSE: "GOOSE",
-    MarketKind.BUY_ANIMAL_COW: "COW",
-    MarketKind.BUY_ANIMAL_SHEEP: "SHEEP",
-}
-_MARKET_SELL_ITEMS = dict(
-    zip(range(MarketKind.SELL_WHEAT, MarketKind.SELL_FERTILIZER + 1), PRODUCTS, strict=True)
-)
 
 
 @dataclass(frozen=True)
@@ -140,15 +113,6 @@ def prepare_quantity_heads(
         values=frozen(actor.market_quantity_value.weight),
         bias=frozen(actor.market_quantity_bias),
     )
-
-
-@dataclass
-class MarketLedger:
-    money: float
-    shed: dict[str, int]
-    hires: int
-    extra_land: int
-    inventory: dict[str, int]
 
 
 def stack_encoded(
@@ -379,103 +343,6 @@ def component_selected_logprobs(
     )
 
 
-def _ledger_kind_mask(
-    observation: dict[str, Any],
-    ledger: MarketLedger,
-) -> np.ndarray:
-    mask = market_kind_mask(observation)
-    player = int(observation.get("player", 0) or 0)
-    farm = (observation.get("farms") or [])[player]
-    mask[MarketKind.HIRE] = len(farm.get("hands") or []) + max(
-        0, ledger.hires - int(farm.get("hires_today", 0) or 0)
-    ) < MAX_UNITS - 1 and ledger.money >= fibonacci_hire_cost(ledger.hires)
-    mask[MarketKind.BUY_LAND] = (
-        ledger.extra_land < len(LAND_PRICES) and ledger.money >= LAND_PRICES[ledger.extra_land]
-    )
-    room = SHED_CAPACITY - sum(ledger.shed.values())
-    for raw_kind, crop in _MARKET_SEED_ITEMS.items():
-        mask[raw_kind] = ledger.money >= SEED_COST[crop]
-    market_params = (observation.get("market") or {}).get("params")
-    for kind, item in _MARKET_PRODUCT_ITEMS.items():
-        quote = market_price(item, ledger.inventory[item] - 1, market_params)
-        mask[kind] = room > 0 and ledger.money >= quote
-    for kind, animal in _MARKET_ANIMAL_ITEMS.items():
-        mask[kind] = room > 0 and ledger.money >= ANIMAL_COST[animal]
-    for kind, product in _MARKET_SELL_ITEMS.items():
-        mask[kind] = ledger.shed.get(product, 0) > 0
-    return mask
-
-
-def _ledger_quantity_mask(
-    observation: dict[str, Any],
-    kind: MarketKind,
-    ledger: MarketLedger,
-) -> np.ndarray:
-    if kind not in QUANTIFIED_MARKET_KINDS:
-        return quantity_mask(observation, kind)
-    room = SHED_CAPACITY - sum(ledger.shed.values())
-    if kind in _MARKET_SELL_ITEMS:
-        maximum = ledger.shed.get(_MARKET_SELL_ITEMS[kind], 0)
-    elif kind in _MARKET_SEED_ITEMS:
-        maximum = int(ledger.money // SEED_COST[_MARKET_SEED_ITEMS[kind]])
-    elif kind in _MARKET_ANIMAL_ITEMS:
-        maximum = min(room, int(ledger.money // ANIMAL_COST[_MARKET_ANIMAL_ITEMS[kind]]))
-    else:
-        item = _MARKET_PRODUCT_ITEMS[kind]
-        market_params = (observation.get("market") or {}).get("params")
-        balance = ledger.money
-        inventory = ledger.inventory[item]
-        maximum = 0
-        while maximum < room:
-            quote = market_price(item, inventory - 1, market_params)
-            if balance < quote:
-                break
-            balance -= quote
-            inventory -= 1
-            maximum += 1
-    return np.asarray([quantity <= maximum for quantity in QUANTITY_BINS], dtype=np.bool_)
-
-
-def _apply_ledger_order(
-    observation: dict[str, Any],
-    kind: MarketKind,
-    quantity: int,
-    ledger: MarketLedger,
-) -> None:
-    market_params = (observation.get("market") or {}).get("params")
-    if kind == MarketKind.HIRE:
-        ledger.money -= fibonacci_hire_cost(ledger.hires)
-        ledger.hires += 1
-    elif kind == MarketKind.BUY_LAND:
-        ledger.money -= LAND_PRICES[ledger.extra_land]
-        ledger.extra_land += 1
-    elif kind in _MARKET_SEED_ITEMS:
-        ledger.money -= SEED_COST[_MARKET_SEED_ITEMS[kind]] * quantity
-    elif kind in _MARKET_PRODUCT_ITEMS:
-        item = _MARKET_PRODUCT_ITEMS[kind]
-        for _ in range(quantity):
-            quote = market_price(item, ledger.inventory[item] - 1, market_params)
-            if ledger.money < quote or sum(ledger.shed.values()) >= SHED_CAPACITY:
-                break
-            ledger.money -= quote
-            ledger.shed[item] = ledger.shed.get(item, 0) + 1
-            ledger.inventory[item] -= 1
-    elif kind in _MARKET_ANIMAL_ITEMS:
-        animal = _MARKET_ANIMAL_ITEMS[kind]
-        ledger.money -= ANIMAL_COST[animal] * quantity
-        ledger.shed[animal] = ledger.shed.get(animal, 0) + quantity
-    elif kind in _MARKET_SELL_ITEMS:
-        item = _MARKET_SELL_ITEMS[kind]
-        for _ in range(quantity):
-            if ledger.shed.get(item, 0) <= 0:
-                break
-            quote = market_price(item, ledger.inventory[item], market_params)
-            ledger.shed[item] -= 1
-            ledger.money += quote
-            if quote > PRICE_FLOOR:
-                ledger.inventory[item] += 1
-
-
 @torch.inference_mode()
 def act_batch(
     actor: FarmActor | StructuredActor | EntityActor,
@@ -624,21 +491,10 @@ def act_batch(
     kind_entropies = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.float32)
     quantity_entropies = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.float32)
     still_active = np.ones(batch_size, dtype=np.bool_)
-    ledgers: list[MarketLedger] = []
-    for row, observation in enumerate(observations):
-        player = int(observation.get("player", 0) or 0)
-        farm = (observation.get("farms") or [])[player]
-        shed = dict(remaining_unit_sheds[row])
-        market_inventory = (observation.get("market") or {}).get("inventory") or {}
-        ledgers.append(
-            MarketLedger(
-                money=float(farm.get("money", 0) or 0),
-                shed=shed,
-                hires=int(farm.get("hires_today", 0) or 0),
-                extra_land=max(0, len(farm.get("unlocked_quadrants") or []) - 1),
-                inventory={item: int(market_inventory.get(item, MARKET_I0)) for item in PRODUCTS},
-            )
-        )
+    ledgers = [
+        MarketLedger.from_observation(observation, shed=dict(remaining_unit_sheds[row]))
+        for row, observation in enumerate(observations)
+    ]
 
     for slot in range(MAX_MARKET_ORDERS):
         for row, observation in enumerate(observations):
