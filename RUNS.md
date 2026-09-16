@@ -3671,3 +3671,502 @@ fresh replay audit; iterations72–74 each applied29actor updates with settled
 shapes and zero compiler events. Training continues beyond that verification
 boundary. The runtime fix changes neither gradients nor the actual compile
 guard's treatment of new frames.
+
+## Rejected critic-only inverted memory attention (2026-09-15)
+
+**Rejected by the user as worse.** Job7286 was cancelled by request (exit143).
+The option, operator, special compatibility handling and experiment-only tests
+have been removed from live source. The following is historical evidence for
+the frozen experiment, not a supported architecture or a future trial.
+
+This ablation follows *Inverted-Attention Transformers can Learn Object
+Representations: Insights from Slot Attention*. Only the entity critic's four
+static-memory reads change. Per query head, memory tokens compete across valid
+entity queries, then each query normalizes its allocated memory weights.
+Actor attention, critic self-attention, FFNs/residuals, shared memory projection,
+and the learned one-query GQA value pool remain unchanged. The flag
+`--critic-inverted-attention true` is off by default.
+
+Frozen implementation:
+`30f6f00255f6be0521646a3a12c8bc2ac0af0946f849693e4522e2b7253ba8c0`.
+The Triton operator differentiates both normalizations, keeps query-head
+competition separate under GQA, and avoids full attention matrices and expanded
+K/V gradient buffers. Independent math review found a CUDA grid-Y overflow:
+job7271 reproduces the old launch failure at131072 lanes; flattened grid-X
+launches pass that same large-batch, zero-stride-input regression.
+
+Verification on the frozen implementation:
+
+- Job7272: six numerical/masking/gradient regressions pass, including GPU
+  float64-oracle comparisons for FP32 and BF16, per-head GQA competition,
+  singleton mean-pool identity, common-key-logit cancellation and extreme
+  competition without underflow.
+- Job7273: changing-mask fullgraph CUDA-graph replay and gradients pass.
+- Job7276: four inactive-unit/privacy/live-gradient contracts pass.
+- Job7274: complete719-step native games, replay parity and a real
+  BF16 `reduce-overhead` actor/critic/critic-NextLat PPO update pass.
+- Isolated fixture failures in7275 and7280 are preserved: the first omitted
+  the entrypoint's sibling `autocull_hook`; the second synthetic untrained
+  actor omitted required `seed_usage`. The fixture now links the complete
+  frozen scripts directory and declares empty exposure; production admission
+  checks were not relaxed.
+
+The user subsequently authorized replacing the running normal-attention
+continuation. Job7263 was cancelled by request after preserving its full
+iteration420 recovery checkpoint in the original run directory:
+`checkpoint-000420.pt`, SHA256
+`2b6479155012aeb77bf7055625b765f8a059d523a509d9c7256cd8bc7d072156`.
+The file was CPU-deserialized to verify actor, critic, optimizer and RNG state.
+Metrics reached440; those later20iterations are not checkpointed. Resume the
+preserved checkpoint with its original frozen source `10eccba60a93577b…`;
+do not reinterpret its critic weights as an inverted-attention recovery.
+
+### Measured final value pooling
+
+Job7279 uses that iteration420 baseline, compiled CUDA BF16 inference and
+256 complete development games against the same BC opponent. It samples32
+evenly spaced states per game:8192 states from184064 genuine transitions.
+The final pool is selective, not approximately uniform:
+
+| Metric | Four learned query heads |
+| --- | --- |
+| Mean normalized attention entropy; uniform=1 | 0.681,0.684,0.717,0.757 |
+| Mean largest attention weight | 0.268,0.365,0.330,0.249 |
+| Mean uniform weight over valid states | 0.05565 |
+| Effective slot fraction | 0.399,0.402,0.444,0.495 |
+
+Replacing only the final pooling weights with valid-state uniform weights,
+while retaining projected values, output projection, normalization and HL head,
+changes scalar value predictions by0.5993 on average and1.5711 at p90 in model
+value units. This measures representation/value sensitivity, not PPO learning
+or playing strength under a different critic. A learned one-query pool is not
+guaranteed optimal, but inverting its query axis would necessarily remove its
+selective weighting.
+
+Commands, preserved failures, checkpoint identity and stratified pooling
+measurements: `artifacts/probes/critic-inverted-attention-20260915/`.
+
+### Verified throughput and authorized replacement
+
+Job7283 passes all six actor-identity, historical warm-start, frozen-opponent
+and strict-recovery contracts. Together the focused GPU selection passes18
+checks; two metadata-only registry/CLI checks also pass.
+
+Jobs7284/7285 complete the matched128-self-play-plus64-league production
+benchmark, with230080 genuine states and29 actor/critic/NextLat minibatches
+per iteration. Both use the same frozen source and BC bytes
+`a1f152531b3eea6361e1549636a7bb9a9d2a6e8ce24063a3a71dd1a9dcde99ee`.
+Each has one cold and two warm repeats:
+
+| Median warm time | Normal critic | Inverted critic |
+| --- | ---: | ---: |
+| Complete iteration | 10.5966s | 11.4546s |
+| PPO update | 8.2047s | 9.1266s |
+| Rollout | 2.3198s | 2.2632s |
+
+The observed complete-iteration overhead is8.10%; two warm repeats do not
+establish a precise long-run speed distribution or any learning advantage.
+
+MLQ7286 ran in
+`runs/production-entity-gqa-d96-critic-inverted-outcome-graphs-b8192-20260915`.
+It starts from the same BC actor with a fresh critic and optimizers, retains
+seed20260812, D96/4Q/2KV, HL255/sigma3, B8192, the same learning rates,
+actor/critic lambdas and critic-only NextLat recipe, and changes only the
+critic internal attention operator. Target500, no autocull, `max_hours=0`,
+two-hour queue cap, priority0, exclusive parallel limit1, one attempt.
+
+Initial startup verification covered iteration6:29 critic updates per wave, actor still frozen
+under the existing critic-warmup gate, latest HL loss3.28137. The actual
+recorded configuration confirms the inverted flag, strict frozen source,
+B8192 and disabled autocull. This is startup/update evidence, not an outcome
+claim; the run was subsequently cancelled rather than completing500 iterations. See `learning-launch.json`,
+`learning-startup-verification.json` and `validation-results.json` in the
+campaign artifact directory above.
+
+## Entity cross-attention and intermediate FFN cost (2026-09-15)
+
+Ordinary attention is restored in source
+`ed6361247fcce4e2b45aa83eb5ee895e597087c37b7c9ff865f615235d2a66b1`.
+Jobs7287/7288 pass five existing native-PPO, privacy/masking and artifact
+contracts; scoped Ruff checks pass. No rejected operator/configuration references
+remain in live source, scripts, tests or README.
+
+Each actor entity reads all220 memory tokens:200 farm tiles and20 economy
+tokens. The critic adds16 masked private opponent-unit tokens. HERE/N/S/E/W
+gathering seeds the unit state; it does not restrict entity cross-attention.
+The two farm-encoder blocks themselves attend across each entire100-tile farm.
+All four entity rounds share the projected memory K/V, with independent
+query/output projections and evolving entity states.
+
+A runtime-only timing prototype inserts an independently parameterized,
+pre-RMS, gated, economy-conditioned96→192→96 FFN between SA and CA in each
+of four rounds, for both actor and critic. Added output projections are zeroed
+for identity-preserving BC initialization. It adds223872 parameters per network
+including conditioning, and7.667712 million FFN matrix FLOPs per state/network.
+That timing-only prototype and its compatibility loader were not retained.
+The subsequent campaign below implements an independently configurable branch
+with fresh matching BC, rather than the prototype's identity-preserving warm start.
+
+All timing workloads retain230080 genuine states and29 actor/critic updates
+per iteration, compiled BF16, and the production league layout. Jobs7289/7291
+complete the initial matched three-iteration workloads. Job7290 emitted all
+three iterations and `benchmark_complete`, but subsequently hit its120-second
+process deadline; its record is preserved rather than called a successful job.
+
+To investigate variable post-update rollout time, jobs7292/7293 each complete
+five full iterations. The comparison window was specified before submission:
+discard repeats0/1 in both arms and use repeats2/3/4. PPO-update medians are
+8.09831s ordinary versus8.43001s with the extra FFNs: **+4.10%**.
+The earlier successful pair found+5.51% update overhead.
+
+Whole-iteration timing is not resolved cleanly: rollout medians varied from
+roughly2.4s to3.7s across arms, reversing the apparent complete-iteration
+comparison. Do not interpret that reversal as a speedup from adding FFNs, or
+attribute its cause without a separate measurement. A5–10% whole-iteration
+overhead is a planning estimate, not a measured conclusion. Learning benefit
+was not tested; no new learning run was launched.
+
+Commands, arithmetic, individual timings, complete raw summaries and the
+predeclared comparison window:
+`artifacts/probes/entity-cross-attention-review-20260915/`.
+
+## Piecewise entity architecture ablations (2026-09-15)
+
+Five independently selectable flags retain the production defaults: round-local
+projected K/V, an FFN between entity SA and CA, a final actor-unit local readout,
+a critic FFN after learned-query pooling, and removal of local unit initialization.
+The last contrast compares local-readout/init-off against local-readout/init-on;
+all other contrasts use the unchanged control. Common source normalization remains
+shared even when projected K/V are untied. No flags are automatically combined or
+promoted.
+
+Final learning source:
+`02cfc15b85047c3cde4cfcb6af0775c8083384184fac7e9bdbad5aa3600b4421`.
+Run roots: `runs/entity-piecewise-20260915/<arm>/`.
+Commands, gates, source identities and analysis protocol:
+`artifacts/probes/entity-piecewise-ablation-20260915/campaign.json`.
+
+Each actor-changing arm receives the original full two-epoch BC recipe over the
+same four corpora, 299104 training rows and69024 held-out rows. The critic-only
+FFN reuses the control BC actor. BC jobs7305/7307/7308/7309/7335 succeeded;
+the earlier untied initializer7306 is superseded, not reused.
+
+PPO retains the recorded production hyperparameters, seed20260812,
+128 self-play plus64 league games,720 ticks,230080 genuine states per wave,
+B8192, compiled BF16, and the existing auxiliary objectives. The user-specified
+budget is enforced as `--max-hours 0.4` with a25-minute MLQ hard cap, exclusive
+parallel limit1 and one attempt. The500-iteration argument is only an upper
+bound. Benchmark and evaluation jobs have120-second caps. Each learning arm is
+followed by its evaluation before the next arm; terminal dependencies retain
+ordering without allowing a skipped intermediate job to bypass earlier work.
+
+Full-size benchmark gates all succeeded. Each contains one cold and two warm
+iterations, with29 actor and29 critic-auxiliary updates per iteration:
+
+| Arm | Benchmark job | Warm update median | Relative to reference |
+| --- | ---: | ---: | ---: |
+| Control |7312|8.18429s|—|
+| Untied K/V |7336|9.07567s|+10.89%|
+| Intermediate FFN |7314|8.97406s|+9.65%|
+| Final local readout |7315|8.35147s|+2.04%|
+| Critic FFN |7316|8.14386s|−0.49%|
+| Local readout without local initialization |7317|8.52603s|+2.09% versus local readout|
+
+These are two-sample warm timing observations, not precise speed distributions;
+small differences do not establish a speedup or slowdown. Benchmark-only
+numerical replay audits are outside the production-iteration timer.
+
+The local decoder exposed a real production-size CUDA grid-Y failure at
+8192×16 unit rows. Masked FlexAttention now uses32768-row attention views above
+65535 batch rows, preserving the full PPO batch, BF16, masks and gradients.
+Regression7300 fails before the fix with grid_y65537 and an invalid launch;
+7301 passes the large-batch gradient and no-grad cases, and7302 passes the actual
+131072-row decoder forward/backward and inference replay. Feature contracts
+7295–7298 and the final shared-normalization/untied-projection equivalence test7334
+also pass. The initial untied benchmark7313 hit its120-second deadline and is
+preserved as a failed, superseded gate, not counted as successful evidence.
+
+The fixed development panel uses256 full games each against native `starter`
+and `scripted-v27`, seeds4500000–4500255, balanced seed-modulo-two seats and
+sampling seed20260917. Seats are paired across arms, not both seats on every map.
+Primary comparison is mean score rate, matching the terminal win/loss/draw
+objective; money, lower-tail money and change from each arm's BC are secondary.
+Paired95% intervals resample whole seed clusters containing both opponents.
+These quantify game-seed uncertainty, not training-seed uncertainty, and are
+exploratory without multiple-comparison adjustment. This is a native development
+panel, not the pinned Kaggle final evaluator. Protocol gate7319 reproduces
+identical money when the same artifact is evaluated twice.
+
+Control7339 completed134 iterations in24.1058 training minutes and evaluation7340
+succeeded. Score rate fell from60.55% for its BC actor to49.61% after PPO:
+98.83% against starter and0.39% against scripted-v27. Aggregate mean money was
+55664 versus66411 for BC. Higher moving-league money is therefore not sufficient
+evidence of stronger fixed-opponent play.
+
+The production-continuation comparison found identical PPO configuration and
+simulator source, but different BC weights and reset critic, optimizers and league
+state. Run variation is plausible, not causally established. The user accepted
+that possibility; preserved production checkpoints107 and420 receive the same
+fixed panel rather than attributing differences in moving-league curves to a new
+architecture. Detailed evidence is in `production-discrepancy.json`.
+
+### Intermittent GPU-idle intervals in untied K/V
+
+The live run's compile watcher identifies late first compilation of newly reached
+stacked league-inference layouts, not guard-triggered recompilation. At
+iterations34/36/37/39 these cost6.04/6.39/4.56/6.60 seconds respectively and extend
+rollout to6.87–9.53 seconds while PPO updates remain about9 seconds. Normal
+post-start medians through iteration61 are2.364s rollout,8.640s update and11.167s
+total; staging is0.069s. Post-start compilation totals48.769s through that point,
+with no compilation in iterations40–61. The largest unaccounted iteration-boundary
+gap is0.227s, so multi-second pauses are not explained by unmeasured checkpoint
+or logging work in this window.
+
+`_stacked_actor_ensemble` caches by physical lane count and `_compiled` by
+per-lane width. Previously unseen power-of-two layout combinations therefore
+compile as league assignments change. Repeated `_w16` names need not denote the
+same frame: separate lane-count ensembles own separate code objects. The frozen
+trials retain this behavior and count its cost against their wall budget; no
+opponent-distribution or batch-size change is used to conceal it.
+Evidence: `untied-gpu-idle-diagnosis.json` in the campaign artifact directory.
+
+### Untied K/V outcome
+
+Learning7344 and evaluation7345 succeeded. The arm completed124 iterations
+and3103 actor updates in23.9995 recorded training minutes, versus134 iterations
+and3364 actor updates for control. Fixed-panel score is49.02% versus49.61%;
+the paired difference is−0.586 percentage points,95% interval
+[−1.758,+0.586]. Mean money is46719 versus55664: difference−8945,
+95% seed-cluster interval[−12191,−5770]. Starter score is98.05% and scripted-v27
+score is0%. Its early moving-league lead did not survive the fixed panel.
+This single matched-budget trial does not support promoting untied projections.
+
+### Separate action API corrections
+
+The architecture trials retain their original frozen source. Separately,
+`MarketLedger` and its existing quote/mutation routines move from `policy.py`
+to `actions.py`; public market helpers now use those same dynamic quotes.
+All sampler, demonstration and probe imports migrate without compatibility
+re-exports. The unit snapshot-mask docstring no longer claims sequentiality.
+Supplied nondefault `shedCapacity` is rejected by `CheckpointAgent` and the
+generated submission entrypoint; observation-only and batched inference still
+assume the default capacity100. No primitive vocabulary, movement economics,
+DROP behavior, native game rules, model defaults or current training recipe changes.
+
+Scoped Ruff checks pass. Model-free action, demonstration, market-ledger and
+configuration regressions:194 passed in15.12s. MLQ7357 passes real compiled CUDA
+BF16 inference with omitted/default configuration, executes the generated agent
+function against the real GPU agent, rejects capacities1 and200, and produces
+an action accepted by the reference engine. This checks the changed entrypoint,
+not a new full submission bundle or CPU model execution. Validation source:
+`e7a45327751fbf0ab977978fda564292ff3ec34f70046bf2d3cbe2b7cfae4588`.
+
+Action-space recommendations remain separate research decisions. Partial wheat
+placement is genuinely absent and can preserve feed stock; larger fertilizer or
+animal pickups can enable routes that their current bins exclude. Oversized
+clamped pickup aliases add no new transfer where smaller exact bins already
+exist. A future target-tile head should marginalize into primitive movement
+probabilities rather than teleport, silently route multiple turns, or invent
+ambiguous BC target labels. DROP retains its actual destructive semantics and
+useful multi-item deposit. No blanket strategy-pruning mask is added.
+
+A model-free native counterfactual at final action718 confirms that a hire
+creates one hand and spends1 money while both games immediately terminate at719;
+this terminal boundary is distinct from the ordinary end-of-day boundary.
+That establishes a zero-future-action case, not its frequency or economic
+importance in learned play. A later useful-hire restriction must be a separate
+sampler-support experiment, applied before sampling in both implementations and
+reflected in stored masks and BC handling. Decisions and proof:
+`action-recommendations.json`, `final-action-hire-probe.json`,
+`action-api-validation.json` and `action-api-smoke.json`.
+
+### Intermediate FFN outcome
+
+Learning7346 and evaluation7347 succeeded:128 iterations,3219 actor updates,
+24.1655 recorded training minutes. Fixed-panel score is49.41% versus49.61%
+control; difference−0.195 percentage points,95% interval[−1.172,+0.586].
+Mean money is59265 versus55664: difference+3601,95% interval[+544,+6474].
+The money10th percentile rises from11801 to21194. Against scripted-v27,
+mean money improves by10146,95% interval[+6941,+13310], but score remains0%.
+This is a secondary money/distribution signal, not an observed win-rate benefit
+or a default promotion. Warm update overhead in the full-size gate was9.65%.
+
+### Final local unit readout outcome
+
+Learning7348 and evaluation7349 succeeded:127 iterations,3219 actor updates,
+24.1260 recorded training minutes. Fixed-panel score is48.44% versus49.61%
+control; difference−1.172 percentage points,95% interval[−2.344,−0.195].
+Mean money is29281 versus55664: difference−26383,95% interval
+[−29369,−23444]. Starter score is96.88% and scripted-v27 score is0%.
+The matching BC actor already had weaker fixed-panel score (53.71% versus
+60.55% control BC) despite slightly lower held-out NLL. This is therefore an
+end-to-end fixed-BC-recipe comparison, not an isolated effect on PPO from
+behaviorally identical initial policies. The trial does not support promotion.
+
+### Critic readout FFN outcome
+
+Learning7350 and evaluation7351 succeeded:139 iterations,3596 actor updates,
+24.0300 recorded training minutes. This arm reuses the exact control BC actor.
+Fixed-panel score is49.61%, identical to control; paired score difference0.000
+percentage points,95% interval[−0.977,+0.977]. Mean money is61208 versus55664:
+difference+5544,95% interval[+2277,+8763]. Starter score is99.22% and
+scripted-v27 score is0%. The full-size warm update gate was effectively flat
+(−0.49%, within two-sample timing noise). This is another secondary money
+improvement without an observed win-rate benefit; defaults remain unchanged.
+
+### Removing local initialization with local readout enabled
+
+Learning7352 and evaluation7353 succeeded:135 iterations,3161 actor updates,
+24.0610 recorded training minutes. The first actor update occurs at iteration27,
+versus17 for local readout with initialization; these are fixed-time comparisons,
+not equal-optimizer-work comparisons. Matching BC score is56.05%, versus53.71%
+for local readout with initialization.
+
+Against the required local-readout reference, final score is48.83% versus48.44%:
+difference+0.391 percentage points,95% interval[−0.977,+1.758]. Mean money
+improves from29281 to36888: difference+7607,95% interval[+4765,+10397].
+Both policies score0% against scripted-v27. The no-initialization arm remains
+below the original control in mean money by18776,95% interval[−22235,−15258];
+its score difference from control is−0.781 points,95% interval[−2.148,+0.391].
+This recovers some money relative to the weak local-readout arm, but does not
+justify replacing the original architecture.
+
+### Original six-arm pilot disposition
+
+All six learning jobs and six fixed-panel evaluations succeeded on their first
+attempt, with25-minute learning and2-minute evaluation hard caps. Queue proof:
+`original-campaign-terminal-jobs.json`. Complete paired comparisons and BC/PPO
+distributions are in `outcome-summary.json`.
+
+| Arm | Iterations | Fixed-panel score | Mean money | Warm full-size update |
+| --- | ---: | ---: | ---: | ---: |
+| Control | 134 | 49.61% | 55664 | 8.184s |
+| Untied projected K/V | 124 | 49.02% | 46719 | 9.076s |
+| Intermediate FFN | 128 | 49.41% | 59265 | 8.974s |
+| Final local readout | 127 | 48.44% | 29281 | 8.351s |
+| Critic readout FFN | 139 | 49.61% | 61208 | 8.144s |
+| Local readout, no local initialization | 135 | 48.83% | 36888 | 8.526s |
+
+No default promotion. Intermediate and critic FFNs show secondary money signals,
+not win-rate improvements. The local-readout variants remain weaker than control.
+All five modified PPO actors score0% against scripted-v27; control wins one of
+256 games. Their BC actors won materially more often against that opponent.
+These are one-training-seed, native-development-panel results, not official
+Kaggle finalist evidence; game-seed intervals do not measure training variance.
+
+The subsequently requested tile cross-attention RoPE is a separate extension.
+Its learning source differs from the matched control source only in
+`src/kaggriculture/entity.py`, excluding the separate action API corrections.
+
+### Tile cross-attention RoPE extension
+
+The user requested 2D RoPE for tile cross-attention after the original arms.
+`--tile-cross-rope true` is independently off by default. Unit queries use
+their `(column,row)` coordinates; both tile-memory grids use local farm
+coordinates. Market queries, economy/private-unit keys, and all values remain
+unrotated. Mixed scores still change on their spatial side; this is not a
+pairwise exemption that preserves every mixed score. Entity SA, critic pooling,
+and the optional local decoder are unchanged.
+
+Learning/benchmark source:
+`13d56d6086b61ed6bbd8dd37dd0b0cc79974c90861956aaa3a3d7ca93e61518f`.
+Its sole file difference from control source02cfc15b is `entity.py`.
+Live-code validation sourcead9ece04 has identical entity implementation and
+also contains the separately verified action API corrections.
+
+CUDA correctness jobs7386–7388 passed within their2-minute caps: a full-trunk
+dense spatial forward/gradient oracle including both farm grids and nonspatial
+memory; shared/untied equivalence with RoPE; combined-feature inactive-unit
+isolation and backward behavior. Seven model-free CLI/artifact metadata checks
+passed, as did scoped Ruff. Matching two-epoch BC7389 succeeded; held-out NLL
+is0.001261689 versus control0.001380757. This alone is not gameplay evidence.
+
+Cold full-size benchmark7390 hit its120s cap after complete repeats0 and1.
+Both had230080 genuine states and29 actor plus29 critic-auxiliary updates.
+Cold repeat0 reported74.201s inside its rollout/update timer, plus19.381s
+for the separate replay-parity audit; warm repeat1 reported8.469s update and
+10.838s total, plus2.206s parity audit. No numerical/runtime error was logged.
+The failed cold attempt is retained. Job7394 repeats the identical three-repeat
+workload with the populated compiler cache, still capped at120s; it is not a
+BC/PPO retry or a cap extension.
+
+Warm-cache gate7394 succeeded with all three full-size repeats and all29 actor
+and critic-auxiliary updates per repeat. Its two warm medians are8.281s update
+and10.825s total, versus8.184s and10.785s control. The update difference is
++1.19%, not a precise timing-distribution estimate. Actor/critic parameter counts
+remain800810/835911. Learning7400 and fixed-panel evaluation7401 are admitted
+under the unchanged24-minute trainer/25-minute hard-cap protocol.
+
+Learning7400 and evaluation7401 succeeded on their first attempts. RoPE reached
+131 iterations and3335 actor updates in24.1346 recorded training minutes.
+Fixed-panel score is49.41% versus49.61% control: difference−0.195 percentage
+points,95% interval[−1.172,+0.781]. Mean money is55627 versus55664:
+difference−38,95% interval[−2979,+2792]. Money10th percentile improves to19794
+from11801, but aggregate money and score do not establish a standalone benefit.
+Scripted-v27 score is0%, versus28.52% for the matching BC actor.
+No default promotion. Complete results are in `outcome-summary.json`.
+
+### Requested four-feature combination
+
+The user selected intermediate FFN, untied projected K/V, critic readout FFN,
+and tile cross-attention RoPE together. The exact overrides are
+`--inter-attention-ffn true --shared-memory-kv false
+--critic-readout-ffn true --tile-cross-rope true`.
+Local initialization remains enabled; final local readout remains disabled.
+This is an interaction trial against the original control, not an attribution
+experiment for any individual feature and not a default promotion.
+
+Use the same frozen13d56d60 source as isolated RoPE, the same two-epoch BC
+recipe, full-size230080-state/B8192 gate, training seed,24-minute trainer
+budget/25-minute hard cap, and fixed native development panel. BC7402 feeds
+full-size benchmark7403. Existing CUDA7386–7388 establish spatial gradients,
+shared/untied equivalence, and combined-feature mask/backward correctness;
+the exact selected combination must also pass its full-size gate before PPO.
+All jobs remain priority0, maxParallelRuns1, maxAttempts1; probes/evals are
+capped at2 minutes. Details are in `combined-four-campaign.json`.
+
+BC7402 completed both epochs, held-out NLL0.001544537. Cold full-size gate7403
+hit120s after complete repeats0 and1, with no stderr error; warm repeat1 update
+was10.274s. The unchanged three-repeat warm-cache gate7408 then succeeded.
+Warm medians are9.781s update and12.474s total; update overhead is19.51%
+versus control. Every repeat contained230080 genuine states,29 actor updates,
+and29 critic-auxiliary updates. Parameter counts are1052402 actor and1124847
+critic. The cold failed attempt remains recorded, not relabeled successful.
+
+Before PPO submission, the user explicitly permitted this combined run to exceed
+25 minutes. Learning7413 therefore uses a55-minute trainer budget
+(`--max-hours 0.9166666666666666`) and60-minute MLQ hard cap. Seed, training
+settings, and architecture flags are otherwise unchanged. Evaluation7414 retains
+the same fixed native panel and2-minute cap. The older24-minute control is
+historical context, not a matched-compute architecture comparison for this
+longer trial; any observed gain confounds architecture and additional training.
+There is still one learning attempt, no automatic retries or default promotion.
+
+Learning7413 and evaluation7414 succeeded on their first attempts. Actual queue
+wall times were55.3514 minutes and0.5374 minutes, within their60-minute and
+2-minute caps. The trainer recorded55.1962 minutes,271 iterations,62351680
+states, and7366 actor updates; first actor update was at iteration18.
+Saved configs verify exactly the four requested flags, local initialization on,
+final local readout off, identical training settings except the authorized
+runtime budget, and the expected frozen source.
+
+| Fixed native panel | Combined BC | Combined PPO | Historical24-minute control PPO |
+| --- | ---: | ---: | ---: |
+| Overall score | 55.86% | 50.20% | 49.61% |
+| Mean money | 57322 | 89467 | 55664 |
+| Money10th percentile | 1445 | 47493 | 11801 |
+| Starter score | 93.36% | 100.00% | 98.83% |
+| Scripted-v27 score | 18.36% | 0.39% | 0.39% |
+
+The combined actor wins256/256 starter games and1/256 scripted-v27 games.
+Versus historical control, paired overall score difference is+0.586 percentage
+points,95% interval[−0.195,+1.563]; mean-money difference is+33802,
+95% interval[+30703,+36993]. The larger money result is real on this panel,
+but cannot be attributed solely to architecture with the unequal budgets.
+Versus its own BC actor, overall score decreases5.664 points,95% interval
+[−8.594,−2.734], while money increases32145. The BC actor won47/256
+scripted-v27 games. Additional money has not translated into strong-opponent
+wins. No default promotion; no further learning run or retry was launched.
+Complete per-game evidence, matched-configuration checks, paired seed-cluster
+intervals, and terminal queue records are in `combined-four-campaign.json`,
+`combined-four-evaluation.json`, and `outcome-summary.json`.

@@ -31,28 +31,59 @@ The production model family is **`entity-attention`**, with width **96** for bot
 encoded memory and entities. Two shared-weight local transformer blocks encode
 each 100-tile farm independently. Exactly **26 persistent states**—16 unit slots
 and ten market-order slots—perform four rounds of self-attention, static-memory
-cross-attention, and one FFN. Four query heads share two KV heads. Memory
-normalization and K/V projection happen once per forward and remain differentiable
-through every round. Economy-conditioned RMS scale/shift modulates each branch.
+cross-attention, and one FFN by default. Four query heads share two KV heads.
+Default memory normalization and K/V projection happen once per forward and remain
+differentiable through every round. Economy-conditioned RMS scale/shift modulates
+each branch.
 
 Actor memory contains all **200 farm tiles plus 20 economy tokens**. Unit queries
 retain HERE/N/S/E/W local features; tile coordinates and ownership remain explicit.
 Inactive units are masked as attention keys and zeroed after every branch;
 all ten market slots remain valid before sampling. Final normalized unit/market
-states feed the existing policy heads directly, without generic latents, scratch
-tokens, opponent summaries, reinjection, MUDD, or separate output decoders.
+states feed the existing policy heads directly by default, without generic latents,
+scratch tokens, opponent summaries, reinjection, MUDD, or separate output decoders.
 
 The independent centralized critic adds **16 private opponent-unit memory
 tokens** (236 total), but still evolves only 26 entities. One learned critic query
 uses projected **four-query-head/two-KV-head cross-attention** over the valid entity
 states. Its normalized `[B, 1, 96]` output feeds the HL-Gauss head and the existing
-critic NextLat target. There is no extra FFN, query residual shortcut, or persistent
-core token. Residual zero-initialization does not zero this standalone readout.
+critic NextLat target. The default readout has no extra FFN, query residual shortcut,
+or persistent core token. Residual zero-initialization does not zero this standalone readout.
 Actor and critic share no parameters. Every attention layer in this production
 family, including critic NextLat, uses GQA; configurations with equal query/KV
 head counts are rejected.
 
-CUDA GQA folds query-head groups into the query sequence without repeating K/V.
+Six independent entity architecture flags preserve those defaults:
+
+| Ablation | CLI override | Effect |
+| --- | --- | --- |
+| Untied projected memory | `--shared-memory-kv false` | Each round owns its K/V projection and key normalization; common source normalization still runs once. |
+| Intermediate FFN | `--inter-attention-ffn true` | Both networks use SA → FFN → CA → FFN, with independent gated, economy-conditioned branches. |
+| Final local unit readout | `--unit-local-readout true` | After global reasoning, each actor unit reads its five HERE/N/S/E/W tiles through a local attention/FFN block. Market states and the critic do not gain this decoder. |
+| Critic readout FFN | `--critic-readout-ffn true` | A gated pre-RMS FFN follows learned-query pooling, before final normalization and HL-Gauss. Actor artifact identity is unchanged. |
+| Remove local initialization | `--unit-local-init false` | Omit the five-tile initialization projection and the private opponent-unit HERE relation tag, retaining categorical, position, ownership, and continuous unit information. |
+| Tile cross-attention RoPE | `--tile-cross-rope true` | Rotate unit queries and both farms' tile keys in global entity-memory reads using the existing axial 2D RoPE; no added parameters. |
+
+The local readout uses already encoded farm tiles, not a second encoder. When
+initialization and final readout are both enabled, they share one local gather.
+Invalid neighbors cannot affect the readout; inactive unit outputs remain zero.
+The local-initialization experiment compares readout-on/init-off against
+readout-on/init-on, rather than changing both features relative to the default.
+For BC ablations select `--architecture entity-attention`; `--production-model`
+intentionally locks the production recipe. Actor-changing flags require matching
+BC artifacts; the critic-only FFN can reuse the default actor. No ablation is
+implicitly enabled or promoted.
+
+Cross-attention RoPE uses unit `(column, row)` coordinates and each farm's local
+board grid; farm ownership remains in the encoded features, not an invented
+coordinate offset. Market queries, economy keys, private opponent-unit keys, and
+all values remain unrotated. Mixed spatial/nonspatial scores still change because
+one side is rotated. Shared tile keys are rotated once before the entity rounds;
+untied keys are rotated after each round's projection and key normalization.
+The flag does not change entity self-attention, critic pooling, or the optional
+five-tile final decoder. Farm self-attention already uses 2D RoPE by default.
+
+Ordinary CUDA GQA folds query-head groups into the query sequence without repeating K/V.
 BF16 attention uses FlexAttention's standard Triton kernel for key-masked GQA
 updates, fusing validity into dense scores without dynamic sparse-block metadata.
 Unmasked calls prefer Flash; masked no-grad rollout prefers cuDNN, retaining its
@@ -61,6 +92,9 @@ The efficient CUDA kernel remains available for unsupported SDPA configurations.
 Short folded attention (head width up to32, up to64 queries and256 keys) uses
 64×64 Flex tiles; larger geometries retain backend heuristics. This avoids
 overpadding the entity queries with the default128-row backward tiles.
+Masked gradient attention above65535 batch rows uses32768-row attention views to
+stay within CUDA's grid-Y limit; this covers the8192×16 local unit decoder without
+reducing the PPO minibatch or switching precision/backend.
 Folding avoids native Flash GQA's expanded backward K/V intermediates. Masks remain
 part of the model: inactive entity states are zeroed after each reasoning branch,
 and excluded as attention keys. Removing masks is an architecture change, not an
@@ -580,7 +614,9 @@ toward 0.5 alike, so formerly easy opponents can become contested again.
 With `inductor_graph`, training precompiles balanced league layouts up to the
 configured lane budget on its first nonempty league wave. This moves their cold
 compilation to startup without changing assignments or padding steady waves.
-CUDA graphs remain wave-owned; new update-gradient phases can still compile
+Previously unseen unbalanced layout combinations can still compile later; inspect
+the recorded compile events rather than treating every idle interval as GPU work.
+CUDA graphs remain wave-owned; new update-gradient phases can also compile
 separately. Structured fused-MLP predictors refresh cached projections before
 training and after each predictor optimizer step, including critic warmup.
 
@@ -611,6 +647,20 @@ opponent inventory ranks remain critic-only. Separate goose/cow/sheep purchase,
 shed and carried-stock tokens and public farmer/hand occupancy remain unchanged.
 Rebuild native encoding and BC caches
 and train fresh actors: old structured model artifacts are rejected, not migrated.
+
+Python action helpers and inference use the default shed capacity of100.
+`CheckpointAgent.__call__(observation, configuration)` and the generated submission
+entrypoint reject a supplied nondefault `shedCapacity` before inference.
+Observation-only calls and `act_many` assume default-capacity environments;
+capacity cannot be inferred from the observation.
+
+`all_unit_action_masks` reports independent masks for the same observation
+snapshot, not sequential resource reservations. Live sampling and compilation
+update seed, shed and tile state after each chosen unit action. Public
+`market_kind_mask` and `quantity_mask` likewise describe a snapshot, but now share
+the live sampler's `MarketLedger` pricing: each product purchase uses its next-unit
+quote and quantity affordability uses cumulative quotes, not the displayed price.
+Live market sampling retains its post-unit ledger and advances it after each order.
 
 Fresh-wave persistence diagnostics compare each active loss with no-change
 prediction through the same encoder/readout. A zero baseline is uninformative,
