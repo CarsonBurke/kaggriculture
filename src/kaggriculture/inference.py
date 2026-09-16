@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from kaggriculture.constants import SHED_CAPACITY
 from kaggriculture.model import policy_compile_options
 from kaggriculture.orientation import Orientation
 from kaggriculture.policy import act_batch, prepare_quantity_heads
@@ -402,7 +403,11 @@ class CheckpointAgent:
         self.orientation = Orientation.IDENTITY
 
     def act_many(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Act on independent environments in one model forward."""
+        """Act on independent default-configuration environments in one forward.
+
+        Observations do not carry shed capacity; callers must use the supported
+        default capacity of 100.
+        """
         if self.cuda_bf16_compiled:
             torch.compiler.cudagraph_mark_step_begin()
         inference_context = (
@@ -420,5 +425,21 @@ class CheckpointAgent:
             ).actions
         return actions
 
-    def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
+    def __call__(
+        self,
+        observation: dict[str, Any],
+        configuration: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Act with default shed capacity, rejecting supplied unsupported capacity.
+
+        Observation-only calls assume the default environment configuration.
+        Kaggle's configuration Struct is also accepted as a mapping.
+        """
+        if configuration is not None:
+            capacity = configuration.get("shedCapacity", SHED_CAPACITY)
+            if capacity != SHED_CAPACITY:
+                raise ValueError(
+                    "unsupported environment configuration: "
+                    f"shedCapacity must be {SHED_CAPACITY}, got {capacity!r}"
+                )
         return self.act_many([observation])[0]

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 from kaggle_environments import make
+from kaggle_environments.utils import Struct
 
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.inference import (
@@ -108,7 +109,29 @@ def test_compiled_bf16_agent_does_not_fall_back_when_cuda_is_unavailable(
         CheckpointAgent(tmp_path / "missing.pt", device="cuda", cuda_bf16_compiled=True)
 
 
-def test_checkpoint_agent_preserves_same_tile_dig_then_plant(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "configuration",
+    [{"shedCapacity": 1}, Struct(shedCapacity=200)],
+    ids=["mapping-lower-capacity", "engine-struct-higher-capacity"],
+)
+def test_checkpoint_agent_rejects_unsupported_shed_capacity_before_inference(
+    configuration: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No weights are needed: unsupported environments must never reach inference.
+    agent = CheckpointAgent.__new__(CheckpointAgent)
+
+    def reject_inference(_observations: list[dict]) -> list[dict]:
+        pytest.fail("unsupported configuration reached inference")
+
+    monkeypatch.setattr(agent, "act_many", reject_inference)
+    with pytest.raises(ValueError, match=r"shedCapacity.*100"):
+        agent({}, configuration)
+
+
+@pytest.mark.parametrize("supply_configuration", [False, True])
+def test_checkpoint_agent_preserves_same_tile_dig_then_plant(
+    tmp_path: Path, supply_configuration: bool
+) -> None:
     agent = _checkpoint_agent_with_ranked_actions(
         tmp_path, (UnitAction.PLANT_WHEAT, UnitAction.DIG)
     )
@@ -121,7 +144,11 @@ def test_checkpoint_agent_preserves_same_tile_dig_then_plant(tmp_path: Path) -> 
     observation["private"]["inventories"].append({})
     observation["private"]["seeds"]["WHEAT"] = 1
 
-    action = agent(observation)
+    action = (
+        agent(observation, environment.configuration)
+        if supply_configuration
+        else agent(observation)
+    )
     following = environment.step([action, {}])[0].observation
 
     assert action["farmer"] == ["DIG"]
@@ -544,7 +571,7 @@ observation["private"]["inventories"] = [{} for _ in range(16)]
 elapsed = []
 for _ in range(5):
     started = time.perf_counter()
-    action = raw_agent(observation)
+    action = raw_agent(observation, environment.configuration)
     elapsed.append(time.perf_counter() - started)
 assert len(action["hands"]) == 15
 assert len(action["market"]) == 10

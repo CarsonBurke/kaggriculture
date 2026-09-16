@@ -71,8 +71,8 @@ _BUNDLE_ROOT = Path(kaggriculture.__file__).resolve().parent.parent
 _AGENT = CheckpointAgent(_BUNDLE_ROOT / "model.pt")
 
 
-def agent(obs):
-    return _AGENT(obs)
+def agent(obs, configuration=None):
+    return _AGENT(obs, configuration)
 '''
 
 
