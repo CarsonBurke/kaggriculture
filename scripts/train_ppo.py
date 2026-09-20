@@ -2375,7 +2375,15 @@ def main() -> None:
         # A population wave has no frozen lanes, so it writes no snapshot archive:
         # an archive nothing reads would claim the run has a frozen-opponent
         # history it does not have.
-        actor_state = agent_states[0]["actor"] if population == 1 else None
+        # Critic warmup leaves the actor frozen, so a snapshot per warmup
+        # iteration is the same policy under a new filename. PFSP then fills
+        # its active window with byte-identical BC copies and the 20% past-self
+        # mix becomes mirror play for the first actor-active steps -- the only
+        # steps this recipe gets before the entropy gate. The iteration-0
+        # snapshot written before the loop is the pretrained baseline.
+        actor_state = (
+            agent_states[0]["actor"] if population == 1 and not warmup_active else None
+        )
         payload = checkpoint_payload(
             agents=agent_states,
             model_config=model_config,
