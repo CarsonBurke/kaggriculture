@@ -12,29 +12,26 @@ import shutil
 import statistics
 import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
 
-from kaggriculture.production import (
-    PRODUCTION_EPISODE_STEPS,
-    PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
-    PRODUCTION_LEAGUE_GAMES,
-    PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS,
-    PRODUCTION_LEAGUE_INITIAL_OPPONENTS,
-    PRODUCTION_OPPONENT_TEMPERATURE,
-    PRODUCTION_SELF_PLAY_GAMES,
-    PRODUCTION_TEMPERATURE,
-    build_training_command,
-    production_model_config,
-    production_vapo_config,
-    require_repository_launcher,
-    resolve_resume_checkpoint,
-)
+from kaggriculture.model import ModelConfig
 from kaggriculture.provenance import source_identity, validate_source_identity
-from kaggriculture.vapo import MAX_FIRST_MINIBATCH_KL, MAX_UPDATE_REPLAY_RATIO_ERROR
+from kaggriculture.vapo import MAX_FIRST_MINIBATCH_KL, MAX_UPDATE_REPLAY_RATIO_ERROR, VapoConfig
 
+PRODUCTION_SELF_PLAY_GAMES = 112
+PRODUCTION_LEAGUE_GAMES = 96
+PRODUCTION_LEAGUE_INITIAL_OPPONENTS = 1
+PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
+PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 2
+PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
+PRODUCTION_EPISODE_STEPS = 720
+PRODUCTION_CHECKPOINT_EVERY = 5
+PRODUCTION_TEMPERATURE = 1.0
+PRODUCTION_OPPONENT_TEMPERATURE = 0.8
 MINIMUM_COMPILE_SPEEDUP = 1.05
 
 
@@ -134,6 +131,16 @@ def _batch_summary(records: list[dict[str, Any]], games: int) -> dict[str, Any]:
     return matches[0]
 
 
+def _production_model_config() -> dict[str, int | float]:
+    return ModelConfig().to_dict()
+
+
+def _production_vapo_config(*, compiled: bool) -> dict[str, int | float | bool]:
+    return asdict(
+        VapoConfig(epochs=1, minibatch_size=2048, target_kl=0.03, compile_update=compiled)
+    )
+
+
 def _require_positive_number(record: dict[str, Any], key: str, context: str) -> float:
     value = record.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -205,8 +212,8 @@ def _validate_configuration(
             "float32_matmul_precision": "high",
             "cudnn_benchmark": True,
         },
-        "model": production_model_config(),
-        "vapo": production_vapo_config(compiled=compiled),
+        "model": _production_model_config(),
+        "vapo": _production_vapo_config(compiled=compiled),
         "max_update_replay_error": MAX_UPDATE_REPLAY_RATIO_ERROR,
         "max_first_minibatch_kl": MAX_FIRST_MINIBATCH_KL,
         "torch": str(torch.__version__),
@@ -490,8 +497,99 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _training_command(
+    args: argparse.Namespace,
+    run_directory: Path,
+    *,
+    compile_models: bool,
+    expected_source_digest: str,
+    calibration_decision: Path,
+    resume_checkpoint: Path | None = None,
+) -> list[str]:
+    model = _production_model_config()
+    vapo = _production_vapo_config(compiled=compile_models)
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("train_vapo.py")),
+        "--run-dir",
+        str(run_directory),
+        "--iterations",
+        str(args.iterations),
+        "--max-hours",
+        str(args.max_hours),
+        "--seed",
+        str(args.seed),
+        "--expected-source-digest",
+        expected_source_digest,
+        "--calibration-decision",
+        str(calibration_decision),
+        "--device",
+        "cuda",
+        "--games",
+        str(PRODUCTION_SELF_PLAY_GAMES),
+        "--league-games",
+        str(PRODUCTION_LEAGUE_GAMES),
+        "--league-active-opponents",
+        str(PRODUCTION_LEAGUE_ACTIVE_OPPONENTS),
+        "--league-historical-opponents",
+        str(PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS),
+        "--league-active-pool-size",
+        str(PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE),
+        "--opponent-temperature",
+        str(PRODUCTION_OPPONENT_TEMPERATURE),
+        "--episode-steps",
+        str(PRODUCTION_EPISODE_STEPS),
+        "--temperature",
+        str(PRODUCTION_TEMPERATURE),
+        "--checkpoint-every",
+        str(PRODUCTION_CHECKPOINT_EVERY),
+        "--cnn-width",
+        str(model["cnn_width"]),
+        "--cnn-blocks",
+        str(model["cnn_blocks"]),
+        "--model-dim",
+        str(model["model_dim"]),
+        "--transformer-layers",
+        str(model["transformer_layers"]),
+        "--attention-heads",
+        str(model["attention_heads"]),
+        "--ffn-multiplier",
+        str(model["ffn_multiplier"]),
+        "--quantity-rank",
+        str(model["quantity_rank"]),
+        "--actor-lr",
+        str(vapo["actor_learning_rate"]),
+        "--critic-lr",
+        str(vapo["critic_learning_rate"]),
+        "--lr-warmup-steps",
+        str(vapo["lr_warmup_steps"]),
+        "--weight-decay",
+        str(vapo["weight_decay"]),
+        "--epochs",
+        str(vapo["epochs"]),
+        "--minibatch-size",
+        str(vapo["minibatch_size"]),
+        "--clip-low",
+        str(vapo["clip_low"]),
+        "--clip-high",
+        str(vapo["clip_high"]),
+        "--gamma",
+        str(vapo["gamma"]),
+        "--actor-gae-lambda",
+        str(vapo["actor_gae_lambda"]),
+        "--target-kl",
+        str(vapo["target_kl"]),
+        "--max-gradient-norm",
+        str(vapo["max_gradient_norm"]),
+    ]
+    if compile_models:
+        command.append("--compile-models")
+    if resume_checkpoint is not None:
+        command.extend(("--resume", str(resume_checkpoint)))
+    return command
+
+
 def main() -> None:
-    require_repository_launcher(Path(__file__))
     args = parse_args()
     if args.iterations < 1:
         raise ValueError("iterations must be positive")
@@ -514,18 +612,21 @@ def main() -> None:
             f"{benchmark_identity['sha256']} != {identity['sha256']}"
         )
     run_directory = args.run_dir.expanduser().resolve()
-    resume_checkpoint = resolve_resume_checkpoint(run_directory)
+    latest_checkpoint = run_directory / "latest.pt"
+    if latest_checkpoint.is_symlink() or (
+        latest_checkpoint.exists() and not latest_checkpoint.is_file()
+    ):
+        raise ValueError(f"training resume checkpoint is not a regular file: {latest_checkpoint}")
+    resume_checkpoint = latest_checkpoint if latest_checkpoint.is_file() else None
     evidence_directory = run_directory / "provenance"
     eager_retained = evidence_directory / "eager-vapo.jsonl"
     compiled_retained = evidence_directory / "compiled-vapo.jsonl"
     _retain_report(eager_report, eager_retained)
     _retain_report(compiled_report, compiled_retained)
     decision_path = run_directory / "calibration-decision.json"
-    command = build_training_command(
+    command = _training_command(
+        args,
         run_directory,
-        iterations=args.iterations,
-        max_hours=args.max_hours,
-        seed=args.seed,
         compile_models=bool(decision["compile_models"]),
         expected_source_digest=identity["sha256"],
         calibration_decision=decision_path,
