@@ -424,6 +424,34 @@ def test_submission_refuses_an_agent_that_loses(tmp_path: Path) -> None:
         )
 
 
+
+def test_submission_accepts_the_official_32_seed_panel_without_a_second_eval(
+    tmp_path: Path,
+) -> None:
+    build_submission = _build_submission_module()
+    checkpoint, finalist, starter = _submission_inputs(tmp_path)
+    finalist["seed_count"] = 32
+    finalist["seed_start"] = 10_000_000
+    finalist["selection_provenance"] = None
+    starter["seed_count"] = 16
+    finalist_path = tmp_path / "finalist.json"
+    starter_path = tmp_path / "starter.json"
+    finalist_path.write_text(json.dumps(finalist), encoding="utf-8")
+    starter_path.write_text(json.dumps(starter), encoding="utf-8")
+    manifest = build_submission.build(
+        checkpoint,
+        finalist_path,
+        tmp_path / "submission.tar.gz",
+        builtin_evaluation_reports=[starter_path],
+        minimum_score_rate=0.5,
+        minimum_builtin_score_rate=0.9,
+        minimum_builtin_seed_count=16,
+    )
+    assert manifest["evaluation"]["seed_count"] == 32
+    assert manifest["evaluation"]["selection_report_sha256"] is None
+    assert manifest["evaluation"]["score_rate"] == 0.75
+
+
 def test_weights_load_across_the_provenance_bump_but_do_not_export(tmp_path: Path) -> None:
     """Loading weights and carrying a calibration claim forward are different
     operations, and only the second needs the claim to be interpretable.

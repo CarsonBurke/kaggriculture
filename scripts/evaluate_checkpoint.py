@@ -14,6 +14,7 @@ import shutil
 import statistics
 import tempfile
 import time
+import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,19 @@ class GameResult:
         return 0.5
 
 
+@dataclass
+class _BatchedGame:
+    spec: GameSpec
+    environment: Any
+    runner: Any
+    started: float
+    action_seconds: list[float]
+    pending_actions: list[Any] | None = None
+    pending_logs: list[dict[str, Any]] | None = None
+    run_seconds: float = 0.0
+    error: BaseException | None = None
+
+
 _WORKER_AGENT: CheckpointAgent | None = None
 _WORKER_OPPONENT: str | None = None
 
@@ -125,14 +139,13 @@ def _artifact_provenance(
         "sha256": digest,
         "size_bytes": path.stat().st_size,
         "format_version": int(metadata["format_version"]),
+        "architecture": str(metadata.get("architecture", "entity-cnn")),
         "iteration": int(metadata.get("iteration", 0)),
         "model_config": metadata["model_config"],
         "source_identity": identity,
         "run_provenance": metadata.get("run_provenance"),
         "agent": agent,
     }
-
-
 
 
 def _opponent_provenance(
@@ -244,8 +257,6 @@ def _initialize_worker(
     _WORKER_OPPONENT = opponent
 
 
-
-
 def _make_environment(seed: int, episode_steps: int):
     from kaggle_environments import make
 
@@ -277,8 +288,84 @@ def _reward(value: Any) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
-def _run_game(spec: GameSpec) -> GameResult:
-    if _WORKER_AGENT is None or _WORKER_OPPONENT is None:
+def _finalize_game(
+    spec: GameSpec,
+    environment: Any,
+    started: float,
+    action_seconds: list[float],
+    captured_output: str | None,
+) -> GameResult:
+    steps = len(environment.steps)
+    final = environment.steps[-1]
+    candidate = final[spec.candidate_seat]
+    opponent = final[1 - spec.candidate_seat]
+    candidate_reward = _reward(candidate.reward)
+    opponent_reward = _reward(opponent.reward)
+    candidate_status = str(candidate.status)
+    opponent_status = str(opponent.status)
+    done = bool(environment.done)
+    issues = []
+    if not done:
+        issues.append("environment did not reach DONE")
+    if steps != spec.episode_steps:
+        issues.append(f"environment produced {steps} steps, expected {spec.episode_steps}")
+    if candidate_status != "DONE":
+        issues.append(f"candidate status is {candidate_status}")
+    if opponent_status != "DONE":
+        issues.append(f"opponent status is {opponent_status}")
+    if candidate_reward is None:
+        issues.append("candidate reward is missing or non-finite")
+    if opponent_reward is None:
+        issues.append("opponent reward is missing or non-finite")
+    return GameResult(
+        seed=spec.seed,
+        candidate_seat=spec.candidate_seat,
+        candidate_reward=candidate_reward,
+        opponent_reward=opponent_reward,
+        candidate_status=candidate_status,
+        opponent_status=opponent_status,
+        environment_done=done,
+        steps=steps,
+        expected_steps=spec.episode_steps,
+        elapsed_seconds=time.perf_counter() - started,
+        action_seconds=tuple(action_seconds),
+        error="; ".join(issues) if issues else None,
+        captured_output=captured_output,
+    )
+
+
+def _failed_game_result(
+    spec: GameSpec,
+    started: float,
+    action_seconds: list[float],
+    error: BaseException,
+    captured_output: str | None,
+) -> GameResult:
+    return GameResult(
+        seed=spec.seed,
+        candidate_seat=spec.candidate_seat,
+        candidate_reward=None,
+        opponent_reward=None,
+        candidate_status="ERROR",
+        opponent_status="UNKNOWN",
+        environment_done=False,
+        steps=0,
+        expected_steps=spec.episode_steps,
+        elapsed_seconds=time.perf_counter() - started,
+        action_seconds=tuple(action_seconds),
+        error=f"{type(error).__name__}: {error}",
+        captured_output=captured_output,
+    )
+
+
+def _run_game(
+    spec: GameSpec,
+    candidate_agent: Any | None = None,
+    *,
+    capture_output: bool = True,
+) -> GameResult:
+    agent = _WORKER_AGENT if candidate_agent is None else candidate_agent
+    if agent is None or _WORKER_OPPONENT is None:
         raise RuntimeError("evaluation worker was not initialized")
     started = time.perf_counter()
     action_seconds: list[float] = []
@@ -288,74 +375,123 @@ def _run_game(spec: GameSpec) -> GameResult:
     def timed_agent(observation):
         action_started = time.perf_counter()
         try:
-            return _WORKER_AGENT(observation)
+            return agent(observation)
         finally:
             action_seconds.append(time.perf_counter() - action_started)
 
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            players: list[Any] = [_WORKER_OPPONENT, _WORKER_OPPONENT]
-            players[spec.candidate_seat] = timed_agent
-            environment = _make_environment(spec.seed, spec.episode_steps)
+        players: list[Any] = [_WORKER_OPPONENT, _WORKER_OPPONENT]
+        players[spec.candidate_seat] = timed_agent
+        environment = _make_environment(spec.seed, spec.episode_steps)
+        if capture_output:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                environment.run(players)
+        else:
             environment.run(players)
-        steps = len(environment.steps)
-        final = environment.steps[-1]
-        candidate = final[spec.candidate_seat]
-        opponent = final[1 - spec.candidate_seat]
-        candidate_reward = _reward(candidate.reward)
-        opponent_reward = _reward(opponent.reward)
-        candidate_status = str(candidate.status)
-        opponent_status = str(opponent.status)
-        done = bool(environment.done)
-        issues = []
-        if not done:
-            issues.append("environment did not reach DONE")
-        if steps != spec.episode_steps:
-            issues.append(f"environment produced {steps} steps, expected {spec.episode_steps}")
-        if candidate_status != "DONE":
-            issues.append(f"candidate status is {candidate_status}")
-        if opponent_status != "DONE":
-            issues.append(f"opponent status is {opponent_status}")
-        if candidate_reward is None:
-            issues.append("candidate reward is missing or non-finite")
-        if opponent_reward is None:
-            issues.append("opponent reward is missing or non-finite")
-        return GameResult(
-            seed=spec.seed,
-            candidate_seat=spec.candidate_seat,
-            candidate_reward=candidate_reward,
-            opponent_reward=opponent_reward,
-            candidate_status=candidate_status,
-            opponent_status=opponent_status,
-            environment_done=done,
-            steps=steps,
-            expected_steps=spec.episode_steps,
-            elapsed_seconds=time.perf_counter() - started,
-            action_seconds=tuple(action_seconds),
-            error="; ".join(issues) if issues else None,
-            captured_output=_captured_text(stdout, stderr),
+        return _finalize_game(
+            spec,
+            environment,
+            started,
+            action_seconds,
+            _captured_text(stdout, stderr) if capture_output else None,
         )
     except Exception as exc:  # external agents are intentionally outside our trust boundary
-        return GameResult(
-            seed=spec.seed,
-            candidate_seat=spec.candidate_seat,
-            candidate_reward=None,
-            opponent_reward=None,
-            candidate_status="ERROR",
-            opponent_status="UNKNOWN",
-            environment_done=False,
-            steps=0,
-            expected_steps=spec.episode_steps,
-            elapsed_seconds=time.perf_counter() - started,
-            action_seconds=tuple(action_seconds),
-            error=f"{type(exc).__name__}: {exc}",
-            captured_output=_captured_text(stdout, stderr),
+        return _failed_game_result(
+            spec,
+            started,
+            action_seconds,
+            exc,
+            _captured_text(stdout, stderr) if capture_output else None,
         )
 
 
 def _run_seed_pair(seed: int) -> tuple[GameResult, GameResult]:
     """Keep both seats of a confidence-interval cluster in one worker task."""
     return (_run_game(GameSpec(seed, 0)), _run_game(GameSpec(seed, 1)))
+
+
+def _run_games_batched(specs: list[GameSpec], batch_size: int) -> list[GameResult]:
+    """Advance official environments in lockstep around one accelerator model."""
+    from kaggle_environments.errors import DeadlineExceeded
+
+    if _WORKER_AGENT is None or _WORKER_OPPONENT is None:
+        raise RuntimeError("evaluation worker was not initialized")
+    results: list[GameResult] = []
+    for offset in range(0, len(specs), batch_size):
+        games: list[_BatchedGame] = []
+        for spec in specs[offset : offset + batch_size]:
+            environment = _make_environment(spec.seed, spec.episode_steps)
+            environment.reset(2)
+            players: list[Any] = [_WORKER_OPPONENT, _WORKER_OPPONENT]
+            players[spec.candidate_seat] = None
+            runner = environment._Environment__agent_runner(players)
+            games.append(_BatchedGame(spec, environment, runner, time.perf_counter(), []))
+
+        while active := [
+            game for game in games if not game.environment.done and game.error is None
+        ]:
+            model_games: list[_BatchedGame] = []
+            observations: list[Any] = []
+            for game in active:
+                if game.run_seconds >= game.environment.configuration.runTimeout:
+                    game.error = TimeoutError(
+                        f"evaluation seed {game.spec.seed} exceeded the official run timeout"
+                    )
+                    continue
+                phase_started = time.perf_counter()
+                game.pending_actions, game.pending_logs = game.runner.act()
+                shared_state = game.environment._Environment__get_shared_state(
+                    game.spec.candidate_seat
+                )
+                game.run_seconds += time.perf_counter() - phase_started
+                if shared_state["status"] == "ACTIVE":
+                    model_games.append(game)
+                    observations.append(shared_state["observation"])
+
+            if model_games:
+                action_started = time.perf_counter()
+                error_log = ""
+                try:
+                    actions = _WORKER_AGENT.act_many(observations)
+                except Exception as exc:
+                    error_log = traceback.format_exc()
+                    actions = [exc] * len(model_games)
+                action_seconds = time.perf_counter() - action_started
+                for game, observation, action in zip(
+                    model_games, observations, actions, strict=True
+                ):
+                    assert game.pending_actions is not None and game.pending_logs is not None
+                    game.run_seconds += action_seconds
+                    game.action_seconds.append(action_seconds)
+                    if (
+                        action_seconds - game.environment.configuration.actTimeout
+                        > observation["remainingOverageTime"]
+                    ):
+                        action = DeadlineExceeded()
+                    game.pending_actions[game.spec.candidate_seat] = action
+                    game.pending_logs[game.spec.candidate_seat] = {
+                        "duration": round(action_seconds, 6),
+                        "stdout": "",
+                        "stderr": error_log,
+                    }
+
+            for game in active:
+                if game.error is not None:
+                    continue
+                assert game.pending_actions is not None and game.pending_logs is not None
+                phase_started = time.perf_counter()
+                game.environment.step(game.pending_actions, game.pending_logs)
+                game.run_seconds += time.perf_counter() - phase_started
+
+        results.extend(
+            _failed_game_result(game.spec, game.started, game.action_seconds, game.error, None)
+            if game.error is not None
+            else _finalize_game(
+                game.spec, game.environment, game.started, game.action_seconds, None
+            )
+            for game in games
+        )
+    return results
 
 
 def _mean_confidence_interval(values: list[float]) -> tuple[float, float]:
@@ -551,12 +687,18 @@ def parse_args() -> argparse.Namespace:
         "--seeds",
         type=int,
         default=DEFAULT_SEED_CLUSTERS,
-        help="seed clusters; both seats run (use 128 for finalist evaluation)",
+        help="seed clusters; both seats run. The official 32-seed panel is enough to package",
     )
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--torch-threads", type=int, default=1)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="official environments advanced in lockstep through one batched model",
+    )
+    parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--selection-report",
         type=Path,
@@ -575,18 +717,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    batch_size = int(getattr(args, "batch_size", 1))
     if args.seeds < 1:
         raise ValueError("--seeds must be positive")
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be positive")
+    if args.workers > 1 and batch_size > 1:
+        raise ValueError("--workers and --batch-size cannot both exceed one")
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be positive")
     artifact = args.artifact.expanduser().resolve()
     if not artifact.is_file():
         raise FileNotFoundError(artifact)
     device = _resolve_device(args.device)
-    if args.workers > 1 and device.type != "cpu":
-        raise ValueError("parallel evaluation supports CPU only; use --workers 1 on accelerators")
     opponent_label, opponent = normalize_opponent(args.opponent)
     seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     started = time.perf_counter()
@@ -633,7 +778,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(
                     "finalist opponent does not match the checkpoint-selection evidence"
                 )
-        if args.workers == 1:
+        if batch_size > 1:
+            if worker_opponent not in BUILTIN_OPPONENTS:
+                raise ValueError("lockstep batching currently requires a built-in opponent")
+            _initialize_worker(
+                str(artifact_snapshot),
+                str(device),
+                args.torch_threads,
+                worker_opponent,
+                member,
+            )
+            specs = [GameSpec(seed, seat) for seed in seeds for seat in (0, 1)]
+            pairs = [(result,) for result in _run_games_batched(specs, batch_size)]
+        elif args.workers == 1:
             _initialize_worker(
                 str(artifact_snapshot),
                 str(device),
@@ -643,6 +800,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             )
             pairs = [_run_seed_pair(seed) for seed in seeds]
         else:
+            # Spawned workers own independent CUDA contexts; never fork a process
+            # after PyTorch has initialized an accelerator.
             context = mp.get_context("spawn")
             with context.Pool(
                 processes=min(args.workers, len(seeds)),
@@ -674,6 +833,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "seed_count": args.seeds,
         "paired_seats": True,
         "workers": args.workers,
+        "batch_size": batch_size,
         "torch_threads_per_worker": args.torch_threads,
         "device": str(device),
         "elapsed_seconds": time.perf_counter() - started,

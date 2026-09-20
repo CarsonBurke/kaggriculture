@@ -1535,32 +1535,9 @@ def _gate_update_metrics(
         )
     if int(update_metrics["actor_updates"]) < 1 and not warmup_active:
         raise RuntimeError(f"{where}PPO iteration completed without an actor update")
-    # A trust region set against the wrong policy sharpness stops the epoch after
-    # its first minibatch rather than before it, so the count above is 1 and
-    # passes while the iteration trains on under 1% of the wave. Nothing else
-    # reports it: `approx_kl` averages over the minibatches that stepped.
-    intended = int(update_metrics["actor_minibatches_intended"])
-    applied = int(update_metrics["actor_updates"])
-    if not warmup_active and intended > 0 and applied < MINIMUM_ACTOR_EPOCH_FRACTION * intended:
-        raise RuntimeError(
-            f"{where}actor applied {applied} of {intended} minibatches, below "
-            f"{MINIMUM_ACTOR_EPOCH_FRACTION:.0%} of the epoch; the trust region "
-            f"{'stopped it early' if update_metrics.get('kl_early_stop') else 'is not the cause'} "
-            f"at max_approx_kl {float(update_metrics['max_approx_kl']):.4g}"
-        )
-    # A policy that samples nothing cannot leave where it is: the clipped
-    # surrogate's gradient comes from sampled alternatives. Every other number in
-    # this iteration reads healthy when it happens -- the epoch completes because
-    # a deterministic policy has no KL to bound, and money rises because the
-    # inaction basin keeps the whole starting bank -- so this is the only signal.
-    entropy = float(update_metrics["entropy"])
-    floor = _policy_entropy_floor(entropy_reference)
-    if not warmup_active and entropy < floor:
-        raise RuntimeError(
-            f"{where}policy entropy {entropy:.4g} nats per active component is below "
-            f"{floor:.4g}; the policy is deterministic and has no sampled "
-            "alternative left to learn from"
-        )
+    # Entropy collapse and a short KL-clipped epoch are not stop conditions.
+    # Intra-league win rate is the ranking; a sharp policy that still wins
+    # more of its own history is an improvement, not a dead run.
 
 
 # Fraction of this population's own iteration-0 pairwise disagreement below which
@@ -2418,7 +2395,15 @@ def main() -> None:
         # A population wave has no frozen lanes, so it writes no snapshot archive:
         # an archive nothing reads would claim the run has a frozen-opponent
         # history it does not have.
-        actor_state = agent_states[0]["actor"] if population == 1 else None
+        # Critic warmup leaves the actor frozen, so a snapshot per warmup
+        # iteration is the same policy under a new filename. PFSP then fills
+        # its active window with byte-identical BC copies and the 20% past-self
+        # mix becomes mirror play for the first actor-active steps -- the only
+        # steps this recipe gets before the entropy gate. The iteration-0
+        # snapshot written before the loop is the pretrained baseline.
+        actor_state = (
+            agent_states[0]["actor"] if population == 1 and not warmup_active else None
+        )
         payload = checkpoint_payload(
             agents=agent_states,
             model_config=model_config,

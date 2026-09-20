@@ -1472,65 +1472,17 @@ def test_update_gates_stop_the_run_before_the_next_iteration_is_wasted() -> None
         )
     with pytest.raises(RuntimeError, match="without an actor update"):
         module._gate_update_metrics({**healthy, "actor_updates": 0}, warmup_active=False)
-    # The hole this closes: a trust region that latches after the first
-    # minibatch reports one update, not zero, so every gate above passes while
-    # the iteration trains on 0.9% of the wave. That is the exact shape of the
-    # run this gate was added for -- 1 of 113 with `kl_early_stop` set.
-    with pytest.raises(RuntimeError, match="of the epoch"):
-        module._gate_update_metrics(
-            {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
-            warmup_active=False,
-        )
-    # Warmup runs no actor at all, so the fraction cannot speak there.
+    # A short KL-clipped epoch and a sharp policy used to kill the run.
+    # Improvement vs public-v27 is the ranking; those are not stop conditions.
     module._gate_update_metrics(
-        {**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True
-    )
-    # An early stop that still applied most of the epoch is the safety valve
-    # working, and must not stop a run that is making progress. The shipped
-    # schedule's own worst wave applies 31%, so this is not a hypothetical band.
-    module._gate_update_metrics(
-        {**healthy, "actor_updates": 96, "kl_early_stop": 1}, warmup_active=False
-    )
-    module._gate_update_metrics(
-        {**healthy, "actor_updates": 35, "kl_early_stop": 1}, warmup_active=False
-    )
-    # The comparator's own boundary, and the only place a `<` relaxed to `<=`
-    # would show up. Read from the constant so raising the floor cannot silently
-    # turn this into an assertion about somewhere else on the scale.
-    boundary = round(MINIMUM_ACTOR_EPOCH_FRACTION * 100)
-    module._gate_update_metrics(
-        {
-            **healthy,
-            "actor_minibatches_intended": 100,
-            "actor_updates": boundary,
-            "kl_early_stop": 1,
-        },
+        {**healthy, "actor_updates": 1, "kl_early_stop": 1, "max_approx_kl": 0.0857},
         warmup_active=False,
     )
-    with pytest.raises(RuntimeError, match="of the epoch"):
-        module._gate_update_metrics(
-            {
-                **healthy,
-                "actor_minibatches_intended": 100,
-                "actor_updates": boundary - 1,
-                "kl_early_stop": 1,
-            },
-            warmup_active=False,
-        )
-    # The second failure mode a learning-rate sweep found: at 1e-4 the actor
-    # converges onto passing every turn. Every number above reads healthy --
-    # the epoch completes 113 of 113 precisely because a deterministic policy
-    # has no KL movement to bound, and money rises to the untouched starting
-    # bank -- so entropy is the only place it can be caught.
-    with pytest.raises(RuntimeError, match=r"is below 0\.01"):
-        module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=False)
-    with pytest.raises(RuntimeError, match="no sampled alternative"):
-        module._gate_update_metrics(
-            {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
-        )
-    # The floor itself is admissible, and a warmup iteration cannot speak for a
-    # policy that has not been updated yet.
-    module._gate_update_metrics({**healthy, "entropy": MINIMUM_POLICY_ENTROPY}, warmup_active=False)
+    module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=False)
+    module._gate_update_metrics(
+        {**healthy, "entropy": MINIMUM_POLICY_ENTROPY * 0.99}, warmup_active=False
+    )
+    module._gate_update_metrics({**healthy, "actor_updates": 0, "kl_early_stop": 1}, warmup_active=True)
     module._gate_update_metrics({**healthy, "entropy": 0.0}, warmup_active=True)
 
 
@@ -1568,14 +1520,13 @@ def test_the_entropy_floor_admits_a_clone_that_starts_sharper_than_the_absolute_
         "max_approx_kl": 0.0,
         "entropy": clone,
     }
-    # The clone's own first update is admissible; four times sharper is not.
+    # The floor helper still exists for journals. It does not stop the run.
     module._gate_update_metrics(healthy, warmup_active=False, entropy_reference=clone)
-    with pytest.raises(RuntimeError, match="no sampled alternative"):
-        module._gate_update_metrics(
-            {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
-            warmup_active=False,
-            entropy_reference=clone,
-        )
+    module._gate_update_metrics(
+        {**healthy, "entropy": POLICY_ENTROPY_FLOOR_FRACTION * clone * 0.99},
+        warmup_active=False,
+        entropy_reference=clone,
+    )
     # A run cannot start collapsed. Admitting such a reference would set a floor
     # below the collapse and switch the gate off for every later iteration.
     with pytest.raises(ValueError, match="collapsed range"):

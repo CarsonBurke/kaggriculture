@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
             "lowest N seeds to take from each corpus; the whole corpus is staged in "
             "host memory at ~10 MiB per episode-seat, so this is what keeps a wide "
             "mixture affordable. Breadth beats depth here: an uncapped single-opponent "
-            "clone reached 99.996% accuracy and still could not act off its own regime"
+            "clone reached 99.996%% accuracy and still could not act off its own regime"
         ),
     )
     parser.add_argument(
@@ -186,7 +186,7 @@ def parse_args() -> argparse.Namespace:
             "on three full 12-epoch arms: 'default' and "
             "'max-autotune-no-cudagraphs' reach the SAME steady state (2.03x and "
             "2.01x per epoch) but cost 39s and 473s to compile, so autotuning "
-            "buys 0.6% of throughput for 12x its own benefit and only breaks even "
+            "buys 0.6%% of throughput for 12x its own benefit and only breaks even "
             "past 16 epochs. Cudagraphs modes are refused separately: an epoch's "
             "last minibatch is a short tail, so the shape varies"
         ),

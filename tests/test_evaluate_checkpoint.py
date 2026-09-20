@@ -67,6 +67,20 @@ def test_summary_clusters_confidence_intervals_by_seed_pair() -> None:
     assert [row["seed"] for row in summary["seed_cluster_statistics"]] == [1, 2]
 
 
+def test_programmatic_evaluation_defaults_to_serial_batch_size(tmp_path: Path) -> None:
+    evaluator = _load_evaluator()
+    args = SimpleNamespace(
+        seeds=1,
+        workers=1,
+        torch_threads=1,
+        artifact=tmp_path / "missing.pt",
+        device="cpu",
+    )
+
+    with pytest.raises(FileNotFoundError):
+        evaluator.evaluate(args)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -130,6 +144,99 @@ def test_worker_reuses_one_loaded_model_across_actions_and_paired_games(monkeypa
     assert counters == {"loads": 1, "actions": 6}
     assert all(result.complete for result in pair)
     assert [len(result.action_seconds) for result in pair] == [3, 3]
+
+
+def test_lockstep_evaluation_uses_one_batched_model_forward_per_step(monkeypatch) -> None:
+    evaluator = _load_evaluator()
+    batches: list[list[int]] = []
+
+    class FakeAgent:
+        def act_many(self, observations):
+            batches.append([observation["lane"] for observation in observations])
+            return [
+                {"farmer": ["PASS"], "hands": [], "market": []} for _observation in observations
+            ]
+
+    class FakeRunner:
+        @staticmethod
+        def act():
+            return [None, None], [{}, {}]
+
+    class FakeEnvironment:
+        def __init__(self, seed: int) -> None:
+            self.seed = seed
+            self.done = False
+            self.turns = 0
+            self.configuration = SimpleNamespace(runTimeout=60, actTimeout=1)
+            final = [
+                SimpleNamespace(reward=100.0, status="DONE"),
+                SimpleNamespace(reward=50.0, status="DONE"),
+            ]
+            self.steps = [final] * 720
+
+        @staticmethod
+        def reset(_agents: int) -> None:
+            return None
+
+        def agent_runner(self, _players):
+            return FakeRunner()
+
+        def shared_state(self, _seat: int):
+            return {
+                "status": "ACTIVE",
+                "observation": {"lane": self.seed, "remainingOverageTime": 60},
+            }
+
+        def step(self, _actions, _logs) -> None:
+            self.turns += 1
+            self.done = self.turns == 3
+
+    FakeEnvironment._Environment__agent_runner = FakeEnvironment.agent_runner
+    FakeEnvironment._Environment__get_shared_state = FakeEnvironment.shared_state
+
+    evaluator._WORKER_AGENT = FakeAgent()
+    evaluator._WORKER_OPPONENT = "pass"
+    monkeypatch.setattr(
+        evaluator,
+        "_make_environment",
+        lambda seed, _episode_steps: FakeEnvironment(seed),
+    )
+    specs = [evaluator.GameSpec(seed, 0) for seed in range(4)]
+
+    results = evaluator._run_games_batched(specs, batch_size=4)
+
+    assert batches == [[0, 1, 2, 3]] * 3
+    assert all(result.complete for result in results)
+    assert all(len(result.action_seconds) == 3 for result in results)
+
+
+def test_lockstep_evaluation_matches_official_model_error_envelope() -> None:
+    evaluator = _load_evaluator()
+
+    class FailingAgent:
+        @staticmethod
+        def __call__(_observation):
+            raise RuntimeError("model failed")
+
+        @staticmethod
+        def act_many(_observations):
+            raise RuntimeError("model failed")
+
+    candidate = FailingAgent()
+    evaluator._WORKER_AGENT = candidate
+    evaluator._WORKER_OPPONENT = "pass"
+    spec = evaluator.GameSpec(seed=17, candidate_seat=0)
+
+    serial = evaluator._run_game(spec, candidate_agent=candidate)
+    (lockstep,) = evaluator._run_games_batched([spec], batch_size=1)
+
+    assert lockstep.complete == serial.complete
+    assert lockstep.candidate_status == serial.candidate_status
+    assert lockstep.opponent_status == serial.opponent_status
+    assert lockstep.candidate_reward == serial.candidate_reward
+    assert lockstep.opponent_reward == serial.opponent_reward
+    assert lockstep.steps == serial.steps
+    assert len(lockstep.action_seconds) == len(serial.action_seconds)
 
 
 def test_run_game_records_non_done_status_as_an_explicit_error(monkeypatch) -> None:

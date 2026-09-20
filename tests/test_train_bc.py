@@ -477,6 +477,19 @@ def test_unflagged_clone_builds_the_family_default_configuration(
     assert config == expected
 
 
+def test_clone_help_formats_literal_percentages(monkeypatch, capsys) -> None:
+    trainer = _load_trainer()
+    monkeypatch.setattr(sys, "argv", ["train_bc.py", "--help"])
+
+    with pytest.raises(SystemExit) as raised:
+        trainer.parse_args()
+
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "99.996% accuracy" in help_text
+    assert "0.6% of throughput" in help_text
+
+
 def test_clone_rejects_a_config_from_another_family(dataset_dir: Path, tmp_path: Path) -> None:
     trainer = _load_trainer()
 

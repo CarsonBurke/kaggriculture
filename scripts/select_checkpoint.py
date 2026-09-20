@@ -147,9 +147,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seeds", type=int, default=32)
     parser.add_argument("--seed-start", type=int, default=10_000_000)
-    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--torch-threads", type=int, default=1)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--inference-equivalence",

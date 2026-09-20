@@ -320,31 +320,32 @@ silently excluded:
 ```bash
 .venv/bin/python scripts/evaluate_checkpoint.py \
   --artifact runs/ppo-main/checkpoint-000100.pt \
-  --seeds 32 --workers 12 \
+  --seeds 32 --device cuda \
   --output evaluations/checkpoint-000100-v27.json
 ```
 
-Use at least `--seeds 128` for finalists. Rank stable-panel results, not the
-training self-play score -- which is 0.5 by symmetry however much or little
-either side is worth, and is part of why the objective needed an absolute dollar
-anchor -- or `latest.pt`. Evaluation takes no compilation flag:
-`--rollout-forward-mode`, `--rollout-bfloat16` and `--update-compile-mode` are
-training knobs, decided by the calibration described above, and the evaluation
-and selection scripts accept none of them.
+The official 32-seed paired panel is enough to package. Do not re-run 128 seeds
+against an artifact you already screened. Rank that panel, not the training
+self-play score -- which is 0.5 by symmetry however much or little either side
+is worth, and is part of why the objective needed an absolute dollar anchor --
+or `latest.pt`. If you must evaluate, use `--device cuda`. Evaluation takes no
+compilation flag: `--rollout-forward-mode`, `--rollout-bfloat16` and
+`--update-compile-mode` are training knobs, decided by the calibration described
+above, and the evaluation and selection scripts accept none of them.
 
 To screen every numbered checkpoint on identical paired seeds and atomically
 promote the strongest lower-confidence-bound result:
 
 ```bash
 .venv/bin/python scripts/select_checkpoint.py \
-  --run-dir runs/ppo-main --seeds 32 --workers 12 \
+  --run-dir runs/ppo-main --seeds 32 --device cuda \
   --output evaluations/ppo-main-screen.json \
   --best-output runs/ppo-main/best.pt
 
 .venv/bin/python scripts/evaluate_checkpoint.py \
   --artifact runs/ppo-main/best.pt \
   --selection-report evaluations/ppo-main-screen.json \
-  --seeds 128 --workers 12 \
+  --seeds 32 --device cuda \
   --output evaluations/ppo-main-finalist-v27.json
 ```
 

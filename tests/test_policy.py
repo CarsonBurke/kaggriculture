@@ -328,3 +328,4 @@ def test_component_selected_logprobs_matches_component_logprobs() -> None:
     # so it agrees bit-for-bit with the full statistics on every head.
     for lean, reference in zip(selected, full[:3], strict=True):
         torch.testing.assert_close(lean, reference, rtol=0.0, atol=0.0)
+

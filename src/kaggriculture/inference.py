@@ -19,7 +19,6 @@ from kaggriculture.provenance import (
 )
 from kaggriculture.registry import resolve_architecture
 
-
 ACTOR_ARTIFACT_FORMAT_VERSION = 5
 # Version 12 records each member's `orientation`: the grid symmetry its
 # observations were rendered through during training. Acting under anything
@@ -146,8 +145,6 @@ def checkpoint_orientation(checkpoint: Mapping[str, Any], agent: int | None = No
     return _orientation_code(checkpoint.get("orientation", 0))
 
 
-
-
 def actor_artifact_from_checkpoint(
     checkpoint: dict[str, Any], *, agent: int | None = None
 ) -> dict[str, Any]:
@@ -186,7 +183,6 @@ def actor_artifact_from_checkpoint(
         "run_provenance": run_provenance,
         # Evaluation is the real board. A stored member code is history.
         "orientation": int(Orientation.IDENTITY),
-
     }
 
 
@@ -252,21 +248,21 @@ class CheckpointAgent:
         # A stored member code on a legacy artifact is ignored.
         self.orientation = Orientation.IDENTITY
 
-    def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
-        action = act_batch(
+    def act_many(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Act on independent environments in one model forward."""
+        actions = act_batch(
             self.actor,
-            [observation],
+            observations,
             deterministic=True,
             orientation=self.orientation,
-        ).actions[0]
-        # The v16/v27 teachers DIG a weed only when an open-loop script wanted
-        # to plant or build there. A masked policy can never emit that intent:
-        # PLANT/BUILD are illegal on WEED, so the sampler never scores them,
-        # and BC cannot recover the hidden script bit. For a reactive agent
-        # the script-sync reason not to dig is gone — a weed underfoot is
-        # sterile land. Replace the standing command before the engine sees it.
-        return clear_standing_weeds(observation, action)
+        ).actions
+        return [
+            clear_standing_weeds(observation, action)
+            for observation, action in zip(observations, actions, strict=True)
+        ]
 
+    def __call__(self, observation: dict[str, Any]) -> dict[str, Any]:
+        return self.act_many([observation])[0]
 
 
 def _tile_at(farm: dict[str, Any], position: Any) -> Any:
@@ -284,9 +280,7 @@ def _is_weed(tile: Any) -> bool:
     return isinstance(tile, dict) and tile.get("kind") == "WEED"
 
 
-def clear_standing_weeds(
-    observation: dict[str, Any], action: dict[str, Any]
-) -> dict[str, Any]:
+def clear_standing_weeds(observation: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
     """Force DIG for every live unit standing on a weed.
 
     Mutates and returns ``action``. Units the engine will not execute this
