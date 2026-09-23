@@ -1,5 +1,13 @@
 # Structured VIT Regression Campaign
 
+Latest decision: [the cross-run comparison](RUN_COMPARISON_20260918.md) selects
+hardness + source-read + NextLat off as the working production recipe. Both actor
+and critic auxiliary coefficients now default to zero. The comparison includes
+fixed-panel gameplay, critic fit, training trajectories and older long runs.
+[Structural architecture ablations](ARCHITECTURE_ABLATIONS_20260918.md) are selected;
+they are not implemented or queued. Historical pending statuses below describe
+submission time, not current queue state.
+
 ## Purpose
 
 This file is the execution ledger for `VIT_NEXTLAT_PROPOSAL.md`. The campaign improves the structured actor without losing attribution and then applies structured NextLat to the best architecture.
@@ -4170,3 +4178,387 @@ wins. No default promotion; no further learning run or retry was launched.
 Complete per-game evidence, matched-configuration checks, paired seed-cluster
 intervals, and terminal queue records are in `combined-four-campaign.json`,
 `combined-four-evaluation.json`, and `outcome-summary.json`.
+
+## RL review experiments, 2026-09-16
+
+The user authorized implementation and experiments, including hardest-opponent
+league selection, with each run under 25 minutes. The user-selected production
+default `shared_memory_kv=False` is preserved. Primary play evaluation is argmax,
+not sampled decoding. No experimental default is promoted automatically.
+
+The spatial prescription is to test a zero-initialized learned displacement
+bias only on own-unit/own-farm edges, not to assume the existing RoPE code is
+incorrect. Its dense gradient checks pass. The concern is the chosen geometry:
+rotating a spatial query changes its scores against unrotated nonspatial keys,
+and two farms' local coordinates do not define physical cross-farm proximity.
+The historical isolated RoPE score difference was only−0.195 percentage points,
+with a95% interval spanning[−1.172,+0.781]; this did not establish underperformance.
+The present bias trial is a mechanism test against the new untied-K/V control,
+not a matched rerun proving why that historical RoPE result occurred.
+
+The broader architectural hypothesis is about iterative source refinement and
+available workspace, not simply whether a model is called a Perceiver.
+[FIT](https://arxiv.org/abs/2305.12689) interleaves local data processing with
+latent communication; [RIN](https://proceedings.mlr.press/v202/jabri23a.html)
+also repeatedly interacts between an interface and a latent workspace for
+iterative generation. Neither establishes an RL advantage here. They motivate
+separating a direct critic information path, one source-writeback step, and
+BiXT's repeated two-stream updates. The current fixed-source trunk can still
+form new queries and retrieve different information each round; fixed memory
+does not imply an inability to reason. The empirical questions are whether
+the compressed decision states discard value-relevant information and whether
+updating source tokens pays for its additional full-token FFN cost.
+
+The objective review found no reward-sign or GAE implementation error: this
+campaign uses terminal win/draw/loss, not money reward. Money can improve while
+relative competitive outcomes worsen, as the prior combined-feature panel
+demonstrated above. Actor lambda approximately0.97218 gives a roughly36-step
+trace in719-transition games; it therefore relies heavily on bootstrapped values
+for early decisions. In the prior combined run's final20 waves, mean aggregate
+MC R-squared was0.403, early-game explained variance0.102 and late-game0.764.
+That is not uniformly poor prediction, and stochastic future actions may impose
+irreducible early uncertainty. Harmful action-dependent value error remains a
+hypothesis, not something those aggregate metrics establish. Common-policy
+fitting compares value learnability with identical trajectories and physical-seed
+holdouts while retaining NextLat; it is not an isolated test of value regression,
+actor lambda, sampled-versus-argmax execution, or actual PPO gradient quality.
+
+The five-arm campaign compares a fresh control against critic source pooling,
+one midpoint memory writeback, own-unit/own-tile relative attention bias, and
+hardest-set league selection. Every learner uses the production 128 self-play
+plus 64 league games, 719 transitions, B8192, production critic warmup and
+NextLat, a 24-minute trainer budget, and a 25-minute MLQ hard cap. All jobs use
+normal priority, `maxParallelRuns=1`, and one attempt. Fixed development panels
+use 256 common physical seeds per opponent (starter and scripted-v27), with
+balanced seat parity and native terminal rewards for scores. Paired intervals
+describe game-seed uncertainty, not training-seed variability.
+
+The report distinguishes valid checkpoint gameplay measurements from actor
+learning evidence. A time-budget stop with zero actor updates, incomplete jobs,
+missing metrics, or a checkpoint that does not match the last logged iteration
+cannot qualify as completed actor learning. Raw panel comparisons are retained.
+Cross-campaign BiXT/control learning claims additionally require inspecting the
+control campaign's learning status; a completed control panel alone is not enough.
+
+The league arm selects the ten lowest posterior learner-score opponents plus
+one stale/uncertain probe, with exact-tie randomization, distinct opponents and
+equal game allocation. Sparse results use Beta(1,1) shrinkage; effective evidence
+decays by 0.98 per wave. It uses only current-learner games and stores evidence
+in recovery checkpoints. A regression confirms that 500 easier snapshots cannot
+collectively displace ten established hard opponents. This directly tests the
+removal of forced easy age strata, not concentration on one scripted opponent.
+Distinct snapshots do not guarantee distinct strategies. The unchanged wave
+contains256 self-play learner trajectories and64 league learner trajectories,
+so league selection affects20% of learner rows, not the entire training mix.
+
+A model-free audit of the previous shared-K/V control's final50 waves
+(`runs/entity-piecewise-20260915/control/ppo/metrics.jsonl`) narrows this hypothesis.
+Of3200 league games,250 were against scripted-v27 with learner score0%; that
+opponent was already present in every wave. Easy pass/random/starter agents
+accounted for147 games, not most of the league. Historical snapshots accounted
+for1777 games at53.07% learner score and active snapshots1026 at53.61%.
+The hardest-set experiment primarily changes which snapshots fill the remaining
+slots; equal allocation across11 opponents does not substantially increase the
+single v27 lane. Its250 games were only1.5625% of the16000 learner trajectories
+in those50 waves. These are moving-policy training diagnostics, not a fixed
+opponent-strength ranking or evidence that near-even self-play is unhelpful.
+
+### Validation and production-memory gate
+
+Compiled GPU checks7657 and7659 passed: new-branch gradients, independent dense
+relative-bias oracle, nonzero-bias vmapped opponents, full-horizon replay parity,
+and inactive private-unit masking. Three matched two-epoch BC runs7660–7662
+completed on the same four corpora (299104 training and 69024 held-out rows).
+Final holdout NLL: control0.0013367624, writeback0.0012688462, tile-bias0.0012453794.
+The critic and league arms reuse the exact control clone.
+
+Initial frozen source35fd21fc passed the six-repeat control gate7663: steady
+median14.921s total,3.082s rollout,11.664s update. Source-read7664 and writeback7665
+ran out of memory at the full production minibatch. No learning arm started from
+that campaign. Its pending learning/evaluation work was cancelled or dependency
+skipped; the successful BC artifacts are retained.
+
+Granular non-reentrant activation recomputation was added around experimental
+entity rounds, writeback blocks and critic pooling. It is restricted to the
+relevant actor/critic paths, leaves the control unchanged, and avoids replaying
+stateful fused MLPs. Model equations and artifact weights are unchanged; memory
+and runtime must be established by the new gate rather than assumed.
+
+Frozen replacement source5bade837 is recorded in
+`artifacts/probes/entity-review-20260916-remat/campaign.json`. Job7696 completed
+22 tests and failed three in8m11s. One older combined-loss test still dereferenced
+shared K/V despite the untied default; it now checks both K/V gradient halves
+in every actor/critic round. Two critic-recomputation comparisons failed with
+plain Inductor options, which differed from production's explicit BF16 cast
+preservation and disabled pattern rewrites. Their oracles now use production
+precision options, with unchanged model code and tolerances. Replacement7725
+passed all25 cases in5m48s, including both previously failing critic comparisons.
+
+No learner started. The never-started descendants were dependency-skipped and
+resubmitted with the same frozen source, commands and BC artifacts. Replacement
+regression7725 gates benchmarks7726–7729; learners7730/7732/7734/7736/7738 and
+evaluations7731/7733/7735/7737/7739 follow. Job7740 fits baseline/source-read critics
+on one common frozen-policy wave with physical-seed holdout. Job7741 measures
+source-pooling attention mass versus the token-count prior. It was superseded
+before starting by7759, which uses production BF16 compiler options instead of
+plain Inductor defaults. The imported frozen model source5bade837, parent7732,
+input artifacts, seeds and five-minute cap are unchanged. The corrected script
+is separately frozen and hashed; its report records model-source identity,
+diagnostic-script hash and compiler options. The original7741 zero-attempt record
+is retained. Probabilities are reconstructed from normalized BF16 Q/K in FP32,
+not extracted from the attention kernel's internal buffers. The manifest retains
+the superseded job records and repaired test hashes. Production control7726,
+source-read7727, writeback7728 and tile-bias7729 have now passed all six benchmark
+repetitions, each with29 actor updates per wave. Steady-state median total times
+are11.602s,11.913s,19.728s and35.981s respectively. Learners and evaluations are
+pending. Original setup and failures remain in
+`artifacts/probes/entity-review-20260916/campaign.json`.
+
+Control learner7730 subsequently succeeded on its first attempt in24.1976
+queue-wall minutes (24.0488 recorded training minutes). It completed120 waves
+and2987 actor updates, with the first actor update at wave18. The final artifact
+is `runs/entity-review-20260916-remat/control/ppo/checkpoint-000120.pt`;
+`latest.pt` points to that committed checkpoint. Maximum recorded replay KL was
+2.126e-8. Evaluation7731 is still pending, so this is completed training, not yet
+a gameplay-improvement claim. The remaining learners are queued.
+
+### Requested BiXT extension
+
+The user additionally requested [BiXT v2](https://arxiv.org/pdf/2402.12138v2).
+The separate arm uses32 generic learned latents, width96, four rounds, and the
+existing tokenizer/farm encoders and decision heads. Its actor data sequence is
+26 decision tokens plus220 source tokens; the critic adds16 private-unit tokens.
+One shared reference-similarity matrix supplies distinct row/column softmaxes
+and simultaneous updates from incoming values. Both streams have FFNs, followed
+by latent self-attention. This is not the midpoint-writeback arm relabeled.
+
+The final latent update is omitted because no head consumes it. Penultimate
+memory-token writes are also omitted: that round still reads all data, but only
+its26 decision outputs and updated latents reach the final decision-only read.
+Dense output/gradient oracles test this exact pruning. Invalid data columns are
+masked only for latent reads; reverse attention uses raw similarities and masks
+its outputs, avoiding all-negative-infinity softmax rows.
+
+The arm retains local RMSNorm, ReLU-squared FFNs, residual gates and GQA latent
+self-attention, uses full MHA for bidirectional attention, and explicitly disables
+FiLM. Its shared-reference attention uses input RMS normalization without the
+control's additional per-head Q/K normalization; latent self-attention keeps
+that normalization. Thus it is an adapted BiXT architecture comparison, not an exact paper
+reproduction or a one-factor test. The paper-scale0.02 latent initialization gets
+the existing scale-aware Adam multiplier. Generic latents, masks, source privacy,
+all live parameter gradients, strict artifact loading, and vmapped full-horizon
+collection have dedicated checks. No speedup is inferred from the paper's
+long-sequence results: explicit similarity storage is substantial at B8192.
+
+The architectural contrast is specific. The older `entity-cnn` actor in
+`model.py` uses a spatial U-Net and jointly updates board, unit, market and state
+tokens. The default entity trunk instead repeatedly reads fixed farm/economy
+memory into action slots; inactive unit slots cannot serve as extra workspace.
+BiXT restores source-token refinement and supplies32 always-valid generic
+workspace tokens. It does not restore the old U-Net's multiscale convolutional
+inductive bias, so this trial cannot explain every historical CNN advantage.
+The midpoint-writeback arm separately tests one source-refresh step without
+adding the generic workspace. These are mechanisms to test, not established
+causes of the historical performance difference.
+
+Frozen sourcec43b2585 and the extension DAG are in
+`artifacts/probes/entity-review-20260916-bixt/campaign.json`: correctness7713,
+matching BC7714, production gate7715, capped learner7716, argmax evaluation7717.
+Correctness7713 passed all21 cases, including the eight GPU cases, in2m39s.
+BC7714 then completed the matching two-epoch recipe in75.295s, with held-out
+NLL0.0013075148. Actor SHA256:
+`0f83d6546aa0c2b8a31fabe6e917aa8df779b3be83f99a96aff5c7d88c09edf6`.
+Production gate7715 failed during the full B8192 actor backward; learner7716 and
+evaluation7717 were therefore not admitted. The generated backward retains
+approximately2.4GiB of attention scores/probabilities alongside2.9GiB of token-FFN
+hidden buffers, before other activations. The OOM reported25.53GiB allocated and
+only31.67MiB reserved-but-unallocated: this is a live-workspace problem, not
+evidence that allocator tuning would solve it. Whole-round rematerialization
+does not bound this within-round overlap. A bounded attention operator is being
+checked against the dense BF16 forward/backward oracle before checkpoint reuse.
+This preserves the external batch, architecture and shared-score equations; it
+does not constitute a smaller-batch learning trial.
+
+The replacement campaign is recorded in
+`artifacts/probes/entity-review-20260916-bixt-bounded/campaign.json`:
+correctness7754 (10-minute cap), production gate7755 (10 minutes), learner7756
+(24-minute soft/25-minute hard cap), evaluation7757 (5 minutes). All remain
+normal-priority exclusive jobs with one attempt. The original BC actor is reused
+by exact SHA. Training uses separate opaque CUDA forward/backward operators,
+tiling128 independent batch rows internally and saving only input R/V tensors
+and masks. Tile bodies launch CUDA ATen kernels; this is not a fused Triton
+implementation or a claimed speedup. The full model stays compiled and its
+production update uses CUDA graphs. No-grad rollout retains the dense compiled
+primitive. Twelve new BF16 oracle cases check both/isolated output gradients,
+noncontiguous inputs, masked tokens, tile tails and output-prefix boundaries;
+model integration additionally checks no-grad/train parity. Memory and speed
+are still contingent on the full production gate.
+Queue delay does not change any experiment's runtime cap.
+The expanded model-free validation passes102 tests, with eight BiXT CUDA tests
+excluded from that local command and reserved for the queued correctness job.
+Scoped Ruff and whitespace validation also pass. These checks do not establish
+GPU feasibility or gameplay improvement.
+
+### 2026-09-18: hardness and critic-source production defaults
+
+Promoted `critic_source_read=True` and `league_selection=hardness` in the
+executable configuration and production launcher. The older architecture
+campaign explicitly retains its entity-only/stratified control, so changing
+production defaults does not silently turn its comparisons into duplicates.
+
+Hardness now separates new-policy discovery from stale-evidence refresh. With
+11 opponents and unseen candidates, nine slots choose lowest posterior score,
+one discovers an unseen built-in (then newest unseen snapshot), and one probes
+stale/uncertain evidence, including older unseen snapshots. Without unseen
+candidates ten slots choose hardness. One/two-lane configurations rotate
+purposes across iterations; built-in budget zero excludes built-in candidates.
+The independent selector review reproduced 400 waves of starvation under the
+old single-probe schedule and checked 3,240 size/uniqueness combinations under
+the replacement. Native terminal rewards now determine terminal-outcome league
+scores, avoiding false ties from separately rounded float32 bank balances.
+
+The source frozen for the new run is
+`7fd61de45298cd3fcb58c0fe0c6930db32fe7f400de625a6d678cb19c7bb7718`.
+Its manifest is `artifacts/probes/hardness-source-default-20260918/campaign.json`.
+BC is copied read-only from the existing matched control artifact, SHA256
+`6056adf62ddd486e65a09d9df8c349264e65baa5ac5d2f2f2b6b5fb07b305bee`;
+source, test files and BC bytes are frozen independently of subsequent edits.
+MLQ 7981 gates CUDA correctness (20m); 7982 gates six full production iterations
+(15m); 7983 trains 500 production waves with 128 self-play plus 64 league games,
+B8192, BF16, compiled production execution, one seed, and 3h soft/190m hard cap.
+The existing online-proxy autocull warms up for 20 actor-active waves and then
+uses 30-wave patience when neither money EMA improves 1000 nor value-loss EMA
+improves min(0.01,1%); alpha 0.1. It preserves a checkpoint and exits 75. This
+cull does not establish external strength. No automatic retry is requested.
+Jobs 7984/7985 evaluate BC and the final available checkpoint under argmax and
+sampled actions separately, 256 common development seeds per opponent, 10m caps.
+They depend on a successful benchmark and terminal training, so a pruned run
+can still be evaluated. All jobs have priority 0 and maxParallelRuns 1.
+
+At 2026-09-18 21:49 UTC all five jobs remain queued behind existing work. GPU
+validation, training results and post-run comparisons are therefore pending.
+Focused model-free validation passes 59 configuration/selection/campaign tests;
+separate outcome-diagnostic checks pass, and scoped Ruff/format/whitespace
+checks pass. The independent code review found no blocking regressions.
+
+The [RL architecture review](REVIEW_RL_20260918.md) uses completed historical
+artifacts, not results from the queued run. It records the BC-to-PPO deployed
+score regression, opening credit limitations, and the proposed execution-order
+actor decoder plus independent economic forecasting critic. No speculative
+architecture refactor was implemented during the read-only review.
+
+### 2026-09-18: credit assignment and dedicated valuation follow-up
+
+Following the architecture review, implemented an opt-in economic critic with
+24 interacting valuation states and independent encoders of 252 centralized
+source tokens. It retains the return head and one-state NextLat interface;
+there are no new economic forecasting targets. The production actor and default
+entity critic remain unchanged by this experiment.
+
+The follow-up source is frozen as
+`d668dcb26bac2a6385b8ea8a104ca3a19242e12fc825e9ab6bf702da16795e31`.
+The manifest is `artifacts/probes/credit-valuation-20260918/campaign.json`.
+All candidates reuse the exact BC bytes from the combined-default baseline,
+500 waves, full production batch/horizon, one seed, BF16 and compiled execution.
+The same 3h soft/190m hard cap and online-proxy autocull apply. Each benchmark
+uses its training arm's actor GAE lambda and auxiliary setting. NextLat-off also
+changes minibatch organization back to individual-state PPO; it does not isolate
+only the auxiliary gradient.
+
+| Arm | Production gate | Training | Argmax evaluation | Sampled evaluation |
+| --- | ---: | ---: | ---: | ---: |
+| Actor GAE lambda 1 | 7989 | 7990 | 7991 | 7992 |
+| Critic NextLat off | 7993 | 7994 | 7995 | 7996 |
+| Economic critic | 7997 | 7998 | 7999 | 8000 |
+
+CUDA correctness 7988 gates all candidates (20m). Benchmarks allow 15m;
+evaluations allow 10m, use 256 matched seeds per opponent, and depend on
+successful gates plus terminal training, including pruned runs. Aggregation
+8001 allows 5m and waits for candidate and baseline evaluations. The report
+checks the pinned baseline manifest, artifact paths, checkpoint bytes and source
+identities, training completion or verified cull, actor updates, and checkpoint
+alignment with the final metrics row. Single-seed pruned runs are explicitly
+partial-budget evidence, not convergence. All jobs use priority 0,
+maxParallelRuns 1, and one attempt; no candidate is promoted automatically.
+
+Historical sampled evaluation 7986 separately checks the old BC/control/source/
+hardness artifacts under the same panel as their completed argmax results. Its
+10m job and output path are in the combined-default manifest. This diagnoses
+sampling versus deployment without waiting for new learning outcomes.
+
+At 2026-09-18 22:10 UTC these GPU jobs remain queued behind higher-priority work.
+Model-free follow-up checks pass 68 tests (four CUDA cases excluded), scoped
+lint/format checks pass, and independent review found no remaining blocker.
+GPU feasibility, throughput and gameplay conclusions are pending execution.
+
+The [execution-order decoder design](ARCHITECTURE_DECODER_DESIGN.md) specifies
+the exact ledger, cached causal decoding, BC/PPO replay and native parity gates
+for the proposed actor refactor. That decoder is not implemented. Additional
+historical telemetry in the follow-up artifact directory records the frozen-BC
+sampled v27 score around 27–29%, falling to 0–1% over the final twenty PPO waves;
+the [review](REVIEW_RL_20260918.md) distinguishes this unpaired training evidence
+from the queued matched decoding comparison.
+
+
+## 2026-09-18: structural ablations with GAE retained and no recurrence
+
+User correction removed the proposed prefix critic and all recurrent modeling.
+Implemented the shared-plan global workspace actor, execution-order causal
+actor, and feed-forward economic forecasting critic. GAE and its lambda values
+remain unchanged; the baseline remains hardness + source-read + NextLat off.
+
+Compiled BF16 validation **8124 passed: 5 tests** in 154.62 seconds. It covers
+exact shared-plan BC/PPO gradients, a full native episode with padded frozen
+opponent lanes, and value/forecast gradient separation. Final integration gate
+**8135** additionally exercises the fixed-panel evaluator on frozen source
+`dc24bffad2aef7b26e400778942a47873f8436f4647d15beb01a1754b4c91a44`.
+
+The six-arm campaign is
+`artifacts/probes/structural-gae-20260918/campaign.json`. Training jobs are
+**8140** component control, **8144** joint-PPO control, **8148** deterministic
+workspace, **8152** shared plan, **8156** economic representation control, and
+**8160** economic forecasting. Three BC jobs share the exact baseline actor
+between critic-only arms. Each learning job requires its own six-iteration
+full-production gate; evaluation runs after terminal state, including culls.
+All jobs use default queue priority and exclusive admission. Learning permits
+500 waves, a four-hour trainer budget and a 250-minute hard cap; BC has a
+60-minute cap, production gates 45 minutes and final evaluations 20 minutes.
+
+The fixed development panel runs every 25 actor-active waves. After 150 waves,
+it culls only sustained loss of at least five score points from initialization
+plus 100 waves without a 0.01 improvement in smoothed score or sampled-panel
+critic MSE. R² remains diagnostic; MSE keeps the criterion defined even when
+all games have the same outcome. Best evaluated checkpoints and guard state
+are persisted.
+
+The causal native CPU contracts pass, including exact full-game mask parity,
+shared-tile effects, insertion-order deposits, prices and a real 719-row BC
+archive. Gate **8134 failed** on an Inductor-generated invalid integer-scan
+kernel before actor tests ran. A dedicated exact integer Triton scan prevents
+that fusion while preserving compiled GPU execution; replacement gate **8163**
+is pending. Causal training is queued behind compiled parity and has not started.
+No new architecture-strength result or default promotion is claimed here.
+
+Causal chain prepared separately in
+`artifacts/probes/structural-causal-20260918/campaign.json`: compiled actor/rule
+gate **8163**, final buffered-collection gate **8164**, full two-epoch BC
+**8165**, full-production benchmark **8166**, 500-wave training **8167**, and
+sampled/argmax final panels **8169/8168**. Every causal learning prerequisite
+uses success dependencies; no causal failure blocks the other six arms. The
+causal training source is frozen as
+`e757fb2500c3133f0572717070549908f6973c5b26901882579302b99f522670`
+(see the manifest for its authoritative complete digest). The final collector
+gate additionally includes signed, strided and vmapped exact integer-scan
+contracts and the pinned int64 ledger storage path.
+
+Automatic cross-run aggregation **8174** waits for all fourteen final evaluation
+jobs to terminate. It runs the independently reviewed reporter from frozen
+source, with exclusive admission and a five-minute cap; its submission is in
+`artifacts/probes/structural-gae-20260918/report-job.json`. Results go to
+`cross-run-comparison.json` and `.md` beside that manifest. Checkpoint hashes,
+BC initializer hashes, complete seed/seat panels and evaluated update budgets
+are validated before comparison. The reporter also reads the historical
+NextLat-off and economic training journals successfully. Thirty focused
+reporting, evaluation and campaign tests pass. As of 2026-09-19 04:50 UTC,
+the remaining GPU gates and training arms have not started; shared queue work
+precedes them. A pending comparison is not evidence for a new default.

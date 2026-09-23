@@ -46,23 +46,31 @@ scratch tokens, opponent summaries, reinjection, MUDD, or separate output decode
 The independent centralized critic adds **16 private opponent-unit memory
 tokens** (236 total), but still evolves only 26 entities. One learned critic query
 uses projected **four-query-head/two-KV-head cross-attention** over the valid entity
-states. Its normalized `[B, 1, 96]` output feeds the HL-Gauss head and the existing
+states and all valid source-memory tokens by default, bypassing the entity-only
+value bottleneck. Its normalized `[B, 1, 96]` output feeds the HL-Gauss head and the existing
 critic NextLat target. The default readout has no extra FFN, query residual shortcut,
 or persistent core token. Residual zero-initialization does not zero this standalone readout.
 Actor and critic share no parameters. Every attention layer in this production
-family, including critic NextLat, uses GQA; configurations with equal query/KV
-head counts are rejected.
+family, including critic NextLat, uses GQA, except the explicit BiXT cross-attention
+ablation below; configurations with equal query/KV head counts are rejected.
 
-Six independent entity architecture flags preserve those defaults:
+Selectable entity architecture flags are available. Production
+defaults to untied projected memory; the table lists the available alternatives
+and ablations:
 
 | Ablation | CLI override | Effect |
 | --- | --- | --- |
-| Untied projected memory | `--shared-memory-kv false` | Each round owns its K/V projection and key normalization; common source normalization still runs once. |
+| Shared projected memory | `--shared-memory-kv true` | One K/V projection and key normalization are shared across rounds; common source normalization still runs once. |
 | Intermediate FFN | `--inter-attention-ffn true` | Both networks use SA → FFN → CA → FFN, with independent gated, economy-conditioned branches. |
 | Final local unit readout | `--unit-local-readout true` | After global reasoning, each actor unit reads its five HERE/N/S/E/W tiles through a local attention/FFN block. Market states and the critic do not gain this decoder. |
 | Critic readout FFN | `--critic-readout-ffn true` | A gated pre-RMS FFN follows learned-query pooling, before final normalization and HL-Gauss. Actor artifact identity is unchanged. |
 | Remove local initialization | `--unit-local-init false` | Omit the five-tile initialization projection and the private opponent-unit HERE relation tag, retaining categorical, position, ownership, and continuous unit information. |
 | Tile cross-attention RoPE | `--tile-cross-rope true` | Rotate unit queries and both farms' tile keys in global entity-memory reads using the existing axial 2D RoPE; no added parameters. |
+| Entity-only critic readout | `--critic-source-read false` | Disable the default source-memory read and pool only over entity states. Actor artifact identity is unchanged. |
+| Economic valuation critic | `--critic-architecture economic` | Replace the critic's decision-slot trunk with 24 valuation states reading 252 centralized sources. Actor artifact identity is unchanged. |
+| Midpoint memory writeback | `--memory-writeback true` | After half the entity rounds, source tokens read entity states through an attention/FFN block; later rounds use fresh memory projections. |
+| Own-unit tile bias | `--unit-tile-bias true` | Add a learned, initially zero per-head displacement bias only between own-unit queries and own-farm tile keys. Mutually exclusive with tile cross-attention RoPE. |
+| BiXT core | `--bixt-latents 32 --global-modulation false --critic-source-read false` | Refine generic learned latents and data tokens using one shared similarity matrix with separate row/column softmaxes. Read action/value heads from refined decision tokens. |
 
 The local readout uses already encoded farm tiles, not a second encoder. When
 initialization and final readout are both enabled, they share one local gather.
@@ -71,8 +79,104 @@ The local-initialization experiment compares readout-on/init-off against
 readout-on/init-on, rather than changing both features relative to the default.
 For BC ablations select `--architecture entity-attention`; `--production-model`
 intentionally locks the production recipe. Actor-changing flags require matching
-BC artifacts; the critic-only FFN can reuse the default actor. No ablation is
-implicitly enabled or promoted.
+BC artifacts; critic-only changes can reuse the default actor. Critic source read
+and hardness league selection are production defaults. The historical architecture
+campaign explicitly retains entity-only critic pooling and stratified selection
+in its control, enabling each promoted feature only in its named arm.
+
+The opt-in economic critic has independent farm, unit, and private-economy
+encoders. Its **252 source tokens** are 200 tiles, 20 economy tokens, 16 own-unit
+slots, and 16 private opponent-unit slots. **24 valuation states** start from
+two farm summaries, two masked workforce summaries, and the 20 economy tokens;
+GQA rounds exchange information between these states and read the full sources.
+Inactive units are masked, including when a workforce is empty. Final pooling
+retains the `[B, 1, 96]` belief, HL-Gauss head, and existing critic NextLat objective.
+This tests a dedicated value representation; it adds no economic forecasting
+targets. It shares no actor parameters and has no actor market-order queries.
+`--critic-source-read` applies only to the default `entity` critic's final source
+bypass; economic valuation states always read all sources. Local unit initialization,
+local readout, tile cross-RoPE/bias, and memory-writeback flags retain their actor
+effect but do not change the economic critic. Economic and BiXT are separate,
+incompatible experiments; `--critic-architecture entity` remains the default.
+
+Three larger, opt-in structural ablations preserve GAE and carry no recurrent
+state across turns. `--architecture strategic-plan` uses a global workspace and
+one categorical plan shared by every action head; BC marginalizes plans exactly
+and PPO records the sampled plan. `--architecture causal-execution` conditions
+36 action factors on the selected prefix and an exact native-compatible resource
+ledger, using cached on-device generation and parallel teacher forcing.
+`--critic-architecture forecast` adds action-conditioned economic predictions at
+1, 24, 96 and 384 steps while the value head remains state-only. Its control is
+the same economic trunk without forecasting heads.
+
+`--architecture lejepa` is a fourth opt-in family: a single `entity-attention`
+trunk shared by the actor and the critic and trained by nothing but an
+attached-target world-model objective, and read through private rounds of
+cross-attention by both the actor's decision slots and the critic's tower. It
+is described in full under
+[LeJEPA world model](#lejepa-world-model) below.
+
+`scripts/queue_structural_campaign.py` freezes full-budget comparisons with
+matched BC data, separate numerical/production gates, both decoding modes, and
+fixed-panel culling. The [architecture design](ARCHITECTURE_ABLATIONS_20260918.md)
+and [cross-run baseline comparison](RUN_COMPARISON_20260918.md) explain the
+controls and current default choice. These experimental architectures are not
+production defaults.
+
+`scripts/queue_credit_campaign.py --baseline PATH --submit` freezes and queues
+the historical full-production comparisons of actor GAE lambda 1, critic NextLat
+off, and the economic critic. These named experiments explicitly retain NextLat
+on in their controls despite the new production default. The baseline is a
+submitted combined-default campaign manifest. Each candidate passes compiled
+CUDA contracts and a production benchmark before training. This historical
+builder gates evaluations on successful training; valid interrupted or culled
+checkpoints require a separate evaluation, as recorded in the run comparison.
+`scripts/summarize_credit_campaign.py CAMPAIGN` checks source
+and checkpoint identities, reports failures separately from learning evidence,
+and pairs outcomes against the same BC actor and baseline. A preview without
+`--submit` reserves its campaign name, so use a distinct `--name` for previews.
+
+The BiXT arm follows the shared-reference, simultaneous bidirectional update from
+[the paper](https://arxiv.org/pdf/2402.12138v2), with separate feed-forward updates
+on both streams followed by latent self-attention. It keeps the farm encoders,
+width, depth, policy/value heads, RMS normalization, ReLU-squared FFNs and gated
+residuals; bidirectional attention uses full MHA while latent self-attention uses
+GQA. Shared references use input RMS normalization, without the control's
+additional per-head Q/K normalization; latent self-attention retains it.
+FiLM is disabled explicitly. This is an adapted architecture comparison,
+not an exact ImageNet-model reproduction or a single-factor attention ablation.
+The actor's data sequence has 246 tokens (26 decisions plus 220 source tokens),
+and the critic has 262. At depth four, the first two rounds update all data;
+the third still reads all data into latents but only writes decision tokens;
+the fourth only reads latents into decisions. Omitted writes cannot reach either
+head, and the final round contains no unused latent-update parameters.
+
+Source-read, writeback and BiXT training use granular activation recomputation
+to preserve the full production minibatch. No-grad collection remains direct.
+Stateful fused MLPs are excluded from recomputation; the BiXT arm requires them
+disabled. The default critic uses recomputation for its source read; the default
+actor does not.
+BiXT training additionally bounds attention scratch inside opaque CUDA operators:
+independent batch rows are tiled internally, without changing the PPO minibatch
+or optimizer update. Both directions still share each score matrix. Backward
+recomputes probabilities instead of retaining them across the token FFN; no-grad
+rollout keeps the dense compiled primitive. This is not a fused attention kernel;
+production memory and throughput are measured in the experiment gates.
+
+The default `--league-selection hardness` pools the configured lane budgets
+and selects distinct opponents with the lowest recent posterior learner score.
+One lane refreshes stale/uncertain evidence. When unseen opponents remain, a
+separate discovery lane first admits untested built-ins, then the newest untested
+snapshot. This prevents a large stale archive from starving new strategies;
+older unseen snapshots remain eligible for refresh. With eleven lanes, nine
+remain for known hardness while discovery is needed, otherwise ten. One- and
+two-lane budgets rotate exploration purposes deterministically across waves.
+Beta(1,1) shrinkage handles sparse evidence, exact ties are randomized, and
+effective game counts decay by 0.98 per learner wave. Games remain evenly
+distributed across selected opponents with balanced seats. Evidence comes only
+from current-learner games, uses native terminal outcomes, and persists in
+recovery checkpoints. `--league-builtin-lanes 0` disables built-ins.
+`--league-selection stratified` retains the earlier age-stratified PFSP ablation.
 
 Cross-attention RoPE uses unit `(column, row)` coordinates and each farm's local
 board grid; farm ownership remains in the encoded features, not an invented
@@ -353,10 +457,13 @@ execution removes that overhead without changing precision, batch size, or
 objectives; do not replace it with per-iteration `empty_cache()`, which discards
 the working set.
 
-The production default is an HL-Gauss critic with **actor NextLat disabled** and
-plain-sum critic training: value loss plus coefficient-1 latent SmoothL1 and
-coefficient-1 decoded-value loss, at horizon 1. Critic source gradients are not
-norm-matched. For a scalar critic, decoded-value KL is unit-variance Gaussian KL
+The production default is an HL-Gauss source-read critic with **actor and critic
+NextLat disabled**, using ordinary value fitting and individual-state PPO
+shuffling. The [cross-run comparison](RUN_COMPARISON_20260918.md) records this
+decision. Critic NextLat is opt-in with
+`--structured-critic-latent-coefficient 1 --structured-critic-value-coefficient 1`:
+this adds latent SmoothL1 and decoded-value loss at horizon 1. Source gradients
+are not norm-matched. For a scalar critic, decoded-value KL is unit-variance Gaussian KL
 (half squared mean error), not a degenerate one-category softmax. Distributional
 critics use categorical decoded KL over the same capped logits as their readout.
 
@@ -412,8 +519,215 @@ readiness, not predictor readiness; persistence scores remain diagnostic only.
 Old shared-attention actor-predictor states are not compatible with these three
 MLPs; start fresh predictor state rather than silently migrating a resumed run.
 
-Both actor coefficients default to zero, so no actor predictor or predictor
-optimizer is constructed. `--structured-critic-gradient-balance` remains an
+### LeJEPA world model
+
+`--architecture lejepa` replaces the detached NextLat convention with LeWorldModel
+(arXiv:2603.19312), which is LeJEPA (arXiv:2511.08544) applied to transitions.
+
+There is **one encoder in the family, trained by this objective and by the
+policy's loss.** The actor owns it as `trunk.`, so snapshots, bundles and frozen
+ensembles are unchanged; the critic borrows the same module rather than holding
+one of its own and reads its latents through a detach, so no value gradient
+reaches it. The actor's heads read the attached belief
+(`LejepaConfig.policy_shapes_backbone`, on by default), so the clone loss and
+then PPO's policy loss arrive in the same backward as the objective's gradient.
+Anti-collapse is SIGReg's job, not an asymmetry in the graph, so a second copy
+would buy nothing but a second copy's compute. The objective's optimizer is the
+backbone's optimizer either way -- it clips the encoder's summed gradient and
+steps it beside the projector and the predictor, because they are one model --
+and `update_ppo` refuses to run if anything else claims those weights.
+
+The policy gradient is not optional. With it detached
+(`policy_shapes_backbone=False`, kept as the ablation) a 12-epoch clone matched
+the teacher at argmax (0.997 market-kind accuracy) and went bankrupt in every
+temperature-1 self-play game: its farm went unwatered and its animals unfed
+within two days of the first sampled departure, because features fitted only to
+predict the teacher's trajectory carry nothing a decision needs once play leaves
+it. The attached clone (holdout NLL 0.0005 vs 0.0033) plays teacher-level banks
+of 70-126k sampled, and its objective is healthier, not weaker: motion 0.44 vs
+0.17 at the same dispersion.
+
+The encoder steps **exactly when the policy does**, on the same minibatch and at
+the actor's learning rate (unless `--structured-learning-rate` sets the world
+model's apart). The heads read it, so every encoder step is a policy step
+whether or not the actor's optimizer took one: a
+minibatch after a KL stop that moved the encoder would move the policy past the
+trust region that had just refused to. After a KL stop, through the critic's
+extra epochs and through a warmup wave, the encoder is frozen with the policy and
+only the projector, the predictor and the reward head keep fitting against it.
+The encoder's gradient is dropped rather than zeroed there, because the optimizer
+skips a missing gradient outright while a zero one would still move the weights
+by momentum, and the backbone's parameter groups keep a warmup clock of their
+own that counts only the steps it takes -- a warmup wave spent fitting a fresh
+predictor must not use up the backbone's warmup, or its first policy steps would
+run at full rate beside heads still warming up. All three losses are computed on
+the pre-step parameters and the
+three optimizers then step together, so the world model, the actor and the
+critic see the same rows the same number of times, in an order that makes no
+tower train against another's already-moved weights.
+
+A warm start (`--init-actor-from`) trains the encoder before PPO by behavior
+cloning (below), so its warmup waves freeze a trained backbone rather than a
+random one: they fit the critic, and fit the objective -- above all the reward
+head, which a clone never trains -- against the cloned encoder. Release is gated
+on the critic's fit alone, not on the objective's, so watch the
+`structured_preupdate_*` ratios over the first released waves. A run started
+from scratch has no warmup and releases a random backbone and its objective
+together. The critic reuses the actor's encoding of each minibatch rather than
+running the backbone a second time.
+
+The objective has exactly two terms plus one this environment forces:
+
+* **Attached next-step prediction.** The regression target is the encoder's own
+  embedding of `o_{t+1}`, with its gradient live. Every other self-predictive
+  objective here detaches that target; this one does not, because the anti-collapse
+  job belongs to the distributional constraint below rather than to an asymmetry in
+  the graph.
+* **SIGReg.** Random unit directions are drawn through each latent group and every
+  one-dimensional marginal is pushed onto `N(0, 1)` by a sliced Epps-Pulley
+  characteristic-function statistic (17 knots to `t = 3`, Gaussian window). A
+  collapsed embedding has a degenerate marginal in every direction and is maximally
+  penalized. The reference's `* n` scaling is dropped, so the coefficient is
+  invariant to minibatch size, token count and unit occupancy; token positions are
+  then combined in proportion to their own support, which is that same factor
+  restored per position and divided out once at the end.
+* **Reward.** The one part of the next step an encoded observation cannot contain.
+  Its head sits outside the transition round and is scored on every staged row,
+  because under `terminal-outcome` rewards the whole nonzero signal sits on each
+  episode's final step, which is never a transition source.
+
+Nothing is corrupted: observations enter the encoder exactly as the policy sees
+them, and the only supervision signal is the passage of one step. There is no
+temporal conditioning either -- the predictor reads the current step's embedding
+and the executed joint action and nothing else, which is precisely what the policy
+and the critic on this encoder are allowed to know.
+
+The latents are per token rather than one pooled CLS embedding, and SIGReg runs
+per group (`unit`, `market`, `economy`, `tile`) *and per token position within a
+group* -- the reference's
+reduction, which averages over the batch axis alone. Both splits are load-bearing,
+because a normality test over a union is satisfiable by a mixture that is
+degenerate inside every component: a farm tile and a market-order slot share
+neither support nor scale, and an encoder that hands every tile slot its own
+constant has a prediction loss of exactly zero while its pooled cloud looks
+entirely ordinary. Per position that encoder scores worse than total collapse.
+Positions no row supervises are dropped rather than scored against an empty
+sample, and inactive unit slots -- which carry an exactly zero latent -- are
+excluded from every population. Support weighting is what makes that masking safe:
+a position's statistic falls like `1 / n_position`, so weighting positions equally
+would let one thinly supported slot -- a unit the agent has just learned to hire --
+read as collapse on sampling noise alone, and pull that slot toward the origin.
+Under a uniform mask it is identical to the plain mean.
+
+Cost is bounded three ways. Contiguous-run minibatches already place a row and its
+successor in the same batch, so the objective costs **no additional encoder
+forward**. Thirty-two farm tiles are supervised per minibatch out of two hundred
+encoded, resampled every minibatch from the trainer's auxiliary generator -- a
+budget on what is supervised, never a corruption of what is encoded. In eager the
+Epps-Pulley intermediate is accumulated in fixed-size checkpointed chunks; under
+`torch.compile` that loop is skipped, because Inductor's partitioner already
+decides what to keep across it and a Python-level chunk loop would only multiply
+the traced subgraphs. Slice directions and the tile sample are drawn on the host
+and copied in place into non-persistent buffers whose identity, shape and dtype
+never change, so the compiled update graph traces once and a refresh forces no
+recompilation. The reward term is skipped outright at a zero coefficient (its baseline
+`reward_scale` is zeroed with it, so "not scored" is not read as "scored
+perfectly"), and its head pools each latent group separately rather than
+concatenating them.
+
+Enable it with `--architecture lejepa --jepa-prediction-coefficient 1
+--jepa-sigreg-coefficient 0.09 --jepa-reward-coefficient 0.1`. Prediction and
+SIGReg must be positive together: an attached target alone is minimized exactly by
+a constant encoder, and a collapsing run's loss curve is a clean descent to zero.
+The detached NextLat coefficients are refused. There is one arm, so there are no
+`--jepa-critic-*` flags and no critic predictor: a `lejepa` critic admits no
+dynamics predictor at all, and a `lejepa` actor admits only this objective, its
+belief class being keyed on the family so that a detached NextLat would walk a
+four-field belief into a helper written for one.
+
+The actor reads the belief the same way, through `policy_readout_layers` rounds
+(default 1) in which its unit and market slots cross-attend to the whole
+observation before their heads. Per-slot heads can only use what the world
+model chose to keep in each slot, and it has no reason to copy the economy into
+a market slot when the economy tokens already hold it: a 12-epoch clone through
+a gated feed-forward per slot plateaued at 0.76 market-kind accuracy, against
+0.997 with the readout and the entity actor's 0.999. `--policy-readout-layers 0`
+keeps the linear probe of each slot as a control.
+
+The critic's privileged information arrives strictly *downstream* of the shared
+encoder, which is what makes sharing safe. The backbone encodes only this seat's
+own observation -- the critic slices the private economy columns off before
+calling it -- and the opponent's unit slots are embedded by the critic's own
+parameters and folded into its detached latents by `critic_private_layers` rounds
+of cross-attention. Nothing privileged can reach the actor through weights
+the actor evaluates, and nothing privileged is in the population SIGReg scores.
+The opponent's units stay out of the predicted belief for the same reason as
+before: a Markov predictor conditioned on this seat's action could only learn
+their mean.
+
+Behavior cloning trains this family with its objective beside it: the clone
+loss reaches the encoder through the heads, and the objective is what makes the
+encoder a world model rather than an entity trunk under another name (and, under
+the detached ablation, the only thing that trains it at all).
+`scripts/train_bc.py` therefore requires the LeJEPA objective whenever it clones `lejepa` (and refuses it for any other family):
+`--jepa-prediction-coefficient` and `--jepa-sigreg-coefficient` must both be
+positive, `--jepa-horizon` sets the transition horizon, and `--run-length` must
+be at least `horizon + 1` so each minibatch holds its successors. The encoder is
+then trained on the demonstration transitions by prediction and SIGReg while the
+heads clone; there is no reward in a demonstration, so the reward term and its
+baseline are off and read as zero in the journal. It is trained as PPO trains
+it: runs are re-cut every epoch at a phase drawn per episode, so every
+transition is a source rather than the half a fixed cut would pick, and the
+heads and the world model are gradient-clipped apart. The objective travels in the
+artifact beside the actor (`jepa_objective`), and PPO's `--init-actor-from`
+resumes it with the encoder and heads: the projector and the predictor are one
+model with the backbone, and fresh ones would spend the critic warmup relearning
+what the clone already fitted, then pull the released backbone toward whatever
+embedding they had settled on. A `lejepa` warm start refuses an artifact
+without one -- including when an in-flight run is resumed with its original
+`--init-actor-from`, if that clone predates the key: re-clone it. A `lejepa`
+training checkpoint written before the backbone had its own optimizer groups
+does not resume either. The warmup waves still fit the objective against the frozen
+backbone, which is where its reward head first sees a reward. The structural
+campaign's `lejepa` arm does exactly this: BC at `--run-length 2` with prediction
+and SIGReg, then the gate and PPO with the reward term added.
+
+What this does not defend against, stated plainly because the telemetry measures
+it: a one-step attached target is also minimized by an encoder constant *along a
+trajectory* while varying across the batch, and a minibatch of consecutive pairs
+carries almost no within-episode structure for a normality test to reject. The
+defenses are the reward term and the two journaled controls
+(`structured_preupdate_persistence_*`, `structured_preupdate_shuffled_*`) -- a
+prediction loss that matches persistence, or that survives shuffling actions
+across rows, is measuring nothing. The shuffled control rolls the action tokens
+over the transition sources by the run length rather than by one: each
+contiguous same-trajectory run contributes `run_length - horizon` consecutive
+sources, so a roll shorter than that would mostly hand a source its own
+trajectory's neighbouring action, which is not a control at all, while a roll of
+the run length always lands in a different run. But persistence alone
+cannot separate the two, because a trajectory-constant encoder sends that baseline
+to zero along with the loss, and `structured_actor_dispersion` stays at one
+throughout: across the batch such an embedding is still perfectly normal.
+**`structured_actor_motion` is the column to watch and to cull on by hand**
+(nothing gates a run on it automatically) -- the RMS
+displacement of the *latents* the policy and the value function read (not the
+projected embedding, which is discarded after training) between a row and its
+successor, relative to their own scale and over supervised tokens only. That
+number going to zero *is* the failure.
+
+Both controls are journaled as ratios against the live loss under
+`structured_persistence_*` / `structured_shuffled_*`, over `combined`,
+`prediction` and each latent group. Only the prediction
+columns are compared: the controls share the live objective's projector, SIGReg
+and reward head, so every other column is identical by construction.
+
+`JepaObjective` is training-only. League snapshots, inference bundles and frozen
+ensembles consume the actor's state dict whole and never carry a projector or a
+predictor the deployed model does not evaluate.
+
+Both coefficients default to zero, so no predictor and no predictor optimizer are
+constructed -- and on this family that also means the backbone never steps, which
+`update_ppo` treats as the configuration error it is. `--structured-critic-gradient-balance` remains an
 experimental opt-in for critic-only 50/50 source-cotangent norm matching; the
 default is `--no-structured-critic-gradient-balance`.
 
@@ -745,11 +1059,14 @@ epsilon to nonzero momentum norms. Small PPO momenta therefore retain the same
 normalization as larger copies, up to floating-point error. Its tensors are
 float32; multiplication accuracy still follows the process-wide matmul setting.
 
-The default physical minibatch ceiling is **8192**: a complete 230080-state
+The default physical minibatch ceiling is **7936**: a complete 230080-state
 production wave uses **29 fixed-shape minibatches**, with no dropped states or
-gradient accumulation: 28 full batches and 704 genuine rows in the last batch;
-its remaining 7488 rows have zero loss/gradient weight. This is the user's
-selected D96 setting; it retains VRAM headroom but is not a measured speed win.
+gradient accumulation: 28 full batches and 7872 genuine rows in the last batch;
+its remaining 64 rows have zero loss/gradient weight. The earlier 8192 ceiling
+produced the same 29 minibatches with a 7488-row padded tail -- 3.2% of every
+update's forward/backward computed for nothing -- and a final optimizer step
+averaged over only 704 states. The step count, learning rates, objectives, and
+precision are unchanged; the D96 VRAM headroom the 8192 ceiling retained grows.
 A matched six-repeat probe measured
 steady whole-iteration medians of 10.952 s at 6400 versus 11.196 s at 8192,
 with peak live memory 16.33 versus 19.99 GiB. All intended updates completed.
@@ -757,6 +1074,18 @@ Larger batches reduce optimizer steps per wave (36 to 29 here) and change gradie
 statistics; they are not learning-equivalent merely because sample coverage is
 unchanged. Learning rates, objectives, and precision are unchanged. Historical
 fixed-shape probes and explicit minibatch overrides retain their declared sizes.
+
+`train_ppo.py --architecture-panel 25` evaluates 64 fixed development seeds
+against `starter` and `scripted-v27`, using both sampled and argmax actions on
+compiled native BF16 paths. Every evaluation preserves an immutable checkpoint.
+After 150 actor-active waves, a run is culled only when its smoothed score is at
+least 0.05 below initialization and neither score nor heldout critic fit has
+materially improved for 100 actor-active waves. An absolute score increase of
+0.01 or critic MSE reduction of 0.01 in the alpha-0.5 EMA resets patience.
+Critic MSE uses sampled-policy panel returns and remains defined when every
+game has the same outcome; MC R-squared is also reported when target variance
+is nonzero. The guard, best evaluated checkpoint and panel policy persist on
+resume. This option defaults off and cannot be combined with `--autocull`.
 
 Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
 plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup
