@@ -790,8 +790,61 @@ class Block(nn.Module):
         return self.ffn_gate(hidden, self.ffn(ffn_input))
 
 
+class _TinyVocabularyEmbedding(torch.autograd.Function):
+    """Sum of embedding lookups whose tables have only a handful of rows.
+
+    The forward is the ordinary gather. The backward is one dense GEMM of the
+    transposed one-hot indices against the gradient: an embedding table this
+    small turns the stock scatter-add backward into millions of atomic adds
+    contending for a few hundred addresses, which at 1.6M tile tokens per
+    minibatch cost more than the whole farm attention backward.
+    """
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(indices: Tensor, *weights: Tensor) -> Tensor:
+        embedded = weights[0][indices[..., 0]]
+        for column, weight in enumerate(weights[1:], start=1):
+            embedded = embedded + weight[indices[..., column]]
+        return embedded
+
+    @staticmethod
+    def setup_context(ctx, inputs: tuple[Tensor, ...], output: Tensor) -> None:
+        indices, *weights = inputs
+        ctx.save_for_backward(indices)
+        ctx.rows = tuple(weight.shape[0] for weight in weights)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor | None, ...]:
+        (indices,) = ctx.saved_tensors
+        columns = len(ctx.rows)
+        flat_gradient = gradient.reshape(-1, gradient.shape[-1])
+        # One combined one-hot over the concatenated vocabularies: each token
+        # row carries one 1 per table, so a single GEMM yields every table's
+        # gradient stacked along the rows.
+        offsets = torch.tensor(
+            tuple(sum(ctx.rows[:column]) for column in range(columns)),
+            device=indices.device,
+            dtype=indices.dtype,
+        )
+        one_hot = nn.functional.one_hot(
+            (indices.reshape(-1, columns) + offsets).reshape(-1), sum(ctx.rows)
+        )
+        one_hot = one_hot.view(-1, columns, sum(ctx.rows)).sum(dim=1).to(gradient.dtype)
+        stacked = one_hot.t() @ flat_gradient
+        return None, *stacked.split(ctx.rows, dim=0)
+
+
 class TileEmbedder(nn.Module):
-    """Categorical embeddings plus a bounded-continuous MLP per tile token."""
+    """Categorical embeddings plus a bounded-continuous MLP per tile token.
+
+    Tile tokens are laid out own farm first, ``y * BOARD_SIZE + x`` within a farm,
+    so the farm, row, column, and quadrant columns are functions of the token slot
+    alone (`tokens.TILE_SLOT_CATEGORICAL`). Their embeddings are therefore one
+    ``[tokens, width]`` table added to every row instead of four per-token
+    lookups, and their backward is a batch reduction rather than a scatter.
+    """
 
     def __init__(self, config: StructuredConfig) -> None:
         super().__init__()
@@ -808,16 +861,38 @@ class TileEmbedder(nn.Module):
             Linear(width, width),
         )
 
-    def forward(self, categorical: Tensor, continuous: Tensor) -> Tensor:
+    def slot_embedding(self, tokens: int, device: torch.device) -> Tensor:
+        """Farm/row/column/quadrant embeddings for the leading ``tokens`` slots."""
+        token = torch.arange(tokens, device=device)
+        farm, position = token // TILE_COUNT, token % TILE_COUNT
+        row, column = position // BOARD_SIZE, position % BOARD_SIZE
+        half = BOARD_SIZE // 2
+        quadrant = (row >= half).long() * 2 + (column >= half).long()
         return (
-            self.kind(categorical[..., 0])
-            + self.occupant(categorical[..., 1])
-            + self.farm(categorical[..., 2])
-            + self.row(categorical[..., 3])
-            + self.column(categorical[..., 4])
-            + self.quadrant(categorical[..., 5])
-            + self.continuous(continuous.to(self.continuous[0].weight.dtype))
+            self.farm.weight[farm]
+            + self.row.weight[row]
+            + self.column.weight[column]
+            + self.quadrant.weight[quadrant]
         )
+
+    def forward(self, categorical: Tensor, continuous: Tensor) -> Tensor:
+        vocabulary = categorical[..., :2]
+        weights = (self.kind.weight, self.occupant.weight)
+        # The custom backward is only for a table that receives a gradient. A
+        # frozen copy under grad mode -- the PPO reference anchor -- takes the
+        # plain gather, which Dynamo also traces where it cannot trace this
+        # vararg Function with no input requiring grad.
+        embedded = (
+            _TinyVocabularyEmbedding.apply(vocabulary, *weights)
+            if torch.is_grad_enabled() and any(weight.requires_grad for weight in weights)
+            else _TinyVocabularyEmbedding.forward(vocabulary, *weights)
+        )
+        projected = self.continuous(continuous.to(self.continuous[0].weight.dtype))
+        slots = self.slot_embedding(categorical.shape[-2], categorical.device)
+        # Enter the compute dtype here: the residual stream is already in it after
+        # the first gated residual, so this only moves one rounding earlier while
+        # halving the traffic and saved activations of the first farm block.
+        return (embedded + slots + projected).to(projected.dtype)
 
 
 class UnitEmbedder(nn.Module):
@@ -1218,6 +1293,33 @@ class StructuredCriticBelief(NamedTuple):
     """The normalized representation consumed by the critic's final value head."""
 
     value_decision: Tensor  # (B, N, D): global first, optionally units then orders.
+
+
+class JepaBelief(NamedTuple):
+    """Everything the shared `lejepa` backbone hands to its one world-model arm.
+
+    The first two fields are the per-slot decision states; the last two are the
+    encoded observation, which is what makes the objective a world model rather
+    than a policy-readout regularizer. Under the shared backbone this is also the
+    entire interface between the world model and its two consumers: the actor's
+    heads and the critic's private tower both read these four tensors and nothing
+    else, and both read them detached.
+    """
+
+    unit_decisions: Tensor  # (B, MAX_UNITS, D)
+    market_decisions: Tensor  # (B, MAX_MARKET_ORDERS, D)
+    economy: Tensor  # (B, economy tokens, D)
+    tiles: Tensor  # (B, 2 * TILE_COUNT, D), own farm then opponent farm
+
+    def detach(self) -> JepaBelief:
+        """The same latents with the gradient cut, which is how consumers read them.
+
+        The backbone is trained by `lejepa.jepa_horizon_loss` alone. Every path
+        from a policy or value objective back into it passes through here, so the
+        detach is one call in one place rather than a convention each consumer
+        has to remember.
+        """
+        return JepaBelief(*(value.detach() for value in self))
 
 
 class StructuredActor(nn.Module):

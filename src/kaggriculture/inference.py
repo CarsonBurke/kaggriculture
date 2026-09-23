@@ -349,6 +349,10 @@ def load_actor_artifact(
     if fused_mlp and target_device.type != "cuda":
         raise ValueError("fused structured artifacts require CUDA inference")
     actor = resolve_architecture(payload).build_actor(dict(model_config)).to(target_device)
+    if resolve_architecture(payload).name == "causal-execution":
+        from kaggriculture.device_ledger import get_device_ledger
+
+        actor.set_device_ledger(get_device_ledger(target_device))
     actor.load_state_dict(checkpoint_actor_state(payload, agent))
     actor.eval()
     return actor, payload

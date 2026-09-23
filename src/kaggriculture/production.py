@@ -24,31 +24,19 @@ PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 # 80% current self-play / 20% past-and-reference-opponent training-data split.
 PRODUCTION_SELF_PLAY_GAMES = 128
 PRODUCTION_LEAGUE_GAMES = 64
+PRODUCTION_LEAGUE_SELECTION = "hardness"
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
-# Historical lanes are the log-age PFSP draw. `_sample_log_age_strata` takes
-# one opponent per occupied log2 age bucket, then refills leftover seats from
-# remaining members of those buckets. A 500-iteration archive outside the
-# 16-deep active window occupies five rungs (ages 17-31, 32-63, 64-127,
-# 128-255, 256-511). Two seats cover two rungs, so the older archive sits
-# idle. Six seats fill every rung of that ladder plus one PFSP refill.
+# Hardness pools the active/historical budget with the admitted built-in
+# budget: eleven distinct opponents, including discovery and stale refresh.
+# The explicit stratified ablation uses two active and six log-age slots.
 PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 6
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
-# Engine reference agents admitted to the TRAINING league, and the lanes
-# reserved for them. They are here because self-play alone never produced an
-# opponent the learner had to beat from outside its own lineage: the cloned
-# policy loses every game to `starter`, a twenty-eight-line carrot loop, and
-# a league it can only lose to itself cannot notice. The lanes are a ceiling,
-# not a floor -- `select_league_mix` contests each reserved lane against one
-# more snapshot on the shared PFSP weight, so beaten built-ins hand their
-# lanes back to the snapshot strata without anyone editing this constant.
-# Evaluation stays separate: `PRODUCTION_EXTERNAL_EVAL_OPPONENTS` below is a
-# diagnostic probe and shares nothing with these lanes.
-#
-# `scripted-v27` is the strength this leaderboard actually fields, replayed from
-# the public agent's own 719-step plan. It belongs here because the PFSP weight
-# is `(1 - score_rate)^2`: the three engine agents the learner already beats in
-# every game weigh nothing and hand their lanes to snapshots, so before v27 the
-# reserved lanes were spent on opponents that had stopped teaching anything.
+# Native reference agents give the learner opponents outside its own lineage.
+# In hardness mode these names compete with snapshots in one pool; this lane
+# count adds to the total budget, and zero disables built-ins. In stratified
+# mode each reserved built-in lane instead contests one additional snapshot
+# using PFSP weights, releasing easy-agent lanes back to the active stratum.
+# External evaluation below remains a separate fixed diagnostic panel.
 PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter,scripted-v27"
 PRODUCTION_LEAGUE_BUILTIN_LANES = 3
 PRODUCTION_EPISODE_STEPS = 720
@@ -136,13 +124,14 @@ def production_ppo_config(
 ) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    With 230,080 states, an 8192-row ceiling produces 29 fixed-shape minibatches per
-    epoch. Production is one actor epoch and one critic epoch on the same wave:
+    With 230,080 states, a 7936-row ceiling produces 29 fixed-shape minibatches per
+    epoch with a 64-row padded tail (8192 made the same 29 with a 7,488-row tail).
+    Production is one actor epoch and one critic epoch on the same wave:
     a second same-wave critic pass memorized holdout, and a second actor pass
     is a replay at a KL that does not bind. Actor and critic run on the same
     CUDA stream to reuse their activation allocation pool without eviction.
-    NextLat shares each trunk pass: h_t and h_{t+1} come from contiguous episode
-    runs, and p_ψ steps on the same backward as PPO.
+    Both NextLat objectives are opt-in. Ordinary PPO shuffles individual states;
+    enabling NextLat instead groups contiguous episode runs for successor targets.
     """
     from kaggriculture.ppo import PpoConfig
 
@@ -155,13 +144,15 @@ def production_ppo_config(
             critic_head_learning_rate=(
                 PpoConfig.critic_learning_rate * PpoConfig.adam_learning_rate_ratio * (25.0 / 3.0)
             ),
-            # Actor NextLat stays off; critic NextLat losses are added directly
-            # to the HL-Gauss value objective, without source-gradient balancing.
+            # Cross-run evidence favors ordinary value fitting: critic NextLat
+            # adds little prediction beyond persistence, while the off recipe
+            # preserves substantially more deployed strength. See
+            # RUN_COMPARISON_20260918.md for the evidence and confounds.
             structured_latent_coefficient=0.0,
             structured_decision_coefficient=0.0,
             structured_decision_horizon=1,
-            structured_critic_latent_coefficient=1.0,
-            structured_critic_value_coefficient=1.0,
+            structured_critic_latent_coefficient=0.0,
+            structured_critic_value_coefficient=0.0,
             structured_critic_horizon=1,
         )
     )
@@ -312,6 +303,8 @@ def build_training_command(
             str(games),
             "--league-games",
             str(PRODUCTION_LEAGUE_GAMES if league else 0),
+            "--league-selection",
+            PRODUCTION_LEAGUE_SELECTION,
             "--league-active-opponents",
             str(PRODUCTION_LEAGUE_ACTIVE_OPPONENTS if league else 0),
             "--league-historical-opponents",
@@ -380,6 +373,8 @@ def build_training_command(
             str(ppo["structured_critic_latent_coefficient"]),
             "--structured-critic-value-coefficient",
             str(ppo["structured_critic_value_coefficient"]),
+            "--economic-forecast-coefficient",
+            str(ppo["economic_forecast_coefficient"]),
             "--structured-critic-horizon",
             str(ppo["structured_critic_horizon"]),
         )

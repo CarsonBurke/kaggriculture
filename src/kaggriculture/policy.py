@@ -27,12 +27,14 @@ from kaggriculture.actions import (
     copy_tile_grid,
     unit_action_mask,
 )
+from kaggriculture.causal_actor import CausalActor, CausalChoice, CausalOutput
 from kaggriculture.constants import (
     CROPS,
     MAX_MARKET_ORDERS,
     MAX_UNITS,
     QUANTITY_BINS,
 )
+from kaggriculture.device_ledger import get_device_ledger, pack_observations, validate_packed
 from kaggriculture.encoding import EncodedObservation, encode_observation
 from kaggriculture.entity import EntityActor
 from kaggriculture.model import ActorOutput, FarmActor
@@ -44,6 +46,7 @@ from kaggriculture.orientation import (
     orient_unit_masks,
 )
 from kaggriculture.registry import architecture_of
+from kaggriculture.strategic_actor import PlanChoice, StrategicActor, StrategicOutput
 from kaggriculture.structured import StructuredActor, stack_structured
 from kaggriculture.tokens import StructuredObservation, encode_structured_observation
 
@@ -78,6 +81,8 @@ class ActionFactors:
     # Behavior entropy summed over each row's active components. Keeping the
     # per-row sums lets any trajectory subset recover its exact mean entropy.
     entropy_sums: np.ndarray
+    plan: np.ndarray | None = None
+    policy_ledger: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +348,52 @@ def component_selected_logprobs(
     )
 
 
+def _causal_policy_step(
+    output: CausalOutput,
+    observations: list[dict[str, Any]],
+    encoded: list[StructuredObservation],
+    packed_ledger: np.ndarray,
+) -> PolicyStep:
+    """Compile the already selected prefix; never resample its conditional logits."""
+    names = output._fields[3:]
+    tensors = output[3:]
+    flat = torch.cat([tensor.flatten().float() for tensor in tensors]).cpu().numpy()
+    values = {}
+    cursor = 0
+    for name, tensor in zip(names, tensors, strict=True):
+        end = cursor + tensor.numel()
+        dtype = (
+            np.bool_
+            if tensor.dtype == torch.bool
+            else np.int64
+            if not tensor.is_floating_point()
+            else np.float32
+        )
+        values[name] = flat[cursor:end].reshape(tensor.shape).astype(dtype, copy=False)
+        cursor = end
+    logprobs = values.pop("factor_logprobs")
+    entropies = values.pop("factor_entropies")
+    factors = ActionFactors(
+        **values,
+        unit_logprobs=logprobs[:, :16],
+        market_kind_logprobs=logprobs[:, 16::2],
+        market_quantity_logprobs=logprobs[:, 17::2],
+        entropy_sums=entropies.sum(axis=1, dtype=np.float64),
+        policy_ledger=packed_ledger,
+    )
+    actions = [
+        compile_action(observation, units, kinds, quantities)
+        for observation, units, kinds, quantities in zip(
+            observations,
+            factors.unit_actions,
+            factors.market_kinds,
+            factors.market_quantities,
+            strict=True,
+        )
+    ]
+    return PolicyStep(actions=actions, encoded=encoded, factors=factors)
+
+
 @torch.inference_mode()
 def act_batch(
     actor: FarmActor | StructuredActor | EntityActor,
@@ -374,6 +425,7 @@ def act_batch(
     if len(opponent_privates) != len(observations):
         raise ValueError("opponent private-state count must match observations")
     device = next(actor.parameters()).device
+    generator = generator or np.random.default_rng()
     if architecture_of(actor).structured_inputs:
         if orientation is not Orientation.IDENTITY:
             raise NotImplementedError(
@@ -385,7 +437,36 @@ def act_batch(
             for observation, opponent_private in zip(observations, opponent_privates, strict=True)
         ]
         inputs, _ = stack_structured(encoded, device=device)
-        output = actor(inputs)
+        if isinstance(actor, CausalActor):
+            if actor.device_ledger is None:
+                actor.set_device_ledger(get_device_ledger(device))
+            packed_ledger = pack_observations(observations)
+            validate_packed(packed_ledger, actor.device_ledger.minimum, actor.device_ledger.maximum)
+            batch = len(observations)
+            choice = CausalChoice(
+                torch.as_tensor(packed_ledger, device=device),
+                torch.full((batch, MAX_UNITS), -1, dtype=torch.long, device=device),
+                torch.full((batch, MAX_MARKET_ORDERS), -1, dtype=torch.long, device=device),
+                torch.full((batch, MAX_MARKET_ORDERS), -1, dtype=torch.long, device=device),
+                torch.as_tensor(generator.random((batch, 36), dtype=np.float32), device=device),
+                torch.full((batch,), max(temperature, 1e-4), device=device),
+                torch.full((batch,), deterministic, dtype=torch.bool, device=device),
+            )
+            output = actor(inputs, choice)
+            return _causal_policy_step(output, observations, encoded, packed_ledger)
+        if isinstance(actor, StrategicActor):
+            batch = len(observations)
+            choice = PlanChoice(
+                torch.full((batch,), -1, dtype=torch.long, device=device),
+                torch.as_tensor(generator.random(batch), dtype=torch.float32, device=device),
+                torch.full((batch,), max(temperature, 1e-4), device=device),
+                torch.full((batch,), deterministic, dtype=torch.bool, device=device),
+                torch.zeros(batch, device=device),
+                torch.ones(batch, dtype=torch.bool, device=device),
+            )
+            output = actor(inputs, choice)
+        else:
+            output = actor(inputs)
     else:
         encoded = [
             encode_observation(observation, opponent_private)
@@ -414,7 +495,6 @@ def act_batch(
     quantity_values = quantity_heads.values
     quantity_bias = quantity_heads.bias
     batch_size = len(observations)
-    generator = generator or np.random.default_rng()
     movement_map = movement_permutation(orientation)
 
     unit_actions = np.zeros((batch_size, MAX_UNITS), dtype=np.int64)
@@ -599,6 +679,8 @@ def act_batch(
         unit_logprobs=unit_logprobs,
         market_kind_logprobs=kind_logprobs,
         market_quantity_logprobs=quantity_logprobs,
-        entropy_sums=entropy_sums,
+        entropy_sums=entropy_sums
+        + (output.plan[:, 2].float().cpu().numpy() if isinstance(output, StrategicOutput) else 0),
+        plan=output.plan.float().cpu().numpy() if isinstance(output, StrategicOutput) else None,
     )
     return PolicyStep(actions=actions, encoded=encoded, factors=factors)

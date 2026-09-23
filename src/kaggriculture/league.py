@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
 import re
 import shutil
@@ -12,12 +13,13 @@ from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import file_digest
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 import numpy as np
 import torch
 
 from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
+from kaggriculture.lejepa_model import LejepaCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.modelargs import actor_model_config
 from kaggriculture.opponents import BUILTIN_OPPONENTS
@@ -29,7 +31,7 @@ from kaggriculture.registry import (
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
 
 AnyActor = FarmActor | StructuredActor | EntityActor
-AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic
+AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic | LejepaCritic
 AnyModelConfig = ModelConfig | StructuredConfig | EntityConfig
 
 LEAGUE_SNAPSHOT_FORMAT_VERSION = 2
@@ -58,6 +60,7 @@ def _opponent_key(ref: SnapshotRef | BuiltinRef) -> str:
 class SnapshotSelection:
     ref: SnapshotRef
     category: Literal["active", "historical"]
+    role: Literal["stratified", "hardness", "discovery", "probe"] = "stratified"
 
     @property
     def key(self) -> str:
@@ -72,6 +75,7 @@ class SnapshotSelection:
 class BuiltinSelection:
     ref: BuiltinRef
     category: Literal["builtin"] = "builtin"
+    role: Literal["stratified", "hardness", "discovery", "probe"] = "stratified"
 
     @property
     def key(self) -> str:
@@ -426,6 +430,175 @@ def list_actor_snapshots(directory: Path) -> list[SnapshotRef]:
 # priority.
 PFSP_UNMEASURED_SCORE_RATE = 0.5
 
+# Discount old games, rather than giving a five-game wave the same weight as
+# fifty games. A roughly 34-wave half-life follows a changing current learner.
+MATCHUP_EVIDENCE_RETENTION = 0.98
+
+
+class MatchupEvidence(TypedDict):
+    score_sum: float
+    games: float
+    last_iteration: int
+
+
+def validate_matchup_evidence(
+    evidence: object, *, current_iteration: int
+) -> dict[str, MatchupEvidence]:
+    """Validate all selection state before consuming the restored RNG stream."""
+    if not isinstance(evidence, dict):
+        raise ValueError("resume checkpoint has no valid league matchup evidence")
+    validated: dict[str, MatchupEvidence] = {}
+    for key, value in evidence.items():
+        valid_key = isinstance(key, str) and (
+            re.fullmatch(r"[0-9]{8}", key) is not None
+            or (key.removeprefix("builtin_") in BUILTIN_OPPONENTS and key.startswith("builtin_"))
+        )
+        if (
+            not valid_key
+            or not isinstance(value, dict)
+            or value.keys() != {"score_sum", "games", "last_iteration"}
+        ):
+            raise ValueError("resume checkpoint has invalid league matchup evidence")
+        score, games, last = value["score_sum"], value["games"], value["last_iteration"]
+        if (
+            type(score) is not float
+            or type(games) is not float
+            or not math.isfinite(score)
+            or not math.isfinite(games)
+            or not 0.0 <= score <= games
+            or games <= 0.0
+            or type(last) is not int
+            or not 0 <= last <= current_iteration
+        ):
+            raise ValueError("resume checkpoint has invalid league matchup evidence values")
+        validated[key] = MatchupEvidence(score_sum=score, games=games, last_iteration=last)
+    return validated
+
+
+def update_matchup_evidence(
+    evidence: dict[str, MatchupEvidence],
+    measured: Mapping[str, tuple[int, float]],
+    *,
+    iteration: int,
+) -> None:
+    """Accumulate fractional wins (ties count half) from current-learner games."""
+    for key, (games, rate) in measured.items():
+        previous = evidence.get(key)
+        if games <= 0 or not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise ValueError("league matchup measurements require games and a valid score rate")
+        if previous is not None and iteration < previous["last_iteration"]:
+            raise ValueError("league matchup measurements cannot move backward in time")
+        discount = (
+            MATCHUP_EVIDENCE_RETENTION ** (iteration - previous["last_iteration"])
+            if previous is not None
+            else 0.0
+        )
+        evidence[key] = MatchupEvidence(
+            score_sum=float(games * rate + (previous["score_sum"] * discount if previous else 0)),
+            games=float(games + (previous["games"] * discount if previous else 0)),
+            last_iteration=iteration,
+        )
+
+
+def _hardness_selections(
+    snapshots: Sequence[SnapshotRef],
+    builtins: Sequence[BuiltinRef],
+    *,
+    count: int,
+    current_iteration: int,
+    active_pool_size: int,
+    generator: np.random.Generator,
+    evidence: Mapping[str, MatchupEvidence],
+) -> list[LeagueSelection]:
+    candidates = [*snapshots, *builtins]
+    count = min(count, len(candidates))
+    if count <= 0:
+        return []
+    score_estimates, probe_priorities = [], []
+    for ref in candidates:
+        record = evidence.get(_opponent_key(ref))
+        last = (
+            record["last_iteration"]
+            if record
+            else (ref.iteration if isinstance(ref, SnapshotRef) else 0)
+        )
+        age = max(0, current_iteration - last)
+        discount = MATCHUP_EVIDENCE_RETENTION**age
+        games = record["games"] * discount if record else 0.0
+        score = record["score_sum"] * discount if record else 0.0
+        # Beta(1, 1) shrinks sparse evidence to even odds and supplies an
+        # uncertainty estimate for the single refresh lane.
+        alpha, beta = 1.0 + score, 1.0 + games - score
+        mean = alpha / (alpha + beta)
+        variance = alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1.0))
+        score_estimates.append(mean)
+        probe_priorities.append((age + 1.0) * math.sqrt(variance))
+    # Discovery and forgetting are different problems. A stale archive can
+    # monopolize an age-weighted probe forever while new snapshots sit at the
+    # prior mean, behind every established hard opponent. Admit one unseen
+    # policy separately; prioritize the finite built-in set, then the newest
+    # snapshot so archive growth cannot delay testing current strategies.
+    unseen = [index for index, ref in enumerate(candidates) if _opponent_key(ref) not in evidence]
+    discovery = bool(unseen) and (
+        count >= 3
+        or (count == 2 and current_iteration % 2 == 1)
+        or (count == 1 and current_iteration % 3 == 1)
+    )
+    # Tiny lane budgets rotate purposes, rather than silently disabling
+    # exploration. The schedule depends only on checkpointed iteration.
+    refresh = (
+        count >= 3
+        or (count == 2 and not discovery)
+        or (count == 1 and current_iteration % 3 != 0 and not discovery)
+    )
+    chosen_indices: list[int] = []
+    roles: dict[str, Literal["hardness", "discovery", "probe"]] = {}
+    if discovery:
+        unseen_builtins = [index for index in unseen if isinstance(candidates[index], BuiltinRef)]
+        index = (
+            int(generator.choice(unseen_builtins))
+            if unseen_builtins
+            else unseen[-1]  # snapshots arrive sorted by iteration
+        )
+        chosen_indices.append(index)
+        roles[_opponent_key(candidates[index])] = "discovery"
+    main_count = count - len(chosen_indices) - int(refresh)
+    # Rank individual matchups, not their aggregate archive mass: hundreds of
+    # easy snapshots must not crowd out a few established hard opponents.
+    # Shuffle before a stable sort so exact posterior ties have no age bias.
+    order = generator.permutation(len(candidates))
+    order = order[np.argsort(np.asarray(score_estimates)[order], kind="stable")]
+    for index in order:
+        if main_count == 0:
+            break
+        if int(index) not in chosen_indices:
+            chosen_indices.append(int(index))
+            roles[_opponent_key(candidates[int(index)])] = "hardness"
+            main_count -= 1
+    if refresh:
+        remaining = [index for index in range(len(candidates)) if index not in chosen_indices]
+        priorities = np.asarray([probe_priorities[index] for index in remaining])
+        tied = np.flatnonzero(priorities == priorities.max())
+        index = remaining[int(generator.choice(tied))]
+        chosen_indices.append(index)
+        roles[_opponent_key(candidates[index])] = "probe"
+    chosen = [candidates[index] for index in chosen_indices]
+    active = {ref.iteration for ref in snapshots[-active_pool_size:]}
+    selections: list[LeagueSelection] = []
+    for ref in sorted(ref for ref in chosen if isinstance(ref, SnapshotRef)):
+        selections.append(
+            SnapshotSelection(
+                ref,
+                "active" if ref.iteration in active else "historical",
+                roles[_opponent_key(ref)],
+            )
+        )
+    selections.extend(
+        BuiltinSelection(ref, role=roles[_opponent_key(ref)])
+        for ref in sorted(ref for ref in chosen if isinstance(ref, BuiltinRef))
+    )
+    return selections
+
 
 def _pfsp_weights(
     values: Sequence[SnapshotRef | BuiltinRef],
@@ -553,10 +726,22 @@ def select_league_mix(
     builtin_lanes: int = 0,
     score_rates: Mapping[str, float] | None = None,
     pretrained_start: bool = False,
+    selection_mode: Literal["stratified", "hardness"] = "hardness",
+    matchup_evidence: Mapping[str, MatchupEvidence] | None = None,
 ) -> list[LeagueSelection]:
     """Select distinct recent-active, log-age historical, and built-in opponents.
 
-    Active candidates are the newest ``active_pool_size`` frozen iterations.
+    The default ``hardness`` mode ranks all eligible candidates by their
+    game-count-weighted posterior learner score, randomizing exact ties. The
+    configured lane counts specify only the total budget. One lane refreshes
+    stale/uncertain evidence, another admits an unseen policy when available,
+    and the rest take the hardest distinct matchups. One- and two-lane budgets
+    rotate exploration purposes across iterations. With builtin_lanes=0,
+    built-ins are disabled. Labels still identify each policy's
+    age stratum, while ``role`` records why it was selected.
+
+    In the optional ``stratified`` mode, active candidates are the newest
+    ``active_pool_size`` frozen iterations.
     Historical candidates must be strictly older than that complete active
     window. The iteration-0 snapshot is excluded by default: games against a
     randomly initialized policy teach nothing a trained snapshot cannot. A
@@ -596,6 +781,8 @@ def select_league_mix(
     """
     if current_iteration < 0:
         raise ValueError("current iteration cannot be negative")
+    if selection_mode not in {"stratified", "hardness"}:
+        raise ValueError("unknown league selection mode")
     if active_count < 0 or historical_count < 0:
         raise ValueError("snapshot selection counts cannot be negative")
     if active_pool_size < 1:
@@ -628,6 +815,16 @@ def select_league_mix(
     eligible = sorted(eligible_by_iteration.values())
 
     trained = eligible if pretrained_start else [ref for ref in eligible if ref.iteration != 0]
+    if selection_mode == "hardness":
+        return _hardness_selections(
+            trained,
+            [BuiltinRef(name) for name in builtins] if builtin_lanes else [],
+            count=active_count + historical_count + min(builtin_lanes, len(builtins)),
+            current_iteration=current_iteration,
+            active_pool_size=active_pool_size,
+            generator=generator,
+            evidence=matchup_evidence or {},
+        )
     active_window = trained[-active_pool_size:]
     active_weights = _pfsp_weights(active_window, score_rates)
     builtin_refs = [BuiltinRef(name) for name in builtins]

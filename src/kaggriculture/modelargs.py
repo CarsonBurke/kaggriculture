@@ -38,6 +38,9 @@ CRITIC_ONLY_MODEL_FIELDS = frozenset(
         "critic_state_read",
         "per_entity_critic",
         "critic_readout_ffn",
+        "critic_source_read",
+        "critic_architecture",
+        "critic_private_layers",
     )
 )
 

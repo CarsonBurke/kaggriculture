@@ -952,6 +952,40 @@ def test_structured_farm_batch_matches_separate_canonical_encoding(
     torch.testing.assert_close(actual[1], expected[1])
 
 
+def test_tile_embedder_matches_per_token_lookups_and_their_gradients(
+    real_inputs: StructuredInputs,
+) -> None:
+    """The slot-table forward and GEMM backward must equal six plain lookups."""
+    torch.manual_seed(0)
+    embedder = structured.TileEmbedder(_tiny_config())
+    categorical, continuous = real_inputs.tile_categorical, real_inputs.tile_continuous
+
+    def reference() -> torch.Tensor:
+        return (
+            embedder.kind(categorical[..., 0])
+            + embedder.occupant(categorical[..., 1])
+            + embedder.farm(categorical[..., 2])
+            + embedder.row(categorical[..., 3])
+            + embedder.column(categorical[..., 4])
+            + embedder.quadrant(categorical[..., 5])
+            + embedder.continuous(continuous.float())
+        )
+
+    for tokens in (categorical.shape[1], categorical.shape[1] // 2):
+        categorical, continuous = categorical[:, :tokens], continuous[:, :tokens]
+        weights = torch.randn_like(embedder(categorical, continuous))
+        (embedder(categorical, continuous) * weights).sum().backward()
+        actual = {name: parameter.grad.clone() for name, parameter in embedder.named_parameters()}
+        embedder.zero_grad()
+        (reference() * weights).sum().backward()
+        expected = {name: parameter.grad.clone() for name, parameter in embedder.named_parameters()}
+        embedder.zero_grad()
+
+        torch.testing.assert_close(embedder(categorical, continuous), reference())
+        # Batch reductions replace scatter-adds, so only summation order differs.
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_structured_actor_shares_the_head_bias_prior_with_farm_actor() -> None:
     torch.manual_seed(0)
     structured = StructuredActor(_tiny_config())

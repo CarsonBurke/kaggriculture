@@ -36,6 +36,7 @@ from kaggriculture.ppo import (
     _fit_explained_variance,
     _fixed_minibatch_positions,
     _r_squared,
+    _reference_kl_sums,
     _stage_tensor,
     _structured_auxiliary_terms,
     _structured_critic_auxiliary_terms,
@@ -43,6 +44,7 @@ from kaggriculture.ppo import (
     _target_correlation,
     _validate_config,
     _validate_optimizer_ownership,
+    _validate_reference_actor,
     _validate_staged_action_masks,
     actor_forward_args,
     actor_lr_cooldown_scale,
@@ -60,6 +62,7 @@ from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.rollout import (
     _SHARED_ROLLOUT_FIELDS,
     _TRAJECTORY_METADATA_FIELDS,
+    RolloutBatch,
     collect_self_play,
     collect_self_play_rust,
 )
@@ -106,7 +109,7 @@ def test_entity_values_route_distinct_unit_and_shared_order_policy_gradients() -
         torch.tensor([[True, False]]),
         torch.tensor([[True, False]]),
     )
-    objective, _, kl, _, parity_kl = kaggriculture.ppo._policy_sums(
+    objective, _, kl, _, parity_kl, joint_kl = kaggriculture.ppo._policy_sums(
         new, old, masks, old, torch.from_numpy(advantages), 0.8, 1.2
     )
     (-objective).backward()
@@ -115,7 +118,7 @@ def test_entity_values_route_distinct_unit_and_shared_order_policy_gradients() -
     torch.testing.assert_close(new[1].grad, -expected[:, 2:])
     torch.testing.assert_close(new[2].grad, new[1].grad)
     assert new[0].grad[0, 0] != new[0].grad[0, 1]
-    assert kl == parity_kl == 0
+    assert kl == parity_kl == joint_kl == 0
 
 
 def test_entity_primary_loss_is_state_mean_not_head_count_weighted() -> None:
@@ -580,6 +583,79 @@ def test_asymmetric_clipping_leaves_harmful_direction_unclipped() -> None:
     assert clipped.item() == 2.0
 
 
+def test_tpo_target_matches_full_distribution_tpo_gradient_at_the_snapshot() -> None:
+    """Fitting the sampled decision alone reproduces `p - q` over the whole head.
+
+    The paper's single-sample target `q ∝ p_old · exp(A · e_a / eta)` needs the
+    full old distribution; the Bernoulli form needs only the stored selected
+    likelihood. They must agree in gradient where the update starts.
+    """
+    generator = torch.Generator().manual_seed(7)
+    logits = torch.randn(3, 9, generator=generator) * 2.0
+    mask = torch.rand(3, 9, generator=generator) > 0.3
+    mask[:, 0] = True
+    masked = torch.where(mask, logits, -float("inf"))
+    p_old = masked.softmax(-1)
+    actions = torch.multinomial(p_old, 1, generator=generator)
+    advantages = torch.tensor([1.7, -2.5, 0.0])
+    eta = 1.5
+
+    scores = torch.zeros_like(p_old).scatter(1, actions, advantages[:, None])
+    q = (p_old.log() + scores / eta).softmax(-1)
+    reference = masked.clone().requires_grad_(True)
+    full_loss = -(q * reference.log_softmax(-1)).nan_to_num(0.0).sum()
+    (expected,) = torch.autograd.grad(full_loss, reference)
+
+    under_test = masked.clone().requires_grad_(True)
+    new = under_test.log_softmax(-1).gather(1, actions)
+    old = p_old.log().gather(1, actions)
+    objective, approximate_kl, clipped = kaggriculture.ppo._tpo_target_sums(
+        new, old, advantages, torch.ones_like(new), eta
+    )
+    (actual,) = torch.autograd.grad(-objective, under_test)
+
+    torch.testing.assert_close(actual.nan_to_num(0.0), expected.nan_to_num(0.0))
+    torch.testing.assert_close(actual.nan_to_num(0.0), p_old - q)
+    # A zero advantage leaves the target at the snapshot: nothing to fit.
+    assert actual[2].nan_to_num(0.0).abs().max().item() < 1e-6
+    assert approximate_kl.item() == pytest.approx(0.0)
+    assert clipped.item() == 0.0
+
+
+def test_tpo_objective_vanishes_at_its_target_and_skips_saturated_decisions() -> None:
+    old = torch.tensor([[math.log(0.25)], [math.log(0.25)], [0.0]])
+    advantages = torch.tensor([2.0, 2.0, 3.0])
+    target = torch.sigmoid(torch.logit(torch.tensor(0.25)) + 2.0)
+    new = torch.tensor([[target.log().item()], [math.log(0.25)], [0.0]], requires_grad=True)
+
+    objective, approximate_kl, _ = kaggriculture.ppo._tpo_target_sums(
+        new, old, advantages, torch.ones_like(old), 1.0
+    )
+    (gradient,) = torch.autograd.grad(objective, new)
+
+    # Row 0 sits on its target: zero divergence and zero pull. Row 1 has not
+    # moved yet, so it is pulled toward the target along the log-likelihood.
+    # Row 2 stored likelihood one -- a PASS-only unit -- and has no target.
+    assert gradient[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+    assert gradient[1, 0] > 0
+    assert gradient[2, 0].item() == 0.0
+    assert torch.isfinite(objective)
+    expected_divergence = (
+        target * (target / 0.25).log() + (1 - target) * ((1 - target) / 0.75).log()
+    )
+    assert objective.item() == pytest.approx(-expected_divergence.item(), rel=1e-5)
+    # Row 1's ratio is one, row 0's is target / 0.25; row 2 contributes zero.
+    ratio = target / 0.25
+    assert approximate_kl.item() == pytest.approx((ratio - 1 - ratio.log()).item(), rel=1e-5)
+
+
+def test_invalid_policy_objective_is_rejected() -> None:
+    with pytest.raises(ValueError, match="policy objective"):
+        _validate_config(PpoConfig(policy_objective="reinforce"))
+    with pytest.raises(ValueError, match="TPO eta"):
+        _validate_config(PpoConfig(policy_objective="tpo", tpo_eta=0.0))
+
+
 def test_component_clipping_preserves_individual_factors_and_weighted_gradients(
     monkeypatch,
 ) -> None:
@@ -603,10 +679,10 @@ def test_component_clipping_preserves_individual_factors_and_weighted_gradients(
     ignored = torch.full_like(inactive, float("nan"))
     monkeypatch.setattr(
         kaggriculture.ppo,
-        "_replayed_component_logprobs",
-        lambda *args: (new, ignored, ignored, torch.ones_like(new), ignored, ignored),
+        "_replayed_policy",
+        lambda *args: ((new, ignored, ignored, torch.ones_like(new), ignored, ignored), None, None),
     )
-    objective, _, kl, clipped, _ = kaggriculture.ppo._actor_minibatch_terms(
+    objective, _, kl, clipped, _, _joint_kl, *_ = kaggriculture.ppo._actor_minibatch_terms(
         None,
         new,
         inactive,
@@ -671,7 +747,7 @@ def test_joint_clipping_masks_inactive_factors_and_nan_padding_before_summing() 
     )
     advantages = torch.tensor([1.0, -1.0, -2.0, float("nan")])
     weights = torch.tensor([1.0, 0.5, 2.0, 0.0])
-    objective, entropy, kl, clipped, component_kl = kaggriculture.ppo._policy_sums(
+    objective, entropy, kl, clipped, component_kl, joint_kl = kaggriculture.ppo._policy_sums(
         factors,
         old,
         active,
@@ -689,6 +765,7 @@ def test_joint_clipping_masks_inactive_factors_and_nan_padding_before_summing() 
     assert float(kl / weights.sum()) == pytest.approx(expected_kl / 3.5, rel=1e-5)
     expected_component_kl = 3 * (3 * (0.1 - math.log(1.1)) + 0.5 * (-0.1 - math.log(0.9)))
     assert float(component_kl) == pytest.approx(expected_component_kl, rel=1e-5)
+    assert float(joint_kl) == pytest.approx(expected_kl, rel=1e-5)
     gradients = torch.autograd.grad(-objective, factors)
     for gradient in gradients:
         torch.testing.assert_close(
@@ -785,6 +862,7 @@ def test_policy_loss_reduction_preserves_clipping_and_excludes_padded_states(
             active & ((actual_ratio < config.clip_low) | (actual_ratio > config.clip_high))
         ).sum()
     component_kl_sum = kl_sum.clone()
+    joint_kl_sum = (torch.expm1(total_log_ratio) - total_log_ratio).detach().sum()
     if scope == "joint":
         ratio = total_log_ratio.exp()
         advantage = torch.from_numpy(prepared.advantages[0, :5])
@@ -851,7 +929,7 @@ def test_policy_loss_reduction_preserves_clipping_and_excludes_padded_states(
     assert metrics["component_kl"] == pytest.approx(
         float(component_kl_sum / component_counts.sum()), rel=1e-5
     )
-    assert metrics["clip_fraction"] == pytest.approx(float(clipped_sum / diagnostic_denominator))
+    assert metrics["joint_kl"] == pytest.approx(float(joint_kl_sum / 5), rel=1e-5)
     if scope == "joint":
         batch_kls = [
             float(kl_per_state[selected].mean()) for selected in (shuffled[:3], shuffled[3:])
@@ -1632,6 +1710,208 @@ def test_one_ppo_update_is_finite() -> None:
         and placement[1].startswith("misc/")
     )
     assert not unfiled, unfiled
+
+
+def _anchor_fixture() -> tuple[FarmActor, DistributionalCritic, RolloutBatch]:
+    model_config = ModelConfig(
+        cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
+    )
+    torch.manual_seed(5)
+    actor = FarmActor(model_config)
+    critic = DistributionalCritic(model_config)
+    rollout = collect_self_play(
+        actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3, reward_mode="shaped"
+    )
+    rollout.rewards[:] = (
+        np.random.default_rng(11).normal(0.0, 0.05, size=rollout.rewards.shape).astype(np.float32)
+    )
+    return actor, critic, rollout
+
+
+def _frozen(actor: FarmActor) -> FarmActor:
+    return copy.deepcopy(actor).eval().requires_grad_(False)
+
+
+def _rollout_reference_kl(
+    actor: FarmActor, reference: FarmActor, rollout: RolloutBatch
+) -> tuple[float, float]:
+    """Mean reference KL per active decision over the rollout, and the largest state total."""
+    valid = rollout.valid
+    states = {name: array[valid] for name, array in rollout.states.items()}
+    states["unit_active"] = rollout.unit_active[valid]
+    args = actor_forward_args(rollout.architecture, states, torch.device("cpu"))
+
+    def tensor(array: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(array[valid])
+
+    kinds = tensor(rollout.market_kinds).long()
+    active = (
+        tensor(rollout.unit_active),
+        tensor(rollout.market_active),
+        tensor(rollout.market_quantity_active),
+    )
+    with torch.no_grad():
+        output = actor(*args)
+        total, largest = _reference_kl_sums(
+            reference,
+            output,
+            actor.quantity_logits(output.market_quantity_context, kinds),
+            kinds,
+            (
+                tensor(rollout.unit_masks),
+                tensor(rollout.market_kind_masks),
+                tensor(rollout.market_quantity_masks),
+            ),
+            active,
+            None,
+            *args,
+        )
+    return float(total) / sum(int(a.sum()) for a in active), float(largest)
+
+
+class _FixedLogits:
+    """A stand-in actor whose three heads return fixed logits, whatever its input."""
+
+    def __init__(self, unit: torch.Tensor, kind: torch.Tensor, quantity: torch.Tensor) -> None:
+        self.output = SimpleNamespace(
+            unit_logits=unit, market_kind_logits=kind, market_quantity_context=None
+        )
+        self.quantity = quantity
+
+    def __call__(self, *_args: object) -> SimpleNamespace:
+        return self.output
+
+    def quantity_logits(self, _context: object, _kinds: torch.Tensor) -> torch.Tensor:
+        return self.quantity
+
+
+def test_reference_kl_is_the_masked_forward_kl_over_active_decisions() -> None:
+    generator = torch.Generator().manual_seed(0)
+    shapes = ((3, 4, 6), (3, 2, 5), (3, 2, 7))
+
+    def logits() -> tuple[torch.Tensor, ...]:
+        return tuple(torch.randn(shape, generator=generator) for shape in shapes)
+
+    current, anchored = logits(), logits()
+    masks = tuple(torch.rand(shape, generator=generator) < 0.6 for shape in shapes)
+    for mask in masks:
+        mask[..., 0] = True
+    # An all-illegal row is a decision nobody took; it must not reach the sum.
+    masks[2][1, 1] = False
+    active = tuple(torch.rand(shape[:2], generator=generator) < 0.7 for shape in shapes)
+    active[2][1, 1] = False
+    sample_weight = torch.tensor([1.0, 0.5, 2.0])
+
+    total, largest = _reference_kl_sums(
+        _FixedLogits(*anchored),
+        SimpleNamespace(unit_logits=current[0], market_kind_logits=current[1]),
+        current[2],
+        torch.zeros(3, 2, dtype=torch.long),
+        masks,
+        active,
+        sample_weight,
+    )
+
+    expected_total = torch.zeros((), dtype=torch.float64)
+    expected_largest = torch.zeros((), dtype=torch.float64)
+    for p_logits, q_logits, mask, on in zip(anchored, current, masks, active, strict=True):
+        for index in np.ndindex(*mask.shape[:2]):
+            if not on[index]:
+                continue
+            legal = mask[index]
+            p = torch.softmax(p_logits[index][legal].double(), -1)
+            q = torch.softmax(q_logits[index][legal].double(), -1)
+            kl = (p * (p / q).log()).sum()
+            expected_total += sample_weight[index[0]] * kl
+            expected_largest = torch.maximum(expected_largest, kl)
+    assert torch.isfinite(total)
+    torch.testing.assert_close(total.double(), expected_total, rtol=1e-5, atol=1e-6)
+    # The largest single decision, unweighted: a flip reads as itself however
+    # many other decisions its state holds or however its row is weighted.
+    torch.testing.assert_close(largest.double(), expected_largest, rtol=1e-5, atol=1e-6)
+
+
+def test_reference_kl_is_zero_without_a_reference() -> None:
+    kinds = torch.zeros(3, 2, dtype=torch.long)
+    total, largest = _reference_kl_sums(None, None, None, kinds, (), (), None)
+    assert float(total) == 0.0 and float(largest) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("coefficient", "reference", "message"),
+    [
+        (0.5, None, "required together"),
+        (0.0, "frozen", "required together"),
+        (0.5, "same", "separate copy"),
+        (0.5, "training", "frozen"),
+        (0.5, "trainable", "frozen"),
+    ],
+)
+def test_the_reference_actor_must_be_a_frozen_copy_paired_with_its_coefficient(
+    coefficient: float, reference: str | None, message: str
+) -> None:
+    actor = FarmActor(ModelConfig(cnn_width=8, cnn_blocks=1, model_dim=16, attention_heads=2))
+    candidates = {
+        None: None,
+        "frozen": _frozen(actor),
+        "same": actor,
+        "training": _frozen(actor).train(),
+        "trainable": _frozen(actor).requires_grad_(True),
+    }
+    config = PpoConfig(reference_kl_coefficient=coefficient)
+    with pytest.raises(ValueError, match=message):
+        _validate_reference_actor(actor, candidates[reference], config)
+
+
+def test_the_reference_anchor_pulls_a_drifted_policy_back() -> None:
+    """The anchor's gradient reaches the policy and outweighs the surrogate's drift.
+
+    Two updates from one perturbed actor on one wave, identical but for the
+    anchor: only the anchored one ends nearer the reference than it began, and
+    both report the metric the stop signal reads.
+    """
+    actor, critic, rollout = _anchor_fixture()
+    reference = _frozen(actor)
+    with torch.no_grad():
+        noise = torch.Generator().manual_seed(9)
+        for parameter in actor.parameters():
+            parameter.add_(
+                0.1
+                * parameter.std().nan_to_num(0.1)
+                * torch.randn(parameter.shape, generator=noise)
+            )
+    start, _ = _rollout_reference_kl(actor, reference, rollout)
+    assert start > 1e-3
+
+    ends = {}
+    for coefficient in (0.0, 2.0):
+        trained, trained_critic = copy.deepcopy(actor), copy.deepcopy(critic)
+        config = PpoConfig(
+            epochs=4,
+            minibatch_size=8,
+            use_bfloat16=False,
+            actor_learning_rate=1e-3,
+            target_kl=10.0,
+            reference_kl_coefficient=coefficient,
+        )
+        metrics = update_ppo(
+            trained,
+            trained_critic,
+            *make_optimizers(trained, trained_critic, config),
+            rollout,
+            config,
+            generator=np.random.default_rng(4),
+            reference_actor=reference if coefficient else None,
+        )
+        if coefficient:
+            assert metrics["reference_kl"] > 0.0
+            assert metrics["max_reference_decision_kl"] >= metrics["reference_kl"]
+        else:
+            assert metrics["reference_kl"] == 0.0 == metrics["max_reference_decision_kl"]
+        ends[coefficient] = _rollout_reference_kl(trained, reference, rollout)[0]
+
+    assert ends[2.0] < 0.8 * start, (start, ends)
+    assert ends[2.0] < 0.8 * ends[0.0], (start, ends)
 
 
 def test_policy_and_critic_gradients_are_not_clipped(

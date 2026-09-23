@@ -47,6 +47,11 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import torch
 
+from kaggriculture.device_ledger import (
+    get_device_ledger,
+    pack_observations,
+    validate_replay_contract,
+)
 from kaggriculture.encoding import encode_observation
 from kaggriculture.entity import EntityActor
 from kaggriculture.evaluation import validate_seed_interval
@@ -59,22 +64,32 @@ from kaggriculture.latent_dynamics import (
     belief_spread,
     latent_horizon_loss,
 )
+from kaggriculture.lejepa import (
+    JEPA_METRICS,
+    JEPA_OBJECTIVE_ARTIFACT_KEY,
+    JepaObjective,
+    JepaTerms,
+    jepa_horizon_loss,
+)
+from kaggriculture.lejepa_model import LejepaActor
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.modelargs import add_model_config_arguments, model_config_from_args
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.orientation import ORIENTATION_CYCLE, augment_demonstration_rows
-from kaggriculture.policy import component_logprobs, component_selected_logprobs
+from kaggriculture.policy import component_logprobs, component_selected_logprobs, mask_logits
 from kaggriculture.ppo import _actor_batch_args, _batch_tensor, _fixed_minibatch_positions
 from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
     ARCHITECTURES,
     CONV_ENTITY,
+    LEJEPA,
     STRUCTURED,
     architecture_of_config,
     resolve_architecture,
 )
 from kaggriculture.rollout import _state_field_specs
+from kaggriculture.strategic_actor import StrategicActor
 from kaggriculture.structured import (
     StructuredActor,
     StructuredBelief,
@@ -335,6 +350,28 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="recursive steps for structured patch and state feature prediction",
     )
+    parser.add_argument(
+        "--jepa-prediction-coefficient",
+        type=float,
+        default=0.0,
+        help=(
+            "weight on the LeJEPA next-embedding regression, the lejepa family's "
+            "backbone objective; requires --architecture lejepa, a positive "
+            "--jepa-sigreg-coefficient, and --run-length above --jepa-horizon"
+        ),
+    )
+    parser.add_argument(
+        "--jepa-sigreg-coefficient",
+        type=float,
+        default=0.0,
+        help="weight on SIGReg, the term that keeps the attached target from collapsing",
+    )
+    parser.add_argument(
+        "--jepa-horizon",
+        type=int,
+        default=1,
+        help="recursive LeJEPA prediction steps; match the PPO run it warm-starts",
+    )
     # Both rate and decay changed UNITS when this moved off AdamW, so both are
     # renamed: a stale invocation now fails at argparse instead of silently
     # training a tenth as fast with a hundredth of the intended decay.
@@ -456,15 +493,23 @@ def _encoding_cache_schema(architecture: str) -> str:
 
     identity = source_identity()
     files = identity["files"]
-    missing = sorted(_ENCODING_SOURCE_FILES - files.keys())
+    encoding_sources = _ENCODING_SOURCE_FILES
+    causal = architecture == "causal-execution"
+    if causal:
+        encoding_sources = encoding_sources | {
+            "scripts/train_bc.py",
+            "src/kaggriculture/device_ledger.py",
+            *(name for name in files if name.startswith("rust/kagg_env/") and name.endswith(".rs")),
+        }
+    missing = sorted(encoding_sources - files.keys())
     if missing:
         raise RuntimeError(f"source identity is missing encoding inputs: {missing}")
     payload = {
         "format_version": BC_ENCODING_CACHE_FORMAT_VERSION,
         "architecture": STRUCTURED
-        if resolve_architecture(architecture).structured_inputs
+        if resolve_architecture(architecture).structured_inputs and not causal
         else architecture,
-        "files": {name: files[name] for name in sorted(_ENCODING_SOURCE_FILES)},
+        "files": {name: files[name] for name in sorted(encoding_sources)},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -494,6 +539,8 @@ def _encode_episode_file(
         if architecture_name == CONV_ENTITY
         else set(_STRUCTURED_STATE_FIELDS)
     )
+    if architecture_name == "causal-execution":
+        state_fields.add("policy_ledger")
     expected = set(_FACTOR_FIELDS) | state_fields
     cache = None if cache_text is None else Path(cache_text)
     if cache is not None:
@@ -529,6 +576,20 @@ def _encode_episode_file(
         ]
         for name in _STRUCTURED_STATE_FIELDS:
             arrays[name] = np.stack([getattr(row, name) for row in encoded])
+        if architecture_name == "causal-execution":
+            arrays["policy_ledger"] = pack_observations(
+                [entry["observation"] for entry in raw["observations"]]
+            )
+            try:
+                validate_replay_contract(
+                    arrays["policy_ledger"],
+                    arrays["unit_actions"],
+                    arrays["market_kinds"],
+                    arrays["market_quantities"],
+                    arrays,
+                )
+            except ValueError as error:
+                raise ValueError(f"{path_text}: {error}") from error
     else:
         raise ValueError(f"architecture {architecture_name!r} has no demonstration tokenizer")
     encoding_active = np.stack([row.unit_active for row in encoded]).astype(bool)
@@ -834,6 +895,99 @@ def _clone_loss_from_output(
     return -_masked_mean(logprobs, active)
 
 
+def _expand_plan_factors(factors: dict[str, torch.Tensor], plans: int) -> dict[str, torch.Tensor]:
+    """Match all_plans' row-major [state, plan] decoder layout."""
+    return {
+        name: value[:, None].expand(-1, plans, *value.shape[1:]).flatten(0, 1)
+        for name, value in factors.items()
+    }
+
+
+def _marginal_plan_nll(
+    log_prior: torch.Tensor,
+    logprobs: tuple[torch.Tensor, ...],
+    active: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """Exact complete-turn mixture likelihood, normalized by physical decisions."""
+    batch, plans = log_prior.shape
+    joint = log_prior
+    count = torch.zeros((), device=log_prior.device)
+    for probabilities, mask in zip(logprobs, active, strict=True):
+        probabilities = probabilities.reshape(batch, plans, -1)
+        joint = joint + torch.where(mask[:, None].bool(), probabilities, 0.0).sum(-1)
+        count = count + mask.sum()
+    return -torch.logsumexp(joint, dim=-1).sum() / count.clamp_min(1)
+
+
+def _strategic_clone_loss(
+    actor: StrategicActor,
+    inputs: StructuredInputs,
+    factors: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    output, log_prior = actor.all_plans(inputs)
+    expanded = _expand_plan_factors(factors, log_prior.shape[1])
+    logprobs = component_selected_logprobs(
+        output,
+        actor.quantity_logits(output.market_quantity_context, expanded["market_kinds"]),
+        expanded["unit_actions"],
+        expanded["market_kinds"],
+        expanded["market_quantities"],
+        expanded["unit_masks"],
+        expanded["market_kind_masks"],
+        expanded["market_quantity_masks"],
+        validate_masks=False,
+    )
+    return _marginal_plan_nll(
+        log_prior,
+        logprobs,
+        (
+            factors["unit_active"],
+            factors["market_active"],
+            factors["market_quantity_active"],
+        ),
+    )
+
+
+def _plan_prefix_statistics(
+    log_prior: torch.Tensor,
+    logits: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    masks: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    targets: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    active: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    """Marginal head diagnostics condition the shared plan on the observed prefix.
+
+    Units precede sequential market (kind, quantity) pairs. Inactive factors
+    never update the posterior; each market quantity also sees its observed kind.
+    """
+    batch, plans = log_prior.shape
+    conditional = tuple(
+        mask_logits(head, mask, validate=False)
+        .log_softmax(-1)
+        .reshape(batch, plans, head.shape[-2], head.shape[-1])
+        for head, mask in zip(logits, masks, strict=True)
+    )
+    selected = [torch.zeros_like(target, dtype=torch.float32) for target in targets]
+    entropy = [torch.zeros_like(target, dtype=torch.float32) for target in targets]
+    marginal = [torch.zeros_like(head[:, 0]) for head in conditional]
+    order = [(0, slot) for slot in range(targets[0].shape[1])]
+    order += [(head, slot) for slot in range(targets[1].shape[1]) for head in (1, 2)]
+    posterior = log_prior
+    for head, slot in order:
+        per_plan = conditional[head][:, :, slot]
+        distribution = torch.logsumexp(posterior[:, :, None] + per_plan, dim=1)
+        target = targets[head][:, slot, None]
+        observed = distribution.gather(-1, target).squeeze(-1)
+        selected[head][:, slot] = observed
+        entropy[head][:, slot] = -(distribution.exp() * distribution).sum(-1)
+        marginal[head][:, slot] = distribution
+        update = per_plan.gather(-1, target[:, None].expand(-1, plans, -1)).squeeze(-1)
+        posterior = torch.where(
+            active[head][:, slot, None], posterior + update - observed[:, None], posterior
+        )
+    return tuple(zip(selected, entropy, marginal, strict=True))
+
+
 def _clone_loss(
     actor: FarmActor | StructuredActor | EntityActor,
     actor_args: tuple[Any, ...],
@@ -844,6 +998,8 @@ def _clone_loss(
     with torch.autocast(
         device_type=factors["unit_actions"].device.type, dtype=torch.bfloat16, enabled=autocast
     ):
+        if isinstance(actor, StrategicActor):
+            return _strategic_clone_loss(actor, actor_args[0], factors)
         output = actor(*actor_args)
         return _clone_loss_from_output(actor, output, factors)
 
@@ -1024,6 +1180,53 @@ def _clone_and_structured_loss(
     return StructuredCloneTerms(clone, *auxiliary)
 
 
+class JepaCloneTerms(NamedTuple):
+    """The clone loss on the heads beside the world-model terms on the backbone."""
+
+    clone: torch.Tensor
+    jepa: JepaTerms
+
+
+def _clone_and_jepa_loss(
+    actor: LejepaActor,
+    objective: JepaObjective,
+    actor_args: tuple[Any, ...],
+    factors: dict[str, torch.Tensor],
+    autocast: bool,
+    horizon: int,
+    sample_weight: torch.Tensor,
+) -> JepaCloneTerms:
+    """The clone loss on the heads and the LeJEPA objective on the backbone.
+
+    One trunk pass serves both, exactly as in PPO with the demonstration corpus in place
+    of the rollout: the world-model objective reads the attached belief, and so do the
+    heads unless the actor is the detached ablation, so the backbone takes the clone
+    gradient beside the objective's. A demonstration carries no reward, so the reward
+    head is left for PPO, whose critic warmup fits it, beside a fresh projector and
+    predictor, against the frozen cloned backbone before anything moves it.
+    """
+    inputs = actor_args[0]
+    if not isinstance(inputs, StructuredInputs):
+        raise TypeError("the LeJEPA objective requires StructuredInputs")
+    with torch.autocast(
+        device_type=factors["unit_actions"].device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast,
+    ):
+        output, belief = actor.forward_with_belief(inputs)
+        clone = _clone_loss_from_output(actor, output, factors)
+        terms = jepa_horizon_loss(
+            objective,
+            belief,
+            inputs,
+            factors,
+            horizon=horizon,
+            sample_weight=sample_weight,
+            score_reward=False,
+        )
+    return JepaCloneTerms(clone, terms)
+
+
 @torch.no_grad()
 def evaluate(
     architecture: str,
@@ -1043,48 +1246,83 @@ def evaluate(
     for start in range(0, tensors.rows, batch_size):
         indices = slice(start, min(start + batch_size, tensors.rows))
         actor_args, factors = _batch(architecture, tensors, indices, device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
-            output = actor(*actor_args)
-            quantity_logits = actor.quantity_logits(
-                output.market_quantity_context, factors["market_kinds"]
-            )
-            logprobs_entropies = component_logprobs(
-                output,
-                quantity_logits,
-                factors["unit_actions"],
-                factors["market_kinds"],
-                factors["market_quantities"],
-                factors["unit_masks"],
-                factors["market_kind_masks"],
-                factors["market_quantity_masks"],
-                validate_masks=False,
-            )
-        heads = {
-            "unit": (
-                logprobs_entropies[0],
-                logprobs_entropies[3],
-                output.unit_logits,
-                factors["unit_masks"],
-                factors["unit_actions"],
-                factors["unit_active"],
-            ),
-            "kind": (
-                logprobs_entropies[1],
-                logprobs_entropies[4],
-                output.market_kind_logits,
-                factors["market_kind_masks"],
-                factors["market_kinds"],
-                factors["market_active"],
-            ),
-            "quantity": (
-                logprobs_entropies[2],
-                logprobs_entropies[5],
-                quantity_logits,
-                factors["market_quantity_masks"],
-                factors["market_quantities"],
-                factors["market_quantity_active"],
-            ),
-        }
+        if isinstance(actor, StrategicActor):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
+                output, log_prior = actor.all_plans(actor_args[0])
+                expanded = _expand_plan_factors(factors, log_prior.shape[1])
+                quantity_logits = actor.quantity_logits(
+                    output.market_quantity_context, expanded["market_kinds"]
+                )
+                statistics = _plan_prefix_statistics(
+                    log_prior,
+                    (output.unit_logits, output.market_kind_logits, quantity_logits),
+                    tuple(
+                        expanded[name]
+                        for name in ("unit_masks", "market_kind_masks", "market_quantity_masks")
+                    ),
+                    tuple(
+                        factors[name]
+                        for name in ("unit_actions", "market_kinds", "market_quantities")
+                    ),
+                    tuple(
+                        factors[name]
+                        for name in ("unit_active", "market_active", "market_quantity_active")
+                    ),
+                )
+            heads = {
+                name: (*stats, factors[mask], factors[target], factors[activity])
+                for name, stats, mask, target, activity in zip(
+                    ("unit", "kind", "quantity"),
+                    statistics,
+                    ("unit_masks", "market_kind_masks", "market_quantity_masks"),
+                    ("unit_actions", "market_kinds", "market_quantities"),
+                    ("unit_active", "market_active", "market_quantity_active"),
+                    strict=True,
+                )
+            }
+        else:
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
+                output = actor(*actor_args)
+                quantity_logits = actor.quantity_logits(
+                    output.market_quantity_context, factors["market_kinds"]
+                )
+                logprobs_entropies = component_logprobs(
+                    output,
+                    quantity_logits,
+                    factors["unit_actions"],
+                    factors["market_kinds"],
+                    factors["market_quantities"],
+                    factors["unit_masks"],
+                    factors["market_kind_masks"],
+                    factors["market_quantity_masks"],
+                    validate_masks=False,
+                )
+            heads = {
+                "unit": (
+                    logprobs_entropies[0],
+                    logprobs_entropies[3],
+                    output.unit_logits,
+                    factors["unit_masks"],
+                    factors["unit_actions"],
+                    factors["unit_active"],
+                ),
+                "kind": (
+                    logprobs_entropies[1],
+                    logprobs_entropies[4],
+                    output.market_kind_logits,
+                    factors["market_kind_masks"],
+                    factors["market_kinds"],
+                    factors["market_active"],
+                ),
+                "quantity": (
+                    logprobs_entropies[2],
+                    logprobs_entropies[5],
+                    quantity_logits,
+                    factors["market_quantity_masks"],
+                    factors["market_quantities"],
+                    factors["market_quantity_active"],
+                ),
+            }
         for name, (logprob, entropy, logits, mask, target, active) in heads.items():
             greedy = logits.float().masked_fill(~mask, -torch.inf).argmax(dim=-1)
             sums[name] += float(-(logprob * active).sum())
@@ -1142,8 +1380,9 @@ def _artifact_payload(
     metrics: dict[str, float],
     bc_provenance: dict[str, Any],
     identity: dict[str, Any],
+    objective: JepaObjective | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "format_version": ACTOR_ARTIFACT_FORMAT_VERSION,
         "architecture": architecture,
         "model_config": config.to_dict(),
@@ -1158,6 +1397,11 @@ def _artifact_payload(
         "bc_provenance": bc_provenance,
         "seed_usage": [],
     }
+    if objective is not None:
+        payload[JEPA_OBJECTIVE_ARTIFACT_KEY] = {
+            name: value.cpu() for name, value in objective.state_dict().items()
+        }
+    return payload
 
 
 # Inductor's own list, read rather than restated, so a torch upgrade that adds or
@@ -1211,6 +1455,11 @@ _STRUCTURED_FIELDS = (
 )
 
 
+# The world-model journal under the same column names the PPO update writes,
+# prefixed so a clone's record cannot be mistaken for a rollout's.
+_JEPA_FIELDS = (*(f"jepa_{name}" for name in JEPA_METRICS), "jepa_steps")
+
+
 # `modded-nanogpt`'s pretraining schedule, transcribed from
 # `TrainingSchedule.get_lr` (train_gpt.py:1968-1976) and `get_muon_momentum`
 # (:1995-2005). Two departures from what this file used to do: the rate holds
@@ -1262,7 +1511,9 @@ def _apply_schedule(optimizer: NorMuon, step: int, total_steps: int) -> None:
             group["momentum"] = momentum
 
 
-def _run_blocks(episode_index: torch.Tensor, run_length: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _run_blocks(
+    episode_index: torch.Tensor, run_length: int, generator: torch.Generator | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Cut the corpus into contiguous same-episode row blocks, in staging order.
 
     A block is up to `run_length` consecutive rows of one episode-seat, and rows
@@ -1277,6 +1528,14 @@ def _run_blocks(episode_index: torch.Tensor, run_length: int) -> tuple[torch.Ten
     720-step horizon stages 719 rows per seat, so a run length of 64 leaves a
     15-row tail on every one of them, and an epoch would stop being a full pass
     over the corpus.
+
+    With a `generator`, every episode's blocks are cut at a phase drawn from it
+    -- a leading block of `phase` rows, then full blocks -- exactly as PPO's
+    contiguous runs are. Without one every episode is cut at phase zero, and a
+    transition objective then only ever sees a pair that opens on a multiple of
+    `run_length`: at a run length of two, half the corpus's transitions, and
+    always the same half. At a run length of one nothing is drawn, so the
+    default sampler consumes the generator exactly as it always has.
     """
     if run_length < 1:
         raise ValueError("run length must be positive")
@@ -1289,9 +1548,12 @@ def _run_blocks(episode_index: torch.Tensor, run_length: int) -> tuple[torch.Ten
     episode_starts = positions[opens]
     episode_lengths = torch.diff(torch.cat((episode_starts, positions.new_tensor([rows]))))
     within = positions - torch.repeat_interleave(episode_starts, episode_lengths)
+    if generator is not None and run_length > 1:
+        phases = torch.randint(run_length, (int(episode_starts.shape[0]),), generator=generator)
+        within = within - torch.repeat_interleave(phases, episode_lengths)
     # Every episode's first row opens a block, so consecutive starts are never
     # more than one episode apart and the gaps between them are the lengths.
-    starts = positions[within % run_length == 0]
+    starts = positions[(within % run_length == 0) | opens]
     return starts, torch.diff(torch.cat((starts, starts.new_tensor([rows]))))
 
 
@@ -1337,6 +1599,9 @@ def train(
     structured_opponent_patch_coefficient: float = 0.0,
     structured_decision_horizon: int = 2,
     structured_patch_horizon: int = 1,
+    jepa_prediction_coefficient: float = 0.0,
+    jepa_sigreg_coefficient: float = 0.0,
+    jepa_horizon: int = 1,
     matrix_learning_rate: float,
     matrix_weight_decay: float,
     adam_learning_rate_ratio: float,
@@ -1401,6 +1666,30 @@ def train(
     entity_active = any(entity_coefficients)
     structured_active = any(structured_coefficients)
     family = resolve_architecture(architecture)
+    jepa_coefficients = (jepa_prediction_coefficient, jepa_sigreg_coefficient)
+    if not all(math.isfinite(value) and value >= 0 for value in jepa_coefficients):
+        raise ValueError("LeJEPA coefficients must be finite and nonnegative")
+    jepa_active = any(jepa_coefficients)
+    if jepa_active != (family.name == LEJEPA):
+        # Without its objective this family is an entity trunk under another
+        # name, and its detached ablation would fit a readout over an encoder
+        # still at initialization while the clone loss descended perfectly well.
+        # No other family has a backbone the objective could own.
+        raise ValueError(
+            "the lejepa family is cloned only beside its LeJEPA objective, and the "
+            "LeJEPA coefficients apply only to --architecture lejepa"
+        )
+    if jepa_active and not all(value > 0 for value in jepa_coefficients):
+        # An attached target alone is minimized exactly by a constant encoder.
+        raise ValueError("the LeJEPA objective needs positive prediction and SIGReg coefficients")
+    if jepa_active and (entity_active or structured_active):
+        raise ValueError("the lejepa family admits only the LeJEPA objective")
+    if jepa_active and jepa_horizon < 1:
+        raise ValueError("the LeJEPA horizon must be positive")
+    if architecture in ("strategic-plan", "causal-execution") and (
+        entity_active or structured_active
+    ):
+        raise ValueError("strategic and causal BC require actor NextLat disabled")
     if entity_active and family.structured_inputs:
         raise ValueError("convolutional latent auxiliary does not support structured-input actors")
     if structured_active and not family.full_belief:
@@ -1425,7 +1714,9 @@ def train(
         else 0
     )
     patch_horizon = structured_patch_horizon if state_active else 0
-    auxiliary_horizon = max(entity_horizon, decision_horizon, patch_horizon)
+    auxiliary_horizon = max(
+        entity_horizon, decision_horizon, patch_horizon, jepa_horizon if jepa_active else 0
+    )
     if auxiliary_horizon and run_length <= auxiliary_horizon:
         raise ValueError(
             f"an auxiliary horizon of {auxiliary_horizon} needs --run-length above it; "
@@ -1452,6 +1743,10 @@ def train(
     torch.manual_seed(seed)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     orientation_rng = np.random.default_rng(seed)
+    # The LeJEPA slice directions and tile sample, redrawn per minibatch from a
+    # stream of their own so enabling the objective leaves the orientation draws
+    # of every other arm untouched.
+    jepa_rng = np.random.default_rng((seed, 1))
 
     train_split, holdout_split, datasets = load_dataset(
         dataset_dirs,
@@ -1464,11 +1759,19 @@ def train(
     )
     # `train_split.rows` is fixed for the life of the process, so the partition
     # is computed once: every epoch reshuffles only the order these positions
-    # index into, and every minibatch is exactly `batch_size` rows wide.
-    minibatch_positions, _minibatch_counts = _fixed_minibatch_positions(
-        train_split.rows, batch_size
+    # index into, and every minibatch is exactly `batch_size` rows wide -- or
+    # the whole split, when that is narrower, rather than one split padded out
+    # to `batch_size` with copies of itself.
+    minibatch_positions, minibatch_counts = _fixed_minibatch_positions(
+        train_split.rows, min(batch_size, train_split.rows)
     )
     minibatch_rows = int(minibatch_positions.shape[1])
+    # The last minibatch wraps to the head of the ordering. The LeJEPA
+    # objective scores SIGReg over every row rather than per transition, so it
+    # is told which rows are those duplicates, exactly as in the PPO update.
+    minibatch_weights = torch.from_numpy(
+        (np.arange(minibatch_rows)[None, :] < minibatch_counts[:, None]).astype(np.float32)
+    ).to(device)
     if auxiliary_horizon and minibatch_rows <= auxiliary_horizon:
         raise ValueError(
             f"an auxiliary horizon of {auxiliary_horizon} needs a wider minibatch; "
@@ -1481,6 +1784,8 @@ def train(
     )
 
     actor = resolve_architecture(architecture).actor_class(config).to(device)
+    if architecture == "causal-execution":
+        actor.set_device_ledger(get_device_ledger(device))
     # Pretraining, so the reference's full recipe applies: spectrally normalized
     # matrix steps, Adam on the gains, biases and heads, and cautious decay on
     # both halves. The PPO update deliberately runs the same optimizer with
@@ -1488,11 +1793,15 @@ def train(
     # p_psi trains alongside the policy and under the same recipe: it is a
     # matrix-and-vector module like any other, and giving it a second optimizer
     # would mean a second schedule nobody chose.
-    dynamics: LatentDynamics | StructuredDynamics | None
+    # The LeJEPA objective joins the same optimizer for the same reason, and
+    # there the backbone it trains is already a member through the actor.
+    dynamics: LatentDynamics | StructuredDynamics | JepaObjective | None
     if entity_active:
         dynamics = LatentDynamics(config.model_dim).to(device)
     elif structured_active:
         dynamics = StructuredDynamics(config).to(device)
+    elif jepa_active:
+        dynamics = JepaObjective(config).to(device)
     else:
         dynamics = None
     refresh_fused_mlp_fp8(actor, bootstrap_down=True)
@@ -1513,11 +1822,20 @@ def train(
         weight_decay=matrix_weight_decay,
         adam_weight_decay=adam_weight_decay,
     )
+    # The `lejepa` heads and world model share no parameter and have different
+    # owners, so they are clipped apart: under one joint norm
+    # the heads' gradient would decide how much of the backbone's survives, which
+    # is not the update PPO continues.
+    clip_groups: tuple[list[torch.Tensor], ...] = (
+        (
+            list(actor.head_parameters()),
+            [*actor.backbone_parameters(), *dynamics.parameters()],
+        )
+        if isinstance(actor, LejepaActor) and isinstance(dynamics, JepaObjective)
+        else (matrices + vectors,)
+    )
     steps_per_epoch = math.ceil(train_split.rows / batch_size)
     total_steps = max(epochs * steps_per_epoch, 1)
-    # Fixed for the whole run: the blocks depend on the corpus and the run
-    # length, and only their order is redrawn per epoch.
-    run_starts, run_lengths = _run_blocks(train_split.staged["episode_index"], run_length)
     step_index = 0
     autocast = device.type == "cuda"
     # Measured on three full 12-epoch arms, not on a step benchmark. Fusing the
@@ -1540,6 +1858,8 @@ def train(
     # artifact is never silently compared against one trained the other way.
     if dynamics is None:
         step_loss = _clone_loss
+    elif isinstance(dynamics, JepaObjective):
+        step_loss = _clone_and_jepa_loss
     elif isinstance(dynamics, StructuredDynamics):
         step_loss = _clone_and_structured_loss
     else:
@@ -1554,6 +1874,8 @@ def train(
         # How the batches were built, so an artifact is not silently comparable
         # to one trained with a different sampler.
         "batch_size": batch_size,
+        # The width actually trained, which the split can clamp below the request.
+        "minibatch_rows": minibatch_rows,
         "run_length": run_length,
         "compile_mode": compile_mode,
         "latent_dynamics_coefficient": latent_dynamics_coefficient,
@@ -1567,6 +1889,9 @@ def train(
         "structured_opponent_patch_coefficient": structured_opponent_patch_coefficient,
         "structured_decision_horizon": decision_horizon,
         "structured_patch_horizon": patch_horizon,
+        "jepa_prediction_coefficient": jepa_prediction_coefficient,
+        "jepa_sigreg_coefficient": jepa_sigreg_coefficient,
+        "jepa_horizon": jepa_horizon if jepa_active else 0,
         "gradient_clip": gradient_clip,
         "command": sys.argv,
     }
@@ -1593,6 +1918,11 @@ def train(
             started = time.perf_counter()
             # The order indexes host storage and also selects the epoch weights
             # from precomputed host-side counts, which needs the same order.
+            # Re-cut every epoch at freshly drawn phases, so every transition
+            # of every episode is a source in expectation.
+            run_starts, run_lengths = _run_blocks(
+                train_split.staged["episode_index"], run_length, generator
+            )
             order = _run_epoch_order(run_starts, run_lengths, generator)
             shuffled_components = train_split.row_components[order.numpy()]
             # The rate and coefficient this epoch opens with, read from the
@@ -1602,9 +1932,15 @@ def train(
             applied_momentum = _momentum_at(step_index, total_steps)
             epoch_loss = 0.0
             epoch_components = 0.0
-            diagnostic_fields = _STRUCTURED_FIELDS if structured_active else _LATENT_FIELDS
+            diagnostic_fields = (
+                _STRUCTURED_FIELDS
+                if structured_active
+                else _JEPA_FIELDS
+                if jepa_active
+                else _LATENT_FIELDS
+            )
             diagnostic_sums = dict.fromkeys(diagnostic_fields, 0.0)
-            for indices in minibatch_positions:
+            for batch_number, indices in enumerate(minibatch_positions):
                 actor_args, factors = _batch(
                     architecture,
                     train_split,
@@ -1616,6 +1952,23 @@ def train(
 
                 if dynamics is None:
                     loss = clone_loss(actor, actor_args, factors, autocast)
+                elif isinstance(dynamics, JepaObjective):
+                    # Buffers overwritten in place: the compiled step traces once.
+                    dynamics.refresh_slices(jepa_rng)
+                    terms = clone_loss(
+                        actor,
+                        dynamics,
+                        actor_args,
+                        factors,
+                        autocast,
+                        jepa_horizon,
+                        minibatch_weights[batch_number],
+                    )
+                    loss = (
+                        terms.clone
+                        + jepa_prediction_coefficient * terms.jepa.prediction
+                        + jepa_sigreg_coefficient * terms.jepa.sigreg
+                    )
                 elif isinstance(dynamics, StructuredDynamics):
                     terms = clone_loss(
                         actor,
@@ -1661,6 +2014,12 @@ def train(
                             "latent": float(terms.latent.detach()),
                             "decision": float(terms.decision.detach()),
                         }
+                    elif isinstance(terms, JepaCloneTerms):
+                        values = {
+                            "clone": float(terms.clone.detach()),
+                            "prediction": float(terms.jepa.prediction.detach()),
+                            "sigreg": float(terms.jepa.sigreg.detach()),
+                        }
                     else:
                         values = {"combined": float(loss.detach())}
                     raise FloatingPointError(
@@ -1668,11 +2027,12 @@ def train(
                     )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    matrices + vectors,
-                    gradient_clip,
-                    error_if_nonfinite=True,
-                )
+                for clipped in clip_groups:
+                    torch.nn.utils.clip_grad_norm_(
+                        clipped,
+                        gradient_clip,
+                        error_if_nonfinite=True,
+                    )
                 _apply_schedule(optimizer, step_index, total_steps)
                 optimizer.step()
                 bootstrap_fp8_down = step_index < 16
@@ -1695,7 +2055,14 @@ def train(
                 clone_term = loss if dynamics is None else terms.clone
                 epoch_loss += float(clone_term.detach()) * components
                 epoch_components += components
-                if isinstance(dynamics, StructuredDynamics):
+                if isinstance(dynamics, JepaObjective):
+                    # One transfer for the whole journal row rather than a
+                    # device read per column.
+                    values = torch.stack([value.detach().float() for value in terms.jepa]).tolist()
+                    for name, value in zip(JEPA_METRICS, values, strict=True):
+                        diagnostic_sums[f"jepa_{name}"] += value
+                    diagnostic_sums["jepa_steps"] += 1.0
+                elif isinstance(dynamics, StructuredDynamics):
                     diagnostic_sums["structured_latent"] += float(terms.latent.detach())
                     diagnostic_sums["structured_decision"] += float(terms.decision.detach())
                     diagnostic_sums["structured_decision_one"] += float(terms.decision_one.detach())
@@ -1803,7 +2170,13 @@ def train(
             # Per-step means, so an arm's numbers are comparable across corpora
             # and batch sizes. Absent entirely on a plain clone rather than
             # written as zeros, which would read as a measured collapse.
-            step_key = "structured_steps" if structured_active else "latent_steps"
+            step_key = (
+                "structured_steps"
+                if structured_active
+                else "jepa_steps"
+                if jepa_active
+                else "latent_steps"
+            )
             steps = diagnostic_sums.pop(step_key)
             if steps:
                 record.update({name: value / steps for name, value in diagnostic_sums.items()})
@@ -1823,7 +2196,13 @@ def train(
             )
             checkpoint_path = output_dir / epoch_checkpoint_pattern.format(epoch=epoch + 1)
             payload = _artifact_payload(
-                architecture, actor, config, holdout, bc_provenance, identity
+                architecture,
+                actor,
+                config,
+                holdout,
+                bc_provenance,
+                identity,
+                dynamics if isinstance(dynamics, JepaObjective) else None,
             )
             # Serialize once. The durable epoch history is immutable, while
             # bc-actor.pt is an atomic hard-link alias for the best holdout
@@ -1870,6 +2249,9 @@ def main() -> None:
         structured_opponent_patch_coefficient=args.structured_opponent_patch_coefficient,
         structured_decision_horizon=args.structured_decision_horizon,
         structured_patch_horizon=args.structured_patch_horizon,
+        jepa_prediction_coefficient=args.jepa_prediction_coefficient,
+        jepa_sigreg_coefficient=args.jepa_sigreg_coefficient,
+        jepa_horizon=args.jepa_horizon,
         matrix_learning_rate=args.matrix_learning_rate,
         matrix_weight_decay=args.matrix_weight_decay,
         adam_learning_rate_ratio=args.adam_learning_rate_ratio,

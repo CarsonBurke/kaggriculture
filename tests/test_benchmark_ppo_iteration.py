@@ -61,6 +61,8 @@ def test_unflagged_benchmark_builds_the_exact_production_model(monkeypatch) -> N
     assert not args.deterministic_training
     assert args.games == str(PRODUCTION_SELF_PLAY_GAMES)
     assert args.architecture == PRODUCTION_ARCHITECTURE
+    assert args.structured_critic_latent_coefficient == 0.0
+    assert args.structured_critic_value_coefficient == 0.0
     assert config == resolve_architecture(PRODUCTION_ARCHITECTURE).build_config(
         production_model_config()
     )

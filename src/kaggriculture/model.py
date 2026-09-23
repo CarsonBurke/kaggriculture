@@ -197,16 +197,26 @@ class Linear(nn.Linear):
 
 
 class RMSNorm(nn.RMSNorm):
-    """Compute-dtype normalization with fixed CUDA forward reduction arithmetic."""
+    """Compute-dtype normalization with fixed CUDA forward reduction arithmetic.
 
-    def forward(self, inputs: Tensor) -> Tensor:
+    `scale`/`shift` of shape `(*inputs.shape[:-2], width)` apply the conditioning
+    `(1 + scale) * normalized + shift`, broadcast over the token dimension. On
+    CUDA the epilogue is fused into the normalization kernel.
+    """
+
+    def forward(
+        self, inputs: Tensor, scale: Tensor | None = None, shift: Tensor | None = None
+    ) -> Tensor:
         if inputs.is_cuda:
             from kaggriculture.triton_norm import rms_norm
 
             eps = self.eps if self.eps is not None else torch.finfo(torch.float32).eps
-            return rms_norm(inputs, self.weight, eps)
+            return rms_norm(inputs, self.weight, eps, scale, shift)
         with torch.autocast(inputs.device.type, enabled=False):
-            return F.rms_norm(inputs, self.normalized_shape, self.weight, self.eps)
+            normalized = F.rms_norm(inputs, self.normalized_shape, self.weight, self.eps)
+        if scale is None or shift is None:
+            return normalized
+        return normalized * (1 + scale.unsqueeze(-2)) + shift.unsqueeze(-2)
 
 
 class ReluSquared(nn.Module):

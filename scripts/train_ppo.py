@@ -23,14 +23,19 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from kaggriculture.actor_dynamics import ActorDynamics
+from kaggriculture.architecture_panel import (
+    PANEL_POLICY,
+    ArchitecturePanelGuard,
+    evaluate_architecture_panel,
+)
 from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.constants import DEFAULT_REWARD_MODE
+from kaggriculture.critic_diagnostics import terminal_outcomes
 from kaggriculture.entity import EntityConfig
 from kaggriculture.evaluation import (
     DEVELOPMENT_SEED_START,
@@ -44,6 +49,7 @@ from kaggriculture.league import (
     BuiltinSelection,
     FrozenActorPool,
     LeagueSelection,
+    MatchupEvidence,
     SnapshotRef,
     SnapshotSelection,
     copy_actor_snapshot,
@@ -53,7 +59,11 @@ from kaggriculture.league import (
     save_actor_state_snapshot,
     select_league_mix,
     snapshot_sha256,
+    update_matchup_evidence,
+    validate_matchup_evidence,
 )
+from kaggriculture.lejepa import JepaObjective, load_artifact_objective
+from kaggriculture.lejepa_model import LejepaCritic
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
     actor_model_config,
@@ -63,6 +73,7 @@ from kaggriculture.modelargs import (
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
 from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
+    BACKBONE_ROLE,
     DEFAULT_ACTOR_GAE_LAMBDA,
     DEFAULT_CRITIC_GAE_LAMBDA,
     MAX_FIRST_MINIBATCH_KL,
@@ -84,6 +95,7 @@ from kaggriculture.production import (
     PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS,
     PRODUCTION_LEAGUE_GAMES,
+    PRODUCTION_LEAGUE_SELECTION,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
     production_ppo_config,
@@ -96,7 +108,13 @@ from kaggriculture.provenance import (
     source_identity,
     validate_run_provenance,
 )
-from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.registry import (
+    ARCHITECTURES,
+    CONV_ENTITY,
+    LEJEPA,
+    pair_towers,
+    resolve_architecture,
+)
 from kaggriculture.rollout import (
     REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
@@ -305,6 +323,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument(
+        "--architecture-panel",
+        type=int,
+        default=0,
+        help="fixed native BF16 development evaluation every N actor-active waves (0 disables); "
+        "cull persistent score deterioration only after strength and critic calibration stall",
+    )
+    parser.add_argument(
         "--autocull",
         action="store_true",
         help=(
@@ -343,12 +368,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--league-active-opponents", type=int, default=2)
     parser.add_argument(
+        "--league-selection",
+        choices=("stratified", "hardness"),
+        default=PRODUCTION_LEAGUE_SELECTION,
+        help=(
+            "pooled hardness with discovery and stale-opponent refresh (default), "
+            "or stratified age coverage"
+        ),
+    )
+    parser.add_argument(
         "--league-historical-opponents",
         type=int,
         default=6,
         help=(
-            "log-age PFSP snapshot lanes per wave; defaults to 6 so a 500-iteration "
-            "archive fills every occupied log2 rung outside the active window"
+            "additional snapshot lanes per wave (default 6); hardness pools these "
+            "with active lanes, while stratified selection samples log-age buckets"
         ),
     )
     parser.add_argument("--league-active-pool-size", type=int, default=16)
@@ -361,7 +395,8 @@ def parse_args() -> argparse.Namespace:
         "--league-builtin-lanes",
         type=int,
         default=0,
-        help="league lanes reserved for admitted built-ins; unwon lanes go to snapshots",
+        help="built-in lane budget; hardness pools it with snapshot lanes, "
+        "stratified contests reserved lanes; zero disables built-ins",
     )
     parser.add_argument(
         "--external-eval",
@@ -473,6 +508,29 @@ def parse_args() -> argparse.Namespace:
             "joint action ratio and measure KL per state; entropy stays per component"
         ),
     )
+    parser.add_argument(
+        "--policy-objective",
+        choices=("clip", "tpo"),
+        default=PpoConfig.policy_objective,
+        help=(
+            "per-decision actor objective: the clipped PPO surrogate (default), or "
+            "single-sample TPO fitting each sampled decision to the target "
+            "logit(p_old) + A / eta; the clip band is then unused"
+        ),
+    )
+    parser.add_argument(
+        "--tpo-eta",
+        type=float,
+        default=PpoConfig.tpo_eta,
+        help="TPO tilt temperature over the whitened advantage; larger is gentler",
+    )
+    parser.add_argument(
+        "--reference-kl-coefficient",
+        type=float,
+        default=PpoConfig.reference_kl_coefficient,
+        help="weight on KL(initial actor || policy) per active decision; anchors the "
+        "decisions PPO's sampled surrogate cannot hold, and requires --init-actor-from",
+    )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
@@ -564,6 +622,12 @@ def parse_args() -> argparse.Namespace:
         help="weight on decoded future-value prediction from critic NextLat",
     )
     parser.add_argument(
+        "--economic-forecast-coefficient",
+        type=float,
+        default=PpoConfig.economic_forecast_coefficient,
+        help="observable multi-horizon forecast loss weight for critic-architecture forecast",
+    )
+    parser.add_argument(
         "--structured-critic-gradient-balance",
         action=argparse.BooleanOptionalAction,
         default=PpoConfig.structured_critic_gradient_balance,
@@ -579,6 +643,34 @@ def parse_args() -> argparse.Namespace:
         "--structured-critic-horizon",
         type=int,
         default=PpoConfig.structured_critic_horizon,
+    )
+    parser.add_argument(
+        "--jepa-prediction-coefficient",
+        type=float,
+        default=PpoConfig.jepa_prediction_coefficient,
+        help="weight on the LeJEPA next-embedding regression, whose target is ATTACHED; "
+        "requires --architecture lejepa and a positive --jepa-sigreg-coefficient",
+    )
+    parser.add_argument(
+        "--jepa-sigreg-coefficient",
+        type=float,
+        default=PpoConfig.jepa_sigreg_coefficient,
+        help="weight on SIGReg, the only thing preventing the attached target above from "
+        "being solved by a constant encoder; `../le-wm` uses 0.09 against a unit "
+        "prediction weight",
+    )
+    parser.add_argument(
+        "--jepa-reward-coefficient",
+        type=float,
+        default=PpoConfig.jepa_reward_coefficient,
+        help="weight on predicting the reward collected on the transition; sparse under "
+        "terminal-outcome rewards, dense under shaped ones",
+    )
+    parser.add_argument(
+        "--jepa-horizon",
+        type=int,
+        default=PpoConfig.jepa_horizon,
+        help="recursive prediction steps; one is the Markov objective the family is built for",
     )
     parser.add_argument(
         "--structured-learning-rate",
@@ -724,6 +816,17 @@ def _validate_population(args: argparse.Namespace) -> None:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.architecture_panel < 0:
+        raise ValueError("--architecture-panel must be nonnegative")
+    if args.architecture_panel:
+        if args.population != 1 or args.autocull:
+            raise ValueError("architecture panel requires one learner and no online-proxy autocull")
+        if not args.device.startswith("cuda") or args.update_compile_mode == "eager":
+            raise ValueError("architecture panel requires compiled CUDA BF16")
+        if args.reward_mode != "terminal-outcome" or args.gamma != 1.0:
+            raise ValueError(
+                "architecture panel calibration requires terminal-outcome and gamma one"
+            )
     if args.autocull and args.population != 1:
         raise ValueError("--autocull requires --population 1")
     # Model-configuration flags are validated by the config dataclass itself,
@@ -761,6 +864,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("target KL must be finite and positive")
     if args.policy_ratio_scope == "joint" and args.policy_loss_reduction != "states":
         raise ValueError("joint policy ratio scope requires state policy loss reduction")
+    if (
+        not math.isfinite(args.economic_forecast_coefficient)
+        or args.economic_forecast_coefficient < 0
+    ):
+        raise ValueError("economic forecast coefficient must be finite and nonnegative")
+    if args.critic_architecture == "forecast":
+        if args.economic_forecast_coefficient == 0:
+            raise ValueError("forecast critic requires a positive economic forecast coefficient")
+        if args.structured_critic_latent_coefficient or args.structured_critic_value_coefficient:
+            raise ValueError("forecast critic replaces critic NextLat; disable critic NextLat")
     structured_actor_coefficients = (
         args.structured_latent_coefficient,
         args.structured_decision_coefficient,
@@ -790,6 +903,33 @@ def _validate_args(args: argparse.Namespace) -> None:
     if any(structured_critic_coefficients) and args.structured_critic_horizon < 1:
         raise ValueError(
             "structured critic horizon must be positive when critic auxiliary is active"
+        )
+    jepa_coefficients = (
+        args.jepa_prediction_coefficient,
+        args.jepa_sigreg_coefficient,
+        args.jepa_reward_coefficient,
+    )
+    if not all(math.isfinite(value) and value >= 0.0 for value in jepa_coefficients):
+        raise ValueError("LeJEPA coefficients must be finite and nonnegative")
+    if any(jepa_coefficients) and args.architecture != LEJEPA:
+        raise ValueError("LeJEPA coefficients require --architecture lejepa")
+    if args.architecture == LEJEPA and not any(jepa_coefficients):
+        raise ValueError(
+            "the lejepa architecture without its objective is the entity architecture "
+            "with extra head parameters; set --jepa-prediction-coefficient and "
+            "--jepa-sigreg-coefficient, or use --architecture entity-attention"
+        )
+    if args.jepa_horizon < 1:
+        raise ValueError("LeJEPA horizons must be positive")
+    if args.architecture == LEJEPA and any(structured_coefficients):
+        # The belief class is keyed on the family, so a lejepa model hands the
+        # four-field JEPA belief to whatever predictor is attached. Pairing it
+        # with a detached NextLat on either arm crashes on the first minibatch;
+        # `_validate_structured_*_auxiliary_modules` refuses it there too, but a
+        # run should learn this from its arguments, not an hour into setup.
+        raise ValueError(
+            "the lejepa architecture admits only the LeJEPA objective; drop the "
+            "detached NextLat coefficients on both arms"
         )
     if args.structured_learning_rate is not None and (
         not math.isfinite(args.structured_learning_rate) or args.structured_learning_rate <= 0.0
@@ -912,6 +1052,7 @@ def _load_initial_actor(
     architecture_name: str,
     model_config: ModelConfig | StructuredConfig | EntityConfig,
     device: torch.device,
+    objective: torch.nn.Module | None = None,
 ) -> dict[str, object]:
     """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
 
@@ -920,6 +1061,13 @@ def _load_initial_actor(
     a clone brings no value function — and the pre-loop league snapshot seeds
     the archive with the pretrained policy automatically, so the learner must keep
     beating its own starting point.
+
+    A `lejepa` clone also carries the `JepaObjective` its backbone was trained
+    beside, and it is loaded into `objective`: the projector and the predictor
+    are one model with the backbone, and fresh ones would spend the critic
+    warmup relearning what the clone already fitted, then pull the released
+    backbone toward whatever embedding they had settled on. Only the reward head
+    is still untrained, since a demonstration has no reward.
     """
     pretrained, payload = load_actor_artifact(path, device)
     artifact_architecture = resolve_architecture(payload)
@@ -932,6 +1080,7 @@ def _load_initial_actor(
     if artifact_config != expected_config:
         raise ValueError("initial actor artifact model configuration does not match arguments")
     actor.load_state_dict(pretrained.state_dict())
+    load_artifact_objective(payload, objective)
     return {
         "path": str(path.resolve()),
         "sha256": file_sha256(path),
@@ -945,6 +1094,30 @@ def _load_initial_actor(
         # without it the checkpoint cannot say where its weights came from.
         "source_identity": payload.get("source_identity"),
     }
+
+
+def _load_reference_actors(
+    provenance: dict[str, Any] | None, population: int, device: torch.device
+) -> list[torch.nn.Module]:
+    """Frozen copies of each member's initial actor, the reference KL's anchor.
+
+    Read back from the warm-start record rather than from the live actor, so a
+    resumed run anchors to the same clone its first wave did; the recorded
+    digest is what makes that a claim rather than a hope.
+    """
+    if provenance is None:
+        raise ValueError("--reference-kl-coefficient anchors to --init-actor-from's artifact")
+    records = provenance.get("agents", [provenance])
+    if len(records) != population:
+        raise ValueError("the warm-start record does not hold one initial actor per agent")
+    references = []
+    for record in records:
+        path = Path(record["path"])
+        if file_sha256(path) != record["sha256"]:
+            raise ValueError(f"initial actor artifact {path} changed since the run began")
+        reference, _ = load_actor_artifact(path, device)
+        references.append(reference.eval().requires_grad_(False))
+    return references
 
 
 def _device(name: str) -> torch.device:
@@ -1111,6 +1284,12 @@ REPLAY_PARITY_STEP_CHANGE_FACTOR = 5.0
 # the 5x intended -- and a defect lifting kind to 8e-3 would warn, where
 # against its own head it is a 10x step and aborts.
 PARITY_COMPONENTS = ("unit", "kind", "quantity")
+
+
+def _parity_components(values: Mapping[str, object] | None) -> tuple[str, ...]:
+    return PARITY_COMPONENTS + (("plan",) if values and "update_replay_plan_kl" in values else ())
+
+
 PARITY_STATISTICS: tuple[tuple[str, float, str], ...] = (
     ("kl", MAX_UPDATE_REPLAY_KL, "sampling-vs-update policy divergence exceeded"),
     # The KL is a mean and a localized defect dilutes into it, so the share of
@@ -1268,7 +1447,7 @@ def _parity_fatal_thresholds(
     is opening.
     """
     thresholds: dict[str, float] = {}
-    for component in PARITY_COMPONENTS:
+    for component in _parity_components(baseline):
         for statistic, bound, _description in PARITY_STATISTICS:
             key = _parity_metric_key(component, statistic)
             previous = None if baseline is None else baseline.get(key)
@@ -1302,7 +1481,7 @@ def _parity_breaches(
     write it into the baseline.
     """
     breaches: list[tuple[str, bool]] = []
-    for component in PARITY_COMPONENTS:
+    for component in _parity_components(metrics):
         for statistic, bound, description in PARITY_STATISTICS:
             key = _parity_metric_key(component, statistic)
             measured = float(metrics[key])
@@ -1333,7 +1512,7 @@ def _parity_measurements(metrics: Mapping[str, float | int]) -> dict[str, float]
         _parity_metric_key(component, statistic): float(
             metrics[_parity_metric_key(component, statistic)]
         )
-        for component in PARITY_COMPONENTS
+        for component in _parity_components(metrics)
         for statistic, _bound, _description in PARITY_STATISTICS
     }
 
@@ -1363,7 +1542,7 @@ def _validate_parity_baseline(
         return {}
     expected = {
         _parity_metric_key(component, statistic)
-        for component in PARITY_COMPONENTS
+        for component in _parity_components(baseline)
         for statistic, _bound, _description in PARITY_STATISTICS
     }
     if set(baseline) != expected:
@@ -1515,7 +1694,11 @@ def _league_opponent_diagnostics(
     diagnostics: dict[str, float | int | str] = {}
     score_rates: dict[str, float] = {}
     margins = league.final_money - league.opponent_money
-    outcomes = (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
+    outcomes = (
+        terminal_outcomes(league)
+        if league.reward_mode == "terminal-outcome"
+        else (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
+    )
     for index, selection in enumerate(selections):
         selected = assignments == index
         games = int(selected.sum())
@@ -1526,6 +1709,7 @@ def _league_opponent_diagnostics(
         prefix = f"league_opponent_{selection.key}"
         score_rate = float(((outcomes[selected] + 1.0) / 2.0).mean())
         diagnostics[f"{prefix}_category"] = selection.category
+        diagnostics[f"{prefix}_role"] = selection.role
         diagnostics[f"{prefix}_games"] = games
         diagnostics[f"{prefix}_score_rate"] = score_rate
         diagnostics[f"{prefix}_mean_margin"] = float(margins[selected].mean())
@@ -1786,6 +1970,7 @@ def _select_league_opponents(
     score_rates: dict[str, float],
     *,
     pretrained_start: bool,
+    matchup_evidence: dict[str, MatchupEvidence] | None = None,
 ) -> list[LeagueSelection]:
     """Select a bounded opponent mix without consuming RNG when league play is off."""
     if not args.league_games:
@@ -1801,6 +1986,8 @@ def _select_league_opponents(
         builtin_lanes=args.league_builtin_lanes,
         score_rates=score_rates,
         pretrained_start=pretrained_start,
+        selection_mode=args.league_selection,
+        matchup_evidence=matchup_evidence,
     )
     if len(selections) > args.league_games:
         raise ValueError("league game budget cannot cover the selected opponent mix")
@@ -1811,9 +1998,15 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
     """Return every non-model setting that can alter future rollout data."""
     return {
         "autocull": dict(AUTOCULL_POLICY) if args.autocull else None,
+        "architecture_panel": (
+            {**PANEL_POLICY, "interval_actor_waves": args.architecture_panel}
+            if args.architecture_panel
+            else None
+        ),
         "games": args.games,
         "league_games": args.league_games,
         "league_active_opponents": args.league_active_opponents,
+        "league_selection": args.league_selection,
         "deterministic_training": args.deterministic_training,
         "league_historical_opponents": args.league_historical_opponents,
         "league_active_pool_size": args.league_active_pool_size,
@@ -1871,11 +2064,12 @@ def _checkpoint_recovery_values_equal(left: object, right: object) -> bool:
         return False
     # Online stopping state affects future execution, unlike timing diagnostics.
     # A replayed orphan must not silently replace it with another patience clock.
-    if not _checkpoint_values_equal(
-        left.get("metrics", {}).get("autocull_state"),
-        right.get("metrics", {}).get("autocull_state"),
-    ):
-        return False
+    for key in ("autocull_state", "architecture_panel_state"):
+        if not _checkpoint_values_equal(
+            left.get("metrics", {}).get(key),
+            right.get("metrics", {}).get(key),
+        ):
+            return False
     return all(key == "metrics" or _checkpoint_values_equal(left[key], right[key]) for key in left)
 
 
@@ -2063,7 +2257,7 @@ def _audit_replay_parity(
     # refuses that; training must too, or an audit can pass while having examined
     # nothing. This one is always fatal: it means the audit examined nothing, at
     # any point in the run, which is never expected drift.
-    for component in PARITY_COMPONENTS:
+    for component in _parity_components(metrics):
         if metrics[f"update_replay_{component}_active_count"] < 1:
             raise RuntimeError(f"{where}update replay parity saw no active {component} components")
     breaches = _parity_breaches(metrics, dict(baseline) or None, ceilings)
@@ -2126,50 +2320,66 @@ def _validate_policy_entropy_reference(value: object) -> float:
 
 _STRUCTURED_ACTOR_PERSISTENCE_FIELDS = ("combined", "latent", "decision")
 _STRUCTURED_CRITIC_PERSISTENCE_FIELDS = ("combined", "latent", "value")
+#: The LeJEPA arms journal a prediction loss per latent group rather than the
+#: detached predictor's two, so the field names differ entirely and reading the
+#: detached ones off a LeJEPA wave is a `KeyError` on the first update.
+_JEPA_ACTOR_PERSISTENCE_FIELDS = ("combined", "prediction", "unit", "market", "economy", "tile")
+#: Controls journaled per arm. The LeJEPA arms carry a second one beside
+#: persistence -- see `lejepa.JepaShuffledControl` -- because persistence alone
+#: cannot separate an idle predictor from an encoder that went constant along
+#: the trajectory. Only the prediction columns are compared against either: both
+#: controls share the live objective's projector, SIGReg and reward head, so
+#: every other column is identical by construction and its ratio is exactly one.
+_STRUCTURED_CONTROLS = ("persistence",)
+_JEPA_CONTROLS = ("persistence", "shuffled")
 
 
 def _structured_persistence_diagnostics(
     update_metrics: Mapping[str, float | int],
     *,
     kind: str,
+    jepa: bool = False,
 ) -> dict[str, float | int]:
-    """Compare predictors with fresh-wave persistence without controlling learning."""
+    """Compare predictors with their fresh-wave controls without controlling learning."""
     if kind == "actor":
-        fields = _STRUCTURED_ACTOR_PERSISTENCE_FIELDS
+        fields = _JEPA_ACTOR_PERSISTENCE_FIELDS if jepa else _STRUCTURED_ACTOR_PERSISTENCE_FIELDS
         metric_prefix = "structured_preupdate_"
-        telemetry_prefix = "structured_persistence_"
+        telemetry_prefix = "structured_"
     elif kind == "critic":
         fields = _STRUCTURED_CRITIC_PERSISTENCE_FIELDS
         metric_prefix = "structured_critic_preupdate_"
-        telemetry_prefix = "structured_critic_persistence_"
+        telemetry_prefix = "structured_critic_"
     else:
         raise ValueError(f"unknown structured predictor diagnostic kind: {kind}")
     measured = {name: float(update_metrics[f"{metric_prefix}{name}"]) for name in fields}
-    # The predictor and persistence use the same fresh wave, source encoder and
-    # decoder. Historical losses are incomparable as representations evolve.
-    reference = {
-        name: float(update_metrics[f"{metric_prefix}persistence_{name}"]) for name in fields
-    }
-    if any(not math.isfinite(value) for value in (*measured.values(), *reference.values())):
-        raise FloatingPointError(f"non-finite structured {kind} persistence loss")
-    # A zero persistence loss provides no prediction task for that decoder.
-    # Keep the ratio finite and label it uninformative, reconsidering each wave.
-    informative = {name: reference[name] > 0.0 for name in fields}
-    ratios = {
-        name: max(0.0, measured[name]) / reference[name] if informative[name] else 1.0
-        for name in fields
-    }
-    if any(not math.isfinite(value) for value in ratios.values()):
-        raise FloatingPointError(f"non-finite structured {kind} persistence ratio")
-    telemetry: dict[str, float | int] = {
-        f"{telemetry_prefix}{name}_ratio": ratio for name, ratio in ratios.items()
-    }
-    telemetry.update(
-        {
-            f"{telemetry_prefix}{name}_informative": int(active)
-            for name, active in informative.items()
+    telemetry: dict[str, float | int] = {}
+    for control in _JEPA_CONTROLS if jepa else _STRUCTURED_CONTROLS:
+        # The predictor and its control use the same fresh wave, source encoder
+        # and decoder. Historical losses are incomparable as representations
+        # evolve.
+        reference = {
+            name: float(update_metrics[f"{metric_prefix}{control}_{name}"]) for name in fields
         }
-    )
+        if any(not math.isfinite(value) for value in (*measured.values(), *reference.values())):
+            raise FloatingPointError(f"non-finite structured {kind} {control} loss")
+        # A zero control loss provides no prediction task for that decoder.
+        # Keep the ratio finite and label it uninformative, reconsidering each wave.
+        informative = {name: reference[name] > 0.0 for name in fields}
+        ratios = {
+            name: max(0.0, measured[name]) / reference[name] if informative[name] else 1.0
+            for name in fields
+        }
+        if any(not math.isfinite(value) for value in ratios.values()):
+            raise FloatingPointError(f"non-finite structured {kind} {control} ratio")
+        telemetry.update(
+            {f"{telemetry_prefix}{control}_{name}_ratio": ratio for name, ratio in ratios.items()}
+        )
+        telemetry.update(
+            {
+                f"{telemetry_prefix}{control}_{name}_informative": int(active)
+                for name, active in informative.items()
+            }
+        )
     return telemetry
 
 
@@ -2508,6 +2718,9 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         policy_loss_reduction=args.policy_loss_reduction,
         policy_ratio_scope=args.policy_ratio_scope,
+        policy_objective=args.policy_objective,
+        tpo_eta=args.tpo_eta,
+        reference_kl_coefficient=args.reference_kl_coefficient,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
         gamma=args.gamma,
@@ -2524,11 +2737,25 @@ def main() -> None:
         structured_decision_horizon=args.structured_decision_horizon,
         structured_critic_latent_coefficient=args.structured_critic_latent_coefficient,
         structured_critic_value_coefficient=args.structured_critic_value_coefficient,
+        economic_forecast_coefficient=args.economic_forecast_coefficient,
         structured_critic_horizon=args.structured_critic_horizon,
         structured_critic_gradient_balance=args.structured_critic_gradient_balance,
         structured_learning_rate=args.structured_learning_rate,
         structured_critic_learning_rate=args.structured_critic_learning_rate,
+        jepa_prediction_coefficient=args.jepa_prediction_coefficient,
+        jepa_sigreg_coefficient=args.jepa_sigreg_coefficient,
+        jepa_reward_coefficient=args.jepa_reward_coefficient,
+        jepa_horizon=args.jepa_horizon,
     )
+    if architecture.name in ("strategic-plan", "causal-execution"):
+        if ppo_config.policy_ratio_scope != "joint" or ppo_config.structured_actor_auxiliary_active:
+            raise ValueError(
+                "structured coordinated actors require joint PPO ratios and actor NextLat off"
+            )
+        if args.population != 1:
+            raise ValueError(
+                "coordinated actors currently use single-learner mixed native collection"
+            )
     training_data_config = _training_data_config(args, device)
     # Derived from the configured trust region rather than fixed, because that
     # is what the ceiling means: the level at which the uncorrected parity
@@ -2543,10 +2770,18 @@ def main() -> None:
     members: list[TrainingAgent] = []
     for _ in range(population):
         member_actor = architecture.actor_class(model_config).to(device)
+        if architecture.name == "causal-execution":
+            from kaggriculture.device_ledger import get_device_ledger
+
+            member_actor.set_device_ledger(get_device_ledger(device))
         # Preserve the historical actor/critic initialization stream. The
         # training-only predictors are constructed afterward, so enabling
         # NextLat cannot silently change the critic seed it is compared against.
         member_critic = architecture.critic_class(model_config).to(device)
+        # One backbone on `lejepa`: the critic reads the actor's, by reference
+        # and outside its own module tree. It has no encoder of its own and is
+        # inert until this runs. A no-op on every other family.
+        pair_towers(member_actor, member_critic)
         # Keep the critic predictor's initialization unchanged when opting into
         # the actor auxiliary.
         member_critic_dynamics = (
@@ -2555,7 +2790,11 @@ def main() -> None:
             else None
         )
         member_dynamics = (
-            ActorDynamics(model_config).to(device)
+            (
+                JepaObjective(model_config)
+                if ppo_config.jepa_active
+                else ActorDynamics(model_config)
+            ).to(device)
             if ppo_config.structured_actor_auxiliary_active and architecture.structured_inputs
             else None
         )
@@ -2565,12 +2804,19 @@ def main() -> None:
             ppo_config,
         )
         dynamics_optimizer = (
-            make_structured_dynamics_optimizer(member_dynamics, ppo_config)
+            make_structured_dynamics_optimizer(
+                member_dynamics,
+                ppo_config,
+                critic=False,
+                # The LeJEPA optimizer owns the shared backbone beside the
+                # objective, and steps the policy's gradient into it too.
+                actor=member_actor if ppo_config.jepa_active else None,
+            )
             if member_dynamics is not None
             else None
         )
         critic_dynamics_optimizer = (
-            make_structured_dynamics_optimizer(member_critic_dynamics, ppo_config)
+            make_structured_dynamics_optimizer(member_critic_dynamics, ppo_config, critic=True)
             if member_critic_dynamics is not None
             else None
         )
@@ -2599,7 +2845,14 @@ def main() -> None:
     initial_actors = _initial_actor_paths(args)
     if initial_actors:
         records = [
-            _load_initial_actor(path, member.actor, architecture.name, model_config, device)
+            _load_initial_actor(
+                path,
+                member.actor,
+                architecture.name,
+                model_config,
+                device,
+                member.structured_dynamics,
+            )
             for path, member in zip(initial_actors, members, strict=True)
         ]
         # Two copies of one artifact under different names are the same policy.
@@ -2672,6 +2925,11 @@ def main() -> None:
             initial_actor_provenance,
             population=population,
         )
+    reference_actors = (
+        _load_reference_actors(initial_actor_provenance, len(members), device)
+        if ppo_config.reference_kl_coefficient > 0.0
+        else []
+    )
     if (
         args.autocull
         and resume_payload is not None
@@ -2684,6 +2942,18 @@ def main() -> None:
             iteration=iteration,
         )
         if args.autocull
+        else None
+    )
+
+    architecture_panel = (
+        ArchitecturePanelGuard(
+            args.architecture_panel,
+            None
+            if resume_payload is None
+            else resume_payload["metrics"].get("architecture_panel_state"),
+            iteration=iteration,
+        )
+        if args.architecture_panel
         else None
     )
 
@@ -2727,6 +2997,16 @@ def main() -> None:
         if development_interval not in seed_usage:
             seed_usage.append(development_interval)
 
+    if architecture_panel is not None:
+        panel_interval = validate_seed_interval(
+            "development",
+            PANEL_POLICY["seed_start"],
+            PANEL_POLICY["games_per_opponent"],
+            usage=seed_usage,
+        )
+        if panel_interval not in seed_usage:
+            seed_usage.append(panel_interval)
+
     args.run_dir.mkdir(parents=True, exist_ok=True)
     journal_path = args.run_dir / "metrics.jsonl"
     journal_iteration = metrics_journal_iteration(journal_path)
@@ -2750,6 +3030,7 @@ def main() -> None:
     # estimates, so a resume that reset them would diverge from the
     # uninterrupted run's entire downstream RNG stream.
     league_score_rates: dict[str, float] = {}
+    league_matchup_evidence: dict[str, MatchupEvidence] = {}
     # The most recent audit's per-head measurements, which is what a later
     # breach is judged a defect or drift against. Persisted because the
     # judgement is a comparison across audits, and a run long enough to drift
@@ -2781,6 +3062,9 @@ def main() -> None:
     entropy_references: list[float | None] = [None for _ in members]
     if resume_payload is not None:
         league_score_rates = _validate_league_score_rates(resume_payload.get("league_score_rates"))
+        league_matchup_evidence = validate_matchup_evidence(
+            resume_payload.get("league_matchup_evidence"), current_iteration=iteration
+        )
         parity_baselines = _validate_parity_baselines(
             resume_payload.get("replay_parity_baseline"), parity_ceilings, population=population
         )
@@ -2887,6 +3171,7 @@ def main() -> None:
             ),
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=dict(league_score_rates),
+            league_matchup_evidence=copy.deepcopy(league_matchup_evidence),
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
             population_disagreement_reference=population_reference,
             policy_entropy_reference=_entropy_reference_record(entropy_references, population),
@@ -2944,6 +3229,12 @@ def main() -> None:
         league_snapshot_manifest[iteration] = current_digest
     league_snapshot_refs = list_actor_snapshots(league_directory)
 
+    initial_panel = None
+    if architecture_panel is not None and resume_payload is None:
+        initial_panel = evaluate_architecture_panel(
+            actor, critic, compile_mode=args.update_compile_mode
+        )
+        architecture_panel.observe(initial_panel, args.run_dir / "checkpoint-000000.pt")
     numbered_checkpoint = args.run_dir / f"checkpoint-{iteration:06d}.pt"
     destination_latest = args.run_dir / "latest.pt"
     if resume_payload is not None:
@@ -2971,6 +3262,14 @@ def main() -> None:
             metrics={
                 "iteration": 0,
                 **({"autocull_state": copy.deepcopy(autocull.state)} if autocull else {}),
+                **(
+                    {
+                        "architecture_panel_state": architecture_panel.snapshot(),
+                        "architecture_panel": initial_panel,
+                    }
+                    if architecture_panel
+                    else {}
+                ),
             },
             training_rng_state=dict(generator.bit_generator.state),
             training_data_config=training_data_config,
@@ -2981,17 +3280,33 @@ def main() -> None:
             ),
             league_snapshot_manifest=league_snapshot_manifest,
             league_score_rates=league_score_rates,
+            league_matchup_evidence=league_matchup_evidence,
             replay_parity_baseline=_parity_baseline_record(parity_baselines, population),
             population_disagreement_reference=population_reference,
             policy_entropy_reference=_entropy_reference_record(entropy_references, population),
             source_identity=current_source_identity,
             run_provenance=run_provenance,
             initial_actor=initial_actor_provenance,
+            seed_usage=seed_usage,
         )
     replace_checkpoint_alias(numbered_checkpoint, destination_latest)
     last_checkpoint_iteration = iteration
     checkpoint_timer = RecoveryCheckpointTimer(args.checkpoint_seconds, clock=time.monotonic)
-    last_metrics = resume_payload["metrics"] if resume_payload is not None else {"iteration": 0}
+    last_metrics = (
+        resume_payload["metrics"]
+        if resume_payload is not None
+        else {
+            "iteration": 0,
+            **(
+                {
+                    "architecture_panel_state": architecture_panel.snapshot(),
+                    "architecture_panel": initial_panel,
+                }
+                if architecture_panel
+                else {}
+            ),
+        }
+    )
 
     # Iteration of the most recent audit per staging configuration. Deliberately
     # process-scoped rather than checkpointed: a resume rebuilds the compiled
@@ -3002,7 +3317,11 @@ def main() -> None:
     compile_watch = CompileWatch()
     previous_lane_signature: tuple[int, int] | None = None
     previous_warmup_active: bool | None = None
-    while iteration < args.iterations and not (autocull is not None and autocull.culled):
+    while (
+        iteration < args.iterations
+        and not (autocull is not None and autocull.culled)
+        and not (architecture_panel is not None and architecture_panel.culled)
+    ):
         # Opponent discovery below must observe the previous iteration's
         # immutable actor snapshot. The same barrier publishes its metrics and
         # recovery checkpoint before this iteration consumes league RNG.
@@ -3125,6 +3444,7 @@ def main() -> None:
                 generator,
                 league_score_rates,
                 pretrained_start=initial_actor_provenance is not None,
+                matchup_evidence=league_matchup_evidence,
             )
             league_games = args.league_games if selections else 0
             opponents = []
@@ -3198,6 +3518,9 @@ def main() -> None:
                 forward_mode=args.rollout_forward_mode,
                 forward_autocast=args.rollout_bfloat16,
                 storage=rollout_arena if league_games else self_play_storage,
+                # A `lejepa` critic reads its behavior values off the learner's own
+                # encoding here, which spares the update its whole-wave replay.
+                critic=critic if isinstance(critic, LejepaCritic) else None,
             )
 
             diagnostic_groups = {
@@ -3234,6 +3557,15 @@ def main() -> None:
                 )
                 league_diagnostics.update(opponent_diagnostics)
             _blend_league_score_rates(league_score_rates, measured_rates)
+            if args.league_selection == "hardness":
+                update_matchup_evidence(
+                    league_matchup_evidence,
+                    {
+                        key: (int(opponent_diagnostics[f"league_opponent_{key}_games"]), rate)
+                        for key, rate in measured_rates.items()
+                    },
+                    iteration=iteration,
+                )
         # The audit is per member, on that member's own rows: in a population wave
         # every row was sampled by its own policy, so a whole-wave replay through
         # one of them measures a policy difference and calls it a staging defect.
@@ -3269,6 +3601,12 @@ def main() -> None:
             if member.actor_optimizer is None or member.critic_optimizer is None:
                 raise RuntimeError("training member has no optimizer")
             set_lr_cooldown(member.actor_optimizer, actor_cooldown)
+            if member.structured_dynamics_optimizer is not None:
+                # A no-op for every family but `lejepa`, whose backbone is the
+                # policy's encoder and must anneal with the heads it feeds.
+                set_lr_cooldown(
+                    member.structured_dynamics_optimizer, actor_cooldown, role=BACKBONE_ROLE
+                )
             for name, predictor, optimizer in (
                 (
                     "actor",
@@ -3297,22 +3635,31 @@ def main() -> None:
                 rows=rows,
                 structured_dynamics=member.structured_dynamics,
                 structured_dynamics_optimizer=member.structured_dynamics_optimizer,
-                structured_actor_auxiliary=(
-                    ppo_config.structured_actor_auxiliary_active and not warmup_active
-                ),
+                # Not switched off for warmup: `actor_epochs=0` already keeps the
+                # auxiliary out of a frozen wave, and this flag is also what the
+                # frozen wave's warm pass traces, which has to be the graph the
+                # release wave will run.
+                structured_actor_auxiliary=ppo_config.structured_actor_auxiliary_active,
                 structured_critic_dynamics=member.structured_critic_dynamics,
                 structured_critic_dynamics_optimizer=(member.structured_critic_dynamics_optimizer),
                 structured_critic_auxiliary=ppo_config.structured_critic_auxiliary_active,
                 auxiliary_generator=auxiliary_generator,
                 diagnostic_groups=diagnostic_groups,
                 diagnostic_gradients=iteration % 25 == 0,
+                reference_actor=reference_actors[agent] if reference_actors else None,
             )
-            for kind, active in (
-                ("actor", ppo_config.structured_actor_auxiliary_active),
-                ("critic", ppo_config.structured_critic_auxiliary_active),
+            for kind, active, jepa in (
+                (
+                    "actor",
+                    ppo_config.structured_actor_auxiliary_active,
+                    ppo_config.jepa_active,
+                ),
+                ("critic", ppo_config.structured_critic_auxiliary_active, False),
             ):
                 if active:
-                    measured.update(_structured_persistence_diagnostics(measured, kind=kind))
+                    measured.update(
+                        _structured_persistence_diagnostics(measured, kind=kind, jepa=jepa)
+                    )
             # Per member, so one collapsed member stops the run as itself rather
             # than being averaged into three healthy ones.
             if not warmup_active and entropy_references[agent] is None:
@@ -3405,13 +3752,33 @@ def main() -> None:
         if autocull is not None:
             metrics["autocull_state"] = autocull.observe(metrics, actor_frozen=warmup_active)
 
+        panel_evaluated = False
+        if architecture_panel is not None:
+            architecture_panel.advance(iteration, actor_active=not warmup_active)
+            if architecture_panel.due:
+                panel_started = time.monotonic()
+                panel = evaluate_architecture_panel(
+                    actor, critic, compile_mode=args.update_compile_mode
+                )
+                architecture_panel.observe(panel, args.run_dir / f"checkpoint-{iteration:06d}.pt")
+                metrics["architecture_panel"] = panel
+                metrics["architecture_panel_seconds"] = time.monotonic() - panel_started
+                # Panel shapes are independent of settled training shapes. Drain
+                # their compilation events here so the next training wave does
+                # not report evaluation specialization as update recompilation.
+                panel_compiles, _ = compile_watch.drain()
+                metrics["architecture_panel_compiles"] = len(panel_compiles)
+                panel_evaluated = True
+            metrics["architecture_panel_state"] = architecture_panel.snapshot()
+
         checkpoint_now = time.monotonic()
         clean_final = (
             iteration >= args.iterations
             or bool(args.max_hours and (checkpoint_now - started) / 3600.0 >= args.max_hours)
             or (autocull is not None and autocull.culled)
+            or (architecture_panel is not None and architecture_panel.culled)
         )
-        recovery_due = clean_final or checkpoint_timer.due(checkpoint_now)
+        recovery_due = clean_final or panel_evaluated or checkpoint_timer.due(checkpoint_now)
         recovery_payload = build_recovery_payload(metrics) if recovery_due else None
         if recovery_due:
             checkpoint_timer.committed(checkpoint_now)
@@ -3479,6 +3846,27 @@ def main() -> None:
         )
     commit_executor.shutdown(wait=True)
     writer.close()
+    if architecture_panel is not None and architecture_panel.culled:
+        with destination_latest.open("rb") as stream:
+            os.fsync(stream.fileno())
+        _fsync_directory(args.run_dir)
+        print(
+            "AUTOCULL "
+            + json.dumps(
+                {
+                    "decision": "cull",
+                    "reason": "fixed_panel_strength_and_calibration_stalled",
+                    "exit_code": CULL,
+                    "checkpoint": str(destination_latest),
+                    "best_checkpoint": architecture_panel.state["best_checkpoint"],
+                    "policy": PANEL_POLICY,
+                    "state": architecture_panel.snapshot(),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(CULL)
     if autocull is not None and autocull.culled:
         # The async boundary above has completed, but atomic publication alone
         # does not flush file contents or directory entries to durable storage.

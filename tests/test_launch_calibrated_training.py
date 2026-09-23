@@ -17,6 +17,7 @@ from kaggriculture.production import (
     PRODUCTION_CHECKPOINT_SECONDS,
     PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
+    PRODUCTION_LEAGUE_SELECTION,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_UPDATE_COMPILE_MODE,
     build_training_command,
@@ -37,6 +38,7 @@ def test_the_shipped_schedule_is_one_the_update_will_accept() -> None:
     # be silently defaulted here rather than decided, so the keys are pinned too.
     assert set(shipped) == fields
     _validate_config(PpoConfig(**shipped))
+    assert not PpoConfig(**shipped).structured_critic_auxiliary_active
 
     # The pairing this guards: critic epochs are the critic-only refits that run
     # after the actor's epochs, so a schedule asking for fewer of them than actor
@@ -137,6 +139,9 @@ def test_training_command_round_trips_through_the_training_parser(monkeypatch, t
 
     assert args.reward_mode == "terminal-outcome"
     assert args.architecture == PRODUCTION_ARCHITECTURE
+    assert args.league_selection == PRODUCTION_LEAGUE_SELECTION == "hardness"
+    assert command.count("--league-selection") == 1
+    assert production_model_config()["critic_source_read"] is True
     assert model_config_from_args(
         resolve_architecture(args.architecture), args
     ) == resolve_architecture(PRODUCTION_ARCHITECTURE).build_config(production_model_config())

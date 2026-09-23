@@ -109,6 +109,30 @@ def _quadrant(x: int, y: int, board_size: int) -> int:
     return (0 if y < half else 2) + (0 if x < half else 1)
 
 
+def _tile_slot_positions(board_size: int) -> np.ndarray:
+    """(row, column, quadrant) per tile token; token order is ``y * board_size + x``."""
+    positions = np.empty((board_size * board_size, 3), dtype=np.int64)
+    for y in range(board_size):
+        for x in range(board_size):
+            positions[y * board_size + x] = (y, x, _quadrant(x, y, board_size))
+    return positions
+
+
+#: The ``farm, row, column, quadrant`` categorical columns of every tile token in
+#: a two-farm observation (own farm first). They depend only on the token slot,
+#: never on game state; both encoders and the tile embedder rely on that.
+TILE_SLOT_CATEGORICAL = np.concatenate(
+    [
+        np.concatenate(
+            (np.full((TILE_COUNT, 1), farm, dtype=np.int64), _tile_slot_positions(BOARD_SIZE)),
+            axis=1,
+        )
+        for farm in range(len(FARM_IDENTITIES))
+    ]
+)
+TILE_SLOT_CATEGORICAL.setflags(write=False)
+
+
 def _shed_distance_map(board_size: int) -> np.ndarray:
     access = shed_access_tiles(board_size)
     grid = np.empty((board_size, board_size), dtype=np.float32)
@@ -149,15 +173,13 @@ def tokenize_farm_tiles(farm: dict, day: int, step: int, *, opponent: bool) -> T
         hand_counts[int(y) * BOARD_SIZE + int(x)] += 1
     continuous[:, _FIELD["hand_count"]] = hand_counts / float(MAX_UNITS - 1)
 
+    farm_slots = slice(farm_identity * TILE_COUNT, (farm_identity + 1) * TILE_COUNT)
+    categorical[:, 2:6] = TILE_SLOT_CATEGORICAL[farm_slots]
     for y in range(BOARD_SIZE):
         for x in range(BOARD_SIZE):
             token = y * BOARD_SIZE + x
             tile = tiles[y][x] if y < len(tiles) and x < len(tiles[y]) else "LOCKED"
             row = categorical[token]
-            row[2] = farm_identity
-            row[3] = y
-            row[4] = x
-            row[5] = _quadrant(x, y, BOARD_SIZE)
             features = continuous[token]
             features[_FIELD["edge"]] = float(x in (0, BOARD_SIZE - 1) or y in (0, BOARD_SIZE - 1))
             features[_FIELD["corner"]] = float(

@@ -116,6 +116,9 @@ ADAM_PARAMETER_ROLES: frozenset[str] = frozenset(
         "market_kind",
         "market_quantity_bias",
         "value_head",
+        "reward_head",
+        "forecast_head",
+        "plan_head",
     }
 )
 
@@ -164,6 +167,8 @@ def _declared_multipliers(module: torch.nn.Module) -> dict[int, float]:
 
 def route_parameters(
     module: torch.nn.Module,
+    *,
+    exclude: Iterable[Tensor] = (),
 ) -> tuple[list[Tensor], list[Tensor], list[float]]:
     """Split a module's parameters into the NorMuon and Adam sets.
 
@@ -175,8 +180,17 @@ def route_parameters(
     the second. A NorMuon step is already invariant to the matrix's scale --
     Polar Express divides by the input's Frobenius norm -- so a multiplier on a
     matrix would describe nothing, and declaring one is an error.
+
+    `exclude` drops named parameters from the routing without changing how the
+    rest are routed. It exists for the `lejepa` family, whose actor carries the
+    shared world-model backbone as a submodule so that one flat state dict still
+    serializes the deployed model, while a different optimizer owns it. Routing
+    is by parameter name and module type, so a subset of one module routes
+    exactly as it would have inside it -- which is the property that makes the
+    split safe to state here rather than by rebuilding the module tree.
     """
 
+    excluded = {id(parameter) for parameter in exclude}
     embedding_parameters = {
         id(child.weight) for child in module.modules() if isinstance(child, torch.nn.Embedding)
     }
@@ -185,7 +199,7 @@ def route_parameters(
     vectors: list[Tensor] = []
     multipliers: list[float] = []
     for name, parameter in module.named_parameters():
-        if not parameter.requires_grad:
+        if not parameter.requires_grad or id(parameter) in excluded:
             continue
         role = ADAM_PARAMETER_ROLES.isdisjoint(name.split("."))
         if parameter.ndim >= 2 and id(parameter) not in embedding_parameters and role:

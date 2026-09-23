@@ -501,14 +501,20 @@ _TRAINING_TAGS = {
     "actor_gradient_norm": "actor/gradient_norm",
     "advantage_mean": "actor/advantage_mean",
     "advantage_std": "actor/advantage_std",
-    # What bounds the step, separated from what takes it. These four are read
+    # The anchor to the initial actor sits with the objective it shapes; its
+    # worst single decision is the reading, since the mean cannot see one flip.
+    "reference_kl": "actor/reference_kl",
+    "max_reference_decision_kl": "actor/max_reference_decision_kl",
+    # What bounds the step, separated from what takes it. These are read
     # together and against each other -- a clip fraction climbing while the KL
-    # stays flat is a different situation from both climbing -- and they were
-    # the four that pushed `actor` past the point of being scannable.
+    # stays flat is a different situation from both climbing -- and they are
+    # the trust-region readings that kept `actor` scannable.
     "approx_kl": "trust-region/approx_kl",
     "max_approx_kl": "trust-region/max_approx_kl",
     "component_kl": "trust-region/component_kl",
     "max_component_kl": "trust-region/max_component_kl",
+    "joint_kl": "trust-region/joint_kl",
+    "max_joint_kl": "trust-region/max_joint_kl",
     "clip_fraction": "trust-region/clip_fraction",
     "kl_early_stop": "trust-region/kl_early_stop",
     # `critic` is how well the critic is fitting; `value` is what it and its
@@ -566,6 +572,7 @@ _TRAINING_TAGS = {
     "update_staging_seconds": "update-timing/staging_seconds",
     "update_predictor_seconds": "update-timing/predictor_seconds",
     "update_behavior_replay_seconds": "update-timing/behavior_replay_seconds",
+    "update_behavior_values_carried": "update-timing/behavior_values_carried",
     "update_advantage_seconds": "update-timing/advantage_seconds",
     "update_minibatch_seconds": "update-timing/minibatch_seconds",
     "update_finalize_seconds": "update-timing/finalize_seconds",
@@ -605,6 +612,7 @@ _TRAINING_TAGS = {
     # trust region never sees it, because the update replays its own behavior
     # likelihoods -- so it belongs beside the audit rather than beside the KL.
     "first_minibatch_component_kl": "parity/first_minibatch_kl",
+    "first_minibatch_joint_kl": "trust-region/first_minibatch_joint_kl",
     "first_minibatch_approx_kl": "trust-region/first_minibatch_kl",
     # Placed explicitly so the per-head prefix rule does not route it into the
     # `parity/<head>` runs, where it would share a chart with the per-head and
@@ -677,15 +685,22 @@ _PER_HEAD_PREFIXES: tuple[tuple[str, str], ...] = (
 #: predictor loss measures transition fitting, and auxiliary loss measures the
 #: representation gradient reaching the policy/value model. Predictor quality
 #: is diagnostic only and never admits or revokes a representation update.
+#: The `nextlat-` naming is historical: these charts now serve both predictor
+#: families, and the shuffled control is the LeJEPA arms' alone. Renaming the
+#: categories would orphan every run note that cites them, which is worth more
+#: than the label being literal. Both `shuffled_` entries must precede the bare
+#: `structured_critic_`/`structured_` matches, which would otherwise claim them.
 _STRUCTURED_PREFIXES: tuple[tuple[str, str], ...] = (
     ("structured_critic_preupdate_", "nextlat-critic-holdout"),
     ("structured_critic_predictor_", "nextlat-critic-predictor"),
     ("structured_critic_persistence_", "nextlat-critic-persistence"),
+    ("structured_critic_shuffled_", "nextlat-critic-shuffled"),
     ("structured_critic_gradient_", "nextlat-critic-gradients"),
     ("structured_critic_", "nextlat-critic-auxiliary"),
     ("structured_preupdate_", "nextlat-actor-holdout"),
     ("structured_predictor_", "nextlat-actor-predictor"),
     ("structured_persistence_", "nextlat-actor-persistence"),
+    ("structured_shuffled_", "nextlat-actor-shuffled"),
     ("structured_gradient_", "nextlat-actor-gradients"),
     ("structured_actor_", "nextlat-actor-auxiliary"),
 )

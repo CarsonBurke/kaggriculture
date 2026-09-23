@@ -17,10 +17,13 @@ import torch
 from kaggle_environments import make
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from kaggriculture.entity import EntityConfig
 from kaggriculture.inference import load_actor_artifact
+from kaggriculture.lejepa import JEPA_OBJECTIVE_ARTIFACT_KEY, JepaObjective
+from kaggriculture.lejepa_model import LejepaActor, LejepaConfig, build_lejepa_pair
 from kaggriculture.model import ModelConfig
 from kaggriculture.optim import NorMuon
-from kaggriculture.registry import CONV_ENTITY, ENTITY_ATTENTION, STRUCTURED
+from kaggriculture.registry import CONV_ENTITY, ENTITY_ATTENTION, LEJEPA, STRUCTURED
 from kaggriculture.structured import StructuredActor, StructuredConfig
 
 EPISODE_STEPS = 8
@@ -715,6 +718,9 @@ def test_epoch_train_loss_is_the_component_weighted_mean(dataset_dir: Path, tmp_
     loss = trainer._clone_loss(actor, actor_args, factors, autocast=False)
 
     assert record["train_loss"] == pytest.approx(float(loss.detach()), rel=1e-5)
+    # The one minibatch is the split itself, not the split padded to the request.
+    _, payload = load_actor_artifact(output / "bc-actor.pt")
+    assert payload["bc_provenance"]["minibatch_rows"] == train_split.rows
 
 
 @pytest.mark.parametrize("architecture", [CONV_ENTITY, STRUCTURED])
@@ -905,14 +911,18 @@ def _synthetic_metadata(spans: tuple[int, ...]) -> tuple[torch.Tensor, torch.Ten
     return episode_index, torch.cat([torch.arange(span, dtype=torch.int32) for span in spans])
 
 
+@pytest.mark.parametrize("phased", [False, True])
 @pytest.mark.parametrize("run_length", [1, 2, 3, 7, 64])
-def test_an_epoch_under_the_run_sampler_visits_every_row_exactly_once(run_length: int) -> None:
+def test_an_epoch_under_the_run_sampler_visits_every_row_exactly_once(
+    run_length: int, phased: bool
+) -> None:
     """An epoch is a pass over the corpus, so the order must be a permutation of
     the rows -- a multiset equality, which a matching row count would not catch,
     and which is why a short tail run is kept whole rather than dropped."""
     trainer = _load_trainer()
     episode_index, _ = _synthetic_metadata(_RUN_SPANS)
-    starts, lengths = trainer._run_blocks(episode_index, run_length)
+    phases = torch.Generator(device="cpu").manual_seed(3) if phased else None
+    starts, lengths = trainer._run_blocks(episode_index, run_length, phases)
 
     order = trainer._run_epoch_order(starts, lengths, torch.Generator(device="cpu").manual_seed(0))
 
@@ -921,14 +931,16 @@ def test_an_epoch_under_the_run_sampler_visits_every_row_exactly_once(run_length
     assert int(lengths.sum()) == rows
 
 
+@pytest.mark.parametrize("phased", [False, True])
 @pytest.mark.parametrize("run_length", [2, 3, 5, 64])
-def test_a_run_is_consecutive_steps_of_one_episode_seat(run_length: int) -> None:
+def test_a_run_is_consecutive_steps_of_one_episode_seat(run_length: int, phased: bool) -> None:
     """Pairing reads adjacent rows, so a run must stay inside one episode-seat and
     advance the step by exactly one: a run spanning a boundary would pair the last
     state of one game with the first state of another and call it a transition."""
     trainer = _load_trainer()
     episode_index, step = _synthetic_metadata(_RUN_SPANS)
-    starts, lengths = trainer._run_blocks(episode_index, run_length)
+    phases = torch.Generator(device="cpu").manual_seed(4) if phased else None
+    starts, lengths = trainer._run_blocks(episode_index, run_length, phases)
 
     order = trainer._run_epoch_order(starts, lengths, torch.Generator(device="cpu").manual_seed(1))
 
@@ -943,6 +955,25 @@ def test_a_run_is_consecutive_steps_of_one_episode_seat(run_length: int) -> None
         assert order[position : position + length].tolist() == list(range(start, start + length))
 
 
+def test_drawn_phases_make_every_transition_a_source() -> None:
+    """A pair is formed only inside a block, so blocks cut at a fixed phase
+    would supervise the same half of the transitions forever at run length two.
+    Across a few epochs of drawn phases, every in-episode transition opens a
+    pair -- both parities of step, in every episode."""
+    trainer = _load_trainer()
+    episode_index, _ = _synthetic_metadata(_RUN_SPANS)
+    generator = torch.Generator(device="cpu").manual_seed(5)
+    sources: set[int] = set()
+    for _ in range(32):
+        starts, lengths = trainer._run_blocks(episode_index, 2, generator)
+        sources.update(starts[lengths == 2].tolist())
+    same_episode = torch.nonzero(episode_index[1:] == episode_index[:-1]).flatten()
+    assert sources == set(same_episode.tolist())
+    # Without a generator the cut is the fixed one it always was.
+    fixed, _ = trainer._run_blocks(episode_index, 2)
+    assert torch.equal(fixed, trainer._run_blocks(episode_index, 2)[0])
+
+
 def test_a_run_length_of_one_is_the_independent_row_shuffle() -> None:
     """The default must leave a queued run's batches alone. At a run length of one
     the sampler is `torch.randperm` on the same generator -- one draw per epoch,
@@ -950,12 +981,14 @@ def test_a_run_length_of_one_is_the_independent_row_shuffle() -> None:
     trainer = _load_trainer()
     episode_index, _ = _synthetic_metadata(_RUN_SPANS)
     rows = sum(_RUN_SPANS)
-    starts, lengths = trainer._run_blocks(episode_index, 1)
     generator = torch.Generator(device="cpu").manual_seed(7)
     reference = torch.Generator(device="cpu").manual_seed(7)
 
-    assert lengths.tolist() == [1] * rows
     for _ in range(3):
+        # Cut per epoch exactly as `train` does: at a run length of one no
+        # phase is drawn, so the generator sees only the shuffle's draw.
+        starts, lengths = trainer._run_blocks(episode_index, 1, generator)
+        assert lengths.tolist() == [1] * rows
         assert torch.equal(
             trainer._run_epoch_order(starts, lengths, generator),
             torch.randperm(rows, generator=reference),
@@ -1060,6 +1093,7 @@ def test_the_artifact_records_how_its_batches_were_built(dataset_dir: Path, tmp_
     _, payload = load_actor_artifact(output / "bc-actor.pt")
     provenance = payload["bc_provenance"]
     assert (provenance["run_length"], provenance["batch_size"]) == (3, 8)
+    assert provenance["minibatch_rows"] == 8
     with pytest.raises(ValueError, match="must be positive"):
         trainer.train(**{**arguments, "output_dir": tmp_path / "other", "run_length": 0})
 
@@ -1359,3 +1393,177 @@ def test_the_auxiliary_is_refused_when_the_sampler_gives_it_no_pairs(
             device=torch.device("cpu"),
             encode_workers=1,
         )
+
+
+def _tiny_lejepa_config() -> LejepaConfig:
+    return LejepaConfig(
+        model_dim=32,
+        attention_heads=2,
+        attention_kv_heads=1,
+        ffn_multiplier=2,
+        farm_blocks=1,
+        core_layers=2,
+        jepa_hidden_dim=48,
+        jepa_slices=16,
+        jepa_tile_samples=8,
+        jepa_sigreg_rows=64,
+    )
+
+
+def _lejepa_bc_kwargs(output: Path, dataset_dir: Path, **overrides):
+    return {
+        "dataset_dirs": [dataset_dir],
+        "output_dir": output,
+        "architecture": LEJEPA,
+        "config": _tiny_lejepa_config(),
+        "holdout_seeds": 1,
+        "epochs": 2,
+        "patience": 2,
+        "batch_size": 8,
+        "run_length": 2,
+        "matrix_learning_rate": 1e-3,
+        "matrix_weight_decay": 0.0,
+        "adam_learning_rate_ratio": 0.35,
+        "adam_weight_decay": 0.0,
+        "seed": 0,
+        "device": torch.device("cpu"),
+        "encode_workers": 1,
+        "jepa_prediction_coefficient": 1.0,
+        "jepa_sigreg_coefficient": 0.09,
+    } | overrides
+
+
+def test_lejepa_bc_trains_the_backbone_with_its_objective(
+    dataset_dir: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The LeJEPA family is a PPO initialization target, so it has to clone.
+
+    Without its objective the encoder would be an entity trunk under another
+    name, and under the detached ablation it would stay at initialization. BC
+    therefore runs the world-model objective on the demonstration transitions
+    beside the clone: the artifact's backbone has to
+    have moved, the journal has to carry the objective's columns, and nothing
+    from the training-only objective may reach the deployed artifact.
+    """
+    trainer = _load_trainer()
+    output = tmp_path / "run-lejepa"
+    built: list[tuple[LejepaActor, dict[str, torch.Tensor]]] = []
+    construct = LejepaActor.__init__
+
+    def recording_init(self, *arguments, **options) -> None:
+        construct(self, *arguments, **options)
+        built.append(
+            (self, {key: value.detach().clone() for key, value in self.trunk.state_dict().items()})
+        )
+
+    monkeypatch.setattr(LejepaActor, "__init__", recording_init)
+    clipped: list[frozenset[int]] = []
+    clip = torch.nn.utils.clip_grad_norm_
+
+    def recording_clip(parameters, *arguments, **options):
+        parameters = list(parameters)
+        clipped.append(frozenset(id(parameter) for parameter in parameters))
+        return clip(parameters, *arguments, **options)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", recording_clip)
+
+    best = trainer.train(**_lejepa_bc_kwargs(output, dataset_dir))
+
+    assert np.isfinite(best["nll"])
+    actor, payload = load_actor_artifact(output / "bc-actor.pt")
+    assert isinstance(actor, LejepaActor)
+    assert payload["architecture"] == LEJEPA
+    assert payload["model_config"] == _tiny_lejepa_config().to_dict()
+    assert payload["bc_provenance"]["jepa_horizon"] == 1
+    # The trained actor is the first one built; loading the artifact built the
+    # rest. Its backbone left initialization, which only the objective can do.
+    trained, initial = built[0]
+    # The heads and the world model are clipped apart, as PPO clips them.
+    heads = frozenset(id(parameter) for parameter in trained.head_parameters())
+    backbone = frozenset(id(parameter) for parameter in trained.backbone_parameters())
+    world_model = clipped[1]
+    assert set(clipped) == {heads, world_model}
+    assert world_model > backbone and not world_model & heads
+    changed = [
+        key
+        for key, value in trained.trunk.state_dict().items()
+        if value.is_floating_point() and not torch.equal(value, initial[key])
+    ]
+    assert any(key.startswith("trunk.") for key in changed)
+    assert not any(
+        key.startswith(("projectors.", "predictor.", "statistic.")) for key in payload["actor"]
+    )
+    records = [
+        json.loads(line)
+        for line in (output / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    for record in records:
+        assert "jepa_steps" not in record
+        assert record["jepa_eligible"] > 0
+        assert np.isfinite(record["jepa_prediction"])
+        assert record["jepa_sigreg"] > 0
+        # No demonstration carries a reward, so the term and its baseline are
+        # both zero rather than a loss beside a live scale.
+        assert record["jepa_reward"] == 0.0
+        assert record["jepa_reward_scale"] == 0.0
+
+    # The objective the backbone was shaped through travels beside the actor, and
+    # PPO's warm start resumes both rather than fitting a fresh projector against
+    # the cloned encoder.
+    config = _tiny_lejepa_config()
+    stored = payload[JEPA_OBJECTIVE_ARTIFACT_KEY]
+    assert stored.keys() == JepaObjective(config).state_dict().keys()
+    spec = importlib.util.spec_from_file_location(
+        "kaggriculture_train_ppo", Path(__file__).parents[1] / "scripts" / "train_ppo.py"
+    )
+    assert spec is not None and spec.loader is not None
+    ppo_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ppo_script)
+    fresh_actor, _critic = build_lejepa_pair(config)
+    fresh_objective = JepaObjective(config)
+    ppo_script._load_initial_actor(
+        output / "bc-actor.pt", fresh_actor, LEJEPA, config, torch.device("cpu"), fresh_objective
+    )
+    assert all(
+        torch.equal(value, payload["actor"][name])
+        for name, value in fresh_actor.state_dict().items()
+    )
+    assert all(
+        torch.equal(value, stored[name]) for name, value in fresh_objective.state_dict().items()
+    )
+    stripped = tmp_path / "stripped.pt"
+    torch.save({k: v for k, v in payload.items() if k != JEPA_OBJECTIVE_ARTIFACT_KEY}, stripped)
+    with pytest.raises(ValueError, match="carries none; re-clone"):
+        ppo_script._load_initial_actor(
+            stripped, fresh_actor, LEJEPA, config, torch.device("cpu"), JepaObjective(config)
+        )
+    with pytest.raises(ValueError, match="no use for"):
+        ppo_script._load_initial_actor(
+            output / "bc-actor.pt", fresh_actor, LEJEPA, config, torch.device("cpu")
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        (
+            {"jepa_prediction_coefficient": 0.0, "jepa_sigreg_coefficient": 0.0},
+            "cloned only beside its LeJEPA objective",
+        ),
+        ({"architecture": ENTITY_ATTENTION}, "cloned only beside its LeJEPA objective"),
+        ({"jepa_sigreg_coefficient": 0.0}, "positive prediction and SIGReg"),
+        ({"latent_dynamics_coefficient": 1.0}, "admits only the LeJEPA objective"),
+        ({"structured_decision_coefficient": 1.0}, "admits only the LeJEPA objective"),
+        ({"run_length": 1}, "needs --run-length above it"),
+    ],
+)
+def test_lejepa_bc_refuses_everything_but_its_objective(
+    dataset_dir: Path, tmp_path: Path, overrides, match
+) -> None:
+    trainer = _load_trainer()
+    if overrides.get("architecture") == ENTITY_ATTENTION:
+        overrides = overrides | {
+            "config": EntityConfig(model_dim=32, attention_heads=2, attention_kv_heads=1)
+        }
+    with pytest.raises(ValueError, match=match):
+        trainer.train(**_lejepa_bc_kwargs(tmp_path / "refused", dataset_dir, **overrides))

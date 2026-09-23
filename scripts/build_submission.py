@@ -57,6 +57,16 @@ PACKAGE_FILES = (
     "provenance.py",
     "registry.py",
     "structured.py",
+    "strategic_actor.py",
+    "causal_actor.py",
+    "lejepa_model.py",
+    "device_ledger.py",
+    "device_ledger_kernels.py",
+    "economic_critic.py",
+    "economic_forecasting.py",
+    "bixt.py",
+    "bixt_attention.py",
+    "relative_attention.py",
     "triton_mlp.py",
     "triton_norm.py",
     "tokens.py",
@@ -496,9 +506,30 @@ def build(
         (root / "evaluation.json").write_bytes(evaluation_contents)
         for name in PACKAGE_FILES:
             shutil.copy2(source_package / name, package / name)
-        packaged_files = [root / "main.py", root / "model.pt", root / "evaluation.json"] + [
-            package / name for name in PACKAGE_FILES
-        ]
+        rule_files = []
+        if artifact.get("architecture") == "causal-execution":
+            import numpy as np
+
+            from kaggriculture.device_ledger import (
+                POLICY_LEDGER_SCHEMA_VERSION,
+                PRICE_MAXIMUM,
+                PRICE_MINIMUM,
+            )
+            from kaggriculture.rust_env import load_native
+
+            table = package / "policy-market-prices.npz"
+            np.savez_compressed(
+                table,
+                schema_version=np.asarray(POLICY_LEDGER_SCHEMA_VERSION, dtype=np.int64),
+                minimum=np.asarray(PRICE_MINIMUM, dtype=np.int64),
+                prices=load_native().BatchEnv.policy_market_prices(PRICE_MINIMUM, PRICE_MAXIMUM),
+            )
+            rule_files.append(table)
+        packaged_files = (
+            rule_files
+            + [root / "main.py", root / "model.pt", root / "evaluation.json"]
+            + [package / name for name in PACKAGE_FILES]
+        )
         files = {path.relative_to(root).as_posix(): file_sha256(path) for path in packaged_files}
         for name in PACKAGE_FILES:
             packaged = files[f"kaggriculture/{name}"]
@@ -562,6 +593,8 @@ def build(
                 archive.add(root / "model.pt", arcname="model.pt")
                 archive.add(root / "evaluation.json", arcname="evaluation.json")
                 archive.add(root / "manifest.json", arcname="manifest.json")
+                for table in rule_files:
+                    archive.add(table, arcname=table.relative_to(root).as_posix(), recursive=False)
                 for name in PACKAGE_FILES:
                     archive.add(
                         package / name,

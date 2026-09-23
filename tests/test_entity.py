@@ -28,7 +28,6 @@ from kaggriculture.ppo import (
     _structured_actor_minibatch_terms,
     _value_objective,
     make_optimizers,
-    make_structured_dynamics_optimizer,
     update_ppo,
     update_replay_parity,
 )
@@ -117,6 +116,92 @@ def _nonzero_finite_gradients(module):
     assert gradients, "the observable loss must reach this model"
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
     assert sum(float(gradient.float().abs().sum()) for gradient in gradients) > 0
+
+
+@pytest.mark.parametrize("flag", ["critic_source_read", "memory_writeback", "unit_tile_bias"])
+def test_experimental_entity_paths_compiled_backward(config, native_batch, flag):
+    """The actual actor/critic loss reaches each proposed information path."""
+    _, inputs, critic_args, _ = native_batch
+    configuration = replace(config, **{flag: True})
+    model = (EntityCritic if flag == "critic_source_read" else EntityActor)(configuration).cuda()
+    if flag == "critic_source_read":
+        torch.nn.init.normal_(model.value_head.weight, std=0.01)
+
+    def loss():
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            if flag == "critic_source_read":
+                output = model(*critic_args)
+            else:
+                output = model(inputs).unit_logits
+            return output.float().square().mean()
+
+    _compiled(loss)().backward()
+    branch = {
+        "critic_source_read": "source_pool_norm",
+        "memory_writeback": "trunk.source_writeback",
+        "unit_tile_bias": "trunk.tile_bias",
+    }[flag]
+    _nonzero_finite_gradients(model.get_submodule(branch))
+
+
+def test_unit_tile_bias_dense_gradient_oracle():
+    """Relative bias applies only to own units/tiles, with exact per-head GQA routing."""
+    from kaggriculture.relative_attention import unit_tile_attention
+
+    torch.manual_seed(71)
+    q = torch.randn(3, 4, 26, 24, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(3, 2, 236, 24, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    bias = (torch.randn(361, 4, device="cuda") * 0.1).requires_grad_()
+    positions = torch.randint(0, 10, (3, 16, 2), device="cuda")
+    valid = torch.ones(3, 236, dtype=torch.bool, device="cuda")
+    valid[:, 221::2] = False
+
+    def actual(q, k, v, bias):
+        return unit_tile_attention(q, k, v, valid, bias, positions, scale=24**-0.5)
+
+    def reference(q, k, v, bias):
+        scores = q.float() @ k.float().repeat_interleave(2, dim=1).transpose(-1, -2)
+        scores = scores * 24**-0.5
+        tiles = torch.arange(100, device="cuda")
+        dx = tiles % 10 - positions[..., 0, None] + 9
+        dy = tiles // 10 - positions[..., 1, None] + 9
+        offsets = bias[dy * 19 + dx].permute(0, 3, 1, 2)
+        scores = scores + torch.nn.functional.pad(offsets, (0, 136, 0, 10))
+        scores = scores.masked_fill(~valid[:, None, None], -float("inf"))
+        return scores.softmax(-1) @ v.float().repeat_interleave(2, dim=1)
+
+    observed = _compiled(actual)(q, k, v, bias)
+    expected = reference(q, k, v, bias)
+    torch.testing.assert_close(observed.float(), expected, atol=0.008, rtol=0.02)
+    direction = torch.randn_like(expected)
+    actual_grad = torch.autograd.grad((observed.float() * direction).sum(), (q, k, v, bias))
+    expected_grad = torch.autograd.grad((expected * direction).sum(), (q, k, v, bias))
+    for left, right in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(left.float(), right.float(), atol=0.02, rtol=0.05)
+    with torch.no_grad():
+        inference = _compiled(actual)(q, k, v, bias)
+    torch.testing.assert_close(inference.float(), expected, atol=0.01, rtol=0.03)
+
+
+def test_critic_source_read_masked_private_units_and_actor_identity(config, native_batch):
+    from kaggriculture.modelargs import actor_model_config
+
+    _, _inputs, critic_args, _ = native_batch
+    configuration = replace(config, critic_source_read=True)
+    control = replace(config, critic_source_read=False)
+    assert actor_model_config(configuration) == actor_model_config(control)
+    model = EntityCritic(configuration).cuda()
+    categorical, continuous, active = critic_args[1:]
+    changed = continuous.clone()
+    changed[~active] = 1000
+
+    def belief(extra):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return model.encode_belief(critic_args[0], categorical, extra, active).value_decision
+
+    read = _compiled(belief)
+    torch.testing.assert_close(read(continuous), read(changed), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("zero_init_branches", [False, True])
@@ -349,6 +434,7 @@ def test_private_state_changes_critic_not_actor_and_has_live_gradients(config, n
 
 
 def test_every_round_contributes_gradients_to_shared_memory_kv(config):
+    config = replace(config, shared_memory_kv=True)
     torch.manual_seed(23)
     actor = EntityActor(config).cuda()
     batch = 4
@@ -380,6 +466,7 @@ def test_every_round_contributes_gradients_to_shared_memory_kv(config):
 
 def test_tile_cross_rope_matches_dense_spatial_oracle_and_gradients(config, native_batch):
     """Both farm grids rotate, while market queries and non-tile keys do not."""
+    config = replace(config, shared_memory_kv=True)
     _, inputs, _, _ = native_batch
     torch.manual_seed(43)
     actual = EntityActor(replace(config, tile_cross_rope=True)).cuda().trunk
@@ -486,8 +573,7 @@ def test_tile_cross_rope_matches_dense_spatial_oracle_and_gradients(config, nati
 @pytest.mark.parametrize("tile_cross_rope", [False, True], ids=["plain", "tile-rope"])
 def test_untied_memory_matches_shared_outputs_and_summed_gradients(config, tile_cross_rope):
     """Tying round-local projections must recover shared-K/V forward and backward."""
-    config = replace(config, tile_cross_rope=tile_cross_rope)
-    torch.manual_seed(29)
+    config = replace(config, shared_memory_kv=True, tile_cross_rope=tile_cross_rope)
     shared = EntityActor(config).cuda().trunk
     untied = EntityActor(replace(config, shared_memory_kv=False)).cuda().trunk
     untied.memory_norm.load_state_dict(shared.memory.norm.state_dict())
@@ -738,9 +824,14 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
     config, native_batch
 ):
     _, inputs, critic_args, factors = native_batch
+    assert config.shared_memory_kv is False
     torch.manual_seed(29)
     actor = EntityActor(config).cuda().train()
     critic = EntityCritic(config).cuda().train()
+    assert actor.trunk.memory is critic.trunk.memory is None
+    critic_memory_weights = tuple(round_.memory.key_value.weight for round_ in critic.trunk.core)
+    assert len(critic_memory_weights) == config.core_layers
+    assert len({id(weight) for weight in critic_memory_weights}) == config.core_layers
     actor_dynamics = ActorDynamics(config).cuda().train()
     critic_dynamics = StructuredCriticDynamics(config).cuda().train()
     torch.nn.init.normal_(critic.value_head.weight, std=0.02)
@@ -790,7 +881,7 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
         critic.pool_attention.query.weight,
         critic.pool_attention.key_value.weight,
         critic.pool_attention.output.weight,
-        critic.trunk.memory.key_value.weight,
+        *critic_memory_weights,
     )
     gradients = torch.autograd.grad(
         auxiliary,
@@ -801,6 +892,10 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
     for gradient in gradients[: len(auxiliary_inputs)]:
         assert gradient is not None and torch.isfinite(gradient).all()
         assert gradient.abs().sum() > 0
+    memory_gradients = gradients[: len(auxiliary_inputs)][-len(critic_memory_weights) :]
+    for gradient in memory_gradients:
+        key_gradient, value_gradient = gradient.chunk(2, dim=0)
+        assert key_gradient.abs().sum() > 0 and value_gradient.abs().sum() > 0
     assert all(gradient is None for gradient in gradients[-2:]), (
         "NextLat must not train its value teacher head"
     )
@@ -828,7 +923,7 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
                 inputs,
                 policy_ratio_scope=ppo.policy_ratio_scope,
             )
-            actor_belief = StructuredDecisionBelief(*ppo_terms[5:])
+            actor_belief = StructuredDecisionBelief(*ppo_terms[8:])
             logits = critic.decode_belief(critic_belief)
             actor_terms = actor_window_loss(
                 actor_dynamics,
@@ -856,8 +951,15 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
         critic_dynamics,
     ):
         _nonzero_finite_gradients(module)
-    assert actor.trunk.memory.key_value.weight.grad.abs().sum() > 0
-    assert critic.trunk.memory.key_value.weight.grad.abs().sum() > 0
+    for module in (actor, critic):
+        weights = tuple(round_.memory.key_value.weight for round_ in module.trunk.core)
+        assert len(weights) == config.core_layers
+        assert len({id(weight) for weight in weights}) == config.core_layers
+        for weight in weights:
+            gradient = weight.grad
+            assert gradient is not None and torch.isfinite(gradient).all()
+            key_gradient, value_gradient = gradient.chunk(2, dim=0)
+            assert key_gradient.abs().sum() > 0 and value_gradient.abs().sum() > 0
 
 
 def test_artifact_roundtrip_preserves_compiled_policy_and_rejects_missing_weights(
@@ -941,9 +1043,7 @@ def test_native_full_horizon_ppo_replay_and_update(config, native_rollout, compi
         minibatch_size=8192,
     )
     critic = EntityCritic(config).cuda()
-    dynamics = StructuredCriticDynamics(config).cuda()
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo)
-    dynamics_optimizer = make_structured_dynamics_optimizer(dynamics, ppo)
     before = actor.market_kind.weight.detach().clone()
     parity = update_replay_parity(
         actor,
@@ -962,9 +1062,6 @@ def test_native_full_horizon_ppo_replay_and_update(config, native_rollout, compi
         rollout,
         ppo,
         generator=np.random.default_rng(20260916),
-        structured_critic_dynamics=dynamics,
-        structured_critic_dynamics_optimizer=dynamics_optimizer,
-        auxiliary_generator=np.random.default_rng(20260917),
     )
     assert metrics["updates"] > 0 and metrics["actor_updates"] > 0
     assert metrics["first_minibatch_component_kl"] <= MAX_FIRST_MINIBATCH_KL

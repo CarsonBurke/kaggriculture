@@ -14,15 +14,41 @@ from typing import Any
 
 from torch import nn
 
+from kaggriculture.causal_actor import CausalActor, CausalConfig
 from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
+from kaggriculture.lejepa_model import LejepaActor, LejepaConfig, LejepaCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
-from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredCritic
+from kaggriculture.strategic_actor import StrategicActor, StrategicConfig
+from kaggriculture.structured import (
+    JepaBelief,
+    StructuredActor,
+    StructuredConfig,
+    StructuredCritic,
+    StructuredCriticBelief,
+    StructuredDecisionBelief,
+)
 from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
 
 CONV_ENTITY = "entity-cnn"
 STRUCTURED = "structured"
 ENTITY_ATTENTION = "entity-attention"
+STRATEGIC = "strategic-plan"
+CAUSAL = "causal-execution"
+LEJEPA = "lejepa"
 DEFAULT_ARCHITECTURE = CONV_ENTITY
+
+
+def pair_towers(actor: nn.Module, critic: nn.Module) -> None:
+    """Hand the critic whatever encoder the actor owns, for families that share one.
+
+    A no-op everywhere but `lejepa`, where the critic holds no encoder of its own
+    and raises rather than guess if it is asked to encode without one. Separate
+    from construction because actors and critics are also built apart -- a league
+    snapshot restores an actor alone -- and only a training pair needs wiring.
+    """
+    attach = getattr(critic, "attach_backbone", None)
+    if attach is not None:
+        attach(actor.trunk)
 
 
 @dataclass(frozen=True)
@@ -35,6 +61,12 @@ class Architecture:
     critic_class: type
     structured_inputs: bool = False
     full_belief: bool = False
+    #: Belief types the PPO update reassembles from a minibatch forward's packed
+    #: tail. Every family but `lejepa` reports the two decision-state fields and
+    #: one pooled valuation state; the LeJEPA families additionally report the
+    #: encoded observation their world-model objective predicts.
+    actor_belief_class: type = StructuredDecisionBelief
+    critic_belief_class: type = StructuredCriticBelief
 
     def build_actor(self, model_config: dict[str, Any]) -> nn.Module:
         return self.actor_class(self.build_config(model_config))
@@ -54,6 +86,20 @@ class Architecture:
 
 
 ARCHITECTURES: dict[str, Architecture] = {
+    CAUSAL: Architecture(
+        name=CAUSAL,
+        config_class=CausalConfig,
+        actor_class=CausalActor,
+        critic_class=EntityCritic,
+        structured_inputs=True,
+    ),
+    STRATEGIC: Architecture(
+        name=STRATEGIC,
+        config_class=StrategicConfig,
+        actor_class=StrategicActor,
+        critic_class=EntityCritic,
+        structured_inputs=True,
+    ),
     CONV_ENTITY: Architecture(
         name=CONV_ENTITY,
         config_class=ModelConfig,
@@ -74,6 +120,15 @@ ARCHITECTURES: dict[str, Architecture] = {
         actor_class=EntityActor,
         critic_class=EntityCritic,
         structured_inputs=True,
+    ),
+    LEJEPA: Architecture(
+        name=LEJEPA,
+        config_class=LejepaConfig,
+        actor_class=LejepaActor,
+        critic_class=LejepaCritic,
+        structured_inputs=True,
+        actor_belief_class=JepaBelief,
+        critic_belief_class=StructuredCriticBelief,
     ),
 }
 

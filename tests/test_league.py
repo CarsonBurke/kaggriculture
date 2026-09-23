@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from kaggriculture.league import (
+    MATCHUP_EVIDENCE_RETENTION,
     FrozenActorPool,
     SnapshotRef,
     copy_actor_snapshot,
@@ -13,10 +14,165 @@ from kaggriculture.league import (
     save_actor_snapshot,
     select_league_mix,
     snapshot_sha256,
+    update_matchup_evidence,
+    validate_matchup_evidence,
 )
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED
 from kaggriculture.structured import StructuredActor, StructuredConfig
+
+
+def test_hardness_pool_prefers_hard_history_without_mandatory_age_slots(tmp_path) -> None:
+    refs = [SnapshotRef(i, tmp_path / f"league-actor-{i:08d}.pt") for i in range(1, 41)]
+    evidence = {
+        f"{i:08d}": {"score_sum": 0.0 if i <= 10 else 100.0, "games": 100.0, "last_iteration": 199}
+        for i in range(1, 41)
+    }
+    hard_slots = 0
+    for seed in range(100):
+        selected = select_league_mix(
+            refs,
+            current_iteration=200,
+            active_count=2,
+            historical_count=9,
+            active_pool_size=16,
+            generator=np.random.default_rng(seed),
+            selection_mode="hardness",
+            matchup_evidence=evidence,
+        )
+        assert len(selected) == len({row.key for row in selected}) == 11
+        assert sum(row.role == "probe" for row in selected) == 1
+        hard_slots += sum(row.role == "hardness" and row.ref.iteration <= 10 for row in selected)
+    # All ten hard candidates are outside the active window, but still compete
+    # for all ten main slots. Uniform or age-stratified sampling fails badly.
+    assert hard_slots == 1000
+
+
+def test_hardness_archive_size_cannot_crowd_out_established_hard_opponents(tmp_path) -> None:
+    refs = [SnapshotRef(i, tmp_path / f"league-actor-{i:08d}.pt") for i in range(1, 511)]
+    evidence = {
+        f"{i:08d}": {"score_sum": 30.0 if i <= 10 else 70.0, "games": 100.0, "last_iteration": 599}
+        for i in range(1, 511)
+    }
+    for seed in range(10):
+        selected = select_league_mix(
+            refs,
+            current_iteration=600,
+            active_count=2,
+            historical_count=9,
+            active_pool_size=16,
+            generator=np.random.default_rng(seed),
+            selection_mode="hardness",
+            matchup_evidence=evidence,
+        )
+        assert {row.key for row in selected if row.role == "hardness"} == {
+            f"{i:08d}" for i in range(1, 11)
+        }
+        assert len({row.key for row in selected}) == 11
+
+
+def test_hardness_equal_posteriors_randomize_without_age_preference(tmp_path) -> None:
+    refs = [SnapshotRef(i, tmp_path / f"league-actor-{i:08d}.pt") for i in range(1, 21)]
+    selections = []
+    for seed in range(10):
+        selected = select_league_mix(
+            refs,
+            current_iteration=30,
+            active_count=2,
+            historical_count=1,
+            active_pool_size=16,
+            generator=np.random.default_rng(seed),
+            selection_mode="hardness",
+        )
+        selections.append(tuple(row.key for row in selected if row.role == "hardness"))
+    assert len(set(selections)) > 1
+
+
+def test_hardness_probe_refreshes_stale_easy_opponent_and_keeps_builtins_last(tmp_path) -> None:
+    refs = [SnapshotRef(i, tmp_path / f"league-actor-{i:08d}.pt") for i in range(1, 21)]
+    evidence = {
+        f"{i:08d}": {"score_sum": 0.0, "games": 100.0, "last_iteration": 199} for i in range(1, 21)
+    }
+    evidence["builtin_pass"] = {"score_sum": 1000.0, "games": 1000.0, "last_iteration": 0}
+    selected = select_league_mix(
+        refs,
+        current_iteration=200,
+        active_count=2,
+        historical_count=6,
+        active_pool_size=16,
+        builtins=["pass"],
+        builtin_lanes=3,
+        generator=np.random.default_rng(11),
+        selection_mode="hardness",
+        matchup_evidence=evidence,
+    )
+    assert len(selected) == 9
+    assert selected[-1].key == "builtin_pass"
+    assert selected[-1].role == "probe"
+
+
+def test_matchup_evidence_accumulates_game_counts_and_ages_only_once() -> None:
+    evidence = {}
+    update_matchup_evidence(evidence, {"00000001": (40, 0.75)}, iteration=10)
+    update_matchup_evidence(evidence, {"00000001": (5, 0.0)}, iteration=12)
+    discount = MATCHUP_EVIDENCE_RETENTION**2
+    assert evidence["00000001"] == {
+        "score_sum": 30.0 * discount,
+        "games": 40.0 * discount + 5.0,
+        "last_iteration": 12,
+    }
+    update_matchup_evidence(evidence, {}, iteration=15)
+    assert evidence["00000001"]["last_iteration"] == 12
+    with pytest.raises(ValueError, match="backward"):
+        update_matchup_evidence(evidence, {"00000001": (2, 0.5)}, iteration=11)
+
+
+def test_hardness_restored_evidence_and_rng_continue_identically(tmp_path) -> None:
+    import copy
+    import json
+
+    refs = [SnapshotRef(i, tmp_path / f"league-actor-{i:08d}.pt") for i in range(1, 30)]
+    evidence = {}
+    update_matchup_evidence(
+        evidence, {"00000003": (5, 0.0), "builtin_pass": (40, 1.0)}, iteration=29
+    )
+    generator = np.random.default_rng(51)
+    restored_generator = np.random.default_rng()
+    restored_generator.bit_generator.state = copy.deepcopy(generator.bit_generator.state)
+    restored_evidence = validate_matchup_evidence(
+        json.loads(json.dumps(evidence)), current_iteration=30
+    )
+    arguments = dict(
+        current_iteration=30,
+        active_count=2,
+        historical_count=6,
+        active_pool_size=16,
+        builtins=["pass"],
+        builtin_lanes=1,
+        selection_mode="hardness",
+    )
+    assert select_league_mix(
+        refs, generator=generator, matchup_evidence=evidence, **arguments
+    ) == select_league_mix(
+        refs, generator=restored_generator, matchup_evidence=restored_evidence, **arguments
+    )
+    assert generator.random() == restored_generator.random()
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        None,
+        {"bad": {"score_sum": 0.0, "games": 1.0, "last_iteration": 0}},
+        {"00000001": {"score_sum": float("nan"), "games": 1.0, "last_iteration": 0}},
+        {"00000001": {"score_sum": 2.0, "games": 1.0, "last_iteration": 0}},
+        {"00000001": {"score_sum": 0.0, "games": 0.0, "last_iteration": 0}},
+        {"00000001": {"score_sum": 0.0, "games": 1.0, "last_iteration": 31}},
+    ],
+)
+def test_matchup_evidence_rejects_corrupt_or_future_recovery_state(evidence) -> None:
+    with pytest.raises(ValueError, match="matchup evidence"):
+        validate_matchup_evidence(evidence, current_iteration=30)
 
 
 def _actor() -> FarmActor:
@@ -191,6 +347,7 @@ def test_league_mix_is_distinct_reproducible_and_separates_age_windows(tmp_path)
     ]
     first = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=33,
         active_count=2,
         historical_count=4,
@@ -199,6 +356,7 @@ def test_league_mix_is_distinct_reproducible_and_separates_age_windows(tmp_path)
     )
     second = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=33,
         active_count=2,
         historical_count=4,
@@ -231,6 +389,7 @@ def test_league_mix_fills_every_log_age_rung_of_a_deep_archive(tmp_path) -> None
     refs = _snapshot_refs(tmp_path, range(1, 500))
     selected = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=500,
         active_count=2,
         historical_count=6,
@@ -259,6 +418,7 @@ def test_league_mix_reserves_lanes_for_built_ins_after_every_snapshot(tmp_path) 
 
     selected = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=20,
         active_count=2,
         historical_count=2,
@@ -297,7 +457,11 @@ def test_league_mix_drains_beaten_built_in_lanes_back_to_snapshots(tmp_path) -> 
 
     for seed in range(16):
         selected = select_league_mix(
-            refs, generator=np.random.default_rng(seed), score_rates=beaten, **arguments
+            refs,
+            selection_mode="stratified",
+            generator=np.random.default_rng(seed),
+            score_rates=beaten,
+            **arguments,
         )
         # The reserved lanes are released, not dropped: the lane count that
         # the wave's stacked frozen forward is captured for stays put.
@@ -312,6 +476,7 @@ def test_league_mix_gives_reserved_lanes_to_the_unbeaten_built_in(tmp_path) -> N
     for seed in range(64):
         selected = select_league_mix(
             refs,
+            selection_mode="stratified",
             current_iteration=20,
             active_count=2,
             historical_count=2,
@@ -336,6 +501,7 @@ def test_league_mix_gives_reserved_lanes_to_the_unbeaten_built_in(tmp_path) -> N
 def test_league_mix_plays_built_ins_before_any_snapshot_exists(tmp_path) -> None:
     selected = select_league_mix(
         [],
+        selection_mode="stratified",
         current_iteration=1,
         active_count=2,
         historical_count=2,
@@ -360,11 +526,19 @@ def test_league_mix_rejects_unknown_and_duplicated_built_ins(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="unknown built-in"):
         select_league_mix(
-            refs, generator=np.random.default_rng(0), builtins=["starter", "v27"], **arguments
+            refs,
+            selection_mode="stratified",
+            generator=np.random.default_rng(0),
+            builtins=["starter", "v27"],
+            **arguments,
         )
     with pytest.raises(ValueError, match="distinct"):
         select_league_mix(
-            refs, generator=np.random.default_rng(0), builtins=["starter", "starter"], **arguments
+            refs,
+            selection_mode="stratified",
+            generator=np.random.default_rng(0),
+            builtins=["starter", "starter"],
+            **arguments,
         )
 
 
@@ -376,6 +550,7 @@ def test_league_mix_excludes_the_random_init_snapshot_from_tiny_pools(tmp_path) 
 
     selected = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=2,
         active_count=4,
         historical_count=4,
@@ -400,6 +575,7 @@ def test_league_mix_keeps_a_pretrained_start_as_a_baseline_opponent(tmp_path) ->
 
     selected = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=2,
         active_count=4,
         historical_count=4,
@@ -419,6 +595,7 @@ def test_league_mix_treats_a_lone_resume_snapshot_as_active(tmp_path) -> None:
 
     selected = select_league_mix(
         [resumed],
+        selection_mode="stratified",
         current_iteration=13,
         active_count=1,
         historical_count=0,
@@ -440,6 +617,7 @@ def test_league_mix_retires_fully_beaten_opponents(tmp_path) -> None:
     for seed in range(32):
         selected = select_league_mix(
             refs,
+            selection_mode="stratified",
             current_iteration=9,
             active_count=2,
             historical_count=2,
@@ -460,6 +638,7 @@ def test_league_mix_returns_empty_when_every_opponent_is_beaten(tmp_path) -> Non
 
     selected = select_league_mix(
         refs,
+        selection_mode="stratified",
         current_iteration=9,
         active_count=2,
         historical_count=2,
@@ -481,6 +660,7 @@ def test_league_mix_prioritizes_competitive_over_unmeasured_opponents(tmp_path) 
     for seed in range(400):
         selected = select_league_mix(
             refs,
+            selection_mode="stratified",
             current_iteration=3,
             active_count=1,
             historical_count=0,
@@ -504,6 +684,7 @@ def test_league_mix_rejects_invalid_score_rates(tmp_path) -> None:
         with pytest.raises(ValueError, match="score rates"):
             select_league_mix(
                 refs,
+                selection_mode="stratified",
                 current_iteration=2,
                 active_count=1,
                 historical_count=0,
@@ -526,9 +707,9 @@ def test_league_mix_rejects_conflicting_duplicate_refs(tmp_path) -> None:
     }
 
     with pytest.raises(ValueError, match="conflicting paths"):
-        select_league_mix([first, second], **arguments)
+        select_league_mix([first, second], selection_mode="stratified", **arguments)
     with pytest.raises(ValueError, match="reused"):
-        select_league_mix([first, reused], **arguments)
+        select_league_mix([first, reused], selection_mode="stratified", **arguments)
 
 
 @pytest.mark.parametrize(
@@ -579,3 +760,114 @@ def test_frozen_actor_pool_reuses_slots_and_reloads_in_place(tmp_path) -> None:
     reference = load_actor_snapshot(second.path, expected_model_config=actor.config)
     for actual, expected in zip(reloaded.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+def test_default_hardness_discovers_new_policies_without_losing_stale_refresh(tmp_path):
+    refs = _snapshot_refs(tmp_path, range(1, 501))
+    evidence = {
+        f"{i:08d}": {
+            "score_sum": 0.0 if i <= 9 else 100.0,
+            "games": 100.0,
+            "last_iteration": 500 if i <= 9 else 300,
+        }
+        for i in range(1, 500)
+    }
+    for iteration in range(501, 521):
+        selected = select_league_mix(
+            refs,
+            current_iteration=iteration,
+            active_count=2,
+            historical_count=9,
+            active_pool_size=16,
+            generator=np.random.default_rng(iteration),
+            matchup_evidence=evidence,
+        )
+        assert len(selected) == len({row.key for row in selected}) == 11
+        assert {row.ref.iteration for row in selected if row.role == "hardness"} == set(
+            range(1, 10)
+        )
+        assert [row.ref.iteration for row in selected if row.role == "discovery"] == [iteration - 1]
+        assert len([row for row in selected if row.role == "probe"]) == 1
+        update_matchup_evidence(
+            evidence,
+            {row.key: (6, 0.0 if row.ref.iteration <= 9 else 1.0) for row in selected},
+            iteration=iteration,
+        )
+        refs.extend(_snapshot_refs(tmp_path, [iteration]))
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_small_hardness_budgets_rotate_discovery_refresh_and_hard_opponents(tmp_path, count):
+    refs = _snapshot_refs(tmp_path, [1, 2, 3])
+    evidence = {
+        "00000001": {"score_sum": 0.0, "games": 100.0, "last_iteration": 9},
+        "00000002": {"score_sum": 100.0, "games": 100.0, "last_iteration": 0},
+    }
+    observed = set()
+    for iteration in range(13, 19):
+        selected = select_league_mix(
+            refs,
+            current_iteration=iteration,
+            active_count=count,
+            historical_count=0,
+            active_pool_size=16,
+            generator=np.random.default_rng(3),
+            matchup_evidence=evidence,
+        )
+        assert len(selected) == len({row.key for row in selected}) == count
+        observed.update((row.ref.iteration, row.role) for row in selected)
+        update_matchup_evidence(
+            evidence,
+            {row.key: (100, 0.0 if row.ref.iteration == 1 else 1.0) for row in selected},
+            iteration=iteration,
+        )
+    assert {(1, "hardness"), (2, "probe"), (3, "discovery")} <= observed
+
+
+def test_hardness_zero_builtin_budget_disables_builtin_candidates(tmp_path):
+    selected = select_league_mix(
+        _snapshot_refs(tmp_path, [1, 2]),
+        current_iteration=3,
+        active_count=2,
+        historical_count=0,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        builtins=["pass", "starter"],
+        builtin_lanes=0,
+    )
+    assert {row.key for row in selected} == {"00000001", "00000002"}
+
+
+def test_hardness_refresh_can_reach_older_unseen_backlog(tmp_path):
+    refs = _snapshot_refs(tmp_path, range(1, 11))
+    evidence = {"00000002": {"score_sum": 0.0, "games": 100.0, "last_iteration": 10}}
+    selected = select_league_mix(
+        refs,
+        current_iteration=11,
+        active_count=3,
+        historical_count=0,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        matchup_evidence=evidence,
+    )
+    assert {(row.ref.iteration, row.role) for row in selected} == {
+        (1, "probe"),
+        (2, "hardness"),
+        (10, "discovery"),
+    }
+
+
+def test_hardness_discovers_unseen_builtins_before_snapshots_and_sorts_lanes(tmp_path):
+    selected = select_league_mix(
+        _snapshot_refs(tmp_path, [1, 2, 3]),
+        current_iteration=4,
+        active_count=2,
+        historical_count=0,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        builtins=["starter"],
+        builtin_lanes=1,
+    )
+    assert selected[-1].key == "builtin_starter"
+    assert selected[-1].role == "discovery"
+    assert all(row.category != "builtin" for row in selected[:-1])

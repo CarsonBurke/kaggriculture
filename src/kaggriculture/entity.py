@@ -1,4 +1,4 @@
-"""Entity-only policies: 26 decision states repeatedly read fixed farm memory."""
+"""Entity decision heads with a fixed-memory default and experimental reasoning cores."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from kaggriculture.model import (
     softcap_value_logits,
 )
 from kaggriculture.structured import (
+    SMALL_QUERY_INITIAL_SCALE,
     Attention,
     Block,
     EconomyEmbedder,
@@ -58,12 +59,18 @@ class EntityConfig:
     zero_init_branches: bool = False
     fused_mlp: bool = False
     split_clock_token: bool = False
-    shared_memory_kv: bool = True
+    shared_memory_kv: bool = False
     inter_attention_ffn: bool = False
     unit_local_readout: bool = False
     critic_readout_ffn: bool = False
     unit_local_init: bool = True
     tile_cross_rope: bool = False
+    # Entity readout only; economic valuation states always read complete memory.
+    critic_source_read: bool = True
+    critic_architecture: str = "entity"
+    memory_writeback: bool = False
+    unit_tile_bias: bool = False
+    bixt_latents: int = 0
     value_atoms: int = 255
     value_min: float = -2.2
     value_max: float = 2.2
@@ -71,6 +78,8 @@ class EntityConfig:
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
+        if self.critic_architecture not in ("entity", "economic", "forecast"):
+            raise ValueError("critic_architecture must be 'entity', 'economic', or 'forecast'")
         if self.observation_schema_version != OBSERVATION_SCHEMA_VERSION:
             raise ValueError("stale entity observation schema; fresh encoding required")
         for name in (
@@ -101,6 +110,37 @@ class EntityConfig:
             )
         if self.split_clock_token:
             raise ValueError("entity memory requires the single town token")
+        if self.unit_tile_bias and self.tile_cross_rope:
+            raise ValueError("unit tile bias and tile cross RoPE are separate experiments")
+        if self.memory_writeback and self.core_layers < 2:
+            raise ValueError("memory writeback requires at least two entity rounds")
+        if isinstance(self.bixt_latents, bool) or not isinstance(self.bixt_latents, int):
+            raise ValueError("bixt_latents must be a nonnegative integer")
+        if self.bixt_latents < 0:
+            raise ValueError("bixt_latents must be a nonnegative integer")
+        if self.bixt_latents:
+            if self.critic_architecture != "entity":
+                raise ValueError("BiXT requires critic_architecture='entity'")
+            if self.core_layers < 2:
+                raise ValueError(
+                    "BiXT requires at least two rounds to exchange data through latents"
+                )
+            incompatible = (
+                "global_modulation",
+                "shared_memory_kv",
+                "inter_attention_ffn",
+                "unit_local_readout",
+                "tile_cross_rope",
+                "critic_source_read",
+                "memory_writeback",
+                "unit_tile_bias",
+                "fused_mlp",
+            )
+            enabled = [name for name in incompatible if getattr(self, name)]
+            if enabled:
+                raise ValueError(
+                    "BiXT ablation requires these flags disabled: " + ", ".join(enabled)
+                )
         if self.value_atoms < 2:
             raise ValueError("value_atoms must be at least 2")
         if not math.isfinite(self.value_min) or not math.isfinite(self.value_max):
@@ -168,6 +208,7 @@ class EntityMemoryRead(nn.Module):
         value: Tensor,
         memory_valid: Tensor | None,
         unit_rotation: tuple[Tensor, Tensor] | None = None,
+        tile_bias: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         batch, tokens, width = queries.shape
         query = self.query(queries).view(batch, tokens, self.heads, self.head_dim)
@@ -182,14 +223,21 @@ class EntityMemoryRead(nn.Module):
             query = torch.cat((units, query[:, :, MAX_UNITS:]), dim=-2)
         query, key, value = _sdpa_inputs(query, key, value)
         mask = None if memory_valid is None else memory_valid[:, None, None, :]
-        attended = _fused_attention(
-            query,
-            key,
-            value,
-            mask,
-            enable_gqa=self.heads != self.kv_heads,
-            scale=self.head_dim**-0.5,
-        )
+        if tile_bias is None:
+            attended = _fused_attention(
+                query,
+                key,
+                value,
+                mask,
+                enable_gqa=self.heads != self.kv_heads,
+                scale=self.head_dim**-0.5,
+            )
+        else:
+            from kaggriculture.relative_attention import unit_tile_attention
+
+            attended = unit_tile_attention(
+                query, key, value, memory_valid, *tile_bias, scale=self.head_dim**-0.5
+            )
         attended = attended.to(queries.dtype).transpose(1, 2).reshape(batch, tokens, width)
         return self.output(attended)
 
@@ -239,23 +287,29 @@ class EntityRound(nn.Module):
         *,
         unit_rotation: tuple[Tensor, Tensor] | None = None,
         tile_rotation: tuple[Tensor, Tensor] | None = None,
+        tile_bias: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         if self.memory is not None:
             key, value = self.memory(key, tile_rotation)
             states = states.to(key.dtype)
         if value is None:
             raise ValueError("shared entity round requires projected memory values")
-        modulation = None
+        modulation: tuple[Tensor, ...] | None = None
         if self.modulation is not None:
             if conditioning is None:
                 raise ValueError("conditioned entity round requires economy conditioning")
-            modulation = (
+            modulation = tuple(
                 self.modulation(conditioning).to(states.dtype).chunk(self.modulation_chunks, dim=-1)
             )
+
+        def modulated(norm: RMSNorm, inputs: Tensor, index: int) -> Tensor:
+            # Each pre-norm fuses its `(1 + scale) * x + shift` conditioning.
+            if modulation is None:
+                return norm(inputs)
+            return norm(inputs, modulation[index], modulation[index + 1])
+
         valid = state_valid.unsqueeze(-1)
-        self_input = self.self_norm(states)
-        if modulation is not None:
-            self_input = self_input * (1 + modulation[0][:, None]) + modulation[1][:, None]
+        self_input = modulated(self.self_norm, states, 0)
         states = torch.where(
             valid,
             self.self_gate(
@@ -265,35 +319,40 @@ class EntityRound(nn.Module):
         )
         if self.inter_ffn is not None:
             assert self.inter_ffn_norm is not None and self.inter_ffn_gate is not None
-            inter_input = self.inter_ffn_norm(states)
-            if modulation is not None:
-                # Append channels: the original self/cross/final-FFN order stays fixed.
-                inter_input = inter_input * (1 + modulation[6][:, None]) + modulation[7][:, None]
+            # Appended channels: the original self/cross/final-FFN order stays fixed.
+            inter_input = modulated(self.inter_ffn_norm, states, 6)
             states = torch.where(
                 valid, self.inter_ffn_gate(states, self.inter_ffn(inter_input)), 0.0
             )
-        cross_input = self.cross_norm(states)
-        if modulation is not None:
-            cross_input = cross_input * (1 + modulation[2][:, None]) + modulation[3][:, None]
+        cross_input = modulated(self.cross_norm, states, 2)
+        cross_update = (
+            self.cross_attention(cross_input, key, value, memory_valid, unit_rotation)
+            if tile_bias is None
+            else self.cross_attention(
+                cross_input, key, value, memory_valid, unit_rotation, tile_bias
+            )
+        )
         states = torch.where(
             valid,
-            self.cross_gate(
-                states, self.cross_attention(cross_input, key, value, memory_valid, unit_rotation)
-            ),
+            self.cross_gate(states, cross_update),
             0.0,
         )
-        ffn_input = self.ffn_norm(states)
-        if modulation is not None:
-            ffn_input = ffn_input * (1 + modulation[4][:, None]) + modulation[5][:, None]
+        ffn_input = modulated(self.ffn_norm, states, 4)
         return torch.where(valid, self.ffn_gate(states, self.ffn(ffn_input)), 0.0)
 
 
 class EntityTrunk(nn.Module):
-    """Both farms are static memory; only 16 units and 10 order slots evolve."""
+    """Decision-token trunk with fixed memory or an opt-in source-updating core."""
 
-    def __init__(self, config: EntityConfig, *, private_columns: bool) -> None:
+    def __init__(
+        self, config: EntityConfig, *, private_columns: bool, rematerialize_farms: bool = False
+    ) -> None:
         super().__init__()
         self.config = config
+        # The farm blocks run over every tile token, and so hold most of what a
+        # training pass retains; `rematerialize_farms` replays them in backward
+        # for an owner whose update cannot afford that (see `LejepaBackbone`).
+        self.rematerialize_farms = rematerialize_farms
         self.tiles = TileEmbedder(config)
         local_readout = config.unit_local_readout and not private_columns
         self.units = UnitEmbedder(
@@ -305,10 +364,46 @@ class EntityTrunk(nn.Module):
         # Unit-RMS lookup rows follow existing market-query optimizer ownership.
         self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
         self.memory = EntityMemory(config) if config.shared_memory_kv else None
-        self.memory_norm = None if config.shared_memory_kv else RMSNorm(config.model_dim)
-        self.core = nn.ModuleList(EntityRound(config) for _ in range(config.core_layers))
+        self.memory_norm = (
+            None if config.shared_memory_kv or config.bixt_latents else RMSNorm(config.model_dim)
+        )
+        self.bixt_latents = None
+        if config.bixt_latents:
+            from kaggriculture.bixt import BiXTRound
+
+            self.bixt_latents = nn.Embedding(config.bixt_latents, config.model_dim)
+            nn.init.trunc_normal_(self.bixt_latents.weight, std=SMALL_QUERY_INITIAL_SCALE)
+            self.bixt_latents.adam_learning_rate_multipliers = {"weight": SMALL_QUERY_INITIAL_SCALE}
+            self.core = nn.ModuleList(
+                BiXTRound(
+                    config,
+                    refine_latents=index < config.core_layers - 1,
+                    output_tokens=(
+                        MAX_UNITS + MAX_MARKET_ORDERS if index >= config.core_layers - 2 else None
+                    ),
+                )
+                for index in range(config.core_layers)
+            )
+        else:
+            self.core = nn.ModuleList(EntityRound(config) for _ in range(config.core_layers))
+        # Additional source paths retain large activations at production B8192.
+        # Replay complete rounds, including their private K/V projections; a
+        # critic-only flag must not change actor execution. Fused MLPs maintain
+        # delayed-scaling state and must not be replayed here.
+        self.rematerialize = not config.fused_mlp and (
+            config.memory_writeback
+            or config.bixt_latents > 0
+            or (private_columns and config.critic_source_read)
+        )
         self.unit_local_decoder = Block(config) if local_readout else None
         self.local_context_norm = RMSNorm(config.model_dim) if local_readout else None
+        self.source_writeback = Block(config) if config.memory_writeback else None
+        self.writeback_context_norm = RMSNorm(config.model_dim) if config.memory_writeback else None
+        self.tile_bias = (
+            nn.Embedding(19 * 19, config.attention_heads) if config.unit_tile_bias else None
+        )
+        if self.tile_bias is not None:
+            nn.init.zeros_(self.tile_bias.weight)
 
     def forward(
         self,
@@ -316,6 +411,17 @@ class EntityTrunk(nn.Module):
         opponent_units: Tensor | None = None,
         opponent_units_active: Tensor | None = None,
     ) -> Tensor:
+        states, _memory, _memory_valid = self.forward_with_memory(
+            inputs, opponent_units, opponent_units_active
+        )
+        return states
+
+    def forward_with_memory(
+        self,
+        inputs: StructuredInputs,
+        opponent_units: Tensor | None = None,
+        opponent_units_active: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         batch = inputs.tile_categorical.shape[0]
         width = self.config.model_dim
         tiles = self.tiles(inputs.tile_categorical, inputs.tile_continuous)
@@ -325,8 +431,19 @@ class EntityTrunk(nn.Module):
             self.rope.sine.view(1, 1, TILE_COUNT, -1).expand(2 * batch, -1, -1, -1),
         )
         # No tile-validity mask: locked squares still carry real public state.
+        rematerialize_farms = self.rematerialize_farms and torch.is_grad_enabled()
         for block in self.farm_local:
-            farms = block(farms, query_rotation=rotation, key_rotation=rotation)
+            farms = (
+                checkpoint(
+                    block,
+                    farms,
+                    use_reentrant=False,
+                    query_rotation=rotation,
+                    key_rotation=rotation,
+                )
+                if rematerialize_farms
+                else block(farms, query_rotation=rotation, key_rotation=rotation)
+            )
         tiles = farms.reshape(batch, 2 * TILE_COUNT, width)
         local = (
             self.units.local_tiles(
@@ -356,7 +473,11 @@ class EntityTrunk(nn.Module):
             dim=1,
         )
         memory_valid = None
-        memory = torch.cat((tiles, economy), dim=1)
+        # Source memory enters the compute dtype once, with the tiles that are
+        # already in it: every consumer projects it under autocast anyway, and
+        # an fp32 concatenation over ~236 tokens per row is the largest saved
+        # activation of the trunk at production minibatch size.
+        memory = torch.cat((tiles, economy.to(tiles.dtype)), dim=1)
         if opponent_units is not None:
             if opponent_units_active is None:
                 raise ValueError("opponent unit memory requires an active mask")
@@ -367,14 +488,40 @@ class EntityTrunk(nn.Module):
                 ),
                 dim=1,
             )
-            memory = torch.cat((memory, opponent_units), dim=1)
+            memory = torch.cat((memory, opponent_units.to(tiles.dtype)), dim=1)
+        if self.bixt_latents is not None:
+            tokens = torch.cat((states, memory), dim=1)
+            valid = torch.cat(
+                (
+                    state_valid,
+                    torch.ones_like(memory[..., 0], dtype=torch.bool)
+                    if memory_valid is None
+                    else memory_valid,
+                ),
+                dim=1,
+            )
+            latents = self.bixt_latents.weight.unsqueeze(0).expand(batch, -1, -1)
+            for index, block in enumerate(self.core):
+                if index == len(self.core) - 2:
+                    # Later memory-token writes cannot reach the decision heads.
+                    # Retain the last live memory for the shared trunk interface.
+                    memory = tokens[:, MAX_UNITS + MAX_MARKET_ORDERS :]
+                latents, tokens = (
+                    checkpoint(block, latents, tokens, valid, use_reentrant=False)
+                    if self.rematerialize and torch.is_grad_enabled()
+                    else block(latents, tokens, valid)
+                )
+                valid = valid[:, : tokens.shape[1]]
+            return tokens, memory, memory_valid
         unit_rotation = tile_rotation = None
-        if self.config.tile_cross_rope:
+        if self.config.tile_cross_rope or self.tile_bias is not None:
             positions = torch.stack(
                 (inputs.unit_categorical[..., 3], inputs.unit_categorical[..., 2]), dim=-1
             )
-            unit_rotation = self.rope.rotation(positions)
-            tile_rotation = (self.rope.cosine, self.rope.sine)
+            if self.config.tile_cross_rope:
+                unit_rotation = self.rope.rotation(positions)
+                tile_rotation = (self.rope.cosine, self.rope.sine)
+        tile_bias = None if self.tile_bias is None else (self.tile_bias.weight, positions)
         if self.memory is not None:
             key, value = self.memory(memory, tile_rotation)
             # Lookup embeddings seed FP32 tensors under autocast; enter the round
@@ -385,17 +532,47 @@ class EntityTrunk(nn.Module):
             assert self.memory_norm is not None
             key, value = self.memory_norm(memory), None
         conditioning = economy_mean if self.config.global_modulation else None
-        for block in self.core:
-            states = block(
+        for index, block in enumerate(self.core):
+            round_args = (
                 states,
                 key,
                 value,
                 state_valid,
                 memory_valid,
                 conditioning,
-                unit_rotation=unit_rotation,
-                tile_rotation=tile_rotation,
             )
+            round_kwargs = {
+                "unit_rotation": unit_rotation,
+                "tile_rotation": tile_rotation,
+                "tile_bias": tile_bias,
+            }
+            states = (
+                checkpoint(block, *round_args, use_reentrant=False, **round_kwargs)
+                if self.rematerialize and torch.is_grad_enabled()
+                else block(*round_args, **round_kwargs)
+            )
+            if self.source_writeback is not None and index + 1 == len(self.core) // 2:
+                writeback_kwargs = {
+                    "context_norm": self.writeback_context_norm,
+                    "context_valid": state_valid,
+                }
+                memory = (
+                    checkpoint(
+                        self.source_writeback,
+                        memory,
+                        states,
+                        use_reentrant=False,
+                        **writeback_kwargs,
+                    )
+                    if self.rematerialize and torch.is_grad_enabled()
+                    else self.source_writeback(memory, states, **writeback_kwargs)
+                )
+                if memory_valid is not None:
+                    memory = torch.where(memory_valid.unsqueeze(-1), memory, 0.0)
+                if self.memory is not None:
+                    key, value = self.memory(memory, tile_rotation)
+                else:
+                    key, value = self.memory_norm(memory), None
         if self.unit_local_decoder is not None:
             assert local is not None and self.local_context_norm is not None
             units, markets = states.split((MAX_UNITS, MAX_MARKET_ORDERS), dim=1)
@@ -411,7 +588,7 @@ class EntityTrunk(nn.Module):
             ).view(batch, MAX_UNITS, width)
             units = torch.where(inputs.unit_active.unsqueeze(-1), units, 0.0)
             states = torch.cat((units, markets), dim=1)
-        return states
+        return states, memory, memory_valid
 
 
 class EntityActor(nn.Module):
@@ -420,7 +597,21 @@ class EntityActor(nn.Module):
     def __init__(self, config: EntityConfig | None = None) -> None:
         super().__init__()
         self.config = config = config or EntityConfig()
-        self.trunk = EntityTrunk(config, private_columns=False)
+        self.trunk = self._build_trunk(config)
+        self._initialize_heads(config)
+
+    def _build_trunk(self, config: EntityConfig) -> nn.Module:
+        """The family's encoder, built before the heads so the RNG stream is fixed.
+
+        A hook beside `_initialize_heads` rather than a reassignment afterwards:
+        a family that swaps the trunk would otherwise draw one trunk's worth of
+        initialization and discard it, moving every head's draw and with it the
+        seed any two architectures are compared under.
+        """
+        return EntityTrunk(config, private_columns=False)
+
+    def _initialize_heads(self, config: EntityConfig) -> None:
+        """Shared factor readouts; each actor family supplies its own representation."""
         self.unit_head = nn.Sequential(
             RMSNorm(config.model_dim), Linear(config.model_dim, N_UNIT_ACTIONS)
         )
@@ -490,13 +681,27 @@ class EntityActor(nn.Module):
 
 
 class EntityCritic(nn.Module):
-    """Independent private-state trunk with one GQA value query over 26 states."""
+    """Pool independent entity/source states or dedicated economic valuation states.
+
+    ``critic_source_read`` controls only the entity readout's source bypass.
+    Economic rounds always read all sources and pool only their valuation states.
+    """
 
     def __init__(self, config: EntityConfig | None = None) -> None:
         super().__init__()
         self.config = config = config or EntityConfig()
-        self.trunk = EntityTrunk(config, private_columns=True)
+        if config.critic_architecture in ("economic", "forecast"):
+            from kaggriculture.economic_critic import EconomicCriticTrunk
+
+            self.trunk = EconomicCriticTrunk(config)
+        else:
+            self.trunk = EntityTrunk(config, private_columns=True)
         self.pool_norm = RMSNorm(config.model_dim)
+        self.source_pool_norm = (
+            RMSNorm(config.model_dim)
+            if config.critic_source_read and config.critic_architecture == "entity"
+            else None
+        )
         self.value_query = nn.Parameter(
             torch.nn.functional.rms_norm(torch.randn(1, config.model_dim), (config.model_dim,))
         )
@@ -516,6 +721,11 @@ class EntityCritic(nn.Module):
         self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
+        self.forecast_heads = None
+        if config.critic_architecture == "forecast":
+            from kaggriculture.economic_forecasting import EconomicForecastHeads
+
+            self.forecast_heads = EconomicForecastHeads(config)
         self.register_buffer(
             "support",
             categorical_value_support(config.value_min, config.value_max, config.value_atoms),
@@ -530,6 +740,11 @@ class EntityCritic(nn.Module):
         opponent_unit_active: Tensor,
     ) -> StructuredCriticBelief:
         batch = inputs.tile_categorical.shape[0]
+        if self.config.critic_architecture in ("economic", "forecast"):
+            states = self.trunk(
+                inputs, opponent_unit_categorical, opponent_unit_continuous, opponent_unit_active
+            )
+            return self._economic_belief(states)
         # Private categorical/continuous features stay present without local init.
         # With it enabled, preserve the original relation-only opponent seed.
         relation_only = None
@@ -545,7 +760,9 @@ class EntityCritic(nn.Module):
             relation_only,
             opponent=True,
         )
-        states = self.trunk(inputs, opponent_units, opponent_unit_active)
+        states, memory, memory_valid = self.trunk.forward_with_memory(
+            inputs, opponent_units, opponent_unit_active
+        )
         valid = torch.cat(
             (
                 inputs.unit_active,
@@ -553,12 +770,71 @@ class EntityCritic(nn.Module):
             ),
             dim=1,
         )
-        query = self.value_query.unsqueeze(0).expand(batch, -1, -1)
-        pooled = self.pool_attention(query, self.pool_norm(states), context_valid=valid)
+        pooled = (
+            checkpoint(self._pool_belief, states, memory, valid, memory_valid, use_reentrant=False)
+            if self.trunk.rematerialize and torch.is_grad_enabled()
+            else self._pool_belief(states, memory, valid, memory_valid)
+        )
+        return StructuredCriticBelief(pooled)
+
+    def _economic_belief(self, states: Tensor) -> StructuredCriticBelief:
+        valid = torch.ones_like(states[..., 0], dtype=torch.bool)
+        pooled = (
+            checkpoint(self._pool_belief, states, states, valid, None, use_reentrant=False)
+            if self.trunk.rematerialize and torch.is_grad_enabled()
+            else self._pool_belief(states, states, valid, None)
+        )
+        return StructuredCriticBelief(pooled)
+
+    def forward_with_forecasts(
+        self,
+        inputs: StructuredInputs,
+        opponent_unit_categorical: Tensor,
+        opponent_unit_continuous: Tensor,
+        opponent_unit_active: Tensor,
+        *,
+        unit_actions: Tensor,
+        market_kinds: Tensor,
+        market_quantities: Tensor,
+        market_active: Tensor,
+        market_quantity_active: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Share one state encoding; sampled actions enter only forecast heads.
+
+        GAE and the value objective continue to use V(s). No action-conditioned
+        forecast state is fed into that baseline, including during training.
+        """
+        if self.forecast_heads is None:
+            raise ValueError("forecast forward requires critic_architecture='forecast'")
+        states = self.trunk(
+            inputs, opponent_unit_categorical, opponent_unit_continuous, opponent_unit_active
+        )
+        value = self.decode_belief(self._economic_belief(states))
+        forecasts = self.forecast_heads(
+            states,
+            unit_actions,
+            market_kinds,
+            market_quantities,
+            inputs.unit_categorical,
+            inputs.unit_active,
+            market_active,
+            market_quantity_active,
+        )
+        return value, forecasts
+
+    def _pool_belief(
+        self, states: Tensor, memory: Tensor, valid: Tensor, memory_valid: Tensor | None
+    ) -> Tensor:
+        query = self.value_query.unsqueeze(0).expand(states.shape[0], -1, -1)
+        context = self.pool_norm(states)
+        if self.source_pool_norm is not None:
+            context = torch.cat((context, self.source_pool_norm(memory)), dim=1)
+            valid = torch.cat((valid, memory_valid), dim=1)
+        pooled = self.pool_attention(query, context, context_valid=valid)
         if self.value_ffn is not None:
             assert self.value_ffn_norm is not None and self.value_ffn_gate is not None
             pooled = self.value_ffn_gate(pooled, self.value_ffn(self.value_ffn_norm(pooled)))
-        return StructuredCriticBelief(self.value_norm(pooled))
+        return self.value_norm(pooled)
 
     def decode_belief(self, belief: StructuredCriticBelief) -> Tensor:
         readout = self.value_head(belief.value_decision[:, 0])

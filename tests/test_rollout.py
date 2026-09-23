@@ -39,6 +39,7 @@ from kaggriculture.rollout import (
     _CROP_SEED_COLUMNS,
     _POPULATION_PAIRING_SEED_SALT,
     _PRODUCT_STOCK_COLUMNS,
+    _SEGMENTED_WAVE_MIN_GAMES,
     CAPTURING_ROLLOUT_FORWARD_MODES,
     COMPILED_ROLLOUT_FORWARD_MODES,
     ROLLOUT_FORWARD_MODES,
@@ -67,6 +68,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredInputs
+from kaggriculture.tokens import TILE_SLOT_CATEGORICAL
 
 
 class _NearOneGenerator:
@@ -400,6 +402,40 @@ def test_native_preference_step_matches_deterministic_masked_sampling(
             )
             if builtin_code:
                 np.testing.assert_array_equal(np.asarray(selected[name])[1], 0.0)
+
+
+@pytest.mark.parametrize("poison", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("rows", [2, 96])
+def test_native_preference_step_rejects_non_finite_inputs(poison: float, rows: int) -> None:
+    """Every table is scanned end to end, whether it fits one chunk or splits."""
+    rank = 4
+    environment = load_native().BatchEnv(np.arange(rows // 2, dtype=np.uint64) + 1)
+    buffers = environment.sample_buffers()
+    inputs = {
+        "unit_utilities": np.zeros((rows, MAX_UNITS, N_UNIT_ACTIONS), dtype=np.float32),
+        "market_kind_utilities": np.zeros((rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), np.float32),
+        "market_quantity_context": np.zeros((rows, MAX_MARKET_ORDERS, rank), dtype=np.float32),
+        "quantity_kind_gate": np.zeros((1, N_MARKET_KINDS, rank), dtype=np.float32),
+        "quantity_values": np.zeros((1, N_QUANTITIES, rank), dtype=np.float32),
+        "quantity_bias": np.zeros((1, N_MARKET_KINDS, N_QUANTITIES), dtype=np.float32),
+    }
+    trailing = (
+        np.zeros(rows, dtype=np.uint16),
+        np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.float32),
+        np.ones(rows, dtype=np.bool_),
+        np.ones(rows, dtype=np.float32),
+        np.zeros(rows, dtype=np.uint8),
+    )
+    environment.select_and_step_into(*inputs.values(), *trailing, buffers)
+    for name, table in inputs.items():
+        poisoned = table.copy()
+        poisoned.reshape(-1)[-1] = poison
+        with pytest.raises(ValueError, match=f"{name} must contain finite values"):
+            environment.select_and_step_into(
+                *(poisoned if other == name else value for other, value in inputs.items()),
+                *trailing,
+                buffers,
+            )
 
 
 @pytest.mark.parametrize("mask_name", ["unit_masks", "market_kind_masks"])
@@ -1523,6 +1559,104 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
 
     assert np.isfinite(rollout.entropy_sums).all() and rollout.mean_entropy > 0.0
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_segmented_mixed_wave_keeps_trajectory_order_and_replays_across_the_split() -> None:
+    """A production-sized wave collects as two interleaved segments.
+
+    The arena must still read self-play first, then league, in seed order,
+    with every stored row replaying from the learner and the stored states of
+    the second segment's first game replaying from a fresh native game. The
+    trajectory range straddling the split is what the replay audits.
+    """
+    config = _small_structured_config()
+    actor = StructuredActor(config).cuda()
+    _force_quantity_orders(actor)
+    opponents = [StructuredActor(config).cuda() for _ in range(2)]
+    self_play_games = _SEGMENTED_WAVE_MIN_GAMES // 2 + 4
+    league_games = _SEGMENTED_WAVE_MIN_GAMES - self_play_games + 2
+    games = self_play_games + league_games
+    assert games >= _SEGMENTED_WAVE_MIN_GAMES
+    split = (games + 1) // 2
+    assert split < self_play_games < games
+    assignments = np.arange(league_games, dtype=np.int64) % 3
+    seed_start = 4100
+    arena = allocate_rollout_storage(
+        STRUCTURED, self_play_games * 2 + league_games, 719, pin_memory=True
+    )
+    rollout = collect_mixed_play_rust(
+        actor,
+        opponents,
+        self_play_games=self_play_games,
+        league_games=league_games,
+        opponent_indices=assignments,
+        builtin_lanes=("random",),
+        seed_start=seed_start,
+        sampling_seed=23,
+        forward_mode="graph",
+        storage=arena,
+        reward_mode="terminal-bank",
+    )
+
+    seeds = np.arange(seed_start, seed_start + games)
+    assert rollout.trajectories == self_play_games * 2 + league_games
+    np.testing.assert_array_equal(
+        rollout.episode_seeds,
+        np.concatenate([np.repeat(seeds[:self_play_games], 2), seeds[self_play_games:]]),
+    )
+    np.testing.assert_array_equal(
+        rollout.seats,
+        np.concatenate([np.tile([0, 1], self_play_games), seeds[self_play_games:] % 2]),
+    )
+    assert (
+        rollout.states["tile_continuous"].__array_interface__["data"][0]
+        == arena["tile_continuous"].__array_interface__["data"][0]
+    )
+    _assert_zero_sum_reward_contract(rollout)
+    assert np.isfinite(rollout.entropy_sums).all() and (rollout.entropy_sums > 0.0).all()
+
+    # The first game of the second segment, both seats: its stored states are
+    # the native game seeded for it, so a misrouted segment cannot pass.
+    first_split_trajectory = 2 * split
+    environment = load_native().BatchEnv(np.asarray([seeds[split]], dtype=np.uint64))
+    rows = slice(first_split_trajectory, first_split_trajectory + 2)
+    for step in range(rollout.horizon):
+        encoded = environment.structured()
+        np.testing.assert_array_equal(
+            rollout.states["unit_continuous"][rows, step], np.asarray(encoded["unit_continuous"])
+        )
+        environment.step_factors(
+            rollout.unit_actions[rows, step].astype(np.uint8)[None],
+            rollout.market_kinds[rows, step].astype(np.uint8)[None],
+            rollout.market_quantities[rows, step].astype(np.uint8)[None],
+        )
+
+    # Learner rows on both sides of the split, and the league rows the second
+    # segment stored after its self-play rows, all replay from the actor.
+    straddling = slice_trajectories(
+        rollout, first_split_trajectory - 4, 2 * self_play_games + league_games // 2
+    )
+    _assert_structured_rows_replay_from_current_actor(actor.cpu(), straddling, atol=1e-4)
+
+
+def test_native_tile_categorical_slot_columns_follow_the_shared_table() -> None:
+    """The tile embedder derives farm/row/column/quadrant from the token slot."""
+    environment = load_native().BatchEnv(np.asarray([17, 18], dtype=np.uint64))
+    for step in range(60):
+        if step % 20 == 0:
+            tiles = np.asarray(environment.structured()["tile_categorical"])
+            np.testing.assert_array_equal(
+                tiles[..., 2:6], np.broadcast_to(TILE_SLOT_CATEGORICAL, tiles[..., 2:6].shape)
+            )
+        actions = environment.builtin_actions(np.full(4, 4, dtype=np.uint8))
+        environment.step_factors(
+            *(
+                actions[name].reshape(2, 2, -1)
+                for name in ("unit_actions", "market_kinds", "market_quantities")
+            )
+        )
 
 
 def test_native_terminal_bank_uses_actual_dones_without_reading_potentials() -> None:

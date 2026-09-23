@@ -21,6 +21,8 @@ from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.entity import EntityActor, EntityConfig, EntityCritic
 from kaggriculture.inference import CHECKPOINT_FORMAT_VERSION, POPULATION_CHECKPOINT_KEY
+from kaggriculture.lejepa import JepaObjective
+from kaggriculture.lejepa_model import LejepaConfig, LejepaCritic
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
 from kaggriculture.orientation import Orientation
 from kaggriculture.ppo import PpoConfig
@@ -36,8 +38,8 @@ from kaggriculture.structured import StructuredActor, StructuredConfig, Structur
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
 AnyActor = FarmActor | StructuredActor | EntityActor
-AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic
-AnyModelConfig = ModelConfig | StructuredConfig | EntityConfig
+AnyCritic = DistributionalCritic | StructuredCritic | EntityCritic | LejepaCritic
+AnyModelConfig = ModelConfig | StructuredConfig | EntityConfig | LejepaConfig
 
 #: The base states every member owns. Structured learners may additionally own
 #: independent actor- and critic-side training-only predictors and optimizers.
@@ -80,7 +82,7 @@ class TrainingAgent:
     critic: AnyCritic
     actor_optimizer: torch.optim.Optimizer | None = None
     critic_optimizer: torch.optim.Optimizer | None = None
-    structured_dynamics: ActorDynamics | None = None
+    structured_dynamics: ActorDynamics | JepaObjective | None = None
     structured_dynamics_optimizer: torch.optim.Optimizer | None = None
     structured_critic_dynamics: StructuredCriticDynamics | None = None
     structured_critic_dynamics_optimizer: torch.optim.Optimizer | None = None
@@ -345,6 +347,7 @@ def checkpoint_payload(
     auxiliary_rng_state: Mapping[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[str, float] | None = None,
+    league_matchup_evidence: dict[str, dict[str, float | int]] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
@@ -444,6 +447,7 @@ def checkpoint_payload(
         # them a resume replays retired opponents and perturbs the RNG
         # stream that opponent selection consumes.
         "league_score_rates": league_score_rates,
+        "league_matchup_evidence": league_matchup_evidence,
         # The most recent sampling-vs-update parity measurement, per audited
         # head. Persisted because the training gate decides defect versus
         # drift by comparing an audit against the previous one, and a run
@@ -576,6 +580,7 @@ def save_checkpoint(
     auxiliary_rng_state: Mapping[str, Any] | None = None,
     league_snapshot_manifest: dict[int, str] | None = None,
     league_score_rates: dict[str, float] | None = None,
+    league_matchup_evidence: dict[str, dict[str, float | int]] | None = None,
     replay_parity_baseline: dict[str, float] | list[dict[str, float]] | None = None,
     population_disagreement_reference: float | None = None,
     policy_entropy_reference: float | list[float | None] | None = None,
@@ -597,6 +602,7 @@ def save_checkpoint(
         auxiliary_rng_state=auxiliary_rng_state,
         league_snapshot_manifest=league_snapshot_manifest,
         league_score_rates=league_score_rates,
+        league_matchup_evidence=league_matchup_evidence,
         replay_parity_baseline=replay_parity_baseline,
         population_disagreement_reference=population_disagreement_reference,
         policy_entropy_reference=policy_entropy_reference,
