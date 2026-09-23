@@ -47,7 +47,7 @@ from kaggriculture.production import (
     PRODUCTION_UPDATE_COMPILE_MODE,
     production_ppo_config,
 )
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, collect_self_play_rust
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
@@ -72,15 +72,15 @@ REPORTED = (
 
 def _auxiliary_recovery(
     state: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    config: PpoConfig,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     require_checkpoint_format(state)
     member = checkpoint_agent_states(state)[0]
-    required = {
-        "structured_dynamics",
-        "structured_dynamics_optimizer",
-        "structured_critic_dynamics",
-        "structured_critic_dynamics_optimizer",
-    }
+    required = set()
+    if config.structured_actor_auxiliary_active:
+        required.update(("structured_dynamics", "structured_dynamics_optimizer"))
+    if config.structured_critic_auxiliary_active:
+        required.update(("structured_critic_dynamics", "structured_critic_dynamics_optimizer"))
     missing = sorted(required - set(member))
     if missing:
         raise ValueError(
@@ -88,7 +88,7 @@ def _auxiliary_recovery(
             + ", ".join(missing)
         )
 
-    return member, copy.deepcopy(state["structured_auxiliary_rng"])
+    return member, copy.deepcopy(state["structured_auxiliary_rng"]) if required else None
 
 
 def main() -> None:
@@ -117,7 +117,9 @@ def main() -> None:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if not isinstance(state, dict):
         raise ValueError("learning-rate probe checkpoint payload must be a mapping")
-    member_state, saved_auxiliary_rng = _auxiliary_recovery(state)
+    schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
+    production_config = PpoConfig(**schedule)
+    member_state, saved_auxiliary_rng = _auxiliary_recovery(state, production_config)
     warmup_minimum, warmup_complete, previous_r_squared = _validate_critic_warmup_state(
         state.get("initial_actor"), population=len(checkpoint_agent_states(state))
     )
@@ -133,15 +135,9 @@ def main() -> None:
         raise ValueError("production auxiliary recovery requires a structured-input model")
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
+    pair_towers(actor, critic)
     actor.load_state_dict(member_state["actor"])
     critic.load_state_dict(member_state["critic"])
-    schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
-    production_config = PpoConfig(**schedule)
-    if not (
-        production_config.structured_actor_auxiliary_active
-        and production_config.structured_critic_auxiliary_active
-    ):
-        raise RuntimeError("production PPO config must enable both structured auxiliaries")
 
     actor.eval()
     if args.league_games:
@@ -211,10 +207,18 @@ def main() -> None:
     for rate in args.learning_rates:
         candidate_actor = copy.deepcopy(actor)
         candidate_critic = copy.deepcopy(critic)
-        candidate_dynamics = ActorDynamics(model_config).to(device)
-        candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
-        candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
-        candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
+        # Two deep copies are two independent object graphs, so a shared
+        # encoder comes back unshared: re-pair the copies rather than let the
+        # candidate critic read an encoder nothing trains.
+        pair_towers(candidate_actor, candidate_critic)
+        candidate_dynamics = None
+        candidate_critic_dynamics = None
+        if production_config.structured_actor_auxiliary_active:
+            candidate_dynamics = ActorDynamics(model_config).to(device)
+            candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
+        if production_config.structured_critic_auxiliary_active:
+            candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
+            candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         # lr_warmup_steps is zeroed so the measured rate is the rate applied on
         # every one of the 113 steps. With warmup left on, the early steps run
         # below the candidate and the epoch would clear a bound the shipped
@@ -225,16 +229,24 @@ def main() -> None:
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config
         )
-        dynamics_optimizer = make_structured_dynamics_optimizer(candidate_dynamics, config)
-        critic_dynamics_optimizer = make_structured_dynamics_optimizer(
-            candidate_critic_dynamics, config
+        dynamics_optimizer = (
+            make_structured_dynamics_optimizer(candidate_dynamics, config)
+            if candidate_dynamics is not None
+            else None
+        )
+        critic_dynamics_optimizer = (
+            make_structured_dynamics_optimizer(candidate_critic_dynamics, config)
+            if candidate_critic_dynamics is not None
+            else None
         )
         actor_optimizer.load_state_dict(member_state["actor_optimizer"])
         critic_optimizer.load_state_dict(member_state["critic_optimizer"])
-        dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
-        critic_dynamics_optimizer.load_state_dict(
-            member_state["structured_critic_dynamics_optimizer"]
-        )
+        if dynamics_optimizer is not None:
+            dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
+        if critic_dynamics_optimizer is not None:
+            critic_dynamics_optimizer.load_state_dict(
+                member_state["structured_critic_dynamics_optimizer"]
+            )
         # Restoring param groups also restores their checkpoint rates. Re-stamp
         # the swept actor and predictor rates, and restart their short-probe
         # warmup clocks, so candidate overrides reach every intended step. The
@@ -244,6 +256,8 @@ def main() -> None:
             (dynamics_optimizer, config.resolved_structured_learning_rate),
             (critic_dynamics_optimizer, config.resolved_structured_learning_rate),
         ):
+            if optimizer is None:
+                continue
             for group in optimizer.param_groups:
                 candidate_rate = base_rate
                 if group.get("kind") == "adam":
@@ -251,8 +265,10 @@ def main() -> None:
                 group["base_lr"] = candidate_rate
                 group["warmup_step"] = 0
                 group["lr"] = candidate_rate
-        auxiliary_generator = np.random.default_rng()
-        auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
+        auxiliary_generator = None
+        if saved_auxiliary_rng is not None:
+            auxiliary_generator = np.random.default_rng()
+            auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
         metrics = update_ppo(
             candidate_actor,
             candidate_critic,

@@ -153,7 +153,7 @@ from kaggriculture.production import (
     production_ppo_config,
 )
 from kaggriculture.provenance import source_identity
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import (
     ROLLOUT_FORWARD_MODES,
     allocate_rollout_storage,
@@ -347,7 +347,7 @@ class GradientContext:
         sample_weight = (
             torch.arange(indices.numel(), device=indices.device) < sample_count
         ).float()
-        policy_sum, _entropy, _kl, _clipped, _component_kl = self.actor_terms(
+        policy_sum, *_ = self.actor_terms(
             self.actor,
             _batch_tensor(staged["unit_actions"], indices, torch.long),
             _batch_tensor(staged["market_kinds"], indices, torch.long),
@@ -842,9 +842,14 @@ def _stage_rollout(rollout: Any, device: torch.device) -> dict[str, Tensor]:
 
 
 def _load_critic(
-    args: argparse.Namespace, architecture: Any, model_config: dict[str, Any], device: torch.device
+    args: argparse.Namespace,
+    architecture: Any,
+    model_config: dict[str, Any],
+    device: torch.device,
+    actor: nn.Module,
 ) -> tuple[nn.Module, dict[str, Any]]:
     critic = architecture.build_critic(model_config).to(device)
+    pair_towers(actor, critic)
     provenance: dict[str, Any] = {"source": "initialized", "iteration": None}
     if args.critic_checkpoint is not None:
         checkpoint = torch.load(args.critic_checkpoint, map_location=device, weights_only=False)
@@ -882,7 +887,7 @@ def main() -> None:
     architecture = resolve_architecture(payload)
     model_config = payload["model_config"]
     config = PpoConfig(**production_ppo_config(update_compile_mode=args.update_compile_mode))
-    critic, critic_provenance = _load_critic(args, architecture, model_config, device)
+    critic, critic_provenance = _load_critic(args, architecture, model_config, device, actor)
 
     arena = allocate_rollout_storage(
         architecture.name,

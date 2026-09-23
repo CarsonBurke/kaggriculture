@@ -41,7 +41,7 @@ import numpy as np
 import torch
 
 from kaggriculture.ppo import actor_forward_args
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust
 from kaggriculture.tokens import TILE_COUNT
 
@@ -61,6 +61,7 @@ def _load(path: Path, device: torch.device) -> tuple[torch.nn.Module, torch.nn.M
     actor = architecture.actor_class(config).to(device)
     actor.load_state_dict(checkpoint["actor"], strict=True)
     critic = architecture.critic_class(config).to(device)
+    pair_towers(actor, critic)
     critic.load_state_dict(checkpoint["critic"], strict=True)
     actor.eval().requires_grad_(False)
     critic.eval().requires_grad_(False)

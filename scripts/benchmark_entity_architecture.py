@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Matched native-state GPU benchmark; run ONLY inside an MLQ allocation.
+"""Historical NextLat architecture benchmark; run ONLY inside an MLQ allocation.
 
 The fixed-state experiment includes a real 719-step production mixed rollout,
 then compares identical 6400-row PPO inputs. It is NOT an iteration-throughput
 claim: the report also emits the two six-repeat whole-iteration commands needed
 to measure collection, optimizer, replay, and league overhead together.
+Critic NextLat remains explicitly enabled for this experiment; this is not the
+current production auxiliary recipe.
 """
 
 from __future__ import annotations
@@ -53,7 +55,12 @@ from kaggriculture.production import (
     production_ppo_config,
 )
 from kaggriculture.provenance import file_sha256, source_identity
-from kaggriculture.registry import ENTITY_ATTENTION, STRUCTURED, resolve_architecture
+from kaggriculture.registry import (
+    ENTITY_ATTENTION,
+    STRUCTURED,
+    pair_towers,
+    resolve_architecture,
+)
 from kaggriculture.rollout import collect_mixed_play_rust
 from kaggriculture.structured import StructuredConfig, StructuredCriticBelief
 from kaggriculture.structured_dynamics import StructuredCriticDynamics, structured_horizon_plan
@@ -69,6 +76,21 @@ FACTOR_NAMES = (
     "market_active",
     "market_quantity_active",
 )
+
+
+def historical_ppo_config() -> PpoConfig:
+    """Retain the measured critic-NextLat workload after production disables it."""
+    return PpoConfig(
+        **{
+            **production_ppo_config(update_compile_mode="default"),
+            "structured_latent_coefficient": 0.0,
+            "structured_decision_coefficient": 0.0,
+            "structured_critic_latent_coefficient": 1.0,
+            "structured_critic_value_coefficient": 1.0,
+            "structured_critic_horizon": 1,
+            "structured_critic_gradient_balance": False,
+        }
+    )
 
 
 def legacy_config() -> StructuredConfig:
@@ -147,6 +169,14 @@ def iteration_command(family, config, artifact, output, seed):
         "terminal-outcome",
         "--auxiliary-mode",
         "enabled",
+        "--structured-latent-coefficient",
+        "0.0",
+        "--structured-decision-coefficient",
+        "0.0",
+        "--structured-critic-latent-coefficient",
+        "1.0",
+        "--structured-critic-value-coefficient",
+        "1.0",
         "--update-compile-mode",
         "default",
         "--rollout-forward-mode",
@@ -308,8 +338,9 @@ def family_benchmark(family, config, artifact, staged, plan, args, deadline):
     torch.manual_seed(args.seed)
     actor = build_actor(family, config, artifact)
     critic = resolve_architecture(family).critic_class(config).cuda().train()
+    pair_towers(actor, critic)
     predictor = StructuredCriticDynamics(config).cuda().train()
-    ppo = PpoConfig(**production_ppo_config(update_compile_mode="default"))
+    ppo = historical_ppo_config()
     indices = torch.arange(6400, device="cuda")
     actor_args = _actor_batch_args(family, staged, indices)
     critic_args = _critic_batch_args(family, staged, indices, actor_args=actor_args)
@@ -490,7 +521,8 @@ def main():
             k: {"argv": v, "shell": shlex.join(v)} for k, v in commands.items()
         },
         "scope": (
-            "fixed-state matched forward/backward; "
+            "historical critic-NextLat-on fixed-state matched forward/backward; "
+            "not the current production auxiliary recipe; "
             "whole-iteration pair required for throughput claims"
         ),
     }
@@ -554,7 +586,7 @@ def main():
             "collector_family": ENTITY_ATTENTION,
             "artifact_sha256": file_sha256(args.entity_actor) if args.entity_actor else None,
         }
-        ppo = PpoConfig(**production_ppo_config(update_compile_mode="default"))
+        ppo = historical_ppo_config()
         staged, plan, report["matched_inputs"] = matched_batch(rollout, args.seed, ppo)
         del collector, rollout
         gc.collect()

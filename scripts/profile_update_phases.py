@@ -31,6 +31,7 @@ from benchmark_ppo_iteration import _hardware_identity, _verify_first_step_criti
 from torch.profiler import ProfilerActivity, profile
 
 from kaggriculture.inference import load_actor_artifact
+from kaggriculture.lejepa import load_artifact_objective
 from kaggriculture.model import parameter_count
 from kaggriculture.modelargs import actor_model_config
 from kaggriculture.ppo import (
@@ -61,7 +62,7 @@ from kaggriculture.production import (
     production_ppo_config,
 )
 from kaggriculture.provenance import file_sha256, source_identity
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
@@ -196,8 +197,10 @@ def _work_counts(metrics, rollout, config) -> dict[str, Any]:
         "critic_optimizer_valid_rows": int(metrics["states"]) * int(metrics["epochs"]),
         "critic_forward_backward_padded_rows": critic_steps * config.minibatch_size,
         "actor_predictor_steps": 0,
-        "critic_predictor_steps": int(metrics["structured_critic_predictor_updates"]),
-        "critic_joint_auxiliary_updates": int(metrics["structured_critic_auxiliary_updates"]),
+        "critic_predictor_steps": int(metrics.get("structured_critic_predictor_updates", 0)),
+        "critic_joint_auxiliary_updates": int(
+            metrics.get("structured_critic_auxiliary_updates", 0)
+        ),
         "behavior_value_replay_rows": replay_rows,
         "behavior_value_replay_chunk_size": replay_chunk,
         "behavior_value_replay_forward_chunks": math.ceil(replay_rows / replay_chunk),
@@ -232,11 +235,6 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
     )
     if not config.use_bfloat16 or config.structured_actor_auxiliary_active:
         raise ValueError("production must use BF16 with actor NextLat off")
-    if (
-        config.structured_critic_latent_coefficient,
-        config.structured_critic_value_coefficient,
-    ) != (1.0, 1.0):
-        raise ValueError("production critic NextLat must remain enabled at 1/1")
     if PRODUCTION_ROLLOUT_FORWARD_MODE != "inductor_graph":
         raise ValueError("compiled CUDA-graph rollout is required")
     report.update(
@@ -269,16 +267,30 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
             raise ValueError("initial actor architecture/configuration does not match production")
         actor = architecture.actor_class(model_config)
         actor.load_state_dict(pretrained.state_dict())
+        # This profile builds no actor objective, so a lejepa clone is refused
+        # here rather than profiled with its world model silently absent.
+        load_artifact_objective(payload, None)
         del pretrained, payload
         critic = architecture.critic_class(model_config)
-        critic_dynamics = StructuredCriticDynamics(model_config)
+        pair_towers(actor, critic)
+        critic_dynamics = (
+            StructuredCriticDynamics(model_config)
+            if config.structured_critic_auxiliary_active
+            else None
+        )
     for module in (actor, critic, critic_dynamics):
+        if module is None:
+            continue
         if any(
             tensor.device.type != "cuda" for tensor in (*module.parameters(), *module.buffers())
         ):
             raise RuntimeError("model construction left a non-CUDA parameter or buffer")
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    critic_dynamics_optimizer = make_structured_dynamics_optimizer(critic_dynamics, config)
+    critic_dynamics_optimizer = (
+        make_structured_dynamics_optimizer(critic_dynamics, config)
+        if critic_dynamics is not None
+        else None
+    )
     frozen_state = {
         name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
     }
@@ -295,7 +307,9 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
         {
             "actor_parameters": parameter_count(actor),
             "critic_parameters": parameter_count(critic),
-            "critic_predictor_parameters": parameter_count(critic_dynamics),
+            "critic_predictor_parameters": (
+                parameter_count(critic_dynamics) if critic_dynamics is not None else 0
+            ),
             "actor_predictor_parameters": 0,
             "frozen_opponents": opponent_count,
             "opponent_policy": "eight frozen copies of initial BC actor, reconstructed each wave",
@@ -407,8 +421,8 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
                 structured_actor_auxiliary=False,
                 structured_critic_dynamics=critic_dynamics,
                 structured_critic_dynamics_optimizer=critic_dynamics_optimizer,
-                structured_critic_auxiliary=True,
-                auxiliary_generator=auxiliary_generator,
+                structured_critic_auxiliary=config.structured_critic_auxiliary_active,
+                auxiliary_generator=(auxiliary_generator if critic_dynamics is not None else None),
                 diagnostic_groups={
                     "self_play": np.arange(rollout.trajectories) < args.games * 2,
                     "league": np.arange(rollout.trajectories) >= args.games * 2,
@@ -455,12 +469,11 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
         ):
             if not math.isfinite(metrics[key]) or metrics[key] > limit:
                 raise RuntimeError(f"update failed {key}: {metrics[key]} > {limit}")
-        if (
-            metrics["actor_updates"] < 1
-            or metrics["structured_critic_predictor_updates"] != metrics["updates"]
-        ):
+        if metrics["actor_updates"] < 1 or metrics.get(
+            "structured_critic_predictor_updates", 0
+        ) != (metrics["updates"] if config.structured_critic_auxiliary_active else 0):
             raise RuntimeError(
-                "update failed to execute actor and every joint critic predictor step"
+                "update failed to execute actor or the configured critic predictor steps"
             )
         _save_report(args.output, report)
         print(

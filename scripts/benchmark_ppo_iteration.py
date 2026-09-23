@@ -25,6 +25,8 @@ from kaggriculture.actor_dynamics import ActorDynamics
 from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.entity import EntityConfig
 from kaggriculture.inference import load_actor_artifact
+from kaggriculture.lejepa import JepaObjective, load_artifact_objective
+from kaggriculture.lejepa_model import LejepaCritic
 from kaggriculture.model import ModelConfig, parameter_count
 from kaggriculture.modelargs import (
     actor_model_config,
@@ -57,7 +59,12 @@ from kaggriculture.production import (
     production_ppo_config,
 )
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, file_sha256, source_identity
-from kaggriculture.registry import ARCHITECTURES, CONV_ENTITY, resolve_architecture
+from kaggriculture.registry import (
+    ARCHITECTURES,
+    CONV_ENTITY,
+    pair_towers,
+    resolve_architecture,
+)
 from kaggriculture.rollout import (
     _ANIMAL_STOCK_COLUMNS,
     _CROP_SEED_COLUMNS,
@@ -201,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         choices=("off", "predictor", "enabled"),
         default="enabled",
         help="isolate ordinary PPO, predictor fitting, or predictor plus source updates; "
-        "enabled measures production joint NextLat updates",
+        "enabled uses the configured auxiliary coefficients (production defaults are zero)",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -220,9 +227,18 @@ def parse_args() -> argparse.Namespace:
         help="total critic epochs (>= --epochs); the actor trains only in the first --epochs",
     )
     parser.add_argument("--minibatch-size", type=int, default=_PRODUCTION_PPO["minibatch_size"])
+    parser.add_argument(
+        "--actor-gae-lambda", type=float, default=_PRODUCTION_PPO["actor_gae_lambda"]
+    )
     parser.add_argument("--temperature", type=float, default=PRODUCTION_TEMPERATURE)
     parser.add_argument("--reward-mode", choices=REWARD_MODES, default=DEFAULT_REWARD_MODE)
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
+    parser.add_argument(
+        "--reference-kl-coefficient",
+        type=float,
+        default=PpoConfig.reference_kl_coefficient,
+        help="anchor the update to --init-actor-from, so its extra forward is timed",
+    )
     parser.add_argument(
         "--policy-loss-reduction",
         choices=("components", "states"),
@@ -243,6 +259,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=_PRODUCTION_PPO["structured_decision_coefficient"],
     )
+    for term in ("latent", "value"):
+        parser.add_argument(
+            f"--structured-critic-{term}-coefficient",
+            type=float,
+            default=_PRODUCTION_PPO[f"structured_critic_{term}_coefficient"],
+        )
+    parser.add_argument(
+        "--economic-forecast-coefficient",
+        type=float,
+        default=_PRODUCTION_PPO["economic_forecast_coefficient"],
+    )
+    # The `lejepa` family refuses to train without its world-model objective, so
+    # benchmarking it needs these; zero everywhere else, as in production.
+    for term in ("prediction", "sigreg", "reward"):
+        parser.add_argument(
+            f"--jepa-{term}-coefficient",
+            type=float,
+            default=_PRODUCTION_PPO[f"jepa_{term}_coefficient"],
+        )
+    parser.add_argument("--jepa-horizon", type=int, default=_PRODUCTION_PPO["jepa_horizon"])
     parser.add_argument(
         "--max-update-replay-kl",
         type=float,
@@ -487,12 +523,16 @@ def main() -> None:
         raise ValueError("--repeats must be at least two to separate cold and steady iterations")
     if args.epochs < 1 or args.minibatch_size < 1:
         raise ValueError("epochs and minibatch size must be positive")
+    if not math.isfinite(args.actor_gae_lambda) or not 0.0 <= args.actor_gae_lambda <= 1.0:
+        raise ValueError("actor GAE lambda must be finite and in [0, 1]")
     if args.critic_epochs < args.epochs:
         raise ValueError("--critic-epochs cannot be fewer than --epochs")
     if not math.isfinite(args.temperature) or args.temperature <= 0.0:
         raise ValueError("temperature must be finite and positive")
     if args.temperature != 1.0:
         raise ValueError("on-policy PPO benchmarking requires --temperature 1.0")
+    if args.reference_kl_coefficient > 0.0 and args.init_actor_from is None:
+        raise ValueError("--reference-kl-coefficient anchors to --init-actor-from's artifact")
     _validate_numerics_gates(args)
     device = torch.device(args.device)
     if (args.profile_repeat is None) != (args.trace_path is None):
@@ -538,10 +578,19 @@ def main() -> None:
             "critic_epochs": args.critic_epochs,
             "minibatch_size": args.minibatch_size,
             "target_kl": args.target_kl,
+            "reference_kl_coefficient": args.reference_kl_coefficient,
+            "actor_gae_lambda": args.actor_gae_lambda,
             "policy_loss_reduction": args.policy_loss_reduction,
             "policy_ratio_scope": args.policy_ratio_scope,
             "structured_latent_coefficient": args.structured_latent_coefficient,
             "structured_decision_coefficient": args.structured_decision_coefficient,
+            "structured_critic_latent_coefficient": args.structured_critic_latent_coefficient,
+            "structured_critic_value_coefficient": args.structured_critic_value_coefficient,
+            "economic_forecast_coefficient": args.economic_forecast_coefficient,
+            "jepa_prediction_coefficient": args.jepa_prediction_coefficient,
+            "jepa_sigreg_coefficient": args.jepa_sigreg_coefficient,
+            "jepa_reward_coefficient": args.jepa_reward_coefficient,
+            "jepa_horizon": args.jepa_horizon,
             "use_bfloat16": not args.no_bfloat16,
             "update_compile_mode": args.update_compile_mode,
         }
@@ -554,6 +603,9 @@ def main() -> None:
                 "structured_decision_coefficient": 0.0,
                 "structured_critic_latent_coefficient": 0.0,
                 "structured_critic_value_coefficient": 0.0,
+                "jepa_prediction_coefficient": 0.0,
+                "jepa_sigreg_coefficient": 0.0,
+                "jepa_reward_coefficient": 0.0,
             }
         )
     initial_actor_digest = (
@@ -636,8 +688,14 @@ def main() -> None:
             torch.cuda.manual_seed_all(args.seed)
             torch.cuda.empty_cache()
         actor = architecture.actor_class(model_config).to(device)
+        if architecture.name == "causal-execution":
+            from kaggriculture.device_ledger import get_device_ledger
+
+            actor.set_device_ledger(get_device_ledger(device))
+        initial_payload = None
+        reference_actor = None
         if args.init_actor_from is not None:
-            pretrained, _ = load_actor_artifact(args.init_actor_from, device=device)
+            pretrained, initial_payload = load_actor_artifact(args.init_actor_from, device=device)
             artifact_config = actor_model_config(pretrained.config)
             expected_config = actor_model_config(model_config)
             if (
@@ -646,8 +704,11 @@ def main() -> None:
             ):
                 raise ValueError("initial actor model configuration does not match benchmark")
             actor.load_state_dict(pretrained.state_dict())
+            if ppo_config.reference_kl_coefficient > 0.0:
+                reference_actor = pretrained.eval().requires_grad_(False)
             del pretrained
         critic = architecture.critic_class(model_config).to(device)
+        pair_towers(actor, critic)
         # Keep critic and critic-predictor initialization independent of whether
         # the optional actor predictor is enabled.
         structured_critic_dynamics = (
@@ -656,16 +717,30 @@ def main() -> None:
             else None
         )
         structured_dynamics = (
-            ActorDynamics(model_config).to(device)
+            (
+                JepaObjective(model_config)
+                if ppo_config.jepa_active
+                else ActorDynamics(model_config)
+            ).to(device)
             if architecture.structured_inputs and ppo_config.structured_actor_auxiliary_active
             else None
         )
+        if initial_payload is not None:
+            # As `train_ppo` warm-starts: a gate measuring a cloned backbone under
+            # a fresh projector would not be measuring the run it gates.
+            load_artifact_objective(initial_payload, structured_dynamics)
+            del initial_payload
         frozen_opponent_state = {
             name: value.detach().cpu().clone() for name, value in actor.state_dict().items()
         }
         actor_optimizer, critic_optimizer = make_optimizers(actor, critic, ppo_config)
         structured_dynamics_optimizer = (
-            make_structured_dynamics_optimizer(structured_dynamics, ppo_config)
+            make_structured_dynamics_optimizer(
+                structured_dynamics,
+                ppo_config,
+                # The LeJEPA optimizer owns the shared backbone, as in train_ppo.
+                actor=actor if ppo_config.jepa_active else None,
+            )
             if structured_dynamics is not None
             else None
         )
@@ -780,6 +855,8 @@ def main() -> None:
                         forward_mode=args.rollout_forward_mode,
                         forward_autocast=args.rollout_bfloat16,
                         storage=arena,
+                        # As training does: the `lejepa` critic's values come from the wave.
+                        critic=critic if isinstance(critic, LejepaCritic) else None,
                     )
                     seed_cursor += physical_games
                     _synchronize(device)
@@ -856,6 +933,7 @@ def main() -> None:
                             "league": np.arange(rollout.trajectories) >= self_play_games * 2,
                         },
                         diagnostic_gradients=repeat == 1,
+                        reference_actor=reference_actor,
                     )
                     _synchronize(device)
                     update_seconds = time.perf_counter() - update_started

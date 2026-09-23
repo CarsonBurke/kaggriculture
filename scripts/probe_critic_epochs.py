@@ -104,7 +104,7 @@ from kaggriculture.production import (
     PRODUCTION_UPDATE_COMPILE_MODE,
 )
 from kaggriculture.provenance import source_identity
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import (
     REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
@@ -475,6 +475,7 @@ def _build_critic(
 ) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
     """Construct one isolated critic/optimizer pair, optionally from a checkpoint."""
     critic = resolve_architecture(architecture).build_critic(model_config).to(device)
+    pair_towers(actor, critic)
     _, critic_optimizer = make_optimizers(actor, critic, config)
     if checkpoint_state is not None:
         critic.load_state_dict(checkpoint_state["critic"], strict=True)

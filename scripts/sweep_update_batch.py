@@ -261,7 +261,7 @@ def _run_cell(
 
     def actor_step() -> None:
         actor_optimizer.zero_grad(set_to_none=True)
-        policy_sum, _entropy_sum, _kl_sum, _clipped, _component_kl = actor_terms(
+        policy_sum, *_ = actor_terms(
             actor,
             batch["unit_actions"],
             batch["market_kinds"],

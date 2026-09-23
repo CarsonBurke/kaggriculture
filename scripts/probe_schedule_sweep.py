@@ -74,7 +74,7 @@ from kaggriculture.production import (
     PRODUCTION_UPDATE_COMPILE_MODE,
     production_ppo_config,
 )
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import pair_towers, resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, slice_trajectories
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
@@ -82,6 +82,7 @@ from kaggriculture.training import checkpoint_agent_states, require_checkpoint_f
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+from probe_lr_trust import _auxiliary_recovery  # noqa: E402
 from train_ppo import _critic_warmup_decision, _validate_critic_warmup_state  # noqa: E402
 
 #: Update metrics worth a column. The pair `actor_updates` /
@@ -205,21 +206,6 @@ def main() -> None:
     warmup_minimum, saved_warmup_complete, saved_previous_r_squared = _validate_critic_warmup_state(
         state.get("initial_actor"), population=len(checkpoint_agent_states(state))
     )
-    required_auxiliary_state = {
-        "structured_dynamics",
-        "structured_dynamics_optimizer",
-        "structured_critic_dynamics",
-        "structured_critic_dynamics_optimizer",
-    }
-    missing_auxiliary_state = sorted(required_auxiliary_state - member_state.keys())
-    if missing_auxiliary_state:
-        raise ValueError(
-            "checkpoint is missing production structured auxiliary recovery state: "
-            + ", ".join(missing_auxiliary_state)
-        )
-
-    saved_auxiliary_rng = copy.deepcopy(state["structured_auxiliary_rng"])
-
     optimizer_state_names = (
         "actor_optimizer",
         "critic_optimizer",
@@ -227,7 +213,9 @@ def main() -> None:
         "structured_critic_dynamics_optimizer",
     )
     saved_optimizer_families = {
-        _optimizer_uses_normuon(member_state[name], name) for name in optimizer_state_names
+        _optimizer_uses_normuon(member_state[name], name)
+        for name in optimizer_state_names
+        if name in member_state
     }
     if len(saved_optimizer_families) != 1:
         raise ValueError("checkpoint member-zero optimizer families are inconsistent")
@@ -237,15 +225,10 @@ def main() -> None:
     model_config = entry.build_config(state["model_config"])
     actor = entry.actor_class(model_config).to(device)
     critic = entry.critic_class(model_config).to(device)
+    pair_towers(actor, critic)
     actor.load_state_dict(member_state["actor"])
     critic.load_state_dict(member_state["critic"])
     schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
-    production_config = PpoConfig(**schedule)
-    if not (
-        production_config.structured_actor_auxiliary_active
-        and production_config.structured_critic_auxiliary_active
-    ):
-        raise RuntimeError("production PPO config must enable actor and critic NextLat")
 
     opponents = []
     if args.snapshot_lanes:
@@ -286,25 +269,37 @@ def main() -> None:
         label = _label(overrides)
         candidate_actor = copy.deepcopy(actor)
         candidate_critic = copy.deepcopy(critic)
+        # Two deep copies are two independent object graphs, so a shared
+        # encoder comes back unshared: re-pair the copies rather than let the
+        # candidate critic read an encoder nothing trains.
+        pair_towers(candidate_actor, candidate_critic)
         config = PpoConfig(**{**schedule, **overrides})
-        if not (
-            config.structured_actor_auxiliary_active and config.structured_critic_auxiliary_active
-        ):
-            raise ValueError(f"schedule candidate {label!r} must keep actor and critic NextLat")
-
-        candidate_dynamics = ActorDynamics(model_config).to(device)
-        candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
-        candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
-        candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
+        _, saved_auxiliary_rng = _auxiliary_recovery(state, config)
+        candidate_dynamics = None
+        candidate_critic_dynamics = None
+        if config.structured_actor_auxiliary_active:
+            candidate_dynamics = ActorDynamics(model_config).to(device)
+            candidate_dynamics.load_state_dict(member_state["structured_dynamics"], strict=True)
+        if config.structured_critic_auxiliary_active:
+            candidate_critic_dynamics = StructuredCriticDynamics(model_config).to(device)
+            candidate_critic_dynamics.load_state_dict(member_state["structured_critic_dynamics"])
         actor_optimizer, critic_optimizer = make_optimizers(
             candidate_actor, candidate_critic, config
         )
-        dynamics_optimizer = make_structured_dynamics_optimizer(candidate_dynamics, config)
-        critic_dynamics_optimizer = make_structured_dynamics_optimizer(
-            candidate_critic_dynamics, config
+        dynamics_optimizer = (
+            make_structured_dynamics_optimizer(candidate_dynamics, config)
+            if candidate_dynamics is not None
+            else None
         )
-        auxiliary_generator = np.random.default_rng()
-        auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
+        critic_dynamics_optimizer = (
+            make_structured_dynamics_optimizer(candidate_critic_dynamics, config)
+            if candidate_critic_dynamics is not None
+            else None
+        )
+        auxiliary_generator = None
+        if saved_auxiliary_rng is not None:
+            auxiliary_generator = np.random.default_rng()
+            auxiliary_generator.bit_generator.state = copy.deepcopy(saved_auxiliary_rng)
 
         # All optimizer moments are inherited when their representation is
         # compatible. Switching optimizer families cold-starts all four
@@ -313,10 +308,12 @@ def main() -> None:
         if restored:
             actor_optimizer.load_state_dict(member_state["actor_optimizer"])
             critic_optimizer.load_state_dict(member_state["critic_optimizer"])
-            dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
-            critic_dynamics_optimizer.load_state_dict(
-                member_state["structured_critic_dynamics_optimizer"]
-            )
+            if dynamics_optimizer is not None:
+                dynamics_optimizer.load_state_dict(member_state["structured_dynamics_optimizer"])
+            if critic_dynamics_optimizer is not None:
+                critic_dynamics_optimizer.load_state_dict(
+                    member_state["structured_critic_dynamics_optimizer"]
+                )
         # Restoring param groups also restores their checkpoint rates. Re-stamp
         # the swept actor and predictor rates, and restart their short-probe
         # warmup clocks, so candidate overrides reach every intended step.
@@ -325,6 +322,8 @@ def main() -> None:
             (dynamics_optimizer, config.resolved_structured_learning_rate),
             (critic_dynamics_optimizer, config.resolved_structured_learning_rate),
         ):
+            if optimizer is None:
+                continue
             for group in optimizer.param_groups:
                 rate = base_rate
                 if group.get("kind") == "adam":
