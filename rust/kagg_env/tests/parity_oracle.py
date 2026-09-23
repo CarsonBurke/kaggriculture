@@ -409,7 +409,9 @@ def assert_official_native_parity(
             err_msg=f"terminal utility divergence at transition {transition + 1}",
         )
         np.testing.assert_array_equal(
-            _native_pair_rewards(native_step, DEFAULT_REWARD_GAMMA),
+            # The expectation above is the shaped reward; the other modes are
+            # functions of the terminal utility asserted just before.
+            _native_pair_rewards(native_step, DEFAULT_REWARD_GAMMA, "shaped"),
             expected_rewards,
             err_msg=f"reward divergence at transition {transition + 1}",
         )

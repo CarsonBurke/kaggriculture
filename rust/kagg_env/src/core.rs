@@ -15,6 +15,11 @@ pub const UNIT_ACTIONS: usize = 68;
 
 pub const MARKET_KINDS: usize = 22;
 pub const MARKET_QUANTITIES: usize = 100;
+/// Exact integer policy state, independent of the lossy observation encoder.
+/// Scalars(7), seeds(5), shed(12), market(9), positions(16*2),
+/// initial inventories(16*12), initial insertion order(16*12), local tiles(16*9).
+pub const POLICY_LEDGER_WIDTH: usize = 593;
+pub const POLICY_LEDGER_SCHEMA_VERSION: usize = 1;
 const UNIT_MASK_VALUES: usize = MAX_UNITS * UNIT_ACTIONS;
 const MARKET_KIND_MASK_VALUES: usize = MAX_MARKET_ORDERS * MARKET_KINDS;
 const MARKET_QUANTITY_MASK_VALUES: usize = MAX_MARKET_ORDERS * MARKET_QUANTITIES;
@@ -775,6 +780,64 @@ struct PolicyMarketLedger {
 }
 
 impl Game {
+    /// Export the acting seat only; no opponent-private fields cross this boundary.
+    /// Each unit acts once. Keeping the tile under each original unit position
+    /// is sufficient for prefix legality, including co-located unit effects.
+    pub fn encode_policy_ledger(&self, player: usize, output: &mut [i64]) {
+        assert_eq!(output.len(), POLICY_LEDGER_WIDTH);
+        output.fill(0);
+        let farm = &self.farms[player];
+        let private = &self.privates[player];
+        let units = farm.positions.len().min(MAX_UNITS);
+        output[..7].copy_from_slice(&[
+            i64::from(self.step / self.config.turns_per_day),
+            farm.money,
+            farm.hires_today as i64,
+            units as i64,
+            i64::from(farm.unlocked.count_ones()) - 1,
+            i64::from(self.config.shed_capacity),
+            self.config.farm_hand_cost_mult,
+        ]);
+        for (target, value) in output[7..12].iter_mut().zip(private.seeds) {
+            *target = i64::from(value);
+        }
+        for (target, value) in output[12..24].iter_mut().zip(private.shed) {
+            *target = i64::from(value);
+        }
+        for (target, value) in output[24..33].iter_mut().zip(self.market_inventory) {
+            *target = i64::from(value);
+        }
+        // PRIVATE_ITEMS is an in-range sentinel for the padded gather column.
+        output[257..449].fill(PRIVATE_ITEMS as i64);
+        for unit in 0..units {
+            let Position(x, y) = farm.positions[unit];
+            output[33 + 2 * unit] = i64::from(x);
+            output[34 + 2 * unit] = i64::from(y);
+            for item in 0..PRIVATE_ITEMS {
+                output[65 + unit * PRIVATE_ITEMS + item] =
+                    i64::from(private.inventories[unit][item]);
+                let ordered = private.inventory_order[unit][item];
+                output[257 + unit * PRIVATE_ITEMS + item] = if ordered == u8::MAX {
+                    PRIVATE_ITEMS as i64
+                } else {
+                    i64::from(ordered)
+                };
+            }
+            let tile = farm.tiles[usize::from(y) * BOARD_SIZE + usize::from(x)];
+            output[449 + unit * 9..449 + (unit + 1) * 9].copy_from_slice(&[
+                tile.kind as i64,
+                i64::from(tile.species),
+                i64::from(tile.has_animal),
+                i64::from(tile.origin_day),
+                i64::from(tile.yield_units),
+                i64::from(tile.watered_or_fed),
+                i64::from(tile.cared_today),
+                i64::from(tile.fertilizer_available),
+                i64::from(tile.fertilized_until_day),
+            ]);
+        }
+    }
+
     pub fn new(seed: u64, config: GameConfig) -> Self {
         let spawn = default_spawn();
         let farms = std::array::from_fn(|_| Farm {
