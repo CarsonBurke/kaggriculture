@@ -12,6 +12,7 @@ from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.entity import EntityConfig
 from kaggriculture.latent_dynamics import DecodeHeads
 from kaggriculture.model import (
     FarmActor,
@@ -30,6 +31,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.structured import (
     Attention,
+    EconomyEmbedder,
     FeedForward,
     FusedFeedForward,
     StructuredActor,
@@ -45,7 +47,7 @@ from kaggriculture.structured_dynamics import (
     _latent_smooth_l1,
     structured_critic_window_loss,
 )
-from kaggriculture.tokens import encode_structured_observation
+from kaggriculture.tokens import FARM_TOKEN_FIELDS, encode_structured_observation
 from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
 
 
@@ -1462,3 +1464,32 @@ def test_conditioning_mean_is_batch_invariant_with_correct_gradient() -> None:
     torch.testing.assert_close(
         tokens.grad, gradient[:, None, :].expand_as(tokens) / tokens.shape[1], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    "config_class", [StructuredConfig, EntityConfig], ids=["structured", "entity"]
+)
+def test_economy_reads_only_its_schemas_farm_columns(config_class) -> None:
+    """v3 weights see exactly the v3 inputs; only a v4 model reads the margin."""
+    margin = FARM_TOKEN_FIELDS.index("money_margin")
+    generator = torch.Generator().manual_seed(3)
+
+    def economy(width: int) -> tuple[torch.Tensor, ...]:
+        shapes = ((9, 5), (3, 3), (5, 6), (2, width), (14,))
+        return tuple(torch.randn(2, *shape, generator=generator) for shape in shapes)
+
+    products, animals, crops, farms, town = economy(len(FARM_TOKEN_FIELDS))
+    moved = farms.clone()
+    moved[..., margin] += 1.0
+    for version, width in ((3, 4), (4, 5)):
+        torch.manual_seed(0)
+        embedder = EconomyEmbedder(
+            config_class(observation_schema_version=version), private_columns=False
+        )
+        assert embedder.farm_projection.in_features == width
+        with torch.no_grad():
+            baseline = embedder(products, animals, crops, farms, town)
+            shifted = embedder(products, animals, crops, moved, town)
+            prefix = embedder(products, animals, crops, farms[..., :width].clone(), town)
+        assert torch.equal(prefix, baseline)
+        assert torch.equal(shifted, baseline) == (version == 3)

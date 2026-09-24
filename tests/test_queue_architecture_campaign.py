@@ -109,7 +109,11 @@ def test_campaign_changes_only_the_named_arm_and_keeps_full_production_shape(cam
             else:
                 assert _argument(command, "--games") == "128"
                 assert _argument(command, "--league-games") == "64"
-                assert _argument(command, "--minibatch-size") == "8192"
+                assert _argument(command, "--minibatch-size") == str(
+                    campaign.module.production_ppo_config(update_compile_mode="reduce-overhead")[
+                        "minibatch_size"
+                    ]
+                )
                 assert _argument(command, "--reward-mode") == "terminal-outcome"
                 assert _argument(command, "--rollout-forward-mode") == "inductor_graph"
                 assert _argument(command, "--update-compile-mode") == "reduce-overhead"
@@ -313,5 +317,7 @@ def test_bixt_only_campaign_queues_its_four_job_chain_without_original_arms(tmp_
         assert _argument(command, "--init-actor-from") == str(clone)
         assert _argument(command, "--games") == "128"
         assert _argument(command, "--league-games") == "64"
-        assert _argument(command, "--minibatch-size") == "8192"
+        assert _argument(command, "--minibatch-size") == str(
+            module.production_ppo_config(update_compile_mode="reduce-overhead")["minibatch_size"]
+        )
         assert "--external-eval" not in command

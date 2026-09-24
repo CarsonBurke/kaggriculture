@@ -16,6 +16,13 @@ from kaggriculture.evaluation import artifact_seed_usage, bounded_mean_interval,
 from kaggriculture.provenance import file_sha256, source_identity
 
 OPPONENTS = ("starter", "scripted-v27")
+HEAD_DECODINGS = {
+    "argmax": (),
+    "sampled": ("units", "kinds", "quantities"),
+    "units": ("units",),
+    "kinds": ("kinds",),
+    "quantities": ("quantities",),
+}
 
 
 def artifact_argument(value: str) -> tuple[str, Path]:
@@ -123,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed-start", type=int, default=4_501_000)
     parser.add_argument("--games", type=int, default=256)
-    parser.add_argument("--decoding", choices=("argmax", "sampled"), default="argmax")
+    parser.add_argument("--decoding", choices=tuple(HEAD_DECODINGS), default="argmax")
     args = parser.parse_args()
     if args.games < 2 or args.games % 2:
         parser.error("--games must be a positive even count for balanced seats")
@@ -149,9 +156,10 @@ def main() -> None:
     torch.set_num_threads(1)
     started = time.perf_counter()
     report: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,
         "source_identity": source_identity(),
         "decoding": args.decoding,
+        "sampled_head_families": list(HEAD_DECODINGS[args.decoding]),
         "precision": "CUDA BF16, Inductor graph",
         "seed_start": args.seed_start,
         "games_per_opponent": args.games,
@@ -190,6 +198,11 @@ def main() -> None:
                 builtin_lanes=(opponent,),
                 seed_start=args.seed_start,
                 deterministic=args.decoding == "argmax",
+                sampled_heads=(
+                    HEAD_DECODINGS[args.decoding]
+                    if args.decoding not in ("argmax", "sampled")
+                    else None
+                ),
                 temperature=1.0,
                 episode_steps=720,
                 reward_mode="terminal-outcome",

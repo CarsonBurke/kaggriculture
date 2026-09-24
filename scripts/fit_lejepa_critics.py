@@ -165,16 +165,12 @@ def main() -> None:
         SELF_PLAY_GAMES + LEAGUE_GAMES,
         usage=artifact_seed_usage(metadata),
     )
-    # The update compile mode both production trainers default to; the lejepa run
-    # this diagnoses used it.
+    # The trainer's default update compile mode, which `lejepa-anchored-20260922`
+    # recorded. Compilation changes kernels, not the fitted objective.
     config = PpoConfig(**production_ppo_config(update_compile_mode=PpoConfig.update_compile_mode))
     if config.gamma != 1.0 or config.critic_gae_lambda != 1.0 or config.critic_epochs != 1:
         raise ValueError("lejepa critic fit requires Monte Carlo critic targets and one epoch")
-    if (
-        config.structured_actor_auxiliary_active
-        or config.structured_critic_auxiliary_active
-        or config.reference_kl_coefficient
-    ):
+    if config.structured_actor_auxiliary_active or config.structured_critic_auxiliary_active:
         # Each would make the inert actor slot, or a predictor, part of the fit.
         raise ValueError("lejepa critic fit requires every actor-side objective off")
     assignments = np.arange(LEAGUE_GAMES) % 3
@@ -202,7 +198,8 @@ def main() -> None:
     groups = np.asarray(
         ["self_play"] * (2 * SELF_PLAY_GAMES)
         + [
-            str(np.asarray(["bc_snapshot", "starter", "scripted-v27"])[lane])
+            # Lane zero plays the frozen actor itself, not a BC snapshot.
+            str(np.asarray(["frozen_self", "starter", "scripted-v27"])[lane])
             for lane in assignments
         ]
     )

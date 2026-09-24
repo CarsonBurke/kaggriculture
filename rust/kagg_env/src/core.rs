@@ -15,6 +15,12 @@ pub const UNIT_ACTIONS: usize = 68;
 
 pub const MARKET_KINDS: usize = 22;
 pub const MARKET_QUANTITIES: usize = 100;
+pub const MARKET_SET_KINDS: usize = MARKET_KINDS - 1;
+pub const MARKET_SET_CHOICES: usize = MARKET_QUANTITIES + 1;
+pub const MARKET_SET_RAW_CHOICES: usize = MARKET_SET_CHOICES + 1;
+const MARKET_SET_ORDER: [u8; MARKET_SET_KINDS] = [
+    13, 14, 15, 16, 17, 18, 19, 20, 21, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 8, 9,
+];
 /// Exact integer policy state, independent of the lossy observation encoder.
 /// Scalars(7), seeds(5), shed(12), market(9), positions(16*2),
 /// initial inventories(16*12), initial insertion order(16*12), local tiles(16*9).
@@ -38,9 +44,11 @@ pub const UNIT_CONTINUOUS: usize = 2 * PRIVATE_ITEMS + 2;
 pub const UNIT_GATHERS: usize = 5;
 pub const PRODUCT_TOKEN_FIELDS: usize = 5;
 pub const ANIMAL_TOKEN_FIELDS: usize = 3;
-pub const OBSERVATION_SCHEMA_VERSION: usize = 3;
+// The newest schema; its layout is a superset every supported schema reads a
+// prefix of (see src/kaggriculture/tokens.py).
+pub const OBSERVATION_SCHEMA_VERSION: usize = 4;
 pub const CROP_TOKEN_FIELDS: usize = 6;
-pub const FARM_TOKEN_FIELDS: usize = 4;
+pub const FARM_TOKEN_FIELDS: usize = 5;
 pub const TOWN_TOKEN_FIELDS: usize = 14;
 
 const PRODUCT_NAMES: [&str; PRODUCTS] = [
@@ -422,9 +430,32 @@ impl Default for SampledFactors {
 
 pub struct QuantityHead<'a> {
     pub rank: usize,
+    pub quantity_rows: usize,
     pub kind_gate: &'a [f32],
     pub values: &'a [f32],
     pub bias: &'a [f32],
+}
+
+pub struct MarketSetFactors {
+    pub values: [u8; MARKET_SET_KINDS],
+    pub masks: [[bool; MARKET_SET_CHOICES]; MARKET_SET_KINDS],
+    pub active: [bool; MARKET_SET_KINDS],
+    pub logprobs: [f32; MARKET_SET_KINDS],
+    pub entropies: [f32; MARKET_SET_KINDS],
+    pub action: CompactAction,
+}
+
+impl Default for MarketSetFactors {
+    fn default() -> Self {
+        Self {
+            values: [0; MARKET_SET_KINDS],
+            masks: [[false; MARKET_SET_CHOICES]; MARKET_SET_KINDS],
+            active: [false; MARKET_SET_KINDS],
+            logprobs: [0.0; MARKET_SET_KINDS],
+            entropies: [0.0; MARKET_SET_KINDS],
+            action: CompactAction::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1302,6 +1333,9 @@ impl Game {
             row[2] =
                 (summary.positions.len().saturating_sub(1) as f64 / (MAX_UNITS - 1) as f64) as f32;
             row[3] = (summary.hires_today as f64 / (MAX_UNITS - 1) as f64) as f32;
+            // Schema v4 money margin, rounded once from float64.
+            row[4] = (signed_log_money(summary.money)
+                - signed_log_money(self.farms[1 - index].money)) as f32;
         }
 
         let hour = self.step % self.config.turns_per_day;
@@ -1532,7 +1566,7 @@ impl Game {
     fn v27_order_score(&self, item: usize, quantity: i32) -> f64 {
         let inventory = self.market_inventory[item];
         let current = self.market_prices[item] as f64;
-        let later = market_price(item, inventory + quantity) as f64;
+        let later = v27_market_price(item, inventory + quantity) as f64;
         let impact = f64::from(quantity) * (current - later).max(0.0);
         // Outside the rebalance regime the reference stops here, and the whole
         // demand walk below is dead code in that configuration.
@@ -1736,6 +1770,249 @@ impl Game {
         }
     }
 
+    /// Interface 3: one optional effective quantity per non-STOP market kind.
+    /// The decisions consume an exact own-policy ledger in their fixed order.
+    /// The returned legacy slots can be passed directly to `step`.
+    pub fn market_set_factors(
+        &self,
+        player: usize,
+        units: &[u8; MAX_UNITS],
+        values: &[u8; MARKET_SET_KINDS],
+        impact_order: bool,
+        hire_last: bool,
+    ) -> Result<MarketSetFactors, String> {
+        self.market_set_decisions(player, units, impact_order, hire_last, |index, _, mask| {
+            let value = usize::from(values[index]);
+            if value >= MARKET_SET_CHOICES || !mask[value] {
+                return Err(format!(
+                    "illegal market set value {value} at decision {index}"
+                ));
+            }
+            Ok((value, 0.0, 0.0))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_market_set(
+        &self,
+        player: usize,
+        units: &[u8; MAX_UNITS],
+        contexts: &[f32],
+        head: &QuantityHead<'_>,
+        draws: &[f32],
+        deterministic: bool,
+        temperature: f32,
+        impact_order: bool,
+        hire_last: bool,
+    ) -> MarketSetFactors {
+        assert_eq!(contexts.len(), MARKET_SET_KINDS * head.rank);
+        assert_eq!(draws.len(), MARKET_SET_KINDS);
+        assert_eq!(head.quantity_rows, MARKET_SET_RAW_CHOICES);
+        assert_eq!(head.kind_gate.len(), MARKET_KINDS * head.rank);
+        assert_eq!(head.values.len(), MARKET_SET_RAW_CHOICES * head.rank);
+        assert_eq!(head.bias.len(), MARKET_KINDS * MARKET_SET_RAW_CHOICES);
+        self.market_set_decisions(
+            player,
+            units,
+            impact_order,
+            hire_last,
+            |index, kind, mask| {
+                let context = &contexts[index * head.rank..(index + 1) * head.rank];
+                let mut logits = [0.0f32; MARKET_SET_CHOICES];
+                for (choice, score) in logits.iter_mut().enumerate() {
+                    *score = market_set_score(context, kind, choice, head);
+                }
+                if let Some(maximum) = mask[1..]
+                    .iter()
+                    .rposition(|&legal| legal)
+                    .map(|index| index + 1)
+                    && maximum > 0
+                {
+                    let all = market_set_score(context, kind, MARKET_SET_CHOICES, head);
+                    let regular = logits[maximum];
+                    let high = regular.max(all);
+                    logits[maximum] = high + (regular.min(all) - high).exp().ln_1p();
+                }
+                let (value, logprob, entropy) =
+                    sample_categorical(&logits, mask, deterministic, temperature, draws[index]);
+                Ok((value, logprob, entropy))
+            },
+        )
+        .expect("masked categorical always selects a legal market set value")
+    }
+
+    pub fn sample_market_set_units(
+        &self,
+        player: usize,
+        logits: &[f32],
+        draws: &[f32],
+        deterministic: bool,
+        temperature: f32,
+    ) -> SampledFactors {
+        assert_eq!(logits.len(), MAX_UNITS * UNIT_ACTIONS);
+        assert_eq!(draws.len(), MAX_UNITS);
+        let mut result = SampledFactors::default();
+        let day = self.step / self.config.turns_per_day;
+        let mut ledger = UnitLedger::from_game(self, player);
+        let live = self.farms[player].positions.len();
+        let mut entropy_sum = 0.0f32;
+        for unit in 0..MAX_UNITS {
+            let mask = &mut result.masks.unit[unit * UNIT_ACTIONS..(unit + 1) * UNIT_ACTIONS];
+            if unit < live {
+                result.masks.unit_active[unit] = true;
+                for (candidate, legal) in mask.iter_mut().enumerate() {
+                    *legal = ledger.action_valid(unit, candidate as u8, day);
+                }
+            } else {
+                mask[0] = true;
+            }
+            let (chosen, logprob, entropy) = sample_categorical(
+                &logits[unit * UNIT_ACTIONS..(unit + 1) * UNIT_ACTIONS],
+                mask,
+                deterministic,
+                temperature,
+                draws[unit],
+            );
+            result.action.units[unit] = chosen as u8;
+            result.unit_logprobs[unit] = logprob;
+            result.unit_entropies[unit] = entropy;
+            if unit < live {
+                entropy_sum += entropy;
+                ledger.apply_action(unit, chosen as u8, day);
+            }
+        }
+        result.mean_entropy = entropy_sum / live.max(1) as f32;
+        result
+    }
+
+    fn market_set_decisions<F>(
+        &self,
+        player: usize,
+        units: &[u8; MAX_UNITS],
+        impact_order: bool,
+        hire_last: bool,
+        mut choose: F,
+    ) -> Result<MarketSetFactors, String>
+    where
+        F: FnMut(usize, usize, &[bool; MARKET_SET_CHOICES]) -> Result<(usize, f32, f32), String>,
+    {
+        let day = self.step / self.config.turns_per_day;
+        let mut unit_ledger = UnitLedger::from_game(self, player);
+        let live = self.farms[player].positions.len();
+        for (index, &requested) in units.iter().enumerate().take(live) {
+            let action = if unit_ledger.action_valid(index, requested, day) {
+                requested
+            } else {
+                0
+            };
+            unit_ledger.apply_action(index, action, day);
+        }
+        let farm = &unit_ledger.farm;
+        let mut ledger = PolicyMarketLedger {
+            money: farm.money,
+            shed: unit_ledger.private.shed,
+            hires: farm.hires_today,
+            original_hires: farm.hires_today,
+            original_units: farm.units,
+            extra_land: farm.unlocked.count_ones() as usize - 1,
+            inventory: self.market_inventory,
+        };
+        let mut factors = MarketSetFactors::default();
+        factors.action.units = *units;
+        let mut slots = 0usize;
+        let mut kinds = MARKET_SET_ORDER;
+        if hire_last {
+            kinds.copy_within(10.., 9);
+            kinds[MARKET_SET_KINDS - 1] = 1;
+        }
+        for (index, &kind) in kinds.iter().enumerate() {
+            let mask = &mut factors.masks[index];
+            mask[0] = true;
+            if slots < MAX_MARKET_ORDERS {
+                if kind == 1 {
+                    let mut money = ledger.money;
+                    let maximum = (MAX_UNITS
+                        - ledger.original_units
+                        - ledger.hires.saturating_sub(ledger.original_hires))
+                    .min(MAX_MARKET_ORDERS - slots);
+                    for (value, legal) in mask.iter_mut().enumerate().take(maximum + 1).skip(1) {
+                        let cost = self
+                            .config
+                            .farm_hand_cost_mult
+                            .saturating_mul(fib(ledger.hires + value - 1));
+                        if money < cost {
+                            break;
+                        }
+                        money -= cost;
+                        *legal = true;
+                    }
+                } else if kind == 2 {
+                    mask[1] = ledger.extra_land < LAND_PRICES.len()
+                        && ledger.money >= LAND_PRICES[ledger.extra_land];
+                } else {
+                    let mut positive = [false; MARKET_QUANTITIES];
+                    fill_market_quantity_mask(&self.config, &ledger, kind, &mut positive);
+                    mask[1..].copy_from_slice(&positive);
+                }
+            }
+            factors.active[index] = mask[1..].iter().any(|&valid| valid);
+            let (value, logprob, entropy) = choose(index, usize::from(kind), mask)?;
+            if value >= MARKET_SET_CHOICES || !mask[value] {
+                return Err(format!(
+                    "illegal market set value {value} at decision {index}"
+                ));
+            }
+            factors.values[index] = value as u8;
+            factors.logprobs[index] = logprob;
+            factors.entropies[index] = entropy;
+            if value > 0 {
+                if kind == 1 {
+                    for _ in 0..value {
+                        apply_policy_market_order(&self.config, &mut ledger, kind, 1);
+                    }
+                    slots += value;
+                } else {
+                    apply_policy_market_order(&self.config, &mut ledger, kind, value as u16);
+                    slots += 1;
+                }
+            }
+        }
+        let mut sells: Vec<(u8, u8, i64)> = Vec::new();
+        for (index, &kind) in kinds.iter().enumerate().take(PRODUCTS) {
+            let value = factors.values[index];
+            if value == 0 {
+                continue;
+            }
+            let item = usize::from(kind - 13);
+            let before = market_price(item, self.market_inventory[item]);
+            let after = market_price(item, self.market_inventory[item] + i32::from(value));
+            let impact = i64::from(value) * (before - after).max(0);
+            sells.push((kind, value, impact));
+        }
+        if impact_order {
+            sells.sort_by_key(|&(kind, _, impact)| (std::cmp::Reverse(impact), kind));
+        }
+        let mut slot = 0usize;
+        for (kind, value, _) in sells {
+            factors.action.market_kinds[slot] = kind;
+            factors.action.market_quantities[slot] = value - 1;
+            slot += 1;
+        }
+        for (index, &kind) in kinds.iter().enumerate().skip(PRODUCTS) {
+            let value = factors.values[index];
+            if value == 0 {
+                continue;
+            }
+            for _ in 0..if kind == 1 { usize::from(value) } else { 1 } {
+                factors.action.market_kinds[slot] = kind;
+                factors.action.market_quantities[slot] = if kind < 3 { 0 } else { value - 1 };
+                slot += 1;
+            }
+        }
+        debug_assert!(slot <= MAX_MARKET_ORDERS);
+        Ok(factors)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn sample_factors(
         &self,
@@ -1866,6 +2143,7 @@ impl Game {
                     [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
                 kind,
                 quantity_head,
+                quantity_mask,
                 &mut quantity_logits,
             );
             let (quantity, quantity_logprob, quantity_entropy) = sample_categorical(
@@ -2037,6 +2315,7 @@ impl Game {
                     [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
                 kind,
                 quantity_head,
+                quantity_mask,
                 &mut quantity_logits,
             );
             let (quantity, quantity_logprob, quantity_entropy) = sample_categorical(
@@ -2816,11 +3095,16 @@ fn score_quantities(
     context: &[f32],
     kind: usize,
     head: &QuantityHead<'_>,
+    mask: &[bool],
     output: &mut [f32; MARKET_QUANTITIES],
 ) {
+    if head.quantity_rows == 7 {
+        score_percentage_quantities(context, kind, head, mask, output);
+        return;
+    }
     #[allow(clippy::needless_range_loop)]
     for quantity in 0..MARKET_QUANTITIES {
-        let mut score = head.bias[kind * MARKET_QUANTITIES + quantity];
+        let mut score = head.bias[kind * head.quantity_rows + quantity];
         #[allow(clippy::needless_range_loop)]
         for rank in 0..head.rank {
             let feature = context[rank] * (1.0 + head.kind_gate[kind * head.rank + rank]);
@@ -2828,6 +3112,74 @@ fn score_quantities(
         }
         output[quantity] = score;
     }
+    if head.quantity_rows == MARKET_QUANTITIES + 1
+        && let Some(maximum) = mask.iter().rposition(|&legal| legal)
+    {
+        let mut all = head.bias[kind * head.quantity_rows + MARKET_QUANTITIES];
+        for (rank, &context_value) in context.iter().enumerate().take(head.rank) {
+            let feature = context_value * (1.0 + head.kind_gate[kind * head.rank + rank]);
+            all += feature * head.values[MARKET_QUANTITIES * head.rank + rank];
+        }
+        let bin = output[maximum];
+        let high = bin.max(all);
+        output[maximum] = high + ((bin.min(all) - high).exp()).ln_1p();
+    }
+}
+
+fn score_percentage_quantities(
+    context: &[f32],
+    kind: usize,
+    head: &QuantityHead<'_>,
+    mask: &[bool],
+    output: &mut [f32; MARKET_QUANTITIES],
+) {
+    let mut parameters = [0.0f32; 7];
+    for (row, parameter) in parameters.iter_mut().enumerate() {
+        *parameter = head.bias[kind * 7 + row];
+        for (rank, &context_value) in context.iter().enumerate().take(head.rank) {
+            *parameter += context_value
+                * (1.0 + head.kind_gate[kind * head.rank + rank])
+                * head.values[row * head.rank + rank];
+        }
+    }
+    let maximum = mask.iter().rposition(|&legal| legal).map_or(1, |last| last + 1);
+    let scale = (1.0 + parameters[6].exp()).ln() + 0.02;
+    let location = 1.0 / (1.0 + (-parameters[5]).exp());
+    let log_sigmoid = |value: f32| -(1.0 + (-value).exp()).ln();
+    let log_one_minus_exp = |delta: f32| (-(-delta).exp_m1()).ln();
+    let high = (1.0 - location) / scale;
+    let low = -location / scale;
+    let log_total = log_sigmoid(high)
+        + log_sigmoid(-low)
+        + log_one_minus_exp(1.0 / scale);
+    let delta = 1.0 / (maximum as f32 * scale);
+    for (index, output_score) in output.iter_mut().enumerate() {
+        let upper = ((index + 1) as f32 / maximum as f32 - location) / scale;
+        let lower = (index as f32 / maximum as f32 - location) / scale;
+        let log_mass = log_sigmoid(upper)
+            + log_sigmoid(-lower)
+            + log_one_minus_exp(delta);
+        *output_score = parameters[4] + log_mass - log_total;
+    }
+    for (atom, amount) in [(0, 1), (1, 2), (2, 3), (3, maximum)] {
+        if amount > maximum || !mask[amount - 1] {
+            continue;
+        }
+        let score = output[amount - 1];
+        let bonus = parameters[atom];
+        let high = score.max(bonus);
+        output[amount - 1] = high + (score.min(bonus) - high).exp().ln_1p();
+    }
+}
+
+fn market_set_score(context: &[f32], kind: usize, choice: usize, head: &QuantityHead<'_>) -> f32 {
+    let mut score = head.bias[kind * head.quantity_rows + choice];
+    for (rank, &feature) in context.iter().enumerate() {
+        score += feature
+            * (1.0 + head.kind_gate[kind * head.rank + rank])
+            * head.values[choice * head.rank + rank];
+    }
+    score
 }
 
 fn sample_categorical(
@@ -2838,10 +3190,10 @@ fn sample_categorical(
     draw: f32,
 ) -> (usize, f32, f32) {
     debug_assert_eq!(logits.len(), mask.len());
-    debug_assert!(logits.len() <= MARKET_QUANTITIES);
+    debug_assert!(logits.len() <= MARKET_SET_CHOICES);
     debug_assert!(mask.iter().any(|&valid| valid));
     let temperature = temperature.max(1e-4);
-    let mut weights = [0.0f32; MARKET_QUANTITIES];
+    let mut weights = [0.0f32; MARKET_SET_CHOICES];
     let mut maximum = f32::NEG_INFINITY;
     let mut argmax = 0usize;
     for index in 0..logits.len() {
@@ -3002,9 +3354,35 @@ enum Shape {
     Square,
     Sqrt,
     Log,
+    /// Linear in `x / T` up to the knee at `T`, then quadratic past it, so the
+    /// price holds near base until demand outruns a field's output and then
+    /// runs away. Scaled by `T`, so `f(T) = 1` (kaggle-environments 1.32.7).
+    Hinge,
 }
 
-const MARKET_PARAMS: [(f64, f64, Shape, f64, Shape, f64); PRODUCTS] = [
+/// The quadratic gain past a `Hinge` knee.
+const HINGE_GAIN: f64 = 8.0;
+
+/// `(base, T, below shape, below target, above shape, above target)`, around `MARKET_I0`.
+type MarketCurve = (f64, f64, Shape, f64, Shape, f64);
+
+const MARKET_PARAMS: [MarketCurve; PRODUCTS] = [
+    (25.0, 400.0, Shape::Sqrt, 0.80, Shape::Log, 0.20),
+    (35.0, 450.0, Shape::Hinge, 1.00, Shape::Sqrt, 0.70),
+    (60.0, 200.0, Shape::Hinge, 0.40, Shape::Sqrt, 0.60),
+    (120.0, 100.0, Shape::Sqrt, 0.70, Shape::Linear, 1.60),
+    (250.0, 300.0, Shape::Log, 0.20, Shape::Square, 3.60),
+    (50.0, 332.0, Shape::Hinge, 0.40, Shape::Log, 0.20),
+    (160.0, 122.0, Shape::Sqrt, 0.60, Shape::Linear, 1.60),
+    (200.0, 105.0, Shape::Log, 0.20, Shape::Square, 3.20),
+    (100.0, 200.0, Shape::Linear, 0.40, Shape::Linear, 0.40),
+];
+
+/// The public v27 agent's own copy of the curves, frozen at 1.32.6: carrot,
+/// tomato and egg still scarcity-price with `log` and `linear`. It scores the
+/// price impact of a sale with these rather than with the engine's, so the
+/// reference replays that misquote instead of the rules.
+const V27_MARKET_PARAMS: [MarketCurve; PRODUCTS] = [
     (25.0, 400.0, Shape::Sqrt, 0.80, Shape::Log, 0.20),
     (35.0, 450.0, Shape::Log, 0.20, Shape::Sqrt, 0.70),
     (60.0, 200.0, Shape::Linear, 0.40, Shape::Sqrt, 0.60),
@@ -3016,9 +3394,13 @@ const MARKET_PARAMS: [(f64, f64, Shape, f64, Shape, f64); PRODUCTS] = [
     (100.0, 200.0, Shape::Linear, 0.40, Shape::Linear, 0.40),
 ];
 
-fn money_feature(amount: i64) -> f32 {
+fn signed_log_money(amount: i64) -> f64 {
     let value = amount as f64;
-    (value.signum() * value.abs().ln_1p() / 12.0) as f32
+    value.signum() * value.abs().ln_1p()
+}
+
+fn money_feature(amount: i64) -> f32 {
+    (signed_log_money(amount) / 12.0) as f32
 }
 
 fn private_vector(private: &PrivateState, output: &mut [f32; 29]) {
@@ -3251,12 +3633,16 @@ fn encode_farm_structured(
     }
 }
 
-fn shape(kind: Shape, x: f64) -> f64 {
+fn shape(kind: Shape, x: f64, scale: f64) -> f64 {
     match kind {
         Shape::Linear => x,
         Shape::Square => x * x,
         Shape::Sqrt => x.sqrt(),
         Shape::Log => x.ln_1p(),
+        Shape::Hinge => {
+            let unit = x / scale;
+            unit + HINGE_GAIN * (unit - 1.0).max(0.0).powi(2)
+        }
     }
 }
 
@@ -3269,7 +3655,16 @@ fn symmetric_margin(zero: f64, one: f64, starting_money: f64) -> f32 {
 }
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
-    let (base, scale, below_shape, below_target, above_shape, above_target) = MARKET_PARAMS[item];
+    curve_price(MARKET_PARAMS[item], inventory)
+}
+
+/// The quote v27 believes a sale moves the price to (see `V27_MARKET_PARAMS`).
+fn v27_market_price(item: usize, inventory: i32) -> i64 {
+    curve_price(V27_MARKET_PARAMS[item], inventory)
+}
+
+fn curve_price(curve: MarketCurve, inventory: i32) -> i64 {
+    let (base, scale, below_shape, below_target, above_shape, above_target) = curve;
     let (kind, target, distance, sign) = if inventory < MARKET_I0 {
         (
             below_shape,
@@ -3285,8 +3680,8 @@ pub fn market_price(item: usize, inventory: i32) -> i64 {
             -1.0,
         )
     };
-    let amplitude = target * base / shape(kind, scale);
-    round_ties_even(base + sign * amplitude * shape(kind, distance)).max(PRICE_FLOOR)
+    let amplitude = target * base / shape(kind, scale, scale);
+    round_ties_even(base + sign * amplitude * shape(kind, distance, scale)).max(PRICE_FLOOR)
 }
 
 #[inline]
@@ -3520,10 +3915,22 @@ mod tests {
         assert_eq!(market_price(0, 10_000), 25);
         assert_eq!(market_price(0, 9_600), 45);
         assert_eq!(market_price(4, 10_300), 1);
-        assert_eq!(market_price(1, 9_999), 36);
-        assert_eq!(market_price(1, 9_550), 42);
-        assert_eq!(market_price(2, 9_600), 108);
-        assert_eq!(market_price(5, 9_336), 90);
+        // Carrot, tomato and egg take the 1.32.7 hinge on the scarcity side;
+        // each value is the official `market_price` at that inventory.
+        assert_eq!(market_price(1, 9_999), 35);
+        assert_eq!(market_price(1, 9_550), 70);
+        assert_eq!(market_price(1, 9_000), 531);
+        assert_eq!(market_price(1, 8_200), 2_695);
+        assert_eq!(market_price(2, 9_700), 144);
+        assert_eq!(market_price(2, 9_600), 300);
+        assert_eq!(market_price(5, 9_336), 250);
+        assert_eq!(market_price(5, 9_000), 758);
+        assert_eq!(market_price(5, 10_500), 39);
+        // v27's frozen quotes, from its own `_market_price`.
+        assert_eq!(v27_market_price(1, 9_550), 42);
+        assert_eq!(v27_market_price(2, 9_600), 108);
+        assert_eq!(v27_market_price(5, 9_336), 90);
+        assert_eq!(v27_market_price(0, 9_600), market_price(0, 9_600));
     }
 
     #[test]
@@ -4095,6 +4502,73 @@ mod tests {
         assert_eq!(game.farms[0].positions.len(), 2);
         assert_eq!(game.farms[0].unlocked, 0b0011);
         assert_eq!(game.farms[0].tiles[5].kind, TileKind::Empty);
+    }
+
+    #[test]
+    fn market_set_sells_fund_later_hire_and_compiles_effective_slots() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 0;
+        game.privates[0].shed[1] = 4;
+        let mut values = [0u8; MARKET_SET_KINDS];
+        values[1] = 4; // SELL_CARROT
+        values[9] = 1; // HIRE
+        let factors = game
+            .market_set_factors(0, &[0; MAX_UNITS], &values, false, false)
+            .unwrap();
+        assert!(factors.masks[1][4]);
+        assert!(factors.masks[9][1]);
+        assert_eq!(&factors.action.market_kinds[..3], &[14, 1, 0]);
+        assert_eq!(factors.action.market_quantities[0], 3);
+        game.step(&[factors.action, CompactAction::default()]);
+        assert_eq!(game.farms[0].positions.len(), 2);
+        assert_eq!(game.privates[0].shed[1], 0);
+    }
+
+    #[test]
+    fn market_set_hire_respects_ten_slot_budget() {
+        let game = Game::new(0, GameConfig::default());
+        let mut values = [0u8; MARKET_SET_KINDS];
+        values[9] = 10;
+        let factors = game
+            .market_set_factors(0, &[0; MAX_UNITS], &values, false, false)
+            .unwrap();
+        assert_eq!(&factors.action.market_kinds, &[1; MAX_MARKET_ORDERS]);
+        assert_eq!(factors.masks[10], {
+            let mut mask = [false; MARKET_SET_CHOICES];
+            mask[0] = true;
+            mask
+        });
+    }
+
+    #[test]
+    fn market_set_all_alias_marginalizes_to_maximum_legal_quantity() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[1] = 7;
+        let mut bias = [0.0f32; MARKET_KINDS * MARKET_SET_RAW_CHOICES];
+        bias[14 * MARKET_SET_RAW_CHOICES + MARKET_SET_CHOICES] = 20.0;
+        let values = [0.0f32; MARKET_SET_RAW_CHOICES];
+        let gates = [0.0f32; MARKET_KINDS];
+        let context = [0.0f32; MARKET_SET_KINDS];
+        let head = QuantityHead {
+            rank: 1,
+            quantity_rows: MARKET_SET_RAW_CHOICES,
+            kind_gate: &gates,
+            values: &values,
+            bias: &bias,
+        };
+        let factors = game.sample_market_set(
+            0,
+            &[0; MAX_UNITS],
+            &context,
+            &head,
+            &[0.0; MARKET_SET_KINDS],
+            true,
+            1.0,
+            false,
+            false,
+        );
+        assert_eq!(factors.values[1], 7);
+        assert_eq!(factors.action.market_quantities[0], 6);
     }
 
     #[test]

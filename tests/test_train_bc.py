@@ -253,6 +253,23 @@ def test_structured_cache_rejects_stale_tile_width(dataset_dir: Path, tmp_path: 
         trainer._encode_episode_file(str(episode), str(cache), architecture_name=STRUCTURED)
 
 
+def test_demonstrations_from_other_market_rules_are_rejected(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """A quote that disagrees with its inventory means the teacher played other rules."""
+    trainer = _load_trainer()
+    manifest = json.loads((dataset_dir / "manifest.json").read_text())
+    with np.load(dataset_dir / manifest["episodes"][0]["file"]) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    raw = json.loads(zlib.decompress(arrays["raw_json_zlib"].tobytes()))
+    raw["observations"][-1]["observation"]["market"]["prices"]["TOMATO"] += 1
+    arrays["raw_json_zlib"] = zlib.compress(json.dumps(raw).encode())
+    stale = tmp_path / "stale.npz"
+    np.savez(stale, **arrays)
+    with pytest.raises(ValueError, match=f"step {len(raw['observations']) - 1} quotes TOMATO"):
+        trainer._encode_episode_file(str(stale), None, architecture_name=STRUCTURED)
+
+
 def test_load_dataset_rejects_mask_violating_targets(dataset_dir: Path, tmp_path: Path) -> None:
     trainer = _load_trainer()
     corrupt = tmp_path / "corrupt"

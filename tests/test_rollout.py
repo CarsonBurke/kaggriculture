@@ -4,6 +4,7 @@ import gc
 import threading
 import weakref
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -50,8 +51,11 @@ from kaggriculture.rollout import (
     _cuda_graph_generation,
     _fill_gpu_policy_statistics,
     _gumbel_utilities,
+    _head_determinism_rows,
     _native_pair_rewards,
+    _quantity_heads,
     _stacked_actor_ensemble,
+    _stage_gpu_preferences,
     _state_field_specs,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
@@ -148,6 +152,79 @@ def test_gumbel_utilities_follow_categorical_probabilities() -> None:
         torch.Generator().manual_seed(2),
     )
     assert tied.argmax(dim=-1).item() == 0
+
+
+@pytest.mark.parametrize(
+    "sampled_heads,expected",
+    [
+        (None, (False, False, False)),
+        ((), (True, True, True)),
+        (("units",), (False, True, True)),
+        (("kinds",), (True, False, True)),
+        (("quantities",), (True, True, False)),
+        (("units", "kinds", "quantities"), (False, False, False)),
+    ],
+)
+def test_head_determinism_preserves_frozen_rows(sampled_heads, expected) -> None:
+    base = np.asarray([False, True, False, True], dtype=np.bool_)
+    unit, kind, quantity = _head_determinism_rows(base, np.asarray([0, 2]), sampled_heads)
+    for result, learner_value in zip((unit, kind, quantity), expected, strict=True):
+        np.testing.assert_array_equal(result[[0, 2]], [learner_value, learner_value])
+        np.testing.assert_array_equal(result[[1, 3]], base[[1, 3]])
+    np.testing.assert_array_equal(base, [False, True, False, True])
+
+
+def test_quantity_head_stack_rejects_mixed_action_interfaces() -> None:
+    actors = tuple(
+        SimpleNamespace(config=SimpleNamespace(action_interface=interface)) for interface in (1, 2)
+    )
+    with pytest.raises(ValueError, match="mixes action interfaces"):
+        _quantity_heads(actors)
+
+
+def test_market_set_storage_is_opt_in_and_keeps_compiled_slot_arrays() -> None:
+    legacy = allocate_rollout_storage(STRUCTURED, 2, 3)
+    assert "market_set_values" not in legacy
+    market_set = allocate_rollout_storage(STRUCTURED, 2, 3, action_interface=3)
+    assert market_set["market_set_values"].shape == (2, 3, 21)
+    assert market_set["market_set_values"].dtype == np.uint8
+    assert market_set["market_set_masks"].shape == (2, 3, 21, 101)
+    assert market_set["market_set_active"].shape == (2, 3, 21)
+    assert market_set["old_market_set_logprobs"].shape == (2, 3, 21)
+    assert market_set["market_kinds"].shape == legacy["market_kinds"].shape
+
+
+def test_gpu_preference_stage_routes_independent_unit_and_kind_modes(monkeypatch) -> None:
+    captured = []
+
+    def utilities(logits, temperatures, deterministic_rows, *unused):
+        captured.append(deterministic_rows.clone())
+        return logits.float()
+
+    monkeypatch.setattr("kaggriculture.rollout._gumbel_utilities", utilities)
+    output = ActorOutput(
+        unit_logits=torch.zeros(2, MAX_UNITS, N_UNIT_ACTIONS),
+        market_kind_logits=torch.zeros(2, MAX_MARKET_ORDERS, N_MARKET_KINDS),
+        market_quantity_context=torch.zeros(2, MAX_MARKET_ORDERS, 4),
+    )
+    transfer = SimpleNamespace(
+        units=torch.empty_like(output.unit_logits),
+        kinds=torch.empty_like(output.market_kind_logits),
+        quantity_context=torch.empty_like(output.market_quantity_context),
+        quantity_draws=torch.empty(2, MAX_MARKET_ORDERS),
+    )
+    _stage_gpu_preferences(
+        output,
+        torch.ones(2),
+        torch.tensor([False, True]),
+        torch.tensor([True, False]),
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.Generator().manual_seed(1),
+        torch.Generator().manual_seed(2),
+        transfer,
+    )
+    assert [row.tolist() for row in captured] == [[False, True], [True, False]]
 
 
 def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor() -> None:

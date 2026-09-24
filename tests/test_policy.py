@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from kaggle_environments import make
 
@@ -328,11 +329,17 @@ def test_compact_cpu_quantity_logits_match_actor_exactly() -> None:
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
+@pytest.mark.parametrize("action_interface", [1, 2])
+def test_component_logprobs_accepts_selected_kind_quantity_logits(action_interface: int) -> None:
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 37})
     observations = [row.observation for row in environment.reset(2)]
     config = ModelConfig(
-        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+        cnn_width=8,
+        cnn_blocks=1,
+        model_dim=16,
+        transformer_layers=3,
+        attention_heads=2,
+        action_interface=action_interface,
     )
     actor = FarmActor(config)
     # Without this the comparison at the end of the test runs over an empty
@@ -353,7 +360,11 @@ def test_component_logprobs_accepts_selected_kind_quantity_logits() -> None:
             torch.from_numpy(np.stack([row.unit_positions for row in encoded])).long(),
         )
         kinds = torch.from_numpy(policy_step.factors.market_kinds)
-        quantity_logits = actor.quantity_logits(output.market_quantity_context, kinds)
+        quantity_logits = actor.quantity_logits(
+            output.market_quantity_context,
+            kinds,
+            torch.from_numpy(policy_step.factors.market_quantity_masks),
+        )
         _, _, quantity_logprobs, *_ = component_logprobs(
             output,
             quantity_logits,

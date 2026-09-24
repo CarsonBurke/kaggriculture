@@ -30,9 +30,23 @@ from kaggriculture.registry import (
 ARMS = {
     "component-control": ("entity", ENTITY_ATTENTION, {}, "components", 0.0),
     "joint-control": ("entity", ENTITY_ATTENTION, {}, "joint", 0.0),
+    "joint-control-v4": (
+        "entity-v4",
+        ENTITY_ATTENTION,
+        {"observation_schema_version": 4},
+        "joint",
+        0.0,
+    ),
     "workspace": ("workspace", STRATEGIC, {"plan_count": 1}, "joint", 0.0),
     "shared-plan": ("shared-plan", STRATEGIC, {"plan_count": 8}, "joint", 0.0),
     "causal": ("causal", CAUSAL, {}, "joint", 0.0),
+    "causal-v4": (
+        "causal-v4",
+        CAUSAL,
+        {"observation_schema_version": 4},
+        "joint",
+        0.0,
+    ),
     "economic-control": (
         "entity",
         ENTITY_ATTENTION,
@@ -50,12 +64,21 @@ ARMS = {
     # The production contract is the entity family's, whose critic has no readout
     # feed-forward; this family's critic is designed with one (LejepaConfig).
     "lejepa": ("lejepa", LEJEPA, {"critic_readout_ffn": True}, "components", 0.0),
+    "lejepa-quantity-all": (
+        "lejepa-quantity-all",
+        LEJEPA,
+        {"critic_readout_ffn": True, "action_interface": 2},
+        "components",
+        0.0,
+    ),
 }
 FAMILIES = {
     "actor": ("component-control", "joint-control", "workspace", "shared-plan"),
     "critic": ("component-control", "economic-control", "forecast"),
     "causal": ("joint-control", "causal"),
+    "causal-v4": ("joint-control-v4", "causal-v4"),
     "lejepa": ("component-control", "lejepa"),
+    "quantity": ("lejepa", "lejepa-quantity-all"),
 }
 #: The LeJEPA objective's shipped weights (README, "LeJEPA world model"). The
 #: family trains its backbone with nothing else, in BC as in PPO, so every job
@@ -63,12 +86,13 @@ FAMILIES = {
 #: takes the two transition terms and PPO adds the reward head.
 JEPA_COEFFICIENTS = {"prediction": 1.0, "sigreg": 0.09, "reward": 0.1}
 JEPA_HORIZON = 1
-#: Clone epochs, (every other family, `lejepa`). The entity actor's clone is
-#: converged in two (holdout NLL 0.0012). A `lejepa` clone fits heads to an
-#: encoder its own objective is still building, and reaches parity only later:
-#: market-kind accuracy 0.90 after two epochs, 0.997 (NLL 0.0033) after twelve.
-#: Cloning keeps the best held-out epoch, so the longer budget cannot overfit.
-BC_EPOCHS = (2, 12)
+#: PPO's backbone rate for a `lejepa` arm, a tenth of the actor's. The encoder
+#: takes the summed JEPA and policy gradient; at the actor's 1.5e-4 it moves
+#: under both heads every minibatch. At 1.5e-5 (JEPA_RUNS, job 9281) the
+#: same clone and recipe beat the full-rate run (9275).
+JEPA_BACKBONE_LEARNING_RATE = 1.5e-5
+MAX_JOB_MINUTES = 30
+TRAINER_HOURS = 27 / 60
 
 
 def jepa_arguments(arm: str, *, reward: bool) -> list[str]:
@@ -96,7 +120,12 @@ def set_argument(command: list[str], flag: str, value: Any) -> None:
 def arm_config(arm: str):
     _, family, changes, _, _ = ARMS[arm]
     architecture = resolve_architecture(family)
-    config = architecture.config_class(**(production_model_config() | changes))
+    base = production_model_config()
+    if family == LEJEPA:
+        # Production's entity config uses v3; fresh LeJEPA arms inherit their
+        # own promoted schema while existing artifacts keep their saved schema.
+        base["observation_schema_version"] = architecture.config_class().observation_schema_version
+    config = architecture.config_class(**(base | changes))
     return architecture, config
 
 
@@ -105,7 +134,7 @@ def training_command(arm: str, run: Path, bc: Path, source: Path) -> list[str]:
     command = build_training_command(
         run,
         iterations=500,
-        max_hours=4.0,
+        max_hours=TRAINER_HOURS,
         seed=20260812,
         rollout_forward_mode="inductor_graph",
         update_compile_mode="reduce-overhead",
@@ -123,6 +152,8 @@ def training_command(arm: str, run: Path, bc: Path, source: Path) -> list[str]:
     set_argument(command, "--economic-forecast-coefficient", ARMS[arm][4])
     set_argument(command, "--architecture-panel", 25)
     command.extend(jepa_arguments(arm, reward=True))
+    if ARMS[arm][1] == LEJEPA:
+        set_argument(command, "--structured-learning-rate", JEPA_BACKBONE_LEARNING_RATE)
     return command
 
 
@@ -138,7 +169,9 @@ def main() -> None:
     if args.validation_job < 1:
         parser.error("validation-job must be a submitted positive job ID")
     arms = tuple(args.arms or FAMILIES[args.family])
-    if "causal" in arms and (args.causal_validation_job is None or args.causal_validation_job < 1):
+    if any(ARMS[arm][1] == CAUSAL for arm in arms) and (
+        args.causal_validation_job is None or args.causal_validation_job < 1
+    ):
         parser.error("causal arm requires a positive --causal-validation-job")
     if len(set(arms)) != len(arms):
         parser.error("duplicate arms")
@@ -173,12 +206,15 @@ def main() -> None:
         "analysis_plan": {
             "primary": "Sampled and argmax native fixed-panel win/draw scores; paired maps",
             "training": (
-                "500 waves, 128 self + 64 league, production minibatch, 720 steps, "
-                "one training seed"
+                "Up to 500 waves per run, 128 self + 64 league, production "
+                "minibatch, 720 steps, one training seed"
             ),
-            "time_limit": "4 trainer hours / 250 minute hard limit, not equal-update evidence",
+            "time_limit": (
+                "27-minute trainer budget / 30-minute per-job hard limit; "
+                "partial-budget evidence unless resumed in another bounded job"
+            ),
             "initialization": (
-                "Same four corpora, BC to convergence per family; critic arms share actor bytes"
+                "Same four corpora, two BC epochs per family; critic arms share actor bytes"
             ),
             "defaults": (
                 "hardness league, source-read critic, actor/critic NextLat off (the lejepa "
@@ -209,6 +245,8 @@ def main() -> None:
     destination.mkdir(parents=True)
 
     def submit(label: str, command: list[str], minutes: int, parents: list[int], *, terminal=False):
+        if not 0 < minutes <= MAX_JOB_MINUTES:
+            raise ValueError(f"{label} exceeds the {MAX_JOB_MINUTES}-minute per-job limit")
         queue = [
             "mlq",
             "submit",
@@ -274,8 +312,6 @@ def main() -> None:
                 str(root / "data" / ".bc-encoded-cache"),
                 "--device",
                 "cuda",
-                "--epochs",
-                str(BC_EPOCHS[architecture.name == LEJEPA]),
                 "--batch-size",
                 "1024",
                 "--compile-mode",
@@ -290,8 +326,8 @@ def main() -> None:
                 *(["--run-length", str(JEPA_HORIZON + 1)] if architecture.name == LEJEPA else []),
                 *jepa_arguments(arm, reward=False),
             ],
-            60,
-            [args.causal_validation_job if owner == "causal" else args.validation_job],
+            30,
+            [args.causal_validation_job if architecture.name == CAUSAL else args.validation_job],
         )
     for arm in arms:
         owner, _, _, ratio, forecast = ARMS[arm]
@@ -351,13 +387,13 @@ def main() -> None:
                 str(destination / f"{arm}-benchmark.jsonl"),
                 *jepa_arguments(arm, reward=True),
             ],
-            45,
+            30,
             [bc_jobs[owner]],
         )
         learning = submit(
             f"learn-{arm}",
             training_command(arm, runs / arm / "ppo", bc_paths[owner], source),
-            250,
+            30,
             [gate],
         )
         for decoding in ("argmax", "sampled"):

@@ -501,10 +501,6 @@ _TRAINING_TAGS = {
     "actor_gradient_norm": "actor/gradient_norm",
     "advantage_mean": "actor/advantage_mean",
     "advantage_std": "actor/advantage_std",
-    # The anchor to the initial actor sits with the objective it shapes; its
-    # worst single decision is the reading, since the mean cannot see one flip.
-    "reference_kl": "actor/reference_kl",
-    "max_reference_decision_kl": "actor/max_reference_decision_kl",
     # What bounds the step, separated from what takes it. These are read
     # together and against each other -- a clip fraction climbing while the KL
     # stays flat is a different situation from both climbing -- and they are

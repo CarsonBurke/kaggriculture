@@ -1,7 +1,7 @@
 # Game Overview
 
 These notes describe the rules implemented by the repository's pinned
-`kaggle-environments==1.32.6`, using the default configuration unless stated
+`kaggle-environments==1.32.7`, using the default configuration unless stated
 otherwise.
 
 Kaggriculture is a two-player farming simulation. Each player controls a separate

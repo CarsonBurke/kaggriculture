@@ -78,6 +78,10 @@ movement of `T` units changes on that side. Available shapes are:
 - `sqrt(x) = square root of x`
 - `log(x) = natural log of (1 + x)`
 - `log10(x) = base-10 log of (1 + x)`
+- `hinge(x) = u + 8 * max(0, u - 1)^2` with `u = x / T`: linear in `u` up to
+  the knee at `T`, then quadratic, so the price holds near base until demand
+  outruns a field's output and then runs away. It is the one shape scaled by
+  `T`, so `hinge(T) = 1` and `target` keeps its meaning.
 
 ## Default Curves
 
@@ -87,11 +91,11 @@ movement of `T` units changes on that side. Available shapes are:
 | Product | Base | T | Below shape / target | Above shape / target |
 |-|-:|-:|-|-|
 | Wheat | $25 | 400 | sqrt / 0.80 | log / 0.20 |
-| Carrot | $35 | 450 | log / 0.20 | sqrt / 0.70 |
-| Tomato | $60 | 200 | linear / 0.40 | sqrt / 0.60 |
+| Carrot | $35 | 450 | hinge / 1.00 | sqrt / 0.70 |
+| Tomato | $60 | 200 | hinge / 0.40 | sqrt / 0.60 |
 | Strawberry | $120 | 100 | sqrt / 0.70 | linear / 1.60 |
 | Melon | $250 | 300 | log / 0.20 | sq / 3.60 |
-| Egg | $50 | 332 | linear / 0.40 | log / 0.20 |
+| Egg | $50 | 332 | hinge / 0.40 | log / 0.20 |
 | Milk | $160 | 122 | sqrt / 0.60 | linear / 1.60 |
 | Wool | $200 | 105 | log / 0.20 | sq / 3.20 |
 | Fertilizer | $100 | 200 | linear / 0.40 | linear / 0.40 |

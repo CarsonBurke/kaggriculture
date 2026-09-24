@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from kaggriculture import rust_env
+from kaggriculture.constants import PRODUCTS, market_price
 
 
 @pytest.fixture(autouse=True)
@@ -49,9 +50,22 @@ def test_the_toolchain_is_reported_when_present_and_absent_without_failing(monke
         assert rust_env.toolchain_identity() is None
 
 
+class FakeBatchEnv:
+    """Quotes the Python rules on demand, which the loader checks against the official ones."""
+
+    @staticmethod
+    def policy_market_prices(minimum: int, _maximum: int) -> Any:
+        class Quotes:
+            def __getitem__(self, cell: tuple[int, int]) -> int:
+                item, offset = cell
+                return market_price(PRODUCTS[item], minimum + offset)
+
+        return Quotes()
+
+
 def fake_module() -> ModuleType:
     module = ModuleType("_kagg_env")
-    module.BatchEnv = object  # type: ignore[attr-defined]
+    module.BatchEnv = FakeBatchEnv  # type: ignore[attr-defined]
     from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
 
     module.OBSERVATION_SCHEMA_VERSION = OBSERVATION_SCHEMA_VERSION
@@ -421,3 +435,19 @@ def test_module_contract_is_validated() -> None:
     module.BatchEnv = object
     with pytest.raises(ImportError, match="stale observation schema"):
         rust_env._validate_module(module, "test module")
+
+
+def test_an_engine_that_disagrees_with_the_installed_market_rules_is_rejected(
+    monkeypatch,
+) -> None:
+    from kaggle_environments.envs.kaggriculture import kaggriculture as official
+
+    native = rust_env.load_native()
+    quote = official.market_price
+    monkeypatch.setattr(
+        official,
+        "market_price",
+        lambda item, inventory: quote(item, inventory) + (item == "TOMATO" and inventory < 0),
+    )
+    with pytest.raises(ImportError, match="TOMATO at inventory -20000"):
+        rust_env._validate_module(native, "test")

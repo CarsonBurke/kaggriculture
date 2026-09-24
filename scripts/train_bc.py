@@ -47,6 +47,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import torch
 
+from kaggriculture.constants import PRODUCTS, market_price
 from kaggriculture.device_ledger import (
     get_device_ledger,
     pack_observations,
@@ -101,7 +102,7 @@ from kaggriculture.telemetry import TensorboardMirror
 from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.training import replace_checkpoint_alias, write_immutable_checkpoint
 
-SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1,))
+SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1, 3))
 BC_ENCODING_CACHE_FORMAT_VERSION = 2
 _ENCODING_SOURCE_FILES = frozenset(
     {
@@ -123,6 +124,7 @@ _FACTOR_FIELDS = (
     "market_active",
     "market_quantity_active",
 )
+_MARKET_SET_FIELDS = ("market_set_values", "market_set_masks", "market_set_active")
 
 # Actor-input state fields per family; the structured critic-only extras are
 # irrelevant here because behavior cloning trains the actor alone.
@@ -531,6 +533,7 @@ def _encode_episode_file(
     cache_text: str | None = None,
     *,
     architecture_name: str,
+    action_interface: int = 1,
 ) -> dict[str, np.ndarray]:
     """Encode one episode-seat archive's raw observations into model inputs."""
 
@@ -541,7 +544,8 @@ def _encode_episode_file(
     )
     if architecture_name == "causal-execution":
         state_fields.add("policy_ledger")
-    expected = set(_FACTOR_FIELDS) | state_fields
+    factor_fields = (*_FACTOR_FIELDS, *(_MARKET_SET_FIELDS if action_interface == 3 else ()))
+    expected = set(factor_fields) | state_fields
     cache = None if cache_text is None else Path(cache_text)
     if cache is not None:
         cached = _cached_episode_arrays(cache, expected)
@@ -557,7 +561,8 @@ def _encode_episode_file(
 
     with np.load(path_text) as archive:
         raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()))
-        arrays = {name: archive[name] for name in _FACTOR_FIELDS}
+        arrays = {name: archive[name] for name in factor_fields}
+    _validate_market_rules(raw["observations"], path_text)
     if architecture_name == CONV_ENTITY:
         encoded = [
             encode_observation(entry["observation"], entry["opponent_private"])
@@ -607,12 +612,34 @@ def _encode_episode_file(
     return arrays
 
 
+def _validate_market_rules(observations: list[dict], name: str) -> None:
+    """Reject demonstrations recorded under other market rules than these.
+
+    Every quote is a function of its inventory, so one disagreement shows the
+    teacher played another rule set. The encoding cache key covers
+    `constants.py`, so a rules change re-encodes, and so re-checks, every episode.
+    """
+    for step, entry in enumerate(observations):
+        market = entry["observation"]["market"]
+        for item in PRODUCTS:
+            quoted = market["prices"][item]
+            expected = market_price(item, market["inventory"][item])
+            if quoted != expected:
+                raise ValueError(
+                    f"{name}: step {step} quotes {item} at {quoted}, but these market rules "
+                    f"give {expected}; re-extract the demonstrations under the current rules"
+                )
+
+
 def _validate_targets_satisfy_masks(arrays: dict[str, np.ndarray], name: str) -> None:
-    for factor, mask, active in (
+    fields = [
         ("unit_actions", "unit_masks", "unit_active"),
         ("market_kinds", "market_kind_masks", "market_active"),
         ("market_quantities", "market_quantity_masks", "market_quantity_active"),
-    ):
+    ]
+    if "market_set_values" in arrays:
+        fields.append(("market_set_values", "market_set_masks", "market_set_active"))
+    for factor, mask, active in fields:
         selected = np.take_along_axis(
             arrays[mask], arrays[factor][..., None].astype(np.int64), axis=-1
         )[..., 0]
@@ -656,9 +683,13 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
                 )
             stacked[name][offset : offset + span] = value
 
+        component_fields = (
+            ("unit_active", "market_set_active")
+            if "market_set_active" in member
+            else ("unit_active", "market_active", "market_quantity_active")
+        )
         components[offset : offset + span] = sum(
-            member[name].astype(np.float64).sum(axis=1)
-            for name in ("unit_active", "market_active", "market_quantity_active")
+            member[name].astype(np.float64).sum(axis=1) for name in component_fields
         )
         episode_index[offset : offset + span] = position
         step[offset : offset + span] = np.arange(span, dtype=np.int32)
@@ -681,6 +712,9 @@ def load_dataset(
     torch_threads: int = 1,
     seeds_per_dataset: int | None = None,
     encoded_cache: Path | None = None,
+    action_interface: int = 1,
+    market_set_sell_order: str = "fixed",
+    market_set_hire_last: bool = False,
 ) -> tuple[DemonstrationTensors, DemonstrationTensors, list[dict[str, Any]]]:
     """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
 
@@ -709,6 +743,16 @@ def load_dataset(
         version = manifest.get("format_version")
         if version not in SUPPORTED_DATASET_FORMAT_VERSIONS:
             raise ValueError(f"{directory}: unsupported dataset format: {version}")
+        if (version == 3) != (action_interface == 3):
+            raise ValueError(
+                f"{directory}: format {version} is incompatible with action_interface="
+                f"{action_interface}"
+            )
+        if version == 3 and manifest.get("market_set") != {
+            "sell_order": market_set_sell_order,
+            "hire_last": market_set_hire_last,
+        }:
+            raise ValueError(f"{directory}: market set order disagrees with actor config")
         if not manifest["episodes"]:
             raise ValueError(f"{directory}: dataset manifest lists no episodes")
         # A step means one environment decision at a fixed horizon; mixing
@@ -772,7 +816,11 @@ def load_dataset(
         ]
         for record in records:
             record["encoded_cache_schema"] = schema
-    encode = partial(_encode_episode_file, architecture_name=architecture)
+    encode = (
+        partial(_encode_episode_file, architecture_name=architecture, action_interface=3)
+        if action_interface == 3
+        else partial(_encode_episode_file, architecture_name=architecture)
+    )
     if encode_workers < 1:
         raise ValueError("encode workers must be positive")
     workers = min(encode_workers, len(paths))
@@ -852,6 +900,12 @@ def _batch(
         "market_active": rows["market_active"],
         "market_quantity_active": rows["market_quantity_active"],
     }
+    if "market_set_values" in rows:
+        factors.update(
+            market_set_values=_batch_tensor(rows["market_set_values"], whole, torch.long),
+            market_set_masks=rows["market_set_masks"],
+            market_set_active=rows["market_set_active"],
+        )
     # The auxiliary needs to know which rows are consecutive steps of one
     # episode-seat. Carried as int64 on the device rather than recomputed from
     # the host order, so the pairing a step trains on is the pairing that step's
@@ -876,9 +930,28 @@ def _clone_loss_from_output(
     belief and the logits separately would double the most expensive part of the
     step to save nothing.
     """
+    if getattr(actor.config, "action_interface", 1) == 3:
+        unit_logits = mask_logits(output.unit_logits, factors["unit_masks"], validate=False)
+        unit_logprob = unit_logits.log_softmax(-1).gather(-1, factors["unit_actions"][..., None])[
+            ..., 0
+        ]
+        market_logits = mask_logits(
+            actor.market_set_logits(output.market_quantity_context, factors["market_set_masks"]),
+            factors["market_set_masks"],
+            validate=False,
+        )
+        market_logprob = market_logits.log_softmax(-1).gather(
+            -1, factors["market_set_values"][..., None]
+        )[..., 0]
+        active = torch.cat((factors["unit_active"], factors["market_set_active"]), dim=1)
+        return -_masked_mean(torch.cat((unit_logprob, market_logprob), dim=1), active)
     unit_logprob, kind_logprob, quantity_logprob = component_selected_logprobs(
         output,
-        actor.quantity_logits(output.market_quantity_context, factors["market_kinds"]),
+        actor.quantity_logits(
+            output.market_quantity_context,
+            factors["market_kinds"],
+            factors["market_quantity_masks"],
+        ),
         factors["unit_actions"],
         factors["market_kinds"],
         factors["market_quantities"],
@@ -928,7 +1001,11 @@ def _strategic_clone_loss(
     expanded = _expand_plan_factors(factors, log_prior.shape[1])
     logprobs = component_selected_logprobs(
         output,
-        actor.quantity_logits(output.market_quantity_context, expanded["market_kinds"]),
+        actor.quantity_logits(
+            output.market_quantity_context,
+            expanded["market_kinds"],
+            expanded["market_quantity_masks"],
+        ),
         expanded["unit_actions"],
         expanded["market_kinds"],
         expanded["market_quantities"],
@@ -1239,19 +1316,53 @@ def evaluate(
 ) -> dict[str, float]:
     """Per-head masked NLL, top-1 accuracy, and entropy on one split."""
     actor.eval()
-    sums = {name: 0.0 for name in ("unit", "kind", "quantity")}
+    head_names = (
+        ("unit", "set")
+        if getattr(actor.config, "action_interface", 1) == 3
+        else ("unit", "kind", "quantity")
+    )
+    sums = {name: 0.0 for name in head_names}
     hits = dict(sums)
     entropies = dict(sums)
     counts = dict(sums)
     for start in range(0, tensors.rows, batch_size):
         indices = slice(start, min(start + batch_size, tensors.rows))
         actor_args, factors = _batch(architecture, tensors, indices, device)
-        if isinstance(actor, StrategicActor):
+        if getattr(actor.config, "action_interface", 1) == 3:
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
+                output = actor(*actor_args)
+                logits = {
+                    "unit": mask_logits(output.unit_logits, factors["unit_masks"], validate=False),
+                    "set": mask_logits(
+                        actor.market_set_logits(
+                            output.market_quantity_context, factors["market_set_masks"]
+                        ),
+                        factors["market_set_masks"],
+                        validate=False,
+                    ),
+                }
+            heads = {}
+            for name, target, mask, activity in (
+                ("unit", "unit_actions", "unit_masks", "unit_active"),
+                ("set", "market_set_values", "market_set_masks", "market_set_active"),
+            ):
+                distribution = logits[name].log_softmax(-1)
+                heads[name] = (
+                    distribution.gather(-1, factors[target][..., None])[..., 0],
+                    -(distribution.exp() * distribution).sum(-1),
+                    logits[name],
+                    factors[mask],
+                    factors[target],
+                    factors[activity],
+                )
+        elif isinstance(actor, StrategicActor):
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
                 output, log_prior = actor.all_plans(actor_args[0])
                 expanded = _expand_plan_factors(factors, log_prior.shape[1])
                 quantity_logits = actor.quantity_logits(
-                    output.market_quantity_context, expanded["market_kinds"]
+                    output.market_quantity_context,
+                    expanded["market_kinds"],
+                    expanded["market_quantity_masks"],
                 )
                 statistics = _plan_prefix_statistics(
                     log_prior,
@@ -1284,7 +1395,9 @@ def evaluate(
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
                 output = actor(*actor_args)
                 quantity_logits = actor.quantity_logits(
-                    output.market_quantity_context, factors["market_kinds"]
+                    output.market_quantity_context,
+                    factors["market_kinds"],
+                    factors["market_quantity_masks"],
                 )
                 logprobs_entropies = component_logprobs(
                     output,
@@ -1670,6 +1783,10 @@ def train(
     if not all(math.isfinite(value) and value >= 0 for value in jepa_coefficients):
         raise ValueError("LeJEPA coefficients must be finite and nonnegative")
     jepa_active = any(jepa_coefficients)
+    if getattr(config, "action_interface", 1) == 3 and (
+        entity_active or structured_active or jepa_active
+    ):
+        raise ValueError("market-set BC currently supports clone loss without decision auxiliaries")
     if jepa_active != (family.name == LEJEPA):
         # Without its objective this family is an entity trunk under another
         # name, and its detached ablation would fit a readout over an encoder
@@ -1756,6 +1873,9 @@ def train(
         torch_threads=torch_threads,
         seeds_per_dataset=seeds_per_dataset,
         encoded_cache=encoded_cache,
+        action_interface=getattr(config, "action_interface", 1),
+        market_set_sell_order=getattr(config, "market_set_sell_order", "fixed"),
+        market_set_hire_last=getattr(config, "market_set_hire_last", False),
     )
     # `train_split.rows` is fixed for the life of the process, so the partition
     # is computed once: every epoch reshuffles only the order these positions
@@ -2186,12 +2306,16 @@ def train(
             metrics_file.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
             metrics_file.flush()
             writer.record(record)
+            accuracy = (
+                f"set {holdout['set_accuracy']:.3f}"
+                if getattr(config, "action_interface", 1) == 3
+                else f"kind {holdout['kind_accuracy']:.3f} "
+                f"quantity {holdout['quantity_accuracy']:.3f}"
+            )
             print(
                 f"epoch {epoch}: train {record['train_loss']:.4f} "
                 f"holdout {holdout['nll']:.4f} "
-                f"acc unit {holdout['unit_accuracy']:.3f} "
-                f"kind {holdout['kind_accuracy']:.3f} "
-                f"quantity {holdout['quantity_accuracy']:.3f}",
+                f"acc unit {holdout['unit_accuracy']:.3f} {accuracy}",
                 flush=True,
             )
             checkpoint_path = output_dir / epoch_checkpoint_pattern.format(epoch=epoch + 1)

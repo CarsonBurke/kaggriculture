@@ -299,7 +299,9 @@ class DecodeHeads(NamedTuple):
                 market_quantity_context=_frozen_linear(self.market_quantity_context, market),
             )
 
-    def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
+    def quantity_logits(
+        self, quantity_context: Tensor, market_kinds: Tensor, quantity_mask: Tensor | None = None
+    ) -> Tensor:
         """`FarmActor.quantity_logits` with every head weight detached."""
         return factored_quantity_logits(
             quantity_context,
@@ -308,6 +310,7 @@ class DecodeHeads(NamedTuple):
             _FrozenEmbedding(self.market_quantity_value.weight.detach()),
             self.market_quantity_bias.detach(),
             self.quantity_rank,
+            quantity_mask,
         )
 
 
@@ -397,8 +400,12 @@ def latent_decode_kl_terms(
         (row & masks.market_active).float(),
     )
     quantity_kl, quantity_weight = _decision_kl(
-        heads.quantity_logits(student.market_quantity_context, masks.market_kinds),
-        heads.quantity_logits(teacher_quantity_context, masks.market_kinds),
+        heads.quantity_logits(
+            student.market_quantity_context, masks.market_kinds, masks.market_quantity_masks
+        ),
+        heads.quantity_logits(
+            teacher_quantity_context, masks.market_kinds, masks.market_quantity_masks
+        ),
         masks.market_quantity_masks,
         (row & masks.market_quantity_active).float(),
     )

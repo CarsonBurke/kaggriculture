@@ -234,12 +234,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-mode", choices=REWARD_MODES, default=DEFAULT_REWARD_MODE)
     parser.add_argument("--target-kl", type=float, default=_PRODUCTION_PPO["target_kl"])
     parser.add_argument(
-        "--reference-kl-coefficient",
-        type=float,
-        default=PpoConfig.reference_kl_coefficient,
-        help="anchor the update to --init-actor-from, so its extra forward is timed",
-    )
-    parser.add_argument(
         "--policy-loss-reduction",
         choices=("components", "states"),
         default=_PRODUCTION_PPO["policy_loss_reduction"],
@@ -279,6 +273,11 @@ def parse_args() -> argparse.Namespace:
             default=_PRODUCTION_PPO[f"jepa_{term}_coefficient"],
         )
     parser.add_argument("--jepa-horizon", type=int, default=_PRODUCTION_PPO["jepa_horizon"])
+    parser.add_argument(
+        "--jepa-detach-target",
+        action=argparse.BooleanOptionalAction,
+        default=_PRODUCTION_PPO["jepa_detach_target"],
+    )
     parser.add_argument(
         "--max-update-replay-kl",
         type=float,
@@ -531,8 +530,6 @@ def main() -> None:
         raise ValueError("temperature must be finite and positive")
     if args.temperature != 1.0:
         raise ValueError("on-policy PPO benchmarking requires --temperature 1.0")
-    if args.reference_kl_coefficient > 0.0 and args.init_actor_from is None:
-        raise ValueError("--reference-kl-coefficient anchors to --init-actor-from's artifact")
     _validate_numerics_gates(args)
     device = torch.device(args.device)
     if (args.profile_repeat is None) != (args.trace_path is None):
@@ -578,7 +575,6 @@ def main() -> None:
             "critic_epochs": args.critic_epochs,
             "minibatch_size": args.minibatch_size,
             "target_kl": args.target_kl,
-            "reference_kl_coefficient": args.reference_kl_coefficient,
             "actor_gae_lambda": args.actor_gae_lambda,
             "policy_loss_reduction": args.policy_loss_reduction,
             "policy_ratio_scope": args.policy_ratio_scope,
@@ -591,6 +587,7 @@ def main() -> None:
             "jepa_sigreg_coefficient": args.jepa_sigreg_coefficient,
             "jepa_reward_coefficient": args.jepa_reward_coefficient,
             "jepa_horizon": args.jepa_horizon,
+            "jepa_detach_target": args.jepa_detach_target,
             "use_bfloat16": not args.no_bfloat16,
             "update_compile_mode": args.update_compile_mode,
         }
@@ -606,6 +603,7 @@ def main() -> None:
                 "jepa_prediction_coefficient": 0.0,
                 "jepa_sigreg_coefficient": 0.0,
                 "jepa_reward_coefficient": 0.0,
+                "jepa_detach_target": False,
             }
         )
     initial_actor_digest = (
@@ -693,7 +691,6 @@ def main() -> None:
 
             actor.set_device_ledger(get_device_ledger(device))
         initial_payload = None
-        reference_actor = None
         if args.init_actor_from is not None:
             pretrained, initial_payload = load_actor_artifact(args.init_actor_from, device=device)
             artifact_config = actor_model_config(pretrained.config)
@@ -704,8 +701,6 @@ def main() -> None:
             ):
                 raise ValueError("initial actor model configuration does not match benchmark")
             actor.load_state_dict(pretrained.state_dict())
-            if ppo_config.reference_kl_coefficient > 0.0:
-                reference_actor = pretrained.eval().requires_grad_(False)
             del pretrained
         critic = architecture.critic_class(model_config).to(device)
         pair_towers(actor, critic)
@@ -765,6 +760,7 @@ def main() -> None:
             self_play_games * 2 + args.league_games,
             PRODUCTION_EPISODE_STEPS - 1,
             pin_memory=device.type == "cuda",
+            action_interface=actor.config.action_interface,
         )
         repeat_payloads = []
 
@@ -933,7 +929,6 @@ def main() -> None:
                             "league": np.arange(rollout.trajectories) >= self_play_games * 2,
                         },
                         diagnostic_gradients=repeat == 1,
-                        reference_actor=reference_actor,
                     )
                     _synchronize(device)
                     update_seconds = time.perf_counter() - update_started

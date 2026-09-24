@@ -454,12 +454,16 @@ def family_benchmark(family, config, artifact, staged, plan, args, deadline):
                 (
                     expected.unit_logits,
                     expected.market_kind_logits,
-                    actor.quantity_logits(expected.market_quantity_context, factors[1][:rows]),
+                    actor.quantity_logits(
+                        expected.market_quantity_context, factors[1][:rows], factors[5][:rows]
+                    ),
                 ),
                 (
                     actual.unit_logits,
                     actual.market_kind_logits,
-                    actor.quantity_logits(actual.market_quantity_context, factors[1][:rows]),
+                    actor.quantity_logits(
+                        actual.market_quantity_context, factors[1][:rows], factors[5][:rows]
+                    ),
                 ),
                 factors[3:6],
                 factors[6:9],

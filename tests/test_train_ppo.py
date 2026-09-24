@@ -2319,51 +2319,6 @@ _TINY_CONFIG = ModelConfig(
 )
 
 
-def test_reference_actors_are_frozen_clones_of_each_recorded_initial_actor(tmp_path) -> None:
-    module = _training_script()
-    records = []
-    for index in range(2):
-        torch.manual_seed(index)
-        path = _actor_artifact(
-            tmp_path / f"initial-{index}.pt", FarmActor(_TINY_CONFIG), _TINY_CONFIG
-        )
-        records.append({"path": str(path), "sha256": module.file_sha256(path)})
-
-    references = module._load_reference_actors(
-        {"agents": records}, population=2, device=torch.device("cpu")
-    )
-
-    assert len(references) == 2
-    for reference, record in zip(references, records, strict=True):
-        assert not reference.training
-        assert not any(value.requires_grad for value in reference.parameters())
-        saved = torch.load(record["path"], weights_only=False)["actor"]
-        for name, value in reference.state_dict().items():
-            assert torch.equal(value, saved[name]), name
-    # One agent's record is the whole provenance, not a one-element population.
-    (single,) = module._load_reference_actors(records[0], 1, torch.device("cpu"))
-    assert torch.equal(
-        next(iter(single.state_dict().values())), next(iter(references[0].state_dict().values()))
-    )
-
-
-def test_reference_actors_refuse_a_run_without_a_matching_warm_start(tmp_path) -> None:
-    module = _training_script()
-    path = _actor_artifact(tmp_path / "initial.pt", FarmActor(_TINY_CONFIG), _TINY_CONFIG)
-    record = {"path": str(path), "sha256": module.file_sha256(path)}
-    cpu = torch.device("cpu")
-
-    with pytest.raises(ValueError, match="--init-actor-from"):
-        module._load_reference_actors(None, 1, cpu)
-    with pytest.raises(ValueError, match="one initial actor per agent"):
-        module._load_reference_actors(record, 2, cpu)
-    # An artifact rewritten after the run began is no longer the clone the
-    # first wave started from, so anchoring to it would be anchoring to a guess.
-    _actor_artifact(path, FarmActor(_TINY_CONFIG), _TINY_CONFIG)
-    with pytest.raises(ValueError, match="changed since the run began"):
-        module._load_reference_actors(record, 1, cpu)
-
-
 def _population_arguments(
     run_dir: Path,
     *,
@@ -2685,48 +2640,6 @@ def test_members_starting_from_the_same_weights_are_rejected(monkeypatch, tmp_pa
     monkeypatch.setattr(sys, "argv", copied)
     with pytest.raises(ValueError, match="different weights per agent"):
         module.main()
-
-
-def test_the_reference_kl_flag_hands_every_update_the_frozen_initial_actor(
-    monkeypatch, tmp_path
-) -> None:
-    module = _training_script()
-    initial = _distinct_actors(_TINY_CONFIG, 1)[0]
-    artifact = _actor_artifact(tmp_path / "bc-actor.pt", initial, _TINY_CONFIG)
-    references = []
-
-    def update(actor, *args, reference_actor=None, **kwargs):
-        references.append((reference_actor, actor))
-        return {
-            "actor_updates": 1,
-            "actor_minibatches_intended": 1,
-            "critic_updates": 1,
-            "first_minibatch_component_kl": 0.0,
-            "value_target_saturated_fraction": 0.0,
-            "entropy": 0.2,
-            "monte_carlo_r_squared": 0.2,
-        }
-
-    _run_population_main(
-        module,
-        monkeypatch,
-        tmp_path / "anchored",
-        population=1,
-        games=2,
-        iterations=2,
-        initial_actors=(artifact,),
-        update_fn=update,
-        extra_arguments=("--reference-kl-coefficient", "0.5"),
-    )
-
-    assert len(references) == 2
-    (reference,) = {id(reference): reference for reference, _ in references}.values()
-    assert reference is not None
-    assert all(reference is not actor for _, actor in references)
-    assert not reference.training
-    assert not any(value.requires_grad for value in reference.parameters())
-    for name, value in initial.state_dict().items():
-        assert torch.equal(reference.state_dict()[name], value), name
 
 
 def test_finite_warm_start_cannot_exit_before_actor_release(monkeypatch, tmp_path) -> None:

@@ -25,30 +25,14 @@ from kaggriculture.provenance import (
     validate_source_identity,
 )
 
+# The builder's package list is the one definition of what a bundle ships.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_submission import PACKAGE_FILES  # noqa: E402
+
 PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
 REQUIRED_MEMBERS = frozenset(
-    {
-        "main.py",
-        "model.pt",
-        "evaluation.json",
-        "manifest.json",
-        "kaggriculture/__init__.py",
-        "kaggriculture/actions.py",
-        "kaggriculture/constants.py",
-        "kaggriculture/encoding.py",
-        "kaggriculture/entity.py",
-        "kaggriculture/inference.py",
-        "kaggriculture/evaluation.py",
-        "kaggriculture/model.py",
-        "kaggriculture/orientation.py",
-        "kaggriculture/policy.py",
-        "kaggriculture/provenance.py",
-        "kaggriculture/registry.py",
-        "kaggriculture/structured.py",
-        "kaggriculture/triton_mlp.py",
-        "kaggriculture/triton_norm.py",
-        "kaggriculture/tokens.py",
-    }
+    {"main.py", "model.pt", "evaluation.json", "manifest.json"}
+    | {f"kaggriculture/{name}" for name in PACKAGE_FILES}
 )
 
 

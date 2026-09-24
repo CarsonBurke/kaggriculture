@@ -52,19 +52,20 @@ from kaggriculture.tokens import (
     ANIMAL_TOKEN_FIELDS,
     CROP_PRIVATE_FIELDS,
     CROP_TOKEN_FIELDS,
-    FARM_TOKEN_FIELDS,
+    DEFAULT_OBSERVATION_SCHEMA_VERSION,
     N_TILE_CONTINUOUS,
     N_UNIT_CONTINUOUS,
-    OBSERVATION_SCHEMA_VERSION,
     PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
     QUADRANT_COUNT,
+    SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
     TILE_COUNT,
     TILE_KINDS,
     TILE_OCCUPANTS,
     TOWN_TOKEN_FIELDS,
     UNIT_ROLES,
     UNIT_TILE_GATHERS,
+    farm_token_fields,
 )
 from kaggriculture.triton_mlp import (
     fused_relu_squared_mlp,
@@ -76,7 +77,8 @@ from kaggriculture.triton_mlp import (
 class StructuredConfig:
     """Target-architecture hyperparameters from VIT_PLAN."""
 
-    observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
+    observation_schema_version: int = DEFAULT_OBSERVATION_SCHEMA_VERSION
+    action_interface: int = 1
     model_dim: int = 128
     attention_heads: int = 4
     attention_kv_heads: int = 2
@@ -134,7 +136,9 @@ class StructuredConfig:
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
-        if self.observation_schema_version != OBSERVATION_SCHEMA_VERSION:
+        if self.action_interface not in (1, 2, 4):
+            raise ValueError("action_interface must be 1, 2, or 4")
+        if self.observation_schema_version not in SUPPORTED_OBSERVATION_SCHEMA_VERSIONS:
             raise ValueError(
                 "stale structured observation schema; fresh encoding and training required"
             )
@@ -226,7 +230,7 @@ class StructuredInputs(NamedTuple):
     products: Tensor  # [B, len(PRODUCTS), product feature width]
     animals: Tensor  # [B, len(ANIMALS), animal feature width]
     crops: Tensor  # [B, len(CROPS), crop feature width]
-    farms: Tensor  # [B, 2, len(FARM_TOKEN_FIELDS)]
+    farms: Tensor  # [B, 2, len(FARM_TOKEN_FIELDS)]; models read their schema's prefix
     town: Tensor  # [B, len(TOWN_TOKEN_FIELDS)]
 
 
@@ -879,9 +883,9 @@ class TileEmbedder(nn.Module):
         vocabulary = categorical[..., :2]
         weights = (self.kind.weight, self.occupant.weight)
         # The custom backward is only for a table that receives a gradient. A
-        # frozen copy under grad mode -- the PPO reference anchor -- takes the
-        # plain gather, which Dynamo also traces where it cannot trace this
-        # vararg Function with no input requiring grad.
+        # frozen copy run under grad mode takes the plain gather, which Dynamo
+        # also traces where it cannot trace this vararg Function with no input
+        # requiring grad.
         embedded = (
             _TinyVocabularyEmbedding.apply(vocabulary, *weights)
             if torch.is_grad_enabled() and any(weight.requires_grad for weight in weights)
@@ -984,7 +988,10 @@ class EconomyEmbedder(nn.Module):
         self.crop_identity = nn.Embedding(len(CROPS), width)
         self.crop_projection = Linear(crop_width, width)
         self.farm_identity = nn.Embedding(2, width)
-        self.farm_projection = Linear(len(FARM_TOKEN_FIELDS), width)
+        # Staged farm tokens carry the newest schema's columns; this model reads
+        # the prefix its own schema defines, so v3 weights see v3 inputs.
+        self.farm_width = len(farm_token_fields(config.observation_schema_version))
+        self.farm_projection = Linear(self.farm_width, width)
         if self.split_clock:
             self.clock_projection = Linear(6, width)
             self.town_projection = Linear(len(TOWN_TOKEN_FIELDS) - 6, width)
@@ -1000,7 +1007,8 @@ class EconomyEmbedder(nn.Module):
             self.product_projection(products.to(dtype)) + self.product_identity.weight,
             self.animal_projection(animals.to(dtype)) + self.animal_identity.weight,
             self.crop_projection(crops.to(dtype)) + self.crop_identity.weight,
-            self.farm_projection(farms.to(dtype)) + self.farm_identity.weight,
+            self.farm_projection(farms[..., : self.farm_width].to(dtype))
+            + self.farm_identity.weight,
         ]
         if self.clock_projection is None:
             tokens.append(self.town_projection(town.to(dtype)).unsqueeze(1))
@@ -1348,8 +1356,9 @@ class StructuredActor(nn.Module):
         self.market_kind = Linear(config.model_dim, N_MARKET_KINDS)
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
-        self.market_quantity_value = nn.Embedding(N_QUANTITIES, config.quantity_rank)
-        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, N_QUANTITIES))
+        quantity_rows = 7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
+        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
         initialize_policy_heads(
             self.unit_head[-1],
             self.market_kind,
@@ -1357,9 +1366,12 @@ class StructuredActor(nn.Module):
             self.market_quantity_kind_gate,
             self.market_quantity_value,
             self.market_quantity_bias,
+            action_interface=config.action_interface,
         )
 
-    def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
+    def quantity_logits(
+        self, quantity_context: Tensor, market_kinds: Tensor, quantity_mask: Tensor | None = None
+    ) -> Tensor:
         """Score exact quantities only for the already-selected market kind."""
         return factored_quantity_logits(
             quantity_context,
@@ -1368,6 +1380,7 @@ class StructuredActor(nn.Module):
             self.market_quantity_value,
             self.market_quantity_bias,
             self.config.quantity_rank,
+            quantity_mask,
         )
 
     def _decode_entities(

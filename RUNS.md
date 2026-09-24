@@ -8,6 +8,10 @@ fixed-panel gameplay, critic fit, training trajectories and older long runs.
 they are not implemented or queued. Historical pending statuses below describe
 submission time, not current queue state.
 
+The current LeJEPA experiments and the kaggle-environments 1.32.7 rules cutover
+are recorded in [JEPA_RUNS.md](JEPA_RUNS.md). Results produced under 1.32.6
+are historical comparisons, not current-rules performance estimates.
+
 ## Purpose
 
 This file is the execution ledger for `VIT_NEXTLAT_PROPOSAL.md`. The campaign improves the structured actor without losing attribution and then applies structured NextLat to the best architecture.
@@ -4562,3 +4566,447 @@ NextLat-off and economic training journals successfully. Thirty focused
 reporting, evaluation and campaign tests pass. As of 2026-09-19 04:50 UTC,
 the remaining GPU gates and training arms have not started; shared queue work
 precedes them. A pending comparison is not evidence for a new default.
+
+## 2026-09-23: 1.32.7 rules and LeJEPA continuation
+
+The installed Kaggle version, Python rules, and Rust parity environment now use
+the 1.32.7 market curves. The previous BC corpora were captured under 1.32.6;
+the current-rules corpora are `data/bc-v16-current-{mirror,starter,pass,random}-64`.
+The clone encoder checks each recorded quote against its inventory under the
+installed rules. [JEPA_RUNS.md](JEPA_RUNS.md) records the parity checks and the
+reason prior absolute scores cannot be carried over to this rule set.
+
+BC's CLI default is two epochs. The structural campaign now inherits that
+default for every architecture, including LeJEPA; its former 12-epoch LeJEPA
+override reflected an earlier detached-readout experiment. The attached-backbone
+epoch-2 initializer gave the critic healthier training data in the subsequent
+PPO comparison. BC job **9300** requested two epochs explicitly from its frozen
+source snapshot and succeeded: 299,104 training rows, 69,024 holdout rows,
+epoch-2 holdout NLL **0.0026**, and unit/kind/quantity accuracies
+**1.000/0.999/0.999**.
+
+The original eight-hour PPO job **9301** was cancelled before its first attempt.
+Replacement **9302** uses the same frozen source, initialization from 9300,
+seed, and PPO recipe, with `--max-hours 0.5833333333333334` (35 minutes of
+trainer time) and a 40-minute queue hard limit to allow final checkpoint work.
+It was cancelled by request at iteration 173, retaining checkpoint 162. Both
+jobs declared `maxParallelRuns=1` and priority 10. Output is
+`runs/lejepa-1327-20260923/ppo`; no cross-rule promotion is claimed.
+
+The next named LeJEPA arm, schema-v4 `money_margin`, uses the same frozen source
+and current-rules corpora. BC job **9303** completed its separate two-epoch
+clone in `runs/lejepa-margin-1327-20260923/bc` (30-minute queue cap). PPO job
+**9304** started after BC success, with output in
+`runs/lejepa-margin-1327-20260923/ppo`. Its command requests 35 minutes of
+trainer time, but the running queue limit was reduced from 40 to **30 minutes**
+on user direction. Both are exclusive, normal-priority jobs. The comparison must distinguish
+whether the margin improves learning from whether either policy discovers
+carrot, tomato, or egg sales; the v16 teacher supplied no such demonstrations.
+
+The training journal reports an aggregate sell-order fraction but no product
+breakdown, so a frozen iteration-87 actor was evaluated separately in **9305**.
+
+Diagnostic **9305** finished: across 64 full native self-play games (128 actor
+seats) from checkpoint 87, it selected legal sales of **141 carrot units in 43
+orders**, **7 tomato units in 6 orders**, and **no eggs**. The policy has begun
+to explore carrot and tomato trading, but it has not established the large-volume
+trade seen in the Kaggle opponent. The record is
+`artifacts/probes/lejepa-1327-20260923/product-sales-ckpt87.json`.
+
+At matched actor wave 25, the schema-v4 margin arm improves fixed-panel critic
+MSE (0.337 versus 0.497) and self-play lower-tail money (~5.8k versus ~1.4k),
+while scripted-v27 sampled score is 0.078 versus 0.188 and argmax score is
+0/64 versus 61/64. This is not yet a clear gameplay win. On user direction,
+fresh LeJEPA runs now inherit schema v4 for its stronger critic and self-play
+economics; the v27 regression remains visible in the promotion record.
+
+At wave 50, its scripted-v27 sampled score is 0.094 versus the baseline's
+0.250, and argmax remains 0/64 versus 64/64. Reassess the feature against later
+fixed panels rather than treating the score regression as resolved.
+
+The 30-minute queue limit stopped **9304** at iteration 89. Its durable
+checkpoint is **85**. At matched actor wave 75, schema-v4 panel critic MSE is
+0.211 versus 0.529 for v3, self-play mean money is 69.0k versus 64.0k, and
+the 10th percentile is 10.0k versus 3.3k. Scripted-v27 sampled score remains
+lower (0.125 versus 0.250) and argmax is 0/64 versus 63/64. Fresh LeJEPA
+defaults now use v4 by user decision; this is an economic/critic promotion
+with an unresolved opponent-strength regression.
+
+All future jobs launched for this line of work must finish within **30 minutes
+from attempt start**. To leave room for a clean final checkpoint, set the
+trainer budget at most 27 minutes and resume longer studies in separate bounded
+jobs. Job 9304 stopped at that deadline between checkpoints because its
+trainer argument was fixed when submitted.
+
+### Action-head and action-use follow-up
+
+The first action-head ablation changes LeJEPA's policy readout from one
+round to two on the same frozen 1.32.7 source, schema-v4 input, demonstrations,
+seed and PPO recipe as the margin baseline. Its shorter wall budget follows
+the new per-job limit. Fresh two-epoch BC **9315** gates
+PPO **9316**; the latter has a 27-minute trainer budget and a 30-minute queue
+limit. The source, commands and baseline job IDs are recorded in
+`artifacts/probes/lejepa-readout2-1327-20260923/campaign.json`. After training
+terminates, **9319/9320** compare sampled/argmax policies on 256 common seeds
+per opponent against margin checkpoint 85. Compare actor-active waves and
+actual actor updates before attributing any difference to readout depth.
+
+The action-use audit **9317/9318** samples the matched v3 checkpoint 87 and v4
+checkpoint 85 on the same 64 native self-play seeds under one frozen source.
+It counts sales by product, HIRE timing including the final actionable turn,
+selected and legal cap-bin pickups, wheat placement and feeding. Its manifest
+is `artifacts/probes/lejepa-action-audit-1327-20260923/campaign.json`.
+These counters are descriptive; a partial-wheat PLACE or larger-pickup arm needs
+evidence that the corresponding route is constrained before changing the
+action vocabulary, native sampler and BC contract. These six jobs are queued
+behind shared GPU work, with limits no longer than 30 minutes.
+
+The joint-ratio PPO arm **9321** and its evaluations **9322/9323** were
+cancelled before starting when the user clarified that the priority is the
+*action decoder*, rather than the PPO ratio objective. Its manifest remains at
+`artifacts/probes/lejepa-joint-ratio-1327-20260923/campaign.json` as a record
+of the unused commands.
+
+If cap-bin use or wheat placement appears material, the native
+`policy_ledger_into` pre-step state can supply exact shed stock, carried wheat
+and unit positions without dumping every game as JSON. A follow-up should
+record only relevant at-shed steps and test an actual route constraint before
+adding partial wheat deposits or larger pickup bins. The current rollout
+counters alone cannot establish unmet demand beyond a cap.
+
+### Execution-order action decoder, current rules
+
+The existing causal actor encodes the public state once, then selects 36 unit,
+market-kind and quantity factors in execution order with an exact device-side
+resource ledger. Later preferences can respond to selected earlier actions;
+the current flat actor updates only legality masks.
+The full proposal is in [ARCHITECTURE_DECODER_DESIGN.md](ARCHITECTURE_DECODER_DESIGN.md)
+and [ARCHITECTURE_ABLATIONS_20260918.md](ARCHITECTURE_ABLATIONS_20260918.md).
+Its earlier compiled gate
+**8163** failed because Inductor fused first-quantity sampling with the ledger
+and emitted a Triton temporary outside its defining loop. The current source
+places the FP32 softmax/CDF inside an opaque CUDA operator to separate those
+reductions without leaving compiled fullgraph execution.
+
+The initial gate submission **9324** lacked the test suite's explicit CUDA
+enable flags. It and its dependent jobs **9325–9335** were cancelled or skipped
+before start. Replacement CUDA gate **9336** explicitly enables and checks
+compiled ledger and actor contracts; success gates full native rollout and
+causal BC-storage gate **9337**. Both use the current 1.32.7 source and have
+30-minute limits. Their source identity, commands and environment are in
+`artifacts/probes/causal-decoder-1327-20260923-v2/gates.json`. The matched
+campaign `artifacts/probes/causal-decoder-1327-20260923-v2-campaign/campaign.json`
+queues two-epoch BC **9338/9339**, full-production gates **9340/9344**,
+27-minute PPO **9341/9345**, and sampled/argmax final panels
+**9342/9343/9346/9347** for flat joint-PPO control and causal decoder.
+Training depends on successful compiled parity and throughput gates. All jobs
+are exclusive, normal priority, and limited to at most 30 minutes. No gameplay
+result is claimed before those gates pass.
+
+The first corrected compiled gate **9336** exited before test collection: the
+frozen source snapshot excludes `tests/`, but its command named test paths
+inside that snapshot. This was a queue-path error, not a compiled decoder
+result. Dependent training **9337–9345** skipped, and the four evaluation
+jobs **9342/9343/9346/9347** were cancelled before start. Replacement gates
+**9353/9354** point pytest at repository tests while importing policy code
+from the unchanged frozen source digest `520775947dd7a453cc772b3c5481469a27179b8d1a42d81b21afc27a8d0ff4ba`.
+Both explicitly enable the CUDA contracts, run exclusively at normal priority,
+and have 30-minute limits. A new matched campaign requires those gates to pass.
+
+Gate **9353** reached the GPU contracts: 19 checks passed, then Inductor
+failed in the causal actor's compiled generation test with the same generated
+Triton `NameError('tmp2 is not defined')` at the first market quantity
+reduction. The opaque CDF alone did not break the offending fusion. Gate
+**9354** cannot run until this compiler path is isolated; no causal training
+result exists yet.
+
+A second causal compiler isolation moves both sampled choice and
+log-probability/entropy materialization across opaque CUDA boundaries, with
+analytic backward for the latter. Exclusive gate **9367** tests the finalized
+live implementation under a 30-minute limit. A new source snapshot and causal
+training campaign wait for this compiled gate; **9353** remains a real failed
+compiler experiment, not an architecture comparison.
+The next causal campaign is configured as a matched schema-v4 control and
+causal pair, so it incorporates the margin observation feature already
+promoted for fresh LeJEPA runs. Its two-epoch BC and bounded PPO jobs will be
+submitted only after compiled GPU parity passes, from one fresh frozen source.
+
+The action-use jobs **9317/9318** succeeded. Over 64 native self-play games
+(128 actor trajectories each), v3 checkpoint 87 sold 141 carrot and 7 tomato
+units and no eggs; v4 margin checkpoint 85 sold 67 carrot and 2 tomato units
+and no eggs. The margin actor's carrot sales appeared in only 6/128
+trajectories, tomato in 1/128. Top-bin wheat pickups were selected 5 times
+for v3 and 2 for margin despite 64,558 and 67,297 legal opportunities;
+fertilizer cap pickups were selected 2 and 3 times. These counts show the
+rare-product problem remains in the current policy, and do not establish that
+larger pickup bins would help. Detailed counters and trajectories are in the
+action-audit manifest's two output JSON files.
+
+### Learnable action-interface ablations
+
+`ACTION_INTERFACE_ABLATIONS.md` is the specific plan for making actions
+easier to learn. The causal decoder above changes conditioning on prior
+choices, but leaves the ten STOP-terminated market slots, order permutations,
+and repeated-kind splits as policy choices. The highest-value proposed
+interface arm, A3, gives each market kind one canonical decision in a fixed
+ledger order. That would make carrot, tomato and egg sell decisions explicit
+even though the teacher never chooses them. A2 adds an opt-in ALL encoding for
+the current legal maximum quantity; A1 canonicalizes demonstration paths and
+market lists so that A3 can be compared to the same training data. Stage 0
+measures per-head sampled departure cost and the teacher's loss from market
+canonicalization. All new GPU jobs remain bounded to 30 minutes and future
+BC clones retain the two-epoch default. The older plan's 12-epoch comparison
+and old-rule schedule are superseded by the current rules and run limit.
+
+Stage 0a now has an opt-in collector/evaluator switch for sampling only unit,
+market-kind, or quantity decisions while holding the other learner heads at
+argmax. Default decoding and frozen-opponent modes remain the same. Its CPU
+rollout/evaluator suite passed 111 tests, with 21 CUDA cases skipped; it still
+needs a queued CUDA parity gate before its panels are interpreted. Stage 0b's
+official-engine panels **9355–9360** compare unmodified public-v16 teacher
+market orders with merged fixed-order and price-impact-order proposals against
+public-v16 and public-v27, 64 seeds in both seats per condition. Each is an
+exclusive normal-priority CPU job with a 30-minute hard limit. Outputs are in
+`artifacts/probes/market-canonicalization-20260923/`; no teacher-order benefit
+is assumed before the paired results arrive.
+
+The initial Stage-0b panel wrapper incorrectly passed a second configuration
+argument to the one-argument public-v16 agent. It produced zero teacher orders
+and invalid $3,000 bank rows; **9355–9358** are discarded and **9359–9362**
+were cancelled. A full-game regression test now requires nonzero teacher
+orders. Corrected panels **9368–9375** use the same seeds and add a HIRE-last
+variant, which is motivated by an exact one-turn replay: moving HIRE before a
+wheat purchase let an otherwise unaffordable fifth hire execute, clipping
+the wheat purchase from 14 to 4. A naive fixed-order rewrite on one mirror
+episode fell from $52,298 to $129. That is a real budget-order effect, so A1
+must filter for engine-equivalent relabels, and A3 must demonstrate that its
+compiled order preserves useful buying and hiring behavior. Local branch
+audits **9363–9365** measure exact next-state equivalence per rewritten turn.
+
+The first local-branch audit **9363** also proved invalid: its branch copied a
+truncated engine history, so the official engine repeated the previous step
+number. It is discarded; **9364/9365** were cancelled. The branch now copies
+full history and a regression test covers the next turn. Corrected coverage
+jobs **9394–9396** are queued. No A1 canonical corpus is published unless a
+full official replay matches the archived trajectory exactly.
+The corrected fixed, impact and HIRE-last branch audits have completed: only
+**2,912 of 7,038**, **2,982 of 6,328** and **3,288 of 7,550** changed market
+turns, respectively, preserved the exact next state in the mirror corpus.
+Turn-level equivalence does not
+establish full-episode equivalence, so neither is a valid blanket BC relabel.
+
+The LeJEPA readout-depth PPO **9316** failed in its first replay-parity audit
+with a CUDA OOM while compiling an update minibatch of 7,936. The two-epoch
+BC **9315** succeeded. Its old evaluation jobs **9319/9320** were cancelled;
+the bounded retry **9366** kept the same source, actor and 27-minute trainer
+budget but used a 4,096 minibatch. It reached at least 54 updates and then
+failed with another CUDA OOM during a compiled actor update; the error report
+showed a separate process using 17.71 GiB of the 31.36 GiB GPU at failure.
+This is an infrastructure/resource failure, not an outcome comparison.
+Paired sampled/argmax panels **9376/9377** are gated on success and must not
+be interpreted as treatment results. A smaller minibatch or isolated GPU
+capacity is required before the readout-depth PPO arm can be evaluated.
+The failed run nevertheless saved a durable iteration-85 checkpoint. Direct
+paired sampled/argmax evaluations of that checkpoint against margin checkpoint
+85 are queued as **9431/9432** (20-minute limits). They measure the partial
+readout-depth arm without treating the OOM as a gameplay outcome.
+
+An opt-in A2 quantity interface is now implemented as model
+`action_interface=2`: a learned ALL score is marginalized by `logaddexp`
+into the current legal-maximum bin. Interface 1 keeps the original 100-row
+heads and checkpoint shapes. Focused Python/native tests passed (including
+the selected-kind likelihood and Rust 101-row sampling), Rust library tests
+passed 45 cases, and the matched campaign is frozen at source digest
+`c3bd84aae2b5faaad0cf378bbd39e8c5cfb1dfe9819c8e5235480bca1fecff53`.
+Contract job **9378** gates two fresh schema-v4 LeJEPA two-epoch BC jobs
+**9379/9380**, production-shape PPO gates **9381/9385**, bounded PPO
+**9382/9386** and paired sampled/argmax panels **9383/9384/9387/9388**.
+The control and treatment differ only by action-interface version at model
+construction. Commands and source are in
+`artifacts/probes/quantity-all-1327-20260923/campaign.json`.
+
+Contract **9378** failed in the structural campaign test fixture: the queued
+environment set `KRAGG_PROJECT_ROOT`, so its temporary-directory assertion
+looked in the wrong root. Five focused checks passed before that unrelated
+error. The fixture now explicitly selects its temporary root and passes all
+14 structural tests with the outer variable set. The original A2 descendants
+were skipped, not trained. Corrected frozen contract **9415** gates equivalent
+two-epoch BC **9416/9417**, PPO shape gates **9418/9422**, bounded PPO
+**9419/9423**, and paired panels **9420/9421/9424/9425**. The new manifest is
+`artifacts/probes/quantity-all-1327-20260923-r2/campaign.json`.
+That R2 gate **9415** also failed before training: its cwd was the frozen
+source directory, and frozen snapshots intentionally omit `tests/`. The R3
+gate **9471** runs repository tests with imports pinned to the same frozen
+source; its exact command passed locally (19 tests). R2 descendants skipped.
+R3 jobs are two-epoch BC **9473/9474**, PPO shape gates **9475/9479**,
+bounded PPO **9476/9480**, and panels **9477/9478/9481/9482**. The matched
+per-head panels are **9483–9487**, and sales audits **9488/9489**. Manifests
+are under `artifacts/probes/quantity-all-1327-20260923-r3/` and
+`artifacts/probes/per-head-departure-1327-20260923-r3/`.
+
+R3 source contract, both two-epoch BC jobs and both PPO shape gates passed.
+The control PPO **9476** completed at iteration 121; A2 PPO **9480** failed
+with CUDA OOM while staging the first update (25.04 GiB held by its process,
+including 18.25 GiB in CUDA graph private pools). Its dependent panel jobs
+nonetheless succeeded by reading its iteration-0 `latest.pt`; those are BC
+readouts, not evidence of PPO improvement. On identical 256-seed native panels
+per opponent, control versus A2 BC overall score was 0.5000 versus 0.9844
+argmax and 0.5645 versus 0.5957 sampled. A2 BC held-out NLL was 0.002229
+versus control 0.002328. The large argmax improvement is an encouraging
+single-seed result; the sampled BC difference of +0.03125 had an exploratory
+paired seed bootstrap 95% interval [-0.0078, 0.0684]. The completed control
+PPO scored 0.9902 argmax and 0.6562 sampled, so the A2 BC alone has not
+beaten the trained control. Control PPO sales in 64 sampled self-play games
+were 44 carrot, 26 tomato and 0 egg units. The A2 PPO sales job skipped.
+
+Memory-safe control and A2 PPO retries **9518/9519** were briefly queued to
+complete the matched comparison after the OOM, with dependent panels
+**9520–9523** and sales audit **9524**. On user reprioritization, the retries
+were cancelled before a new treatment result; the dependent jobs were
+cancelled or skipped. A2 remains a promising BC-only result, not an established
+PPO winner. Commands are retained in
+`artifacts/probes/quantity-all-1327-20260923-r3/memory-safe-retry.json`.
+
+Stage-0 per-head closed-loop evaluation jobs **9389–9393** compare argmax,
+all-sampled, units-only, kinds-only and quantities-only decoding of margin
+checkpoint 85 on the same 256-seed native panel per opponent. These are
+opt-in diagnostic modes in the frozen source, all gated by contract **9378**,
+exclusive at normal priority with 30-minute limits. Their manifest is
+`artifacts/probes/per-head-departure-1327-20260923/campaign.json`.
+The failed contract skipped these original panels before they ran; the same
+frozen per-head source and checkpoint are resubmitted as **9426–9430** behind
+corrected gate **9415**, in
+`artifacts/probes/per-head-departure-1327-20260923-r2/campaign.json`.
+
+A3 now has an opt-in 21-kind market-set actor, canonical compiler, effective
+fill tracing for BC, native Rust sampler and joint PPO replay. It removes STOP,
+order permutations and repeated same-kind orders from the learned decisions,
+while retaining ten compiled engine slots for the value input. Python and Rust
+agree on all 21 x 101 legality masks, chosen values, active flags and compiled
+orders over 36 evolving turns in four seats under both tested order conventions.
+The critic keeps the control's ten-slot trunk, so its capacity is matched.
+The Python rollout collectors explicitly reject interface 3 because they do
+not store its behavior factors. One-game native gate **9400** and its dependent
+production-size gate **9401** were cancelled/skipped after the ordering panel
+rejected this compiler, before either consumed GPU time. Any redesigned A3
+PPO must use joint ratios with the
+legacy decision auxiliary disabled. The archived random opponent cannot be
+replayed by simply restarting its seed, so any exact-fill corpus must be
+freshly traced rather than guessed.
+
+The first valid Stage-0b official panel against public-v27 (64 seeds, both
+seats, rules 1.32.7) **rejects** the proposed fixed market order as a BC/PPO
+starting interface: unchanged public-v16 scored 128/128 and mean $92,496,
+whereas fixed, impact-sorted sells and HIRE-last each scored 0/128 with mean
+$8,477, $8,578 and $2,200 respectively. These variants changed thousands of
+turns. The earlier one-step HIRE/buy budget counterexample is therefore
+representative of a consequential order dependency. A3 extraction/training is
+held until a learnable interface can retain enough dynamic execution order.
+The public-v16 mirror panel also finished: unchanged teacher score 0.5 and mean
+$86,287, whereas fixed and impact variants scored 0 with mean $22 and
+HIRE-last scored 0 with mean $0. The A3 native gates **9400/9401** were
+cancelled/skipped before GPU use after this result. The exact-order causal
+decoder is now the active structural arm. Per-game records, provenance and
+branch examples are in `artifacts/probes/market-canonicalization-20260923/`.
+
+The public higher-Elo teacher search found no verified ready model that both
+outperforms public-v16 under 1.32.7 and sells carrot, tomato and egg. Kaito's
+public v48 and boatlee's v20 have historical high scores but no evidence of
+these three trades; CDrookieDc's public agent mass-sells eggs but explicitly
+avoids carrot and tomato. The island-GA code models the new price hinges but
+its winning schedules are private. Any replacement requires paired current-
+rules games and measured trio sales before use as a teacher.
+
+The repaired causal decoder passed its compiled CUDA contract gate **9367**.
+The schema-v4 matched causal-versus-flat campaign is frozen in
+`artifacts/probes/causal-v4-1327-20260923/campaign.json`: two-epoch BC jobs
+**9402/9403**, production-shape PPO gates **9404/9408**, at-most-30-minute
+PPO jobs **9405/9409**, and paired argmax/sampled panels **9406/9407/9410/9411**.
+Both arms use the promoted margin observation and joint PPO ratios.
+The flat schema-v4 control BC **9402** completed its two epochs with held-out
+NLL 0.0027 and unit/kind/quantity accuracies 1.000/0.999/0.998; its frozen
+actor is at `runs/causal-v4-1327-20260923/entity-v4/bc/bc-actor.pt`.
+The causal schema-v4 clone **9403** also finished two epochs: held-out NLL
+0.0027, unit/kind/quantity accuracies 1.000/0.998/0.999. Supervised fit is
+thus comparable at this resolution; native PPO gates determine whether the
+extra conditioning earns its runtime and improves outcomes.
+
+To check the user-important trading behavior, native 64-game sampled sales
+audits **9433/9434** (flat/causal) and **9435/9436** (A2 control/ALL) are queued
+after their respective PPO jobs succeed, all on the same seeds with 20-minute
+limits. They report carrot, tomato and egg units separately, not just an
+aggregate sell-order fraction. Commands and outputs are in
+`artifacts/probes/action-sales-followup-20260923/campaign.json`.
+
+The causal PPO **9409** was stopped after 16 iterations when its rollout
+throughput collapsed; the flat control **9405** reached 136 iterations within
+the same 30-minute cap. The causal actor had zero updates in iterations 1–12
+under the configured critic warmup and 29 updates per wave in iterations
+13–16. Normal causal rollout was 15–17 seconds versus 2–3 seconds for flat;
+iterations 15–16 rose to 225/249 seconds because new 2- and 4-lane frozen
+opponent ensembles each triggered a 175/204-second Inductor compile. The
+causal custom choice/distribution ops also emitted 864 vmap fallback warnings.
+This is an implementation throughput failure, not evidence that the actor
+cannot learn. The dependent 256-game causal panels **9410/9411** were
+cancelled before start because no comparably trained checkpoint exists; the
+causal sales audit **9434** is gated on PPO success and will skip. Retrying
+requires stable ensemble lanes and vmap-safe custom ops, then a production
+shape throughput gate that compares steady rollout and compilation overhead
+against the flat control before another 30-minute PPO allocation.
+The flat joint-ratio control's architecture panel itself fell from initial
+score 0.758 to score EMA 0.515 after 122 actor waves; its best score checkpoint
+remained BC iteration 0. The causal BC started at 0.781 but got no post-warmup
+panel by wave 4. This discourages promotion of joint-ratio PPO from either arm
+without held-out paired evaluation and a useful actor-learning signal.
+Explicit vmap batching rules for `causal_choose` and `causal_distribution`
+are now in the live code. Focused CUDA parity/gradient gate **9472** passed.
+The production-shape **graph** benchmark **9490** failed during CUDA graph
+capture: a ledger lookup materialized a CPU index tensor on the capture path.
+The live ledger now constructs that index on the device. The companion
+**inductor_graph** benchmark **9491** was cancelled while compiling because
+its 20-minute cap was excessive for this diagnostic. Frozen source
+`8b1b1a26af3ab1c8dc390553fccbaf3515b9ab75292ebb1ad4bdde3bf645dd02`
+is recorded in `artifacts/probes/causal-v4-vmap-20260923/campaign.json`.
+The two-minute eager CUDA probe **9498** started but failed after about 19
+seconds during its first vmapped ensemble forward: efficient attention rejected
+the 36-column attention mask because its `strideM` was not a multiple of 8.
+Its single-actor timings were not emitted before the exception. This exposed
+another inference backend issue; it gives no evidence that the vmap change
+improves rollout throughput. No causal PPO retry is queued until practical
+rollout throughput and league compilation cost are demonstrated.
+A reviewed fallback is a market-only causal architecture: compute unit logits
+in parallel, still select/apply their exact ledger effects in order, and use
+cached causal attention only for the 20 ordered market kind/quantity choices.
+It preserves teacher execution order unlike the rejected A3 set. This is a
+design candidate, not a trained or parity-validated result. Following the
+user's priority change, implementation and a short throughput gate for this
+variant supersede A2 PPO retries. No causal training is authorized by a speed
+claim until the variant passes exact action/replay parity and shows useful
+rollout throughput under a two-minute benchmark cap.
+The opt-in `parallel_unit_decode` variant now computes unit logits together,
+applies all 16 unit choices through the exact ledger in order, then decodes
+the 20 market decisions with a 24-position padded cache (the padding is for
+efficient CUDA attention's mask-stride requirement). The original causal
+configuration remains the default. Midgame CPU and CUDA contract **9526**
+passed: a legal sell, native masks, generated/teacher logits and quantity
+context, and nonzero quantity gradients. Two-minute eager probes at 192 rows
+measured **70 ms** single forward and 129–143 ms for 2/4-lane ensembles with
+zero vmap fallback warnings (**9527**). The original full-causal decoder took
+129–150 ms single forward and its vmapped eager ensemble still hit the
+36-column efficient-attention mask-stride error (**9528**). These are forward
+measurements, not whole-rollout or PPO outcomes. Frozen source is
+`fe1078ae45b47d2fb831eba4ede8156009a1422a0abd21968159b9b73a8de1cb`.
+Matched two-epoch BC **9533/9535**, bounded PPO **9534/9536**, panels
+**9537–9540** and trio-sales audits **9541/9542** are queued at normal
+priority. The campaign holds one frozen-opponent lane in both arms because
+the earlier growing-league run recompiled at 1→2→4 opponent models for
+126/176/204 seconds. Commands and the authoritative future gates are in
+`ACTION_INTERFACE_ABLATIONS.md` and
+`artifacts/probes/market-causal-v4-20260924/campaign.json`.
+The causal probe **9498** was admitted and failed before producing measurements;
+the 30-minute PPO run **9409** remains stopped after four actor-update waves.
+
+As of 2026-09-23 22:03 UTC, three unrelated CleanRL jobs **9412–9414** were
+running concurrently in the shared mlq daemon. The remaining Kaggriculture
+PPO gates, contract and panels are queued at normal priority with exclusive
+`maxParallelRuns=1`; their wait time is outside each job's 30-minute cap.

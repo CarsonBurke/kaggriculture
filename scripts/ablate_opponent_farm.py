@@ -112,6 +112,8 @@ def main() -> None:
 
     device = torch.device("cpu")
     actor, critic, checkpoint = _load(arguments.checkpoint, device)
+    if getattr(actor.config, "action_interface", 1) == 2:
+        raise ValueError("this counterfactual probe cannot reconstruct ALL quantity masks")
     architecture = checkpoint["architecture"]
     rollout = collect_mixed_play_rust(
         actor,

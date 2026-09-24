@@ -37,6 +37,14 @@ from kaggriculture.constants import (
 from kaggriculture.device_ledger import get_device_ledger, pack_observations, validate_packed
 from kaggriculture.encoding import EncodedObservation, encode_observation
 from kaggriculture.entity import EntityActor
+from kaggriculture.market_set import (
+    MARKET_SET_MAX_VALUE,
+    N_MARKET_SET_KINDS,
+    MarketSetOrder,
+    compile_market_set,
+    marginalize_market_set_all,
+    market_set_value_mask,
+)
 from kaggriculture.model import ActorOutput, FarmActor
 from kaggriculture.orientation import (
     Orientation,
@@ -83,6 +91,10 @@ class ActionFactors:
     entropy_sums: np.ndarray
     plan: np.ndarray | None = None
     policy_ledger: np.ndarray | None = None
+    market_set_values: np.ndarray | None = None
+    market_set_masks: np.ndarray | None = None
+    market_set_active: np.ndarray | None = None
+    market_set_logprobs: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +130,45 @@ def prepare_quantity_heads(
         values=frozen(actor.market_quantity_value.weight),
         bias=frozen(actor.market_quantity_bias),
     )
+
+
+def percentage_quantity_logits_numpy(parameters: np.ndarray, masks: np.ndarray) -> np.ndarray:
+    """Reference FP32 integer logits for the percentage quantity interface."""
+    if parameters.shape[-1] != 7 or masks.shape != (*parameters.shape[:-1], N_QUANTITIES):
+        raise ValueError("percentage parameters and quantity masks must align")
+    maximum = np.maximum(masks.sum(axis=-1), 1).astype(np.int64)
+    quantity = np.arange(1, N_QUANTITIES + 1, dtype=np.float32)
+    scale = np.logaddexp(np.float32(0), parameters[..., 6:7]) + np.float32(0.02)
+    location = np.float32(1) / (np.float32(1) + np.exp(-parameters[..., 5:6]))
+    upper = (quantity / maximum[..., None] - location) / scale
+    lower = ((quantity - 1) / maximum[..., None] - location) / scale
+    delta = np.float32(1) / (maximum[..., None] * scale)
+
+    def log_sigmoid(value: np.ndarray) -> np.ndarray:
+        return -np.logaddexp(np.float32(0), -value)
+
+    log_mass = log_sigmoid(upper) + log_sigmoid(-lower) + np.log(-np.expm1(-delta))
+    high = (np.float32(1) - location) / scale
+    low = -location / scale
+    log_total = (
+        log_sigmoid(high)
+        + log_sigmoid(-low)
+        + np.log(-np.expm1(-np.float32(1) / scale))
+    )
+    result = parameters[..., 4:5] + log_mass - log_total
+    for atom, amount in enumerate((1, 2, 3, 0)):
+        destinations = maximum if atom == 3 else np.full_like(maximum, amount)
+        active = masks.any(-1) if atom == 3 else maximum >= amount
+        indices = (destinations - 1).clip(0, N_QUANTITIES - 1)
+        row = np.arange(indices.size)
+        flat = result.reshape(-1, N_QUANTITIES)
+        old = flat[row, indices.reshape(-1)]
+        flat[row, indices.reshape(-1)] = np.where(
+            active.reshape(-1),
+            np.logaddexp(old, parameters[..., atom].reshape(-1)),
+            old,
+        )
+    return result
 
 
 def stack_encoded(
@@ -395,6 +446,128 @@ def _causal_policy_step(
 
 
 @torch.inference_mode()
+def _market_set_policy_step(
+    actor: EntityActor,
+    observations: list[dict[str, Any]],
+    encoded: list[StructuredObservation],
+    unit_actions: np.ndarray,
+    real_unit_actions: np.ndarray,
+    unit_masks: np.ndarray,
+    unit_active: np.ndarray,
+    unit_logprobs: np.ndarray,
+    unit_entropies: np.ndarray,
+    post_unit_sheds: list[dict[str, int]],
+    context: np.ndarray,
+    heads: PreparedQuantityHeads,
+    deterministic: bool,
+    temperature: float,
+    generator: np.random.Generator,
+) -> PolicyStep:
+    """Sample the opt-in per-kind market set after the unit-phase ledger."""
+    batch_size = len(observations)
+    order = MarketSetOrder(actor.config.market_set_sell_order, actor.config.market_set_hire_last)
+    kinds = order.decision_kinds
+    if context.shape[:2] != (batch_size, N_MARKET_SET_KINDS):
+        raise ValueError("market-set context does not have one row per kind")
+    choices = np.zeros((batch_size, N_MARKET_SET_KINDS), dtype=np.uint8)
+    masks = np.zeros((batch_size, N_MARKET_SET_KINDS, MARKET_SET_MAX_VALUE + 1), dtype=np.bool_)
+    active = np.zeros((batch_size, N_MARKET_SET_KINDS), dtype=np.bool_)
+    logprobs = np.zeros((batch_size, N_MARKET_SET_KINDS), dtype=np.float32)
+    entropies = np.zeros((batch_size, N_MARKET_SET_KINDS), dtype=np.float32)
+    ledgers = [
+        MarketLedger.from_observation(observation, shed=dict(post_unit_sheds[row]))
+        for row, observation in enumerate(observations)
+    ]
+    used_slots = np.zeros(batch_size, dtype=np.uint8)
+    for index, kind in enumerate(kinds):
+        for row, observation in enumerate(observations):
+            mask = market_set_value_mask(observation, kind, ledgers[row], int(used_slots[row]))
+            masks[row, index] = mask
+            active[row, index] = bool(mask[1:].any())
+        features = context[:, index] * (1.0 + heads.kind_gate[int(kind)])
+        raw_logits = features @ heads.values.T + heads.bias[int(kind)]
+        effective_logits = np.stack(
+            [
+                marginalize_market_set_all(raw_logits[row], masks[row, index])
+                for row in range(batch_size)
+            ]
+        )
+        sampled, selected_logprobs, selected_entropies = _sample_numpy_categorical(
+            effective_logits, masks[:, index], deterministic, temperature, generator
+        )
+        choices[:, index] = sampled
+        logprobs[:, index] = selected_logprobs
+        entropies[:, index] = selected_entropies
+        for row, value in enumerate(sampled):
+            if not value:
+                continue
+            if kind == MarketKind.HIRE:
+                for _ in range(int(value)):
+                    _apply_ledger_order(observations[row], kind, 1, ledgers[row])
+                used_slots[row] += int(value)
+            else:
+                _apply_ledger_order(observations[row], kind, int(value), ledgers[row])
+                used_slots[row] += 1
+
+    market_kinds = np.full((batch_size, MAX_MARKET_ORDERS), int(MarketKind.STOP), dtype=np.int64)
+    market_quantities = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.int64)
+    kind_masks = np.zeros((batch_size, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.bool_)
+    quantity_masks = np.zeros((batch_size, MAX_MARKET_ORDERS, N_QUANTITIES), dtype=np.bool_)
+    market_active = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.bool_)
+    quantity_active = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.bool_)
+    actions = []
+    for row, observation in enumerate(observations):
+        compiled, factors = compile_market_set(
+            observation,
+            choices[row],
+            order=order,
+            post_unit_shed=post_unit_sheds[row],
+        )
+        if not np.array_equal(factors.masks, masks[row]):
+            raise ValueError("market-set sampler and compiler legality masks differ")
+        for slot, raw in enumerate(compiled):
+            opcode = str(raw[0])
+            kind = MarketKind[opcode if len(raw) == 1 else f"{opcode}_{raw[1]}"]
+            market_kinds[row, slot] = int(kind)
+            market_active[row, slot] = True
+            kind_masks[row, slot, int(kind)] = True
+            quantity = int(raw[2]) - 1 if len(raw) > 2 else 0
+            market_quantities[row, slot] = quantity
+            quantity_masks[row, slot, quantity] = True
+            quantity_active[row, slot] = kind in QUANTIFIED_MARKET_KINDS
+        kind_masks[row, len(compiled) :, MarketKind.STOP] = True
+        quantity_masks[row, len(compiled) :, 0] = True
+        actions.append(
+            compile_action(
+                observation, real_unit_actions[row], market_kinds[row], market_quantities[row]
+            )
+        )
+    entropy_sums = (
+        (unit_entropies * unit_active).sum(axis=1) + (entropies * active).sum(axis=1)
+    ).astype(np.float64)
+    factors = ActionFactors(
+        unit_actions=unit_actions,
+        market_kinds=market_kinds,
+        market_quantities=market_quantities,
+        unit_masks=unit_masks,
+        market_kind_masks=kind_masks,
+        market_quantity_masks=quantity_masks,
+        unit_active=unit_active,
+        market_active=market_active,
+        market_quantity_active=quantity_active,
+        unit_logprobs=unit_logprobs,
+        market_kind_logprobs=np.zeros_like(market_kinds, dtype=np.float32),
+        market_quantity_logprobs=np.zeros_like(market_quantities, dtype=np.float32),
+        entropy_sums=entropy_sums,
+        market_set_values=choices,
+        market_set_masks=masks,
+        market_set_active=active,
+        market_set_logprobs=logprobs,
+    )
+    return PolicyStep(actions=actions, encoded=encoded, factors=factors)
+
+
+@torch.inference_mode()
 def act_batch(
     actor: FarmActor | StructuredActor | EntityActor,
     observations: list[dict[str, Any]],
@@ -560,6 +733,25 @@ def act_batch(
             )
             apply_unit_tile_effect(observations[row], unit_index, int(raw_action), unit_tiles[row])
 
+    if isinstance(actor, EntityActor) and actor.config.action_interface == 3:
+        return _market_set_policy_step(
+            actor,
+            observations,
+            encoded,
+            unit_actions,
+            real_unit_actions,
+            unit_masks,
+            unit_active,
+            unit_logprobs,
+            unit_entropies,
+            remaining_unit_sheds,
+            market_quantity_context,
+            quantity_heads,
+            deterministic,
+            temperature,
+            generator,
+        )
+
     market_kinds = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.int64)
     market_quantities = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.int64)
     kind_masks = np.zeros((batch_size, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.bool_)
@@ -619,6 +811,21 @@ def act_batch(
             slot_quantity_logits = (
                 quantity_features @ quantity_values.T + quantity_bias[active_kinds]
             )
+            if quantity_values.shape[0] == 7:
+                slot_quantity_logits = percentage_quantity_logits_numpy(
+                    slot_quantity_logits, quantity_masks[active_rows, slot]
+                )
+            elif quantity_values.shape[0] == N_QUANTITIES + 1:
+                active_mask = quantity_masks[active_rows, slot]
+                maximum = active_mask.sum(axis=-1).astype(np.int64) - 1
+                if np.any(maximum < 0):
+                    raise ValueError("quantified market rows need a legal quantity")
+                rows = np.arange(active_rows.size)
+                slot_quantity_logits[rows, maximum] = np.logaddexp(
+                    slot_quantity_logits[rows, maximum],
+                    slot_quantity_logits[:, N_QUANTITIES],
+                )
+                slot_quantity_logits = slot_quantity_logits[:, :N_QUANTITIES]
             active_quantities, active_logprobs, active_entropies = _sample_numpy_categorical(
                 slot_quantity_logits,
                 quantity_masks[active_rows, slot],

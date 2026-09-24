@@ -232,8 +232,11 @@ def test_default_market_prices_match_official_engine_on_both_sides(item: str) ->
     initial = int(pricing["I0"])
     scale = int(pricing["T"])
 
-    for inventory in (initial - scale, initial - 1, initial, initial + 1, initial + scale):
-        assert market_price(item, inventory) == official.market_price(item, inventory)
+    # Past the knee is where the curves differ (the hinge's quadratic regime),
+    # so the sweep runs to deep scarcity and glut, not just one `T` either side.
+    for multiple in (-8, -4, -3, -2.5, -2, -1.5, -1, 0, 1, 1.5, 2, 3, 4, 8):
+        for inventory in {initial + round(multiple * scale) + delta for delta in (-1, 0, 1)}:
+            assert market_price(item, inventory) == official.market_price(item, inventory)
 
 
 @pytest.mark.parametrize("quantity", range(1, 101))

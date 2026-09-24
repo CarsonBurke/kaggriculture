@@ -27,7 +27,7 @@ from kaggriculture.structured import (
     StructuredCriticBelief,
     StructuredDecisionBelief,
 )
-from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION
+from kaggriculture.tokens import SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
 
 CONV_ENTITY = "entity-cnn"
 STRUCTURED = "structured"
@@ -77,7 +77,8 @@ class Architecture:
     def build_config(self, model_config: dict[str, Any]) -> Any:
         """Decode a saved model configuration, rejecting stale observation schemas."""
         if self.structured_inputs and (
-            model_config.get("observation_schema_version") != OBSERVATION_SCHEMA_VERSION
+            model_config.get("observation_schema_version")
+            not in SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "stale structured observation schema; fresh encoding and training required"

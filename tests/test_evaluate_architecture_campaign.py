@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,34 @@ def _rollout():
         opponent_money=np.asarray([5.0, 10.0, 10.0, 10.0]),
         rewards=rewards,
         reward_mode="terminal-outcome",
+    )
+
+
+@pytest.mark.parametrize("decoding", ["argmax", "sampled", "units", "kinds", "quantities"])
+def test_panel_accepts_independent_head_decoding(evaluator, monkeypatch, decoding, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_architecture_campaign.py",
+            "--artifact",
+            "actor=actor.pt",
+            "--output",
+            str(tmp_path / "panel.json"),
+            "--decoding",
+            decoding,
+        ],
+    )
+    assert evaluator.parse_args().decoding == decoding
+    assert (
+        evaluator.HEAD_DECODINGS[decoding]
+        == {
+            "argmax": (),
+            "sampled": ("units", "kinds", "quantities"),
+            "units": ("units",),
+            "kinds": ("kinds",),
+            "quantities": ("quantities",),
+        }[decoding]
     )
 
 

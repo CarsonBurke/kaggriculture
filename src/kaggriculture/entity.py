@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from kaggriculture.actions import N_MARKET_KINDS, N_QUANTITIES, N_UNIT_ACTIONS
 from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.market_set import N_MARKET_SET_KINDS, MarketSetOrder
 from kaggriculture.model import (
     ActorOutput,
     AxialRotaryEmbedding,
@@ -40,14 +41,21 @@ from kaggriculture.structured import (
     _fused_attention,
     _token_mean,
 )
-from kaggriculture.tokens import OBSERVATION_SCHEMA_VERSION, TILE_COUNT
+from kaggriculture.tokens import (
+    DEFAULT_OBSERVATION_SCHEMA_VERSION,
+    SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
+    TILE_COUNT,
+)
 
 
 @dataclass(frozen=True)
 class EntityConfig:
     """Only fields used by the entity architecture and its training heads."""
 
-    observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
+    observation_schema_version: int = DEFAULT_OBSERVATION_SCHEMA_VERSION
+    action_interface: int = 1
+    market_set_sell_order: str = "fixed"
+    market_set_hire_last: bool = False
     model_dim: int = 96
     attention_heads: int = 4
     attention_kv_heads: int = 2
@@ -78,9 +86,16 @@ class EntityConfig:
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
+        if self.action_interface not in (1, 2, 3, 4):
+            raise ValueError("action_interface must be 1, 2, 3, or 4")
+        MarketSetOrder(self.market_set_sell_order, self.market_set_hire_last)
+        if self.action_interface != 3 and (
+            self.market_set_sell_order != "fixed" or self.market_set_hire_last
+        ):
+            raise ValueError("market set order applies only to action_interface=3")
         if self.critic_architecture not in ("entity", "economic", "forecast"):
             raise ValueError("critic_architecture must be 'entity', 'economic', or 'forecast'")
-        if self.observation_schema_version != OBSERVATION_SCHEMA_VERSION:
+        if self.observation_schema_version not in SUPPORTED_OBSERVATION_SCHEMA_VERSIONS:
             raise ValueError("stale entity observation schema; fresh encoding required")
         for name in (
             "model_dim",
@@ -345,14 +360,21 @@ class EntityTrunk(nn.Module):
     """Decision-token trunk with fixed memory or an opt-in source-updating core."""
 
     def __init__(
-        self, config: EntityConfig, *, private_columns: bool, rematerialize_farms: bool = False
+        self,
+        config: EntityConfig,
+        *,
+        private_columns: bool,
+        market_count: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
-        # The farm blocks run over every tile token, and so hold most of what a
-        # training pass retains; `rematerialize_farms` replays them in backward
-        # for an owner whose update cannot afford that (see `LejepaBackbone`).
-        self.rematerialize_farms = rematerialize_farms
+        self.market_count = (
+            market_count
+            if market_count is not None
+            else N_MARKET_SET_KINDS
+            if config.action_interface == 3
+            else MAX_MARKET_ORDERS
+        )
         self.tiles = TileEmbedder(config)
         local_readout = config.unit_local_readout and not private_columns
         self.units = UnitEmbedder(
@@ -362,7 +384,7 @@ class EntityTrunk(nn.Module):
         self.rope = AxialRotaryEmbedding(config.model_dim // config.attention_heads)
         self.farm_local = nn.ModuleList(Block(config) for _ in range(config.farm_blocks))
         # Unit-RMS lookup rows follow existing market-query optimizer ownership.
-        self.market_queries = nn.Embedding(MAX_MARKET_ORDERS, config.model_dim)
+        self.market_queries = nn.Embedding(self.market_count, config.model_dim)
         self.memory = EntityMemory(config) if config.shared_memory_kv else None
         self.memory_norm = (
             None if config.shared_memory_kv or config.bixt_latents else RMSNorm(config.model_dim)
@@ -379,7 +401,7 @@ class EntityTrunk(nn.Module):
                     config,
                     refine_latents=index < config.core_layers - 1,
                     output_tokens=(
-                        MAX_UNITS + MAX_MARKET_ORDERS if index >= config.core_layers - 2 else None
+                        MAX_UNITS + self.market_count if index >= config.core_layers - 2 else None
                     ),
                 )
                 for index in range(config.core_layers)
@@ -421,7 +443,17 @@ class EntityTrunk(nn.Module):
         inputs: StructuredInputs,
         opponent_units: Tensor | None = None,
         opponent_units_active: Tensor | None = None,
+        *,
+        rematerialize_farms: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """States, source memory and its validity from one trunk pass.
+
+        The farm blocks run over every tile token, and so hold most of what a
+        training pass retains. `rematerialize_farms` replays them in backward
+        instead, for the one caller whose update cannot afford to retain them
+        (`LejepaBackbone.rematerialized`); every other pass keeps them, because
+        the replay costs a second farm forward per step.
+        """
         batch = inputs.tile_categorical.shape[0]
         width = self.config.model_dim
         tiles = self.tiles(inputs.tile_categorical, inputs.tile_continuous)
@@ -431,7 +463,7 @@ class EntityTrunk(nn.Module):
             self.rope.sine.view(1, 1, TILE_COUNT, -1).expand(2 * batch, -1, -1, -1),
         )
         # No tile-validity mask: locked squares still carry real public state.
-        rematerialize_farms = self.rematerialize_farms and torch.is_grad_enabled()
+        rematerialize_farms = rematerialize_farms and torch.is_grad_enabled()
         for block in self.farm_local:
             farms = (
                 checkpoint(
@@ -468,7 +500,7 @@ class EntityTrunk(nn.Module):
         state_valid = torch.cat(
             (
                 inputs.unit_active,
-                torch.ones(batch, MAX_MARKET_ORDERS, dtype=torch.bool, device=states.device),
+                torch.ones(batch, self.market_count, dtype=torch.bool, device=states.device),
             ),
             dim=1,
         )
@@ -505,7 +537,7 @@ class EntityTrunk(nn.Module):
                 if index == len(self.core) - 2:
                     # Later memory-token writes cannot reach the decision heads.
                     # Retain the last live memory for the shared trunk interface.
-                    memory = tokens[:, MAX_UNITS + MAX_MARKET_ORDERS :]
+                    memory = tokens[:, MAX_UNITS + self.market_count :]
                 latents, tokens = (
                     checkpoint(block, latents, tokens, valid, use_reentrant=False)
                     if self.rematerialize and torch.is_grad_enabled()
@@ -575,7 +607,7 @@ class EntityTrunk(nn.Module):
                     key, value = self.memory_norm(memory), None
         if self.unit_local_decoder is not None:
             assert local is not None and self.local_context_norm is not None
-            units, markets = states.split((MAX_UNITS, MAX_MARKET_ORDERS), dim=1)
+            units, markets = states.split((MAX_UNITS, self.market_count), dim=1)
             slots = local.shape[2]
             local_valid = inputs.unit_tile_gather_valid.clone()
             # Keep inactive rows safe for attention, then discard their decoded state.
@@ -616,11 +648,24 @@ class EntityActor(nn.Module):
             RMSNorm(config.model_dim), Linear(config.model_dim, N_UNIT_ACTIONS)
         )
         self.market_norm = RMSNorm(config.model_dim)
-        self.market_kind = Linear(config.model_dim, N_MARKET_KINDS)
+        self.market_kind = (
+            None if config.action_interface == 3 else Linear(config.model_dim, N_MARKET_KINDS)
+        )
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
-        self.market_quantity_value = nn.Embedding(N_QUANTITIES, config.quantity_rank)
-        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, N_QUANTITIES))
+        quantity_rows = (
+            7 if config.action_interface == 4 else
+            N_QUANTITIES + (config.action_interface == 2) + 2 * (config.action_interface == 3)
+        )
+        self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
+        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
+        if config.action_interface == 3:
+            order = MarketSetOrder(config.market_set_sell_order, config.market_set_hire_last)
+            self.register_buffer(
+                "market_set_kind_ids",
+                torch.as_tensor([int(kind) for kind in order.decision_kinds]),
+                persistent=False,
+            )
         initialize_policy_heads(
             self.unit_head[-1],
             self.market_kind,
@@ -628,9 +673,14 @@ class EntityActor(nn.Module):
             self.market_quantity_kind_gate,
             self.market_quantity_value,
             self.market_quantity_bias,
+            action_interface=config.action_interface,
         )
 
-    def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
+    def quantity_logits(
+        self, quantity_context: Tensor, market_kinds: Tensor, quantity_mask: Tensor | None = None
+    ) -> Tensor:
+        if self.config.action_interface == 3:
+            raise ValueError("interface-3 actor uses market_set_logits")
         return factored_quantity_logits(
             quantity_context,
             market_kinds,
@@ -638,11 +688,33 @@ class EntityActor(nn.Module):
             self.market_quantity_value,
             self.market_quantity_bias,
             self.config.quantity_rank,
+            quantity_mask,
         )
 
     def _head_belief(self, states: Tensor) -> StructuredDecisionBelief:
-        units, markets = states.split((MAX_UNITS, MAX_MARKET_ORDERS), dim=1)
+        units, markets = states.split((MAX_UNITS, self.trunk.market_count), dim=1)
         return StructuredDecisionBelief(self.unit_head[0](units), self.market_norm(markets))
+
+    def market_set_logits(self, context: Tensor, mask: Tensor) -> Tensor:
+        """Score 21 effective per-kind values, marginalizing the ALL alias."""
+        if self.config.action_interface != 3:
+            raise ValueError("market set logits require action_interface=3")
+        if context.shape[-2:] != (N_MARKET_SET_KINDS, self.config.quantity_rank):
+            raise ValueError("market set context must have 21 kind rows")
+        if mask.shape != (*context.shape[:-1], N_QUANTITIES + 1):
+            raise ValueError("market set mask must have 101 effective values")
+        with torch.autocast(context.device.type, enabled=False):
+            kinds = self.market_set_kind_ids
+            gated = context.float() * (1.0 + self.market_quantity_kind_gate(kinds).float())
+            values = self.market_quantity_value.weight.float()
+            scores = self.market_quantity_bias[kinds].float()
+            for rank in range(self.config.quantity_rank):
+                scores = scores + gated[..., rank, None] * values[:, rank]
+            maximum = mask.long().sum(-1).sub(1).clamp_min(0)
+            at_max = scores[..., : N_QUANTITIES + 1].gather(-1, maximum[..., None])
+            merged = torch.logaddexp(at_max, scores[..., N_QUANTITIES + 1 :])
+            merged = torch.where(mask[..., 1:].any(-1, keepdim=True), merged, at_max)
+            return scores[..., : N_QUANTITIES + 1].scatter(-1, maximum[..., None], merged)
 
     def encode_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
         return self._head_belief(self.trunk(inputs))
@@ -656,12 +728,15 @@ class EntityActor(nn.Module):
         return self._head_belief(states)
 
     def decode_belief(self, belief: StructuredDecisionBelief) -> ActorOutput:
+        context = self.market_quantity_context(belief.market_decisions).contiguous()
         return ActorOutput(
             unit_logits=self.unit_head[-1](belief.unit_decisions).contiguous(),
-            market_kind_logits=self.market_kind(belief.market_decisions).contiguous(),
-            market_quantity_context=self.market_quantity_context(
-                belief.market_decisions
-            ).contiguous(),
+            market_kind_logits=(
+                context[..., :0]
+                if self.market_kind is None
+                else self.market_kind(belief.market_decisions).contiguous()
+            ),
+            market_quantity_context=context,
         )
 
     def forward_with_belief(
@@ -695,7 +770,11 @@ class EntityCritic(nn.Module):
 
             self.trunk = EconomicCriticTrunk(config)
         else:
-            self.trunk = EntityTrunk(config, private_columns=True)
+            self.trunk = EntityTrunk(
+                config,
+                private_columns=True,
+                market_count=MAX_MARKET_ORDERS if config.action_interface == 3 else None,
+            )
         self.pool_norm = RMSNorm(config.model_dim)
         self.source_pool_norm = (
             RMSNorm(config.model_dim)
@@ -766,7 +845,7 @@ class EntityCritic(nn.Module):
         valid = torch.cat(
             (
                 inputs.unit_active,
-                torch.ones(batch, MAX_MARKET_ORDERS, dtype=torch.bool, device=states.device),
+                torch.ones(batch, self.trunk.market_count, dtype=torch.bool, device=states.device),
             ),
             dim=1,
         )

@@ -290,7 +290,32 @@ def _validate_module(module: ModuleType, origin: str) -> ModuleType:
         raise ImportError(
             f"native extension loaded from {origin} has stale observation schema; rebuild required"
         )
+    _verify_official_market_rules(module, origin)
     return module
+
+
+def _verify_official_market_rules(module: ModuleType, origin: str) -> None:
+    """Reject an engine whose quotes differ from the installed official simulator.
+
+    A frozen source snapshot runs against the shared environment, so a later
+    kaggle-environments upgrade would otherwise train on one rule set while
+    official evaluation plays another. The strided sweep covers each curve's
+    knee and both tails at a few milliseconds per process.
+    """
+    from kaggle_environments.envs.kaggriculture import kaggriculture as official
+
+    from kaggriculture.constants import PRODUCTS
+
+    minimum, maximum = -20_000, 30_000
+    prices = module.BatchEnv.policy_market_prices(minimum, maximum)
+    for item, product in enumerate(PRODUCTS):
+        for inventory in range(minimum, maximum + 1, 7):
+            if prices[item, inventory - minimum] != official.market_price(product, inventory):
+                raise ImportError(
+                    f"native extension loaded from {origin} quotes {product} at inventory "
+                    f"{inventory} differently from the installed kaggle-environments; "
+                    "the source and the environment disagree on market rules"
+                )
 
 
 def load_native(*, build: bool = True, release: bool = True) -> ModuleType:

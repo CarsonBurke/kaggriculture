@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from kaggriculture.actions import N_QUANTITIES
 from kaggriculture.constants import MAX_UNITS
 from kaggriculture.encoding import (
     BOARD_CHANNELS,
@@ -135,6 +136,7 @@ def main() -> None:
     quantity_logits = actor.quantity_logits(
         actor_output.market_quantity_context,
         market_kinds,
+        torch.ones((*market_kinds.shape, N_QUANTITIES), device=device, dtype=torch.bool),
     )
     critic_logits = critic(board, critic_features)
     loss = sum(tensor.float().square().mean() for tensor in actor_output)

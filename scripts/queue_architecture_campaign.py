@@ -10,7 +10,11 @@ import sys
 from pathlib import Path
 
 from kaggriculture.modelargs import model_config_arguments
-from kaggriculture.production import build_training_command, production_model_config
+from kaggriculture.production import (
+    build_training_command,
+    production_model_config,
+    production_ppo_config,
+)
 from kaggriculture.provenance import file_sha256, freeze_source, source_identity
 from kaggriculture.registry import ENTITY_ATTENTION, resolve_architecture
 
@@ -73,7 +77,7 @@ def main() -> None:
             "primary": "Argmax native development score on 256 common seeds per opponent",
             "comparison": "Equal wall-clock budget; report iterations and paired seed uncertainty",
             "warm_start": "Matched two-epoch BC; critic and league reuse control BC exactly",
-            "training": "Production 128 self-play + 64 league games, B8192, one training seed",
+            "training": "Production 128 self-play + 64 league games, production minibatch",
             "limits": "24-minute trainer budget; 25-minute hard cap including startup",
             "culling": "No plateau cull at this horizon; numerical/readiness gates remain",
             "promotion": "No automatic default changes; exploratory single-training-seed evidence",
@@ -83,6 +87,8 @@ def main() -> None:
     destination.mkdir(parents=True, exist_ok=True)
 
     def submit(label: str, command: list[str], minutes: int, parents: list[int]) -> int:
+        if not 0 < minutes <= 30:
+            raise ValueError(f"{label} exceeds the 30-minute per-job limit")
         queue_command = [
             "mlq",
             "submit",
@@ -209,7 +215,7 @@ def main() -> None:
             "inductor_graph",
             "--rollout-bfloat16",
             "--minibatch-size",
-            "8192",
+            str(production_ppo_config(update_compile_mode="reduce-overhead")["minibatch_size"]),
             "--init-actor-from",
             str(bc_paths[arm]),
             "--output",

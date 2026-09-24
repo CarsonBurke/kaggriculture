@@ -516,28 +516,8 @@ def test_submission_bundle_is_isolated_complete_and_within_action_timeout(
         text=True,
     )
 
-    required = {
-        "main.py",
-        "model.pt",
-        "evaluation.json",
-        "manifest.json",
-        "kaggriculture/__init__.py",
-        "kaggriculture/actions.py",
-        "kaggriculture/constants.py",
-        "kaggriculture/encoding.py",
-        "kaggriculture/entity.py",
-        "kaggriculture/inference.py",
-        "kaggriculture/evaluation.py",
-        "kaggriculture/model.py",
-        "kaggriculture/orientation.py",
-        "kaggriculture/policy.py",
-        "kaggriculture/provenance.py",
-        "kaggriculture/registry.py",
-        "kaggriculture/structured.py",
-        "kaggriculture/tokens.py",
-        "kaggriculture/triton_mlp.py",
-        "kaggriculture/triton_norm.py",
-    }
+    # Exactly what the validator admits, so a built bundle can pass it.
+    required = _validate_submission_module().REQUIRED_MEMBERS
     with tarfile.open(archive, "r:gz") as bundle:
         assert set(bundle.getnames()) == required
         bundle.extractall(tmp_path / "extracted", filter="data")

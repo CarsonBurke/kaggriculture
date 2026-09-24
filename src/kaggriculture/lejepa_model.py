@@ -125,6 +125,10 @@ class LejepaConfig(EntityConfig):
     which fix nothing, stay on `PpoConfig` where the rest of the trade-offs are.
     """
 
+    # The current-rules money-margin arm is the working basis for future LeJEPA
+    # runs. Saved v3 artifacts still name their schema explicitly when loaded.
+    observation_schema_version: int = 4
+
     #: Hidden width of every projector, of the predictor's output head, and of
     #: the reward body. `../le-wm` runs a 192-wide encoder through a 2048-wide
     #: projector hidden layer; four times the model width is the same shape of
@@ -176,6 +180,8 @@ class LejepaConfig(EntityConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.action_interface == 3:
+            raise ValueError("LeJEPA decision layout does not support market-set interface 3")
         for name in ("jepa_hidden_dim", "jepa_slices", "jepa_tile_samples", "jepa_sigreg_rows"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -212,15 +218,19 @@ class LejepaBackbone(nn.Module):
     def __init__(self, config: EntityConfig) -> None:
         super().__init__()
         self.config = config
-        self.trunk = EntityTrunk(config, private_columns=False, rematerialize_farms=True)
+        self.trunk = EntityTrunk(config, private_columns=False)
 
-    def _encode(self, inputs: StructuredInputs) -> tuple[Tensor, Tensor]:
+    def _encode(
+        self, inputs: StructuredInputs, *, rematerialize_farms: bool = False
+    ) -> tuple[Tensor, Tensor]:
         """States and source memory from one trunk pass, with no optional output.
 
         `EntityTrunk.forward_with_memory` also returns a validity mask that is
         `None` without opponent-unit memory, which this encoder never has.
         """
-        states, memory, _ = self.trunk.forward_with_memory(inputs)
+        states, memory, _ = self.trunk.forward_with_memory(
+            inputs, rematerialize_farms=rematerialize_farms
+        )
         return states, memory
 
     def _belief(self, states: Tensor, memory: Tensor) -> JepaBelief:
@@ -239,11 +249,15 @@ class LejepaBackbone(nn.Module):
         The belief carries the trunk's whole tile memory and the objective scores
         a sample of its columns, so the update retains the trunk's activations
         across every term that reads it. The farm blocks, which run over every
-        tile token, are most of those; the trunk is built to recompute only them.
-        At the production minibatch that peaks ~3.7 GiB under recomputing the
-        whole trunk, as this once did, and skips the rest of its replay.
+        tile token, are most of those, and only they are recomputed. At the
+        production minibatch that peaks ~3.7 GiB under recomputing the whole
+        trunk, as this once did, and skips the rest of its replay.
+
+        Only this path pays the replay. `forward` keeps the farm activations:
+        the clone and the critic fit without recomputing, and recomputing there
+        more than doubled a clone epoch (11 s to 26 s).
         """
-        return self.forward(inputs)
+        return self._belief(*self._encode(inputs, rematerialize_farms=True))
 
 
 class _ReadoutRound(nn.Module):

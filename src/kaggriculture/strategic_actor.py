@@ -28,6 +28,8 @@ class StrategicConfig(EntityConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.action_interface == 3:
+            raise ValueError("strategic decoder does not support market-set interface 3")
         for name in ("workspace_states", "plan_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:

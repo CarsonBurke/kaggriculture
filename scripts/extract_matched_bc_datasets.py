@@ -40,7 +40,8 @@ def main() -> None:
             opponent,
             "--workers",
             "8",
-            "--resume",
+            # A committed manifest marks a corpus to resume; otherwise start one.
+            *(["--resume"] if (output / "manifest.json").is_file() else []),
         ]
         print("+", " ".join(command), flush=True)
         subprocess.run(command, cwd=root, check=True)

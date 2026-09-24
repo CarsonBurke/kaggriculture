@@ -250,6 +250,7 @@ class DeviceLedger:
 
         self.action_ids = torch.arange(68, device=device)
         self.items = torch.arange(12, device=device)
+        self.goods_ids = ints([0, 8])
         self.crop_ids = torch.arange(5, device=device)
         self.quantities = torch.arange(1, 101, device=device)
         self.seed_cost = ints([10, 20, 50, 100, 80])
@@ -456,7 +457,7 @@ class DeviceLedger:
         hire = (state.units + state.hires - state.original_hires < 16) & (state.money >= cost)
         land = (state.land < 3) & (state.money >= self.land_cost[state.land])
         goods = torch.stack((state.market[:, 0], state.market[:, 8]), dim=1) - 1
-        goods_cost = self.prices[self.items[[0, 8]][None], goods - self.minimum]
+        goods_cost = self.prices[self.goods_ids[None], goods - self.minimum]
         mask = torch.cat(
             (
                 torch.ones_like(hire[:, None]),

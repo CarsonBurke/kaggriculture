@@ -237,7 +237,7 @@ mlq submit --name kagg-cuda-tests --max-parallel-runs 1 --priority 0 \
 
 The first Rust-backed rollout automatically builds the native extension with
 `cargo build --release`. Rust traces must pass differential tests against
-`kaggle-environments==1.32.6` before they are admitted to training.
+`kaggle-environments==1.32.7` before they are admitted to training.
 
 Run the complete native correctness gate with:
 
@@ -548,8 +548,11 @@ of 70-126k sampled, and its objective is healthier, not weaker: motion 0.44 vs
 0.17 at the same dispersion.
 
 The encoder steps **exactly when the policy does**, on the same minibatch and at
-the actor's learning rate (unless `--structured-learning-rate` sets the world
-model's apart). The heads read it, so every encoder step is a policy step
+the actor's learning rate unless `--structured-learning-rate` sets the world
+model's apart. Every `lejepa` PPO run sets it to a tenth of the actor's, 1.5e-5
+(`JEPA_BACKBONE_LEARNING_RATE`): at the full rate the encoder moves under both
+gradients every minibatch, and the slower backbone beat the full-rate run on the
+same clone (JEPA_RUNS, 9281 vs 9275). The heads read it, so every encoder step is a policy step
 whether or not the actor's optimizer took one: a
 minibatch after a KL stop that moved the encoder would move the policy past the
 trust region that had just refused to. After a KL stop, through the critic's
@@ -962,6 +965,18 @@ shed and carried-stock tokens and public farmer/hand occupancy remain unchanged.
 Rebuild native encoding and BC caches
 and train fresh actors: old structured model artifacts are rejected, not migrated.
 
+Schema v4 appends `money_margin` to each farm token: that farm's signed
+`log1p` money minus the other farm's, unscaled and rounded once from float64.
+The absolute `money` feature (`/12`) is staged in fp16 and cast to bf16 under
+autocast, which leaves roughly 5% resolution on a late-game bank; the margin is
+near zero exactly when a game is close, where floating point is finest. v3 and
+v4 coexist: both tokenizers always emit the v4 layout, and each model's
+`observation_schema_version` selects the farm-token prefix its embedder reads,
+so v3 artifacts load and act unchanged. Fresh LeJEPA model configs default to
+v4; production entity and the other structured families continue to default to
+v3. Override a fresh run with `--observation-schema-version` when making an
+explicit schema comparison.
+
 Python action helpers and inference use the default shed capacity of100.
 `CheckpointAgent.__call__(observation, configuration)` and the generated submission
 entrypoint reject a supplied nondefault `shedCapacity` before inference.
@@ -1237,7 +1252,7 @@ mlq submit --name kagg-bundle-validation --max-parallel-runs 1 --time-limit 2h \
 ## Game mechanics
 
 The [mechanics overview](mechanics/overview.md) documents the rules implemented by
-the pinned `kaggle-environments==1.32.6` release. The companion pages cover:
+the pinned `kaggle-environments==1.32.7` release. The companion pages cover:
 
 - [agent API and state](mechanics/api.md)
 - [default constants](mechanics/constants.md)

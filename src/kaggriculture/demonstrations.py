@@ -57,6 +57,7 @@ from kaggriculture.constants import (
     SEED_COST,
     SHED_CAPACITY,
     fibonacci_hire_cost,
+    market_price,
     shed_access_tiles,
 )
 
@@ -265,6 +266,82 @@ def _parse_market_order(order: Any) -> tuple[MarketKind, int] | None:
     if item not in table:
         raise DemonstrationError(f"unknown market order: {order!r}")
     return table[item], quantity
+
+
+def canonicalize_market_orders(
+    observation: dict[str, Any],
+    orders: list[Any],
+    *,
+    sell_order: str = "fixed",
+    hire_last: bool = False,
+) -> list[list[Any]]:
+    """Merge repeated kinds and put sells first for a market interface trial.
+
+    This is a *proposal* for the official engine to execute, not an assertion of
+    outcome equivalence: buy/sell order and simultaneous opponent orders can
+    change fills and prices. The paired engine panel must measure that change.
+    """
+    if sell_order not in {"fixed", "impact"}:
+        raise ValueError(f"unknown sell order {sell_order!r}")
+    totals: dict[MarketKind, int] = {}
+    for raw in orders[:MAX_MARKET_ORDERS]:
+        parsed = _parse_market_order(raw)
+        if parsed is None:
+            continue
+        kind, quantity = parsed
+        increment = 1 if kind in (MarketKind.HIRE, MarketKind.BUY_LAND) else quantity
+        totals[kind] = totals.get(kind, 0) + increment
+    if totals.get(MarketKind.BUY_LAND, 0) > 1:
+        raise DemonstrationError("canonical market set cannot represent multiple BUY_LAND orders")
+
+    sells = [kind for kind in MarketKind if kind.name.startswith("SELL_") and kind in totals]
+    if sell_order == "impact":
+        market = observation.get("market") or {}
+        inventory = market.get("inventory") or {}
+        params = market.get("params")
+
+        def impact(kind: MarketKind) -> int:
+            item = kind.name.removeprefix("SELL_")
+            stock = int(inventory.get(item, 0))
+            amount = totals[kind]
+            return amount * max(
+                0,
+                market_price(item, stock, params) - market_price(item, stock + amount, params),
+            )
+
+        sells.sort(key=lambda kind: (-impact(kind), int(kind)))
+    # Keep the proposed interface's execution order independent of the legacy
+    # MarketKind enum, where products happen to precede animals.
+    remainder = [
+        *(() if hire_last else (MarketKind.HIRE,)),
+        MarketKind.BUY_LAND,
+        *(kind for kind in MarketKind if kind.name.startswith("BUY_SEED_")),
+        *(kind for kind in MarketKind if kind.name.startswith("BUY_ANIMAL_")),
+        *(kind for kind in MarketKind if kind.name.startswith("BUY_PRODUCT_")),
+        *((MarketKind.HIRE,) if hire_last else ()),
+    ]
+    canonical: list[list[Any]] = []
+    for kind in [*sells, *(kind for kind in remainder if kind in totals)]:
+        count = totals[kind]
+        if kind == MarketKind.HIRE:
+            canonical.extend([["HIRE"] for _ in range(count)])
+        elif kind == MarketKind.BUY_LAND:
+            canonical.append(["BUY_LAND"])
+        else:
+            item = kind.name.split("_", 1)[1]
+            if kind.name.startswith("BUY_SEED_"):
+                canonical.append(["BUY_SEED", item.removeprefix("SEED_"), count])
+            elif kind.name.startswith("BUY_PRODUCT_"):
+                canonical.append(["BUY_PRODUCT", item.removeprefix("PRODUCT_"), count])
+            elif kind.name.startswith("BUY_ANIMAL_"):
+                canonical.append(["BUY_ANIMAL", item.removeprefix("ANIMAL_"), count])
+            else:
+                canonical.append(["SELL", item, count])
+    if len(canonical) > MAX_MARKET_ORDERS:
+        raise DemonstrationError(
+            f"canonical market has {len(canonical)} orders, above {MAX_MARKET_ORDERS} slots"
+        )
+    return canonical
 
 
 def _engine_would_execute(

@@ -849,6 +849,60 @@ def test_the_prediction_target_carries_gradient(actor_inputs, factors, plan) -> 
     assert rows_with_gradient >= set(target[plan.eligible[0]].tolist())
 
 
+def test_the_detached_target_ablation_moves_only_the_target_side_gradient(
+    actor_inputs, factors, plan
+) -> None:
+    """cleanrl's JEPA-PPO stop-gradient, as an ablation of LeWM's attached target.
+
+    Detaching changes where the prediction term's gradient lands and nothing
+    else: every returned value is bitwise identical, a row that is only ever a
+    successor stops receiving prediction gradient, and a row that is only ever a
+    source receives exactly what it did with the target attached.
+    """
+    torch.manual_seed(0)
+    config = _tiny_config()
+    objective = JepaObjective(config)
+    shapes = {
+        "unit": (8, MAX_UNITS, config.model_dim),
+        "market": (8, MAX_MARKET_ORDERS, config.model_dim),
+        "economy": (8, 6, config.model_dim),
+        "tile": (8, 2 * TILE_COUNT, config.model_dim),
+    }
+    values = {name: torch.randn(shape) for name, shape in shapes.items()}
+
+    def run(detach_target: bool) -> tuple[JepaTerms, Tensor]:
+        latents = {name: value.clone().requires_grad_() for name, value in values.items()}
+        belief = JepaBelief(*(latents[name] for name in shapes))
+        terms = jepa_horizon_loss(
+            objective,
+            belief,
+            actor_inputs,
+            factors,
+            horizon=1,
+            plan=plan,
+            detach_target=detach_target,
+        )
+        terms.prediction.backward()
+        # Per-row gradient magnitude over every latent group.
+        per_row = sum(latents[name].grad.abs().flatten(1).sum(1) for name in shapes)
+        return terms, per_row
+
+    attached, attached_gradient = run(detach_target=False)
+    detached, detached_gradient = run(detach_target=True)
+
+    for name, left, right in zip(JEPA_METRICS, attached, detached, strict=True):
+        assert torch.equal(left.detach(), right.detach()), name
+    eligible = plan.eligible[0]
+    sources = set(plan.indices[0][eligible].tolist())
+    targets = set(plan.indices[plan.eligible.shape[0] + 1][eligible].tolist())
+    successor_only = sorted(targets - sources)
+    source_only = sorted(sources - targets)
+    assert successor_only and source_only
+    assert (attached_gradient[successor_only] > 0.0).all()
+    assert (detached_gradient[successor_only] == 0.0).all()
+    torch.testing.assert_close(detached_gradient[source_only], attached_gradient[source_only])
+
+
 def test_the_reward_term_is_scored_on_rows_the_transition_cannot_reach(
     actor_inputs, factors, plan
 ) -> None:
@@ -1291,6 +1345,12 @@ def test_lejepa_and_detached_nextlat_are_mutually_exclusive() -> None:
         _jepa_ppo_config(structured_critic_latent_coefficient=0.1, structured_critic_horizon=1)
 
 
+def test_the_detached_target_ablation_requires_the_objective_it_ablates() -> None:
+    assert _jepa_ppo_config(jepa_detach_target=True).jepa_detach_target
+    with pytest.raises(ValueError, match="requires the LeJEPA objective"):
+        _validate_config(PpoConfig(jepa_detach_target=True))
+
+
 def test_active_flags_follow_the_coefficients() -> None:
     config = _jepa_ppo_config()
 
@@ -1405,7 +1465,7 @@ def test_every_jepa_knob_has_a_flag_that_defaults_to_the_config(monkeypatch, tmp
     args = _cli_args(module, monkeypatch, tmp_path, "--architecture", "entity-attention")
     fields = [name for name in PpoConfig.__dataclass_fields__ if name.startswith("jepa_")]
 
-    assert len(fields) == 4
+    assert len(fields) == 5
     for name in fields:
         assert hasattr(args, name), name
         assert getattr(args, name) == getattr(PpoConfig, name), name
@@ -1460,6 +1520,39 @@ def test_the_lejepa_family_refuses_a_detached_predictor_on_either_arm() -> None:
     # And the objective itself is refused on the critic side outright.
     with pytest.raises(ValueError, match="belongs to the actor arm"):
         _validate_structured_critic_auxiliary_modules(critic, JepaObjective(model_config), jepa)
+
+
+def test_the_detached_target_flag_parses_and_is_bound_to_the_objective(
+    monkeypatch, tmp_path
+) -> None:
+    module = _training_script()
+    objective = (
+        "--architecture",
+        LEJEPA,
+        "--jepa-prediction-coefficient",
+        "1.0",
+        "--jepa-sigreg-coefficient",
+        "0.09",
+    )
+
+    assert not _cli_args(module, monkeypatch, tmp_path, *objective).jepa_detach_target
+    enabled = _cli_args(module, monkeypatch, tmp_path, *objective, "--jepa-detach-target")
+    module._validate_args(enabled)
+    assert enabled.jepa_detach_target
+    assert not _cli_args(
+        module, monkeypatch, tmp_path, *objective, "--no-jepa-detach-target"
+    ).jepa_detach_target
+    with pytest.raises(ValueError, match="requires the LeJEPA objective"):
+        module._validate_args(
+            _cli_args(
+                module,
+                monkeypatch,
+                tmp_path,
+                "--architecture",
+                "entity-attention",
+                "--jepa-detach-target",
+            )
+        )
 
 
 def test_the_cli_refuses_the_lejepa_family_beside_a_detached_nextlat(monkeypatch, tmp_path) -> None:
@@ -1561,6 +1654,60 @@ def test_update_ppo_trains_the_shared_backbone_and_nothing_else_does() -> None:
     assert _moved(objective.named_parameters(), before_objective)
     assert _moved(actor.trunk.named_parameters(), before_backbone)
     assert _moved(critic.named_parameters(), before_critic)
+
+
+def test_update_ppo_hands_the_detached_target_switch_to_the_objective(monkeypatch) -> None:
+    """The config field is read inside the compiled update, not only validated."""
+    import kaggriculture.ppo as ppo_module
+
+    torch.manual_seed(0)
+    model_config = _tiny_config()
+    actor, critic = build_lejepa_pair(model_config)
+    rollout = collect_self_play(
+        actor,
+        games=1,
+        seed_start=225,
+        episode_steps=8,
+        sampling_seed=53,
+        reward_mode="shaped",
+    )
+    config = PpoConfig(
+        optimizer="adamw",
+        epochs=1,
+        minibatch_size=1 << 12,
+        lr_warmup_steps=0,
+        target_kl=1.0,
+        use_bfloat16=False,
+        jepa_prediction_coefficient=1.0,
+        jepa_sigreg_coefficient=0.09,
+        jepa_detach_target=True,
+    )
+    objective = JepaObjective(model_config)
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    seen: list[bool] = []
+
+    def spy(*args, detach_target: bool = False, **kwargs):
+        seen.append(detach_target)
+        return jepa_horizon_loss(*args, detach_target=detach_target, **kwargs)
+
+    monkeypatch.setattr(ppo_module, "jepa_horizon_loss", spy)
+    update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(43),
+        auxiliary_generator=np.random.default_rng(44),
+        structured_dynamics=objective,
+        structured_dynamics_optimizer=make_structured_dynamics_optimizer(
+            objective, config, critic=False, actor=actor
+        ),
+        structured_actor_auxiliary=True,
+    )
+
+    assert seen and all(seen)
 
 
 def test_update_ppo_encodes_each_minibatch_once_for_both_towers(monkeypatch) -> None:
@@ -1746,67 +1893,8 @@ def test_ppo_carries_the_policy_gradient_into_the_backbone(monkeypatch, shapes) 
     assert bool(_moved(actor.trunk.named_parameters(), before_backbone)) == shapes
 
 
-def test_the_reference_anchor_runs_through_the_lejepa_update() -> None:
-    """The anchor reads the frozen clone's own backbone, which nothing steps.
-
-    The reference is a whole second model, trunk included, so its KL compares
-    two complete programs rather than two heads over one shared encoder; the
-    update must drive the live actor while leaving that clone bit-identical.
-    """
-    torch.manual_seed(0)
-    model_config = _tiny_config()
-    actor, critic = build_lejepa_pair(model_config)
-    _pin_quantity_orders(actor)
-    rollout = collect_self_play(
-        actor, games=1, seed_start=225, episode_steps=8, sampling_seed=53, reward_mode="shaped"
-    )
-    noise = np.random.default_rng(7).standard_normal(rollout.rewards.shape)
-    rollout = replace(rollout, rewards=noise.astype(rollout.rewards.dtype))
-    reference = copy.deepcopy(actor).eval().requires_grad_(False)
-    frozen = {name: value.clone() for name, value in reference.state_dict().items()}
-    config = PpoConfig(
-        optimizer="adamw",
-        epochs=2,
-        minibatch_size=1 << 12,
-        lr_warmup_steps=0,
-        target_kl=1.0,
-        use_bfloat16=False,
-        jepa_prediction_coefficient=1.0,
-        jepa_sigreg_coefficient=0.09,
-        reference_kl_coefficient=1.0,
-    )
-    objective = JepaObjective(model_config)
-    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    objective_optimizer = make_structured_dynamics_optimizer(
-        objective, config, critic=False, actor=actor
-    )
-
-    metrics = update_ppo(
-        actor,
-        critic,
-        actor_optimizer,
-        critic_optimizer,
-        rollout,
-        config,
-        generator=np.random.default_rng(43),
-        auxiliary_generator=np.random.default_rng(44),
-        structured_dynamics=objective,
-        structured_dynamics_optimizer=objective_optimizer,
-        structured_actor_auxiliary=True,
-        reference_actor=reference,
-    )
-
-    assert metrics["actor_updates"] == 2
-    # The first minibatch compares the actor with its exact copy; the second
-    # sees the first step's movement, which the anchor now measures.
-    assert 0.0 < metrics["reference_kl"] <= metrics["max_reference_decision_kl"]
-    assert math.isfinite(metrics["max_reference_decision_kl"])
-    for name, value in reference.state_dict().items():
-        assert torch.equal(value, frozen[name]), name
-
-
 def test_a_frozen_copy_traces_whole_under_grad_mode() -> None:
-    """The anchor runs a frozen clone inside the compiled update, grad mode on.
+    """A frozen clone of the actor compiles whole with grad mode on.
 
     Nothing in that forward requires grad, the one case where Dynamo cannot
     trace the tiny-vocabulary embedding's vararg Function; the production gate

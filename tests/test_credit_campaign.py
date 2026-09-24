@@ -32,7 +32,7 @@ def argument(command, flag):
     return command[command.index(flag) + 1]
 
 
-def test_credit_commands_preserve_full_budget_and_only_change_named_mechanisms(tmp_path):
+def test_credit_commands_use_bounded_budget_and_only_change_named_mechanisms(tmp_path):
     module = load_script("queue_credit_campaign")
     root = tmp_path
     source = root / "source"
@@ -45,12 +45,14 @@ def test_credit_commands_preserve_full_budget_and_only_change_named_mechanisms(t
             "--iterations": "500",
             "--games": "128",
             "--league-games": "64",
-            "--minibatch-size": "8192",
+            "--minibatch-size": str(
+                production_ppo_config(update_compile_mode="default")["minibatch_size"]
+            ),
             "--episode-steps": "720",
             "--league-selection": "hardness",
             "--critic-source-read": "true",
             "--init-actor-from": str(actor),
-            "--max-hours": "3.0",
+            "--max-hours": str(module.TRAINER_HOURS),
         }.items():
             assert argument(train, flag) == value
         assert train[1] == str(source / "scripts/train_ppo.py")
@@ -137,7 +139,8 @@ def test_campaign_gates_learning_and_evaluates_successful_runs(tmp_path, monkeyp
         gate, train = jobs[f"gate-{arm}"], jobs[f"train-{arm}"]
         assert gate["after_success"] == [validation]
         assert train["after_success"] == [gate["submission"]["id"]]
-        assert train["time_limit_minutes"] == 190
+        assert train["time_limit_minutes"] == 30
+        assert all(job["time_limit_minutes"] <= 30 for job in jobs.values())
         for mode in ("argmax", "sampled"):
             evaluation = jobs[f"evaluate-{arm}-{mode}"]
             assert evaluation["after_success"] == [train["submission"]["id"]]

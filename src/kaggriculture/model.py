@@ -89,6 +89,7 @@ def categorical_value(logits: Tensor, support: Tensor) -> Tensor:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    action_interface: int = 1
     cnn_width: int = 48
     cnn_blocks: int = 2
     model_dim: int = 96
@@ -106,6 +107,8 @@ class ModelConfig:
     scalar_value: bool = False
 
     def __post_init__(self) -> None:
+        if self.action_interface not in (1, 2, 4):
+            raise ValueError("action_interface must be 1, 2, or 4")
         if self.cnn_width <= 0:
             raise ValueError("cnn_width must be positive")
         if self.cnn_blocks <= 0:
@@ -552,14 +555,18 @@ def _board_positions() -> Tensor:
 
 def initialize_policy_heads(
     unit_head: nn.Linear,
-    market_kind: nn.Linear,
+    market_kind: nn.Linear | None,
     market_quantity_context: nn.Linear,
     market_quantity_kind_gate: nn.Embedding,
     market_quantity_value: nn.Embedding,
     market_quantity_bias: nn.Parameter,
+    *,
+    action_interface: int = 1,
 ) -> None:
     """Initialize the shared policy heads every actor architecture uses."""
     for head in (unit_head, market_kind, market_quantity_context):
+        if head is None:
+            continue
         nn.init.normal_(head.weight, std=0.01)
         if head.bias is not None:
             nn.init.zeros_(head.bias)
@@ -594,16 +601,53 @@ def initialize_policy_heads(
         unit_bias[UnitAction.COLLECT_FERTILIZER] = 2.0
         unit_bias[UnitAction.CARE] = 1.0
 
+        if action_interface == 3:
+            # Row zero is a genuine no-order choice for every kind. Rows 1..100
+            # are effective quantities and row 101 aliases the legal maximum.
+            quantities = torch.arange(
+                1,
+                N_QUANTITIES + 1,
+                device=market_quantity_bias.device,
+                dtype=market_quantity_bias.dtype,
+            )
+            market_quantity_bias[:, 0] = 4.5
+            market_quantity_bias[
+                MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1, 1 : N_QUANTITIES + 1
+            ].copy_(-2.0 * quantities.log())
+            market_quantity_bias[
+                MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1,
+                1 : N_QUANTITIES + 1,
+            ].copy_(-2.5 * quantities.log())
+            market_quantity_bias[
+                MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1,
+                1 : N_QUANTITIES + 1,
+            ].copy_(0.5 * quantities.log())
+            market_quantity_bias[MarketKind.BUY_LAND, 1] = -7.0
+            return
+
         # Keep roughly 95% opening STOP probability and bias initial
         # exploration toward cheap hires/seeds and inventory liquidation.
-        kind_bias = market_kind.bias
-        kind_bias[MarketKind.STOP] = 4.5
-        kind_bias[MarketKind.HIRE] = 1.0
-        kind_bias[MarketKind.BUY_LAND] = -7.0
-        kind_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1] = -1.0
-        kind_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_PRODUCT_FERTILIZER + 1] = -3.0
-        kind_bias[MarketKind.BUY_ANIMAL_GOOSE : MarketKind.BUY_ANIMAL_SHEEP + 1] = -4.0
-        kind_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1] = 4.0
+        if market_kind is not None:
+            kind_bias = market_kind.bias
+            kind_bias[MarketKind.STOP] = 4.5
+            kind_bias[MarketKind.HIRE] = 1.0
+            kind_bias[MarketKind.BUY_LAND] = -7.0
+            kind_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1] = -1.0
+            kind_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_PRODUCT_FERTILIZER + 1] = -3.0
+            kind_bias[MarketKind.BUY_ANIMAL_GOOSE : MarketKind.BUY_ANIMAL_SHEEP + 1] = -4.0
+            kind_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1] = 4.0
+
+        if action_interface == 4:
+            # Four atoms (1, 2, 3, legal maximum), continuous weight, and
+            # logistic location/scale.  A broad continuous component keeps
+            # every legal integer reachable at initialization.
+            market_quantity_bias[:, 4] = -0.5
+            market_quantity_bias[:, 6] = -1.5
+            market_quantity_bias[
+                MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1, 0
+            ] = 1.5
+            market_quantity_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1, 3] = 2.0
+            return
 
         quantities = torch.as_tensor(
             QUANTITY_BINS,
@@ -611,15 +655,15 @@ def initialize_policy_heads(
             dtype=market_quantity_bias.dtype,
         )
         log_quantity = quantities.log()
-        market_quantity_bias[MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1].copy_(
-            -2.0 * log_quantity
-        )
-        market_quantity_bias[MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1].copy_(
-            -2.5 * log_quantity
-        )
-        market_quantity_bias[MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1].copy_(
-            0.5 * log_quantity
-        )
+        market_quantity_bias[
+            MarketKind.BUY_SEED_WHEAT : MarketKind.BUY_SEED_MELON + 1, :N_QUANTITIES
+        ].copy_(-2.0 * log_quantity)
+        market_quantity_bias[
+            MarketKind.BUY_PRODUCT_WHEAT : MarketKind.BUY_ANIMAL_SHEEP + 1, :N_QUANTITIES
+        ].copy_(-2.5 * log_quantity)
+        market_quantity_bias[
+            MarketKind.SELL_WHEAT : MarketKind.SELL_FERTILIZER + 1, :N_QUANTITIES
+        ].copy_(0.5 * log_quantity)
 
 
 def factored_quantity_logits(
@@ -629,6 +673,7 @@ def factored_quantity_logits(
     quantity_value: nn.Embedding,
     quantity_bias: Tensor,
     quantity_rank: int,
+    quantity_mask: Tensor | None = None,
 ) -> Tensor:
     """Score the native sampler's small FP32 head, even under trunk autocast."""
     if quantity_context.shape[:-1] != market_kinds.shape:
@@ -645,7 +690,72 @@ def factored_quantity_logits(
         scores = quantity_bias[kinds].float()
         for rank in range(quantity_rank):
             scores = scores + quantity_features[..., rank, None] * values[:, rank]
-        return scores
+        if values.shape[0] == 7:
+            if quantity_mask is None:
+                raise ValueError("percentage quantity head requires a legality mask")
+            return percentage_quantity_logits(scores, quantity_mask)
+        if values.shape[0] == N_QUANTITIES:
+            return scores
+        if values.shape[0] != N_QUANTITIES + 1 or quantity_mask is None:
+            raise ValueError("ALL quantity head requires a 100-bin legality mask")
+        if quantity_mask.shape != (*market_kinds.shape, N_QUANTITIES):
+            raise ValueError("quantity mask and selected market kinds must align")
+        maximum = quantity_mask.long().sum(-1).sub(1).clamp_min(0)
+        maximum_score = scores[..., :N_QUANTITIES].gather(-1, maximum[..., None])
+        merged = torch.logaddexp(maximum_score, scores[..., N_QUANTITIES:])
+        merged = torch.where(quantity_mask.any(-1, keepdim=True), merged, maximum_score)
+        return scores[..., :N_QUANTITIES].scatter(-1, maximum[..., None], merged)
+
+
+def percentage_quantity_logits(parameters: Tensor, mask: Tensor) -> Tensor:
+    """Integer log masses of a logistic fraction plus 1/2/3/ALL atoms.
+
+    For legal maximum m, amount q receives the logistic CDF mass between
+    (q-1)/m and q/m. The component is conditioned to the interval [0, 1].
+    Atoms that refer to the same executed amount are merged before sampling.
+    The returned 100 logits can be masked and normalized by the usual exact
+    categorical machinery in BC, PPO, and native inference.
+    """
+    if parameters.shape[-1] != 7 or mask.shape != (*parameters.shape[:-1], N_QUANTITIES):
+        raise ValueError("percentage parameters and quantity mask must align")
+    if parameters.dtype != torch.float32:
+        parameters = parameters.float()
+    maximum = mask.long().sum(-1).clamp_min(1)
+    quantity = torch.arange(1, N_QUANTITIES + 1, device=parameters.device)
+    scale = torch.nn.functional.softplus(parameters[..., 6:7]) + 0.02
+    location = torch.sigmoid(parameters[..., 5:6])
+    upper = (quantity / maximum[..., None] - location) / scale
+    lower = ((quantity - 1) / maximum[..., None] - location) / scale
+    delta = 1.0 / (maximum[..., None] * scale)
+    # log(sigmoid(upper) - sigmoid(lower)), stable even in the tails.
+    log_mass = (
+        torch.nn.functional.logsigmoid(upper)
+        + torch.nn.functional.logsigmoid(-lower)
+        + torch.log(-torch.expm1(-delta))
+    )
+    high = (1.0 - location) / scale
+    low = -location / scale
+    log_total = (
+        torch.nn.functional.logsigmoid(high)
+        + torch.nn.functional.logsigmoid(-low)
+        + torch.log(-torch.expm1(-1.0 / scale))
+    )
+    result = parameters[..., 4:5] + log_mass - log_total
+    for atom, destination in enumerate((1, 2, 3, 0)):
+        amount = maximum if atom == 3 else torch.full_like(maximum, destination)
+        if atom != 3:
+            active = maximum >= destination
+        else:
+            active = mask.any(-1)
+        index = (amount - 1).clamp(0, N_QUANTITIES - 1)[..., None]
+        original = result.gather(-1, index)
+        merged = torch.where(
+            active[..., None],
+            torch.logaddexp(original, parameters[..., atom : atom + 1]),
+            original,
+        )
+        result = result.scatter(-1, index, merged)
+    return result
 
 
 class FarmActor(nn.Module):
@@ -673,8 +783,9 @@ class FarmActor(nn.Module):
         # learned interaction plus a fully expressive kind/quantity bias.
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
-        self.market_quantity_value = nn.Embedding(N_QUANTITIES, config.quantity_rank)
-        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, N_QUANTITIES))
+        quantity_rows = 7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
+        self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
         self.register_buffer("board_positions", _board_positions(), persistent=False)
         self._initialize_policy_heads()
 
@@ -686,9 +797,12 @@ class FarmActor(nn.Module):
             self.market_quantity_kind_gate,
             self.market_quantity_value,
             self.market_quantity_bias,
+            action_interface=self.config.action_interface,
         )
 
-    def quantity_logits(self, quantity_context: Tensor, market_kinds: Tensor) -> Tensor:
+    def quantity_logits(
+        self, quantity_context: Tensor, market_kinds: Tensor, quantity_mask: Tensor | None = None
+    ) -> Tensor:
         """Score exact quantities only for the already-selected market kind."""
         return factored_quantity_logits(
             quantity_context,
@@ -697,6 +811,7 @@ class FarmActor(nn.Module):
             self.market_quantity_value,
             self.market_quantity_bias,
             self.config.quantity_rank,
+            quantity_mask,
         )
 
     def _head_inputs(

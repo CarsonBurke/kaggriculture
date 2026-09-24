@@ -33,6 +33,10 @@ def replace_argument(command: list[str], flag: str, value: str) -> None:
     command[command.index(flag) + 1] = value
 
 
+MAX_JOB_MINUTES = 30
+TRAINER_HOURS = 27 / 60
+
+
 def build_commands(root: Path, source: Path, output: Path, actor: Path, arms: list[str]) -> dict:
     """Build explicit production commands without constructing or running a model."""
     commands = {}
@@ -41,7 +45,7 @@ def build_commands(root: Path, source: Path, output: Path, actor: Path, arms: li
         train = build_training_command(
             run,
             iterations=500,
-            max_hours=3.0,
+            max_hours=TRAINER_HOURS,
             seed=20260812,
             rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
             update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
@@ -168,10 +172,13 @@ def main() -> None:
         "arms": args.arms,
         "jobs": {},
         "plan": {
-            "budget": "500 production waves, one seed, 3h soft/190m hard cap",
+            "budget": (
+                "Up to 500 production waves, one seed, 27-minute trainer / "
+                "30-minute per-job hard cap; longer studies resume in bounded jobs"
+            ),
             "autocull": baseline["plan"]["autocull"],
             "controls": (
-                "Same actor, production hardness/source-read, BF16 compilation, full horizon/B8192"
+                "Same actor, production hardness/source-read, BF16, full horizon and minibatch"
             ),
             "no_nextlat_caveat": (
                 "Disabling NextLat also restores plain-PPO individual-state shuffling"
@@ -185,6 +192,8 @@ def main() -> None:
     }
 
     def submit(label: str, command: list[str], minutes: int, *, success=(), terminal=()) -> int:
+        if not 0 < minutes <= MAX_JOB_MINUTES:
+            raise ValueError(f"{label} exceeds the {MAX_JOB_MINUTES}-minute per-job limit")
         queued = [
             "mlq",
             "submit",
@@ -243,7 +252,7 @@ def main() -> None:
     evaluations = []
     for arm, command in commands.items():
         gate = submit(f"gate-{arm}", command["benchmark"], 15, success=[validation])
-        train = submit(f"train-{arm}", command["train"], 190, success=[gate])
+        train = submit(f"train-{arm}", command["train"], 30, success=[gate])
         for mode, evaluation in command["evaluations"].items():
             evaluations.append(submit(f"evaluate-{arm}-{mode}", evaluation, 10, success=[train]))
     submit(

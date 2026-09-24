@@ -369,7 +369,11 @@ def policy_sharpness(actor, batch, *, limit: int, seed: int, chunk: int = 256) -
                 ),
                 (
                     "market_quantity",
-                    actor.quantity_logits(output.market_quantity_context, kinds),
+                    actor.quantity_logits(
+                        output.market_quantity_context,
+                        kinds,
+                        torch.from_numpy(fields["market_quantity_masks"][index]).to(torch.bool),
+                    ),
                     fields["market_quantity_masks"],
                     fields["market_quantities"],
                     fields["market_quantity_active"],
@@ -415,6 +419,7 @@ def policy_sharpness(actor, batch, *, limit: int, seed: int, chunk: int = 256) -
 
 def measure_cell(cell: Cell, args: dict[str, Any]) -> dict[str, Any]:
     """One wave under one decode rule, plus the sharpness of the states it saw."""
+    from kaggriculture.orientation import Orientation
     from kaggriculture.rollout import collect_mixed_play_rust
 
     actor, orientation = _load_actor(cell.path)
@@ -528,9 +533,9 @@ def measure_official(cell: Cell, args: dict[str, Any]) -> dict[str, Any]:
     actor, orientation = _load_actor(cell.path)
 
     def agent(observation: dict[str, Any]) -> dict[str, Any]:
-        return act_batch(
-            actor, [observation], deterministic=True, orientation=orientation
-        ).actions[0]
+        return act_batch(actor, [observation], deterministic=True, orientation=orientation).actions[
+            0
+        ]
 
     started = time.perf_counter()
     outcomes = [

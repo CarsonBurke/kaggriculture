@@ -43,7 +43,23 @@ from kaggriculture.constants import (
 )
 
 TILE_COUNT = BOARD_SIZE * BOARD_SIZE
-OBSERVATION_SCHEMA_VERSION = 3
+# Every supported schema reads a prefix of one tokenized layout, so a single
+# tokenization (Python here, the native extension for rollouts) serves models of
+# every supported version from the same staged arrays -- v3 artifacts keep
+# acting on current rollouts and inference -- and one encoded BC cache serves
+# both. (League snapshots must still match the learner's whole config.)
+# `OBSERVATION_SCHEMA_VERSION` names the newest schema, whose layout both
+# tokenizers emit; a model's config names the schema it consumes, and its
+# embedder slices that schema's prefix (`farm_token_fields`).
+#
+# v3: per-unit carried-item insertion ranks (README).
+# v4: adds the farm token's `money_margin`.
+OBSERVATION_SCHEMA_VERSION = 4
+SUPPORTED_OBSERVATION_SCHEMA_VERSIONS = frozenset((3, 4))
+# The common model-config default remains v3 for production entity and other
+# structured families. Fresh LeJEPA configs override it to v4; saved v3 model
+# configs still carry their explicit version for loading and resume.
+DEFAULT_OBSERVATION_SCHEMA_VERSION = 3
 
 # Categorical vocabularies. Index 0 of the occupant vocabulary is the "no
 # occupant" value so embeddings for absent fields are learned, not
@@ -396,7 +412,18 @@ FARM_TOKEN_FIELDS = (
     "unlocked_quadrants",  # / 4
     "hands",  # hired hands / (MAX_UNITS - 1)
     "hires_today",  # / (MAX_UNITS - 1)
+    # Schema v4. This farm's signed log1p money minus the other farm's,
+    # unscaled: ln((1 + own) / (1 + other)) for nonnegative money, so the two
+    # rows are exact negatives. `money` sits near 0.94 late in a game, where a
+    # bf16 input step is 2^-8 -- about 5% of a bank -- so two close banks are
+    # often the same number to the model. The margin is formed in float64
+    # before any rounding and is small exactly when the game is close, where
+    # floating point is finest: a 1% lead is 0.01, a 10x blowout 2.3. Leaving
+    # it unscaled (not /12 like `money`) keeps the decision-relevant range at
+    # the magnitude of the other [0, 1] inputs rather than 12x below them.
+    "money_margin",
 )
+_FARM_TOKEN_WIDTHS = {3: 4, 4: len(FARM_TOKEN_FIELDS)}
 TOWN_TOKEN_FIELDS = (
     "day",
     "hour",
@@ -432,9 +459,23 @@ class EconomyTokens:
     town: np.ndarray  # [len(TOWN_TOKEN_FIELDS)] float32
 
 
-def _money_feature(value: float) -> float:
+def farm_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``FARM_TOKEN_FIELDS`` a model of this schema consumes."""
+    try:
+        return FARM_TOKEN_FIELDS[: _FARM_TOKEN_WIDTHS[schema_version]]
+    except KeyError:
+        raise ValueError(f"unsupported observation schema version {schema_version!r}") from None
+
+
+def _signed_log_money(value: float) -> float:
     amount = float(value or 0)
-    return float(np.copysign(np.log1p(abs(amount)) / 12.0, amount))
+    return float(np.copysign(np.log1p(abs(amount)), amount))
+
+
+def _money_feature(value: float) -> float:
+    # Division is sign-symmetric, so this is bit-identical to scaling inside
+    # the copysign, which is how the native tokenizer orders it.
+    return _signed_log_money(value) / 12.0
 
 
 def tokenize_economy(observation: dict) -> EconomyTokens:
@@ -500,12 +541,14 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
     farm_rows = []
     for farm_index in (player, 1 - player):
         farm = farms[farm_index]
+        other = farms[1 - farm_index]
         farm_rows.append(
             (
                 _money_feature(farm.get("money", 0)),
                 len(farm.get("unlocked_quadrants") or []) / 4.0,
                 len(farm.get("hands") or []) / float(MAX_UNITS - 1),
                 float(farm.get("hires_today", 0) or 0) / float(MAX_UNITS - 1),
+                _signed_log_money(farm.get("money", 0)) - _signed_log_money(other.get("money", 0)),
             )
         )
     shops = (observation.get("town") or {}).get("unlocked_shops") or []
@@ -661,6 +704,7 @@ __all__ = [
     "ANIMAL_TOKEN_FIELDS",
     "CROP_PRIVATE_FIELDS",
     "CROP_TOKEN_FIELDS",
+    "DEFAULT_OBSERVATION_SCHEMA_VERSION",
     "FARM_IDENTITIES",
     "FARM_TOKEN_FIELDS",
     "N_TILE_CATEGORICAL",
@@ -671,6 +715,7 @@ __all__ = [
     "PRODUCT_PRIVATE_FIELDS",
     "PRODUCT_TOKEN_FIELDS",
     "QUADRANT_COUNT",
+    "SUPPORTED_OBSERVATION_SCHEMA_VERSIONS",
     "TILE_CATEGORICAL_FIELDS",
     "TILE_CONTINUOUS_FIELDS",
     "TILE_COUNT",
@@ -689,6 +734,7 @@ __all__ = [
     "UnitTokens",
     "clock_features",
     "encode_structured_observation",
+    "farm_token_fields",
     "opponent_economy_columns",
     "tokenize_economy",
     "tokenize_farm_tiles",

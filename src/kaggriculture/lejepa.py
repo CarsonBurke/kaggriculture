@@ -15,7 +15,9 @@ This transplant keeps that shape exactly:
   this repository (`latent_dynamics`, `structured_dynamics`, `actor_dynamics`)
   detaches that target, because an attached target is minimized by a constant
   encoder. LeWM's answer is that the anti-collapse job belongs to a distributional
-  constraint, not to an asymmetry in the graph.
+  constraint, not to an asymmetry in the graph. `jepa_horizon_loss(detach_target=True)`
+  is the ablation: a stop-gradient on the successor's embedding alone, without an
+  EMA teacher, which is what cleanrl's JEPA-PPO does.
 * **SIGReg.** Random unit directions are drawn through the embedding and each
   one-dimensional marginal is pushed onto ``N(0, 1)`` by an Epps-Pulley
   characteristic-function statistic. A collapsed embedding has a degenerate
@@ -793,6 +795,7 @@ def jepa_horizon_loss(
     plan: StructuredHorizonPlan | None = None,
     sample_weight: Tensor | None = None,
     score_reward: bool = True,
+    detach_target: bool = False,
 ) -> JepaTerms:
     """Score one minibatch under LeWM's two terms, plus the reward this env needs.
 
@@ -817,6 +820,11 @@ def jepa_horizon_loss(
     contiguous-run minibatches a row and its successor are both already in the
     batch, so the entire world-model objective costs no additional encoder
     forward -- which is what makes it affordable at all.
+
+    `detach_target` stops the gradient at the gathered successor embeddings and
+    nowhere else: the source side, SIGReg and the reward stay attached, and every
+    value returned is unchanged -- only where the prediction term's gradient
+    lands differs.
     """
     if horizon < 1:
         raise ValueError("the LeJEPA horizon must be at least one step")
@@ -924,6 +932,8 @@ def jepa_horizon_loss(
         residual = residual + _eligible_rms_ratio(predicted, previous, eligible)
         eligible_total = eligible_total + eligible.float().sum()
         target = gather(target_index)
+        if detach_target:
+            target = target.detach()
         weight = token_valid & eligible.unsqueeze(-1)
         # How far the *encoder* moves between a source row and the successor it is
         # scored against, relative to its own scale. Measured on the latents the

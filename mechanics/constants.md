@@ -1,6 +1,6 @@
 # Default Game Constants
 
-These are the defaults in `kaggle-environments==1.32.6`. Configuration overrides
+These are the defaults in `kaggle-environments==1.32.7`. Configuration overrides
 can change values in the first table and the market curve parameters.
 
 ## Configuration

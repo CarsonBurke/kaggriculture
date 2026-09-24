@@ -82,20 +82,16 @@ def test_plan_is_a_joint_ppo_factor_with_masked_entropy_and_gradient(monkeypatch
     ignored = torch.full_like(inactive, float("nan"))
     monkeypatch.setattr(
         ppo,
-        "_replayed_policy",
+        "_replayed_component_logprobs",
         lambda *args: (
-            (
-                physical,
-                ignored,
-                ignored,
-                plan,
-                torch.full_like(physical, 0.5),
-                ignored,
-                ignored,
-                torch.full_like(plan, 0.7),
-            ),
-            None,
-            None,
+            physical,
+            ignored,
+            ignored,
+            plan,
+            torch.full_like(physical, 0.5),
+            ignored,
+            ignored,
+            torch.full_like(plan, 0.7),
         ),
     )
     choice = PlanChoice(
@@ -218,11 +214,11 @@ def test_plan_likelihood_is_in_every_replay_audit_and_saved_replay(monkeypatch):
 
     def replay_with_entropy(*args):
         result = replay(*args)
-        return (*result, *(torch.ones_like(part) for part in result)), None, None
+        return (*result, *(torch.ones_like(part) for part in result))
 
     monkeypatch.setattr(ppo, "_actor_batch_args", actor_args)
     monkeypatch.setattr(ppo, "_replayed_selected_logprobs", replay)
-    monkeypatch.setattr(ppo, "_replayed_policy", replay_with_entropy)
+    monkeypatch.setattr(ppo, "_replayed_component_logprobs", replay_with_entropy)
     metrics = ppo.update_replay_parity(
         actor, rollout, minibatch_size=2, compile_mode="eager", autocast_enabled=False
     )

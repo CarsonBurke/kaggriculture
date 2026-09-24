@@ -524,13 +524,6 @@ def parse_args() -> argparse.Namespace:
         default=PpoConfig.tpo_eta,
         help="TPO tilt temperature over the whitened advantage; larger is gentler",
     )
-    parser.add_argument(
-        "--reference-kl-coefficient",
-        type=float,
-        default=PpoConfig.reference_kl_coefficient,
-        help="weight on KL(initial actor || policy) per active decision; anchors the "
-        "decisions PPO's sampled surrogate cannot hold, and requires --init-actor-from",
-    )
     parser.add_argument("--target-kl", type=float, default=PpoConfig.target_kl)
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
@@ -671,6 +664,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=PpoConfig.jepa_horizon,
         help="recursive prediction steps; one is the Markov objective the family is built for",
+    )
+    parser.add_argument(
+        "--jepa-detach-target",
+        action=argparse.BooleanOptionalAction,
+        default=PpoConfig.jepa_detach_target,
+        help="ablation: stop the gradient at the successor embedding the LeJEPA prediction "
+        "regresses onto (cleanrl's JEPA-PPO, no EMA); off keeps LeWM's attached target",
     )
     parser.add_argument(
         "--structured-learning-rate",
@@ -921,6 +921,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.jepa_horizon < 1:
         raise ValueError("LeJEPA horizons must be positive")
+    if args.jepa_detach_target and not any(jepa_coefficients):
+        raise ValueError("--jepa-detach-target requires the LeJEPA objective")
     if args.architecture == LEJEPA and any(structured_coefficients):
         # The belief class is keyed on the family, so a lejepa model hands the
         # four-field JEPA belief to whatever predictor is attached. Pairing it
@@ -1094,30 +1096,6 @@ def _load_initial_actor(
         # without it the checkpoint cannot say where its weights came from.
         "source_identity": payload.get("source_identity"),
     }
-
-
-def _load_reference_actors(
-    provenance: dict[str, Any] | None, population: int, device: torch.device
-) -> list[torch.nn.Module]:
-    """Frozen copies of each member's initial actor, the reference KL's anchor.
-
-    Read back from the warm-start record rather than from the live actor, so a
-    resumed run anchors to the same clone its first wave did; the recorded
-    digest is what makes that a claim rather than a hope.
-    """
-    if provenance is None:
-        raise ValueError("--reference-kl-coefficient anchors to --init-actor-from's artifact")
-    records = provenance.get("agents", [provenance])
-    if len(records) != population:
-        raise ValueError("the warm-start record does not hold one initial actor per agent")
-    references = []
-    for record in records:
-        path = Path(record["path"])
-        if file_sha256(path) != record["sha256"]:
-            raise ValueError(f"initial actor artifact {path} changed since the run began")
-        reference, _ = load_actor_artifact(path, device)
-        references.append(reference.eval().requires_grad_(False))
-    return references
 
 
 def _device(name: str) -> torch.device:
@@ -2720,7 +2698,6 @@ def main() -> None:
         policy_ratio_scope=args.policy_ratio_scope,
         policy_objective=args.policy_objective,
         tpo_eta=args.tpo_eta,
-        reference_kl_coefficient=args.reference_kl_coefficient,
         clip_low=args.clip_low,
         clip_high=args.clip_high,
         gamma=args.gamma,
@@ -2746,6 +2723,7 @@ def main() -> None:
         jepa_sigreg_coefficient=args.jepa_sigreg_coefficient,
         jepa_reward_coefficient=args.jepa_reward_coefficient,
         jepa_horizon=args.jepa_horizon,
+        jepa_detach_target=args.jepa_detach_target,
     )
     if architecture.name in ("strategic-plan", "causal-execution"):
         if ppo_config.policy_ratio_scope != "joint" or ppo_config.structured_actor_auxiliary_active:
@@ -2756,6 +2734,11 @@ def main() -> None:
             raise ValueError(
                 "coordinated actors currently use single-learner mixed native collection"
             )
+    if model_config.action_interface == 3:
+        if ppo_config.policy_ratio_scope != "joint" or ppo_config.structured_actor_auxiliary_active:
+            raise ValueError("market-set PPO requires joint ratios and actor NextLat off")
+        if args.population != 1:
+            raise ValueError("market-set PPO currently requires one learner")
     training_data_config = _training_data_config(args, device)
     # Derived from the configured trust region rather than fixed, because that
     # is what the ceiling means: the level at which the uncorrected parity
@@ -2925,11 +2908,6 @@ def main() -> None:
             initial_actor_provenance,
             population=population,
         )
-    reference_actors = (
-        _load_reference_actors(initial_actor_provenance, len(members), device)
-        if ppo_config.reference_kl_coefficient > 0.0
-        else []
-    )
     if (
         args.autocull
         and resume_payload is not None
@@ -3139,6 +3117,7 @@ def main() -> None:
         self_play_rows + args.league_games,
         args.episode_steps - 1,
         pin_memory=device.type == "cuda",
+        action_interface=model_config.action_interface,
     )
     self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
 
@@ -3646,7 +3625,6 @@ def main() -> None:
                 auxiliary_generator=auxiliary_generator,
                 diagnostic_groups=diagnostic_groups,
                 diagnostic_gradients=iteration % 25 == 0,
-                reference_actor=reference_actors[agent] if reference_actors else None,
             )
             for kind, active, jepa in (
                 (

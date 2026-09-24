@@ -28,13 +28,158 @@ from kaggriculture.structured import (
 )
 
 DECISIONS = 36
+MARKET_DECISIONS = 20
+MARKET_CACHE = 24  # Efficient SDPA requires a multiple-of-eight key stride.
 BOS = 190
 LEDGER_FEATURES = 57
+
+
+@torch.library.custom_op("kaggriculture::causal_distribution", mutates_args=(), device_types="cuda")
+def causal_distribution(
+    logits: Tensor, mask: Tensor, selected: Tensor, active: Tensor, temperatures: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Keep the likelihood reduction separate from the next ledger decision.
+
+    Inductor otherwise fuses this reduction with the 100-bin market ledger and
+    emits a Triton temporary outside its defining loop. The operator preserves
+    the ordinary FP32 categorical calculation and supports actor gradients.
+    """
+    logprob = (logits.float() / temperatures[:, None]).masked_fill(~mask, -1e9).log_softmax(-1)
+    chosen = logprob.gather(-1, selected[:, None]).squeeze(-1)
+    entropy = -(logprob.exp() * logprob).sum(-1)
+    return torch.where(active, chosen, 0), torch.where(active, entropy, 0)
+
+
+@causal_distribution.register_fake
+def _fake_causal_distribution(
+    logits: Tensor, mask: Tensor, selected: Tensor, active: Tensor, temperatures: Tensor
+) -> tuple[Tensor, Tensor]:
+    del mask, selected, active, temperatures
+    result = logits.new_empty(logits.shape[0], dtype=torch.float32)
+    return result, torch.empty_like(result)
+
+
+def _causal_distribution_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs)
+
+
+def _causal_distribution_backward(ctx, grad_chosen: Tensor, grad_entropy: Tensor):
+    logits, mask, selected, active, temperatures = ctx.saved_tensors
+    if grad_chosen is None:
+        grad_chosen = torch.zeros_like(temperatures)
+    if grad_entropy is None:
+        grad_entropy = torch.zeros_like(temperatures)
+    logprob = (logits.float() / temperatures[:, None]).masked_fill(~mask, -1e9).log_softmax(-1)
+    probabilities = logprob.exp()
+    entropy = -(probabilities * logprob).sum(-1)
+    selected_gradient = torch.nn.functional.one_hot(selected.long(), logits.shape[-1]).float()
+    gradient = grad_chosen[:, None] * (selected_gradient - probabilities)
+    gradient -= grad_entropy[:, None] * probabilities * (logprob + entropy[:, None])
+    gradient = gradient * active[:, None] * mask / temperatures[:, None]
+    return gradient.to(logits.dtype), None, None, None, None
+
+
+causal_distribution.register_autograd(
+    _causal_distribution_backward, setup_context=_causal_distribution_context
+)
+
+
+def _flatten_vmap_rows(
+    batch_size: int, in_dims: tuple[int | None, ...], *values: Tensor
+) -> tuple[Tensor, ...]:
+    """Present every mapped lane and its rows as one custom-op batch."""
+    return tuple(
+        (
+            value.unsqueeze(0).expand(batch_size, *value.shape)
+            if dim is None
+            else value.movedim(dim, 0)
+        ).flatten(0, 1)
+        for value, dim in zip(values, in_dims, strict=True)
+    )
+
+
+@torch.library.register_vmap(causal_distribution)
+def _vmap_causal_distribution(
+    info: object,
+    in_dims: tuple[int | None, ...],
+    logits: Tensor,
+    mask: Tensor,
+    selected: Tensor,
+    active: Tensor,
+    temperatures: Tensor,
+) -> tuple[tuple[Tensor, Tensor], tuple[int, int]]:
+    flattened = _flatten_vmap_rows(
+        info.batch_size, in_dims, logits, mask, selected, active, temperatures
+    )
+    chosen, entropy = causal_distribution(*flattened)
+    return (
+        chosen.unflatten(0, (info.batch_size, -1)),
+        entropy.unflatten(0, (info.batch_size, -1)),
+    ), (0, 0)
+
+
+@torch.library.custom_op("kaggriculture::causal_choose", mutates_args=(), device_types="cuda")
+def causal_choose(
+    logits: Tensor,
+    mask: Tensor,
+    recorded: Tensor,
+    uniform: Tensor,
+    temperatures: Tensor,
+    deterministic: Tensor,
+) -> Tensor:
+    """Materialize a selected factor before updating the exact prefix ledger."""
+    scaled = (logits.float() / temperatures[:, None]).masked_fill(~mask, -1e9)
+    cdf = scaled.softmax(-1).cumsum(-1)
+    last = torch.where(mask, torch.arange(mask.shape[-1], device=mask.device), 0).amax(-1)
+    sampled = torch.minimum((cdf <= uniform[:, None]).sum(-1), last)
+    sampled = torch.where(deterministic, scaled.argmax(-1), sampled)
+    proposed = torch.where(recorded >= 0, recorded, sampled).long()
+    return torch.where(mask.gather(1, proposed[:, None]).squeeze(1), proposed, 0)
+
+
+@causal_choose.register_fake
+def _fake_causal_choose(
+    logits: Tensor,
+    mask: Tensor,
+    recorded: Tensor,
+    uniform: Tensor,
+    temperatures: Tensor,
+    deterministic: Tensor,
+) -> Tensor:
+    del logits, mask, uniform, temperatures, deterministic
+    return torch.empty_like(recorded)
+
+
+@torch.library.register_vmap(causal_choose)
+def _vmap_causal_choose(
+    info: object,
+    in_dims: tuple[int | None, ...],
+    logits: Tensor,
+    mask: Tensor,
+    recorded: Tensor,
+    uniform: Tensor,
+    temperatures: Tensor,
+    deterministic: Tensor,
+) -> tuple[Tensor, int]:
+    flattened = _flatten_vmap_rows(
+        info.batch_size,
+        in_dims,
+        logits,
+        mask,
+        recorded,
+        uniform,
+        temperatures,
+        deterministic,
+    )
+    selected = causal_choose(*flattened)
+    return selected.unflatten(0, (info.batch_size, -1)), 0
 
 
 @dataclass(frozen=True)
 class CausalConfig(EntityConfig):
     decoder_layers: int = 2
+    parallel_unit_decode: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -44,6 +189,8 @@ class CausalConfig(EntityConfig):
             or self.decoder_layers < 1
         ):
             raise ValueError("decoder_layers must be a positive integer")
+        if not isinstance(self.parallel_unit_decode, bool):
+            raise ValueError("parallel_unit_decode must be a boolean")
         if any(
             (
                 self.bixt_latents,
@@ -296,6 +443,8 @@ class CausalActor(EntityActor):
     def _distribution(
         logits: Tensor, mask: Tensor, selected: Tensor, active: Tensor, temperatures: Tensor
     ) -> tuple[Tensor, Tensor]:
+        if logits.is_cuda:
+            return causal_distribution(logits, mask, selected, active, temperatures)
         logprob = (logits.float() / temperatures[:, None]).masked_fill(~mask, -1e9).log_softmax(-1)
         chosen = logprob.gather(-1, selected[:, None]).squeeze(-1)
         entropy = -(logprob.exp() * logprob).sum(-1)
@@ -310,6 +459,8 @@ class CausalActor(EntityActor):
         temperatures: Tensor,
         deterministic: Tensor,
     ) -> Tensor:
+        if logits.is_cuda:
+            return causal_choose(logits, mask, recorded, uniform, temperatures, deterministic)
         scaled = (logits.float() / temperatures[:, None]).masked_fill(~mask, -1e9)
         cdf = scaled.softmax(-1).cumsum(-1)
         # The final legal category absorbs FP32 cumulative-rounding residue.
@@ -333,7 +484,7 @@ class CausalActor(EntityActor):
         quantity_states = self.market_norm(states[:, 17::2])
         kind_logits = self.market_kind(kind_states)
         context = self.market_quantity_context(quantity_states)
-        quantity_logits = self.quantity_logits(context, kinds)
+        quantity_logits = self.quantity_logits(context, kinds, masks.market_quantity_masks)
         logprobs, entropies = [], []
         for position in range(DECISIONS):
             if position < 16:
@@ -393,7 +544,8 @@ class CausalActor(EntityActor):
         canonical_kinds, canonical_quantities = [], []
         unit_masks, kind_masks, quantity_masks, active, qactive = [], [], [], [], []
         for unit in range(16):
-            features.append(ledger_features(state, unit))
+            if not self.config.parallel_unit_decode:
+                features.append(ledger_features(state, unit))
             unit_masks.append(rules.unit_mask(state, unit))
             tokens.append(units[:, unit])
             state = rules.apply_unit(state, unit, units[:, unit])
@@ -418,11 +570,29 @@ class CausalActor(EntityActor):
             (torch.full_like(units[:, :1], BOS), torch.stack(tokens[:-1], 1)), dim=1
         )
         queries, memory, valid, conditioning = self.trunk.encode(inputs)
-        hidden = self.trunk.tokens(queries, torch.stack(features, 1), previous)
-        positions = self.trunk.positions
+        if self.config.parallel_unit_decode:
+            # Unit neural decisions share the encoded observation. Their legality
+            # and resource effects still replay in exact execution order above.
+            market_hidden = (
+                queries[:, 16:]
+                + self.trunk.position.weight[16:]
+                + self.trunk.previous_action(previous[:, 16:])
+                + self.trunk.ledger(torch.stack(features, 1))
+            )
+            market_hidden = torch.nn.functional.pad(
+                market_hidden, (0, 0, 0, MARKET_CACHE - MARKET_DECISIONS)
+            )
+            positions = self.trunk.positions[:MARKET_CACHE]
+            unit_hidden = queries[:, :16]
+            hidden = market_hidden
+        else:
+            hidden = self.trunk.tokens(queries, torch.stack(features, 1), previous)
+            positions = self.trunk.positions
         causal = (positions[:, None] >= positions[None])[None, None]
         for layer, keys, condition in zip(self.trunk.layers, memory, conditioning, strict=True):
             hidden = layer.parallel(hidden, keys, valid, condition, causal)
+        if self.config.parallel_unit_decode:
+            hidden = torch.cat((unit_hidden, hidden[:, :MARKET_DECISIONS]), 1)
         masks = ReplayMasks(
             torch.stack(unit_masks, 1),
             torch.stack(kind_masks, 1),
@@ -440,6 +610,8 @@ class CausalActor(EntityActor):
     ) -> CausalOutput:
         if isinstance(choice, CausalReplay):
             return self.teacher_force(inputs, *choice)
+        if self.config.parallel_unit_decode:
+            return self._forward_market_causal(inputs, choice)
         rules = self._rules()
         state = initial_ledger(choice.packed_ledger)
         queries, memory, valid, conditioning = self.trunk.encode(inputs)
@@ -529,7 +701,9 @@ class CausalActor(EntityActor):
                 context = self.market_quantity_context(self.market_norm(hidden[:, 0]))
                 quantity_contexts.append(context)
                 decision_active = state.market_active & (kinds[-1] >= 3)
-                logits = self.quantity_logits(context[:, None], kinds[-1][:, None])[:, 0]
+                logits = self.quantity_logits(
+                    context[:, None], kinds[-1][:, None], quote.mask[:, None]
+                )[:, 0]
                 mask = quote.mask
                 selected = self._choose(
                     logits,
@@ -565,6 +739,146 @@ class CausalActor(EntityActor):
             torch.stack(kinds, 1),
             torch.stack(quantities, 1),
             *masks,
+            torch.stack(logprobs, 1),
+            torch.stack(entropies, 1),
+        )
+
+    def _forward_market_causal(
+        self, inputs: StructuredInputs, choice: CausalChoice
+    ) -> CausalOutput:
+        """Parallel unit readout, exact unit replay, then cached market decoding."""
+        rules = self._rules()
+        state = initial_ledger(choice.packed_ledger)
+        queries, memory, valid, conditioning = self.trunk.encode(inputs)
+        unit_logits = self.unit_head(queries[:, :16])
+        units, unit_masks, logprobs, entropies = [], [], [], []
+        for unit in range(16):
+            mask = rules.unit_mask(state, unit)
+            selected = self._choose(
+                unit_logits[:, unit],
+                mask,
+                choice.unit_actions[:, unit],
+                choice.uniforms[:, unit],
+                choice.temperatures,
+                choice.deterministic,
+            )
+            lp, entropy = self._distribution(
+                unit_logits[:, unit],
+                mask,
+                selected,
+                unit < state.units,
+                choice.temperatures,
+            )
+            unit_masks.append(mask)
+            units.append(selected)
+            logprobs.append(lp)
+            entropies.append(entropy)
+            state = rules.apply_unit(state, unit, selected)
+
+        batch = queries.shape[0]
+        cache = [
+            (
+                keys[0].new_zeros(
+                    (
+                        batch,
+                        self.config.attention_kv_heads,
+                        MARKET_CACHE,
+                        self.config.model_dim // self.config.attention_heads,
+                    )
+                ),
+                keys[1].new_zeros(
+                    (
+                        batch,
+                        self.config.attention_kv_heads,
+                        MARKET_CACHE,
+                        self.config.model_dim // self.config.attention_heads,
+                    )
+                ),
+            )
+            for keys in memory
+        ]
+        previous = units[-1]
+        kinds, quantities = [], []
+        kind_logits, quantity_contexts = [], []
+        kind_masks, quantity_masks, active, qactive = [], [], [], []
+        positions = self.trunk.positions[:MARKET_CACHE]
+        for step in range(MARKET_DECISIONS):
+            position = 16 + step
+            hidden = (
+                queries[:, position : position + 1]
+                + self.trunk.position.weight[position]
+                + self.trunk.previous_action(previous)[:, None]
+                + self.trunk.ledger(ledger_features(state, None))[:, None]
+            )
+            for index, layer in enumerate(self.trunk.layers):
+                hidden, cache[index] = layer.step(
+                    hidden,
+                    memory[index],
+                    valid,
+                    conditioning[index],
+                    cache[index],
+                    step,
+                    positions,
+                )
+            if step % 2 == 0:
+                slot = step // 2
+                logits = self.market_kind(self.market_norm(hidden[:, 0]))
+                mask = rules.market_kind_mask(state)
+                decision_active = state.market_active
+                selected = self._choose(
+                    logits,
+                    mask,
+                    choice.market_kinds[:, slot],
+                    choice.uniforms[:, position],
+                    choice.temperatures,
+                    choice.deterministic,
+                )
+                quote = rules.market_quote(state, selected)
+                kind_logits.append(logits)
+                kind_masks.append(mask)
+                active.append(decision_active)
+                kinds.append(selected)
+                previous = selected + 68
+            else:
+                slot = step // 2
+                context = self.market_quantity_context(self.market_norm(hidden[:, 0]))
+                logits = self.quantity_logits(
+                    context[:, None], kinds[-1][:, None], quote.mask[:, None]
+                )[:, 0]
+                mask = quote.mask
+                decision_active = state.market_active & (kinds[-1] >= 3)
+                selected = self._choose(
+                    logits,
+                    mask,
+                    choice.market_quantities[:, slot],
+                    choice.uniforms[:, position],
+                    choice.temperatures,
+                    choice.deterministic,
+                )
+                quantity_contexts.append(context)
+                quantity_masks.append(mask)
+                qactive.append(decision_active)
+                quantities.append(selected)
+                state = rules.apply_market(state, quote, selected)
+                previous = selected + 90
+            lp, entropy = self._distribution(
+                logits, mask, selected, decision_active, choice.temperatures
+            )
+            logprobs.append(lp)
+            entropies.append(entropy)
+        return CausalOutput(
+            unit_logits,
+            torch.stack(kind_logits, 1),
+            torch.stack(quantity_contexts, 1),
+            torch.stack(units, 1),
+            torch.stack(kinds, 1),
+            torch.stack(quantities, 1),
+            torch.stack(unit_masks, 1),
+            torch.stack(kind_masks, 1),
+            torch.stack(quantity_masks, 1),
+            torch.arange(16, device=queries.device)[None] < state.units[:, None],
+            torch.stack(active, 1),
+            torch.stack(qactive, 1),
             torch.stack(logprobs, 1),
             torch.stack(entropies, 1),
         )

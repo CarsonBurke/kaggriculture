@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from kaggriculture.causal_actor import CausalReplay
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import MARKET_I0, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS, market_price
 from kaggriculture.device_ledger import POLICY_LEDGER_WIDTH, pack_observations
 from kaggriculture.ppo import _actor_batch_args, _critic_batch_args
 from kaggriculture.registry import CAUSAL
@@ -47,7 +47,10 @@ def _observation():
         "step": 50,
         "farms": [copy.deepcopy(farm), copy.deepcopy(farm)],
         "private": {"seeds": {"WHEAT": 7}, "shed": {"WHEAT": 3}, "inventories": [{}]},
-        "market": {},
+        "market": {
+            "inventory": {item: MARKET_I0 for item in PRODUCTS},
+            "prices": {item: market_price(item, MARKET_I0) for item in PRODUCTS},
+        },
         "town": {},
     }
 

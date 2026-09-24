@@ -35,7 +35,6 @@ from kaggriculture.lejepa import (
     jepa_horizon_loss,
 )
 from kaggriculture.model import (
-    ActorOutput,
     DistributionalCritic,
     FarmActor,
     distributional_value_loss,
@@ -44,7 +43,12 @@ from kaggriculture.model import (
     scalar_value_loss,
 )
 from kaggriculture.optim import NorMuon, route_parameters
-from kaggriculture.policy import component_logprobs, component_selected_logprobs, mask_logits
+from kaggriculture.policy import (
+    categorical_logprob,
+    categorical_statistics,
+    component_logprobs,
+    component_selected_logprobs,
+)
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE
 from kaggriculture.registry import (
     CONV_ENTITY,
@@ -309,20 +313,6 @@ class PpoConfig:
     # TPO tilt temperature over the batch-whitened advantage. Per-decision target
     # KL from the snapshot reaches 0.5 nats at |A| / eta = 3 on a 50% decision.
     tpo_eta: float = 1.0
-    # Weight on KL(reference || policy), per active decision, against the frozen
-    # initial actor (the behavior clone a warm start loads). Zero disables it.
-    #
-    # PPO's surrogate only moves a decision through the actions sampled there,
-    # so a decision the policy already takes with probability ~1 receives no
-    # gradient at all: nothing holds it in place while shared parameters move
-    # under every other state's update. The opening purchase is such a decision
-    # -- one state, identical in every game -- and in the first attached lejepa
-    # run it drifted from the teacher's one cow to two over ten updates of
-    # joint KL ~0.001, then bankrupted every game at once. The trust region could
-    # not see it, being a mean over hundreds of thousands of decisions. The
-    # forward KL restores exactly those decisions: its gradient on each state is
-    # the gap between the reference's distribution and the policy's.
-    reference_kl_coefficient: float = 0.0
     # DAPO's Clip-Higher band, as eps_low 0.2 and eps_high 0.28 rather than
     # PPO's symmetric 0.2 either side. The asymmetry exists to stop entropy
     # collapse: a symmetric band clips a low-probability action's upside at the
@@ -458,6 +448,10 @@ class PpoConfig:
     jepa_sigreg_coefficient: float = 0.0
     jepa_reward_coefficient: float = 0.0
     jepa_horizon: int = 1
+    # The stop-gradient ablation of the design above: the successor's embedding
+    # is regressed as a constant, as in cleanrl's JEPA-PPO (no EMA teacher),
+    # while the source side, SIGReg and the reward stay attached. Off is LeWM.
+    jepa_detach_target: bool = False
     # Observable multi-horizon delta supervision, used only by the feed-forward
     # forecast critic. Its heads share the critic optimizer, never a predictor.
     economic_forecast_coefficient: float = 1.0
@@ -622,8 +616,6 @@ def _validate_config(config: PpoConfig) -> None:
         )
     if not math.isfinite(config.tpo_eta) or config.tpo_eta <= 0.0:
         raise ValueError("TPO eta must be finite and positive")
-    if not math.isfinite(config.reference_kl_coefficient) or config.reference_kl_coefficient < 0:
-        raise ValueError("reference KL coefficient must be finite and nonnegative")
     if not math.isfinite(config.gamma) or not 0.0 < config.gamma <= 1.0:
         raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
@@ -685,6 +677,10 @@ def _validate_jepa_coefficients(config: PpoConfig) -> None:
     representation with the opposite convention about where the gradient stops.
     """
     if not config.jepa_active:
+        if config.jepa_detach_target:
+            # A no-op flag would still be journaled in the config, labelling a run
+            # as the stop-gradient ablation of an objective it never trained.
+            raise ValueError("detaching the LeJEPA target requires the LeJEPA objective")
         return
     if not (config.jepa_prediction_coefficient > 0.0 and config.jepa_sigreg_coefficient > 0.0):
         raise ValueError(
@@ -898,6 +894,38 @@ def _actor_batch_args(
             ),
         )
     return args
+
+
+def _policy_factor_batch_args(
+    actor: Actor, staged: dict[str, Tensor], indices: Tensor | slice
+) -> tuple[Tensor, ...]:
+    """Gather the policy's sampled factors, excluding compiled-slot metadata in v3."""
+    unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
+    if getattr(actor.config, "action_interface", 1) == 3:
+        return (
+            unit_actions,
+            _batch_tensor(staged["market_set_values"], indices, torch.long),
+            _batch_tensor(staged["unit_masks"], indices, torch.bool),
+            _batch_tensor(staged["market_set_masks"], indices, torch.bool),
+            _batch_tensor(staged["unit_active"], indices, torch.float32),
+            _batch_tensor(staged["market_set_active"], indices, torch.float32),
+            _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
+            _batch_tensor(staged["old_market_set_logprobs"], indices, torch.float32),
+        )
+    return (
+        unit_actions,
+        _batch_tensor(staged["market_kinds"], indices, torch.long),
+        _batch_tensor(staged["market_quantities"], indices, torch.long),
+        _batch_tensor(staged["unit_masks"], indices, torch.bool),
+        _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+        _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+        _batch_tensor(staged["unit_active"], indices, torch.float32),
+        _batch_tensor(staged["market_active"], indices, torch.float32),
+        _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
+        _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
+        _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
+        _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
+    )
 
 
 def actor_forward_args(
@@ -1686,77 +1714,25 @@ def _replayed_component_logprobs(
     every actor minibatch. The behavior side is the sampler likelihood stored
     by the rollout. Autocast keeps log_softmax in fp32 by policy.
     """
-    return _replayed_policy(
-        actor,
-        unit_actions,
-        market_kinds,
-        market_quantities,
-        unit_masks,
-        kind_masks,
-        quantity_masks,
-        autocast_enabled,
-        *actor_args,
-    )[0]
-
-
-def _replayed_policy(
-    actor: Actor,
-    unit_actions: Tensor,
-    market_kinds: Tensor,
-    market_quantities: Tensor,
-    unit_masks: Tensor,
-    kind_masks: Tensor,
-    quantity_masks: Tensor,
-    autocast_enabled: bool,
-    *actor_args: Any,
-) -> tuple[tuple[Tensor, ...], ActorOutput, Tensor]:
-    """`_replayed_component_logprobs` plus the output and quantity logits it read.
-
-    The logits are what a full-distribution term -- the reference KL -- needs
-    beside the sampled likelihoods, from the same forward.
-    """
     with torch.autocast(
         device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
         actor_output = actor(*actor_args)
-        quantity_logits = actor.quantity_logits(actor_output.market_quantity_context, market_kinds)
-        components = _output_component_logprobs(
+        components = component_logprobs(
             actor_output,
-            quantity_logits,
+            actor.quantity_logits(
+                actor_output.market_quantity_context, market_kinds, quantity_masks
+            ),
             unit_actions,
             market_kinds,
             market_quantities,
             unit_masks,
             kind_masks,
             quantity_masks,
+            validate_masks=False,
         )
-    return components, actor_output, quantity_logits
-
-
-def _output_component_logprobs(
-    actor_output: ActorOutput,
-    quantity_logits: Tensor,
-    unit_actions: Tensor,
-    market_kinds: Tensor,
-    market_quantities: Tensor,
-    unit_masks: Tensor,
-    kind_masks: Tensor,
-    quantity_masks: Tensor,
-) -> tuple[Tensor, ...]:
-    """The replayed likelihoods and entropies of one forward's output."""
-    components = component_logprobs(
-        actor_output,
-        quantity_logits,
-        unit_actions,
-        market_kinds,
-        market_quantities,
-        unit_masks,
-        kind_masks,
-        quantity_masks,
-        validate_masks=False,
-    )
     if isinstance(actor_output, StrategicOutput):
         return (
             *components[:3],
@@ -1792,7 +1768,9 @@ def _replayed_selected_logprobs(
         actor_output = actor(*actor_args)
         components = component_selected_logprobs(
             actor_output,
-            actor.quantity_logits(actor_output.market_quantity_context, market_kinds),
+            actor.quantity_logits(
+                actor_output.market_quantity_context, market_kinds, quantity_masks
+            ),
             unit_actions,
             market_kinds,
             market_quantities,
@@ -1804,6 +1782,108 @@ def _replayed_selected_logprobs(
         if isinstance(actor_output, StrategicOutput):
             return (*components, actor_output.plan[:, 1:2])
         return components
+
+
+def _market_set_component_logprobs(
+    actor: EntityActor,
+    unit_actions: Tensor,
+    market_set_values: Tensor,
+    unit_masks: Tensor,
+    market_set_masks: Tensor,
+    autocast_enabled: bool,
+    *actor_args: Any,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Replay effective set values through the same two policy factors as sampling."""
+    with torch.autocast(
+        device_type=unit_actions.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        output = actor(*actor_args)
+        unit_logprob, unit_entropy = categorical_statistics(
+            output.unit_logits, unit_masks, unit_actions, validate_mask=False
+        )
+        set_logprob, set_entropy = categorical_statistics(
+            actor.market_set_logits(output.market_quantity_context, market_set_masks),
+            market_set_masks,
+            market_set_values,
+            validate_mask=False,
+        )
+    return unit_logprob, set_logprob, unit_entropy, set_entropy
+
+
+def _market_set_selected_logprobs(
+    actor: EntityActor,
+    unit_actions: Tensor,
+    market_set_values: Tensor,
+    unit_masks: Tensor,
+    market_set_masks: Tensor,
+    autocast_enabled: bool,
+    *actor_args: Any,
+) -> tuple[Tensor, Tensor]:
+    """Entropy-free likelihood replay for interface 3 parity diagnostics."""
+    with torch.autocast(
+        device_type=unit_actions.device.type,
+        dtype=torch.bfloat16,
+        enabled=autocast_enabled,
+    ):
+        output = actor(*actor_args)
+        return (
+            categorical_logprob(output.unit_logits, unit_masks, unit_actions, validate_mask=False),
+            categorical_logprob(
+                actor.market_set_logits(output.market_quantity_context, market_set_masks),
+                market_set_masks,
+                market_set_values,
+                validate_mask=False,
+            ),
+        )
+
+
+def _market_set_minibatch_terms(
+    actor: EntityActor,
+    unit_actions: Tensor,
+    market_set_values: Tensor,
+    unit_masks: Tensor,
+    market_set_masks: Tensor,
+    unit_active: Tensor,
+    market_set_active: Tensor,
+    old_unit: Tensor,
+    old_market_set: Tensor,
+    advantages: Tensor,
+    clip_low: float,
+    clip_high: float,
+    autocast_enabled: bool,
+    *actor_args: Any,
+    sample_weight: Tensor | None = None,
+    policy_ratio_scope: str = "joint",
+    policy_objective: str = "clip",
+    tpo_eta: float = 1.0,
+) -> tuple[Tensor, ...]:
+    """Joint PPO surrogate for unit actions and effective market-set values."""
+    if policy_ratio_scope != "joint":
+        raise ValueError("market-set PPO requires joint policy ratios")
+    replayed = _market_set_component_logprobs(
+        actor,
+        unit_actions,
+        market_set_values,
+        unit_masks,
+        market_set_masks,
+        autocast_enabled,
+        *actor_args,
+    )
+    return _policy_sums(
+        replayed[:2],
+        (old_unit, old_market_set),
+        (unit_active, market_set_active),
+        replayed[2:],
+        advantages,
+        clip_low,
+        clip_high,
+        sample_weight=sample_weight,
+        policy_ratio_scope="joint",
+        policy_objective=policy_objective,
+        tpo_eta=tpo_eta,
+    )
 
 
 @torch.no_grad()
@@ -1828,24 +1908,30 @@ def replay_behavior_logprobs(
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
     device = staged["unit_actions"].device
+    market_set = getattr(actor.config, "action_interface", 1) == 3
     replay = _cached_update_callable(
         actor,
         "_kaggriculture_logprob_replay",
-        _replayed_selected_logprobs,
+        _market_set_selected_logprobs if market_set else _replayed_selected_logprobs,
         _device_compile_mode(compile_mode, device),
     )
     rows = staged["unit_actions"].shape[0]
-    replayed = {
+    replayed: dict[str, Tensor] = {
         "old_unit_logprobs": torch.zeros(
             (rows, staged["unit_actions"].shape[1]), dtype=torch.float32, device=device
         ),
-        "old_market_kind_logprobs": torch.zeros(
-            (rows, staged["market_kinds"].shape[1]), dtype=torch.float32, device=device
-        ),
-        "old_market_quantity_logprobs": torch.zeros(
-            (rows, staged["market_quantities"].shape[1]), dtype=torch.float32, device=device
-        ),
     }
+    if market_set:
+        replayed["old_market_set_logprobs"] = torch.zeros(
+            (rows, staged["market_set_values"].shape[1]), dtype=torch.float32, device=device
+        )
+    else:
+        replayed["old_market_kind_logprobs"] = torch.zeros(
+            (rows, staged["market_kinds"].shape[1]), dtype=torch.float32, device=device
+        )
+        replayed["old_market_quantity_logprobs"] = torch.zeros(
+            (rows, staged["market_quantities"].shape[1]), dtype=torch.float32, device=device
+        )
     if architecture == "strategic-plan":
         replayed["old_plan_logprobs"] = torch.zeros(rows, dtype=torch.float32, device=device)
     ordered = torch.from_numpy(valid_indices).to(device=device)
@@ -1854,17 +1940,28 @@ def replay_behavior_logprobs(
     for batch in range(positions.shape[0]):
         _begin_update_graph_step(compile_mode, device)
         indices = ordered[staged_positions[batch]]
-        values_by_factor = replay(
-            actor,
-            _batch_tensor(staged["unit_actions"], indices, torch.long),
-            _batch_tensor(staged["market_kinds"], indices, torch.long),
-            _batch_tensor(staged["market_quantities"], indices, torch.long),
-            _batch_tensor(staged["unit_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
-            autocast_enabled,
-            *_actor_batch_args(architecture, staged, indices),
-        )
+        if market_set:
+            values_by_factor = replay(
+                actor,
+                _batch_tensor(staged["unit_actions"], indices, torch.long),
+                _batch_tensor(staged["market_set_values"], indices, torch.long),
+                _batch_tensor(staged["unit_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_set_masks"], indices, torch.bool),
+                autocast_enabled,
+                *_actor_batch_args(architecture, staged, indices),
+            )
+        else:
+            values_by_factor = replay(
+                actor,
+                _batch_tensor(staged["unit_actions"], indices, torch.long),
+                _batch_tensor(staged["market_kinds"], indices, torch.long),
+                _batch_tensor(staged["market_quantities"], indices, torch.long),
+                _batch_tensor(staged["unit_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+                autocast_enabled,
+                *_actor_batch_args(architecture, staged, indices),
+            )
         for name, values in zip(replayed, values_by_factor, strict=True):
             count = int(counts[batch])
             if name == "old_plan_logprobs":
@@ -1926,69 +2023,6 @@ def _cached_update_callable(module: torch.nn.Module, attribute: str, function, m
     return compiled
 
 
-def _validate_reference_actor(
-    actor: Actor, reference_actor: Actor | None, config: PpoConfig
-) -> None:
-    """Require the anchor and its coefficient together, on a frozen twin of the actor."""
-    if (reference_actor is None) != (config.reference_kl_coefficient == 0.0):
-        raise ValueError("reference_kl_coefficient and reference_actor are required together")
-    if reference_actor is None:
-        return
-    if isinstance(actor, (StrategicActor, CausalActor)):
-        raise ValueError("the reference KL anchor covers the three component heads only")
-    if reference_actor is actor or type(reference_actor) is not type(actor):
-        raise ValueError("the reference actor must be a separate copy of the actor's class")
-    if reference_actor.training or any(p.requires_grad for p in reference_actor.parameters()):
-        raise ValueError("the reference actor must be frozen: eval mode, no gradients")
-
-
-def _reference_kl_sums(
-    reference_actor: Actor | None,
-    output: ActorOutput,
-    quantity_logits: Tensor,
-    market_kinds: Tensor,
-    masks: tuple[Tensor, Tensor, Tensor],
-    active: tuple[Tensor, Tensor, Tensor],
-    sample_weight: Tensor | None,
-    *actor_args: Any,
-) -> tuple[Tensor, Tensor]:
-    """Forward KL from the frozen reference to the policy, over masked decisions.
-
-    Returns the weighted sum over active decisions -- normalized outside, like
-    the surrogate -- and, detached, the largest single decision's KL: a mean
-    over a wave is exactly what cannot see one decision flip, and a per-state
-    total would read a late state's many small divergences as one. The quantity
-    distributions are both read at the stored market kinds, so each compares
-    the same conditional. Zeros when there is no reference, so the compiled
-    graph keeps one output signature.
-    """
-    zero = market_kinds.new_zeros((), dtype=torch.float32)
-    if reference_actor is None:
-        return zero, zero
-    reference = reference_actor(*actor_args)
-    reference_quantity = reference_actor.quantity_logits(
-        reference.market_quantity_context, market_kinds
-    )
-    total = zero
-    largest = zero
-    for current, anchored, mask, weight in zip(
-        (output.unit_logits, output.market_kind_logits, quantity_logits),
-        (reference.unit_logits, reference.market_kind_logits, reference_quantity),
-        masks,
-        active,
-        strict=True,
-    ):
-        anchored_log = mask_logits(anchored.detach(), mask, validate=False).log_softmax(-1)
-        current_log = mask_logits(current, mask, validate=False).log_softmax(-1)
-        kl = torch.where(mask, anchored_log.exp() * (anchored_log - current_log), 0.0).sum(-1)
-        weight = weight.float()
-        if sample_weight is not None:
-            weight = weight * sample_weight[:, None]
-        total = total + (kl * weight).sum()
-        largest = torch.maximum(largest, torch.where(weight > 0, kl.detach(), 0.0).amax())
-    return total, largest
-
-
 def _actor_minibatch_terms(
     actor: Actor,
     unit_actions: Tensor,
@@ -2012,21 +2046,19 @@ def _actor_minibatch_terms(
     policy_ratio_scope: str = "components",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
-    reference_actor: Actor | None = None,
 ) -> tuple[Tensor, ...]:
     """One actor minibatch: update likelihood plus clipped surrogate reductions.
 
     Returns device-side (policy objective sum, entropy sum, scoped k3 KL sum,
-    scoped clipped count, component k3 KL sum, joint k3 KL sum, reference KL
-    sum, largest single-decision reference KL). Normalization stays outside so host
-    integers never enter the graph.
+    scoped clipped count, component k3 KL sum, joint k3 KL sum). Normalization
+    stays outside so host integers never enter the graph.
 
     Entropy and KL are telemetry, not objective terms. Detaching their sums
     inside this compiled region preserves their exact forward values while
     keeping their softmax-sized derivative branches and saved intermediates
     out of the actor backward.
     """
-    replayed, output, quantity_logits = _replayed_policy(
+    replayed = _replayed_component_logprobs(
         actor,
         unit_actions,
         market_kinds,
@@ -2037,21 +2069,6 @@ def _actor_minibatch_terms(
         autocast_enabled,
         *actor_args,
     )
-    with torch.autocast(
-        device_type=unit_actions.device.type,
-        dtype=torch.bfloat16,
-        enabled=autocast_enabled,
-    ):
-        reference_kl = _reference_kl_sums(
-            reference_actor,
-            output,
-            quantity_logits,
-            market_kinds,
-            (unit_masks, kind_masks, quantity_masks),
-            (unit_active, kind_active, quantity_active),
-            sample_weight,
-            *actor_args,
-        )
     factor_count = len(replayed) // 2
     old = (old_unit, old_kind, old_quantity)
     active = (unit_active, kind_active, quantity_active)
@@ -2061,21 +2078,18 @@ def _actor_minibatch_terms(
         choice = actor_args[1]
         old += (choice.old_logprobs[:, None],)
         active += (choice.active[:, None],)
-    return (
-        *_policy_sums(
-            replayed[:factor_count],
-            old,
-            active,
-            replayed[factor_count:],
-            advantages,
-            clip_low,
-            clip_high,
-            sample_weight=sample_weight,
-            policy_ratio_scope=policy_ratio_scope,
-            policy_objective=policy_objective,
-            tpo_eta=tpo_eta,
-        ),
-        *reference_kl,
+    return _policy_sums(
+        replayed[:factor_count],
+        old,
+        active,
+        replayed[factor_count:],
+        advantages,
+        clip_low,
+        clip_high,
+        sample_weight=sample_weight,
+        policy_ratio_scope=policy_ratio_scope,
+        policy_objective=policy_objective,
+        tpo_eta=tpo_eta,
     )
 
 
@@ -2139,9 +2153,8 @@ def _structured_actor_minibatch_terms(
     policy_ratio_scope: str = "components",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
-    reference_actor: Actor | None = None,
 ) -> tuple[Tensor, ...]:
-    """PPO terms, the reference KL and the belief from one structured actor forward."""
+    """PPO terms and the belief from one structured actor forward."""
     (inputs,) = actor_args
     if not isinstance(inputs, StructuredInputs):
         raise TypeError("structured actor minibatches require StructuredInputs")
@@ -2151,7 +2164,6 @@ def _structured_actor_minibatch_terms(
         enabled=autocast_enabled,
     ):
         output, belief = actor.forward_with_auxiliary_belief(inputs)
-        quantity_logits = actor.quantity_logits(output.market_quantity_context, market_kinds)
         (
             new_unit,
             new_kind,
@@ -2161,7 +2173,7 @@ def _structured_actor_minibatch_terms(
             quantity_entropy,
         ) = component_logprobs(
             output,
-            quantity_logits,
+            actor.quantity_logits(output.market_quantity_context, market_kinds, quantity_masks),
             unit_actions,
             market_kinds,
             market_quantities,
@@ -2169,16 +2181,6 @@ def _structured_actor_minibatch_terms(
             kind_masks,
             quantity_masks,
             validate_masks=False,
-        )
-        reference_kl = _reference_kl_sums(
-            reference_actor,
-            output,
-            quantity_logits,
-            market_kinds,
-            (unit_masks, kind_masks, quantity_masks),
-            (unit_active, kind_active, quantity_active),
-            sample_weight,
-            inputs,
         )
     return (
         *_policy_sums(
@@ -2194,7 +2196,6 @@ def _structured_actor_minibatch_terms(
             policy_objective=policy_objective,
             tpo_eta=tpo_eta,
         ),
-        *reference_kl,
         *belief,
     )
 
@@ -2536,6 +2537,7 @@ def update_replay_parity(
     valid_indices = np.flatnonzero(flat_valid)
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
+    market_set = getattr(actor.config, "action_interface", 1) == 3
     staged = {name: _stage_tensor(array, device) for name, array in rollout.states.items()}
     staged |= {
         name: _stage_tensor(getattr(rollout, name), device)
@@ -2554,14 +2556,26 @@ def update_replay_parity(
             "old_market_quantity_logprobs",
         )
     }
+    if market_set:
+        staged.update(
+            {
+                name: _stage_tensor(getattr(rollout, name), device)
+                for name in (
+                    "market_set_values",
+                    "market_set_masks",
+                    "market_set_active",
+                    "old_market_set_logprobs",
+                )
+            }
+        )
     ordered = torch.from_numpy(valid_indices).to(device=device)
     replay = _cached_update_callable(
         actor,
         "_kaggriculture_logprob_replay",
-        _replayed_selected_logprobs,
+        _market_set_selected_logprobs if market_set else _replayed_selected_logprobs,
         _device_compile_mode(compile_mode, device),
     )
-    components = ("unit", "kind", "quantity")
+    components = ("unit", "set") if market_set else ("unit", "kind", "quantity")
     if rollout.architecture == "strategic-plan":
         components += ("plan",)
     maximum_logprob_error = dict.fromkeys(components, 0.0)
@@ -2588,28 +2602,42 @@ def update_replay_parity(
         joint_log_ratio = torch.zeros(rows, device=device, dtype=torch.float64)
         minibatch_component_kl_sum = 0.0
         minibatch_components = 0
-        market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
-        replayed = replay(
-            actor,
-            _batch_tensor(staged["unit_actions"], indices, torch.long),
-            market_kinds,
-            _batch_tensor(staged["market_quantities"], indices, torch.long),
-            _batch_tensor(staged["unit_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
-            _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
-            autocast_enabled,
-            *_actor_batch_args(rollout.architecture, staged, indices),
-        )
-        factor_metadata = (
-            ("unit", replayed[0][:rows], "old_unit_logprobs", "unit_active"),
-            ("kind", replayed[1][:rows], "old_market_kind_logprobs", "market_active"),
-            (
-                "quantity",
-                replayed[2][:rows],
-                "old_market_quantity_logprobs",
-                "market_quantity_active",
-            ),
-        )
+        if market_set:
+            replayed = replay(
+                actor,
+                _batch_tensor(staged["unit_actions"], indices, torch.long),
+                _batch_tensor(staged["market_set_values"], indices, torch.long),
+                _batch_tensor(staged["unit_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_set_masks"], indices, torch.bool),
+                autocast_enabled,
+                *_actor_batch_args(rollout.architecture, staged, indices),
+            )
+            factor_metadata = (
+                ("unit", replayed[0][:rows], "old_unit_logprobs", "unit_active"),
+                ("set", replayed[1][:rows], "old_market_set_logprobs", "market_set_active"),
+            )
+        else:
+            replayed = replay(
+                actor,
+                _batch_tensor(staged["unit_actions"], indices, torch.long),
+                _batch_tensor(staged["market_kinds"], indices, torch.long),
+                _batch_tensor(staged["market_quantities"], indices, torch.long),
+                _batch_tensor(staged["unit_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
+                _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
+                autocast_enabled,
+                *_actor_batch_args(rollout.architecture, staged, indices),
+            )
+            factor_metadata = (
+                ("unit", replayed[0][:rows], "old_unit_logprobs", "unit_active"),
+                ("kind", replayed[1][:rows], "old_market_kind_logprobs", "market_active"),
+                (
+                    "quantity",
+                    replayed[2][:rows],
+                    "old_market_quantity_logprobs",
+                    "market_quantity_active",
+                ),
+            )
         if rollout.architecture == "strategic-plan":
             factor_metadata += (("plan", replayed[3][:rows], "old_plan_logprobs", "plan_active"),)
         for name, new_logprobs, old_key, active_key in factor_metadata:
@@ -2729,21 +2757,34 @@ def _replay_to_update_minibatch_kl(
     # The k3 sum ignores both the advantages and the clip bounds, so the
     # defaults stand in for a config this audit is not otherwise given.
     clip = PpoConfig()
+    market_set = getattr(actor.config, "action_interface", 1) == 3
     # Keep the audit's compiled callable separate from the optimizer's so fixed
     # diagnostic modes and shapes cannot specialize or evict the production
     # update cache.
     terms = _cached_update_callable(
-        actor, "_kaggriculture_update_audit_terms", _actor_minibatch_terms, resolved_mode
+        actor,
+        "_kaggriculture_update_audit_terms",
+        _market_set_minibatch_terms if market_set else _actor_minibatch_terms,
+        resolved_mode,
     )
     # A fixed shuffle makes the sampled per-minibatch maximum reproducible
     # between audit waves.
     shuffled = np.random.default_rng(_REPLAY_AUDIT_SHUFFLE_SEED).permutation(valid_indices)
     shuffled_device = torch.from_numpy(shuffled).to(device=device)
-    flat_component_counts = (
-        rollout.unit_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_quantity_active.reshape(rollout.valid.size, -1).sum(axis=1, dtype=np.int64)
+    flat_component_counts = rollout.unit_active.reshape(rollout.valid.size, -1).sum(
+        axis=1, dtype=np.int64
     )
+    if market_set:
+        flat_component_counts += rollout.market_set_active.reshape(rollout.valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
+    else:
+        flat_component_counts += rollout.market_active.reshape(rollout.valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
+        flat_component_counts += rollout.market_quantity_active.reshape(rollout.valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
     if rollout.architecture == "strategic-plan":
         flat_component_counts += rollout.states["plan_active"].reshape(-1).astype(np.int64)
     zero_advantages = torch.zeros(minibatch_size, dtype=torch.float32, device=device)
@@ -2774,27 +2815,18 @@ def _replay_to_update_minibatch_kl(
         with torch.enable_grad():
             policy_sum, entropy_sum, kl_sum, clipped_sum, component_kl_sum, *_unused = terms(
                 actor,
-                _batch_tensor(staged["unit_actions"], indices, torch.long),
-                _batch_tensor(staged["market_kinds"], indices, torch.long),
-                _batch_tensor(staged["market_quantities"], indices, torch.long),
-                _batch_tensor(staged["unit_masks"], indices, torch.bool),
-                _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
-                _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
-                _batch_tensor(staged["unit_active"], indices, torch.float32),
-                _batch_tensor(staged["market_active"], indices, torch.float32),
-                _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
-                _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
-                _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
-                _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
+                *_policy_factor_batch_args(actor, staged, indices),
                 zero_advantages[: indices.numel()],
                 clip.clip_low,
                 clip.clip_high,
                 autocast_enabled,
                 *_actor_batch_args(rollout.architecture, staged, indices),
                 sample_weight=sample_weights[batch],
-                policy_ratio_scope="joint"
-                if rollout.architecture == "strategic-plan"
-                else "components",
+                policy_ratio_scope=(
+                    "joint"
+                    if market_set or rollout.architecture == "strategic-plan"
+                    else "components"
+                ),
             )
         minibatch_kl_sum = float(component_kl_sum.detach().double())
         minibatch_kl = minibatch_kl_sum / max(1, component_count)
@@ -3129,11 +3161,17 @@ def _validate_staged_action_masks(staged: dict[str, Tensor], valid: Tensor) -> N
     """Validate stored categorical support in one staged accelerator pass."""
     flags: list[Tensor] = []
     messages: list[str] = []
-    for name, masks_key, actions_key in (
-        ("unit", "unit_masks", "unit_actions"),
-        ("market kind", "market_kind_masks", "market_kinds"),
-        ("market quantity", "market_quantity_masks", "market_quantities"),
-    ):
+    factors = [("unit", "unit_masks", "unit_actions")]
+    if "market_set_values" in staged:
+        factors.append(("market set", "market_set_masks", "market_set_values"))
+    else:
+        factors.extend(
+            (
+                ("market kind", "market_kind_masks", "market_kinds"),
+                ("market quantity", "market_quantity_masks", "market_quantities"),
+            )
+        )
+    for name, masks_key, actions_key in factors:
         masks = staged[masks_key]
         actions = staged[actions_key].long()
         if masks.shape[:-1] != actions.shape:
@@ -3454,7 +3492,10 @@ def _jepa_auxiliary_terms(
 
     What differs is everything downstream. There is no stop-gradient anywhere in
     the returned loss: the successor's embedding carries gradient by design, and
-    SIGReg is the term that makes that safe.
+    SIGReg is the term that makes that safe. `PpoConfig.jepa_detach_target` is the
+    ablation that puts one back on the successor alone. It is a Python branch
+    read off `config` inside the compiled callable, so Dynamo guards on it the
+    same way it guards on the reward coefficient's `score_reward` switch.
     """
     if complete_windows:
         raise ValueError("the LeJEPA objective has no complete-window variant")
@@ -3495,6 +3536,7 @@ def _jepa_auxiliary_terms(
             plan=plan,
             sample_weight=sample_weight,
             score_reward=config.jepa_reward_coefficient > 0.0,
+            detach_target=config.jepa_detach_target,
         )
         loss = (
             config.jepa_prediction_coefficient * terms.prediction
@@ -3658,7 +3700,6 @@ def _warm_actor_update_graphs(
     autocast_enabled: bool,
     sample_weight: Tensor | None = None,
     auxiliary_sample_weight: Tensor | None = None,
-    reference_actor: Actor | None = None,
 ) -> None:
     """Compile the released actor's forward and backward while it is frozen.
 
@@ -3691,7 +3732,6 @@ def _warm_actor_update_graphs(
         auxiliary_active,
         autocast_enabled,
         auxiliary_sample_weight is None,
-        reference_actor is None,
         tuple(indices.shape),
         tuple(staged["advantages"].shape[1:]),
         None if plan is None else (tuple(plan.indices.shape), tuple(plan.eligible.shape)),
@@ -3705,18 +3745,7 @@ def _warm_actor_update_graphs(
     actor_args = _actor_batch_args(architecture, staged, indices)
     actor_pack = actor_terms(
         actor,
-        _batch_tensor(staged["unit_actions"], indices, torch.long),
-        _batch_tensor(staged["market_kinds"], indices, torch.long),
-        _batch_tensor(staged["market_quantities"], indices, torch.long),
-        _batch_tensor(staged["unit_masks"], indices, torch.bool),
-        _batch_tensor(staged["market_kind_masks"], indices, torch.bool),
-        _batch_tensor(staged["market_quantity_masks"], indices, torch.bool),
-        _batch_tensor(staged["unit_active"], indices, torch.float32),
-        _batch_tensor(staged["market_active"], indices, torch.float32),
-        _batch_tensor(staged["market_quantity_active"], indices, torch.float32),
-        _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32),
-        _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32),
-        _batch_tensor(staged["old_market_quantity_logprobs"], indices, torch.float32),
+        *_policy_factor_batch_args(actor, staged, indices),
         _batch_tensor(staged["advantages"], indices, torch.float32),
         config.clip_low,
         config.clip_high,
@@ -3726,25 +3755,29 @@ def _warm_actor_update_graphs(
         policy_ratio_scope=config.policy_ratio_scope,
         policy_objective=config.policy_objective,
         tpo_eta=config.tpo_eta,
-        reference_actor=reference_actor,
     )
     if config.policy_loss_reduction == "states":
         policy_denominator = (
             indices.numel() if sample_weight is None else sample_weight.sum().clamp_min(1)
         )
     else:
+        active_names = (
+            ("unit_active", "market_set_active")
+            if getattr(actor.config, "action_interface", 1) == 3
+            else ("unit_active", "market_active", "market_quantity_active")
+        )
         policy_denominator = sum(
             (
                 _batch_tensor(staged[name], indices, torch.float32)
                 * (sample_weight[:, None] if sample_weight is not None else 1.0)
             ).sum()
-            for name in ("unit_active", "market_active", "market_quantity_active")
+            for name in active_names
         ).clamp_min(1)
-    loss = (-actor_pack[0] + config.reference_kl_coefficient * actor_pack[6]) / policy_denominator
+    loss = -actor_pack[0] / policy_denominator
     if structured_terms_fn is not None:
         assert architecture_of_config(actor.config).structured_inputs
         assert structured_dynamics is not None
-        belief = architecture_of_config(actor.config).actor_belief_class(*actor_pack[8:])
+        belief = architecture_of_config(actor.config).actor_belief_class(*actor_pack[6:])
         auxiliary_loss, _ = structured_terms_fn(
             actor,
             structured_dynamics,
@@ -3791,7 +3824,6 @@ def update_ppo(
     auxiliary_generator: np.random.Generator | None = None,
     diagnostic_groups: Mapping[str, np.ndarray] | None = None,
     diagnostic_gradients: bool = False,
-    reference_actor: Actor | None = None,
 ) -> dict[str, float | int]:
     """Replay one rollout with asymmetric, per-component clipped policy updates.
 
@@ -3807,17 +3839,18 @@ def update_ppo(
     rows belong to two different members, so no storage order makes one
     member's rows a contiguous block and slicing would copy the wave's state
     arrays.
-
-    `reference_actor` is the frozen policy `config.reference_kl_coefficient`
-    anchors to; the two are required together.
     """
     _validate_config(config)
-    _validate_reference_actor(actor, reference_actor, config)
     if isinstance(actor, (StrategicActor, CausalActor)):
         if config.policy_ratio_scope != "joint":
             raise ValueError("strategic and causal PPO require joint policy ratios")
         if config.structured_actor_auxiliary_active or structured_dynamics is not None:
             raise ValueError("strategic and causal PPO require actor NextLat disabled")
+    if getattr(actor.config, "action_interface", 1) == 3:
+        if config.policy_ratio_scope != "joint":
+            raise ValueError("market-set PPO requires joint policy ratios")
+        if config.structured_actor_auxiliary_active or structured_dynamics is not None:
+            raise ValueError("market-set PPO requires actor auxiliary disabled")
     entity_critic = isinstance(critic, StructuredCritic) and getattr(
         critic.config, "per_entity_critic", False
     )
@@ -3948,11 +3981,21 @@ def update_ppo(
     valid_indices = np.flatnonzero(flat_valid)
     if valid_indices.size == 0:
         raise ValueError("rollout contains no valid states")
-    flat_component_counts = (
-        rollout.unit_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
-        + rollout.market_quantity_active.reshape(flat_valid.size, -1).sum(axis=1, dtype=np.int64)
+    market_set = getattr(actor.config, "action_interface", 1) == 3
+    flat_component_counts = rollout.unit_active.reshape(flat_valid.size, -1).sum(
+        axis=1, dtype=np.int64
     )
+    if market_set:
+        flat_component_counts += rollout.market_set_active.reshape(flat_valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
+    else:
+        flat_component_counts += rollout.market_active.reshape(flat_valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
+        flat_component_counts += rollout.market_quantity_active.reshape(flat_valid.size, -1).sum(
+            axis=1, dtype=np.int64
+        )
 
     if rollout.architecture == "strategic-plan":
         flat_component_counts += rollout.states["plan_active"].reshape(-1).astype(np.int64)
@@ -3983,6 +4026,18 @@ def update_ppo(
             "rewards",
         )
     }
+    if market_set:
+        staged.update(
+            {
+                name: _stage_tensor(getattr(rollout, name), device)
+                for name in (
+                    "market_set_values",
+                    "market_set_masks",
+                    "market_set_active",
+                    "old_market_set_logprobs",
+                )
+            }
+        )
     # Stored categorical support is validated in one staged pass; repeated
     # NumPy sweeps over the multi-gigabyte host rollout would stall the update.
     _validate_staged_action_masks(staged, torch.from_numpy(flat_valid).to(device))
@@ -4120,7 +4175,6 @@ def update_ppo(
             "approx_kl",
             "component_kl",
             "joint_kl",
-            "reference_kl",
             "clip_fraction",
             "actor_gradient_norm",
             "critic_gradient_norm",
@@ -4148,7 +4202,6 @@ def update_ppo(
     first_minibatch_joint_kl = 0.0
     max_component_kl = 0.0
     max_joint_kl = 0.0
-    max_reference_decision_kl = torch.zeros((), device=device, dtype=torch.float32)
     actor_auxiliary_active = bool(
         actor_predictor_active and structured_actor_auxiliary and actor_epochs
     )
@@ -4204,7 +4257,13 @@ def update_ppo(
             if actor_predictor_active
             else "_kaggriculture_update_terms"
         ),
-        _structured_actor_minibatch_terms if actor_predictor_active else _actor_minibatch_terms,
+        (
+            _structured_actor_minibatch_terms
+            if actor_predictor_active
+            else _market_set_minibatch_terms
+            if market_set
+            else _actor_minibatch_terms
+        ),
         compile_mode,
     )
     critic_objective_fn = _cached_update_callable(
@@ -4338,7 +4397,6 @@ def update_ppo(
                 autocast_enabled=autocast_enabled,
                 sample_weight=sample_weights[0],
                 auxiliary_sample_weight=sample_weights[0] if jepa_actor_arm else None,
-                reference_actor=reference_actor,
             )
 
         for batch_number in range(minibatch_positions.shape[0]):
@@ -4400,22 +4458,6 @@ def update_ppo(
                     states if config.policy_ratio_scope == "joint" else component_count
                 )
                 diagnostic_denominator = max(1, diagnostic_count)
-                unit_actions = _batch_tensor(staged["unit_actions"], indices, torch.long)
-                market_kinds = _batch_tensor(staged["market_kinds"], indices, torch.long)
-                market_quantities = _batch_tensor(staged["market_quantities"], indices, torch.long)
-                unit_masks = _batch_tensor(staged["unit_masks"], indices, torch.bool)
-                kind_masks = _batch_tensor(staged["market_kind_masks"], indices, torch.bool)
-                quantity_masks = _batch_tensor(staged["market_quantity_masks"], indices, torch.bool)
-                unit_active = _batch_tensor(staged["unit_active"], indices, torch.float32)
-                kind_active = _batch_tensor(staged["market_active"], indices, torch.float32)
-                quantity_active = _batch_tensor(
-                    staged["market_quantity_active"], indices, torch.float32
-                )
-                old_unit = _batch_tensor(staged["old_unit_logprobs"], indices, torch.float32)
-                old_kind = _batch_tensor(staged["old_market_kind_logprobs"], indices, torch.float32)
-                old_quantity = _batch_tensor(
-                    staged["old_market_quantity_logprobs"], indices, torch.float32
-                )
                 advantages = _batch_tensor(staged["advantages"], indices, torch.float32)
 
                 actor_optimizer.zero_grad(set_to_none=True)
@@ -4425,18 +4467,7 @@ def update_ppo(
                 )
                 actor_pack = actor_terms(
                     actor,
-                    unit_actions,
-                    market_kinds,
-                    market_quantities,
-                    unit_masks,
-                    kind_masks,
-                    quantity_masks,
-                    unit_active,
-                    kind_active,
-                    quantity_active,
-                    old_unit,
-                    old_kind,
-                    old_quantity,
+                    *_policy_factor_batch_args(actor, staged, indices),
                     advantages,
                     config.clip_low,
                     config.clip_high,
@@ -4446,7 +4477,6 @@ def update_ppo(
                     policy_ratio_scope=config.policy_ratio_scope,
                     policy_objective=config.policy_objective,
                     tpo_eta=config.tpo_eta,
-                    reference_actor=reference_actor,
                 )
                 (
                     policy_sum,
@@ -4455,9 +4485,7 @@ def update_ppo(
                     clipped_sum,
                     component_kl_sum,
                     joint_kl_sum,
-                    reference_kl_sum,
-                    reference_decision_kl,
-                ) = actor_pack[:8]
+                ) = actor_pack[:6]
                 batch_kl = kl_sum.detach().double() / diagnostic_denominator
                 batch_joint_kl = joint_kl_sum.detach().double() / max(1, states)
                 batch_component_kl = (
@@ -4465,16 +4493,14 @@ def update_ppo(
                     if config.policy_ratio_scope == "components"
                     else component_kl_sum.detach().double() / component_denominator
                 )
-                policy_loss = (
-                    -policy_sum + config.reference_kl_coefficient * reference_kl_sum
-                ) / policy_denominator
+                policy_loss = -policy_sum / policy_denominator
                 entropy_mean = entropy_sum / component_denominator
                 if actor_predictor_active:
                     assert architecture_of_config(actor.config).structured_inputs
                     assert structured_dynamics is not None
                     assert structured_dynamics_optimizer is not None
                     assert structured_terms_fn is not None
-                    actor_belief = actor_belief_class(*actor_pack[8:])
+                    actor_belief = actor_belief_class(*actor_pack[6:])
                     source_belief = (
                         actor_belief if actor_auxiliary_active else _detached_belief(actor_belief)
                     )
@@ -4965,12 +4991,6 @@ def update_ppo(
                     )
                     refresh_fused_mlp_fp8(actor, bootstrap_down=False)
                     totals["policy_loss"] -= policy_sum.detach().double()
-                    totals["reference_kl"] += reference_kl_sum.detach().double()
-                    torch.maximum(
-                        max_reference_decision_kl,
-                        reference_decision_kl,
-                        out=max_reference_decision_kl,
-                    )
                     totals["entropy"] += entropy_mean.detach().double() * component_count
                     totals["approx_kl"] += batch_kl * diagnostic_count
                     totals["component_kl"] += batch_component_kl * component_count
@@ -5205,10 +5225,6 @@ def update_ppo(
         "approx_kl": float(totals["approx_kl"] / max(1, diagnostic_total)),
         "component_kl": float(totals["component_kl"] / max(1, total_components)),
         "joint_kl": float(totals["joint_kl"] / max(1, actor_states)),
-        # Per active decision, and the worst single state's total: the drift
-        # this anchor exists for is invisible in the first and plain in the second.
-        "reference_kl": float(totals["reference_kl"] / max(1, total_components)),
-        "max_reference_decision_kl": float(max_reference_decision_kl),
         "max_component_kl": max_component_kl,
         "max_joint_kl": max_joint_kl,
         "first_minibatch_component_kl": first_minibatch_component_kl,

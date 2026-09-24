@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Research and evaluation tooling for the Kaggriculture simulation competition"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "kaggle-environments==1.32.6",
+  "kaggle-environments==1.32.7",
 ]
 
 [project.optional-dependencies]

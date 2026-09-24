@@ -923,7 +923,7 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
                 inputs,
                 policy_ratio_scope=ppo.policy_ratio_scope,
             )
-            actor_belief = StructuredDecisionBelief(*ppo_terms[8:])
+            actor_belief = StructuredDecisionBelief(*ppo_terms[6:])
             logits = critic.decode_belief(critic_belief)
             actor_terms = actor_window_loss(
                 actor_dynamics,

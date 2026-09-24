@@ -46,7 +46,7 @@ import torch
 from kaggriculture.constants import ANIMALS
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import StructuredConfig, StructuredInputs
-from kaggriculture.tokens import ANIMAL_TOKEN_FIELDS, N_TILE_CONTINUOUS
+from kaggriculture.tokens import ANIMAL_TOKEN_FIELDS, FARM_TOKEN_FIELDS, N_TILE_CONTINUOUS
 
 #: Field dtype and trailing shape, as `allocate_rollout_storage("structured")`
 #: lays them out. The categorical and flag groups arrive from the simulator
@@ -62,7 +62,7 @@ _FIELDS: tuple[tuple[str, torch.dtype, tuple[int, ...]], ...] = (
     ("products", torch.float32, (9, 5)),
     ("animals", torch.float32, (len(ANIMALS), len(ANIMAL_TOKEN_FIELDS))),
     ("crops", torch.float32, (5, 6)),
-    ("farms", torch.float32, (2, 4)),
+    ("farms", torch.float32, (2, len(FARM_TOKEN_FIELDS))),
     ("town", torch.float32, (14,)),
 )
 

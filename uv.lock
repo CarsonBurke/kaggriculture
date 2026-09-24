@@ -1232,7 +1232,7 @@ wheels = [
 
 [[package]]
 name = "kaggle-environments"
-version = "1.32.6"
+version = "1.32.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "flask" },
@@ -1257,9 +1257,9 @@ dependencies = [
     { name = "termcolor" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7c/a5/2f72c81ef5b577d954f534fe51f089005c342d05022faafaba9ccb45b314/kaggle_environments-1.32.6.tar.gz", hash = "sha256:0221b66ef8023c83aa065e16cc42c5b050f04bc5d0d6711208588072ea6248bc", size = 59875672, upload-time = "2026-08-07T17:20:24.086Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/11/50/5a033ac37f3d27d5c4d085145cb5c61652f27d55a8361b555846bcef745f/kaggle_environments-1.32.7.tar.gz", hash = "sha256:4679d757e3677ada652d239679767c678a317c3fabdc58a332a3b6c9566ce1c0", size = 59876308, upload-time = "2026-08-15T01:35:50.984Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/e2/74658416d8aef6bcf9789d0652f4d12d55c9af10ead3e2912bffc737fc31/kaggle_environments-1.32.6-py3-none-any.whl", hash = "sha256:e70a7d7765b16deb1fcfa00532eb5197f28bc9fbfa07a0eee150a17d67bd77ab", size = 60677343, upload-time = "2026-08-07T17:20:19.634Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/a3/16f3211bec7d5b594619e4f53400111783cc0c1575343bef006485d02f64/kaggle_environments-1.32.7-py3-none-any.whl", hash = "sha256:2a1bb862ad2d6463080f80f6a766f46d94b53fd57168cfeddb9857fc3dbc4c8f", size = 60678379, upload-time = "2026-08-15T01:35:47.291Z" },
 ]
 
 [[package]]
@@ -1282,7 +1282,7 @@ train = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kaggle-environments", specifier = "==1.32.6" },
+    { name = "kaggle-environments", specifier = "==1.32.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "tensorboard", marker = "extra == 'train'", specifier = ">=2.18" },

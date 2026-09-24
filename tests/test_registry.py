@@ -57,9 +57,13 @@ def test_architecture_of_maps_constructed_actors_back() -> None:
     assert architecture_of(conv).name == "entity-cnn"
 
 
-def test_structured_artifact_loads_and_acts_on_a_real_observation(tmp_path) -> None:
+@pytest.mark.parametrize("schema_version,farm_width", [(3, 4), (4, 5)])
+def test_structured_artifact_loads_and_acts_on_a_real_observation(
+    tmp_path, schema_version, farm_width
+) -> None:
     torch.manual_seed(0)
     config = StructuredConfig(
+        observation_schema_version=schema_version,
         model_dim=32,
         attention_heads=2,
         ffn_multiplier=2,
@@ -85,6 +89,8 @@ def test_structured_artifact_loads_and_acts_on_a_real_observation(tmp_path) -> N
     loaded, loaded_payload = load_actor_artifact(path)
     assert isinstance(loaded, StructuredActor)
     assert loaded_payload["architecture"] == "structured"
+    assert loaded.config.observation_schema_version == schema_version
+    assert loaded.trunk.economy.farm_projection.in_features == farm_width
 
     agent = CheckpointAgent(path)
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 11})
@@ -103,7 +109,7 @@ def test_every_registered_family_round_trips_config() -> None:
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("shared_memory_kv", False),
+        ("shared_memory_kv", None),
         ("inter_attention_ffn", True),
         ("unit_local_readout", True),
         ("critic_readout_ffn", True),
@@ -116,6 +122,8 @@ def test_entity_ablation_cli_roundtrip_preserves_independent_selection(field, va
     parser = argparse.ArgumentParser()
     add_model_config_arguments(parser)
     baseline = model_config_from_args(family, parser.parse_args([]))
+    if value is None:
+        value = not getattr(baseline, field)
     selected = model_config_from_args(
         family, parser.parse_args(["--" + field.replace("_", "-"), str(value).lower()])
     )
@@ -136,7 +144,7 @@ def test_entity_actor_identity_excludes_only_critic_readout_ablation() -> None:
         resolve_architecture("entity-attention").build_config(critic_changed.to_dict()) != baseline
     )
     for field, value in (
-        ("shared_memory_kv", False),
+        ("shared_memory_kv", not baseline.shared_memory_kv),
         ("inter_attention_ffn", True),
         ("unit_local_readout", True),
         ("unit_local_init", False),
@@ -162,7 +170,7 @@ def test_entity_config_rejects_attention_without_strict_gqa(heads, kv_heads) -> 
 
 
 @pytest.mark.parametrize("builder", ["build_actor", "build_critic"])
-@pytest.mark.parametrize("version", [None, 1])
+@pytest.mark.parametrize("version", [None, 1, 2, 5])
 @pytest.mark.parametrize("architecture", ["structured", "entity-attention"])
 def test_structured_artifacts_reject_stale_observation_schema(
     builder, version, architecture

@@ -23,10 +23,13 @@ from kaggriculture.encoding import encode_observation
 from kaggriculture.tokens import (
     ANIMAL_TOKEN_FIELDS,
     FARM_IDENTITIES,
+    FARM_TOKEN_FIELDS,
     N_TILE_CATEGORICAL,
     N_TILE_CONTINUOUS,
+    OBSERVATION_SCHEMA_VERSION,
     PRODUCT_TOKEN_FIELDS,
     QUADRANT_COUNT,
+    SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
     TILE_CONTINUOUS_FIELDS,
     TILE_COUNT,
     TILE_KIND_INDEX,
@@ -36,6 +39,7 @@ from kaggriculture.tokens import (
     UNIT_TILE_GATHERS,
     clock_features,
     encode_structured_observation,
+    farm_token_fields,
     tokenize_economy,
     tokenize_farm_tiles,
     tokenize_units,
@@ -356,6 +360,92 @@ def test_economy_tokens_match_engine_market_state() -> None:
             sign = 1.0 if own_money >= other_money else -1.0
             if own_money != other_money:
                 assert sign * (tokens.farms[0, 0] - tokens.farms[1, 0]) > 0
+
+
+def _signed_log(amount: float) -> float:
+    return float(np.copysign(np.log1p(abs(amount)), amount))
+
+
+def _legacy_v3_farm_rows(observation: dict) -> np.ndarray:
+    """The schema-v3 farm tokenizer, verbatim, before the v4 margin existed."""
+    player = int(observation.get("player", 0) or 0)
+    rows = []
+    for farm_index in (player, 1 - player):
+        farm = observation["farms"][farm_index]
+        amount = float(farm.get("money", 0) or 0)
+        rows.append(
+            (
+                float(np.copysign(np.log1p(abs(amount)) / 12.0, amount)),
+                len(farm.get("unlocked_quadrants") or []) / 4.0,
+                len(farm.get("hands") or []) / float(MAX_UNITS - 1),
+                float(farm.get("hires_today", 0) or 0) / float(MAX_UNITS - 1),
+            )
+        )
+    return np.asarray(rows, dtype=np.float32)
+
+
+def test_farm_token_schemas_are_prefixes_of_the_emitted_layout() -> None:
+    assert {3, 4} == SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
+    assert farm_token_fields(OBSERVATION_SCHEMA_VERSION) == FARM_TOKEN_FIELDS
+    assert farm_token_fields(4) == (*farm_token_fields(3), "money_margin")
+    assert farm_token_fields(3) == ("money", "unlocked_quadrants", "hands", "hires_today")
+    for version in (2, 5):
+        with pytest.raises(ValueError, match="unsupported observation schema"):
+            farm_token_fields(version)
+
+
+@pytest.mark.parametrize(
+    "own_money,other_money",
+    [
+        (80_000, 76_000),  # a close late game: 0.0513
+        (80_000, 80_001),  # one coin at a late-game bank
+        (4_000, 40_000),  # a 10x blowout: -2.3
+        (0, 1_000_000_000),
+        (250, 250),
+        (0, 0),
+        (-30, 12),  # signed log keeps a debt below every bank
+    ],
+)
+def test_money_margin_is_the_float64_signed_log_ratio_and_swaps_with_the_seat(
+    own_money, other_money
+) -> None:
+    margin = FARM_TOKEN_FIELDS.index("money_margin")
+    observation = {
+        "farms": [
+            {"money": own_money, "unlocked_quadrants": [0], "hands": [[1, 1]]},
+            {"money": other_money, "unlocked_quadrants": [], "hands": [], "hires_today": 2},
+        ],
+    }
+    seat_zero = tokenize_economy({**observation, "player": 0}).farms
+    seat_one = tokenize_economy({**observation, "player": 1}).farms
+
+    expected = np.float32(_signed_log(own_money) - _signed_log(other_money))
+    assert seat_zero.dtype == np.float32
+    assert seat_zero[0, margin] == expected
+    # Own row first: each row is that farm minus the other, so rows negate
+    # exactly and a seat swap is a row swap of every column.
+    assert seat_zero[1, margin] == -expected
+    np.testing.assert_array_equal(seat_one, seat_zero[::-1])
+    if own_money != other_money:
+        assert np.sign(seat_zero[0, margin]) == np.sign(own_money - other_money)
+    # Rollout staging is float16, rounded from the same float32 value.
+    staged = encode_structured_observation({**observation, "player": 0}).farms
+    assert staged[0, margin] == np.float16(expected)
+    assert staged[1, margin] == -np.float16(expected)
+
+
+def test_v3_farm_columns_are_unchanged_by_the_v4_margin() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 80, "seed": 11})
+    environment.run(["starter", "starter"])
+    v3_width = len(farm_token_fields(3))
+    for step_state in environment.steps[::7]:
+        for seat in (0, 1):
+            observation = step_state[seat].observation
+            farms = tokenize_economy(observation).farms
+            legacy = _legacy_v3_farm_rows(observation)
+            assert farms[:, :v3_width].tobytes() == legacy.tobytes()
+            staged = encode_structured_observation(observation).farms
+            assert staged[:, :v3_width].tobytes() == legacy.astype(np.float16).tobytes()
 
 
 def test_clock_features_are_bounded_and_phase_consistent() -> None:

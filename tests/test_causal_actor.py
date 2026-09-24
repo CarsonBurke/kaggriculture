@@ -9,7 +9,14 @@ import numpy as np
 import pytest
 import torch
 
-from kaggriculture.causal_actor import CausalActor, CausalChoice, CausalConfig, CausalReplay
+from kaggriculture.causal_actor import (
+    CausalActor,
+    CausalChoice,
+    CausalConfig,
+    CausalReplay,
+    causal_choose,
+    causal_distribution,
+)
 from kaggriculture.device_ledger import DeviceLedger
 from kaggriculture.model import policy_compile_options
 from kaggriculture.rust_env import load_native
@@ -21,6 +28,129 @@ pytestmark = [
         os.environ.get("KAGG_CAUSAL_CUDA") != "1", reason="compiled GPU contracts require mlq"
     ),
 ]
+
+
+def test_causal_distribution_matches_reference_gradient():
+    torch.manual_seed(61904)
+    logits = torch.randn(4, 100, device="cuda", requires_grad=True)
+    mask = (
+        torch.arange(100, device="cuda")[None]
+        < torch.tensor([1, 7, 32, 100], device="cuda")[:, None]
+    )
+    selected = torch.tensor([0, 6, 17, 91], device="cuda")
+    active = torch.tensor([True, True, False, True], device="cuda")
+    temperatures = torch.tensor([1.0, 0.8, 1.2, 1.5], device="cuda")
+    weights = torch.randn(4, 2, device="cuda")
+
+    chosen, entropy = causal_distribution(logits, mask, selected, active, temperatures)
+    actual_gradient = torch.autograd.grad(
+        (torch.stack((chosen, entropy), -1) * weights).sum(), logits
+    )[0]
+    reference_logprob = (logits / temperatures[:, None]).masked_fill(~mask, -1e9).log_softmax(-1)
+    reference_chosen = torch.where(
+        active, reference_logprob.gather(-1, selected[:, None]).squeeze(-1), 0
+    )
+    reference_entropy = torch.where(
+        active, -(reference_logprob.exp() * reference_logprob).sum(-1), 0
+    )
+    reference_gradient = torch.autograd.grad(
+        (torch.stack((reference_chosen, reference_entropy), -1) * weights).sum(), logits
+    )[0]
+    torch.testing.assert_close(chosen, reference_chosen, rtol=0, atol=0)
+    torch.testing.assert_close(entropy, reference_entropy, rtol=0, atol=0)
+    torch.testing.assert_close(actual_gradient, reference_gradient, rtol=1e-5, atol=1e-6)
+
+
+def test_causal_choose_matches_reference_for_sampling_and_recorded_actions():
+    logits = torch.arange(40, device="cuda", dtype=torch.float32).reshape(4, 10) / 7
+    mask = (
+        torch.arange(10, device="cuda")[None] < torch.tensor([1, 4, 7, 10], device="cuda")[:, None]
+    )
+    recorded = torch.tensor([-1, -1, 9, 8], device="cuda")
+    uniform = torch.tensor([0.7, 0.35, 0.8, 0.6], device="cuda")
+    temperatures = torch.tensor([1.0, 0.8, 1.2, 1.5], device="cuda")
+    deterministic = torch.tensor([False, True, False, False], device="cuda")
+    actual = causal_choose(logits, mask, recorded, uniform, temperatures, deterministic)
+
+    scaled = (logits / temperatures[:, None]).masked_fill(~mask, -1e9)
+    cdf = scaled.softmax(-1).cumsum(-1)
+    last = torch.where(mask, torch.arange(mask.shape[-1], device="cuda"), 0).amax(-1)
+    sampled = torch.minimum((cdf <= uniform[:, None]).sum(-1), last)
+    sampled = torch.where(deterministic, scaled.argmax(-1), sampled)
+    proposed = torch.where(recorded >= 0, recorded, sampled).long()
+    expected = torch.where(mask.gather(1, proposed[:, None]).squeeze(1), proposed, 0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shared_mask", [False, True])
+def test_causal_custom_ops_vmap_matches_per_lane_and_distribution_gradient(shared_mask):
+    torch.manual_seed(61905)
+    lanes, rows, choices = 3, 4, 17
+    logits = torch.randn(lanes, rows, choices, device="cuda", requires_grad=True)
+    mask = (
+        torch.arange(choices, device="cuda")[None]
+        < torch.tensor([1, 5, 12, 17], device="cuda")[:, None]
+    )
+    masks = mask if shared_mask else mask.expand(lanes, -1, -1).clone()
+    mask_dim = None if shared_mask else 0
+    selected = torch.tensor([0, 4, 10, 16], device="cuda").expand(lanes, -1)
+    active = torch.tensor([True, False, True, True], device="cuda").expand(lanes, -1)
+    temperatures = torch.linspace(0.8, 1.4, lanes * rows, device="cuda").reshape(lanes, rows)
+    uniform = torch.rand(lanes, rows, device="cuda")
+    deterministic = torch.tensor([False, True, False, True], device="cuda").expand(lanes, -1)
+    recorded = torch.tensor([-1, -1, 10, -1], device="cuda").expand(lanes, -1)
+
+    chosen, entropy = torch.vmap(causal_distribution, in_dims=(0, mask_dim, 0, 0, 0))(
+        logits, masks, selected, active, temperatures
+    )
+    expected = [
+        causal_distribution(
+            logits[index],
+            mask if shared_mask else masks[index],
+            selected[index],
+            active[index],
+            temperatures[index],
+        )
+        for index in range(lanes)
+    ]
+    torch.testing.assert_close(chosen, torch.stack([part[0] for part in expected]))
+    torch.testing.assert_close(entropy, torch.stack([part[1] for part in expected]))
+    weights = torch.randn(lanes, rows, 2, device="cuda")
+    actual_gradient = torch.autograd.grad(
+        (torch.stack((chosen, entropy), -1) * weights).sum(), logits, retain_graph=True
+    )[0]
+    reference_gradient = torch.autograd.grad(
+        (
+            torch.stack(
+                (
+                    torch.stack([part[0] for part in expected]),
+                    torch.stack([part[1] for part in expected]),
+                ),
+                -1,
+            )
+            * weights
+        ).sum(),
+        logits,
+    )[0]
+    torch.testing.assert_close(actual_gradient, reference_gradient, rtol=1e-5, atol=1e-6)
+
+    actual_choice = torch.vmap(causal_choose, in_dims=(0, mask_dim, 0, 0, 0, 0))(
+        logits.detach(), masks, recorded, uniform, temperatures, deterministic
+    )
+    expected_choice = torch.stack(
+        [
+            causal_choose(
+                logits[index].detach(),
+                mask if shared_mask else masks[index],
+                recorded[index],
+                uniform[index],
+                temperatures[index],
+                deterministic[index],
+            )
+            for index in range(lanes)
+        ]
+    )
+    torch.testing.assert_close(actual_choice, expected_choice, rtol=0, atol=0)
 
 
 @pytest.fixture(scope="module")

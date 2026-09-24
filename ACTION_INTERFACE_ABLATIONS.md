@@ -1,10 +1,43 @@
 # Action-interface ablations, 2026-09-22 to 2026-09-30
 
-Plan only. Nothing here has been implemented or trained. Every number below was measured for
-this plan from the corpora, the code, or the shared BC checkpoint, and the scripts that produced
-them are listed in the appendix. Final submission deadline: 2026-09-30 23:59 UTC. The plan freezes
-the submission candidate at 2026-09-29 12:00 UTC so a full day is left for building and validating
-the bundle.
+This is the single plan and queue ledger for action-decoding ablations.
+`RUNS.md` records measured outcomes and broader training history. Background
+measurements below remain useful, but the current gates and job IDs in section
+4 supersede the original dated schedule.
+Final submission deadline: 2026-09-30 23:59 UTC. The plan freezes the
+submission candidate at 2026-09-29 12:00 UTC so a full day is left for building
+and validating the bundle.
+
+**2026-09-23 update.** Stage-0b falsified the proposed A1/A3 fixed market
+ordering. On Kaggle 1.32.7 against public-v27, unchanged v16 won 128/128 paired
+games and banked $92,496 on average; fixed, impact-sorted and HIRE-last
+rewrites each won 0/128 and banked $8,477, $8,578 and $2,200. The original
+claim in section 1.5(4) that sells-first is safe is wrong: order changes hiring
+and purchasing budgets, and repeated/interleaved kinds are sometimes essential.
+Do not use the Stage-0 gate rule below to choose among those three variants.
+Any A1 market relabel needs exact full-engine replay equality. Current A3 is a
+parity-tested opt-in prototype whose corpus builder requires an explicit lossy
+relabel flag; it is not a training candidate. The exact-order causal decoder,
+A2 quantity alias, and per-head diagnostic panels have completed their first
+attempts. See section 4 for current jobs.
+The first causal-v4 PPO attempt was stopped after only four actor-update waves:
+normal rollout cost 15–17 seconds versus 2–3 seconds for flat, then changing
+frozen-opponent lane counts forced 175- and 204-second recompiles. Its custom
+CUDA choice/distribution ops also lacked vmap batching rules. This is a
+throughput failure, not a learning result; a fresh causal run needs a matched
+production-shape speed gate before training.
+If the exact-order decoder remains too slow after vmap and graph-mode fixes,
+the next design candidate is a **market-only causal** decoder: calculate all
+unit logits in one neural pass, select/apply units sequentially through the
+exact ledger, then run cached attention only for the 20 ordered market
+kind/quantity choices. This keeps the teacher's slot order and repeated kinds
+while removing 16 expensive attention steps. Its CUDA parity gate passed and
+its short forward probe is faster; two-epoch BC and bounded PPO are queued.
+**2026-09-24 priority update.** The A2 BC showed an argmax gain, but its PPO
+job failed on the first update from GPU OOM. Matched A2 retry jobs were
+cancelled at the user's request so the market-only causal variant can be
+developed next. The percentage quantity head in section 2.2b is being built
+as the next independent quantity ablation.
 
 ## 1. What the evidence says before any arm runs
 
@@ -129,12 +162,11 @@ it is.
    [python.rs:474](rust/kagg_env/src/python.rs#L474) and
    [python.rs:728](rust/kagg_env/src/python.rs#L728). The change is small (section 2.2).
 4. **"Sells first so proceeds fund buys" as the teacher's convention.** v16 buys before selling in
-   35% of mixed turns. Sells-first is still the right canonical order. Selling first adds money
-   and shed room, with one exception: BUY_PRODUCT_WHEAT and BUY_PRODUCT_FERTILIZER add to the shed
-   stock that SELL_WHEAT and SELL_FERTILIZER draw on
-   ([core.rs:2779](rust/kagg_env/src/core.rs#L2779)). The corpus has 512 turns (one per episode)
-   that sell wheat after buying it, and none of them becomes infeasible under sells-first. The A1
-   round-trip gate checks this per turn instead of assuming it.
+   35% of mixed turns. The original plan inferred that sells-first would be a
+   safe canonical order from own-ledger feasibility. The official paired panel
+   disproved that inference: market slot order changes actual fills, subsequent
+   budgets and open-loop teacher outcomes. A1 must require exact full-engine
+   replay equality before publishing any market relabels.
 5. **"A production PPO iteration is about 6 s."** That is the lejepa family (6.4 s median over
    64 iterations, `runs/lejepa-full-20260922`). The production entity actor runs at 12.1 s median
    (`runs/structural-gae-20260918/component-control`, about 2.45 s rollout and 9.4 s update).
@@ -144,21 +176,22 @@ it is.
 
 ## 2. Arms
 
-Every arm keeps the entity trunk, the production PPO recipe of the day and the production league.
-The new heads live in the shared head layer (`EntityActor._initialize_heads`,
-[entity.py:596](src/kaggriculture/entity.py#L596)), so lejepa inherits them. Each arm is a
-**versioned action interface** (`action_interface` in the model config, validated like
-`observation_schema_version`), because the baseline has to keep running beside every arm during
-the ablation. Old checkpoints load as interface 1.
+Structural policy changes are opt-in model-config fields or versioned action
+interfaces so old checkpoints retain their behavior. Matched arms use the same
+rules, corpus, opponent schedule and evaluation seeds. All BC runs use two
+epochs; GPU training has a 30-minute hard cap and each speed benchmark a
+two-minute hard cap.
 
-| Arm | Change | Rust sampler | BC re-extraction | Replay / factor format | Effort |
-| --- | --- | --- | --- | --- | --- |
-| A0 | Production clone, 2 epochs (exists) | no | no | no | 0 |
-| A0-12 | Production clone, 12 epochs (convergence control) | no | no | no | queue only |
-| A1 canon | Canonicalized corpus, production heads | no | yes (CPU) | no | 0.5 day |
-| A2 all | A1 plus an ALL encoding for quantities | small | no (reuses A1) | no | 1 day |
-| A3 set | Market as a per-kind canonical set, ALL included | yes | yes (CPU) | yes (market arrays) | 3 days |
-| A4 pointer | Target-tile pointer for units | yes | yes (CPU) | yes (unit arrays) | 3 days, gated |
+| Arm | Change | State | Next gate |
+| --- | --- | --- | --- |
+| F0 | Flat schema-v4 control | Built; matched BC/PPO queued | Compare with market-causal |
+| C0 | Full 36-step causal decoder | Built; first PPO stopped for throughput | Retain as diagnostic, no retry yet |
+| C1 | Parallel unit logits, 20 ordered causal market choices | Built; CUDA parity and eager speed probe passed | Two-epoch BC, matched PPO and panels queued |
+| A2 | Explicit ALL quantity alias | Built; BC promising; PPO OOM | Paused after user reprioritization |
+| A2b | Fraction-structured integer quantity policy | Implementation in progress | Exact Rust/Python likelihood and replay parity |
+| A1 | Engine-equivalent corpus relabeling | Market rewrites rejected | Exact full-game replay before any path-only corpus |
+| A3 | Per-kind market set in a fixed order | Prototype built; official paired panel rejected it | No training of this compiler |
+| A4 | Target-tile pointer | Planned; unit-sampling diagnostic completed | Reassess after C1/A2b; do not queue yet |
 
 ### 2.1 A1: canonicalized corpus (control for everything after it)
 
@@ -237,6 +270,54 @@ option: the select path rejects non-finite quantity tensors
 Parity: extend the Rust-vs-Python quantity likelihood tests and the replay-parity audit.
 
 **Risk.** Low. It is also the fallback deliverable if A3 slips.
+
+### 2.2b A2b: percentage-structured market quantities
+
+**Hypothesis.** Quantities are ordered, and the legal maximum changes with the
+state and preceding orders. Sharing a policy over the fraction of that maximum
+may generalize across legal caps better than 100 unrelated categorical rows.
+This remains an ablation, not a replacement for A2: 56% of corpus quantities
+are exactly 1–3 and 64% of sell quantities are the legal maximum, so one plain
+unimodal Beta can fit the important modes poorly. The Beta policy in
+`../cleanrl/cleanrl/ppo_continuous_action.py` uses
+`alpha,beta = 1 + softplus(head)`, which does not create endpoint spikes.
+
+**Proposed first arm.** Keep the categorical kind/STOP decision, and for a
+selected quantified kind define its positive legal amount `q` in `1..m`.
+Use a small mixture with explicit atoms at 1, 2, 3 and `m`, merging duplicates
+when `m < 4`; model the remaining amounts by a continuous CDF over `u` in
+`(0,1)`. For `q = ceil(m*u)`, its integer probability is the CDF difference
+`F(q/m) - F((q-1)/m)`. A discretized logistic CDF is the first candidate;
+a discretized Beta or Beta-binomial can be compared if it offers a measurable
+fit gain without expensive or unstable CDF evaluation. The current local
+PyTorch 2.13 build has no `torch.special.betainc`, so a Beta CDF would need
+additional differentiable implementation work. Normalize the mixture
+after masking illegal or duplicated atoms. When `m = 1`, `P(q=1) = 1` and
+the quantity entropy is zero. Zero amount stays in the kind/STOP decision;
+adding 0% to this head would duplicate a no-order decision.
+
+**Likelihood contract.** BC uses the exact probability of the teacher's
+executed integer amount. Native sampling, recorded rollout log-probabilities,
+PPO replay, entropy and KL use that same integer distribution and the same
+prefix-specific `m`. Evaluating a Beta density at the center of a rounded
+integer is incorrect. CleanRL's raw Beta log-density is valid for PPO only if
+the exact sampled latent percentage is stored and replayed; that would not
+provide a direct likelihood for the existing integer BC demonstrations and
+would waste exploration on percentages that execute identically. Require
+Python/Rust parity at legal caps 1, 2, 3, 16 and 100, with boundary and
+duplicate-atom cases, before training.
+
+**Readout.** Compare A2b with both the original categorical control and A2 ALL
+using two-epoch BC, held-out quantity NLL by kind and legal cap, the same
+paired argmax/sampled native panels, trio sales, and matched PPO capped at
+30 minutes. Benchmark each inference path within two minutes. Promote only on
+closed-loop outcome and sale volume, not BC NLL alone.
+
+**Other amount-like actions.** Unit pickup actions encode bounded quantities
+(wheat up to 16, fertilizer up to 8, animals up to 4). Audit their frequency
+and current per-head departure cost before adapting this head. Movement,
+planting, HIRE and BUY_LAND are discrete choices in this engine; continuous
+observation features do not imply continuous action distributions.
 
 ### 2.3 A3: the market as a per-kind canonical set
 
@@ -402,120 +483,124 @@ defined at the level of what the step does, not how it is encoded.
 The public-v16 panel runs in the official engine (64 seeds, both seats, CPU workers via
 [evaluate_checkpoint.py](scripts/evaluate_checkpoint.py)) for final candidates only.
 
-**PPO.** Matched budget: 150 waves from each arm's own 12-epoch clone, 10 critic-warmup waves, the
-production recipe of the day for every arm (if a drift-control recipe from the RL review lands
-first, all arms use it), and 3 seeds per arm, because the loop is not reproducible under a fixed
-seed ([REVIEW_RL_20260920.md](REVIEW_RL_20260920.md) section 1). Readouts: the external argmax panel
-against v27 and starter at each committed checkpoint (existing `--external-eval`), paired v27 bank
-change against the arm's own initializer, sampled starter score, and per-head entropy.
+**PPO.** Screen each arm from its own two-epoch clone for at most 27 training
+minutes (30-minute hard MLQ limit). Keep optimizer, minibatch, critic warmup,
+league schedule and evaluation seeds matched within each comparison. Read out
+both argmax and sampled native play, paired v27 bank, per-head entropy and
+carrot/tomato/egg sale counts. Multiple training seeds and official-engine
+games are required before a final submission choice; one-seed development
+panels screen arms, not certify them.
 
-## 4. Stages, gates and schedule
+## 4. Current build and queue plan (2026-09-24)
 
-### Stage 0 (2026-09-22 to 09-23 12:00 UTC): A0-12 and the diagnostics that order the arms
+This section is the authoritative action-ablation plan. `RUNS.md` contains
+observed results, not competing future schedules. All jobs use normal MLQ
+priority and exclusive GPU admission. A job's queue wait does not count toward
+its cap. Two epochs is the BC default; no benchmark exceeds two minutes and
+no training run exceeds 30 minutes.
 
-- **A0-12 clone.** The 12-epoch clone of the production interface, 2 seeds, trained first because
-  0a, 0c and the A4 gate all read it. About 0.5 GPU-hour.
+### 4.1 C1: market-only causal, first priority
 
-- **0a. Per-head departure cost.** Evaluate A0 and A0-12 on the v27 and starter panels, sampling
-  one head family at T=1 and the rest at argmax: {none, all, units, kinds, quantities}. The native
-  path already supports this without Rust changes. In `_stage_gpu_preferences`, Gumbel noise goes
-  only on the chosen heads, and the Rust `deterministic` flag governs only quantities in the
-  select path ([core.rs:2045](rust/kagg_env/src/core.rs#L2045)). The Python change is evaluation
-  only, but it is more than one argument: the host `deterministic_rows` and the
-  `gpu_deterministic_rows` are built from one array
-  ([rollout.py:2344](src/kaggriculture/rollout.py#L2344),
-  [rollout.py:2383](src/kaggriculture/rollout.py#L2383)) and must be split per head family; the
-  per-head tensors must be allocated before graph capture; and the `learner_stochastic` check in
-  [evaluate_architecture_campaign.py:200](scripts/evaluate_architecture_campaign.py#L200) becomes
-  a per-head decoding argument. About 20 panels, **under 1 GPU-hour**.
-- **0b. Teacher canonicalization loss.** Wrap public-v16 in an agent that rewrites only its market
-  list: (i) merged, fixed order; (ii) merged, impact-ranked sells; (iii) unchanged, as control.
-  Play it against public-v27 and against unmodified v16 in the official engine, 64 seeds, both
-  seats. The teacher is open-loop (1.2), so its later actions do not react to the rewrite and the
-  paired bank difference is the order's own worth. Paths need no test (1.1). **CPU only**, about an
-  hour on 8 workers.
-- **0c.** Recompute section 1.4 for A0-12 on the holdout seeds. (The section 1.4 numbers used the
-  first four files per corpus, which are training seeds, and the fp32 Python encoder. Both biases
-  are small on a 99.9%-deterministic corpus, but the gate numbers should be holdout numbers.) CPU,
-  minutes.
+The source is frozen at
+`artifacts/source-snapshots/fe1078ae45b47d2fb831eba4ede8156009a1422a0abd21968159b9b73a8de1cb`.
+The opt-in `parallel_unit_decode` flag retains exact sequential unit ledger
+updates, computes the unit neural logits together, and makes the 20 market
+kind/quantity choices causally. CUDA native-mask/replay parity **9526** passed.
+At 192 midgame rows, the two-minute eager probes found **70 ms** per C1 single
+forward (**9527**) versus **129–150 ms** for C0 (**9528**). C1's two- and
+four-lane eager ensembles took 129–132 and 141–143 ms with zero vmap fallback
+warnings. C0's eager ensembles still fail efficient attention's 36-column mask
+stride; the C1 market cache pads to 24 columns. These forward numbers do not
+establish whole-rollout or PPO speed.
 
-**Gate after Stage 0.** Build A4 inside this window only if (a) unit-only sampling explains at
-least a third of the sampled v27 gap (all-sampled minus argmax) in 0a for A0-12, and (b) a second
-implementer can work in a separate worktree, since A3 and A4 both edit `sample_factors` and
-`select_factors`. Otherwise A4 is written up and deferred. Choose the A1/A3 sell order from 0b:
-fixed order unless impact order beats it by more than the paired interval. Add Plackett-Luce only
-if both lose to the teacher's order by more than the interval.
+| Arm | Two-epoch BC | PPO | Argmax / sampled panels | Trio sales |
+| --- | ---: | ---: | ---: | ---: |
+| Matched flat v4 F0 | **9533** | **9534** | **9537 / 9538** | **9541** |
+| Market-only causal C1 | **9535** | **9536** | **9539 / 9540** | **9542** |
 
-### Stage 1 (09-23 12:00 to 09-24 18:00): A1 and A2 clones
+The PPO jobs depend on their own BC jobs; panels and sales depend on PPO
+success. Commands and frozen source are in
+`artifacts/probes/market-causal-v4-20260924/campaign.json`. Both PPO runs use
+component ratios, minibatch 4096, default Inductor update compilation without
+CUDA graph capture, four critic-warmup iterations, and the same league setting:
+one active frozen-opponent lane, zero historical lanes and the native builtin
+opponents. That stable lane count avoids the previous 1→2→4 ensemble
+recompilations; it changes the training distribution from the growing league,
+so all conclusions are within this matched comparison. Inspect the first
+actor-update wave and stop an arm if replay parity fails or actor updates make
+no progress. Do not infer play strength from forward latency.
 
-12-epoch clones, 2 seeds each, under 2 GPU-hours with panels. Score is the mean match score
-(win 1, draw 0.5, loss 0) from the evaluation script. **Gate (applies to every BC arm, here and
-in Stage 2).** (i) The argmax v27 score is no more than 2 percentage points below A0-12's, and the
-argmax paired-bank interval includes zero or better. (ii) Expected departures per game fall by at
-least 30%, **or** the sampled v27 paired-bank interval excludes zero on the positive side. Arms
-passing both enter the stack; the best passing Stage-1 arm is the fallback submission base.
+### 4.2 A2b: percentage-structured quantities, second priority
 
-### Stage 2 (09-24 18:00 to 09-27 18:00): A3, and A4 if gated
+Implement the exact integer policy in section 2.2b as opt-in interface 4. The
+market kind/STOP factor stays categorical; an active quantity takes one of
+`1..m`, where `m` is the current legal maximum after all preceding orders.
+Python BC, PPO replay and the Rust native selector must agree on the same
+per-integer probability and entropy. The first candidate uses a discretized
+logistic CDF plus explicit small-quantity and ALL atoms, merging duplicate
+atoms when `m` is small. The existing categorical interface 1 and ALL
+interface 2 are controls. A raw Beta log-density on a rounded integer is not
+an acceptable replay likelihood. Current PyTorch has no `special.betainc`,
+so Beta CDF integration is a later candidate only if the logistic arm misses a
+specific pattern.
 
-Implementation with parity tests first: Rust-vs-Python masks and likelihoods, the null round trip
-on the canonicalized corpus with engine replay, and replay parity at production shape. Then clones
-and panels under the Stage-1 gate, about 1 GPU-hour. The hard cut is 09-27 18:00 UTC, which is the
-three-day estimate with no slack: if A3 is not passing its parity tests then, it is cut. A4 runs in
-parallel only with a second implementer in a separate worktree.
+Queue in this order after implementation: (1) focused CPU/Rust parity and
+boundary/gradient tests; (2) exclusive CUDA replay contract, two-minute cap;
+(3) matched two-epoch F0/A2b BC; (4) matched, at-most-30-minute PPO only if
+BC and native sampling are legal; (5) paired argmax/sampled panels and trio
+sales. Every command and dependency goes into one campaign manifest beside the
+outputs. Compare by legal cap, kind and executed quantity as well as outcome;
+NLL alone cannot promote an arm.
 
-### Stage 3: matched-budget PPO, in two waves
+### 4.3 Other action candidates and stop gates
 
-- **3a (09-25 to 09-26), while A3 is being built.** Baseline A0-12 and the passing Stage-1 arms,
-  3 seeds times 150 waves each. The GPU is otherwise idle during A3 implementation, so this costs
-  no calendar time.
-- **3b (09-28), only if A3 passes Stage 2.** A3, 3 seeds, the same recipe (with the recalibration
-  in 2.3 risk 4 if triggered), compared against the 3a baseline runs.
+- **A2 ALL:** Its BC argmax panel was promising, but PPO failed at the first
+  update with CUDA OOM. Retry jobs 9518–9524 were canceled at the user's
+  request. Keep it as a control for A2b; do not restart that PPO campaign while
+  C1 and A2b run.
+- **A1 path relabel:** The market-order relabel failed exact engine-equivalence
+  checks and is excluded. Build a path-only corpus only after full native
+  trajectory replay proves identical next states; then compare to a fresh
+  two-epoch control. Do not queue the rejected market rewrite.
+- **A3 fixed-order per-kind set:** The official paired panel decisively
+  rejected it (0/128 wins against v27 versus 128/128 for the unchanged
+  teacher). Its parity-tested prototype remains archived; no BC/PPO job for
+  that compiler.
+- **A4 target-tile pointer:** Completed per-head panels **9483–9487** show
+  units-only sampling improves v27 score to 26.95%, versus 17.19% for all
+  sampled and 0% for argmax. Kinds-only remains at 0%, so unit exploration is
+  useful while sampled market kinds are the clearer harm. The old numerical
+  A4 gate is satisfied, but its premise that unit departures are damaging is
+  not. Reassess A4 after C1/A2b; require an exact factor likelihood and native
+  first-step mapping before queueing BC. Movement remains a discrete grid
+  decision, even if a pointer selects a distant target.
+- **P1 pickup amount:** Current pickup counts are discrete with maxima 16/8/4.
+  Audit their opportunity and regret contribution first. Adapt the A2b integer
+  mass head only if this is material; do not apply a raw continuous PPO density
+  to a rounded pickup count.
 
-At 12.1 s per wave a run is 30 minutes. The total is at most 12 runs, about 6 GPU-hours plus about
-2 hours of checkpoint panels; half that on lejepa. **Decision rule.** Each seed's wave-150
-checkpoint plays the 256-map argmax v27 panel. The statistic is the paired v27 bank change against
-the arm's own clone, and the comparison with the baseline uses a bootstrap that resamples maps and,
-within each, seeds. An arm wins if the 95% interval of (arm minus baseline) excludes zero on the
-positive side and no seed's argmax v27 score falls more than 5 percentage points below its own
-clone's. Three seeds are too few for a seed-level test; the map-paired bootstrap carries most of
-the power, and the result is still read as evidence, not proof. If no arm wins, PPO has not beaten BC under either interface,
-which is the current state of every recipe. The submission is then chosen among BC clones by the
-argmax panels, and an interface arm is preferred only if it passed the Stage-1 gate with a better
-argmax bank.
+### 4.4 Promotion and resource rule
 
-### Stage 4 (09-28 18:00 to 09-29 12:00 UTC): final candidates
-
-Official-engine v16 panel for the top two candidates, the argmax v27 and starter panels,
-`build_submission` and `validate_submission`. Freeze at 12:00 UTC on 09-29; the remaining 36 hours
-are buffer for bundle problems only.
-
-### Budget
-
-| Stage | GPU-hours | Notes |
-| --- | ---: | --- |
-| 0 | < 1 | plus about 1 CPU-hour of official-engine games |
-| 1 | about 2 | BC is 8-15 s per epoch on the entity actor |
-| 2 | about 1 | |
-| 3 | about 8 | up to 12 PPO runs plus panels; about 4 on lejepa |
-| 4 | about 1 | plus 2-4 CPU-hours for the v16 panels |
-| Total | about 13 | Implementation time, not GPU, is the binding constraint |
-
-The critical path is Stage 0 (0.5 day), A1 and A2 (1.5 days), A3 (3 days, ending 09-27 18:00),
-A3 PPO (about 1 day including panels) and the final panels (0.75 day), ending at the 09-29 12:00
-freeze with no slack. The Stage-1 arms' PPO runs overlap A3 implementation. That is why A3 has a
-hard cut, why A2 plus the 3a results are the fallback deliverable, and why A4 needs a parallel
-implementer or waits.
+A clear winner in paired native outcome and relevant trade volume becomes the
+initializer/control for later action runs immediately; record the source and
+checkpoint digest. A one-seed argmax gain or held-out BC NLL gain alone is a
+screening result. Keep both decoding modes and the carrot/tomato/egg units in
+every market-related panel. Training jobs stop at 30 minutes; benchmarks stop
+at two minutes. Do not launch a new long run merely to obtain a benchmark
+number that would take longer to compile than to measure.
 
 ## 5. Biggest uncertainties
 
 1. **Whether any interface fixes what PPO is losing.** The review attributes the PPO erosion
    mostly to objective, credit and drift. Interface arms can shrink the sampled tail and still not
    make PPO improve over BC. Stage 3 is designed to show that honestly, not to rescue it.
-2. **A3's departure count.** More, easier decisions per turn could raise T=1 departures. The Stage-2
-   gate measures this before any PPO is spent.
-3. **Sell-order value against v27.** Unknown until Stage 0b. It decides between fixed order,
-   impact order, and Plackett-Luce.
-4. **Timing uncertainty is untouched by any interface.** The largest departure flows (STOP versus
+2. **C1's actual training throughput.** The eager forward is faster and CUDA
+   parity passed, but full rollout, Inductor compilation and PPO updates have
+   not yet been measured for the new decoder.
+3. **Fraction-policy credit.** A2b shares amount structure across legal caps,
+   but the teacher favors exact 1–3 and legal maximum. Explicit atoms and
+   exact integer likelihood may still add complexity without improving play.
+4. **Timing uncertainty is untouched by quantity parameterization.** The largest departure flows (STOP versus
    SELL_MILK/SELL_WOOL, PASS versus act) are when-to-act questions. If A0-12 already removes most
    of them, interface gains will read small at BC.
 

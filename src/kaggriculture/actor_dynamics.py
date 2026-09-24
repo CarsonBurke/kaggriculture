@@ -177,8 +177,12 @@ def _actor_decode_kl(
             heads.market_quantity_context, target.market_quantity_decisions.detach().float()
         )
         quantity_kl, quantity_weight = _decision_kl(
-            heads.quantity_logits(student_quantity, masks.market_kinds),
-            heads.quantity_logits(teacher_quantity, masks.market_kinds),
+            heads.quantity_logits(
+                student_quantity, masks.market_kinds, masks.market_quantity_masks
+            ),
+            heads.quantity_logits(
+                teacher_quantity, masks.market_kinds, masks.market_quantity_masks
+            ),
             masks.market_quantity_masks,
             (row & masks.market_quantity_active).float(),
         )

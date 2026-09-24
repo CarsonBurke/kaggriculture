@@ -23,9 +23,11 @@ from kaggriculture.actions import (
     copy_tile_grid,
     unit_action_mask,
 )
-from kaggriculture.constants import CROPS, PRODUCTS, market_price
+from kaggriculture.constants import CROPS, MARKET_PARAMS, PRODUCTS, market_price
 from kaggriculture.device_ledger import (
     POLICY_LEDGER_WIDTH,
+    PRICE_MAXIMUM,
+    PRICE_MINIMUM,
     DeviceLedger,
     initial_ledger,
     pack_observations,
@@ -115,6 +117,28 @@ def test_native_quotes_and_boundary_validation(rules):
         env.policy_ledger_into(np.empty((2, POLICY_LEDGER_WIDTH - 1), dtype=np.int64))
     with pytest.raises(ValueError, match="prefix bounds"):
         validate_packed(env.policy_ledger(), 9500, 10500)
+
+
+def test_the_full_price_table_saturates_only_unreachable_hinge_quotes():
+    """Deep below zero the hinge quotes exceed int32, but only buys reach there."""
+    prices = load_native().BatchEnv.policy_market_prices(PRICE_MINIMUM, PRICE_MAXIMUM)
+    assert prices.shape == (len(PRODUCTS), PRICE_MAXIMUM - PRICE_MINIMUM + 1)
+    assert prices.min() >= 1
+    saturated = prices == np.iinfo(np.int32).max
+    for item, product in enumerate(PRODUCTS):
+        cells = np.flatnonzero(saturated[item])
+        # Players buy only wheat and fertilizer; the rest fall by town consumption.
+        if product in ("WHEAT", "FERTILIZER") or MARKET_PARAMS[product]["below_func"] != "hinge":
+            assert cells.size == 0, product
+            continue
+        assert cells.size and cells[-1] == cells.size - 1, product
+        floor = PRICE_MINIMUM + cells.size
+        assert floor < -600_000, product
+        for inventory in (PRICE_MINIMUM, floor - 1, floor, 0, 9_000, PRICE_MAXIMUM):
+            expected = market_price(product, inventory)
+            quoted = int(prices[item, inventory - PRICE_MINIMUM])
+            assert quoted == (expected if inventory >= floor else np.iinfo(np.int32).max)
+        assert market_price(product, floor - 1) > np.iinfo(np.int32).max
 
 
 def test_colocated_units_reserve_tiles_seeds_and_ordered_shed_capacity(rules):

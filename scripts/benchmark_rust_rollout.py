@@ -139,7 +139,11 @@ def replay_diagnostics(
         market_kinds = tensor("market_kinds", torch.long, selected)
         replayed = component_logprobs(
             output,
-            actor.quantity_logits(output.market_quantity_context, market_kinds),
+            actor.quantity_logits(
+                output.market_quantity_context,
+                market_kinds,
+                tensor("market_quantity_masks", torch.bool, selected),
+            ),
             tensor("unit_actions", torch.long, selected),
             market_kinds,
             tensor("market_quantities", torch.long, selected),
