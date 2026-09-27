@@ -7,9 +7,9 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 MILESTONES = (25, 50, 100, 200, 300, 400, 500)
 
@@ -105,7 +105,7 @@ def main() -> None:
         "source_sha256": source_digest,
         "milestones": list(MILESTONES),
         "arms": records,
-        "comparison": "Exact actor waves; optimizer updates and warmup exposure reported separately",
+        "comparison": "Exact actor waves; optimizer updates and warmup exposure recorded separately",
     }
     (args.output_dir / "selection.json").write_text(json.dumps(index, indent=2) + "\n")
     env = dict(os.environ)
