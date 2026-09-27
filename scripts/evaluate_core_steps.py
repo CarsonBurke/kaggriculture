@@ -105,7 +105,7 @@ def main() -> None:
         "source_sha256": source_digest,
         "milestones": list(MILESTONES),
         "arms": records,
-        "comparison": "Exact actor waves; optimizer updates and warmup exposure recorded separately",
+        "comparison": "Exact actor waves; separate optimizer-update and warmup accounting",
     }
     (args.output_dir / "selection.json").write_text(json.dumps(index, indent=2) + "\n")
     env = dict(os.environ)
