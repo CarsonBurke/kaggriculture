@@ -21,6 +21,7 @@ HEAD_DECODINGS = {
     "sampled": ("units", "kinds", "quantities"),
     "units": ("units",),
     "kinds": ("kinds",),
+    "unit_kind": ("units", "kinds"),
     "quantities": ("quantities",),
 }
 

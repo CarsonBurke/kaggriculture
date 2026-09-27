@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count legal product sell orders in full native games from a frozen actor."""
+"""Count product sales and pickup quantities in native games from a frozen actor."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from kaggriculture import rollout as rollout_module
 from kaggriculture.actions import MarketKind, UnitAction
 from kaggriculture.constants import QUANTITY_BINS
 from kaggriculture.inference import load_actor_artifact
-from kaggriculture.provenance import file_sha256
+from kaggriculture.provenance import file_sha256, source_identity
 from kaggriculture.rollout import collect_self_play_rust
 
 
@@ -32,6 +32,38 @@ def action_diagnostics(rollout: rollout_module.RolloutBatch) -> dict[str, object
         "cow_4": UnitAction.PICKUP_COW_4,
         "sheep_4": UnitAction.PICKUP_SHEEP_4,
     }
+    pickup_families = {
+        "wheat": (UnitAction.PICKUP_WHEAT_1, 16),
+        "fertilizer": (UnitAction.PICKUP_FERTILIZER_1, 8),
+        "goose": (UnitAction.PICKUP_GOOSE_1, 4),
+        "cow": (UnitAction.PICKUP_COW_1, 4),
+        "sheep": (UnitAction.PICKUP_SHEEP_1, 4),
+    }
+    pickup_amounts = {}
+    for name, (first, width) in pickup_families.items():
+        first = int(first)
+        legal = rollout.unit_masks[..., first : first + width]
+        if np.any(legal[..., 1:] & ~legal[..., :-1]):
+            raise ValueError(f"{name} pickup masks must be legal prefixes")
+        selected = active_units & (rollout.unit_actions >= first) & (
+            rollout.unit_actions < first + width
+        )
+        amounts = rollout.unit_actions[selected].astype(np.int64) - first + 1
+        maximum = legal.sum(axis=-1)[selected]
+        if np.any(amounts > maximum):
+            raise ValueError(f"selected {name} pickup exceeds its legal maximum")
+        histogram = np.bincount(amounts, minlength=width + 1)
+        pickup_amounts[name] = {
+            "selected": int(selected.sum()),
+            "legal_opportunities": int((active_units & legal.any(axis=-1)).sum()),
+            "nonmaximum_selected": int((amounts < maximum).sum()),
+            "units": int(amounts.sum()),
+            "amounts": {
+                str(amount): int(count)
+                for amount, count in enumerate(histogram)
+                if amount > 0 and count
+            },
+        }
     return {
         "hire": {
             "orders": int(hires.sum()),
@@ -47,6 +79,7 @@ def action_diagnostics(rollout: rollout_module.RolloutBatch) -> dict[str, object
             }
             for name, action in pickup_caps.items()
         },
+        "pickup_amounts": pickup_amounts,
         "place_wheat": int(
             (active_units & (rollout.unit_actions == int(UnitAction.PLACE_WHEAT))).sum()
         ),
@@ -102,6 +135,8 @@ def main() -> None:
         "sampling_seed": args.sampling_seed,
         "mode": "sampled_temperature_1_native_self_play",
         "source_root": str(source_root),
+        "source_identity": source_identity(),
+        "probe_script_sha256": file_sha256(Path(__file__)),
         "sales": sales,
         "action_diagnostics": action_diagnostics(rollout),
     }

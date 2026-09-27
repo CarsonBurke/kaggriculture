@@ -32,12 +32,18 @@ unit logits in one neural pass, select/apply units sequentially through the
 exact ledger, then run cached attention only for the 20 ordered market
 kind/quantity choices. This keeps the teacher's slot order and repeated kinds
 while removing 16 expensive attention steps. Its CUDA parity gate passed and
-its short forward probe is faster; two-epoch BC and bounded PPO are queued.
-**2026-09-24 priority update.** The A2 BC showed an argmax gain, but its PPO
-job failed on the first update from GPU OOM. Matched A2 retry jobs were
-cancelled at the user's request so the market-only causal variant can be
-developed next. The percentage quantity head in section 2.2b is being built
-as the next independent quantity ablation.
+its short forward probe was faster, but its two-epoch BC unit fit was much
+worse than flat. The user closed the causal arm on 2026-09-24; all remaining
+causal jobs were canceled before start.
+**2026-09-24 quantity priority update.** The memory-safe A2 ALL PPO retry
+succeeded; percentage and narrow-percentage heads failed their sampled-game
+gates, and the transplanted percentage head failed its early-buy gate. The
+promoted initializer is now the A8 local-affordance PPO actor with categorical
+ALL quantities. The latest factorwise decode and pickup audits in section 4.3
+support retaining that head while using greedy quantities when evaluating an
+otherwise sampled policy. PPO rollout and deterministic submission remain as
+trained; a new quantity head needs stronger evidence of an amount-specific
+failure before another training run.
 
 ## 1. What the evidence says before any arm runs
 
@@ -184,14 +190,15 @@ two-minute hard cap.
 
 | Arm | Change | State | Next gate |
 | --- | --- | --- | --- |
-| F0 | Flat schema-v4 control | Built; matched BC/PPO queued | Compare with market-causal |
-| C0 | Full 36-step causal decoder | Built; first PPO stopped for throughput | Retain as diagnostic, no retry yet |
-| C1 | Parallel unit logits, 20 ordered causal market choices | Built; CUDA parity and eager speed probe passed | Two-epoch BC, matched PPO and panels queued |
-| A2 | Explicit ALL quantity alias | Built; BC promising; PPO OOM | Paused after user reprioritization |
-| A2b | Fraction-structured integer quantity policy | Implementation in progress | Exact Rust/Python likelihood and replay parity |
+| F0 | Flat schema-v4 control | BC completed; causal-campaign PPO canceled | Historical reference only |
+| C0 | Full 36-step causal decoder | Stopped for throughput | Closed by user |
+| C1 | Parallel unit logits, 20 ordered causal market choices | BC unit fit weak; all later jobs canceled | Closed by user |
+| A2 | Explicit ALL quantity alias | PPO **9588** completed and promoted within A2 | Follow-up unit/kind split **9626** and matched BC sales **9627** |
+| A2b | Fraction-structured integer quantity policy | Two-epoch BC **9589** succeeded; scale-floor NLL ceiling found | PPO **9590** running; paired panels queued |
+| A2c | Narrow-scale fraction head | CPU/native parity passed, immutable source frozen | CUDA gate **9617**, BC **9618**, panels **9619/9620** queued |
 | A1 | Engine-equivalent corpus relabeling | Market rewrites rejected | Exact full-game replay before any path-only corpus |
 | A3 | Per-kind market set in a fixed order | Prototype built; official paired panel rejected it | No training of this compiler |
-| A4 | Target-tile pointer | Planned; unit-sampling diagnostic completed | Reassess after C1/A2b; do not queue yet |
+| A4 | Target-tile pointer | Planned; unit-sampling diagnostic completed | Reassess after quantity results; do not queue yet |
 
 ### 2.1 A1: canonicalized corpus (control for everything after it)
 
@@ -240,7 +247,8 @@ matters (64% of sells, 5.5% of buys).
 **Why this form.** An additive "bonus on the max bin" has the same expressiveness, but its
 parameter means something different at every m. The mixture gives ALL its own state-dependent score.
 Stored factors, masks and trajectory arrays are untouched, and m is recoverable from the stored
-quantity mask at replay. An ordinal (discretized-logistic or cumulative-link) head is not proposed.
+quantity mask at replay. A separate discretized-logistic quantity arm is now
+specified in section 2.2b.
 The corpus's non-max quantities are specific small integers (1-3 are 56% of all quantities),
 which the per-kind bias already captures, and the only max-relative structure is ALL.
 
@@ -454,13 +462,17 @@ tile states ([entity.py:641](src/kaggriculture/entity.py#L641)). The pickup init
   departure mass. The only cheap form, `logit = item + count` inside the existing 68-way head, is
   pure model code (unit logits are GPU-side) and can ride along with A4 if it is built. It is not
   worth an arm.
-- **Ordinal quantity head.** Covered in 2.2.
+- **Raw continuous quantity density.** Section 2.2b explains why the game
+  requires an exact executed-integer likelihood even when a latent fraction is sampled.
 - **Claimed-tile mask.** Contradicted by the teacher (1.5.2).
 
 ## 3. Evaluation protocol
 
-All panels are the fixed native development panel (256 maps, seeds from `DEVELOPMENT_SEED_START`,
-both seats) ([evaluate_architecture_campaign.py](scripts/evaluate_architecture_campaign.py)). Every
+Primary panels use the fixed native development panel (256 seeds from
+`DEVELOPMENT_SEED_START`, seat determined by seed parity). Two-minute
+preliminary gates may use its first 128 seeds, as A2c does; require a larger
+confirmation before promotion
+([evaluate_architecture_campaign.py](scripts/evaluate_architecture_campaign.py)). Every
 number is reported as score and paired bank (learner minus the same-map baseline), with a
 map-paired bootstrap 95% interval.
 
@@ -473,7 +485,7 @@ defined at the level of what the step does, not how it is encoded.
   effect is equal: the multiset of (kind, total quantity), with ALL and m identified. For slot-order
   arms that probability is a sum over the orderings and splits that reach the teacher's net effect;
   it is computed exactly by enumerating them, which is cheap because the teacher's turns have at
-  most a handful of distinct kinds. Without this, A0-12 would be charged for its learned buys-first
+  most a handful of distinct kinds. Without this, a slot-order control would be charged for its learned buys-first
   and split orders and the A1+ arms would pass gate (ii) by construction.
 - Expected departures per game: the sum over steps of 1 - p(teacher's engine action). This is the
   quantity section 1.4 decomposes, and the one tied to the sampled tail.
@@ -494,12 +506,14 @@ panels screen arms, not certify them.
 ## 4. Current build and queue plan (2026-09-24)
 
 This section is the authoritative action-ablation plan. `RUNS.md` contains
-observed results, not competing future schedules. All jobs use normal MLQ
-priority and exclusive GPU admission. A job's queue wait does not count toward
+observed results, not competing future schedules. Training uses normal MLQ
+priority and exclusive GPU admission; short defect probes **9626/9628/9636**
+were raised one priority level to resolve the current action failure. A job's
+queue wait does not count toward
 its cap. Two epochs is the BC default; no benchmark exceeds two minutes and
 no training run exceeds 30 minutes.
 
-### 4.1 C1: market-only causal, first priority
+### 4.1 C1: market-only causal, closed
 
 The source is frozen at
 `artifacts/source-snapshots/fe1078ae45b47d2fb831eba4ede8156009a1422a0abd21968159b9b73a8de1cb`.
@@ -515,22 +529,22 @@ establish whole-rollout or PPO speed.
 
 | Arm | Two-epoch BC | PPO | Argmax / sampled panels | Trio sales |
 | --- | ---: | ---: | ---: | ---: |
-| Matched flat v4 F0 | **9533** | **9534** | **9537 / 9538** | **9541** |
-| Market-only causal C1 | **9535** | **9536** | **9539 / 9540** | **9542** |
+| Matched flat v4 F0 | **9543** | **9553** | **9554 / 9555** | **9556** |
+| Market-only causal C1 | **9548** | **9557** | **9558 / 9559** | **9560** |
 
-The PPO jobs depend on their own BC jobs; panels and sales depend on PPO
-success. Commands and frozen source are in
-`artifacts/probes/market-causal-v4-20260924/campaign.json`. Both PPO runs use
-component ratios, minibatch 4096, default Inductor update compilation without
-CUDA graph capture, four critic-warmup iterations, and the same league setting:
-one active frozen-opponent lane, zero historical lanes and the native builtin
-opponents. That stable lane count avoids the previous 1→2→4 ensemble
-recompilations; it changes the training distribution from the growing league,
-so all conclusions are within this matched comparison. Inspect the first
-actor-update wave and stop an arm if replay parity fails or actor updates make
-no progress. Do not infer play strength from forward latency.
+C1 BC **9548** finished with holdout NLL **0.0482** and unit accuracy
+**0.977**, versus F0 **0.0025** and **1.000**. The parallel unit path bypassed
+the decoder's farm/economy attention, a likely capacity cause. C1 PPO
+**9557** and dependents **9558–9560** were canceled before start. A repaired
+unit decoder passed CPU replay/gradient tests, but the user closed the causal
+arm; its queued CUDA contract **9577** was canceled before start, and dependent
+probe/BC **9578/9579** skipped. The uncommitted repair was removed from the
+working tree. F0 PPO **9553** was also canceled during the causal-campaign
+shutdown; its BC **9543** remains a measured reference. Earlier superseded
+chains and commands are retained in
+`artifacts/probes/market-causal-v4-20260924/campaign.json`.
 
-### 4.2 A2b: percentage-structured quantities, second priority
+### 4.2 A2 ALL versus A2b percentage: active priority
 
 Implement the exact integer policy in section 2.2b as opt-in interface 4. The
 market kind/STOP factor stays categorical; an active quantity takes one of
@@ -544,20 +558,326 @@ an acceptable replay likelihood. Current PyTorch has no `special.betainc`,
 so Beta CDF integration is a later candidate only if the logistic arm misses a
 specific pattern.
 
-Queue in this order after implementation: (1) focused CPU/Rust parity and
-boundary/gradient tests; (2) exclusive CUDA replay contract, two-minute cap;
-(3) matched two-epoch F0/A2b BC; (4) matched, at-most-30-minute PPO only if
-BC and native sampling are legal; (5) paired argmax/sampled panels and trio
-sales. Every command and dependency goes into one campaign manifest beside the
-outputs. Compare by legal cap, kind and executed quantity as well as outcome;
+Compare A2 and A2b with the same LeJEPA actor family, four-corpus BC recipe,
+PPO update settings, evaluation seeds and current rules. A2's existing
+two-epoch BC checkpoint is the control and the best initial argmax result.
+A2b receives its own two-epoch BC. Both PPO jobs have a 27-minute soft and
+30-minute hard limit. Read paired argmax/sampled panels and trio-sales volume;
 NLL alone cannot promote an arm.
+
+The opt-in interface-4 implementation is frozen at
+`artifacts/source-snapshots/5c1e129eb7697502dfe2965aaac02d2de6453f2ce8d0bdba1b6ad97b980c1ffe`.
+It parameterizes a logistic fraction conditioned to [0, 1] and adds 1, 2, 3,
+and legal-maximum atoms, merging atoms that execute the same integer amount.
+Torch BC/PPO, NumPy inference, and Rust native sampling use the resulting
+100 integer logits. Sixteen focused CPU tests, selected PPO/BC replay tests,
+Rust build, Ruff and independent review passed; the Rust scale softplus was
+made stable at large learned values and tested at raw scale 100. Native parity
+has so far covered an opening-state legal maximum; Torch/NumPy cover maxima
+1, 2, 3, 16 and 100. The CUDA legal-logit gate **9562** passed in under one
+second of test time within its two-minute cap; BC is now eligible to train.
+
+| Quantity job | MLQ ID | Prerequisite | Hard cap |
+| --- | ---: | --- | ---: |
+| CUDA integer-logit gate, passed | **9562** | None | 2 min |
+| A2 ALL memory-safe PPO, succeeded | **9588** | Existing A2 BC **9474** | 30 min |
+| A2b LeJEPA two-epoch BC, succeeded | **9589** | Gate success | 30 min |
+| A2b LeJEPA PPO, canceled | **9590** | A2b BC success | 30 min |
+| A2 argmax / sampled panels, succeeded | **9591 / 9592** | A2 PPO success | 20 min each |
+| A2 carrot/tomato/egg sales, succeeded | **9593** | A2 PPO success | 10 min |
+| A2b argmax / sampled panels, skipped | **9594 / 9595** | A2b PPO success | 20 min each |
+| A2b carrot/tomato/egg sales, skipped | **9596** | A2b PPO success | 10 min |
+
+All jobs use normal priority and exclusive GPU admission. Commands and
+dependencies are recorded in
+`artifacts/probes/quantity-focus-20260924/campaign.json`. Both PPO arms use
+component ratios, minibatch 4096 and default Inductor update compilation
+without CUDA graph capture, avoiding A2's earlier first-update OOM. The
+previous entity-architecture percentage chain **9567–9571** was
+canceled/skipped before start because it would confound the quantity comparison
+with an actor-family change.
+
+**A2 low-money tail diagnostic.** The matched 256-game sampled BC panels show
+an A2 v27 median of $38,115 versus $17,638 for the categorical LeJEPA control,
+but 42 versus 6 games finish below $1,000. A2's first ten critic-only PPO
+waves have median money p10 about $444; waves 38–47 rise to about $7,392.
+This establishes a fragile sampled BC start, not a permanently weak PPO tail.
+Head-intervention probes **9606** (A2) and **9607** (categorical) completed
+128 paired v27 games each with argmax, quantity-only sampling, no-quantity
+sampling, and all-head sampling. A2's below-$1,000 counts are **0, 2, 24,
+19** respectively; its money p10 is **$62,553, $53,437, $79, $68**. Thus
+quantity sampling alone produces a strong, mostly robust actor, while
+sampling units and kinds creates the low-money tail even with argmax
+quantities. The categorical control has **1, 0, 2, 5** below-$1,000 games
+under the same four modes. Large legal-maximum buys are associated with A2
+failures in both no-quantity and all-sampled modes; this is not evidence that
+the ALL quantity atom causes those failures. A2's max-buy hypothesis is
+rejected as the primary explanation. In no-quantity sampling, the 24
+low-money games average 105 buy and 87 sell orders, versus 137 buy and 133
+sell orders in the remaining games. The all-sampled low-money games average
+101 buy and 79 sell orders, versus 134 and 128 otherwise. This reduced
+activity is consistent with disrupted market timing or production, but does
+not isolate STOP from unit moves. Each probe used a two-minute cap and
+normal-priority exclusive admission; per-game and market-order traces are in
+`artifacts/probes/quantity-tail-20260924/`. A2 unit-only, kind-only,
+unit+quantity and kind+quantity split **9626** used 128 matched games and a
+two-minute cap to locate which other head drives the tail.
+That split completed: unit-only, kind-only, unit+quantity, and kind+quantity
+sampling produced **8, 7, 8, 11** below-$1,000 games, with v27 score rates
+**0.508, 0.727, 0.461, 0.641**. Unit sampling hurts score more than kind
+sampling in this A2 BC actor, while the two heads together produce 24
+low-money games. The failure is an interaction, not a market-only or
+unit-only defect. Keep A4 and A6 conditional on more focused diagnosis.
+Two-minute diagnostic **9636** repeats the split with per-game unit PASS,
+MOVE, PICKUP, PLANT, WATER and HARVEST counts and active-unit fractions, plus
+nonSTOP orders per turn and SELL/HIRE fractions, to
+locate which activity collapses before choosing a structural decoder.
+Probe **9636** completed. Unit-only sampling averages PASS on **19.6%** of
+active unit decisions, HARVEST on **4.23%**, 0.725 nonSTOP market orders per
+turn, and a **10.5%** SELL fraction. Kind-only sampling gives **18.2%**,
+**4.95%**, **0.779**, and **11.9%**. These are means of per-game fractions;
+the paired unit-minus-kind score difference is **−0.219** (exploratory
+bootstrap 95% **[−0.328,−0.109]**). Within the eight unit-only low-money
+games, PASS averages **26.9%**, HARVEST **1.43%**, nonSTOP orders **0.542**
+per turn, and SELL **6.5%**. The seven kind-only low-money games have the
+same qualitative loss of farming and sales. Thus low-money episodes show
+production and market activity collapsing together; the aggregate data
+do not prove that move direction, PASS, or STOP is the first bad decision.
+The simple market STOP calibration arm remains deferred. Next unit work
+should audit the first divergent unit decision on paired seeds before a
+target-tile pointer or verb factorization receives a BC slot.
+
+A2 PPO **9588** completed successfully at wave 68. Its internal fixed panel
+score improved from 0.8008 at initialization to 0.8242 at wave 50, and
+rollout money p10 median rose from $444 in waves 1–10 to $11,129 in waves
+54–63. Paired endpoint panels **9591/9592** completed: argmax score improved
+0.9844 → 0.9902 overall, with a paired 95% score interval crossing zero;
+sampled score improved **0.5957 → 0.6504**, paired difference **+0.0547**
+with exploratory 95% interval **[+0.0156,+0.0938]**. Sampled v27 money p10
+rose **$165 → $8,498**, and games below $1,000 fell **42 → 6** in 256 seeds.
+This is a clear within-A2 PPO winner. The promoted immutable A2 reference is
+`artifacts/promoted/quantity-all-ppo-20260924.pt`, SHA-256
+`c6814f2532b8d5d553cea21d063e3d070bb2fa190035b084533ec64da7258824`.
+Use it for later A2-derived runs; keep the independently initialized A2b/A2c
+arms matched for their interface comparison. A2 PPO is not yet a clear winner
+over the prior categorical PPO, which scored 0.6562 sampled overall on its
+historical panel.
+The 64-game sampled self-play sales audit **9593** recorded 58 carrot units,
+5 tomato units and 0 egg units across 128 A2 PPO trajectories. Thus PPO has
+some carrot/tomato trades but has not found the large new-rule trade volume,
+and egg remains absent. Matched A2 BC sales audit **9627** completed with
+**139 carrot, 2 tomato and 0 egg units** across the same 128 sampled
+trajectories. The PPO panel therefore sold fewer carrots and only three more
+tomatoes in raw total; it did not discover the desired three-product trade.
+These are paired-seed aggregate totals, not a significance claim. Keep the
+score promotion separate from the resource-trading objective.
+
+A2b BC **9589** completed two epochs. Holdout quantity NLL is **0.18469**,
+versus **0.00435** for matched A2 ALL. Unit NLL is 0.00215 versus 0.00188,
+and kind NLL is 0.00412 versus 0.00345. Quantity decisions are only about
+4% of active decisions, so the quantity gap explains nearly all of the
+overall NLL difference (0.00977 versus 0.00223). The compact fraction head
+is substantially harder to fit to the script in two epochs. More specifically,
+its logistic scale has a hard minimum of 0.02 of the legal range. Across the
+full 512-seat BC corpus, 32,734 of 170,348 quantified decisions (19.2%)
+target neither 1, 2, 3 nor the legal maximum. Numerically optimizing
+location and scale **separately for each such target**, while respecting the
+0.02 floor, gives a quantity NLL floor near **0.1656** averaged over all
+quantity decisions. The observed 0.1847 is already close to that optimistic
+oracle; longer training is unlikely to close the gap to ALL under this
+parameterization. This is a numerical oracle, not a formal analytic bound,
+but the code-imposed scale minimum explains most of the measured quantity
+fit gap. The calculation is reproducible with
+`artifacts/probes/quantity-focus-20260924/quantity_floor_oracle.py` and its
+JSON result in that directory. Exact integer parity passed, and the BC
+losses alone cannot establish whether sampled gameplay or PPO learning is
+worse. Keep the outcome panels as the gate.
+The A2b PPO run **9590** has begun. Its fixed initialization panel score is
+0.4727, versus A2 ALL's 0.8008 on the matched internal panel. This is an
+early closed-loop warning consistent with the broad fraction quantity head;
+the first ten PPO waves update only the critic, so treat the later actor-wave
+trajectory and paired panels as the outcome comparison.
+At wave 1, A2b's sampled market STOP share is 0.712 and sell share 0.051,
+versus A2 ALL's 0.580 and 0.106, while mean executed quantity is similar
+(5.33 versus 5.14). The immediate weakness therefore includes when and
+whether to sell, not just how many units each order specifies. These are
+different BC fits sharing a trunk; the comparison does not isolate a direct
+quantity-to-kind causal effect.
+**A2b is rejected.** The user canceled PPO **9590** after iteration 66; its
+dependent panels **9594–9596** were skipped. The first critic-only rollout had
+money mean/median/p90 **$3,899/$50/$4,739**, versus A2 ALL's
+**$64,153/$62,787/$140,650**. Its STOP/SELL/HIRE order fractions were
+**0.712/0.051/0.113**, versus ALL's **0.580/0.106/0.203**; unit PASS/HARVEST
+were **0.299/0.019**, versus **0.191/0.041**. This is an economically broken
+sampled BC initializer even though unit and kind teacher-forced accuracies
+exceed 99.8%. At actor wave 50 the fixed-panel score was 0.500, up from
+0.4727 but still well below ALL's 0.8242; its terminal-money recovery is not
+enough evidence to promote it. Keep the canceled checkpoint for diagnosis,
+not as a run parent. Matched head-intervention probe **9628** used a
+two-minute cap to determine whether fraction sampling alone causes the
+collapse or requires unit/kind sampling as well.
+That probe completed on 128 paired v27 seeds. Percentage BC argmax has
+**0.805** score, **$84,106** median money, and 2 below-$1,000 games.
+Sampling **only quantity** collapses to **0.016** score, **$37** median, and
+**96** below-$1,000 games; all-head sampling gives **0.008**, **$56**, and
+**108**. On the same seeds, ALL BC quantity-only sampling has **0.898** score
+and just 2 low-money games. Percentage quantity-only sampling raises
+legal-maximum buys from 11.1 to 28.6 per game; buys at a legal maximum of at
+least five rise from 1.07 to 6.32. Sell orders fall from 150.0 to 47.2 per
+game. The quantity-only money is lower than argmax in 124/128 paired games,
+with mean paired difference **−$76,212** (exploratory bootstrap 95% interval
+**[−$81,523,−$70,701]**). This directly establishes that quantity sampling
+is sufficient to cause the percentage arm's economic collapse. The scale
+floor explains most of its teacher-forced quantity NLL; A2c's sampled panel
+will test whether narrowing it also fixes the observed full-game failure.
+
+**Pre-PPO closed-loop gate for new action interfaces.** Finish the matched
+two-epoch BC and a paired sampled full-game panel against the promoted ALL
+BC before queueing PPO. Record mean, median, p10 and p90 final money, score,
+and fraction of games below $1,000, paired by seed and seat. Reject an arm
+whose sampled mean, median, or p10 money is below half of matched ALL BC;
+whose below-$1,000 fraction exceeds the control by more than five percentage
+points; or whose sampled score drops by more than five percentage points,
+unless a specific controlled head intervention shows a recoverable decoding
+choice. Also inspect STOP/SELL/HIRE, unit PASS/HARVEST, and legal-maximum
+buys in a rollout diagnostic before PPO; the paired outcome-panel schema
+does not contain these action fractions.
+Teacher-forced NLL and argmax wins cannot override a failed sampled-game gate.
+Use this gate on A2c after jobs **9633/9634**; do not automatically queue PPO.
+
+**A2c narrow-scale fraction arm:** version the fraction head so its minimum
+scale is 0.001, and keep the four atoms, seven trainable outputs,
+initialization, and exact integer mass contract. Existing interface-4
+checkpoints retain their 0.02 floor.
+The same per-target numerical oracle on the full corpus
+drops from NLL 0.1656 at scale floor 0.02 to 0.00033 at floor 0.001,
+so this intervention directly removes the identified expressivity ceiling.
+The isolated source snapshot is
+`artifacts/source-snapshots/9ca98babc31354706ac4584ce6d3a040217ae0d1490382f85c3e289c3c1455ee`.
+Fourteen CPU tests covering Torch/NumPy parity and Rust sample/select integer
+log-probability parity for both floors passed against its isolated native
+build; `cargo check` and release build passed. Independent review found no
+static blocker. CUDA parity gate **9617** has a two-minute hard cap; matched
+two-epoch LeJEPA BC **9618** depends on gate success and has a 30-minute cap.
+CUDA gate **9617** succeeded with six tests in 1.49 seconds of test time.
+Paired 128-seed argmax/sampled BC panels **9633/9634** depend on BC success,
+each with a two-minute cap; the older 256-seed, five-minute-cap jobs
+**9619/9620** were canceled before starting. All use normal-priority
+exclusive admission.
+Commands and immutable source are in
+`artifacts/probes/quantity-narrow-20260924/campaign.json`. Compare this arm
+with interface 4 and A2 ALL using the same seeds. Queue PPO only if closed-loop
+BC merits it; per-cap NLL is a diagnostic of the corrected floor. Gate job
+**9635**, dependent on sampled panel **9634**, writes the explicit per-opponent
+money/score decision to `artifacts/probes/quantity-narrow-20260924/gate.json`.
+
+Matched two-epoch A2c BC job **9618** succeeded. Holdout quantity NLL is
+**0.05780** and quantity argmax accuracy **98.798%**, versus 0.18469 and
+97.602% for A2b percentage BC. ALL BC remains stronger at 0.00435 and
+99.953%. The lower scale floor fixes a substantial fit defect but leaves a
+material gap. The paired sampled-game gate, not fit alone, decides on PPO.
+Initial panel jobs **9633/9634** failed at artifact import before any games:
+the evaluator loaded the live package, whose config does not include isolated
+interface 5. Corrected jobs **9643/9644** set `PYTHONPATH` to the frozen
+source and passed an explicit import smoke check; dependent gate **9645**
+replaces the skipped **9635**. All retain two-minute caps.
+
+Corrected paired panels **9643/9644** succeeded. A2c narrow-scale BC is
+better than A2b percentage BC under sampled play, but fails the A2 ALL
+control decisively. Against scripted v27, argmax score is **0.211** versus
+ALL **0.977**, with **27/128** versus **0/128** money-below-$1,000 games.
+Sampled score is **0.023** versus ALL **0.336**, with **59/128** versus
+**19/128** low-money games. Against starter, sampled score is **0.734** versus
+ALL **0.891** and low-money games **24/128** versus **8/128**. No A2c PPO
+will run. Two-minute head-intervention probe **9652** is queued to separate
+residual quantity sampling from unit/kind drift in this arm.
+The explicit paired gate **9645** completed and returned `passes=false` for
+both starter and scripted v27; its p10/median/low-money checks all reject
+promotion. See `artifacts/probes/quantity-narrow-20260924/gate.json`.
+Head intervention **9652** completed on 128 paired v27 seeds. A2c argmax
+score/low-money games were **0.211/27**; sampling only quantities yielded
+**0.211/24**. Sampling unit and kind while keeping quantity greedy yielded
+**0.016/55**, and sampling all heads yielded **0.023/59**. Thus, after the
+scale fix, quantity stochasticity is no longer the dominant failure. The
+greedy policy is already poor, and unit/kind sampling creates the sampled
+tail. A2d's inherited frozen ALL unit/kind/trunk directly tests this drift.
+
+**A2d quantity-head transplant, conditional on A2c:** If the corrected
+fraction head still fails the sampled-game gate despite a much lower quantity
+NLL, isolate representation drift by starting from the promoted A2 PPO
+trunk/unit/kind weights, replacing only its categorical quantity head with
+the narrow fraction head, and distilling the parent's exact executed-integer
+distribution on the same teacher and on-policy states. Freeze the inherited
+heads during the first fit. Compare the transplanted head with the unchanged
+parent on paired argmax and sampled full games before any PPO. This is a
+controlled head test, not a fresh architecture claim; measure p10 and
+maximum buys explicitly. A2c failed that gate, so this arm is active.
+The shape change is limited to `market_quantity_value.weight` (101×32 to
+7×32) and `market_quantity_bias` (22×101 to 22×7); copy and strictly verify
+all other actor tensors. Distill KL over the **masked executed-integer**
+distribution, not raw head parameters, on teacher and promoted-policy
+on-policy prefixes. Track KL by kind and legal maximum. A dedicated script
+must also preserve the LeJEPA objective state if its result will warm-start
+PPO; standard BC/PPO loaders do not perform this migration automatically.
+The isolated implementation is
+`artifacts/probes/quantity-transplant-20260924/distill.py`. CPU checks verified
+strict tensor migration, exact KL/gradients on a real encoded row, and loading
+all 60 parent objective tensors. Independent review found no launch blocker
+after adding bounded fit/evaluation reserves, positive-step checks, and KL
+breakdowns by market kind and legal maximum. Distillation **9655** is queued
+with a 30-minute hard cap and a 25-minute internal cap; paired 128-seed
+argmax/sampled panels **9656/9657** depend on its success, each capped at two
+minutes. A partial fit or incomplete holdout evaluation cannot support
+promotion even if a checkpoint is saved.
+Initial job **9655** failed before training because the rollout stores
+`unit_active` among action factors rather than observation states. The
+staging code now reads that factor explicitly; a real two-game CPU native
+rollout produced 1,438 valid rows and 440 active quantity decisions. The
+corrected distillation **9664** is queued with the same 30-minute cap;
+dependent paired panels **9665/9666** replace skipped **9656/9657**.
+When two unrelated CleanRL jobs left ample GPU memory and utilization low,
+**9664** was admitted through `mlq` with `maxParallelRuns=3`; it remains
+subject to the same 30-minute cap and is monitored for contention.
+Job **9664** succeeded in 61.5 seconds, completing both epochs and all
+diagnostics (1,560 optimizer steps). Exact masked integer KL against the A2
+parent is **0.220** on 31,939 teacher-holdout quantity decisions and **0.613**
+on 8,455 sampled-parent on-policy decisions; on-policy quantity argmax
+disagreement is **13.2%**. This is a substantial remaining distribution gap,
+not promotion evidence. Paired game panels **9665/9666** were queued as the
+outcome gate.
+The first paired panel jobs **9665/9666** failed before gameplay because the
+distilled artifact omitted mandatory `seed_usage`. Its on-policy collection
+also used seed 8,200,000 outside the repository's reserved domains. The
+script now validates inherited BC/RL exposure, uses online-RL seeds
+20,400,000–20,400,031, and writes the combined provenance. Corrected
+two-epoch distillation **9668** is queued with the same 30-minute cap;
+paired two-minute panels **9669/9670** depend on it. The earlier artifact
+is retained only as a diagnostic and cannot be promoted.
+Corrected **9668** completed both epochs with valid reserved seed usage and
+complete diagnostics (teacher/on-policy masked quantity KL **0.216/0.626**).
+Paired panels **9669/9670** reject A2d: against v27, argmax score falls
+**0.984 → 0.000** from promoted ALL PPO to A2d, and sampled score falls
+**0.297 → 0.000**. Against starter, argmax mean money falls about
+**$153,960 → $13,538**. All nonquantity actor tensors are exact copies, so
+the quantity head alone is sufficient to cause this failure. Do not queue
+PPO or promote A2d. Paired 128-seed executed-order traces **9671/9672**
+are queued to identify which amounts cause the economic collapse.
+Those traces completed. On seed 4,501,008, the first greedy order is
+`BUY_PRODUCT_WHEAT` with legal maximum 95 for both actors, but ALL PPO buys
+**14** and A2d buys **40** (sampled A2d **42**). The next cow/sheep legal
+maxima immediately fall from the parent's **6/4** to **4/2**. Across the
+128 greedy games, A2d makes **46.1** sell orders/game versus parent
+**173.6**, and **75.6** buy orders versus **158.9**. This is an early budget
+error and downstream market collapse, not merely sampling noise. Future
+quantity heads must pass a paired early-order amount/affordability gate,
+especially for high-cap buys, before any PPO queue.
 
 ### 4.3 Other action candidates and stop gates
 
-- **A2 ALL:** Its BC argmax panel was promising, but PPO failed at the first
-  update with CUDA OOM. Retry jobs 9518–9524 were canceled at the user's
-  request. Keep it as a control for A2b; do not restart that PPO campaign while
-  C1 and A2b run.
+- **A2 ALL history:** Its first PPO failed at the first update with CUDA OOM.
+  Retry jobs 9518–9524 were canceled during the earlier causal priority. The
+  memory-safe retry **9588** succeeded and its sampled endpoint panel earned
+  within-A2 promotion; see section 4.2.
 - **A1 path relabel:** The market-order relabel failed exact engine-equivalence
   checks and is excluded. Build a path-only corpus only after full native
   trajectory replay proves identical next states; then compare to a fresh
@@ -571,23 +891,282 @@ NLL alone cannot promote an arm.
   sampled and 0% for argmax. Kinds-only remains at 0%, so unit exploration is
   useful while sampled market kinds are the clearer harm. The old numerical
   A4 gate is satisfied, but its premise that unit departures are damaging is
-  not. Reassess A4 after C1/A2b; require an exact factor likelihood and native
-  first-step mapping before queueing BC. Movement remains a discrete grid
-  decision, even if a pointer selects a distant target.
+  not. Reassess A4 after the quantity comparison. A pointer would replace primitive move
+  choices with latent target tiles while retaining the engine's 68 primitive
+  actions. BC must marginalize over every target that compiles to the teacher's
+  first move; PPO must either store the selected latent target or use the
+  corresponding engine-action marginal in both behavior and replay. The target
+  mask must permit adjacent locked tiles because the engine permits transit
+  through them. Require exact Python/Rust target-to-first-step, sequential
+  ledger and likelihood parity over locked transit, two-axis paths and shared
+  targets before queueing BC. Movement remains a discrete grid decision, even
+  if a pointer selects a distant target.
+- **A5 conditional market STOP gate, deferred after A2 split 9626:** The current
+  22-way kind choice makes STOP probability depend on the masked set of legal
+  nonSTOP kinds. A separate Bernoulli continue decision followed by a masked
+  nonSTOP kind choice can calibrate order timing while preserving ordered slots,
+  repeated kinds, sequential ledger legality and exact engine-action
+  likelihood. Initialize its gate logit from the old masked nonSTOP logsumexp
+  minus STOP logit; zero learned residual exactly reproduces the promoted A2
+  distribution. Trainable calibration is the ablation. BC targets are the
+  existing STOP versus nonSTOP decisions; PPO can store one combined market
+  slot log probability. Require Torch/NumPy/Rust sample and selected-logprob
+  parity, native teacher-action replay, and a matched sampled BC panel before
+  PPO. Algebraically, a scalar gate residual is equivalent to shifting the
+  existing STOP logit: this is a calibration/optimization test, not a new
+  action distribution, and it does not prevent early STOP truncation. Do not
+  spend a BC/PPO slot on it: **9626** found both unit and kind contributions,
+  and no evidence yet singles out STOP calibration. A count-first
+  decoder is the structural option if early STOP truncation dominates; it
+  adds latent replay and infeasible-count questions, so do not mix it into A5.
+- **A6 count-first ordered market decoder, deferred:** Predict the
+  number of nonSTOP orders (0–10) once, then sample that many ordered kinds
+  and quantities under the existing sequential ledger. This preserves
+  teacher order and repeated kinds while removing independent early STOP
+  draws. The A2 split found a kind contribution but a stronger unit effect
+  on score, so isolate premature STOP before implementing this market-only
+  change. Store the sampled count as a latent action in PPO and include its
+  behavior and replay likelihood; when a sampled earlier order exhausts all
+  legal kinds, record both the requested count and forced termination. BC
+  uses the teacher's feasible count. Require exact ordered engine-action
+  identity, forced-termination cases, likelihood replay, and native parity
+  before BC. Do not queue until the market branch is specifically supported.
+- **A7 productive-work aliases, gated on corpus ambiguity audit:** Keep every
+  existing primitive unit action and add state-dependent `WORK_CROP` and
+  `WORK_ANIMAL` latent choices. Under the same sequential unit ledger, each
+  alias compiles to a productive local verb such as HARVEST, WATER, FEED,
+  CARE or COLLECT in a fixed priority justified against teacher states.
+  Merge alias and direct-action probability into the executed primitive's
+  exact likelihood for BC/PPO. This gives one learnable intent a stable
+  meaning across crop/animal states and may replace random PASS/movement
+  departures with useful work; direct primitives preserve coverage. First
+  measure how often each alias applies, how often candidate verbs conflict,
+  and teacher agreement with the proposed priority. Reject ambiguous
+  aliases rather than hard-coding an unmeasured order. If supported, require
+  Python/Rust selected-action, replay likelihood and sequential-ledger parity
+  before two-epoch BC and sampled full-game gate. Do not combine with a
+  movement pointer in the first comparison.
+
+  Initial CPU audit on eight teacher episode-seats (53,330 active unit
+  decisions) **rejects a naive crop alias**: among 10,829 teacher crop-work
+  choices, HARVEST→WATER→FERTILIZE matches 6,894 (63.7%); with multiple work
+  verbs legal it matches only 1,688/5,623 (30.0%). WATER-first improves to
+  9,241/10,829 (85.3%) but still misses 1,588, with wheat and strawberry
+  preferring opposite actions. A naive animal priority matches 6,940/7,508
+  (92.4%) teacher animal-work choices, including 4,726/5,294 (89.3%) in
+  ambiguous states. Teacher still PASSES at 2,044 crop and 1,251 animal work
+  opportunities and MOVES at 7,614/3,960, so an unconditional work bias is
+  unsafe. The best separate fixed priority for each crop agrees on 95.8% of
+  teacher crop-work choices, still missing state-dependent cases. Limit
+  follow-up to crop/state-aware rules or an animal-only alias
+  with a learned work decision, after a broader opportunity audit; no BC job
+  for the naive crop alias.
+- **A8 action-conditioned local affordances, follow-up to A7 audit:** Keep the
+  68 primitive actions and exact native masks. For each legal local verb,
+  derive a compact candidate-effect description from the unit, current tile,
+  inventory, crop/animal state, and time remaining. A shared scorer compares
+  that description with the unit decision state and adds a zero-initialized
+  residual to the verb logit. Leave PASS and movement logits untouched in
+  this first arm; consider a PASS residual conditioned on available work later.
+  The explicit candidate effects give local work a shared representation
+  across crops and animals without imposing the rejected fixed verb priority.
+  Initialize exactly to the promoted A2 ALL PPO actor. Its full checkpoint
+  includes the LeJEPA objective under `structured_dynamics`; transfer that
+  to the BC warm-start key `jepa_objective` with exact state verification.
+  Audit feature availability and
+  stale same-turn information, then require Torch/NumPy feature parity,
+  orientation parity, initial logit identity, and exact replayed 68-way
+  likelihood before two-epoch BC and sampled full-game gate. This is the
+  preferred local-action arm if the narrow quantity work finishes and the
+  action failures still matter; no training job is queued yet.
+  An isolated rank-16 scorer draft is at
+  `artifacts/probes/unit-affordance-20260924/source`. Review removed its
+  initial movement residual, added time remaining, and factorized scoring to
+  avoid a large action-effect tensor. The conditional PASS residual is
+  deferred.
+  The isolated PPO loader now permits only the `unit_affordance_scorer`
+  false-to-true config change and requires exactly six missing scorer weights;
+  both the A2 ALL BC artifact and the promoted A2 PPO checkpoint loaded on
+  CPU with exact actor and objective state verification.
+  A sixth CPU test compares official Python and native Rust structured tokens
+  for both seats with a nonzero scorer, verifies PASS/movement logits remain
+  unchanged, and checks native selected-action log probabilities against PPO
+  replay to 2e-4 absolute tolerance. All six tests and Ruff pass. A short
+  eager BF16 CUDA memory/latency gate **9667** is queued after A2d terminates,
+  with a two-minute cap and batch 4096. It compares a full actor policy
+  forward/backward against A2 but omits Inductor and the LeJEPA objective;
+  a pass is a memory screen, not a full PPO throughput result. No A8 training
+  is queued.
+  Gate **9667** passed but measured a cold baseline against a warm A8 call.
+  Corrected gate **9673** warms both variants at batch 4,096 with 16 active
+  units: eager BF16 policy forward/backward is **0.249 s** for A2 and
+  **0.258 s** for A8, with virtually identical peak extra allocation
+  (**8.573 GB** in both). This removes the dense-scorer memory concern;
+  Inductor and the LeJEPA objective still require a separate full-update
+  performance gate before a long PPO run.
+  A two-minute full PPO-loop smoke **9678** is queued from the promoted A2
+  PPO checkpoint with the opt-in scorer, eager rollout/update, two tiny
+  iterations, and no critic warmup. It checks loader/objective/replay/update
+  integration; its reduced workload is not an outcome comparison or Inductor
+  throughput claim. A production-size PPO run remains gated on this result.
+  Smoke attempts **9678/9679** failed CLI validation before training; the
+  corrected **9681** completed an eager full PPO update and exact replay
+  checks, then stopped at its intentionally tiny two-iteration limit before
+  the fresh critic met the actor-release gate. Production-shape A8 PPO
+  **9682** is queued from the promoted ALL PPO actor and transferred LeJEPA
+  objective, with disjoint online-RL seed 20,500,000, a 27-minute internal
+  runtime target, and a 30-minute hard cap. Its initial policy is exactly
+  the promoted ALL PPO parent; compare only released actor snapshots on
+  paired sampled games before any promotion.
+  Run **9682** reached actor wave 25 and its fixed panel score moved from
+  **0.82031 to 0.83594**, but a later compiled JEPA update failed at
+  iteration 45 when `plan.indices` widened to 2,560. This is a compiler
+  shape-guard failure, not evidence of action collapse. The immutable
+  iteration-35 checkpoint retains the actor, critic, optimizer, RNG, and
+  league archive. Recovery job **9686** resumes an explicitly recorded fork
+  from that checkpoint with eager updates and the compiled-only architecture
+  panel disabled; rollout collection and all action/model parameters stay
+  the same. It is exclusive with a 27-minute internal target and 30-minute
+  hard cap. A paired external panel is still required for any A8 promotion.
+  The fork provenance is preserved in
+  `runs/unit-affordance-20260924/ppo-eager-fork/fork_provenance.json`;
+  read source metrics through iteration 35 and fork metrics from 36 onward.
+  Review of the guard shows `structured_horizon_plan` creates a variable
+  number of eligible JEPA pairs per shuffled minibatch; the observed widths
+  512, 2,048, and 2,560 are legitimate. The compiled update assumes those
+  widths settle and aborts on a new bucket. This is unrelated to A8 action
+  logits. A future compiled fix may pad the plan to a fixed bucket while
+  preserving its eligible mask and source indices, but needs exact
+  loss/gradient checks and a two-minute 4,096-row memory gate before use.
+  The row minibatch is already padded to 4,096; the varying dimension is
+  eligible adjacent pairs inside the JEPA plan. Full batches usually need
+  about 2,048 pairs, but a shuffled run boundary can push the count into
+  the 2,560 bucket. A fixed per-batch plan capacity tied to the existing
+  `count` loop variable is the narrower proposed fix.
+  Two-minute endpoint job **9688** compares the promoted parent, A8 actor
+  wave 25, and final A8 actor on 128 new paired seeds per opponent with
+  sampled decoding. Two-minute sales job **9689** audits the final actor on
+  the parent's 64 self-play diagnostic seeds. Both wait for **9686**.
+  Recovery **9686** finished cleanly at iteration 95 in 27.3 minutes. The
+  first independent sampled panel **9688** rejects wave 25 (overall score
+  difference −0.0273) but favors final A8: score **0.6953 versus 0.6445**
+  for promoted ALL, paired difference **+0.0508** with exploratory 95%
+  interval **[0.0000,+0.1016]**; mean money difference **+$7,813** with
+  interval **[+$2,660,+$13,243]**. Both starter and v27 p10 improved.
+  Sales audit **9689** found final A8 **48 carrot, 6 tomato, 0 egg** units
+  versus matched parent's **58, 5, 0**; A8 is not a trio-trade solution.
+  Replication panel **9690** uses 256 new paired seeds per opponent and a
+  two-minute cap before deciding promotion.
+  Replication **9690** confirms final A8: overall sampled score **0.6816
+  versus 0.6445** (paired **+0.0371**, exploratory 95% interval
+  **[+0.0020,+0.0723]**) and mean money **+$6,740** (interval
+  **[+$2,903,+$10,711]**). Starter and v27 p10 both rise. Promote the
+  immutable final full checkpoint as
+  `artifacts/promoted/unit-affordance-ppo-20260924.pt`, SHA-256
+  `6d36c49bc7d1e694a6d027b5a67f55abd95e16e53310cc4779a419a275c0a9cd`.
+  Its embedded promotion record includes the eager fork provenance.
+  Future LeJEPA action ablations now initialize from this A8 checkpoint
+  with `unit_affordance_scorer=true`; keep ALL as the paired control.
+  The scorer and strict PPO objective warm-start path are ported to the
+  canonical source. A8 improves general outcome but is not a carrot/tomato/
+  egg-trade solution.
+  The promoted artifact retains the isolated training source identity. The
+  original paired panels used that source; canonical evaluation now has a
+  cross-tree witness, recorded in the A8 quantity follow-up below.
+  Warm-starting a fresh canonical run does not rewrite this history. A
+  source-locked submission export needs its own bundle validation.
+  The paired result promotes the **trained policy**, not a causal claim that
+  the scorer beats equal-duration continuation of ALL: A8 received further
+  PPO updates and no matched scorer-off continuation ran. Its scorer query
+  moved from zero to norm 0.305, showing it was learned, but the separate
+  architectural contribution is unresolved. Do not queue a redundant ALL
+  continuation merely to relabel this outcome gain as a mechanism win.
 - **P1 pickup amount:** Current pickup counts are discrete with maxima 16/8/4.
   Audit their opportunity and regret contribution first. Adapt the A2b integer
   mass head only if this is material; do not apply a raw continuous PPO density
   to a rounded pickup count.
 
+**2026-09-24 A8 quantity follow-up.** Keep the promoted A8 scorer and the
+categorical ALL market head. A factorwise intervention on 128 matched seeds per
+opponent first suggested that sampling unit and market-kind choices while taking
+greedy quantities improves sampled money. A fresh 256-seed-per-opponent
+replication with identical executable source and artifact confirmed it:
+`unit_kind` decoding scored **0.7168** against **0.6777** for all-head
+sampling, a paired **+0.0391** score difference (exploratory 95% interval
+**[+0.0176,+0.0625]**). Mean money increased **$2,451** (interval
+**[$884,$4,151]**). The gain was concentrated against scripted v27
+(+0.0742 score), while starter remained near saturation. These are the same
+trained weights and seeds; the changed choice rule is the intervention.
+`scripts/evaluate_architecture_campaign.py` now exposes `--decoding unit_kind`
+for this reproducible stochastic evaluation. This does not change the
+deterministic submission agent or PPO's temperature-1 behavior policy.
+
+Quantity-only sampling with greedy unit and kind choices on 128 matched seeds
+scored **0.9766** overall, versus **0.9922** for full argmax (paired
+**−0.0156**, interval **[−0.0313,−0.0039]**) and lost **$3,432** mean money.
+The amount head has a measurable sampling cost, but remains far stronger than
+the rejected fraction heads; most of the all-sampled loss comes from the other
+heads or their interaction. A new market amount representation has no outcome
+case from this evidence alone.
+
+The P1 audit covered 512 current-rules teacher episodes and 3,413,120 active
+unit decisions. Pickups were **67,580** decisions (1.98%); **60,383** selected
+amounts were below the legal maximum, mostly wheat and fertilizer. A separate
+64-game sampled A8 self-play audit (128 player trajectories) found **16,382**
+pickups, **14,775** below the legal maximum. A8's wheat and fertilizer amount
+histograms remain concentrated at small integers. This is not a paired
+teacher-policy comparison, but it shows A8 already executes the relevant
+nonmaximum amounts. Its local affordance scorer includes action identity,
+amount, held resource, and shed stock, so the existing categorical pickup
+actions can represent conditional amount preferences. No pickup-head rewrite
+is justified by frequency alone. Goose pickups had zero legal opportunities in
+this A8 panel; the absent egg trade is upstream of pickup quantity.
+
+The replication reports are
+`artifacts/probes/unit-affordance-20260924/a8-qdecode-replication-{sampled-matched-source,greedy-quantity}.json`;
+both record source identity `e24c45e00210cb0eb8608433f7cb76fc1c1f01657620518b3715cae984c0c7dd`.
+The first 128-seed `unit_kind` diagnostic injected that mode at invocation
+and its source manifest did not capture the injected code; use the 256-seed
+replication for the decision. The pickup reports are
+`pickup-amount-audit.json` and `a8-pickup-amount-onpolicy.json` in the same
+probe directory. The canonical and frozen A8 snapshots have byte-identical
+policy source (48 Python files) and native engine source (6 Rust files).
+Cross-tree attempt **9882** matched all 512 canonical game rows, but its
+Python import resolved to the editable canonical package despite running from
+the frozen directory. It is not a cross-tree witness. Corrected job **9886**
+set `PYTHONPATH` to the frozen snapshot's `src`; its recorded source identity
+`b491a032b3dd7fe72b7be54e8568937cdffd18d451cc62c4f73781fb0f95c4ce`
+equals the promoted artifact's. Against the canonical source on the same
+256 seeds per opponent, all **512** sampled game rows and summaries matched
+exactly. This witnesses canonical evaluation for this checkpoint and decode
+mode; submission bundle export remains a separate validation step.
+The paired decode jobs were **9858/9859** (discovery), **9866/9867/9874**
+(replication, including the source-matched repeat), **9860** (quantity-only),
+and **9872** (argmax); the pickup audits were **9863/9868** (teacher) and
+**9873/9881** (A8, with source-hash refresh). GPU evaluations used exclusive
+`mlq` jobs capped at two minutes.
+
 ### 4.4 Promotion and resource rule
 
-A clear winner in paired native outcome and relevant trade volume becomes the
-initializer/control for later action runs immediately; record the source and
-checkpoint digest. A one-seed argmax gain or held-out BC NLL gain alone is a
-screening result. Keep both decoding modes and the carrot/tomato/egg units in
-every market-related panel. Training jobs stop at 30 minutes; benchmarks stop
-at two minutes. Do not launch a new long run merely to obtain a benchmark
+Current LeJEPA action-run initializer is the promoted A8 full PPO checkpoint
+`artifacts/promoted/unit-affordance-ppo-20260924.pt` (SHA-256
+`6d36c49bc7d1e694a6d027b5a67f55abd95e16e53310cc4779a419a275c0a9cd`),
+with `unit_affordance_scorer=true`. Keep promoted quantity ALL as the fixed
+paired control for decoder claims; retain the A8 scorer in future action
+arms unless an ablation explicitly removes it.
+
+A clear winner in paired native outcome and its arm-specific behavior becomes
+the initializer for later action runs immediately; record the source and
+checkpoint digest. For market arms, behavior includes relevant trade volume.
+A one-seed argmax gain or held-out BC NLL gain alone is a screening result.
+Keep both decoding modes and the carrot/tomato/egg units in every
+market-related panel. Training jobs stop at 30 minutes; benchmarks stop at
+two minutes. Do not launch a new long run merely to obtain a benchmark
 number that would take longer to compile than to measure.
+
+### 4.5 Public teacher screen
+
+The publicly callable [Kaito v48 notebook](https://www.kaggle.com/code/kaitofukami/40-40-early-floor-39-46-top-10-v48-fast-routes) and [Boatlee V20 notebook](https://www.kaggle.com/code/boatlee/v20-adaptive-r1-multi-route-agent) have complete agent source and historical Kaggle scores, but no paired 1.32.7 result against our v16 teacher. Their route tapes schedule small carrot sales, with no regular tomato/egg sales; Kaito has a possible final-turn liquidation path for all three if stock remains. [Boatlee V16-RC5](https://www.kaggle.com/code/boatlee/v16-rc5-high-score-8c-4s-premium-market-lead) schedules no trio sales. The [island-GA repository](https://github.com/destbreso/kaggriculture-island-ga) includes price-aware code but withholds winning schedules. These are source-code observations, not executed trade counts. A candidate enters the teacher pool only after its public source runs under 1.32.7, beats v16 on paired seeds, and demonstrates executed trio trades. No replacement is promoted yet.
 
 ## 5. Biggest uncertainties
 
@@ -601,7 +1180,7 @@ number that would take longer to compile than to measure.
    but the teacher favors exact 1–3 and legal maximum. Explicit atoms and
    exact integer likelihood may still add complexity without improving play.
 4. **Timing uncertainty is untouched by quantity parameterization.** The largest departure flows (STOP versus
-   SELL_MILK/SELL_WOOL, PASS versus act) are when-to-act questions. If A0-12 already removes most
+   SELL_MILK/SELL_WOOL, PASS versus act) are when-to-act questions. If longer BC already removes most
    of them, interface gains will read small at BC.
 
 ## Appendix: reproducing the measurements
