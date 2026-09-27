@@ -1356,7 +1356,9 @@ class StructuredActor(nn.Module):
         self.market_kind = Linear(config.model_dim, N_MARKET_KINDS)
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
-        quantity_rows = 7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        quantity_rows = (
+            7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        )
         self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
         self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
         initialize_policy_heads(

@@ -25,7 +25,7 @@ def test_all_interface_is_opt_in_and_validated(config: type) -> None:
     assert config().action_interface == 1
     assert config(action_interface=2).action_interface == 2
     with pytest.raises(ValueError, match="action_interface"):
-        config(action_interface=4)
+        config(action_interface=5)
 
 
 def test_all_row_merges_into_legal_maximum_and_backpropagates() -> None:

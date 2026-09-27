@@ -3142,23 +3142,23 @@ fn score_percentage_quantities(
                 * head.values[row * head.rank + rank];
         }
     }
-    let maximum = mask.iter().rposition(|&legal| legal).map_or(1, |last| last + 1);
-    let scale = (1.0 + parameters[6].exp()).ln() + 0.02;
+    let maximum = mask
+        .iter()
+        .rposition(|&legal| legal)
+        .map_or(1, |last| last + 1);
+    let softplus = |value: f32| value.max(0.0) + (-value.abs()).exp().ln_1p();
+    let scale = softplus(parameters[6]) + 0.02;
     let location = 1.0 / (1.0 + (-parameters[5]).exp());
-    let log_sigmoid = |value: f32| -(1.0 + (-value).exp()).ln();
+    let log_sigmoid = |value: f32| -softplus(-value);
     let log_one_minus_exp = |delta: f32| (-(-delta).exp_m1()).ln();
     let high = (1.0 - location) / scale;
     let low = -location / scale;
-    let log_total = log_sigmoid(high)
-        + log_sigmoid(-low)
-        + log_one_minus_exp(1.0 / scale);
+    let log_total = log_sigmoid(high) + log_sigmoid(-low) + log_one_minus_exp(1.0 / scale);
     let delta = 1.0 / (maximum as f32 * scale);
     for (index, output_score) in output.iter_mut().enumerate() {
         let upper = ((index + 1) as f32 / maximum as f32 - location) / scale;
         let lower = (index as f32 / maximum as f32 - location) / scale;
-        let log_mass = log_sigmoid(upper)
-            + log_sigmoid(-lower)
-            + log_one_minus_exp(delta);
+        let log_mass = log_sigmoid(upper) + log_sigmoid(-lower) + log_one_minus_exp(delta);
         *output_score = parameters[4] + log_mass - log_total;
     }
     for (atom, amount) in [(0, 1), (1, 2), (2, 3), (3, maximum)] {

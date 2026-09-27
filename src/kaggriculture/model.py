@@ -743,10 +743,7 @@ def percentage_quantity_logits(parameters: Tensor, mask: Tensor) -> Tensor:
     result = parameters[..., 4:5] + log_mass - log_total
     for atom, destination in enumerate((1, 2, 3, 0)):
         amount = maximum if atom == 3 else torch.full_like(maximum, destination)
-        if atom != 3:
-            active = maximum >= destination
-        else:
-            active = mask.any(-1)
+        active = maximum >= destination if atom != 3 else mask.any(-1)
         index = (amount - 1).clamp(0, N_QUANTITIES - 1)[..., None]
         original = result.gather(-1, index)
         merged = torch.where(
@@ -783,7 +780,9 @@ class FarmActor(nn.Module):
         # learned interaction plus a fully expressive kind/quantity bias.
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
-        quantity_rows = 7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        quantity_rows = (
+            7 if config.action_interface == 4 else N_QUANTITIES + (config.action_interface == 2)
+        )
         self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
         self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
         self.register_buffer("board_positions", _board_positions(), persistent=False)

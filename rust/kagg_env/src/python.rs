@@ -1108,9 +1108,12 @@ impl BatchEnv {
         }
         let heads = head_shape[0];
         let quantity_rows = quantity_values.shape().get(1).copied().unwrap_or(0);
-        if quantity_rows != 7 && quantity_rows != MARKET_QUANTITIES && quantity_rows != MARKET_QUANTITIES + 1 {
+        if quantity_rows != 7
+            && quantity_rows != MARKET_QUANTITIES
+            && quantity_rows != MARKET_QUANTITIES + 1
+        {
             return Err(PyValueError::new_err(
-                "quantity_values must have 100 or 101 rows",
+                "quantity_values must have 7, 100, or 101 rows",
             ));
         }
         ensure_shape(
@@ -1369,9 +1372,12 @@ impl BatchEnv {
         }
         let heads = head_shape[0];
         let quantity_rows = quantity_values.shape().get(1).copied().unwrap_or(0);
-        if quantity_rows != 7 && quantity_rows != MARKET_QUANTITIES && quantity_rows != MARKET_QUANTITIES + 1 {
+        if quantity_rows != 7
+            && quantity_rows != MARKET_QUANTITIES
+            && quantity_rows != MARKET_QUANTITIES + 1
+        {
             return Err(PyValueError::new_err(
-                "quantity_values must have 100 or 101 rows",
+                "quantity_values must have 7, 100, or 101 rows",
             ));
         }
         ensure_shape(
