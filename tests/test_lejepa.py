@@ -2357,11 +2357,9 @@ def test_the_compiled_bf16_update_settles_and_a_slice_refresh_never_retraces() -
             config,
             # The auxiliary stream is held fixed across waves because it draws
             # the contiguous-run shuffle as well as the slice directions and the
-            # tile sample. A fresh shuffle moves the transition plan's source
-            # count between its eight compiled buckets, which is a legitimate
-            # recompilation and would confound the claim being made here. The
-            # buffers still refresh on every one of this wave's minibatches,
-            # which is what the claim is about.
+            # tile sample, keeping both waves' inputs comparable. The buffers
+            # still refresh on every one of this wave's minibatches, which is
+            # what the claim is about.
             generator=np.random.default_rng(70 + wave),
             auxiliary_generator=np.random.default_rng(80),
             **arms,

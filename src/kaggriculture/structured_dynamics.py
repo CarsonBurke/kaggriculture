@@ -295,8 +295,11 @@ def structured_horizon_plan(
 
     Eligibility is cumulative across every intervening step: a matching later
     endpoint cannot repair a broken recursive ancestry. Retain only sources
-    with a valid first edge. Eight aligned occupancy buckets per minibatch size
-    bound compiled shapes; all-false padding keeps zero-loss backward alive.
+    with a valid first edge. The plan always has one column per row: shuffled
+    runs that happen to continue each other make the eligible count vary from
+    minibatch to minibatch, and any count-dependent width eventually reaches a
+    shape a settled compiled update has never seen. All-false padding keeps
+    zero-loss backward alive.
     """
     if horizon < 1:
         raise ValueError("structured plan horizon must be positive")
@@ -314,13 +317,7 @@ def structured_horizon_plan(
     eligible = np.logical_and.accumulate(eligible, axis=0)
     sources = np.flatnonzero(eligible[0])
     count = sources.size
-    alignment = max(64, (1 << (step.size - 1).bit_length()) // 8)
-    bucket = max(alignment, ((count + alignment - 1) // alignment) * alignment)
-    # Use spare shape slots to split coarse buckets. Retaining every old boundary
-    # ensures padding never increases, while still allowing at most eight shapes.
-    spare_buckets = 8 - (step.size + alignment - 1) // alignment
-    if alignment > 64 and bucket <= spare_buckets * alignment and count <= bucket - alignment // 2:
-        bucket -= alignment // 2
+    bucket = step.size
     padded_sources = np.zeros(bucket, dtype=np.int64)
     padded_sources[:count] = sources
     indices = np.empty((1 + 2 * horizon, bucket), dtype=np.int64)

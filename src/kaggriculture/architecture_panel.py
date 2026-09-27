@@ -166,8 +166,17 @@ class ArchitecturePanelGuard:
         return copy.deepcopy(self.state)
 
 
-def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str, Any]:
+def evaluate_architecture_panel(
+    actor,
+    critic,
+    *,
+    compile_mode: str,
+    calibration_actor=None,
+) -> dict[str, Any]:
     """Native compiled BF16 strength plus V(s) calibration on unseen fixed seeds.
+
+    When deployment uses averaged weights, pass the live actor separately:
+    its critic must be calibrated on returns from its own sampled policy.
 
     Sampling generators are fixed, and the surrounding training RNG is restored.
     Each seed's learner seat is its parity, giving 32 games in each seat per
@@ -184,7 +193,9 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
     if device.type != "cuda" or not torch.cuda.is_bf16_supported() or compile_mode == "eager":
         raise ValueError("architecture panel requires compiled CUDA BF16")
     architecture = architecture_of_config(actor.config).name
+    calibration_actor = actor if calibration_actor is None else calibration_actor
     actor_training, critic_training = actor.training, critic.training
+    calibration_training = calibration_actor.training
     numpy_rng = np.random.get_state()
     panels = []
     targets_sum = targets_squared = residual_squared = 0.0
@@ -192,11 +203,11 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
     try:
         actor.eval()
         critic.eval()
+        calibration_actor.eval()
         with torch.random.fork_rng(devices=[device]), torch.no_grad():
             for mode in PANEL_POLICY["decoding"]:
                 for opponent in PANEL_POLICY["opponents"]:
-                    rollout = collect_mixed_play_rust(
-                        actor,
+                    collection = dict(
                         self_play_games=0,
                         league_games=PANEL_POLICY["games_per_opponent"],
                         builtin_lanes=(opponent,),
@@ -209,6 +220,7 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
                         forward_mode="inductor_graph",
                         forward_autocast=True,
                     )
+                    rollout = collect_mixed_play_rust(actor, **collection)
                     outcomes = terminal_outcomes(rollout).astype(np.float64)
                     expected_seeds = np.arange(
                         PANEL_POLICY["seed_start"], PANEL_POLICY["seed_start"] + len(outcomes)
@@ -221,12 +233,26 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
                     ):
                         raise ValueError("architecture panel collector violated its fixed protocol")
                     if mode == PANEL_POLICY["calibration_decoding"]:
+                        calibration = (
+                            rollout
+                            if calibration_actor is actor
+                            else collect_mixed_play_rust(calibration_actor, **collection)
+                        )
+                        terminal_outcomes(calibration)
+                        if (
+                            calibration.valid.shape != rollout.valid.shape
+                            or not np.all(calibration.valid)
+                            or not np.array_equal(calibration.episode_seeds, expected_seeds)
+                            or not np.array_equal(calibration.seats, expected_seeds % 2)
+                            or not calibration.learner_stochastic
+                        ):
+                            raise ValueError("critic calibration violated its live-policy protocol")
                         staged = {
                             name: _stage_tensor(value, device)
-                            for name, value in rollout.states.items()
+                            for name, value in calibration.states.items()
                         }
                         staged |= {
-                            name: _stage_tensor(getattr(rollout, name), device)
+                            name: _stage_tensor(getattr(calibration, name), device)
                             for name in ("unit_active", "unit_actions")
                         }
                         values = (
@@ -239,19 +265,20 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
                             )
                             .cpu()
                             .numpy()
-                            .reshape(rollout.valid.shape)
+                            .reshape(calibration.valid.shape)
                             .astype(np.float64)
                         )
                         if not np.isfinite(values).all():
                             raise FloatingPointError(
                                 "architecture panel critic predictions are nonfinite"
                             )
-                        targets = np.broadcast_to(outcomes[:, None], values.shape)
+                        paid = calibration.rewards[:, -1].astype(np.float64)
+                        targets = np.broadcast_to(paid[:, None], values.shape)
                         state_count += values.size
                         targets_sum += float(targets.sum())
                         targets_squared += float(np.square(targets).sum())
                         residual_squared += float(np.square(values - targets).sum())
-                        del staged, values, targets
+                        del staged, values, targets, calibration
                     panels.append(
                         {
                             "decoding": mode,
@@ -267,6 +294,7 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
         np.random.set_state(numpy_rng)
         actor.train(actor_training)
         critic.train(critic_training)
+        calibration_actor.train(calibration_training)
     total_variation = targets_squared - targets_sum * targets_sum / state_count
     return {
         "score_rate": float(np.mean([panel["score_rate"] for panel in panels])),
@@ -275,5 +303,6 @@ def evaluate_architecture_panel(actor, critic, *, compile_mode: str) -> dict[str
         ),
         "critic_mse": residual_squared / state_count,
         "critic_states": state_count,
+        "critic_policy": "live" if calibration_actor is not actor else "deployment",
         "panels": panels,
     }

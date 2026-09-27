@@ -198,7 +198,10 @@ def test_panel_milestones_commit_and_culled_resume_cannot_restart(monkeypatch, t
 
 
 @pytest.mark.parametrize("invalid", [False, True])
-def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch, invalid):
+@pytest.mark.parametrize("separate_live_actor", [False, True])
+def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(
+    monkeypatch, invalid, separate_live_actor
+):
     from types import SimpleNamespace
 
     import numpy as np
@@ -224,14 +227,16 @@ def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch
             self.training = value
 
     actor, critic = Network(True), Network(False)
+    live_actor = Network(True) if separate_live_actor else actor
     collected, replayed = [], []
     fork_rng = torch.random.fork_rng
     monkeypatch.setattr(torch.random, "fork_rng", lambda devices: fork_rng(devices=[]))
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
 
-    def collect(*args, **kwargs):
+    def collect(policy, **kwargs):
         assert not torch.is_grad_enabled()
         assert not actor.training and not critic.training
+        assert not live_actor.training
         assert kwargs["self_play_games"] == 0
         assert kwargs["league_games"] == 64
         assert kwargs["forward_mode"] == "inductor_graph"
@@ -242,6 +247,9 @@ def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch
         torch.rand(1)
         rewards = np.zeros((64, 719), dtype=np.float32)
         rewards[:, -1] = 1 if kwargs["deterministic"] else np.tile([-1, 1], 32)
+        if separate_live_actor and policy is live_actor:
+            # This policy loses every game; deployment's sampled policy does not.
+            rewards[:, -1] = -1
         if invalid:
             rewards[0, -1] = np.nan
         seeds = np.arange(kwargs["seed_start"], kwargs["seed_start"] + 64)
@@ -261,7 +269,7 @@ def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch
         assert not collected[-1]["deterministic"]
         assert kwargs["compile_mode"] == "default" and kwargs["autocast_enabled"]
         replayed.append(1)
-        return torch.zeros(64 * 719)
+        return torch.full((64 * 719,), -1.0) if separate_live_actor else torch.zeros(64 * 719)
 
     monkeypatch.setattr(rollout_module, "collect_mixed_play_rust", collect)
     monkeypatch.setattr(ppo, "_stage_tensor", lambda array, device: torch.from_numpy(array))
@@ -269,14 +277,19 @@ def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch
     numpy_state, torch_state = np.random.get_state(), torch.get_rng_state().clone()
     if invalid:
         with pytest.raises(ValueError, match="native terminal outcomes"):
-            evaluate_architecture_panel(actor, critic, compile_mode="default")
+            evaluate_architecture_panel(
+                actor, critic, compile_mode="default", calibration_actor=live_actor
+            )
     else:
-        result = evaluate_architecture_panel(actor, critic, compile_mode="default")
+        result = evaluate_architecture_panel(
+            actor, critic, compile_mode="default", calibration_actor=live_actor
+        )
         assert result["score_rate"] == 0.75
-        assert result["monte_carlo_r_squared"] == 0.0
-        assert result["critic_mse"] == 1.0
+        assert result["monte_carlo_r_squared"] == (None if separate_live_actor else 0.0)
+        assert result["critic_mse"] == (0.0 if separate_live_actor else 1.0)
+        assert result["critic_policy"] == ("live" if separate_live_actor else "deployment")
         assert result["critic_states"] == 2 * 64 * 719
-        assert len(collected) == 4 and len(replayed) == 2
+        assert len(collected) == (6 if separate_live_actor else 4) and len(replayed) == 2
         assert {call["builtin_lanes"] for call in collected} == {("starter",), ("scripted-v27",)}
         assert len({call["sampling_seed"] for call in collected}) == 1
     observed_numpy = np.random.get_state()
@@ -284,3 +297,4 @@ def test_fixed_panel_protocol_rng_modes_and_sampled_only_calibration(monkeypatch
     np.testing.assert_array_equal(observed_numpy[1], numpy_state[1])
     torch.testing.assert_close(torch.get_rng_state(), torch_state)
     assert actor.training is True and critic.training is False
+    assert live_actor.training is True
