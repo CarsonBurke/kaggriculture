@@ -1056,7 +1056,7 @@ def _load_initial_actor(
     device: torch.device,
     objective: torch.nn.Module | None = None,
 ) -> dict[str, object]:
-    """Initialize a fresh run's actor from a pretrained artifact (BC warm start).
+    """Initialize a fresh run's actor from a pretrained actor artifact.
 
     The artifact must carry the same actor configuration; critic-only fields
     may differ. The critic and both optimizers deliberately start fresh —
@@ -1064,12 +1064,10 @@ def _load_initial_actor(
     the archive with the pretrained policy automatically, so the learner must keep
     beating its own starting point.
 
-    A `lejepa` clone also carries the `JepaObjective` its backbone was trained
-    beside, and it is loaded into `objective`: the projector and the predictor
-    are one model with the backbone, and fresh ones would spend the critic
-    warmup relearning what the clone already fitted, then pull the released
-    backbone toward whatever embedding they had settled on. Only the reward head
-    is still untrained, since a demonstration has no reward.
+    A `lejepa` artifact also carries the `JepaObjective` its backbone was
+    trained beside, and it is loaded into `objective`: the projector and the
+    predictor are one model with the backbone. A BC artifact stores it as
+    `jepa_objective`; a full PPO checkpoint stores it as `structured_dynamics`.
     """
     pretrained, payload = load_actor_artifact(path, device)
     artifact_architecture = resolve_architecture(payload)
@@ -1079,10 +1077,30 @@ def _load_initial_actor(
         artifact_architecture.build_config(payload["model_config"])
     )
     expected_config = actor_model_config(model_config)
-    if artifact_config != expected_config:
+    affordance_upgrade = (
+        architecture_name == "lejepa"
+        and expected_config.get("unit_affordance_scorer") is True
+        and artifact_config.get("unit_affordance_scorer") is False
+        and {**expected_config, "unit_affordance_scorer": False} == artifact_config
+    )
+    if artifact_config != expected_config and not affordance_upgrade:
         raise ValueError("initial actor artifact model configuration does not match arguments")
-    actor.load_state_dict(pretrained.state_dict())
-    load_artifact_objective(payload, objective)
+    incompatible = actor.load_state_dict(pretrained.state_dict(), strict=not affordance_upgrade)
+    if affordance_upgrade:
+        scorer = actor.unit_affordance
+        if scorer is None or set(incompatible.missing_keys) != {
+            f"unit_affordance.{key}" for key in scorer.state_dict()
+        } or incompatible.unexpected_keys:
+            raise ValueError("affordance warm start has unexpected state-dict differences")
+        if torch.count_nonzero(scorer.query.weight).item() != 0:
+            raise ValueError("affordance warm start did not preserve zero residual")
+    if architecture_name == "lejepa" and "jepa_objective" not in payload:
+        stored_objective = payload.get("structured_dynamics")
+        if not isinstance(stored_objective, dict) or not stored_objective:
+            raise ValueError("LeJEPA PPO warm start has no saved objective")
+        load_artifact_objective({**payload, "jepa_objective": stored_objective}, objective)
+    else:
+        load_artifact_objective(payload, objective)
     return {
         "path": str(path.resolve()),
         "sha256": file_sha256(path),

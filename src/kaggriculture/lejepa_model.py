@@ -85,7 +85,8 @@ from dataclasses import dataclass, replace
 import torch
 from torch import Tensor, nn
 
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.actions import N_UNIT_ACTIONS, UnitAction
+from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS, PRIVATE_ITEMS
 from kaggriculture.entity import EntityActor, EntityConfig, EntityTrunk
 from kaggriculture.model import (
     ActorOutput,
@@ -110,6 +111,7 @@ from kaggriculture.tokens import (
     ANIMAL_TOKEN_FIELDS,
     CROP_TOKEN_FIELDS,
     PRODUCT_TOKEN_FIELDS,
+    TILE_CONTINUOUS_FIELDS,
     TILE_COUNT,
 )
 
@@ -177,6 +179,9 @@ class LejepaConfig(EntityConfig):
     critic_private_layers: int = 1
     #: The entity family's critic readout feed-forward, on by default here.
     critic_readout_ffn: bool = True
+    # A8: score each primitive against its destination/current tile and the
+    # resource it changes. Zero-initialized query preserves a loaded A2 actor.
+    unit_affordance_scorer: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -299,6 +304,104 @@ class _ReadoutRound(nn.Module):
         return torch.where(valid, self.ffn_gate(tokens, self.ffn(self.ffn_norm(tokens))), 0.0)
 
 
+class _UnitAffordanceScorer(nn.Module):
+    """A low-rank local-effect residual over the existing primitive logits.
+
+    It reads only the acting seat's observation. Masks and sequential shed/tile
+    effects stay with the native selector; this scorer never claims an action is
+    legal. The unit query is zero at initialization, preserving A2 exactly.
+    """
+
+    def __init__(self, model_dim: int, rank: int = 16) -> None:
+        super().__init__()
+        self.query = Linear(model_dim, rank, bias=False)
+        nn.init.zeros_(self.query.weight)
+        self.tile_kind = nn.Embedding(6, rank)
+        self.tile_occupant = nn.Embedding(9, rank)
+        self.tile_continuous = Linear(len(TILE_CONTINUOUS_FIELDS), rank, bias=False)
+        self.action = nn.Embedding(N_UNIT_ACTIONS, rank)
+        self.resource = Linear(5, rank, bias=False)
+        self.rank = rank
+
+        item = [0] * N_UNIT_ACTIONS
+        has_item = [False] * N_UNIT_ACTIONS
+        amount = [0.0] * N_UNIT_ACTIONS
+        for first, count, item_index in (
+            (6, 16, 0),
+            (22, 8, 8),
+            (30, 4, 9),
+            (34, 4, 10),
+            (38, 4, 11),
+        ):
+            for quantity in range(count):
+                action_id = first + quantity
+                item[action_id] = item_index
+                has_item[action_id] = True
+                amount[action_id] = (quantity + 1) / 16.0
+        for action_id, item_index in ((42, 9), (43, 10), (44, 11)):
+            item[action_id] = item_index
+            has_item[action_id] = True
+            amount[action_id] = 1.0 / 16.0
+        for item_index in range(9):
+            action_id = 59 + item_index
+            item[action_id] = item_index
+            has_item[action_id] = True
+        self.register_buffer("item", torch.tensor(item), persistent=False)
+        self.register_buffer("has_item", torch.tensor(has_item), persistent=False)
+        self.register_buffer("amount", torch.tensor(amount), persistent=False)
+        self.register_buffer(
+            "crop", torch.tensor([min(4, max(0, a - 45)) for a in range(N_UNIT_ACTIONS)]),
+            persistent=False,
+        )
+        self.register_buffer(
+            "is_plant",
+            torch.tensor([45 <= a <= 49 for a in range(N_UNIT_ACTIONS)]),
+            persistent=False,
+        )
+
+    def forward(self, units: Tensor, inputs: StructuredInputs) -> Tensor:
+        _, count, _ = units.shape
+        # Own-farm tokens lead the two-farm observation. Only local verbs get
+        # a residual; movement remains under the original policy head.
+        own_kind = inputs.tile_categorical[:, :TILE_COUNT, 0]
+        own_occupant = inputs.tile_categorical[:, :TILE_COUNT, 1]
+        own_features = inputs.tile_continuous[:, :TILE_COUNT].float()
+        tiles = (
+            self.tile_kind(own_kind)
+            + self.tile_occupant(own_occupant)
+            + self.tile_continuous(own_features)
+        )
+        here = tiles.gather(
+            1, inputs.unit_tile_gather[..., 0, None].expand(-1, -1, self.rank)
+        )
+        here = torch.where(inputs.unit_tile_gather_valid[..., 0, None], here, 0.0)
+
+        # Product and animal shed stock are observable private fields; seeds
+        # are a separate crop family. These are turn-start amounts. Subsequent
+        # selected actions change the selector ledger and its legality masks.
+        held = inputs.unit_continuous[..., : len(PRIVATE_ITEMS)].index_select(2, self.item)
+        held = held * self.has_item.to(held.dtype)
+        shed = torch.cat((inputs.products[..., 3], inputs.animals[..., 1]), dim=1)
+        shed = shed.index_select(1, self.item)[:, None, :].expand(-1, count, -1)
+        shed = shed * self.has_item.to(shed.dtype)
+        seed = inputs.crops[..., 1].index_select(1, self.crop)[:, None, :]
+        seed = seed.expand(-1, count, -1) * self.is_plant.to(seed.dtype)
+        query = self.query(units)
+        tile_score = (query * here).sum(dim=-1, keepdim=True)
+        action_score = torch.einsum("bur,ar->bua", query, self.action.weight)
+        coefficients = torch.nn.functional.linear(query, self.resource.weight.T)
+        resource_score = (
+            coefficients[..., 0, None] * held.float()
+            + coefficients[..., 1, None] * shed.float()
+            + coefficients[..., 2, None] * seed.float()
+            + coefficients[..., 3, None] * self.amount[None, None, :]
+            + coefficients[..., 4, None] * inputs.town[:, None, 3, None].float()
+        )
+        score = (tile_score + action_score + resource_score) * (self.rank**-0.5)
+        local_verb = torch.arange(N_UNIT_ACTIONS, device=score.device) >= int(UnitAction.DROP)
+        return torch.where(inputs.unit_active[..., None] & local_verb, score, 0.0)
+
+
 class LejepaActor(EntityActor):
     """Entity actor whose trunk is the shared world model its policy also shapes.
 
@@ -328,6 +431,9 @@ class LejepaActor(EntityActor):
         # `initialize_policy_heads` scales every readout below for one that is.
         self.unit_readout_norm = RMSNorm(config.model_dim) if layers else None
         self.market_readout_norm = RMSNorm(config.model_dim) if layers else None
+        self.unit_affordance = (
+            _UnitAffordanceScorer(config.model_dim) if config.unit_affordance_scorer else None
+        )
 
     def backbone_parameters(self):
         """The world model's parameters, which the actor's optimizer must not own."""
@@ -346,13 +452,13 @@ class LejepaActor(EntityActor):
 
     def forward_with_belief(self, inputs: StructuredInputs) -> tuple[ActorOutput, JepaBelief]:
         belief = self.encode_belief(inputs)
-        return self.decode_belief(belief, inputs.unit_active), belief
+        return self.decode_belief(belief, inputs.unit_active, inputs), belief
 
     def forward_with_auxiliary_belief(
         self, inputs: StructuredInputs
     ) -> tuple[ActorOutput, JepaBelief]:
         belief = self.auxiliary_belief(inputs)
-        return self.decode_belief(belief, inputs.unit_active), belief
+        return self.decode_belief(belief, inputs.unit_active, inputs), belief
 
     def _read(
         self, units: Tensor, markets: Tensor, belief: JepaBelief, unit_active: Tensor
@@ -380,7 +486,9 @@ class LejepaActor(EntityActor):
         units, markets = decisions.split((MAX_UNITS, MAX_MARKET_ORDERS), dim=1)
         return self.unit_readout_norm(units), self.market_readout_norm(markets)
 
-    def decode_belief(self, belief: JepaBelief, unit_active: Tensor) -> ActorOutput:
+    def decode_belief(
+        self, belief: JepaBelief, unit_active: Tensor, inputs: StructuredInputs | None = None
+    ) -> ActorOutput:
         """Read the belief through the heads, attached unless the config detaches.
 
         This is the single point that decides whether the policy's gradient
@@ -402,8 +510,13 @@ class LejepaActor(EntityActor):
         markets = self.market_norm(belief.market_decisions)
         if self.readout:
             units, markets = self._read(units, markets, belief, unit_active)
+        unit_logits = self.unit_head[-1](units)
+        if self.unit_affordance is not None:
+            if inputs is None:
+                raise ValueError("unit affordance scorer needs the policy observation")
+            unit_logits = unit_logits + self.unit_affordance(units, inputs).to(unit_logits.dtype)
         return ActorOutput(
-            unit_logits=self.unit_head[-1](units).contiguous(),
+            unit_logits=unit_logits.contiguous(),
             market_kind_logits=self.market_kind(markets).contiguous(),
             market_quantity_context=self.market_quantity_context(markets).contiguous(),
         )
