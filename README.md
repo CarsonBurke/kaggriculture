@@ -2,8 +2,9 @@
 
 Research and evaluation tooling for the Kaggriculture simulation competition.
 
-Production training is BC-initialized self-play PPO with DAPO's asymmetric clip
-band, terminal win/loss/draw rewards, and separate actor/critic GAE traces. A fresh
+Production training is BC-initialized self-play PPO on the `lejepa` family with
+DAPO's asymmetric clip band, terminal win/loss/draw rewards, and Monte Carlo
+credit for both actor and critic (GAE lambda 1 on both, still separate knobs). A fresh
 production run must load one behavior-cloned actor, then fits its fresh critic
 for at least ten iterations and until every member's previous fresh-wave
 pre-update Monte Carlo-return R-squared reaches 0.10. Only an existing
@@ -11,7 +12,9 @@ checkpoint can bypass that initialization. An exact batched Rust simulator suppl
 high-throughput rollouts; the pinned Kaggle environment remains the parity
 oracle and final evaluator.
 
-The default critic uses categorical HL-Gauss cross-entropy with 255 linearly
+The production `lejepa` critic is the exact win/draw/loss classifier
+(`--wdl-value`, `LejepaConfig.wdl_value`); every other family's default, and
+`lejepa` with `--wdl-value false`, uses categorical HL-Gauss cross-entropy with 255 linearly
 spaced, exactly mirrored bins on `[-2.2, 2.2]`, tail-stable Gaussian mass
 calculations, FP32 capped logits, and a paired expectation reduction.
 `--value-sigma-ratio` tunes Gaussian sigma in bin widths (default `3.0`,
@@ -27,7 +30,14 @@ performance, not raw cross-entropy across smoothing settings: the interior
 label-entropy floor rises from about `1.2003` to `2.5222` nats for those ratios.
 The categorical arm uses neither symlog nor a critic EMA.
 
-The production model family is **`entity-attention`**, with width **96** for both
+The production model family is **`lejepa`** ([LeJEPA world model](#lejepa-world-model)):
+one `entity-attention` trunk, described next, shared by actor and critic and trained
+by its world-model objective beside the policy's loss. Its defaults are the promoted
+core -- schema v4, every market quantity choice (`--action-interface 2`), the local unit
+affordance scorer, unit target navigation, market resource conditioning, the critic
+readout FFN and the WDL critic -- which the adopted PPO recipe was measured on.
+
+The `entity-attention` trunk has width **96** for both
 encoded memory and entities. Two shared-weight local transformer blocks encode
 each 100-tile farm independently. Exactly **26 persistent states**—16 unit slots
 and ten market-order slots—perform four rounds of self-attention, static-memory
@@ -50,8 +60,8 @@ states and all valid source-memory tokens by default, bypassing the entity-only
 value bottleneck. Its normalized `[B, 1, 96]` output feeds the HL-Gauss head and the existing
 critic NextLat target. The default readout has no extra FFN, query residual shortcut,
 or persistent core token. Residual zero-initialization does not zero this standalone readout.
-Actor and critic share no parameters. Every attention layer in this production
-family, including critic NextLat, uses GQA, except the explicit BiXT cross-attention
+In the `entity-attention` family actor and critic share no parameters. Every attention
+layer in that family, including critic NextLat, uses GQA, except the explicit BiXT cross-attention
 ablation below; configurations with equal query/KV head counts are rejected.
 
 Selectable entity architecture flags are available. Production
@@ -109,11 +119,11 @@ ledger, using cached on-device generation and parallel teacher forcing.
 1, 24, 96 and 384 steps while the value head remains state-only. Its control is
 the same economic trunk without forecasting heads.
 
-`--architecture lejepa` is a fourth opt-in family: a single `entity-attention`
-trunk shared by the actor and the critic and trained by nothing but an
-attached-target world-model objective, and read through private rounds of
-cross-attention by both the actor's decision slots and the critic's tower. It
-is described in full under
+`--architecture lejepa`, the production family and the default architecture of
+`train_ppo.py`, is a single `entity-attention` trunk shared by the actor and the
+critic, trained by an attached-target world-model objective and the policy's loss,
+and read through private rounds of cross-attention by both the actor's decision
+slots and the critic's tower. It is described in full under
 [LeJEPA world model](#lejepa-world-model) below.
 
 `scripts/queue_structural_campaign.py` freezes full-budget comparisons with
@@ -168,8 +178,9 @@ and selects distinct opponents with the lowest recent posterior learner score.
 One lane refreshes stale/uncertain evidence. When unseen opponents remain, a
 separate discovery lane first admits untested built-ins, then the newest untested
 snapshot. This prevents a large stale archive from starving new strategies;
-older unseen snapshots remain eligible for refresh. With eleven lanes, nine
-remain for known hardness while discovery is needed, otherwise ten. One- and
+older unseen snapshots remain eligible for refresh. With the production twelve
+lanes (two active, six historical, four built-in), ten remain for known hardness
+while discovery is needed, otherwise eleven. One- and
 two-lane budgets rotate exploration purposes deterministically across waves.
 Beta(1,1) shrinkage handles sparse evidence, exact ties are randomized, and
 effective game counts decay by 0.98 per learner wave. Games remain evenly
@@ -548,11 +559,13 @@ of 70-126k sampled, and its objective is healthier, not weaker: motion 0.44 vs
 0.17 at the same dispersion.
 
 The encoder steps **exactly when the policy does**, on the same minibatch and at
-the actor's learning rate unless `--structured-learning-rate` sets the world
-model's apart. Every `lejepa` PPO run sets it to a tenth of the actor's, 1.5e-5
-(`JEPA_BACKBONE_LEARNING_RATE`): at the full rate the encoder moves under both
-gradients every minibatch, and the slower backbone beat the full-rate run on the
-same clone (JEPA_RUNS, 9281 vs 9275). The heads read it, so every encoder step is a policy step
+the rate `--structured-learning-rate` sets for the world model. A `lejepa` launch
+defaults it to 1.5e-5 (`LEJEPA_PPO_DEFAULTS` in `ppo.py`), a tenth of the former
+1.5e-4 actor rate: at the full rate the encoder moves under both gradients every
+minibatch, and the slower backbone beat the full-rate run on the same clone
+(JEPA_RUNS, 9281 vs 9275). The objective's weights default the same way, to
+prediction 1.0 and SIGReg 0.09 with the reward head off; every other family
+defaults to no objective and to the actor's rate. The heads read it, so every encoder step is a policy step
 whether or not the actor's optimizer took one: a
 minibatch after a KL stop that moved the encoder would move the policy past the
 trust region that had just refused to. After a KL stop, through the critic's
@@ -758,9 +771,8 @@ over owned unit/order entries; market-kind and quantity decisions share their
 order's advantage. All predictions use the same team return target, with primary
 critic loss averaged over active global/entity slots within each state. Global
 critic diagnostics and critic NextLat retain the global value representation.
-This experiment requires both GAE lambdas to be one and component ratio scope:
-pass `--actor-gae-lambda 1` explicitly to override the promoted VAPO default.
-It cannot be combined with a shorter actor trace or joint ratios.
+This experiment requires both GAE lambdas to be one, the default, and component
+ratio scope. It cannot be combined with a shorter actor trace or joint ratios.
 
 PPO has no patch, economy, or opponent-state prediction objectives. Its actor
 predictor reads unit/market head-input representations and actions; its critic
@@ -893,29 +905,41 @@ separately rounded binary32 bank telemetry, which can turn close wins into ties.
 Credit diagnostics use the stored terminal outcome, without potential correction.
 Explicit `--reward-mode shaped` and `--reward-mode terminal-bank` remain available.
 
-The promoted VAPO temporal defaults are `--gamma 1`,
-`--actor-gae-lambda 0.972183588317107`, and `--critic-gae-lambda 1`.
-The actor value is `1 - 1 / (0.05 * 719)`, using VAPO's alpha `0.05` and the
-full game's 719 transitions. It is fixed for this game, not adapted per batch.
+The temporal defaults are `--gamma 1`, `--actor-gae-lambda 1`, and
+`--critic-gae-lambda 1`. The critic fits full, undiscounted Monte Carlo returns:
+the default target at every valid state is the terminal win/loss/draw outcome.
+With explicit shaped reward, the target is instead `U[T] - P[t]`. The actor's
+advantage is the same return less the critic's baseline. Collection shaping,
+advantages, and value targets share gamma. HL-Gauss targets outside categorical
+support saturate at the outer atom, with the saturated fraction reported.
 
-The critic fits full, undiscounted Monte Carlo returns: the default target at
-every valid state is the terminal win/loss/draw outcome. With explicit shaped
-reward, the target is instead `U[T] - P[t]`. Actor advantages use a shorter GAE
-trace, with geometric weight sum approximately 35.95 transitions,
-to reduce variance while relying on the critic for longer-term value. This is
-not a 36-turn planning cutoff; inaccurate critic predictions can bias the actor.
-Collection shaping, advantages, and value targets share gamma. Targets outside
-categorical support saturate at the outer atom, with the saturated fraction
-reported.
+The actor lambda was VAPO's `1 - 1 / (0.05 * 719)` = 0.972 until 2026-09-27: a
+trace with geometric weight sum near 36 transitions, trading variance for the
+critic's bias. Fine-tuning the eight-epoch WDL clone, whose critic reaches only
+0.10-0.23 Monte Carlo R-squared, every 0.972 arm collapsed after the clone (zero
+argmax wins against V27 at wave 50) while lambda 1 beat the clone itself 0.992
+argmax at the same wave (`artifacts/probes/ppo-ablations-20260927`). Pass
+`--actor-gae-lambda 0.972183588317107` to reproduce the former trace.
 
 The temporal settings were first promoted from dense-reward trial **7010**.
 The user subsequently selected **7122**, the HL-Gauss VAPO terminal-outcome LR3
 trial, as the new production default: terminal win/loss/draw reward and tripled
 actor/critic rates, retaining HL-Gauss, component PPO clipping/KL,
 and the existing auxiliary recipe. The later entity-attention architecture
-promotion is separate. This adopts VAPO's temporal settings, not
+promotion is separate. This adopted VAPO's temporal settings, not
 every component of its training recipe. New launches inherit the new defaults;
 explicit overrides and previously frozen commands retain their declared settings.
+
+The current recipe is the September 27 staged PPO ablations' adopted arm
+(`artifacts/probes/ppo-stage2-20260927`, `lambda-1-actor-lr-5e-5`; stage three
+confirmed keeping the JEPA objective): `lejepa` from a BC clone, actor lambda 1,
+actor LR 5e-5, backbone LR 1.5e-5, minibatch 4096 with retained update
+activations, 128 self-play plus 64 league games with four built-in lanes, and the
+architecture panel every 25 actor-active waves. A plain `train_ppo.py` launch that
+states only its run directory, clone, budget and seed resolves to exactly that
+command, and `build_training_command` emits it in full.
+`scripts/queue_core_campaign.py` still states every flag, because it launches
+frozen source snapshots whose defaults predate these.
 
 The default trust region is `target_kl = 0.03` on the active-component mean KL.
 Its historical calibration does not establish the stopping frequency after
@@ -923,8 +947,9 @@ changing rewards and auxiliary balance; measure accepted minibatches explicitly.
 
 Entropy is measured but not optimized. The main actor objective is clipped PPO;
 production leaves the actor future-policy auxiliary off unless explicitly enabled.
-The critic jointly optimizes one-step latent and decoded-value prediction
-auxiliaries. Production uses one learner with 128 self-play games and 64 league games per wave (320
+The production critic has no auxiliary objective: critic NextLat is off by
+default, and the `lejepa` world-model objective is mutually exclusive with the
+detached NextLat terms. Production uses one learner with 128 self-play games and 64 league games per wave (320
 learner trajectories). Stale matchup evidence for built-ins and snapshots decays
 toward 0.5 alike, so formerly easy opponents can become contested again.
 
@@ -969,13 +994,33 @@ Schema v4 appends `money_margin` to each farm token: that farm's signed
 `log1p` money minus the other farm's, unscaled and rounded once from float64.
 The absolute `money` feature (`/12`) is staged in fp16 and cast to bf16 under
 autocast, which leaves roughly 5% resolution on a late-game bank; the margin is
-near zero exactly when a game is close, where floating point is finest. v3 and
-v4 coexist: both tokenizers always emit the v4 layout, and each model's
-`observation_schema_version` selects the farm-token prefix its embedder reads,
-so v3 artifacts load and act unchanged. Fresh LeJEPA model configs default to
-v4; production entity and the other structured families continue to default to
-v3. Override a fresh run with `--observation-schema-version` when making an
-explicit schema comparison.
+near zero exactly when a game is close, where floating point is finest.
+
+Schema v5 appends `shop_<NAME>_first_unlock` to the town token for each shop:
+one plus the index of that shop's first instance in the town's unlock order,
+over eight, or zero while it is locked. The per-shop counts are a multiset and
+cannot say which shop opened first; with them, the ranks recover the order of
+the distinct shops, which opening-keyed demand plans read (the `demand-advance4`
+bot routes on its first two unlocked shops, and most of its routes differ from
+the swapped pair's).
+
+Schema v6 prices held stock. Each product token appends `held_value`: the exact
+coins selling every unit of it the seat holds (shed and hands) would bank, one
+unit at a time down the price curve as each sale restocks the market, over a full
+shed at the top base price (25,000). Each farm token appends `liquidation`, money
+plus those proceeds on the `money` scale -- the engine's liquidation value and
+the shaping potential's input -- and `liquidation_margin`, its float64 signed
+`log1p` ratio to the other row's. Held stock is private, so the opponent row's
+liquidation is its money alone; the centralized critic reads the opponent's own
+`held_value` as the private `opponent_held_value` column.
+
+v3 through v6 coexist: both tokenizers always emit the v6 layout, and each
+model's `observation_schema_version` selects the product-, farm- and town-token
+prefixes its embedder reads (and a critic's private product prefix), so v3, v4
+and v5 artifacts load and act unchanged. Fresh LeJEPA
+model configs, production's, default to v4; `entity-attention` and the other
+structured families continue to default to v3. Override a fresh run with
+`--observation-schema-version` when making an explicit schema comparison.
 
 Python action helpers and inference use the default shed capacity of100.
 `CheckpointAgent.__call__(observation, configuration)` and the generated submission
@@ -1029,13 +1074,18 @@ float64 and uses strict intervals. Rounding fallback selects only positive mass;
 selected log-probabilities come from logits and the normalizer, without flooring
 underflowed probabilities.
 
-Actor and critic trunk base learning rates both default to `1.5e-4` (NorMuon
-matrices), with `5.25e-5` for their ordinary Adam parameter groups. Production
+The actor trunk's base learning rate defaults to `5e-5` and the critic's to
+`1.5e-4` (NorMuon matrices), with `0.35` times each for their ordinary Adam
+parameter groups. At the former shared `1.5e-4` every Monte Carlo arm peaked
+against its clone by wave 50 and then drifted; `5e-5` held 0.936 argmax against
+the clone at the thirty-minute endpoint against 0.68
+(`artifacts/probes/ppo-stage2-20260927`). Production
 and the direct training CLI default the separate value-head Adam LR to `4.375e-4`, preserving
 its `25/3` boost over ordinary Adam groups. The raw training CLI accepts
 `--critic-head-lr` as an optional absolute override. Each group retains its own
 32-optimizer-step linear LR warmup and checkpointed state. NextLat predictors
-inherit their corresponding actor/critic base rate unless explicitly overridden.
+inherit their corresponding actor/critic base rate unless explicitly overridden;
+the `lejepa` world model and backbone default to their own 1.5e-5.
 Embedding weights are assigned to Adam by module ownership, including tied
 weights; direct learned latent/opponent/value queries also use Adam. Hidden
 projection matrices remain on NorMuon. This corrects older structured-model
@@ -1074,15 +1124,18 @@ epsilon to nonzero momentum norms. Small PPO momenta therefore retain the same
 normalization as larger copies, up to floating-point error. Its tensors are
 float32; multiplication accuracy still follows the process-wide matmul setting.
 
-The default physical minibatch ceiling is **7936**: a complete 230080-state
-production wave uses **29 fixed-shape minibatches**, with no dropped states or
-gradient accumulation: 28 full batches and 7872 genuine rows in the last batch;
-its remaining 64 rows have zero loss/gradient weight. The earlier 8192 ceiling
-produced the same 29 minibatches with a 7488-row padded tail -- 3.2% of every
-update's forward/backward computed for nothing -- and a final optimizer step
-averaged over only 704 states. The step count, learning rates, objectives, and
-precision are unchanged; the D96 VRAM headroom the 8192 ceiling retained grows.
-A matched six-repeat probe measured
+The default physical minibatch ceiling is **4096**, the size every measured
+LeJEPA recipe ran and the one the promoted actor rate was calibrated at: a
+complete 230080-state production wave uses **57 fixed-shape minibatches**, with no
+dropped states or gradient accumulation: 56 full batches and 704 genuine rows in
+the last; its remaining 3392 rows have zero loss/gradient weight. With the update
+retaining its farm activations (`--no-rematerialize-actor-update`, the `lejepa`
+default; every other family keeps replay, its memory without it unmeasured)
+the production update peaks at 17.2 GiB and runs 0.36 s per wave faster than
+replaying them; 16384 rows do not fit the device
+(`artifacts/probes/ppo-speed-20260927`). The former entity-attention ceiling was
+7936, chosen for a 64-row padded tail over 29 minibatches. For that family, a
+matched six-repeat probe measured
 steady whole-iteration medians of 10.952 s at 6400 versus 11.196 s at 8192,
 with peak live memory 16.33 versus 19.99 GiB. All intended updates completed.
 Larger batches reduce optimizer steps per wave (36 to 29 here) and change gradient
@@ -1100,7 +1153,10 @@ materially improved for 100 actor-active waves. An absolute score increase of
 Critic MSE uses sampled-policy panel returns and remains defined when every
 game has the same outcome; MC R-squared is also reported when target variance
 is nonzero. The guard, best evaluated checkpoint and panel policy persist on
-resume. This option defaults off and cannot be combined with `--autocull`.
+resume. It defaults to every 25 actor-active waves for a single learner and off
+for a population or with `--autocull`, which it cannot be combined with. It
+requires CUDA, a compiled update, terminal-outcome and gamma 1, so it also defaults
+off wherever one of those is missing; an explicit interval there is refused.
 
 Raw `train_ppo.py --autocull` optionally enables a single-learner online-proxy
 plateau guard. Frozen-actor waves do not count. After 20 actor-active warmup
