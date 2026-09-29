@@ -21,7 +21,6 @@ evaluations/
 .DS_Store
 
 # Local git worktrees for parallel experiment branches
-worktrees/
 .worktrees/
 
 # Cargo build tree for the native env extension
