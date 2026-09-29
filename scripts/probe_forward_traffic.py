@@ -34,10 +34,13 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from kaggriculture.ppo import PpoConfig, _critic_batch_args, actor_forward_args
-from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import ENTITY_ATTENTION, resolve_architecture
 from kaggriculture.rollout import _state_field_specs
 from kaggriculture.tokens import MAX_UNITS
+
+# The call sites below name the entity-attention forward; production's `lejepa`
+# wraps that trunk in heads this probe does not attribute.
+PROBED_ARCHITECTURE = ENTITY_ATTENTION
 
 #: Call sites worth separating. Each is a module path prefix inside the trunk;
 #: an operator is charged to the longest prefix that is currently on the stack,
@@ -203,7 +206,7 @@ def _states(rows: int) -> dict[str, np.ndarray]:
     """
     states = {
         name: np.zeros((rows, *shape), dtype=dtype)
-        for name, (shape, dtype) in _state_field_specs(PRODUCTION_ARCHITECTURE).items()
+        for name, (shape, dtype) in _state_field_specs(PROBED_ARCHITECTURE).items()
     }
     states["unit_active"] = np.ones((rows, MAX_UNITS), dtype=np.bool_)
     return states
@@ -233,8 +236,8 @@ def main() -> None:
     parser.add_argument("--report", type=argparse.FileType("w"))
     arguments = parser.parse_args()
 
-    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
-    config = architecture.build_config(production_model_config())
+    architecture = resolve_architecture(PROBED_ARCHITECTURE)
+    config = architecture.config_class()
     dtype = getattr(torch, arguments.dtype)
     # Built at the target dtype rather than converted into it: under
     # `FakeTensorMode` a later `Module.to` cannot swap parameter storage.

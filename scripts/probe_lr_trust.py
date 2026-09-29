@@ -47,7 +47,7 @@ from kaggriculture.production import (
     PRODUCTION_UPDATE_COMPILE_MODE,
     production_ppo_config,
 )
-from kaggriculture.registry import pair_towers, resolve_architecture
+from kaggriculture.registry import LEJEPA, pair_towers, resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, collect_self_play_rust
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
@@ -117,7 +117,17 @@ def main() -> None:
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if not isinstance(state, dict):
         raise ValueError("learning-rate probe checkpoint payload must be a mapping")
-    schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
+    # The probe replays NextLat predictors; the `lejepa` world-model objective,
+    # on by default for that family, has no replay path here.
+    if resolve_architecture(state["architecture"]).name == LEJEPA:
+        raise ValueError("this probe does not replay a lejepa checkpoint's world-model objective")
+    schedule = dict(
+        production_ppo_config(
+            update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+            architecture=resolve_architecture(state["architecture"]).name,
+            critic_architecture=state["model_config"].get("critic_architecture"),
+        )
+    )
     production_config = PpoConfig(**schedule)
     member_state, saved_auxiliary_rng = _auxiliary_recovery(state, production_config)
     warmup_minimum, warmup_complete, previous_r_squared = _validate_critic_warmup_state(

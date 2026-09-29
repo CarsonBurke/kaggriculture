@@ -74,7 +74,7 @@ from kaggriculture.production import (
     PRODUCTION_UPDATE_COMPILE_MODE,
     production_ppo_config,
 )
-from kaggriculture.registry import pair_towers, resolve_architecture
+from kaggriculture.registry import LEJEPA, pair_towers, resolve_architecture
 from kaggriculture.rollout import collect_mixed_play_rust, slice_trajectories
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.training import checkpoint_agent_states, require_checkpoint_format
@@ -202,6 +202,10 @@ def main() -> None:
     device = torch.device("cuda")
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     require_checkpoint_format(state)
+    # The probe replays NextLat predictors; the `lejepa` world-model objective,
+    # on by default for that family, has no replay path here.
+    if resolve_architecture(state["architecture"]).name == LEJEPA:
+        raise ValueError("this probe does not replay a lejepa checkpoint's world-model objective")
     member_state = checkpoint_agent_states(state)[0]
     warmup_minimum, saved_warmup_complete, saved_previous_r_squared = _validate_critic_warmup_state(
         state.get("initial_actor"), population=len(checkpoint_agent_states(state))
@@ -228,7 +232,13 @@ def main() -> None:
     pair_towers(actor, critic)
     actor.load_state_dict(member_state["actor"])
     critic.load_state_dict(member_state["critic"])
-    schedule = dict(production_ppo_config(update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE))
+    schedule = dict(
+        production_ppo_config(
+            update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+            architecture=entry.name,
+            critic_architecture=getattr(model_config, "critic_architecture", None),
+        )
+    )
 
     opponents = []
     if args.snapshot_lanes:

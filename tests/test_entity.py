@@ -835,7 +835,9 @@ def test_ppo_and_three_head_actor_and_critic_nextlat_combined_compiled_backward(
     actor_dynamics = ActorDynamics(config).cuda().train()
     critic_dynamics = StructuredCriticDynamics(config).cuda().train()
     torch.nn.init.normal_(critic.value_head.weight, std=0.02)
-    ppo = PpoConfig(**production_ppo_config(update_compile_mode="default"))
+    ppo = PpoConfig(
+        **production_ppo_config(update_compile_mode="default", architecture=ENTITY_ATTENTION)
+    )
     rows = inputs.unit_active.shape[0]
     advantages = torch.linspace(-1, 1, rows, device="cuda")
     value_targets = torch.linspace(-0.5, 0.5, rows, device="cuda")
@@ -1039,7 +1041,9 @@ def test_native_full_horizon_ppo_replay_and_update(config, native_rollout, compi
     assert rollout.valid.shape == (6, 719) and rollout.valid.all()
     assert rollout.state_count == 6 * 719
     ppo = replace(
-        PpoConfig(**production_ppo_config(update_compile_mode=compile_mode)),
+        PpoConfig(
+            **production_ppo_config(update_compile_mode=compile_mode, architecture=ENTITY_ATTENTION)
+        ),
         minibatch_size=8192,
     )
     critic = EntityCritic(config).cuda()

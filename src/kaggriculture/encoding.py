@@ -17,13 +17,12 @@ from kaggriculture.constants import (
     EPISODE_STEPS,
     MARKET_I0,
     MAX_UNITS,
-    PRICE_FLOOR,
     PRIVATE_ITEMS,
     PRODUCTS,
     SHOP_NAMES,
     STARTING_MONEY,
     TURNS_PER_DAY,
-    market_price,
+    sale_proceeds,
 )
 
 FARM_CHANNELS = 29
@@ -291,11 +290,7 @@ def liquidation_value(observation: dict[str, Any], expected_player: int) -> floa
             int(inventory.get(item, 0) or 0) for inventory in inventories
         )
         inventory_level = int(market_inventory.get(item, MARKET_I0))
-        for _ in range(held):
-            price = market_price(item, inventory_level, market_params)
-            value += float(price)
-            if price > PRICE_FLOOR:
-                inventory_level += 1
+        value += float(sale_proceeds(item, held, inventory_level, market_params))
     return value
 
 

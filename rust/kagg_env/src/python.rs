@@ -1,12 +1,12 @@
 use crate::core::{
     ANIMAL_TOKEN_FIELDS, ANIMALS, BOARD_CHANNELS, BOARD_SIZE, BuiltinAgent, CRITIC_FEATURES,
     CROP_TOKEN_FIELDS, CROPS, CompactAction, FARM_TOKEN_FIELDS, GLOBAL_FEATURES, Game, GameConfig,
-    MARKET_KINDS, MARKET_QUANTITIES, MARKET_SET_CHOICES, MARKET_SET_KINDS, MARKET_SET_RAW_CHOICES,
-    MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS, MarketSetFactors, OBSERVATION_SCHEMA_VERSION,
-    PLAYERS, POLICY_LEDGER_SCHEMA_VERSION, POLICY_LEDGER_WIDTH, PRODUCT_TOKEN_FIELDS, PRODUCTS,
-    PyRandom, SampledFactors, StepResult, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS,
-    TOWN_TOKEN_FIELDS, UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES,
-    UNIT_GATHERS, V27State,
+    MARKET_KINDS, MARKET_QUANTITIES, MARKET_RESOURCE_FEATURES, MARKET_SET_CHOICES,
+    MARKET_SET_KINDS, MARKET_SET_RAW_CHOICES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS,
+    MarketSetFactors, OBSERVATION_SCHEMA_VERSION, PLAYERS, POLICY_LEDGER_SCHEMA_VERSION,
+    POLICY_LEDGER_WIDTH, PRODUCT_TOKEN_FIELDS, PRODUCTS, PyRandom, SampledFactors, StepResult,
+    TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS, UNIT_ACTIONS,
+    UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS, V27State,
 };
 use crate::v27_script::{V27_SOURCE_NAME, V27_SOURCE_SHA256, V27_STEPS};
 use half::f16;
@@ -120,6 +120,11 @@ fn market_set_output<'py>(
 #[pyclass(name = "BatchEnv")]
 pub(crate) struct BatchEnv {
     games: Vec<Game>,
+    resource_kind: Vec<f32>,
+    resource_quantity: Vec<f32>,
+    resource_heads: usize,
+    resource_rank: usize,
+    resource_enabled: Vec<bool>,
     sampled_scratch: Vec<SampledFactors>,
     results_scratch: Vec<StepResult>,
     /// Shaping potential of each game's current state. Every step path updates
@@ -130,7 +135,16 @@ pub(crate) struct BatchEnv {
     /// clears its own row when the step index restarts, exactly as the
     /// reference's module-level state does.
     v27_states: Vec<V27State>,
+    /// Actions an outside agent submitted for the coming step, one slot per
+    /// game seat. Rows coded `EXTERNAL_AGENT_CODE` consume their slot on the
+    /// next sampling step; every step starts with all slots empty again.
+    external_actions: Vec<Option<CompactAction>>,
 }
+
+/// Row code for a seat whose action an outside agent supplied through
+/// `set_external_actions` for this step, rather than a native built-in. It sits
+/// far from the built-in codes, which track `opponents.BUILTIN_AGENT_ORDER`.
+pub(crate) const EXTERNAL_AGENT_CODE: u8 = 255;
 
 #[pymethods]
 impl BatchEnv {
@@ -147,14 +161,67 @@ impl BatchEnv {
             .map(|&seed| Game::new(seed, GameConfig::default()))
             .collect();
         Ok(Self {
+            resource_kind: Vec::new(),
+            resource_quantity: Vec::new(),
+            resource_heads: 0,
+            resource_rank: 0,
+            resource_enabled: Vec::new(),
             sampled_scratch: (0..games.len() * PLAYERS)
                 .map(|_| SampledFactors::default())
                 .collect(),
             results_scratch: vec![StepResult::default(); games.len()],
             potential_cache: games.iter().map(Game::pair_potential).collect(),
             v27_states: vec![V27State::default(); games.len() * PLAYERS],
+            external_actions: vec![None; games.len() * PLAYERS],
             games,
         })
+    }
+
+    /// Cache decoder residual matrices once per policy rollout, never per turn.
+    fn set_market_resource_heads(
+        &mut self,
+        kind: PyReadonlyArray3<'_, f32>,
+        quantity: PyReadonlyArray3<'_, f32>,
+    ) -> PyResult<()> {
+        let heads = kind.shape()[0];
+        let rank = quantity.shape()[1];
+        ensure_shape(
+            kind.shape(),
+            &[heads, MARKET_KINDS, MARKET_RESOURCE_FEATURES],
+            "resource kind",
+        )?;
+        ensure_shape(
+            quantity.shape(),
+            &[heads, rank, MARKET_RESOURCE_FEATURES],
+            "resource quantity",
+        )?;
+        if heads == 0 || rank == 0 {
+            return Err(PyValueError::new_err(
+                "resource heads and rank must be positive",
+            ));
+        }
+        let kind = kind.as_slice()?;
+        let quantity = quantity.as_slice()?;
+        if kind.iter().chain(quantity).any(|v| !v.is_finite()) {
+            return Err(PyValueError::new_err("resource weights must be finite"));
+        }
+        self.resource_enabled = (0..heads)
+            .map(|head| {
+                kind[head * MARKET_KINDS * MARKET_RESOURCE_FEATURES
+                    ..(head + 1) * MARKET_KINDS * MARKET_RESOURCE_FEATURES]
+                    .iter()
+                    .any(|&x| x != 0.0)
+                    || quantity[head * rank * MARKET_RESOURCE_FEATURES
+                        ..(head + 1) * rank * MARKET_RESOURCE_FEATURES]
+                        .iter()
+                        .any(|&x| x != 0.0)
+            })
+            .collect();
+        self.resource_kind = kind.to_vec();
+        self.resource_quantity = quantity.to_vec();
+        self.resource_heads = heads;
+        self.resource_rank = rank;
+        Ok(())
     }
 
     fn __len__(&self) -> usize {
@@ -177,6 +244,94 @@ impl BatchEnv {
         for (cached, game) in self.potential_cache.iter_mut().zip(&self.games) {
             *cached = game.pair_potential();
         }
+        self.external_actions.fill(None);
+        Ok(())
+    }
+
+    /// Stage outside agents' factor rows for the next sampling step.
+    ///
+    /// Each listed row must be coded `EXTERNAL_AGENT_CODE` in that step's
+    /// `builtin_agents`, and every such row must have been staged here: the
+    /// step refuses either mismatch instead of playing a stale or default
+    /// action. Rows execute under the interpreter's submitted-dict rules, as
+    /// `step_factors(external=True)` does, since they come from a real agent.
+    #[pyo3(signature = (rows, unit_actions, market_kinds, market_quantities))]
+    fn set_external_actions(
+        &mut self,
+        rows: PyReadonlyArray1<'_, i64>,
+        unit_actions: PyReadonlyArray2<'_, u8>,
+        market_kinds: PyReadonlyArray2<'_, u8>,
+        market_quantities: PyReadonlyArray2<'_, u8>,
+    ) -> PyResult<()> {
+        let count = rows.shape()[0];
+        ensure_shape(unit_actions.shape(), &[count, MAX_UNITS], "unit_actions")?;
+        ensure_shape(
+            market_kinds.shape(),
+            &[count, MAX_MARKET_ORDERS],
+            "market_kinds",
+        )?;
+        ensure_shape(
+            market_quantities.shape(),
+            &[count, MAX_MARKET_ORDERS],
+            "market_quantities",
+        )?;
+        let rows = rows.as_array();
+        let units = unit_actions.as_array();
+        let kinds = market_kinds.as_array();
+        let quantities = market_quantities.as_array();
+        let total = self.external_actions.len();
+        let mut staged = self.external_actions.clone();
+        for (index, &row) in rows.iter().enumerate() {
+            let slot = usize::try_from(row)
+                .ok()
+                .filter(|&slot| slot < total)
+                .ok_or_else(|| {
+                    PyIndexError::new_err(format!("external row {row} is outside 0..{total}"))
+                })?;
+            if staged[slot].is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "external row {slot} is already staged for this step"
+                )));
+            }
+            let action = CompactAction {
+                units: std::array::from_fn(|unit| units[[index, unit]]),
+                market_kinds: std::array::from_fn(|order| kinds[[index, order]]),
+                market_quantities: std::array::from_fn(|order| quantities[[index, order]]),
+                external: true,
+            };
+            if let Some(&unit) = action
+                .units
+                .iter()
+                .find(|&&unit| usize::from(unit) >= UNIT_ACTIONS)
+            {
+                return Err(PyValueError::new_err(format!(
+                    "external row {slot} unit action {unit}, expected 0..{}",
+                    UNIT_ACTIONS - 1
+                )));
+            }
+            if let Some(&kind) = action
+                .market_kinds
+                .iter()
+                .find(|&&kind| usize::from(kind) >= MARKET_KINDS)
+            {
+                return Err(PyValueError::new_err(format!(
+                    "external row {slot} market kind {kind}, expected 0..{}",
+                    MARKET_KINDS - 1
+                )));
+            }
+            if let Some(&quantity) = action
+                .market_quantities
+                .iter()
+                .find(|&&quantity| usize::from(quantity) >= MARKET_QUANTITIES)
+            {
+                return Err(PyValueError::new_err(format!(
+                    "external row {slot} market quantity {quantity}, expected 0..{}",
+                    MARKET_QUANTITIES - 1
+                )));
+            }
+            staged[slot] = Some(action);
+        }
+        self.external_actions = staged;
         Ok(())
     }
 
@@ -580,6 +735,8 @@ impl BatchEnv {
                         let row = game_index * PLAYERS + player;
                         let head_id = usize::from(ids[row]);
                         let head = crate::core::QuantityHead {
+                            resource_kind: &[],
+                            resource_quantity: &[],
                             rank,
                             quantity_rows: MARKET_SET_RAW_CHOICES,
                             kind_gate: &gates[head_id * MARKET_KINDS * rank
@@ -639,6 +796,7 @@ impl BatchEnv {
         sell_order: &str,
         hire_last: bool,
     ) -> PyResult<()> {
+        self.refuse_staged_external_actions()?;
         let impact = market_set_impact(sell_order)?;
         let rows = self.games.len() * PLAYERS;
         ensure_shape(
@@ -845,6 +1003,8 @@ impl BatchEnv {
                             );
                             let head_id = usize::from(ids[row]);
                             let head = crate::core::QuantityHead {
+                                resource_kind: &[],
+                                resource_quantity: &[],
                                 rank,
                                 quantity_rows: MARKET_SET_RAW_CHOICES,
                                 kind_gate: &gates[head_id * MARKET_KINDS * rank
@@ -1158,6 +1318,13 @@ impl BatchEnv {
 
         let unit_logits = unit_logits.as_slice()?;
         let kind_logits = market_kind_logits.as_slice()?;
+        if !self.resource_kind.is_empty()
+            && (self.resource_heads != heads || self.resource_rank != rank)
+        {
+            return Err(PyValueError::new_err(
+                "cached market resource heads do not match quantity heads",
+            ));
+        }
         let quantity_context = market_quantity_context.as_slice()?;
         let kind_gate = quantity_kind_gate.as_slice()?;
         let quantity_values = quantity_values.as_slice()?;
@@ -1169,7 +1336,7 @@ impl BatchEnv {
         let deterministic_rows = deterministic_rows.as_slice()?;
         let temperatures = temperatures.as_slice()?;
         let builtin_agents = builtin_agents.as_slice()?;
-        validate_builtin_agents(builtin_agents)?;
+        validate_row_agents(builtin_agents)?;
         if head_ids.iter().any(|&head| usize::from(head) >= heads) {
             return Err(PyValueError::new_err(
                 "head_ids contains an out-of-range head",
@@ -1198,6 +1365,9 @@ impl BatchEnv {
             }
         }
 
+        // Taken last, after every refusal above, so a rejected call leaves
+        // the staged rows in place for the caller to retry.
+        let external = self.take_external_actions(builtin_agents)?;
         let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
         let mut output_slices = output_arrays.slices()?;
         {
@@ -1217,15 +1387,21 @@ impl BatchEnv {
                         // learner, so `collect_mixed_play_rust` in
                         // src/kaggriculture/rollout.py is where that invariant
                         // is enforced.
-                        let builtin = BuiltinAgent::from_code(builtin_agents[row])
-                            .expect("codes are validated above");
-                        if let Some(agent) = builtin {
-                            let action = game.builtin_action(
-                                player,
-                                agent,
-                                &mut builtin_rng(game, player),
-                                v27_state,
-                            );
+                        let scripted = if builtin_agents[row] == EXTERNAL_AGENT_CODE {
+                            external[row]
+                        } else {
+                            BuiltinAgent::from_code(builtin_agents[row])
+                                .expect("codes are validated above")
+                                .map(|agent| {
+                                    game.builtin_action(
+                                        player,
+                                        agent,
+                                        &mut builtin_rng(game, player),
+                                        v27_state,
+                                    )
+                                })
+                        };
+                        if let Some(action) = scripted {
                             output.masks = game.factor_masks(player, &action);
                             output.action = action;
                             // The row's action never passed through the network,
@@ -1244,6 +1420,24 @@ impl BatchEnv {
                         let values_offset = head_id * quantity_rows * rank;
                         let bias_offset = head_id * MARKET_KINDS * quantity_rows;
                         let head = crate::core::QuantityHead {
+                            resource_kind: if self.resource_kind.is_empty()
+                                || !self.resource_enabled[head_id]
+                            {
+                                &[]
+                            } else {
+                                &self.resource_kind[head_id
+                                    * MARKET_KINDS
+                                    * MARKET_RESOURCE_FEATURES
+                                    ..(head_id + 1) * MARKET_KINDS * MARKET_RESOURCE_FEATURES]
+                            },
+                            resource_quantity: if self.resource_quantity.is_empty()
+                                || !self.resource_enabled[head_id]
+                            {
+                                &[]
+                            } else {
+                                &self.resource_quantity[head_id * rank * MARKET_RESOURCE_FEATURES
+                                    ..(head_id + 1) * rank * MARKET_RESOURCE_FEATURES]
+                            },
                             rank,
                             quantity_rows,
                             kind_gate: &kind_gate[gate_offset..gate_offset + MARKET_KINDS * rank],
@@ -1414,6 +1608,13 @@ impl BatchEnv {
 
         let unit_utilities = unit_utilities.as_slice()?;
         let kind_utilities = market_kind_utilities.as_slice()?;
+        if !self.resource_kind.is_empty()
+            && (self.resource_heads != heads || self.resource_rank != rank)
+        {
+            return Err(PyValueError::new_err(
+                "cached market resource heads do not match quantity heads",
+            ));
+        }
         let quantity_context = market_quantity_context.as_slice()?;
         let kind_gate = quantity_kind_gate.as_slice()?;
         let quantity_values = quantity_values.as_slice()?;
@@ -1423,7 +1624,7 @@ impl BatchEnv {
         let deterministic_rows = deterministic_rows.as_slice()?;
         let temperatures = temperatures.as_slice()?;
         let builtin_agents = builtin_agents.as_slice()?;
-        validate_builtin_agents(builtin_agents)?;
+        validate_row_agents(builtin_agents)?;
         if head_ids.iter().any(|&head| usize::from(head) >= heads) {
             return Err(PyValueError::new_err(
                 "head_ids contains an out-of-range head",
@@ -1463,6 +1664,9 @@ impl BatchEnv {
             }
         }
 
+        // Taken last, after every refusal above, so a rejected call leaves
+        // the staged rows in place for the caller to retry.
+        let external = self.take_external_actions(builtin_agents)?;
         let mut output_arrays = SampleOutputArrays::new(output, rows, self.games.len())?;
         let mut output_slices = output_arrays.slices()?;
         let games = &mut self.games;
@@ -1482,15 +1686,21 @@ impl BatchEnv {
                     for player in 0..PLAYERS {
                         let row = first_row + player;
                         let sampled_row = &mut sampled_rows[player];
-                        let builtin = BuiltinAgent::from_code(builtin_agents[row])
-                            .expect("codes are validated above");
-                        if let Some(agent) = builtin {
-                            let action = game.builtin_action(
-                                player,
-                                agent,
-                                &mut builtin_rng(game, player),
-                                &mut v27_rows[player],
-                            );
+                        let scripted = if builtin_agents[row] == EXTERNAL_AGENT_CODE {
+                            external[row]
+                        } else {
+                            BuiltinAgent::from_code(builtin_agents[row])
+                                .expect("codes are validated above")
+                                .map(|agent| {
+                                    game.builtin_action(
+                                        player,
+                                        agent,
+                                        &mut builtin_rng(game, player),
+                                        &mut v27_rows[player],
+                                    )
+                                })
+                        };
+                        if let Some(action) = scripted {
                             sampled_row.masks = game.factor_masks(player, &action);
                             sampled_row.action = action;
                             sampled_row.unit_logprobs.fill(0.0);
@@ -1508,6 +1718,24 @@ impl BatchEnv {
                         let values_offset = head_id * quantity_rows * rank;
                         let bias_offset = head_id * MARKET_KINDS * quantity_rows;
                         let head = crate::core::QuantityHead {
+                            resource_kind: if self.resource_kind.is_empty()
+                                || !self.resource_enabled[head_id]
+                            {
+                                &[]
+                            } else {
+                                &self.resource_kind[head_id
+                                    * MARKET_KINDS
+                                    * MARKET_RESOURCE_FEATURES
+                                    ..(head_id + 1) * MARKET_KINDS * MARKET_RESOURCE_FEATURES]
+                            },
+                            resource_quantity: if self.resource_quantity.is_empty()
+                                || !self.resource_enabled[head_id]
+                            {
+                                &[]
+                            } else {
+                                &self.resource_quantity[head_id * rank * MARKET_RESOURCE_FEATURES
+                                    ..(head_id + 1) * rank * MARKET_RESOURCE_FEATURES]
+                            },
                             rank,
                             quantity_rows,
                             kind_gate: &kind_gate[gate_offset..gate_offset + MARKET_KINDS * rank],
@@ -1553,6 +1781,7 @@ impl BatchEnv {
         builtin_agents: PyReadonlyArray1<'py, u8>,
         output: &Bound<'py, PyDict>,
     ) -> PyResult<()> {
+        self.refuse_staged_external_actions()?;
         let rows = self.games.len() * PLAYERS;
         ensure_shape(unit_actions.shape(), &[rows, MAX_UNITS], "unit_actions")?;
         ensure_shape(
@@ -1660,6 +1889,7 @@ impl BatchEnv {
         market_quantities: PyReadonlyArray3<'py, u8>,
         external: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.refuse_staged_external_actions()?;
         let compact = extract_compact_actions(
             self.games.len(),
             unit_actions,
@@ -1699,6 +1929,7 @@ impl BatchEnv {
         market_kinds: PyReadonlyArray3<'py, u8>,
         market_quantities: PyReadonlyArray3<'py, u8>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.refuse_staged_external_actions()?;
         let (submitted_units, market_actions) =
             extract_submitted_actions(&self.games, unit_actions, market_kinds, market_quantities)?;
         let previous_potentials = self.potential_cache.clone();
@@ -2096,6 +2327,18 @@ fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound
     let rows = batch * PLAYERS;
     let output = PyDict::new(py);
     output.set_item(
+        "market_kind_deltas",
+        PyArray3::<f32>::zeros(py, [rows, MAX_MARKET_ORDERS, MARKET_KINDS], false),
+    )?;
+    output.set_item(
+        "market_resources",
+        PyArray3::<f32>::zeros(
+            py,
+            [rows, MAX_MARKET_ORDERS, MARKET_RESOURCE_FEATURES],
+            false,
+        ),
+    )?;
+    output.set_item(
         "unit_actions",
         PyArray2::<u8>::zeros(py, [rows, MAX_UNITS], false),
     )?;
@@ -2167,6 +2410,8 @@ fn allocate_sample_buffers<'py>(py: Python<'py>, batch: usize) -> PyResult<Bound
 }
 
 struct SampleOutputArrays<'py> {
+    market_kind_deltas: PyReadwriteArray3<'py, f32>,
+    market_resources: PyReadwriteArray3<'py, f32>,
     unit_actions: PyReadwriteArray2<'py, u8>,
     market_kinds: PyReadwriteArray2<'py, u8>,
     market_quantities: PyReadwriteArray2<'py, u8>,
@@ -2201,6 +2446,16 @@ impl<'py> SampleOutputArrays<'py> {
             }};
         }
         Ok(Self {
+            market_kind_deltas: output_array!(
+                "market_kind_deltas",
+                PyArray3<f32>,
+                [rows, MAX_MARKET_ORDERS, MARKET_KINDS]
+            ),
+            market_resources: output_array!(
+                "market_resources",
+                PyArray3<f32>,
+                [rows, MAX_MARKET_ORDERS, MARKET_RESOURCE_FEATURES]
+            ),
             unit_actions: output_array!("unit_actions", PyArray2<u8>, [rows, MAX_UNITS]),
             market_kinds: output_array!("market_kinds", PyArray2<u8>, [rows, MAX_MARKET_ORDERS]),
             market_quantities: output_array!(
@@ -2257,6 +2512,8 @@ impl<'py> SampleOutputArrays<'py> {
 
     fn slices(&mut self) -> PyResult<SampleOutputSlices<'_>> {
         let Self {
+            market_kind_deltas,
+            market_resources,
             unit_actions,
             market_kinds,
             market_quantities,
@@ -2278,6 +2535,12 @@ impl<'py> SampleOutputArrays<'py> {
             utilities,
         } = self;
         Ok(SampleOutputSlices {
+            market_kind_deltas: market_kind_deltas
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_kind_deltas"))?,
+            market_resources: market_resources
+                .as_slice_mut()
+                .map_err(|_| non_contiguous("market_resources"))?,
             unit_actions: unit_actions
                 .as_slice_mut()
                 .map_err(|_| non_contiguous("unit_actions"))?,
@@ -2338,6 +2601,8 @@ impl<'py> SampleOutputArrays<'py> {
 }
 
 struct SampleOutputSlices<'a> {
+    market_kind_deltas: &'a mut [f32],
+    market_resources: &'a mut [f32],
     unit_actions: &'a mut [u8],
     market_kinds: &'a mut [u8],
     market_quantities: &'a mut [u8],
@@ -2487,6 +2752,60 @@ fn validate_seeds(seeds: &[u64]) -> PyResult<()> {
     if seeds.iter().any(|&seed| seed > MAX_SAFE_SEED) {
         return Err(PyValueError::new_err(format!(
             "seed exceeds exact CPython-compatible maximum {MAX_SAFE_SEED}"
+        )));
+    }
+    Ok(())
+}
+
+impl BatchEnv {
+    /// Hand this step's staged outside actions to the sampler, emptying the slots.
+    ///
+    /// Staging and row codes must agree exactly: a coded row without a staged
+    /// action would otherwise play a default PASS, and a staged row the codes
+    /// do not claim would silently carry its action into a later step.
+    /// Steps that never play external rows must not strand staged ones for a
+    /// later step to execute against a different state.
+    fn refuse_staged_external_actions(&self) -> PyResult<()> {
+        match self.external_actions.iter().position(Option::is_some) {
+            Some(row) => Err(PyValueError::new_err(format!(
+                "row {row} has a staged external action, which only the sampling steps play"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn take_external_actions(&mut self, codes: &[u8]) -> PyResult<Vec<Option<CompactAction>>> {
+        for (row, (&code, staged)) in codes.iter().zip(&self.external_actions).enumerate() {
+            match (code == EXTERNAL_AGENT_CODE, staged.is_some()) {
+                (true, false) => {
+                    return Err(PyValueError::new_err(format!(
+                        "row {row} is coded external but no action was staged for it"
+                    )));
+                }
+                (false, true) => {
+                    return Err(PyValueError::new_err(format!(
+                        "row {row} has a staged external action but is coded {code}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(std::mem::replace(
+            &mut self.external_actions,
+            vec![None; codes.len()],
+        ))
+    }
+}
+
+/// `validate_builtin_agents` for the sampling steps, which also play rows
+/// staged through `set_external_actions`.
+fn validate_row_agents(codes: &[u8]) -> PyResult<()> {
+    if let Some(&code) = codes
+        .iter()
+        .find(|&&code| code != EXTERNAL_AGENT_CODE && BuiltinAgent::from_code(code).is_err())
+    {
+        return Err(PyValueError::new_err(format!(
+            "builtin_agents contains unknown agent code {code}, expected 0..=4 or {EXTERNAL_AGENT_CODE}"
         )));
     }
     Ok(())
@@ -2656,6 +2975,8 @@ fn fill_sample_step_output(
     output: &mut SampleOutputSlices<'_>,
 ) {
     let SampleOutputSlices {
+        market_kind_deltas,
+        market_resources,
         unit_actions,
         market_kinds,
         market_quantities,
@@ -2677,6 +2998,14 @@ fn fill_sample_step_output(
         utilities,
     } = output;
 
+    sampled
+        .par_iter()
+        .zip(market_resources.par_chunks_mut(MAX_MARKET_ORDERS * MARKET_RESOURCE_FEATURES))
+        .for_each(|(row, target)| target.copy_from_slice(&row.market_resources));
+    sampled
+        .par_iter()
+        .zip(market_kind_deltas.par_chunks_mut(MAX_MARKET_ORDERS * MARKET_KINDS))
+        .for_each(|(row, target)| target.copy_from_slice(&row.market_kind_deltas));
     sampled
         .par_iter()
         .zip(unit_actions.par_chunks_mut(MAX_UNITS))
@@ -2771,6 +3100,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("V27_SOURCE_SHA256", V27_SOURCE_SHA256)?;
     module.add("V27_SOURCE_NAME", V27_SOURCE_NAME)?;
     module.add("V27_STEPS", V27_STEPS)?;
+    module.add("EXTERNAL_AGENT_CODE", EXTERNAL_AGENT_CODE)?;
     Ok(())
 }
 
@@ -2882,7 +3212,8 @@ mod tests {
                 // farm minus the other, so it negates within a row pair and
                 // swaps with the seat.
                 let margin = |seat: usize, slot: usize| {
-                    farms[(seat * PLAYERS + slot) * FARM_TOKEN_FIELDS + FARM_TOKEN_FIELDS - 1]
+                    // Column 4 is the schema v4 money margin.
+                    farms[(seat * PLAYERS + slot) * FARM_TOKEN_FIELDS + 4]
                 };
                 assert!(margin(0, 0) < f16::ZERO);
                 assert_eq!(margin(0, 1), -margin(0, 0));

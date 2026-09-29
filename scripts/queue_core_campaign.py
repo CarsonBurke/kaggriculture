@@ -5,6 +5,9 @@ The four arms add ALL quantities, unit affordances, and margin observations
 one at a time to schema-v3 LeJEPA with legacy absolute quantities. All runs
 receive the same BC corpus, initialization seed, production workload and budget.
 Submission queues BC only. PPO must pass the full-game admission wrapper.
+
+Every job is capped at thirty minutes. PPO stops itself on a 27-minute trainer
+budget, so arms reach different wave counts; compare them at exact shared waves.
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ import subprocess
 from pathlib import Path
 
 VARIANTS = ("legacy", "schema3-no-affordance", "schema3", "control")
+MAX_JOB_MINUTES = 30
+TRAINER_HOURS = 27 / 60
+BC_MINUTES = 20
 
 
 def options(values: dict[str, object]) -> list[str]:
@@ -26,6 +32,13 @@ def options(values: dict[str, object]) -> list[str]:
 
 
 def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
+    """Every job's complete command, stated flag by flag.
+
+    The control's PPO command is the repository's default recipe, which a
+    plain `train_ppo.py` launch now resolves to, but the jobs run a frozen
+    source snapshot whose defaults may predate or outlive it, so nothing here
+    leans on a default.
+    """
     if variant not in VARIANTS:
         raise ValueError(f"unknown core variant: {variant}")
     schema = 4 if variant == "control" else 3
@@ -57,11 +70,11 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
         "bixt-latents": 0,
         "value-sigma-ratio": 3.0,
         "scalar-value": False,
+        "wdl-value": True,
         "policy-readout-layers": 1,
         "policy-shapes-backbone": True,
         "critic-private-layers": 1,
         "unit-affordance-scorer": variant in ("schema3", "control"),
-        "market-affordance-scorer": False,
         "jepa-hidden-dim": 384,
         "jepa-slices": 128,
         "jepa-tile-samples": 32,
@@ -104,10 +117,9 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
             "init-actor-from": directory / "bc/bc-actor.pt",
             "critic-warmup-iterations": 10,
             "iterations": 540,
-            "actor-waves": 500,
-            "max-hours": 0.0,
+            "max-hours": TRAINER_HOURS,
             "seed": 20800000,
-            "reward-mode": "terminal-soft-outcome",
+            "reward-mode": "terminal-outcome",
             "device": "cuda",
             "population": 1,
             "games": 128,
@@ -116,12 +128,14 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
             "league-active-opponents": 2,
             "league-historical-opponents": 6,
             "league-active-pool-size": 16,
-            "league-builtin-opponents": "pass,random,starter,scripted-v27,scripted-v16",
+            "league-builtin-opponents": "pass,random,starter,scripted-v27",
             "league-builtin-lanes": 4,
             "episode-steps": 720,
             "temperature": 1.0,
             "checkpoint-seconds": 420,
-            "actor-lr": 0.00015,
+            # Slows the post-clone drift that full-rate Monte Carlo PPO shows after
+            # wave 50 (artifacts/probes/ppo-stage3-20260927).
+            "actor-lr": 0.00005,
             "critic-lr": 0.00015,
             "critic-head-lr": 0.0004375,
             "lr-warmup-steps": 32,
@@ -133,7 +147,9 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
             "clip-low": 0.8,
             "clip-high": 1.28,
             "gamma": 1.0,
-            "actor-gae-lambda": 0.972183588317107,
+            # Monte Carlo credit: the only setting that improved on the clone at
+            # matched waves (artifacts/probes/ppo-ablations-20260927).
+            "actor-gae-lambda": 1.0,
             "critic-gae-lambda": 1.0,
             "target-kl": 0.03,
             "optimizer": "normuon",
@@ -145,14 +161,20 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
             "economic-forecast-coefficient": 0.0,
             "rollout-forward-mode": "inductor_graph",
             "update-compile-mode": "default",
-            "jepa-reward-coefficient": 0.1,
+            "jepa-reward-coefficient": 0.0,
             "structured-learning-rate": 0.000015,
             "architecture-panel": 25,
-            "actor-average-half-life": 8.0,
             "actor-lr-cooldown-frac": 0.0,
         }
     )
-    ppo += ["--rollout-bfloat16", "--no-structured-critic-gradient-balance"]
+    # The update retains the farm activations instead of replaying them: the
+    # same function, 0.36 s less per wave at a 17.2 GiB peak on this model
+    # (artifacts/probes/ppo-speed-20260927).
+    ppo += [
+        "--rollout-bfloat16",
+        "--no-structured-critic-gradient-balance",
+        "--no-rematerialize-actor-update",
+    ]
     return {"bc": bc, "ppo": ppo}
 
 
@@ -206,6 +228,8 @@ def main() -> None:
         ),
         "culling": "ArchitecturePanelGuard: after 150 actor waves, deterioration >=0.05 from init, "
         "100 waves without material score-EMA or critic-MSE improvement",
+        "time_limit": f"{TRAINER_HOURS * 60:g}-minute trainer budget / "
+        f"{MAX_JOB_MINUTES}-minute per-job hard limit",
         "precision": "CUDA BF16, compiled updates and Inductor graph collection",
         "jobs": {},
     }
@@ -229,7 +253,7 @@ def main() -> None:
     ]
     # Clone all arms first, allowing initialization quality to be compared before PPO.
     for name, stages in variants.items():
-        command = [*common, "--name", f"core-{name}-bc", "--time-limit", "20m"]
+        command = [*common, "--name", f"core-{name}-bc", "--time-limit", f"{BC_MINUTES}m"]
         completed = subprocess.run(
             [*command, "--", *stages["bc"]], text=True, capture_output=True, check=True
         )

@@ -62,10 +62,12 @@ from kaggriculture.tokens import (
     TILE_COUNT,
     TILE_KINDS,
     TILE_OCCUPANTS,
-    TOWN_TOKEN_FIELDS,
     UNIT_ROLES,
     UNIT_TILE_GATHERS,
     farm_token_fields,
+    product_private_fields,
+    product_token_fields,
+    town_token_fields,
 )
 from kaggriculture.triton_mlp import (
     fused_relu_squared_mlp,
@@ -227,7 +229,7 @@ class StructuredInputs(NamedTuple):
     unit_active: Tensor  # [B, MAX_UNITS] bool
     unit_tile_gather: Tensor  # [B, MAX_UNITS, 5] int64 into own-farm tiles
     unit_tile_gather_valid: Tensor  # [B, MAX_UNITS, 5] bool
-    products: Tensor  # [B, len(PRODUCTS), product feature width]
+    products: Tensor  # [B, len(PRODUCTS), product feature width]; models read their schema's prefix
     animals: Tensor  # [B, len(ANIMALS), animal feature width]
     crops: Tensor  # [B, len(CROPS), crop feature width]
     farms: Tensor  # [B, 2, len(FARM_TOKEN_FIELDS)]; models read their schema's prefix
@@ -966,15 +968,33 @@ class UnitEmbedder(nn.Module):
         return torch.where(active.unsqueeze(-1), embedded, 0.0)
 
 
+def _schema_columns(tokens: Tensor, public: int, staged: int, private: int) -> Tensor:
+    """A schema's public prefix of staged tokens, then its private prefix if any.
+
+    ``staged`` is the newest schema's public width, where a critic's appended
+    private columns begin. The result is contiguous, the layout an older
+    schema's projection always read, so its kernels see the same operand.
+    """
+    if not private:
+        return tokens[..., :public].contiguous()
+    return torch.cat((tokens[..., :public], tokens[..., staged : staged + private]), dim=-1)
+
+
 class EconomyEmbedder(nn.Module):
     """Product, crop, farm-summary, and town tokens with identity embeddings."""
 
     def __init__(self, config: StructuredConfig, *, private_columns: bool) -> None:
         super().__init__()
         width = config.model_dim
-        product_width = len(PRODUCT_TOKEN_FIELDS) + (
-            len(PRODUCT_PRIVATE_FIELDS) if private_columns else 0
+        schema = config.observation_schema_version
+        # Staged product tokens carry the newest schema's columns and, in a
+        # critic's input, the newest private columns after them; this model
+        # reads the prefix of each its own schema defines.
+        self.product_width = len(product_token_fields(schema))
+        self.product_private_width = (
+            len(product_private_fields(schema)) if private_columns else 0
         )
+        product_width = self.product_width + self.product_private_width
         crop_width = len(CROP_TOKEN_FIELDS) + (len(CROP_PRIVATE_FIELDS) if private_columns else 0)
         animal_width = len(ANIMAL_TOKEN_FIELDS) + (
             len(ANIMAL_PRIVATE_FIELDS) if private_columns else 0
@@ -988,21 +1008,26 @@ class EconomyEmbedder(nn.Module):
         self.crop_identity = nn.Embedding(len(CROPS), width)
         self.crop_projection = Linear(crop_width, width)
         self.farm_identity = nn.Embedding(2, width)
-        # Staged farm tokens carry the newest schema's columns; this model reads
-        # the prefix its own schema defines, so v3 weights see v3 inputs.
+        # Staged farm and town tokens carry the newest schema's columns; this
+        # model reads the prefixes its own schema defines, so v3 weights see v3
+        # inputs.
         self.farm_width = len(farm_token_fields(config.observation_schema_version))
         self.farm_projection = Linear(self.farm_width, width)
+        self.town_width = len(town_token_fields(config.observation_schema_version))
         if self.split_clock:
             self.clock_projection = Linear(6, width)
-            self.town_projection = Linear(len(TOWN_TOKEN_FIELDS) - 6, width)
+            self.town_projection = Linear(self.town_width - 6, width)
         else:
             self.clock_projection = None
-            self.town_projection = Linear(len(TOWN_TOKEN_FIELDS), width)
+            self.town_projection = Linear(self.town_width, width)
 
     def forward(
         self, products: Tensor, animals: Tensor, crops: Tensor, farms: Tensor, town: Tensor
     ) -> Tensor:
         dtype = self.product_projection.weight.dtype
+        products = _schema_columns(
+            products, self.product_width, len(PRODUCT_TOKEN_FIELDS), self.product_private_width
+        )
         tokens = [
             self.product_projection(products.to(dtype)) + self.product_identity.weight,
             self.animal_projection(animals.to(dtype)) + self.animal_identity.weight,
@@ -1010,6 +1035,7 @@ class EconomyEmbedder(nn.Module):
             self.farm_projection(farms[..., : self.farm_width].to(dtype))
             + self.farm_identity.weight,
         ]
+        town = town[..., : self.town_width]
         if self.clock_projection is None:
             tokens.append(self.town_projection(town.to(dtype)).unsqueeze(1))
         else:
@@ -1475,12 +1501,14 @@ class StructuredActor(nn.Module):
             market_decisions=decisions.market_decisions,
         )
 
-    def auxiliary_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
-        # Keep the auxiliary path memory-safe at production minibatch size by
-        # rematerializing the trunk. Both head-input tensors stay source-live.
+    def auxiliary_belief(
+        self, inputs: StructuredInputs, *, rematerialize: bool = True
+    ) -> StructuredDecisionBelief:
+        # Rematerializing the trunk keeps the auxiliary path memory-safe at
+        # production minibatch size. Both head-input tensors stay source-live.
         trunk = (
             checkpoint(self.trunk, inputs, use_reentrant=False)
-            if torch.is_grad_enabled()
+            if rematerialize and torch.is_grad_enabled()
             else self.trunk(inputs)
         )
         return self._decode_entities(
@@ -1492,9 +1520,9 @@ class StructuredActor(nn.Module):
         )
 
     def forward_with_auxiliary_belief(
-        self, inputs: StructuredInputs
+        self, inputs: StructuredInputs, *, rematerialize: bool = True
     ) -> tuple[ActorOutput, StructuredDecisionBelief]:
-        belief = self.auxiliary_belief(inputs)
+        belief = self.auxiliary_belief(inputs, rematerialize=rematerialize)
         return self.decode_belief(belief), belief
 
     def decode_belief(self, belief: StructuredBelief | StructuredDecisionBelief) -> ActorOutput:

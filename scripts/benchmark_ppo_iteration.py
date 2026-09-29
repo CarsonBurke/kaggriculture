@@ -41,6 +41,7 @@ from kaggriculture.ppo import (
     UPDATE_COMPILE_MODES,
     UPDATE_REPLAY_TAIL_LOGPROB,
     PpoConfig,
+    family_ppo_defaults,
     make_optimizers,
     make_structured_dynamics_optimizer,
     update_ppo,
@@ -262,16 +263,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--economic-forecast-coefficient",
         type=float,
-        default=_PRODUCTION_PPO["economic_forecast_coefficient"],
+        default=None,
+        help="forecast critic delta-supervision weight; defaults to the chosen family's, "
+        "as in train_ppo",
     )
-    # The `lejepa` family refuses to train without its world-model objective, so
-    # benchmarking it needs these; zero everywhere else, as in production.
-    for term in ("prediction", "sigreg", "reward"):
-        parser.add_argument(
-            f"--jepa-{term}-coefficient",
-            type=float,
-            default=_PRODUCTION_PPO[f"jepa_{term}_coefficient"],
-        )
+    # The `lejepa` family refuses to train without its world-model objective and
+    # every other family refuses it, so its weights default to the family's.
+    for term in ("prediction", "sigreg"):
+        parser.add_argument(f"--jepa-{term}-coefficient", type=float, default=None)
+    parser.add_argument(
+        "--jepa-reward-coefficient",
+        type=float,
+        default=_PRODUCTION_PPO["jepa_reward_coefficient"],
+    )
     parser.add_argument("--jepa-horizon", type=int, default=_PRODUCTION_PPO["jepa_horizon"])
     parser.add_argument(
         "--jepa-detach-target",
@@ -361,6 +365,14 @@ def parse_args() -> argparse.Namespace:
         help="execution mode of the update-path forward/backward; `eager` is one of the modes, "
         "so this alone decides whether the update compiles",
     )
+    parser.add_argument(
+        "--rematerialize-actor-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="replay the actor's update-forward activations in backward when an auxiliary "
+        "reads its belief, trading a second forward for memory; the same function either way. "
+        "Defaults to the chosen family's: lejepa retains them, every other family replays",
+    )
     parser.add_argument("--no-bfloat16", action="store_true")
     parser.add_argument(
         "--deterministic-training",
@@ -375,6 +387,20 @@ def parse_args() -> argparse.Namespace:
         for name, value in production_model_config().items():
             if hasattr(args, name) and getattr(args, name) is None:
                 setattr(args, name, value)
+    # Resolved as train_ppo resolves them, so a benchmark and the launch it
+    # gates agree on the family's objective and backbone rate.
+    family = family_ppo_defaults(args.architecture, args.critic_architecture)
+    for name in (
+        "economic_forecast_coefficient",
+        "jepa_prediction_coefficient",
+        "jepa_sigreg_coefficient",
+        "rematerialize_actor_update",
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, family.get(name, getattr(PpoConfig, name)))
+    args.structured_learning_rate = family.get(
+        "structured_learning_rate", PpoConfig.structured_learning_rate
+    )
     return args
 
 
@@ -588,8 +614,10 @@ def main() -> None:
             "jepa_reward_coefficient": args.jepa_reward_coefficient,
             "jepa_horizon": args.jepa_horizon,
             "jepa_detach_target": args.jepa_detach_target,
+            "structured_learning_rate": args.structured_learning_rate,
             "use_bfloat16": not args.no_bfloat16,
             "update_compile_mode": args.update_compile_mode,
+            "rematerialize_actor_update": args.rematerialize_actor_update,
         }
     )
     if args.auxiliary_mode == "off":

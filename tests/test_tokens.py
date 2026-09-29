@@ -12,21 +12,27 @@ from kaggriculture.constants import (
     ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
+    EPISODE_STEPS,
     MAX_UNITS,
     PRIVATE_ITEMS,
     PRODUCTS,
     SHED_CAPACITY,
+    SHOP_NAMES,
     TURNS_PER_DAY,
+    market_price,
+    sale_proceeds,
     shed_access_tiles,
 )
-from kaggriculture.encoding import encode_observation
+from kaggriculture.encoding import encode_observation, liquidation_value
 from kaggriculture.tokens import (
     ANIMAL_TOKEN_FIELDS,
     FARM_IDENTITIES,
     FARM_TOKEN_FIELDS,
+    HELD_VALUE_SCALE,
     N_TILE_CATEGORICAL,
     N_TILE_CONTINUOUS,
     OBSERVATION_SCHEMA_VERSION,
+    PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
     QUADRANT_COUNT,
     SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
@@ -36,13 +42,17 @@ from kaggriculture.tokens import (
     TILE_KINDS,
     TILE_OCCUPANT_INDEX,
     TILE_OCCUPANTS,
+    TOWN_TOKEN_FIELDS,
     UNIT_TILE_GATHERS,
     clock_features,
     encode_structured_observation,
     farm_token_fields,
+    product_private_fields,
+    product_token_fields,
     tokenize_economy,
     tokenize_farm_tiles,
     tokenize_units,
+    town_token_fields,
 )
 
 _FIELD = {name: index for index, name in enumerate(TILE_CONTINUOUS_FIELDS)}
@@ -385,13 +395,92 @@ def _legacy_v3_farm_rows(observation: dict) -> np.ndarray:
 
 
 def test_farm_token_schemas_are_prefixes_of_the_emitted_layout() -> None:
-    assert {3, 4} == SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
+    assert {3, 4, 5, 6} == SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
     assert farm_token_fields(OBSERVATION_SCHEMA_VERSION) == FARM_TOKEN_FIELDS
+    assert farm_token_fields(6) == (
+        *farm_token_fields(5),
+        "liquidation",
+        "liquidation_margin",
+    )
+    assert farm_token_fields(5) == farm_token_fields(4)
     assert farm_token_fields(4) == (*farm_token_fields(3), "money_margin")
     assert farm_token_fields(3) == ("money", "unlocked_quadrants", "hands", "hires_today")
-    for version in (2, 5):
+    for version in (2, 7):
         with pytest.raises(ValueError, match="unsupported observation schema"):
             farm_token_fields(version)
+
+
+def test_town_token_schemas_are_prefixes_of_the_emitted_layout() -> None:
+    assert town_token_fields(OBSERVATION_SCHEMA_VERSION) == TOWN_TOKEN_FIELDS
+    legacy = (
+        "day",
+        "hour",
+        "progress",
+        "remaining",
+        "hour_sin",
+        "hour_cos",
+        *(f"shop_{name}" for name in SHOP_NAMES),
+    )
+    assert town_token_fields(3) == town_token_fields(4) == legacy
+    assert town_token_fields(6) == town_token_fields(5) == (
+        *legacy,
+        *(f"shop_{name}_first_unlock" for name in SHOP_NAMES),
+    )
+    for version in (2, 7):
+        with pytest.raises(ValueError, match="unsupported observation schema"):
+            town_token_fields(version)
+
+
+def test_product_token_schemas_are_prefixes_of_the_emitted_layout() -> None:
+    assert product_token_fields(OBSERVATION_SCHEMA_VERSION) == PRODUCT_TOKEN_FIELDS
+    legacy = ("market_inventory", "price", "base_price", "shed_stock", "carried_stock")
+    for version in (3, 4, 5):
+        assert product_token_fields(version) == legacy
+        assert product_private_fields(version) == (
+            "opponent_shed_stock",
+            "opponent_carried_stock",
+        )
+    assert product_token_fields(6) == (*legacy, "held_value")
+    assert product_private_fields(6) == (*product_private_fields(5), "opponent_held_value")
+    assert product_private_fields(OBSERVATION_SCHEMA_VERSION) == PRODUCT_PRIVATE_FIELDS
+    for version in (2, 7):
+        with pytest.raises(ValueError, match="unsupported observation schema"):
+            product_token_fields(version)
+        with pytest.raises(ValueError, match="unsupported observation schema"):
+            product_private_fields(version)
+
+
+def _town_shops(town: np.ndarray) -> tuple[dict[str, float], dict[str, float]]:
+    """Per-shop (count, first-unlock rank) columns of one town token."""
+    column = {name: index for index, name in enumerate(TOWN_TOKEN_FIELDS)}
+    return (
+        {name: float(town[column[f"shop_{name}"]]) for name in SHOP_NAMES},
+        {name: float(town[column[f"shop_{name}_first_unlock"]]) for name in SHOP_NAMES},
+    )
+
+
+def test_town_first_unlock_ranks_distinct_shops_in_unlock_order() -> None:
+    def observation(shops: list[str]) -> dict:
+        return {"farms": [{}, {}], "town": {"unlocked_shops": shops}}
+
+    def town(shops: list[str]) -> np.ndarray:
+        return tokenize_economy(observation(shops)).town
+
+    # A repeat instance adds to its shop's count but keeps its first rank.
+    counts, ranks = _town_shops(town(["PIZZA_SHOP", "BAKERY", "PIZZA_SHOP"]))
+    assert counts == {**dict.fromkeys(SHOP_NAMES, 0.0), "PIZZA_SHOP": 0.25, "BAKERY": 0.125}
+    assert ranks == {**dict.fromkeys(SHOP_NAMES, 0.0), "PIZZA_SHOP": 0.125, "BAKERY": 0.25}
+    # The swapped opening: identical counts, so only the ranks separate them.
+    swapped_counts, swapped_ranks = _town_shops(town(["BAKERY", "PIZZA_SHOP", "PIZZA_SHOP"]))
+    assert swapped_counts == counts
+    assert swapped_ranks == {**ranks, "PIZZA_SHOP": 0.25, "BAKERY": 0.125}
+    # Eight unlocks fill the ranks to exactly one, and fp16 staging is exact.
+    every = list(reversed(SHOP_NAMES))
+    _, full = _town_shops(town(every))
+    assert full == {name: (every.index(name) + 1) / 8 for name in SHOP_NAMES}
+    staged = encode_structured_observation(observation(every)).town
+    assert staged.tobytes() == town(every).astype(np.float16).tobytes()
+    assert not town([])[len(town_token_fields(4)) :].any()
 
 
 @pytest.mark.parametrize(
@@ -446,6 +535,119 @@ def test_v3_farm_columns_are_unchanged_by_the_v4_margin() -> None:
             assert farms[:, :v3_width].tobytes() == legacy.tobytes()
             staged = encode_structured_observation(observation).farms
             assert staged[:, :v3_width].tobytes() == legacy.astype(np.float16).tobytes()
+
+
+def _legacy_v5_product_rows(observation: dict) -> np.ndarray:
+    """The schema-v5 product tokenizer, verbatim, before the v6 held value existed."""
+    private = observation.get("private") or {}
+    market = observation.get("market") or {}
+    inventory = market.get("inventory") or {}
+    prices = market.get("prices") or {}
+    shed = private.get("shed") or {}
+    carried = {
+        item: sum(int(unit.get(item, 0) or 0) for unit in private.get("inventories") or [])
+        for item in PRODUCTS
+    }
+    max_base_price = float(max(BASE_PRICE.values()))
+    return np.asarray(
+        [
+            (
+                (float(inventory.get(item, 10_000) or 0) - 10_000) / 500.0,
+                float(prices.get(item, BASE_PRICE[item]) or 0) / (2.0 * BASE_PRICE[item]),
+                BASE_PRICE[item] / max_base_price,
+                float(shed.get(item, 0) or 0) / SHED_CAPACITY,
+                carried[item] / SHED_CAPACITY,
+            )
+            for item in PRODUCTS
+        ],
+        dtype=np.float32,
+    )
+
+
+def test_v5_columns_are_unchanged_by_the_v6_liquidation() -> None:
+    environment = make("kaggriculture", configuration={"episodeSteps": 240, "seed": 11})
+    environment.run(["starter", "starter"])
+    v5_products = len(product_token_fields(5))
+    v5_farms = len(farm_token_fields(5))
+    held = 0
+    for step_state in environment.steps[::3]:
+        for seat in (0, 1):
+            observation = step_state[seat].observation
+            economy = tokenize_economy(observation)
+            legacy = _legacy_v5_product_rows(observation)
+            assert economy.products[:, :v5_products].tobytes() == legacy.tobytes()
+            staged = encode_structured_observation(observation)
+            assert staged.products[:, :v5_products].tobytes() == (
+                legacy.astype(np.float16).tobytes()
+            )
+            # Every v6 column is exactly what it replaces: the bank's own terms.
+            own_value = liquidation_value(observation, seat)
+            held += own_value != observation["farms"][seat]["money"]
+            farms = tokenize_economy(observation).farms
+            margin = FARM_TOKEN_FIELDS.index("money_margin")
+            liquidation = FARM_TOKEN_FIELDS.index("liquidation")
+            assert farms[0, liquidation] == np.float32(_signed_log(own_value) / 12.0)
+            assert farms[1, liquidation] == farms[1, 0]
+            if own_value == observation["farms"][seat]["money"]:
+                assert farms[:, v5_farms:].tobytes() == farms[:, [0, margin]].tobytes()
+    # The starter holds harvests between sales, so the new columns were live.
+    assert held > 10
+
+
+def test_held_value_and_liquidation_price_only_the_stock_a_seat_can_see() -> None:
+    held_value = PRODUCT_TOKEN_FIELDS.index("held_value")
+    liquidation = FARM_TOKEN_FIELDS.index("liquidation")
+    margin = FARM_TOKEN_FIELDS.index("liquidation_margin")
+    # MELON quotes walk from 31 onto the price floor partway through the stock.
+    floor = next(level for level in range(10_000, 11_000) if market_price("MELON", level) == 1)
+    observation = {
+        "player": 0,
+        "farms": [{"money": 250, "hands": []}, {"money": 4_000, "hands": []}],
+        "market": {"inventory": {"MELON": floor - 10}},
+        "private": {"shed": {"WHEAT": 60}, "inventories": [{"MELON": 25}]},
+    }
+    opponent_private = {"shed": {"WOOL": 90}, "inventories": [{"WOOL": 3}, {"EGG": 7}]}
+    tokens = tokenize_economy(observation)
+
+    proceeds = {
+        "WHEAT": sale_proceeds("WHEAT", 60, 10_000),
+        "MELON": sale_proceeds("MELON", 25, floor - 10),
+    }
+    assert proceeds["MELON"] == sum(market_price("MELON", floor - 10 + n) for n in range(10)) + 15
+    assert proceeds["MELON"] < 25 * market_price("MELON", floor - 10)
+    for index, item in enumerate(PRODUCTS):
+        expected = proceeds.get(item, 0) / HELD_VALUE_SCALE
+        assert tokens.products[index, held_value] == np.float32(expected)
+    own = 250 + sum(proceeds.values())
+    assert own == liquidation_value(observation, 0)
+    assert tokens.farms[0, liquidation] == np.float32(_signed_log(own) / 12.0)
+    # The opponent's stock is private: its row values its bank alone.
+    assert tokens.farms[1, liquidation] == np.float32(_signed_log(4_000) / 12.0)
+    expected_margin = np.float32(_signed_log(own) - _signed_log(4_000))
+    assert tokens.farms[0, margin] == expected_margin
+    assert tokens.farms[1, margin] == -expected_margin
+    assert expected_margin > tokens.farms[0, FARM_TOKEN_FIELDS.index("money_margin")]
+
+    # The critic's private column is the opponent's own held value, priced
+    # against the shared market; the actor's tokens never move with it.
+    staged = encode_structured_observation(observation, opponent_private)
+    blind = encode_structured_observation(observation, {"shed": {}, "inventories": []})
+    for name in ("products", "animals", "crops", "farms", "town"):
+        np.testing.assert_array_equal(getattr(staged, name), getattr(blind, name))
+    opponent_held = PRODUCT_PRIVATE_FIELDS.index("opponent_held_value")
+    for index, item in enumerate(PRODUCTS):
+        units = {"WOOL": 93, "EGG": 7}.get(item, 0)
+        expected = sale_proceeds(item, units, 10_000) / HELD_VALUE_SCALE
+        assert staged.critic_products[index, opponent_held] == np.float16(np.float32(expected))
+    opponent_view = {
+        **observation,
+        "player": 1,
+        "private": opponent_private,
+    }
+    np.testing.assert_array_equal(
+        staged.critic_products[:, opponent_held],
+        encode_structured_observation(opponent_view).products[:, held_value],
+    )
 
 
 def test_clock_features_are_bounded_and_phase_consistent() -> None:
@@ -510,3 +712,38 @@ def test_animal_stock_and_public_units_preserve_actor_critic_information_boundar
     assert private_changed.critic_animals[ANIMALS.index("SHEEP"), 1] == np.float16(
         2 / SHED_CAPACITY
     )
+
+
+def test_native_town_tokens_match_python_through_every_shop_unlock() -> None:
+    """Both tokenizers agree as a real town unlocks repeats out of name order."""
+    import json
+
+    from kaggriculture.constants import MAX_MARKET_ORDERS
+    from kaggriculture.rust_env import load_native
+    from kaggriculture.script_opponents import shaped_observation
+    from kaggriculture.structured import StructuredInputs
+
+    # Seed 0 opens YARN_STORE, BAKERY and unlocks both again later.
+    environment = load_native().BatchEnv(np.asarray([0], dtype=np.uint64))
+    units = np.zeros((1, 2, MAX_UNITS), dtype=np.uint8)
+    orders = np.zeros((1, 2, MAX_MARKET_ORDERS), dtype=np.uint8)
+    for step in range(EPISODE_STEPS - 1):
+        # The town changes only at day boundaries, and the first hour of each
+        # day is the first observation carrying a new unlock.
+        if step % TURNS_PER_DAY == 0:
+            snapshot = json.loads(environment.snapshot_json(0))
+            native = environment.structured()
+            for seat in (0, 1):
+                python = encode_structured_observation(shaped_observation(snapshot, seat))
+                for name in StructuredInputs._fields:
+                    np.testing.assert_array_equal(
+                        getattr(python, name),
+                        np.asarray(native[name])[seat],
+                        err_msg=f"Python/native divergence at step {step}: {name}",
+                    )
+        environment.step_factors(units, orders, orders)
+    shops = snapshot["town"]["unlocked_shops"]
+    # The seed exercises what the ranks exist for: a repeated shop, and an
+    # unlock order the per-shop counts (in name order) cannot express.
+    assert len(set(shops)) < len(shops)
+    assert list(dict.fromkeys(shops)) != sorted(set(shops))

@@ -124,12 +124,23 @@ def test_resume_rejects_missing_or_invalid_guard_evidence(tmp_path, field, value
         ArchitecturePanelGuard(25, state, iteration=0)
 
 
-def test_panel_flag_is_opt_in_and_resume_bound(monkeypatch, tmp_path):
+def test_panel_defaults_where_it_can_run_and_is_resume_bound(monkeypatch, tmp_path):
     module = _training_script()
     base = ["train_ppo.py", "--run-dir", str(tmp_path)]
-    monkeypatch.setattr(sys, "argv", base)
+    # Production's cadence wherever the run can host it, and off wherever it
+    # cannot, so an unflagged launch never needs to opt out.
+    for extra, interval in (
+        ((), 25),
+        (("--device", "cpu"), 0),
+        (("--update-compile-mode", "eager"), 0),
+        (("--autocull",), 0),
+        (("--population", "2", "--games", "2"), 0),
+        (("--reward-mode", "shaped", "--wdl-value", "false"), 0),
+    ):
+        monkeypatch.setattr(sys, "argv", [*base, *extra])
+        assert module.parse_args().architecture_panel == interval, extra
+    monkeypatch.setattr(sys, "argv", [*base, "--architecture-panel", "0"])
     args = module.parse_args()
-    assert args.architecture_panel == 0
     assert module._training_data_config(args, torch.device("cpu"))["architecture_panel"] is None
     monkeypatch.setattr(sys, "argv", [*base, "--architecture-panel", "25"])
     args = module.parse_args()

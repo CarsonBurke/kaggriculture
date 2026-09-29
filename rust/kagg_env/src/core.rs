@@ -42,14 +42,14 @@ pub const TILE_CONTINUOUS: usize = 20;
 pub const UNIT_CATEGORICAL: usize = 4;
 pub const UNIT_CONTINUOUS: usize = 2 * PRIVATE_ITEMS + 2;
 pub const UNIT_GATHERS: usize = 5;
-pub const PRODUCT_TOKEN_FIELDS: usize = 5;
+pub const PRODUCT_TOKEN_FIELDS: usize = 6;
 pub const ANIMAL_TOKEN_FIELDS: usize = 3;
 // The newest schema; its layout is a superset every supported schema reads a
 // prefix of (see src/kaggriculture/tokens.py).
-pub const OBSERVATION_SCHEMA_VERSION: usize = 4;
+pub const OBSERVATION_SCHEMA_VERSION: usize = 6;
 pub const CROP_TOKEN_FIELDS: usize = 6;
-pub const FARM_TOKEN_FIELDS: usize = 5;
-pub const TOWN_TOKEN_FIELDS: usize = 14;
+pub const FARM_TOKEN_FIELDS: usize = 7;
+pub const TOWN_TOKEN_FIELDS: usize = 22;
 
 const PRODUCT_NAMES: [&str; PRODUCTS] = [
     "WHEAT",
@@ -400,7 +400,11 @@ impl Default for FactorMasks {
     }
 }
 
+pub const MARKET_RESOURCE_FEATURES: usize = 29;
+
 pub struct SampledFactors {
+    pub market_resources: [f32; MAX_MARKET_ORDERS * MARKET_RESOURCE_FEATURES],
+    pub market_kind_deltas: [f32; MAX_MARKET_ORDERS * MARKET_KINDS],
     pub action: CompactAction,
     pub masks: FactorMasks,
     pub unit_logprobs: [f32; MAX_UNITS],
@@ -416,6 +420,8 @@ impl Default for SampledFactors {
     fn default() -> Self {
         Self {
             action: CompactAction::default(),
+            market_resources: [0.0; MAX_MARKET_ORDERS * MARKET_RESOURCE_FEATURES],
+            market_kind_deltas: [0.0; MAX_MARKET_ORDERS * MARKET_KINDS],
             masks: FactorMasks::default(),
             unit_logprobs: [0.0; MAX_UNITS],
             market_kind_logprobs: [0.0; MAX_MARKET_ORDERS],
@@ -429,6 +435,8 @@ impl Default for SampledFactors {
 }
 
 pub struct QuantityHead<'a> {
+    pub resource_kind: &'a [f32],
+    pub resource_quantity: &'a [f32],
     pub rank: usize,
     pub quantity_rows: usize,
     pub kind_gate: &'a [f32],
@@ -802,12 +810,42 @@ impl UnitLedger {
 #[derive(Clone)]
 struct PolicyMarketLedger {
     money: i64,
+    seeds: [u32; CROPS],
     shed: [u16; PRIVATE_ITEMS],
     hires: usize,
     original_hires: usize,
     original_units: usize,
     extra_land: usize,
     inventory: [i32; PRODUCTS],
+}
+
+impl PolicyMarketLedger {
+    fn resource_features(&self) -> [f32; MARKET_RESOURCE_FEATURES] {
+        let log = |x: f64| (x.signum() * x.abs().ln_1p() / 12.0) as f32;
+        let mut values = [0.0; MARKET_RESOURCE_FEATURES];
+        values[0] = log(self.money as f64);
+        for (i, &count) in self.shed.iter().enumerate() {
+            values[1 + i] = f32::from(count) / 100.0;
+        }
+        for (i, &count) in self.inventory.iter().enumerate() {
+            values[1 + PRIVATE_ITEMS + i] = log(f64::from(count));
+        }
+        values[22] = self.hires as f32 / MAX_UNITS as f32;
+        values[23] = self.extra_land as f32 / 3.0;
+        for (i, &count) in self.seeds.iter().enumerate() {
+            values[24 + i] = log(f64::from(count));
+        }
+        values
+    }
+}
+
+fn resource_residual(weights: &[f32], features: &[f32], output: &mut [f32]) {
+    if weights.is_empty() {
+        return;
+    }
+    for (row, value) in weights.chunks_exact(MARKET_RESOURCE_FEATURES).zip(output) {
+        *value += row.iter().zip(features).map(|(w, x)| w * x).sum::<f32>();
+    }
 }
 
 impl Game {
@@ -1285,12 +1323,19 @@ impl Game {
             .iter()
             .map(|params| params.0)
             .fold(0.0, f64::max);
+        let held_value_scale = f64::from(self.config.shed_capacity) * max_base_price;
+        let held = self.held_products(player);
+        // Schema v6: the seat's liquidation value, money plus every product's
+        // proceeds; integers, so it is exact.
+        let mut liquidation = farm.money;
         for item in 0..PRODUCTS {
             let base = MARKET_PARAMS[item].0;
             let mut carried = 0.0f64;
             for inventory in &private.inventories {
                 carried += f64::from(inventory[item]);
             }
+            let proceeds = sale_proceeds(item, held[item], self.market_inventory[item]);
+            liquidation += proceeds;
             let row = &mut products[item * PRODUCT_TOKEN_FIELDS..(item + 1) * PRODUCT_TOKEN_FIELDS];
             row[0] =
                 ((f64::from(self.market_inventory[item]) - f64::from(MARKET_I0)) / 500.0) as f32;
@@ -1298,6 +1343,8 @@ impl Game {
             row[2] = (base / max_base_price) as f32;
             row[3] = (f64::from(private.shed[item]) / f64::from(self.config.shed_capacity)) as f32;
             row[4] = (carried / f64::from(self.config.shed_capacity)) as f32;
+            // Schema v6 held value: this stock's exact sale proceeds.
+            row[5] = (proceeds as f64 / held_value_scale) as f32;
         }
         let max_animal_cost = ANIMAL_COST.iter().copied().max().unwrap() as f64;
         for animal in 0..ANIMALS {
@@ -1325,6 +1372,8 @@ impl Game {
             row[4] = (f64::from(CROP_MAX_HELD[crop]) / max_yield) as f32;
             row[5] = f32::from(u8::from(CROP_ONGOING[crop]));
         }
+        // Held stock is private: the opponent row's liquidation is its money.
+        let liquidations = [liquidation, self.farms[opponent].money];
         for (slot, index) in [player, opponent].into_iter().enumerate() {
             let summary = &self.farms[index];
             let row = &mut farms[slot * FARM_TOKEN_FIELDS..(slot + 1) * FARM_TOKEN_FIELDS];
@@ -1336,6 +1385,10 @@ impl Game {
             // Schema v4 money margin, rounded once from float64.
             row[4] = (signed_log_money(summary.money)
                 - signed_log_money(self.farms[1 - index].money)) as f32;
+            // Schema v6 liquidation and its margin, the latter also from float64.
+            row[5] = money_feature(liquidations[slot]);
+            row[6] = (signed_log_money(liquidations[slot])
+                - signed_log_money(liquidations[1 - slot])) as f32;
         }
 
         let hour = self.step % self.config.turns_per_day;
@@ -1350,12 +1403,18 @@ impl Game {
         town[3] = (f64::from(self.config.episode_steps - 1 - self.step) / horizon) as f32;
         town[4] = cycle.sin() as f32;
         town[5] = cycle.cos() as f32;
+        let unlocked = &self.shops[..usize::from(self.shop_count)];
         for shop in 0..8 {
-            let count = self.shops[..usize::from(self.shop_count)]
+            let count = unlocked
                 .iter()
                 .filter(|&&candidate| usize::from(candidate) == shop)
                 .count();
             town[6 + shop] = (count as f64 / 8.0) as f32;
+            // Schema v5: (1 + the unlock index of this shop's first instance) / 8.
+            town[14 + shop] = unlocked
+                .iter()
+                .position(|&candidate| usize::from(candidate) == shop)
+                .map_or(0.0, |index| ((index + 1) as f64 / 8.0) as f32);
         }
     }
 
@@ -1367,6 +1426,15 @@ impl Game {
     /// shed value, an optimistic bound: depositing needs shed room and one
     /// more turn.  Quotes and counts are integers, so the sum is exact in f64.
     pub fn liquidation_value(&self, player: usize) -> f64 {
+        let mut value = self.farms[player].money as f64;
+        for (item, &count) in self.held_products(player).iter().enumerate() {
+            value += sale_proceeds(item, count, self.market_inventory[item]) as f64;
+        }
+        value
+    }
+
+    /// Each product's units in this seat's shed and unit hands.
+    fn held_products(&self, player: usize) -> [i64; PRODUCTS] {
         let mut held = [0_i64; PRODUCTS];
         for (count, &stored) in held.iter_mut().zip(&self.privates[player].shed) {
             *count = i64::from(stored);
@@ -1376,18 +1444,7 @@ impl Game {
                 *count += i64::from(carried);
             }
         }
-        let mut value = self.farms[player].money as f64;
-        for (item, &count) in held.iter().enumerate() {
-            let mut market = self.market_inventory[item];
-            for _ in 0..count {
-                let price = market_price(item, market);
-                value += price as f64;
-                if price > PRICE_FLOOR {
-                    market += 1;
-                }
-            }
-        }
-        value
+        held
     }
 
     /// Bounded liquidation margin from player zero's perspective.
@@ -1717,6 +1774,7 @@ impl Game {
         let farm = &unit_ledger.farm;
         let mut ledger = PolicyMarketLedger {
             money: farm.money,
+            seeds: unit_ledger.private.seeds.map(u32::from),
             shed: unit_ledger.private.shed,
             hires: farm.hires_today,
             original_hires: farm.hires_today,
@@ -1910,6 +1968,7 @@ impl Game {
         let farm = &unit_ledger.farm;
         let mut ledger = PolicyMarketLedger {
             money: farm.money,
+            seeds: unit_ledger.private.seeds.map(u32::from),
             shed: unit_ledger.private.shed,
             hires: farm.hires_today,
             original_hires: farm.hires_today,
@@ -2039,9 +2098,15 @@ impl Game {
         );
         debug_assert_eq!(
             quantity_head.values.len(),
-            MARKET_QUANTITIES * quantity_head.rank
+            quantity_head.quantity_rows * quantity_head.rank
         );
-        debug_assert_eq!(quantity_head.bias.len(), MARKET_KINDS * MARKET_QUANTITIES);
+        debug_assert_eq!(
+            quantity_head.bias.len(),
+            MARKET_KINDS * quantity_head.quantity_rows
+        );
+        let mut market_resources = [0.0; MAX_MARKET_ORDERS * MARKET_RESOURCE_FEATURES];
+        let mut market_kind_deltas = [0.0; MAX_MARKET_ORDERS * MARKET_KINDS];
+        let mut conditioned_context = vec![0.0; quantity_head.rank];
         let mut action = CompactAction::default();
         let mut unit_masks = [false; UNIT_MASK_VALUES];
         let mut market_kind_masks = [false; MARKET_KIND_MASK_VALUES];
@@ -2090,6 +2155,7 @@ impl Game {
         let farm = &unit_ledger.farm;
         let mut ledger = PolicyMarketLedger {
             money: farm.money,
+            seeds: unit_ledger.private.seeds.map(u32::from),
             shed: unit_ledger.private.shed,
             hires: farm.hires_today,
             original_hires: farm.hires_today,
@@ -2100,6 +2166,21 @@ impl Game {
         let mut still_active = true;
         let mut quantity_logits = [0.0f32; MARKET_QUANTITIES];
         for slot in 0..MAX_MARKET_ORDERS {
+            let features = ledger.resource_features();
+            market_resources
+                [slot * MARKET_RESOURCE_FEATURES..(slot + 1) * MARKET_RESOURCE_FEATURES]
+                .copy_from_slice(&features);
+            let delta = &mut market_kind_deltas[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            resource_residual(quantity_head.resource_kind, &features, delta);
+            conditioned_context.copy_from_slice(
+                &market_quantity_context
+                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+            );
+            resource_residual(
+                quantity_head.resource_quantity,
+                &features,
+                &mut conditioned_context,
+            );
             let kind_mask = &mut market_kind_masks[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
             let quantity_mask = &mut market_quantity_masks
                 [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
@@ -2109,8 +2190,12 @@ impl Game {
             } else {
                 kind_mask[0] = true;
             }
+            let mut conditioned_kind = [0.0; MARKET_KINDS];
+            for (i, value) in conditioned_kind.iter_mut().enumerate() {
+                *value = market_kind_logits[slot * MARKET_KINDS + i] + delta[i];
+            }
             let (kind, kind_logprob, kind_entropy) = sample_categorical(
-                &market_kind_logits[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS],
+                &conditioned_kind,
                 kind_mask,
                 deterministic,
                 temperature,
@@ -2139,8 +2224,7 @@ impl Game {
             }
             market_quantity_active[slot] = true;
             score_quantities(
-                &market_quantity_context
-                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+                &conditioned_context,
                 kind,
                 quantity_head,
                 quantity_mask,
@@ -2169,6 +2253,8 @@ impl Game {
         }
 
         SampledFactors {
+            market_resources,
+            market_kind_deltas,
             action,
             masks: FactorMasks {
                 unit: unit_masks,
@@ -2220,9 +2306,12 @@ impl Game {
         );
         debug_assert_eq!(
             quantity_head.values.len(),
-            MARKET_QUANTITIES * quantity_head.rank
+            quantity_head.quantity_rows * quantity_head.rank
         );
-        debug_assert_eq!(quantity_head.bias.len(), MARKET_KINDS * MARKET_QUANTITIES);
+        debug_assert_eq!(
+            quantity_head.bias.len(),
+            MARKET_KINDS * quantity_head.quantity_rows
+        );
         debug_assert_eq!(market_quantity_draws.len(), MAX_MARKET_ORDERS);
         let select = |utilities: &[f32], mask: &[bool]| {
             let mut selected = None;
@@ -2239,6 +2328,9 @@ impl Game {
                 .expect("factor masks always contain a valid action")
         };
 
+        let mut market_resources = [0.0; MAX_MARKET_ORDERS * MARKET_RESOURCE_FEATURES];
+        let mut market_kind_deltas = [0.0; MAX_MARKET_ORDERS * MARKET_KINDS];
+        let mut conditioned_context = vec![0.0; quantity_head.rank];
         let mut action = CompactAction::default();
         let mut unit_masks = [false; UNIT_MASK_VALUES];
         let mut market_kind_masks = [false; MARKET_KIND_MASK_VALUES];
@@ -2273,6 +2365,7 @@ impl Game {
         let farm = &unit_ledger.farm;
         let mut ledger = PolicyMarketLedger {
             money: farm.money,
+            seeds: unit_ledger.private.seeds.map(u32::from),
             shed: unit_ledger.private.shed,
             hires: farm.hires_today,
             original_hires: farm.hires_today,
@@ -2283,6 +2376,21 @@ impl Game {
         let mut still_active = true;
         let mut quantity_logits = [0.0f32; MARKET_QUANTITIES];
         for slot in 0..MAX_MARKET_ORDERS {
+            let features = ledger.resource_features();
+            market_resources
+                [slot * MARKET_RESOURCE_FEATURES..(slot + 1) * MARKET_RESOURCE_FEATURES]
+                .copy_from_slice(&features);
+            let delta = &mut market_kind_deltas[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
+            resource_residual(quantity_head.resource_kind, &features, delta);
+            conditioned_context.copy_from_slice(
+                &market_quantity_context
+                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+            );
+            resource_residual(
+                quantity_head.resource_quantity,
+                &features,
+                &mut conditioned_context,
+            );
             let kind_mask = &mut market_kind_masks[slot * MARKET_KINDS..(slot + 1) * MARKET_KINDS];
             let quantity_mask = &mut market_quantity_masks
                 [slot * MARKET_QUANTITIES..(slot + 1) * MARKET_QUANTITIES];
@@ -2293,10 +2401,11 @@ impl Game {
                 kind_mask[0] = true;
             }
             let kind_offset = slot * MARKET_KINDS;
-            let kind = select(
-                &market_kind_utilities[kind_offset..kind_offset + MARKET_KINDS],
-                kind_mask,
-            );
+            let mut conditioned_kind = [0.0; MARKET_KINDS];
+            for (i, value) in conditioned_kind.iter_mut().enumerate() {
+                *value = market_kind_utilities[kind_offset + i] + delta[i] / temperature.max(1e-4);
+            }
+            let kind = select(&conditioned_kind, kind_mask);
             action.market_kinds[slot] = kind as u8;
             if !still_active || kind == 0 {
                 quantity_mask[0] = true;
@@ -2311,8 +2420,7 @@ impl Game {
             }
             market_quantity_active[slot] = true;
             score_quantities(
-                &market_quantity_context
-                    [slot * quantity_head.rank..(slot + 1) * quantity_head.rank],
+                &conditioned_context,
                 kind,
                 quantity_head,
                 quantity_mask,
@@ -2344,6 +2452,8 @@ impl Game {
                 .count();
 
         SampledFactors {
+            market_resources,
+            market_kind_deltas,
             masks: FactorMasks {
                 unit: unit_masks,
                 market_kind: market_kind_masks,
@@ -3049,7 +3159,9 @@ fn apply_policy_market_order(
             ledger.extra_land += 1;
         }
         3..=7 => {
-            ledger.money -= SEED_COST[usize::from(kind - 3)] * i64::from(quantity);
+            let crop = usize::from(kind - 3);
+            ledger.money -= SEED_COST[crop] * i64::from(quantity);
+            ledger.seeds[crop] += u32::from(quantity);
         }
         8 | 9 => {
             let item = if kind == 8 { 0 } else { 8 };
@@ -3656,6 +3768,25 @@ fn symmetric_margin(zero: f64, one: f64, starting_money: f64) -> f32 {
 
 pub fn market_price(item: usize, inventory: i32) -> i64 {
     curve_price(MARKET_PARAMS[item], inventory)
+}
+
+/// Exact coins from selling `units` of `item` one at a time into the market.
+///
+/// The engine's sell arithmetic: each unit quotes at the current market
+/// inventory, and a sale restocks the market only while the quote sits above
+/// the price floor -- so once a quote reaches the floor, every remaining unit
+/// sells at it.
+fn sale_proceeds(item: usize, units: i64, mut inventory: i32) -> i64 {
+    let mut proceeds = 0;
+    for sold in 0..units {
+        let price = market_price(item, inventory);
+        if price <= PRICE_FLOOR {
+            return proceeds + (units - sold) * price;
+        }
+        proceeds += price;
+        inventory += 1;
+    }
+    proceeds
 }
 
 /// The quote v27 believes a sale moves the price to (see `V27_MARKET_PARAMS`).
@@ -4307,6 +4438,104 @@ mod tests {
     }
 
     #[test]
+    fn town_token_ranks_first_unlocks_and_counts_repeats() {
+        let encoded_town = |shops: &[u8]| {
+            let mut game = Game::new(0, GameConfig::default());
+            game.shops[..shops.len()].copy_from_slice(shops);
+            game.shop_count = shops.len() as u8;
+            let mut town = [0.0; TOWN_TOKEN_FIELDS];
+            game.encode_player_structured(
+                0,
+                &mut [0; TILE_TOKENS * TILE_CATEGORICAL],
+                &mut [0.0; TILE_TOKENS * TILE_CONTINUOUS],
+                &mut [0; MAX_UNITS * UNIT_CATEGORICAL],
+                &mut [0.0; MAX_UNITS * UNIT_CONTINUOUS],
+                &mut [false; MAX_UNITS],
+                &mut [0; MAX_UNITS * UNIT_GATHERS],
+                &mut [false; MAX_UNITS * UNIT_GATHERS],
+                &mut [0.0; PRODUCTS * PRODUCT_TOKEN_FIELDS],
+                &mut [0.0; ANIMALS * ANIMAL_TOKEN_FIELDS],
+                &mut [0.0; CROPS * CROP_TOKEN_FIELDS],
+                &mut [0.0; PLAYERS * FARM_TOKEN_FIELDS],
+                &mut town,
+            );
+            town
+        };
+        // PIZZA_SHOP, BAKERY, PIZZA_SHOP: a repeat counts but keeps its first rank.
+        let town = encoded_town(&[5, 0, 5]);
+        assert_eq!(town[6..14], [0.125, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0]);
+        assert_eq!(town[14..], [0.25, 0.0, 0.0, 0.0, 0.0, 0.125, 0.0, 0.0]);
+        // The swapped opening has the same counts and only the ranks tell it apart.
+        let swapped = encoded_town(&[0, 5, 5]);
+        assert_eq!(swapped[..14], town[..14]);
+        assert_eq!(swapped[14..], [0.125, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0]);
+        assert!(encoded_town(&[])[14..].iter().all(|&rank| rank == 0.0));
+    }
+
+    #[test]
+    fn liquidation_tokens_price_only_the_stock_the_seat_can_see() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.farms[0].money = 250;
+        game.farms[1].money = 4000;
+        game.privates[0].shed[0] = 60;
+        game.privates[0].inventories[0][4] = 25;
+        // MELON quotes walk down from 31 onto the price floor partway through
+        // the stock (the floor starts at inventory 10_158).
+        game.market_inventory[4] = 10_148;
+        game.privates[1].shed[7] = 90;
+        let encoded = |game: &Game, player: usize| {
+            let mut products = [0.0; PRODUCTS * PRODUCT_TOKEN_FIELDS];
+            let mut farms = [0.0; PLAYERS * FARM_TOKEN_FIELDS];
+            game.encode_player_structured(
+                player,
+                &mut [0; TILE_TOKENS * TILE_CATEGORICAL],
+                &mut [0.0; TILE_TOKENS * TILE_CONTINUOUS],
+                &mut [0; MAX_UNITS * UNIT_CATEGORICAL],
+                &mut [0.0; MAX_UNITS * UNIT_CONTINUOUS],
+                &mut [false; MAX_UNITS],
+                &mut [0; MAX_UNITS * UNIT_GATHERS],
+                &mut [false; MAX_UNITS * UNIT_GATHERS],
+                &mut products,
+                &mut [0.0; ANIMALS * ANIMAL_TOKEN_FIELDS],
+                &mut [0.0; CROPS * CROP_TOKEN_FIELDS],
+                &mut farms,
+                &mut [0.0; TOWN_TOKEN_FIELDS],
+            );
+            (products, farms)
+        };
+        let (products, farms) = encoded(&game, 0);
+        let held_value = |item: usize| products[item * PRODUCT_TOKEN_FIELDS + 5];
+        let scale = 100.0 * 250.0;
+        let proceeds = [0, 4].map(|item| {
+            let units = i64::from(game.privates[0].shed[item])
+                + i64::from(game.privates[0].inventories[0][item]);
+            sale_proceeds(item, units, game.market_inventory[item])
+        });
+        assert_eq!(proceeds[1], 190);
+        assert_eq!(held_value(0), (proceeds[0] as f64 / scale) as f32);
+        assert_eq!(held_value(4), (proceeds[1] as f64 / scale) as f32);
+        assert!((1..PRODUCTS).all(|item| item == 4 || held_value(item) == 0.0));
+
+        let own = game.liquidation_value(0);
+        assert_eq!(own, (250 + proceeds[0] + proceeds[1]) as f64);
+        assert_eq!(farms[5], money_feature(own as i64));
+        // The opponent's wool is private: its row values its bank alone.
+        assert_eq!(farms[FARM_TOKEN_FIELDS + 5], money_feature(4000));
+        let margin = (signed_log_money(own as i64) - signed_log_money(4000)) as f32;
+        assert_eq!(farms[6], margin);
+        assert_eq!(farms[FARM_TOKEN_FIELDS + 6], -margin);
+        // The v4 money margin still compares banks only.
+        assert_eq!(
+            farms[4],
+            (signed_log_money(250) - signed_log_money(4000)) as f32
+        );
+
+        let (_, opponent) = encoded(&game, 1);
+        assert_eq!(opponent[5], money_feature(game.liquidation_value(1) as i64));
+        assert_eq!(opponent[FARM_TOKEN_FIELDS + 5], money_feature(250));
+    }
+
+    #[test]
     fn quantity_mask_is_exact_prefix_not_sparse_bins() {
         let mut game = Game::new(0, GameConfig::default());
         game.privates[0].shed[0] = 37;
@@ -4550,6 +4779,8 @@ mod tests {
         let gates = [0.0f32; MARKET_KINDS];
         let context = [0.0f32; MARKET_SET_KINDS];
         let head = QuantityHead {
+            resource_kind: &[],
+            resource_quantity: &[],
             rank: 1,
             quantity_rows: MARKET_SET_RAW_CHOICES,
             kind_gate: &gates,

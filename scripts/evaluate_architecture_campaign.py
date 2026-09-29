@@ -22,6 +22,8 @@ HEAD_DECODINGS = {
     "units": ("units",),
     "kinds": ("kinds",),
     "unit_kind": ("units", "kinds"),
+    "unit_quantity": ("units", "quantities"),
+    "kind_quantity": ("kinds", "quantities"),
     "quantities": ("quantities",),
 }
 
@@ -67,6 +69,7 @@ def panel_rows(rollout: Any, *, seed_start: int, games: int) -> list[dict[str, A
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scores = [row["score"] for row in rows]
     money = [row["money"] for row in rows]
+    low_money_count = sum(value < 1_000 for value in money)
     return {
         "games": len(rows),
         "score_rate": float(np.mean(scores)),
@@ -75,6 +78,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "money_mean": float(np.mean(money)),
         "money_median": float(np.median(money)),
         "money_p10": float(np.quantile(money, 0.1)),
+        "low_money_threshold": 1_000,
+        "low_money_count": low_money_count,
+        "low_money_fraction": low_money_count / len(rows),
         "margin_mean": float(np.mean([row["money"] - row["opponent_money"] for row in rows])),
     }
 
@@ -82,11 +88,12 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def paired_comparison(
     candidate: dict[str, list[dict[str, Any]]],
     reference: dict[str, list[dict[str, Any]]],
+    opponents: tuple[str, ...] = OPPONENTS,
 ) -> dict[str, Any]:
-    """Bootstrap whole matched seeds, keeping both opponent outcomes together."""
-    if set(candidate) != set(OPPONENTS) or set(reference) != set(OPPONENTS):
+    """Bootstrap whole matched seeds, keeping every opponent's outcome together."""
+    if set(candidate) != set(opponents) or set(reference) != set(opponents):
         raise ValueError("paired comparison requires the complete opponent panel")
-    expected = [(row["seed"], row["seat"]) for row in reference[OPPONENTS[0]]]
+    expected = [(row["seed"], row["seat"]) for row in reference[opponents[0]]]
     if not expected or len(set(expected)) != len(expected):
         raise ValueError("paired comparison requires distinct nonempty seed clusters")
     for panels in (candidate, reference):
@@ -105,15 +112,15 @@ def paired_comparison(
         "scope": "Exploratory game-seed uncertainty; no multiplicity or training-seed correction",
         "panels": {},
     }
-    for panel in (*OPPONENTS, "overall"):
-        opponents = OPPONENTS if panel == "overall" else (panel,)
+    for panel in (*opponents, "overall"):
+        pooled = opponents if panel == "overall" else (panel,)
         metrics = {}
         for field in ("score", "money"):
             difference = np.mean(
                 [
                     np.asarray([row[field] for row in candidate[opponent]])
                     - np.asarray([row[field] for row in reference[opponent]])
-                    for opponent in opponents
+                    for opponent in pooled
                 ],
                 axis=0,
             )
@@ -132,12 +139,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-start", type=int, default=4_501_000)
     parser.add_argument("--games", type=int, default=256)
     parser.add_argument("--decoding", choices=tuple(HEAD_DECODINGS), default="argmax")
+    parser.add_argument(
+        "--reference-opponent",
+        action="append",
+        type=artifact_argument,
+        default=[],
+        help=(
+            "LABEL=PATH neural opponent added to the panel, decoded as the candidate is: "
+            "argmax against argmax, temperature one against temperature one"
+        ),
+    )
     args = parser.parse_args()
     if args.games < 2 or args.games % 2:
         parser.error("--games must be a positive even count for balanced seats")
     labels = [label for label, _ in args.artifact]
     if len(set(labels)) != len(labels):
         parser.error("artifact labels must be distinct")
+    references = [label for label, _ in args.reference_opponent]
+    if len(set(references)) != len(references) or set(references) & set(OPPONENTS):
+        parser.error("reference opponent labels must be distinct from each other and built-ins")
+    if references and args.decoding not in ("argmax", "sampled"):
+        # A partial decoding names which of the candidate's heads sample; the
+        # opponent would need a decoding of its own, and none is defined.
+        parser.error("reference opponents require argmax or sampled decoding")
     seed_protocol("development", args.seed_start, args.games, usage=[])
     return args
 
@@ -156,6 +180,15 @@ def main() -> None:
         raise FileExistsError(args.output)
     torch.set_num_threads(1)
     started = time.perf_counter()
+    references: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for label, path in args.reference_opponent:
+        opponent, _metadata = load_actor_artifact(path, device="cuda")
+        opponent.eval().requires_grad_(False)
+        references[label] = (
+            opponent,
+            {"path": str(path.resolve()), "sha256": file_sha256(path)},
+        )
+    opponents = (*OPPONENTS, *references)
     report: dict[str, Any] = {
         "format_version": 2,
         "source_identity": source_identity(),
@@ -165,9 +198,10 @@ def main() -> None:
         "seed_start": args.seed_start,
         "games_per_opponent": args.games,
         "sampling_seed": 20260917,
-        "opponents": list(OPPONENTS),
+        "opponents": list(opponents),
+        "reference_opponents": {label: record for label, (_, record) in references.items()},
         "seat_protocol": "seed modulo 2; balanced across maps, not both seats per map",
-        "primary_metric": "Mean win/draw score, equally weighted over the two opponents",
+        "primary_metric": "Mean win/draw score, equally weighted over the panel's opponents",
         "scope": "Native development diagnostic; one training seed, not official finalist evidence",
         "artifacts": {},
         "comparisons_to_first": {},
@@ -191,12 +225,15 @@ def main() -> None:
             "panels": {},
         }
         panels = {}
-        for opponent in OPPONENTS:
+        for opponent in opponents:
+            neural = opponent in references
             rollout = collect_mixed_play_rust(
                 actor,
+                (references[opponent][0],) if neural else (),
                 self_play_games=0,
                 league_games=args.games,
-                builtin_lanes=(opponent,),
+                builtin_lanes=() if neural else (opponent,),
+                deterministic_opponent=args.decoding == "argmax",
                 seed_start=args.seed_start,
                 deterministic=args.decoding == "argmax",
                 sampled_heads=(
@@ -226,14 +263,14 @@ def main() -> None:
         if file_sha256(path) != digest:
             raise RuntimeError(f"artifact changed during evaluation: {path}")
         entry["overall_score_rate"] = float(
-            np.mean([entry["panels"][opponent]["summary"]["score_rate"] for opponent in OPPONENTS])
+            np.mean([entry["panels"][opponent]["summary"]["score_rate"] for opponent in opponents])
         )
         report["artifacts"][label] = entry
         if reference is None:
             reference = panels
             report["reference"] = label
         else:
-            report["comparisons_to_first"][label] = paired_comparison(panels, reference)
+            report["comparisons_to_first"][label] = paired_comparison(panels, reference, opponents)
         del actor, metadata
     report["elapsed_seconds"] = time.perf_counter() - started
     report["complete"] = True

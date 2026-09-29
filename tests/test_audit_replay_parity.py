@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kaggriculture.production import PRODUCTION_ARCHITECTURE
 from kaggriculture.provenance import source_identity
 
 
@@ -97,7 +98,12 @@ def _run(
         "load_actor_artifact",
         lambda path, device=None: (SimpleNamespace(eval=lambda: None), {"model_config": {}}),
     )
-    monkeypatch.setattr(module, "resolve_architecture", lambda payload: SimpleNamespace(name="x"))
+    # A real family: the audit takes that family's PPO settings from its name.
+    monkeypatch.setattr(
+        module,
+        "resolve_architecture",
+        lambda payload: SimpleNamespace(name=PRODUCTION_ARCHITECTURE),
+    )
     monkeypatch.setattr(module, "allocate_rollout_storage", lambda *args, **kwargs: {})
     monkeypatch.setattr(module, "_measure", measure)
     monkeypatch.setattr(

@@ -54,6 +54,7 @@ from kaggriculture.orientation import (
     orient_unit_masks,
 )
 from kaggriculture.registry import architecture_of
+from kaggriculture.resource_conditioning import RESOURCE_FEATURES, market_resource_features
 from kaggriculture.strategic_actor import PlanChoice, StrategicActor, StrategicOutput
 from kaggriculture.structured import StructuredActor, stack_structured
 from kaggriculture.tokens import StructuredObservation, encode_structured_observation
@@ -91,6 +92,7 @@ class ActionFactors:
     entropy_sums: np.ndarray
     plan: np.ndarray | None = None
     policy_ledger: np.ndarray | None = None
+    market_resources: np.ndarray | None = None
     market_set_values: np.ndarray | None = None
     market_set_masks: np.ndarray | None = None
     market_set_active: np.ndarray | None = None
@@ -113,6 +115,8 @@ class PreparedQuantityHeads:
     kind_gate: np.ndarray
     values: np.ndarray
     bias: np.ndarray
+    resource_kind: np.ndarray | None = None
+    resource_quantity: np.ndarray | None = None
 
 
 def prepare_quantity_heads(
@@ -129,6 +133,12 @@ def prepare_quantity_heads(
         kind_gate=frozen(actor.market_quantity_kind_gate.weight),
         values=frozen(actor.market_quantity_value.weight),
         bias=frozen(actor.market_quantity_bias),
+        resource_kind=frozen(actor.market_resource_conditioner.kind.weight)
+        if getattr(actor, "market_resource_conditioner", None) is not None
+        else None,
+        resource_quantity=frozen(actor.market_resource_conditioner.quantity.weight)
+        if getattr(actor, "market_resource_conditioner", None) is not None
+        else None,
     )
 
 
@@ -150,11 +160,7 @@ def percentage_quantity_logits_numpy(parameters: np.ndarray, masks: np.ndarray) 
     log_mass = log_sigmoid(upper) + log_sigmoid(-lower) + np.log(-np.expm1(-delta))
     high = (np.float32(1) - location) / scale
     low = -location / scale
-    log_total = (
-        log_sigmoid(high)
-        + log_sigmoid(-low)
-        + np.log(-np.expm1(-np.float32(1) / scale))
-    )
+    log_total = log_sigmoid(high) + log_sigmoid(-low) + np.log(-np.expm1(-np.float32(1) / scale))
     result = parameters[..., 4:5] + log_mass - log_total
     for atom, amount in enumerate((1, 2, 3, 0)):
         destinations = maximum if atom == 3 else np.full_like(maximum, amount)
@@ -268,7 +274,15 @@ def categorical_statistics(
     log_probabilities = masked.log_softmax(dim=-1)
     probabilities = log_probabilities.exp()
     selected = log_probabilities.gather(-1, actions.long().unsqueeze(-1)).squeeze(-1)
-    entropy = -(probabilities * log_probabilities).sum(dim=-1)
+    # Masked entries hold a log-probability near float32's minimum. Their product
+    # with an underflowed zero probability is an exact zero forward, but
+    # differentiating it multiplies the cotangent by that log-probability, which
+    # overflows to inf and meets the zero probability as NaN. Zeroing exactly the
+    # zero-probability terms changes no entropy value -- an all-masked row stays
+    # uniform -- and keeps an entropy bonus's gradient finite.
+    entropy = -(probabilities * torch.where(probabilities > 0.0, log_probabilities, 0.0)).sum(
+        dim=-1
+    )
     return selected, entropy
 
 
@@ -764,11 +778,23 @@ def act_batch(
     quantity_entropies = np.zeros((batch_size, MAX_MARKET_ORDERS), dtype=np.float32)
     still_active = np.ones(batch_size, dtype=np.bool_)
     ledgers = [
-        MarketLedger.from_observation(observation, shed=dict(remaining_unit_sheds[row]))
+        MarketLedger.from_observation(
+            observation, shed=dict(remaining_unit_sheds[row]), seeds=remaining_seeds[row]
+        )
         for row, observation in enumerate(observations)
     ]
 
+    market_resources = np.zeros(
+        (batch_size, MAX_MARKET_ORDERS, RESOURCE_FEATURES), dtype=np.float32
+    )
     for slot in range(MAX_MARKET_ORDERS):
+        resources = np.stack([market_resource_features(ledger) for ledger in ledgers])
+        market_resources[:, slot] = resources
+        slot_kind_logits = market_kind_logits[:, slot]
+        slot_context = market_quantity_context[:, slot]
+        if quantity_heads.resource_kind is not None:
+            slot_kind_logits = slot_kind_logits + resources @ quantity_heads.resource_kind.T
+            slot_context = slot_context + resources @ quantity_heads.resource_quantity.T
         for row, observation in enumerate(observations):
             if still_active[row]:
                 kind_masks[row, slot] = _ledger_kind_mask(observation, ledgers[row])
@@ -776,7 +802,7 @@ def act_batch(
             else:
                 kind_masks[row, slot, MarketKind.STOP] = True
         sampled_cpu, logprob, entropy = _sample_numpy_categorical(
-            market_kind_logits[:, slot],
+            slot_kind_logits,
             kind_masks[:, slot],
             deterministic,
             temperature,
@@ -805,9 +831,7 @@ def act_batch(
         quantity_draws = None if deterministic else generator.random((batch_size, 1))[active_rows]
         if active_rows.size:
             active_kinds = sampled_cpu[active_rows]
-            quantity_features = market_quantity_context[active_rows, slot] * (
-                1.0 + quantity_kind_gate[active_kinds]
-            )
+            quantity_features = slot_context[active_rows] * (1.0 + quantity_kind_gate[active_kinds])
             slot_quantity_logits = (
                 quantity_features @ quantity_values.T + quantity_bias[active_kinds]
             )
@@ -868,6 +892,7 @@ def act_batch(
         + (quantity_entropies * quantity_active).sum(axis=1)
     ).astype(np.float64)
     factors = ActionFactors(
+        market_resources=market_resources,
         unit_actions=unit_actions,
         market_kinds=market_kinds,
         market_quantities=market_quantities,

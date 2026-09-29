@@ -135,6 +135,66 @@ def test_plan_is_a_joint_ppo_factor_with_masked_entropy_and_gradient(monkeypatch
         ppo._actor_minibatch_terms(*arguments)
 
 
+def test_the_entropy_bonus_reaches_the_plan_factor_over_active_states_only(monkeypatch):
+    physical = torch.tensor([[math.log(1.1)], [0.0], [float("nan")]])
+    plan = torch.tensor([[math.log(1.1)], [math.log(1.4)], [float("nan")]])
+    physical_entropy = torch.full_like(physical, 0.5, requires_grad=True)
+    plan_entropy = torch.full_like(plan, 0.7, requires_grad=True)
+    inactive = torch.zeros(3, 1)
+    ignored = torch.full_like(inactive, float("nan"))
+    monkeypatch.setattr(
+        ppo,
+        "_replayed_component_logprobs",
+        lambda *args: (
+            physical,
+            ignored,
+            ignored,
+            plan,
+            physical_entropy,
+            ignored,
+            ignored,
+            plan_entropy,
+        ),
+    )
+    choice = PlanChoice(
+        torch.zeros(3, dtype=torch.long),
+        torch.zeros(3),
+        torch.ones(3),
+        torch.zeros(3, dtype=torch.bool),
+        torch.zeros(3),
+        torch.tensor([True, False, True]),
+    )
+    terms = ppo._actor_minibatch_terms(
+        None,
+        physical,
+        inactive,
+        inactive,
+        inactive,
+        inactive,
+        inactive,
+        torch.ones_like(physical),
+        inactive,
+        inactive,
+        torch.zeros_like(physical),
+        ignored,
+        ignored,
+        torch.ones(3),
+        0.8,
+        1.28,
+        False,
+        None,
+        choice,
+        sample_weight=torch.tensor([1.0, 1.0, 0.0]),
+        policy_ratio_scope="joint",
+        entropy_gradient=True,
+    )
+    torch.testing.assert_close(terms[1], torch.tensor(0.5 + 0.5 + 0.7))
+    terms[1].backward()
+    # The plan is active on the first state only; the third is wrapped padding.
+    torch.testing.assert_close(plan_entropy.grad, torch.tensor([[1.0], [0.0], [0.0]]))
+    torch.testing.assert_close(physical_entropy.grad, torch.tensor([[1.0], [1.0], [0.0]]))
+
+
 def test_plan_replay_args_use_recorded_indices_and_critic_ignores_plan(monkeypatch):
     # The typed argument boundary is independent of actual observation values.
     fields = {
@@ -191,7 +251,11 @@ def test_plan_likelihood_is_in_every_replay_audit_and_saved_replay(monkeypatch):
         setattr(rollout, name, np.ones((1, horizon, 1), dtype=np.bool_))
     for name in ("old_unit_logprobs", "old_market_kind_logprobs", "old_market_quantity_logprobs"):
         setattr(rollout, name, np.full((1, horizon, 1), -1.0, dtype=np.float32))
-    actor = SimpleNamespace(parameters=lambda: iter((torch.zeros(1),)))
+    # Every actor carries its model configuration; the replay reads its action
+    # interface to choose the market-set path, which the plan actor never takes.
+    actor = SimpleNamespace(
+        parameters=lambda: iter((torch.zeros(1),)), config=SimpleNamespace(action_interface=1)
+    )
 
     def actor_args(architecture, staged, indices):
         old = staged["old_plan_logprobs"][indices]

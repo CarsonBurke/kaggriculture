@@ -654,8 +654,9 @@ class EntityActor(nn.Module):
         self.market_quantity_context = Linear(config.model_dim, config.quantity_rank, bias=False)
         self.market_quantity_kind_gate = nn.Embedding(N_MARKET_KINDS, config.quantity_rank)
         quantity_rows = (
-            7 if config.action_interface == 4 else
-            N_QUANTITIES + (config.action_interface == 2) + 2 * (config.action_interface == 3)
+            7
+            if config.action_interface == 4
+            else N_QUANTITIES + (config.action_interface == 2) + 2 * (config.action_interface == 3)
         )
         self.market_quantity_value = nn.Embedding(quantity_rows, config.quantity_rank)
         self.market_quantity_bias = nn.Parameter(torch.zeros(N_MARKET_KINDS, quantity_rows))
@@ -719,10 +720,13 @@ class EntityActor(nn.Module):
     def encode_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
         return self._head_belief(self.trunk(inputs))
 
-    def auxiliary_belief(self, inputs: StructuredInputs) -> StructuredDecisionBelief:
+    def auxiliary_belief(
+        self, inputs: StructuredInputs, *, rematerialize: bool = True
+    ) -> StructuredDecisionBelief:
+        """The decision belief an auxiliary reads; `rematerialize` replays the trunk."""
         states = (
             checkpoint(self.trunk, inputs, use_reentrant=False)
-            if torch.is_grad_enabled()
+            if rematerialize and torch.is_grad_enabled()
             else self.trunk(inputs)
         )
         return self._head_belief(states)
@@ -746,9 +750,9 @@ class EntityActor(nn.Module):
         return self.decode_belief(belief), belief
 
     def forward_with_auxiliary_belief(
-        self, inputs: StructuredInputs
+        self, inputs: StructuredInputs, *, rematerialize: bool = True
     ) -> tuple[ActorOutput, StructuredDecisionBelief]:
-        belief = self.auxiliary_belief(inputs)
+        belief = self.auxiliary_belief(inputs, rematerialize=rematerialize)
         return self.decode_belief(belief), belief
 
     def forward(self, inputs: StructuredInputs) -> ActorOutput:

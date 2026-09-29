@@ -497,6 +497,7 @@ _BEHAVIOR_CATEGORIES: dict[str, tuple[str, str]] = {
 _TRAINING_TAGS = {
     "policy_loss": "actor/policy_loss",
     "entropy": "actor/entropy",
+    "entropy_bonus": "actor/entropy_bonus",
     "actor_updates": "actor/updates",
     "actor_gradient_norm": "actor/gradient_norm",
     "advantage_mean": "actor/advantage_mean",
@@ -525,6 +526,10 @@ _TRAINING_TAGS = {
     "lambda_return_explained_variance": "critic/lambda_return_explained_variance",
     "monte_carlo_explained_variance": "critic/monte_carlo_explained_variance",
     "monte_carlo_r_squared": "critic/monte_carlo_r_squared",
+    "behavior_match_score_mse": "outcome-calibration/match_score_mse",
+    "behavior_match_score_bias": "outcome-calibration/match_score_bias",
+    "behavior_match_score_calibration_error": "outcome-calibration/match_score_calibration_error",
+    "behavior_match_score_out_of_range_fraction": "outcome-calibration/out_of_range_fraction",
     "value_target_correlation": "critic/target_correlation",
     "critic_gradient_norm": "critic/gradient_norm",
     "critic_trunk_gradient_norm": "critic-clip/trunk_gradient_norm",

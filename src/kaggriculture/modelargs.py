@@ -31,6 +31,7 @@ CALIBRATED_MODEL_FIELDS = frozenset(("value_atoms", "value_min", "value_max"))
 CRITIC_ONLY_MODEL_FIELDS = frozenset(
     (
         "scalar_value",
+        "wdl_value",
         "value_sigma_ratio",
         *CALIBRATED_MODEL_FIELDS,
         "critic_core_layers",

@@ -14,7 +14,6 @@ from typing import Any
 from kaggriculture.modelargs import model_config_arguments
 from kaggriculture.production import (
     build_training_command,
-    production_model_config,
     production_ppo_config,
 )
 from kaggriculture.provenance import freeze_source, source_identity
@@ -120,11 +119,15 @@ def set_argument(command: list[str], flag: str, value: Any) -> None:
 def arm_config(arm: str):
     _, family, changes, _, _ = ARMS[arm]
     architecture = resolve_architecture(family)
-    base = production_model_config()
+    # The campaign's matched base is the entity-attention production contract
+    # it was designed against, whatever production has since become.
+    base = resolve_architecture(ENTITY_ATTENTION).config_class().to_dict()
     if family == LEJEPA:
-        # Production's entity config uses v3; fresh LeJEPA arms inherit their
-        # own promoted schema while existing artifacts keep their saved schema.
+        # That contract uses v3; the LeJEPA arms take their family's promoted
+        # schema, and `build_config` keeps the family as these arms defined it,
+        # before its later action-interface and head defaults.
         base["observation_schema_version"] = architecture.config_class().observation_schema_version
+        return architecture, architecture.build_config(base | changes)
     config = architecture.config_class(**(base | changes))
     return architecture, config
 
@@ -139,19 +142,19 @@ def training_command(arm: str, run: Path, bc: Path, source: Path) -> list[str]:
         rollout_forward_mode="inductor_graph",
         update_compile_mode="reduce-overhead",
         initial_actors=(bc,),
+        architecture=architecture.name,
+        model_config=config.to_dict(),
     )
     command[1] = str(source / "scripts" / "train_ppo.py")
     # This campaign evaluates synchronously through the same compiled native
     # GPU collector; the ordinary exported CPU external worker is unsuitable.
     command.remove("--external-eval")
-    set_argument(command, "--architecture", architecture.name)
-    arguments = model_config_arguments(architecture, config.to_dict())
-    for flag, value in zip(arguments[::2], arguments[1::2], strict=True):
-        set_argument(command, flag, value)
     set_argument(command, "--policy-ratio-scope", ARMS[arm][3])
     set_argument(command, "--economic-forecast-coefficient", ARMS[arm][4])
     set_argument(command, "--architecture-panel", 25)
-    command.extend(jepa_arguments(arm, reward=True))
+    # The campaign's objective carries the reward head production leaves off.
+    for argument in jepa_arguments(arm, reward=True):
+        set_argument(command, *argument.split("=", 1))
     if ARMS[arm][1] == LEJEPA:
         set_argument(command, "--structured-learning-rate", JEPA_BACKBONE_LEARNING_RATE)
     return command

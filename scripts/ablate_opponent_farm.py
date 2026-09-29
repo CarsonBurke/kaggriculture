@@ -57,7 +57,7 @@ _TILE_FIELDS = ("tile_categorical", "tile_continuous")
 def _load(path: Path, device: torch.device) -> tuple[torch.nn.Module, torch.nn.Module, dict]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     architecture = resolve_architecture(checkpoint["architecture"])
-    config = architecture.config_class(**checkpoint["model_config"])
+    config = architecture.build_config(checkpoint["model_config"])
     actor = architecture.actor_class(config).to(device)
     actor.load_state_dict(checkpoint["actor"], strict=True)
     critic = architecture.critic_class(config).to(device)

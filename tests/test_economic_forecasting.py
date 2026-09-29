@@ -56,7 +56,7 @@ def test_features_have_fixed_scales_ownership_and_no_static_clock_targets():
     states["crops"][0, :, 0, 1] = 11
     states["critic_crops"][0, :, 0, 0] = 12
     states["town"][..., :6] = 99
-    states["town"][..., 6:] = np.arange(8) / 8
+    states["town"][..., 6:14] = np.arange(8) / 8
     states["tile_categorical"][..., :TILE_COUNT, 0] = TILE_KINDS.index("PLANT")
     states["unit_active"][..., :2] = True
     states["opponent_unit_active"][..., :4] = True

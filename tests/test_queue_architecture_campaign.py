@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from kaggriculture.production import production_model_config
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 ARMS = ("control", "critic-source", "writeback", "tile-bias", "hardness-league")
 DELTAS = {
@@ -60,12 +62,12 @@ def campaign(request, tmp_path, monkeypatch):
     if request.param:
         argv.append("--submit")
     monkeypatch.setattr(sys, "argv", argv)
-    before_model = module.production_model_config()
+    before_model = production_model_config()
     module.main()
     manifest_path = tmp_path / "artifacts" / "probes" / "test-campaign" / "campaign.json"
     manifest = json.loads(manifest_path.read_text())
     assert fake_script.read_bytes() == original_source
-    assert module.production_model_config() == before_model
+    assert production_model_config() == before_model
     # The mocked freeze is the sole source operation. Launch planning only
     # writes its manifest; it must not create models, runs, or source patches.
     assert {path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()} == {
@@ -86,8 +88,9 @@ def campaign(request, tmp_path, monkeypatch):
 def test_campaign_changes_only_the_named_arm_and_keeps_full_production_shape(campaign):
     jobs = campaign.manifest["jobs"]
     architecture = campaign.module.resolve_architecture(campaign.module.ENTITY_ATTENTION)
+    # The historical entity-attention control, not whatever production now is.
     config_args = campaign.module.model_config_arguments(
-        architecture, campaign.module.production_model_config()
+        architecture, architecture.config_class().to_dict()
     )
     base = dict(zip(config_args[::2], config_args[1::2], strict=True))
     assert base["--shared-memory-kv"] == "false"
@@ -121,6 +124,7 @@ def test_campaign_changes_only_the_named_arm_and_keeps_full_production_shape(cam
                 for term in ("latent", "value"):
                     assert _argument(command, f"--structured-critic-{term}-coefficient") == "1.0"
         learning = jobs[f"learn-{arm}"]["command"]
+        assert _argument(learning, "--architecture") == campaign.module.ENTITY_ATTENTION
         assert "--external-eval" not in learning
         assert _argument(learning, "--max-hours") == "0.4"
         assert _argument(learning, "--seed") == "20260812"
@@ -286,13 +290,13 @@ def test_bixt_only_campaign_queues_its_four_job_chain_without_original_arms(tmp_
         "argv",
         [str(fake_script), "--name", "bixt-only", "--validation-job", "7701", "--arms", "bixt"],
     )
-    before_model = module.production_model_config()
+    before_model = production_model_config()
     module.main()
     manifest_path = tmp_path / "artifacts" / "probes" / "bixt-only" / "campaign.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["arms"] == ["bixt"]
     assert module.DEFAULT_ARMS == ARMS
-    assert module.production_model_config() == before_model
+    assert production_model_config() == before_model
     assert frozen == [tmp_path / "artifacts" / "source-snapshots" / identity["sha256"]]
     assert [path for path in tmp_path.rglob("*") if path.is_file()] == [manifest_path]
     jobs = manifest["jobs"]

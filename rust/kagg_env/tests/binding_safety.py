@@ -117,16 +117,21 @@ def child_noncontiguous_inputs() -> None:
 def assert_unknown_builtin_code_rejected() -> None:
     native = load_native(build=False, release=True)
     environment = native.BatchEnv(np.arange(BATCH, dtype=np.uint64))
-    inputs = sampler_inputs()
-    inputs[-1] = np.full(ROWS, np.iinfo(np.uint8).max, dtype=np.uint8)
-    before = step_of(environment)
-    try:
-        environment.sample_and_step_into(*inputs, environment.sample_buffers())
-    except ValueError as error:
-        assert "unknown agent code" in str(error), error
-    else:
-        raise AssertionError("unknown builtin agent code was accepted")
-    assert step_of(environment) == before
+    # The external code is known but needs a staged action, which no row has.
+    for code, message in [
+        (5, "unknown agent code"),
+        (native.EXTERNAL_AGENT_CODE, "no action was staged"),
+    ]:
+        inputs = sampler_inputs()
+        inputs[-1] = np.full(ROWS, code, dtype=np.uint8)
+        before = step_of(environment)
+        try:
+            environment.sample_and_step_into(*inputs, environment.sample_buffers())
+        except ValueError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError(f"agent code {code} was accepted")
+        assert step_of(environment) == before
 
 
 def assert_output_rejected_without_step(

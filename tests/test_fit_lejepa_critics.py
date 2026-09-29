@@ -22,7 +22,15 @@ def diagnostic():
 
 def test_entity_critic_takes_reference_critic_options_on_actor_geometry(diagnostic):
     actor = LejepaConfig(critic_readout_ffn=True, critic_source_read=False)
-    reference = asdict(EntityConfig(critic_readout_ffn=False, critic_source_read=True))
+    # The reference run's geometry is the actor's; only its critic options differ.
+    reference = asdict(
+        EntityConfig(
+            observation_schema_version=actor.observation_schema_version,
+            action_interface=actor.action_interface,
+            critic_readout_ffn=False,
+            critic_source_read=True,
+        )
+    )
     config = diagnostic.entity_critic_config(actor, reference)
     assert type(config) is EntityConfig
     assert not config.critic_readout_ffn and config.critic_source_read

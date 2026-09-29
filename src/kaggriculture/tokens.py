@@ -39,25 +39,31 @@ from kaggriculture.constants import (
     SHED_CAPACITY,
     SHOP_NAMES,
     TURNS_PER_DAY,
+    sale_proceeds,
     shed_access_tiles,
 )
 
 TILE_COUNT = BOARD_SIZE * BOARD_SIZE
 # Every supported schema reads a prefix of one tokenized layout, so a single
 # tokenization (Python here, the native extension for rollouts) serves models of
-# every supported version from the same staged arrays -- v3 artifacts keep
+# every supported version from the same staged arrays -- older artifacts keep
 # acting on current rollouts and inference -- and one encoded BC cache serves
-# both. (League snapshots must still match the learner's whole config.)
+# them all. (League snapshots must still match the learner's whole config.)
 # `OBSERVATION_SCHEMA_VERSION` names the newest schema, whose layout both
 # tokenizers emit; a model's config names the schema it consumes, and its
-# embedder slices that schema's prefix (`farm_token_fields`).
+# embedder slices that schema's prefix (`product_token_fields`,
+# `farm_token_fields`, `town_token_fields`; the critic's private columns by
+# `product_private_fields`).
 #
 # v3: per-unit carried-item insertion ranks (README).
 # v4: adds the farm token's `money_margin`.
-OBSERVATION_SCHEMA_VERSION = 4
-SUPPORTED_OBSERVATION_SCHEMA_VERSIONS = frozenset((3, 4))
-# The common model-config default remains v3 for production entity and other
-# structured families. Fresh LeJEPA configs override it to v4; saved v3 model
+# v5: adds the town token's per-shop `first_unlock` positions.
+# v6: adds the product token's `held_value` and the farm token's `liquidation`
+#     and `liquidation_margin` (and the critic's `opponent_held_value`).
+OBSERVATION_SCHEMA_VERSION = 6
+SUPPORTED_OBSERVATION_SCHEMA_VERSIONS = frozenset((3, 4, 5, 6))
+# The common model-config default remains v3 for entity-attention and the other
+# structured families. Fresh LeJEPA configs, production's, override it to v4; saved v3 model
 # configs still carry their explicit version for loading and resume.
 DEFAULT_OBSERVATION_SCHEMA_VERSION = 3
 
@@ -393,7 +399,17 @@ PRODUCT_TOKEN_FIELDS = (
     "base_price",  # BASE_PRICE / max BASE_PRICE
     "shed_stock",  # own shed count / SHED_CAPACITY
     "carried_stock",  # summed across own units / SHED_CAPACITY
+    # Schema v6. The exact coins selling every unit of this product the seat
+    # holds (shed and hands) into the current market would bank, one unit at a
+    # time: each sale restocks the market, so the quote walks down the curve
+    # (`sale_proceeds`, the engine's sell arithmetic). / HELD_VALUE_SCALE, so a
+    # full shed of melons at base price is 1. `price` times the stock
+    # overstates a large stock by exactly the impact this prices in.
+    "held_value",
 )
+_PRODUCT_TOKEN_WIDTHS = {3: 5, 4: 5, 5: 5, 6: 6}
+# Coins per unit of `held_value`: a full shed at the highest base price.
+HELD_VALUE_SCALE = float(SHED_CAPACITY * max(BASE_PRICE.values()))
 ANIMAL_TOKEN_FIELDS = (
     "purchase_price",  # ANIMAL_COST / max ANIMAL_COST; animals have no market quote
     "shed_stock",  # own shed count / SHED_CAPACITY
@@ -422,8 +438,21 @@ FARM_TOKEN_FIELDS = (
     # it unscaled (not /12 like `money`) keeps the decision-relevant range at
     # the magnitude of the other [0, 1] inputs rather than 12x below them.
     "money_margin",
+    # Schema v6. What this farm would bank selling out now -- money plus its
+    # products' `held_value` in coins, the engine's liquidation value (the
+    # shaping potential's input) -- on `money`'s signed log1p / 12 scale.
+    # Held stock is private, so the opponent row carries the opponent's money
+    # alone, the public lower bound on its liquidation; the centralized critic
+    # reads the opponent's true proceeds from `opponent_held_value`.
+    "liquidation",
+    # Schema v6. `money_margin` over the `liquidation` column's coins: this
+    # row's signed log1p liquidation minus the other row's, formed in float64,
+    # unscaled, so the rows are exact negatives. From the own row it is the
+    # margin the seat would lead by if it sold out now and the opponent kept
+    # only its bank: a stockpile no longer reads as a deficit.
+    "liquidation_margin",
 )
-_FARM_TOKEN_WIDTHS = {3: 4, 4: len(FARM_TOKEN_FIELDS)}
+_FARM_TOKEN_WIDTHS = {3: 4, 4: 5, 5: 5, 6: 7}
 TOWN_TOKEN_FIELDS = (
     "day",
     "hour",
@@ -431,16 +460,32 @@ TOWN_TOKEN_FIELDS = (
     "remaining",
     "hour_sin",
     "hour_cos",
-    *(f"shop_{name}" for name in SHOP_NAMES),
+    *(f"shop_{name}" for name in SHOP_NAMES),  # unlocked instances / 8
+    # Schema v5. (1 + the index of this shop's first instance in the town's
+    # unlock order) / 8, or 0 while it is locked. Counts alone are a multiset:
+    # they cannot say which shop opened first, and demand planning keyed on the
+    # opening shops reads that order. With the counts these recover the order
+    # of the distinct shops; where a repeat instance fell stays unencoded.
+    *(f"shop_{name}_first_unlock" for name in SHOP_NAMES),
 )
+_TOWN_TOKEN_WIDTHS = {
+    3: 6 + len(SHOP_NAMES),
+    4: 6 + len(SHOP_NAMES),
+    5: 6 + 2 * len(SHOP_NAMES),
+    6: 6 + 2 * len(SHOP_NAMES),
+}
 
 
 # Extra economy columns the centralized critic appends from the opponent's
-# private state; the actor never sees them.
+# private state; the actor never sees them. Each is the opponent's own view of
+# the matching actor column, which is how rollouts stage it (the paired seat's
+# tokens, `rollout._PRODUCT_STOCK_COLUMNS`), and it is schema-sliced like them.
 PRODUCT_PRIVATE_FIELDS = (
     "opponent_shed_stock",  # opponent shed count / SHED_CAPACITY
     "opponent_carried_stock",  # summed across opponent units / SHED_CAPACITY
+    "opponent_held_value",  # schema v6: the opponent's `held_value`
 )
+_PRODUCT_PRIVATE_WIDTHS = {3: 2, 4: 2, 5: 2, 6: 3}
 ANIMAL_PRIVATE_FIELDS = (
     "opponent_shed_stock",
     "opponent_carried_stock",
@@ -459,12 +504,33 @@ class EconomyTokens:
     town: np.ndarray  # [len(TOWN_TOKEN_FIELDS)] float32
 
 
-def farm_token_fields(schema_version: int) -> tuple[str, ...]:
-    """The prefix of ``FARM_TOKEN_FIELDS`` a model of this schema consumes."""
+def _schema_prefix(
+    fields: tuple[str, ...], widths: dict[int, int], schema_version: int
+) -> tuple[str, ...]:
     try:
-        return FARM_TOKEN_FIELDS[: _FARM_TOKEN_WIDTHS[schema_version]]
+        return fields[: widths[schema_version]]
     except KeyError:
         raise ValueError(f"unsupported observation schema version {schema_version!r}") from None
+
+
+def product_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``PRODUCT_TOKEN_FIELDS`` a model of this schema consumes."""
+    return _schema_prefix(PRODUCT_TOKEN_FIELDS, _PRODUCT_TOKEN_WIDTHS, schema_version)
+
+
+def farm_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``FARM_TOKEN_FIELDS`` a model of this schema consumes."""
+    return _schema_prefix(FARM_TOKEN_FIELDS, _FARM_TOKEN_WIDTHS, schema_version)
+
+
+def town_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``TOWN_TOKEN_FIELDS`` a model of this schema consumes."""
+    return _schema_prefix(TOWN_TOKEN_FIELDS, _TOWN_TOKEN_WIDTHS, schema_version)
+
+
+def product_private_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``PRODUCT_PRIVATE_FIELDS`` a critic of this schema consumes."""
+    return _schema_prefix(PRODUCT_PRIVATE_FIELDS, _PRODUCT_PRIVATE_WIDTHS, schema_version)
 
 
 def _signed_log_money(value: float) -> float:
@@ -476,6 +542,28 @@ def _money_feature(value: float) -> float:
     # Division is sign-symmetric, so this is bit-identical to scaling inside
     # the copysign, which is how the native tokenizer orders it.
     return _signed_log_money(value) / 12.0
+
+
+def _carried_items(private: dict) -> dict[str, int]:
+    """Each product and animal summed across one seat's unit inventories."""
+    return {
+        item: sum(int(unit.get(item, 0) or 0) for unit in private.get("inventories") or [])
+        for item in (*PRODUCTS, *ANIMALS)
+    }
+
+
+def _held_proceeds(shed: dict, carried: dict[str, int], market: dict) -> dict[str, int]:
+    """Each product's exact coins if one seat sold its shed and carried stock now."""
+    inventory = market.get("inventory") or {}
+    return {
+        item: sale_proceeds(
+            item,
+            int(shed.get(item, 0) or 0) + carried[item],
+            int(inventory.get(item, MARKET_I0) or 0),
+            market.get("params"),
+        )
+        for item in PRODUCTS
+    }
 
 
 def tokenize_economy(observation: dict) -> EconomyTokens:
@@ -490,10 +578,8 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
     prices = market.get("prices") or {}
     shed = private.get("shed") or {}
     seeds = private.get("seeds") or {}
-    carried = {
-        item: sum(int(unit.get(item, 0) or 0) for unit in private.get("inventories") or [])
-        for item in (*PRODUCTS, *ANIMALS)
-    }
+    carried = _carried_items(private)
+    proceeds = _held_proceeds(shed, carried, market)
     max_base_price = float(max(BASE_PRICE.values()))
 
     products = np.asarray(
@@ -504,6 +590,7 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 BASE_PRICE[item] / max_base_price,
                 float(shed.get(item, 0) or 0) / SHED_CAPACITY,
                 carried[item] / SHED_CAPACITY,
+                proceeds[item] / HELD_VALUE_SCALE,
             )
             for item in PRODUCTS
         ],
@@ -538,6 +625,11 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
         ],
         dtype=np.float32,
     )
+    # The seat's own stock is the only held stock it observes (see `liquidation`).
+    liquidation = {
+        player: float(farms[player].get("money", 0) or 0) + sum(proceeds.values()),
+        1 - player: float(farms[1 - player].get("money", 0) or 0),
+    }
     farm_rows = []
     for farm_index in (player, 1 - player):
         farm = farms[farm_index]
@@ -549,6 +641,9 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 len(farm.get("hands") or []) / float(MAX_UNITS - 1),
                 float(farm.get("hires_today", 0) or 0) / float(MAX_UNITS - 1),
                 _signed_log_money(farm.get("money", 0)) - _signed_log_money(other.get("money", 0)),
+                _money_feature(liquidation[farm_index]),
+                _signed_log_money(liquidation[farm_index])
+                - _signed_log_money(liquidation[1 - farm_index]),
             )
         )
     shops = (observation.get("town") or {}).get("unlocked_shops") or []
@@ -556,6 +651,10 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
         (
             clock_features(observation),
             np.asarray([shops.count(name) / 8.0 for name in SHOP_NAMES], dtype=np.float32),
+            np.asarray(
+                [(shops.index(name) + 1) / 8.0 if name in shops else 0.0 for name in SHOP_NAMES],
+                dtype=np.float32,
+            ),
         )
     )
     return EconomyTokens(
@@ -569,17 +668,23 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
 
 def opponent_economy_columns(
     opponent_private: dict,
+    market: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Critic-only columns from the opponent's private shed, hands, and seeds."""
+    """Critic-only columns from the opponent's private shed, hands, and seeds.
+
+    ``market`` is the shared observation's; held stock is valued against it.
+    """
     shed = opponent_private.get("shed") or {}
     seeds = opponent_private.get("seeds") or {}
-    carried = {
-        item: sum(int(unit.get(item, 0) or 0) for unit in opponent_private.get("inventories") or [])
-        for item in (*PRODUCTS, *ANIMALS)
-    }
+    carried = _carried_items(opponent_private)
+    proceeds = _held_proceeds(shed, carried, market)
     products = np.asarray(
         [
-            (float(shed.get(item, 0) or 0) / SHED_CAPACITY, carried[item] / SHED_CAPACITY)
+            (
+                float(shed.get(item, 0) or 0) / SHED_CAPACITY,
+                carried[item] / SHED_CAPACITY,
+                proceeds[item] / HELD_VALUE_SCALE,
+            )
             for item in PRODUCTS
         ],
         dtype=np.float32,
@@ -620,9 +725,9 @@ class StructuredObservation:
     crops: np.ndarray  # [len(CROPS), len(CROP_TOKEN_FIELDS)] float16
     farms: np.ndarray  # [2, len(FARM_TOKEN_FIELDS)] float16
     town: np.ndarray  # [len(TOWN_TOKEN_FIELDS)] float16
-    critic_products: np.ndarray | None  # [len(PRODUCTS), 2] float16
-    critic_animals: np.ndarray | None  # [len(ANIMALS), 2] float16
-    critic_crops: np.ndarray | None  # [len(CROPS), 1] float16
+    critic_products: np.ndarray | None  # [len(PRODUCTS), len(PRODUCT_PRIVATE_FIELDS)] float16
+    critic_animals: np.ndarray | None  # [len(ANIMALS), len(ANIMAL_PRIVATE_FIELDS)] float16
+    critic_crops: np.ndarray | None  # [len(CROPS), len(CROP_PRIVATE_FIELDS)] float16
     opponent_unit_categorical: np.ndarray | None  # [MAX_UNITS, 4] int8
     opponent_unit_continuous: np.ndarray | None  # [MAX_UNITS, ...] float16
     opponent_unit_active: np.ndarray | None  # [MAX_UNITS] bool
@@ -649,7 +754,9 @@ def encode_structured_observation(
     critic_products = critic_animals = critic_crops = None
     opponent_categorical = opponent_continuous = opponent_active = None
     if opponent_private is not None:
-        critic_products, critic_animals, critic_crops = opponent_economy_columns(opponent_private)
+        critic_products, critic_animals, critic_crops = opponent_economy_columns(
+            opponent_private, observation.get("market") or {}
+        )
         critic_products = critic_products.astype(np.float16)
         critic_animals = critic_animals.astype(np.float16)
         critic_crops = critic_crops.astype(np.float16)
@@ -707,6 +814,7 @@ __all__ = [
     "DEFAULT_OBSERVATION_SCHEMA_VERSION",
     "FARM_IDENTITIES",
     "FARM_TOKEN_FIELDS",
+    "HELD_VALUE_SCALE",
     "N_TILE_CATEGORICAL",
     "N_TILE_CONTINUOUS",
     "N_UNIT_CATEGORICAL",
@@ -736,7 +844,10 @@ __all__ = [
     "encode_structured_observation",
     "farm_token_fields",
     "opponent_economy_columns",
+    "product_private_fields",
+    "product_token_fields",
     "tokenize_economy",
     "tokenize_farm_tiles",
     "tokenize_units",
+    "town_token_fields",
 ]

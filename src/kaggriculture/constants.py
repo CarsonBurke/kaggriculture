@@ -230,6 +230,29 @@ def market_price(
     return max(PRICE_FLOOR, round(price))
 
 
+def sale_proceeds(
+    item: str,
+    units: int,
+    inventory: int,
+    params: dict[str, dict[str, int | float | str]] | None = None,
+) -> int:
+    """Exact coins from selling ``units`` of ``item`` one at a time into the market.
+
+    Mirrors the engine's sell arithmetic: each unit quotes at the current
+    market inventory, and a sale restocks the market only while the quote sits
+    above the price floor -- so once a quote reaches the floor, every remaining
+    unit sells at it.
+    """
+    proceeds = 0
+    for sold in range(units):
+        price = market_price(item, inventory, params)
+        if price <= PRICE_FLOOR:
+            return proceeds + (units - sold) * price
+        proceeds += price
+        inventory += 1
+    return proceeds
+
+
 def fibonacci_hire_cost(hires_today: int) -> int:
     """Return the engine's 1, 1, 2, 3, 5, ... daily hire cost."""
     a, b = 1, 1

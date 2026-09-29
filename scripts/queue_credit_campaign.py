@@ -16,6 +16,7 @@ from kaggriculture.production import (
     build_training_command,
 )
 from kaggriculture.provenance import file_sha256, freeze_source, source_identity
+from kaggriculture.registry import ENTITY_ATTENTION
 
 ARMS = {
     "monte-carlo": {"--actor-gae-lambda": "1.0"},
@@ -33,6 +34,9 @@ def replace_argument(command: list[str], flag: str, value: str) -> None:
     command[command.index(flag) + 1] = value
 
 
+#: The baseline's actor trace, VAPO's `1 - 1 / (0.05 * 719)`, which every arm
+#: but the Monte Carlo one keeps after production adopted lambda 1.
+HISTORICAL_ACTOR_GAE_LAMBDA = 1 - 1 / (0.05 * 719)
 MAX_JOB_MINUTES = 30
 TRAINER_HOURS = 27 / 60
 
@@ -50,13 +54,20 @@ def build_commands(root: Path, source: Path, output: Path, actor: Path, arms: li
             rollout_forward_mode=PRODUCTION_ROLLOUT_FORWARD_MODE,
             update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
             initial_actors=(actor,),
+            # The baseline these arms are measured against is entity-attention.
+            architecture=ENTITY_ATTENTION,
         )
         train[1] = str(source / "scripts/train_ppo.py")
         train.remove("--external-eval")
+        # Online-proxy autocull is this campaign's stop rule; the architecture
+        # panel that production later adopted cannot share a run with it.
         train.append("--autocull")
-        # Preserve this named historical experiment as production defaults evolve.
+        replace_argument(train, "--architecture-panel", "0")
+        # Pin the mechanisms this experiment names as production defaults evolve;
+        # the rest of the schedule (rates, minibatch, lanes) follows production.
         for term in ("latent", "value"):
             replace_argument(train, f"--structured-critic-{term}-coefficient", "1.0")
+        replace_argument(train, "--actor-gae-lambda", str(HISTORICAL_ACTOR_GAE_LAMBDA))
         for flag, value in ARMS[arm].items():
             replace_argument(train, flag, value)
         benchmark = [

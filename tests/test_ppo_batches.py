@@ -101,8 +101,9 @@ def _update_fixture():
     actor = FarmActor(model_config)
     critic = DistributionalCritic(model_config)
     rollout = collect_self_play(actor, games=1, seed_start=304, episode_steps=5, sampling_seed=305)
+    # Dense noise is not a completed-game outcome; label it as the shaped mode.
     rollout.rewards[:] = np.random.default_rng(306).normal(0, 0.1, rollout.rewards.shape)
-    return actor, critic, rollout
+    return actor, critic, replace(rollout, reward_mode="shaped")
 
 
 def test_update_padding_preserves_parameters_and_reported_objectives() -> None:

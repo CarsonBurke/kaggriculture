@@ -14,9 +14,10 @@ import kaggriculture.ppo
 from kaggriculture import telemetry
 from kaggriculture.actions import MarketKind
 from kaggriculture.actor_dynamics import ActorDynamics
+from kaggriculture.bank_advantage import UNGROUPED, own_bank_advantages
 from kaggriculture.constants import EPISODE_STEPS, TURNS_PER_DAY
 from kaggriculture.model import DistributionalCritic, FarmActor, ModelConfig
-from kaggriculture.policy import component_logprobs
+from kaggriculture.policy import categorical_statistics, component_logprobs
 from kaggriculture.ppo import (
     DEFAULT_ACTOR_GAE_LAMBDA,
     MAX_UPDATE_REPLAY_KL,
@@ -781,6 +782,8 @@ def test_policy_loss_reduction_preserves_clipping_and_excludes_padded_states(
     """Exercise real PPO backward and reporting across unequal, padded batches."""
     actor, critic = _small_update_models()
     rollout = collect_self_play(actor, games=1, seed_start=95, episode_steps=6, sampling_seed=10)
+    # The synthetic dense rewards below are not terminal match outcomes.
+    rollout = replace(rollout, reward_mode="shaped")
     rollout.valid[:] = False
     rollout.valid[0, :5] = True
     rollout.rewards[0, :5] = [1.0, -3.0, 2.0, -2.0, 1.0]
@@ -1074,6 +1077,40 @@ def test_unchanged_actor_replay_has_unit_importance_ratios() -> None:
         torch.testing.assert_close(ratios, torch.ones_like(ratios), atol=1e-5, rtol=1e-5)
 
 
+def test_the_replay_audit_runs_the_bonus_graph_and_measures_the_same_forward(
+    monkeypatch,
+) -> None:
+    """A positive coefficient audits the entropy-differentiating update graph."""
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(model_config)
+    rollout = collect_self_play(actor, games=1, seed_start=94, episode_steps=12, sampling_seed=12)
+    original = kaggriculture.ppo._policy_sums
+    requested: list[bool] = []
+
+    def recording(*args, entropy_gradient: bool = False, **kwargs):
+        requested.append(entropy_gradient)
+        return original(*args, entropy_gradient=entropy_gradient, **kwargs)
+
+    monkeypatch.setattr(kaggriculture.ppo, "_policy_sums", recording)
+
+    def audit(entropy_gradient: bool) -> dict[str, float | int]:
+        requested.clear()
+        parity = update_replay_parity(
+            actor,
+            rollout,
+            minibatch_size=4,
+            compile_mode=UNCOMPILED_UPDATE_COMPILE_MODE,
+            autocast_enabled=False,
+            entropy_gradient=entropy_gradient,
+        )
+        assert requested and set(requested) == {entropy_gradient}
+        return parity
+
+    assert audit(True) == audit(False)
+
+
 def test_update_replay_parity_gates_the_update_path_forward() -> None:
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
@@ -1344,6 +1381,7 @@ def test_update_uses_rollout_stored_sampler_likelihoods(
     baseline_rollout = collect_self_play(
         baseline_actor, games=1, seed_start=95, episode_steps=3, sampling_seed=10
     )
+    baseline_rollout = replace(baseline_rollout, reward_mode="shaped")
     shifted_rollout = copy.deepcopy(baseline_rollout)
     baseline_rollout.rewards[:] = 1.0
     shifted_rollout.rewards[:] = 1.0
@@ -1638,6 +1676,45 @@ def test_over_target_kl_still_steps_the_actor_predictor() -> None:
     assert all(state["step"] >= 1 for state in dynamics_optimizer.state.values() if "step" in state)
 
 
+def test_structured_update_rematerialization_trades_memory_and_nothing_else() -> None:
+    """Retaining the trunk hands the predictor the same decision belief, not the full one."""
+
+    def update(rematerialize_actor_update: bool) -> dict[str, torch.Tensor]:
+        torch.manual_seed(0)
+        actor, rollout = _structured_rollout_with_quantity_orders(seed_start=227, sampling_seed=55)
+        critic = StructuredCritic(_small_structured_config())
+        config = PpoConfig(
+            optimizer="adamw",
+            epochs=1,
+            minibatch_size=1 << 12,
+            target_kl=1.0,
+            use_bfloat16=False,
+            structured_decision_coefficient=0.5,
+            rematerialize_actor_update=rematerialize_actor_update,
+        )
+        dynamics = ActorDynamics(_small_structured_config())
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+        metrics = update_ppo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(56),
+            structured_dynamics=dynamics,
+            structured_dynamics_optimizer=make_structured_dynamics_optimizer(dynamics, config),
+            structured_actor_auxiliary=True,
+            auxiliary_generator=np.random.default_rng(57),
+        )
+        assert metrics["structured_actor_auxiliary_updates"] >= 1
+        return {name: value.detach().clone() for name, value in actor.named_parameters()}
+
+    reference = update(True)
+    for name, value in update(False).items():
+        torch.testing.assert_close(value, reference[name], rtol=0, atol=0, msg=name)
+
+
 def test_one_ppo_update_is_finite() -> None:
     model_config = ModelConfig(
         cnn_width=16, cnn_blocks=1, model_dim=32, transformer_layers=3, attention_heads=4
@@ -1720,6 +1797,7 @@ def test_policy_and_critic_gradients_are_not_clipped(
         episode_steps=4,
         sampling_seed=10,
     )
+    rollout = replace(rollout, reward_mode="shaped")
     rollout.rewards[:] = np.random.default_rng(12).normal(0.0, 0.05, size=rollout.rewards.shape)
     config = PpoConfig(
         optimizer="adamw",
@@ -1929,6 +2007,7 @@ def test_a_return_past_the_outermost_atom_saturates_and_is_reported() -> None:
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
     # A reward far outside the critic's calibrated support, so the target
     # saturates no matter what the critic predicts.
+    rollout = replace(rollout, reward_mode="shaped")
     rollout.rewards[:, -1] = np.float32(9.0)
     config = PpoConfig(epochs=1, minibatch_size=8, use_bfloat16=False)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
@@ -1969,6 +2048,7 @@ def test_scalar_critic_regresses_on_an_unclipped_return() -> None:
     critic = DistributionalCritic(model_config)
     assert critic.value_head.out_features == 1
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    rollout = replace(rollout, reward_mode="shaped")
     rollout.rewards[:, -1] = np.float32(9.0)
     config = PpoConfig(
         epochs=1, critic_epochs=6, minibatch_size=8, use_bfloat16=False, critic_learning_rate=3.0e-2
@@ -2029,8 +2109,8 @@ def test_extra_critic_epochs_refit_the_critic_without_touching_the_actor() -> No
         _validate_config(PpoConfig(epochs=4, critic_epochs=2))
 
 
-def test_zero_policy_advantage_leaves_actor_unchanged(monkeypatch) -> None:
-    """Measured entropy must not create a gradient outside the PPO surrogate."""
+def _zero_advantage_wave(monkeypatch) -> tuple[FarmActor, DistributionalCritic, object]:
+    """A wave whose every advantage, and so every surrogate gradient, is zero."""
     model_config = ModelConfig(
         cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
     )
@@ -2045,17 +2125,20 @@ def test_zero_policy_advantage_leaves_actor_unchanged(monkeypatch) -> None:
         "replay_behavior_values",
         lambda critic, architecture, staged, **kwargs: torch.zeros(staged["unit_actions"].shape[0]),
     )
+    return actor, critic, rollout
+
+
+def _zero_advantage_update(actor, critic, rollout, **overrides) -> dict:
     config = PpoConfig(
         epochs=1,
         minibatch_size=rollout.state_count,
         lr_warmup_steps=0,
         use_bfloat16=False,
         actor_learning_rate=1.0e-2,
+        **overrides,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
-    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
-
-    metrics = update_ppo(
+    return update_ppo(
         actor,
         critic,
         actor_optimizer,
@@ -2065,11 +2148,238 @@ def test_zero_policy_advantage_leaves_actor_unchanged(monkeypatch) -> None:
         generator=np.random.default_rng(11),
     )
 
+
+def test_zero_policy_advantage_leaves_actor_unchanged(monkeypatch) -> None:
+    """Measured entropy must not create a gradient outside the PPO surrogate."""
+    actor, critic, rollout = _zero_advantage_wave(monkeypatch)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    metrics = _zero_advantage_update(actor, critic, rollout)
+
     assert metrics["actor_updates"] == 1
     assert metrics["policy_loss"] == pytest.approx(0.0, abs=1e-12)
     assert metrics["entropy"] > 0.0
+    assert "entropy_bonus" not in metrics
     for name, parameter in actor.named_parameters():
         torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+
+def test_entropy_bonus_is_the_only_gradient_when_policy_advantage_is_zero(monkeypatch) -> None:
+    """With the surrogate silenced, whatever the actor does is the bonus's doing.
+
+    The reported entropy rising over the identical states is then the bonus
+    ascending the very quantity the `entropy` metric measures, while
+    `policy_loss` keeps reporting the surrogate alone.
+    """
+    actor, critic, rollout = _zero_advantage_wave(monkeypatch)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+
+    first = _zero_advantage_update(actor, critic, rollout, entropy_coefficient=1.0)
+    second = _zero_advantage_update(actor, critic, rollout, entropy_coefficient=1.0)
+
+    assert first["policy_loss"] == pytest.approx(0.0, abs=1e-12)
+    assert second["entropy"] > first["entropy"]
+    # States reduction: the bonus is the coefficient times each state's summed
+    # component entropy, which is at least the per-component mean.
+    # By hand: one minibatch holds every state, so the bonus is the coefficient
+    # times the summed component entropy over the state count, and the entropy
+    # metric is that same sum over the component count.
+    valid = rollout.valid
+    components = (
+        rollout.unit_active.sum(axis=-1)
+        + rollout.market_active.sum(axis=-1)
+        + rollout.market_quantity_active.sum(axis=-1)
+    )[valid].sum()
+    assert first["entropy_bonus"] == pytest.approx(
+        1.0 * first["entropy"] * components / valid.sum()
+    )
+    # Components reduction shares the entropy metric's denominator exactly.
+    per_component = _zero_advantage_update(
+        actor, critic, rollout, entropy_coefficient=0.5, policy_loss_reduction="components"
+    )
+    assert per_component["entropy_bonus"] == pytest.approx(0.5 * per_component["entropy"])
+    assert any(
+        not torch.equal(parameter, before[name]) for name, parameter in actor.named_parameters()
+    )
+
+
+def test_a_non_finite_entropy_bonus_is_refused_before_the_actor_steps(monkeypatch) -> None:
+    """The guard reads the optimized objective, not only the reported surrogate."""
+    actor, critic, rollout = _zero_advantage_wave(monkeypatch)
+    original = kaggriculture.ppo._policy_sums
+
+    def poisoned(*args, **kwargs):
+        terms = original(*args, **kwargs)
+        return (terms[0], terms[1] * float("inf"), *terms[2:])
+
+    monkeypatch.setattr(kaggriculture.ppo, "_policy_sums", poisoned)
+    before = {name: parameter.detach().clone() for name, parameter in actor.named_parameters()}
+    with pytest.raises(FloatingPointError, match="non-finite entropy bonus"):
+        _zero_advantage_update(actor, critic, rollout, entropy_coefficient=0.01)
+    for name, parameter in actor.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=(
+                pytest.mark.cuda,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ),
+        ),
+    ],
+)
+def test_a_zero_entropy_coefficient_is_the_surrogate_only_update_bit_for_bit(
+    monkeypatch, request, device: str
+) -> None:
+    """Zero must neither move the optimum nor build the entropy derivative.
+
+    The reference forces every policy reduction to its pre-bonus contract --
+    entropy detached, never differentiated -- which is what the surrogate-only
+    update was. The zero coefficient must reproduce it to the bit while its own
+    reductions are never asked for an entropy gradient.
+
+    CUDA scatter-style backwards are nondeterministic run to run, so that arm
+    runs under deterministic algorithms, as `--deterministic-training` does.
+    """
+    if device == "cuda":
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        restore = (
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        request.addfinalizer(
+            lambda: torch.use_deterministic_algorithms(restore[0], warn_only=restore[1])
+        )
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    model_config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    torch.manual_seed(0)
+    initial_actor = FarmActor(model_config).to(device)
+    initial_critic = DistributionalCritic(model_config).to(device)
+    rollout = collect_self_play(
+        initial_actor, games=2, seed_start=94, episode_steps=12, sampling_seed=10
+    )
+    # Opposed terminal outcomes, so the surrogate has a real gradient to take.
+    last = rollout.valid.shape[1] - 1 - rollout.valid[:, ::-1].argmax(axis=1)
+    rollout.rewards[np.arange(last.size), last] = np.where(np.arange(last.size) % 2, -1.0, 1.0)
+    original = kaggriculture.ppo._policy_sums
+    requested: list[bool] = []
+
+    def recording(*args, entropy_gradient: bool = False, **kwargs):
+        requested.append(entropy_gradient)
+        terms = original(*args, entropy_gradient=entropy_gradient, **kwargs)
+        assert not terms[1].requires_grad
+        return terms
+
+    def surrogate_only(*args, entropy_gradient: bool = False, **kwargs):
+        return original(*args, entropy_gradient=False, **kwargs)
+
+    def run(policy_sums, **overrides) -> dict[str, torch.Tensor]:
+        monkeypatch.setattr(kaggriculture.ppo, "_policy_sums", policy_sums)
+        actor = copy.deepcopy(initial_actor)
+        critic = copy.deepcopy(initial_critic)
+        config = PpoConfig(
+            optimizer="adamw",
+            epochs=2,
+            minibatch_size=16,
+            lr_warmup_steps=0,
+            target_kl=1.0,
+            use_bfloat16=device == "cuda",
+            update_compile_mode="default",
+            **overrides,
+        )
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+        metrics = update_ppo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(11),
+        )
+        assert metrics["actor_updates"] > 1
+        assert "entropy_bonus" not in metrics
+        return {name: value.detach().clone() for name, value in actor.named_parameters()}
+
+    reference = run(surrogate_only)
+    for overrides in ({}, {"entropy_coefficient": 0.0}):
+        requested.clear()
+        for name, value in run(recording, **overrides).items():
+            torch.testing.assert_close(value, reference[name], rtol=0, atol=0, msg=name)
+        # Compiled, the reductions run as traced graph code, not per call.
+        if device == "cpu":
+            assert requested and not any(requested)
+    assert any(
+        not torch.equal(reference[name], value) for name, value in initial_actor.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("scope", ["components", "joint"])
+def test_the_entropy_gradient_ascends_only_active_decisions(scope: str) -> None:
+    """The bonus differentiates the same masked entropy sum the metric reports.
+
+    Detached by default, so the surrogate-only graph carries no entropy branch.
+    When asked for, one ascent step raises the reported sum, and the inactive
+    slots and the zero-weight wrapped state receive exactly no gradient.
+    """
+    generator = torch.Generator().manual_seed(3)
+    logits = tuple(
+        torch.randn(3, 2, width, generator=generator, requires_grad=True) for width in (5, 4, 6)
+    )
+    # Masked tails, as every real head has: their near-minimum log-probabilities
+    # are what turn a cotangent above one into NaN if they are differentiated.
+    masks = tuple(torch.arange(width) < width - 2 for width in (5, 4, 6))
+    masks = tuple(mask.expand(3, 2, -1) for mask in masks)
+    actions = torch.zeros(3, 2, dtype=torch.long)
+    active = tuple(torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 1.0]]) for _ in logits)
+    sample_weight = torch.tensor([1.0, 1.0, 0.0])
+
+    def entropy_sum(entropy_gradient: bool) -> torch.Tensor:
+        statistics = [
+            categorical_statistics(value, mask, actions)
+            for value, mask in zip(logits, masks, strict=True)
+        ]
+        return kaggriculture.ppo._policy_sums(
+            tuple(selected.detach() for selected, _ in statistics),
+            tuple(selected.detach() for selected, _ in statistics),
+            active,
+            tuple(entropy for _, entropy in statistics),
+            torch.zeros(3),
+            0.8,
+            1.28,
+            sample_weight=sample_weight,
+            policy_ratio_scope=scope,
+            entropy_gradient=entropy_gradient,
+        )[1]
+
+    assert not entropy_sum(False).requires_grad
+    before = entropy_sum(True)
+    gradients = torch.autograd.grad(4.0 * before, logits)
+    for gradient, mask in zip(gradients, masks, strict=True):
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient[~mask]) == 0
+        assert torch.count_nonzero(gradient[0, 1]) == 0
+        assert torch.count_nonzero(gradient[2]) == 0
+        assert torch.count_nonzero(gradient[:2]) > 0
+    with torch.no_grad():
+        for value, gradient in zip(logits, gradients, strict=True):
+            value.add_(gradient, alpha=0.1)
+    assert float(entropy_sum(False)) > float(before.detach())
+
+
+def test_entropy_coefficient_ships_disabled_and_rejects_negative_or_nonfinite() -> None:
+    assert PpoConfig().entropy_coefficient == 0.0
+    _validate_config(PpoConfig(entropy_coefficient=0.01))
+    for rejected in (-1.0e-3, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="entropy coefficient"):
+            _validate_config(PpoConfig(entropy_coefficient=rejected))
 
 
 def test_behavior_values_are_replayed_before_the_update_mutates_the_critic(monkeypatch) -> None:
@@ -2303,6 +2613,7 @@ def test_fused_actor_refreshes_projection_caches_after_one_ppo_minibatch() -> No
             episode_steps=8,
             sampling_seed=41,
         )
+    rollout = replace(rollout, reward_mode="shaped")
     rollout.rewards[:] = np.random.default_rng(42).normal(
         0.0,
         0.05,
@@ -3241,8 +3552,9 @@ def test_compiled_entity_critic_warmup_and_actor_update_keep_auxiliary_global() 
 )
 def test_entity_critic_refuses_undefined_temporal_or_joint_advantages(config, reason) -> None:
     critic = StructuredCritic(replace(_small_structured_config(), per_entity_critic=True))
+    actor = StructuredActor(critic.config)
     with pytest.raises(ValueError, match=reason):
-        update_ppo(None, critic, None, None, None, config, generator=np.random.default_rng(64))
+        update_ppo(actor, critic, None, None, None, config, generator=np.random.default_rng(64))
 
 
 def test_optimizer_ownership_requires_exact_disjoint_pairs() -> None:
@@ -3598,6 +3910,75 @@ def test_normalized_advantages_whiten_the_owned_states_and_keep_raw_statistics()
     np.testing.assert_allclose(whitened.value_targets, raw.value_targets, rtol=1e-6)
 
 
+def test_the_bank_stream_adds_to_grouped_actor_advantages_only() -> None:
+    """A_actor = A_outcome + beta * z on every valid state of a grouped trajectory.
+
+    Ungrouped rows keep their outcome advantage exactly, and the critic's targets
+    and the outcome statistics never see the stream.
+    """
+    rewards = np.zeros((5, 4), dtype=np.float32)
+    rewards[:, -1] = [1.0, 1.0, -1.0, 1.0, 1.0]
+    valid = np.ones((5, 4), dtype=np.bool_)
+    valid[3, 3] = False
+    rewards[3, 2], rewards[3, 3] = 1.0, 0.0
+    rollout = SimpleNamespace(
+        rewards=rewards,
+        valid=valid,
+        # Two (opponent, seat) groups of two, then an ungrouped row.
+        final_money=np.asarray([12_000.0, 9_000.0, 8_000.0, 11_000.0, 70_000.0], np.float32),
+    )
+    groups = np.asarray([0, 1, 0, 1, UNGROUPED])
+    values = np.full((5, 4), 0.25, dtype=np.float32)
+    config = PpoConfig(bank_advantage_coefficient=0.5, bank_advantage_scale_floor=1.0)
+
+    outcome = prepare_advantages(rollout, values, PpoConfig())
+    mixed = prepare_advantages(rollout, values, config, bank_groups=groups)
+
+    bank = own_bank_advantages(rollout.final_money, groups, scale_floor=1.0)
+    expected = outcome.advantages + 0.5 * bank.z[:, None] * valid
+    np.testing.assert_allclose(mixed.advantages, expected, rtol=1e-6)
+    np.testing.assert_array_equal(mixed.advantages[4], outcome.advantages[4])
+    assert (mixed.advantages[~valid] == 0.0).all()
+    # Deviations of +-4000 and -+2000 in the two groups: RMS sqrt(10) * 1000.
+    assert mixed.bank_metrics["bank_advantage_deviation_std"] == pytest.approx(1000 * 10**0.5)
+    assert mixed.bank_metrics["bank_advantage_own_bank_mean"] == pytest.approx(10_000.0)
+    assert mixed.bank_metrics["bank_advantage_grouped_fraction"] == pytest.approx(0.8)
+    # Trajectory 1 won with a bank below its group's; the other three agree.
+    assert mixed.bank_metrics["bank_advantage_sign_disagreement"] == pytest.approx(0.25)
+    np.testing.assert_array_equal(mixed.value_targets, outcome.value_targets)
+    np.testing.assert_array_equal(mixed.monte_carlo_returns, outcome.monte_carlo_returns)
+    assert mixed.raw_advantage_std == outcome.raw_advantage_std
+    assert outcome.bank_metrics == {}
+
+
+def test_the_bank_stream_refuses_a_wave_it_cannot_group() -> None:
+    rewards = np.zeros((2, 3), dtype=np.float32)
+    rewards[:, -1] = [1.0, -1.0]
+    rollout = SimpleNamespace(
+        rewards=rewards,
+        valid=np.ones((2, 3), dtype=np.bool_),
+        final_money=np.asarray([1.0, 2.0], dtype=np.float32),
+    )
+    values = np.zeros((2, 3), dtype=np.float32)
+    config = PpoConfig(bank_advantage_coefficient=0.5)
+    with pytest.raises(ValueError, match="needs the wave's bank groups"):
+        prepare_advantages(rollout, values, config)
+    with pytest.raises(ValueError, match="single learner"):
+        prepare_advantages(rollout, values, config, rows=np.arange(2), bank_groups=np.zeros(2))
+    with pytest.raises(ValueError, match="at least one grouped trajectory"):
+        prepare_advantages(rollout, values, config, bank_groups=np.full(2, UNGROUPED))
+    with pytest.raises(ValueError, match="one entry per trajectory"):
+        prepare_advantages(rollout, values, config, bank_groups=np.zeros(3, dtype=np.int64))
+    with pytest.raises(ValueError, match="gamma 1 and actor GAE lambda 1"):
+        _validate_config(PpoConfig(bank_advantage_coefficient=0.5, actor_gae_lambda=0.95))
+    with pytest.raises(ValueError, match="gamma 1 and actor GAE lambda 1"):
+        _validate_config(PpoConfig(bank_advantage_coefficient=0.5, gamma=0.99))
+    with pytest.raises(ValueError, match="bank advantage coefficient"):
+        _validate_config(PpoConfig(bank_advantage_coefficient=-0.1))
+    with pytest.raises(ValueError, match="scale floor"):
+        _validate_config(PpoConfig(bank_advantage_scale_floor=0.0))
+
+
 def test_first_and_last_critic_epoch_losses_separate_fitting_from_memorizing() -> None:
     """One averaged loss cannot tell a generalizing critic from a memorizing one.
 
@@ -3657,6 +4038,7 @@ def _population_wave() -> tuple[FarmActor, DistributionalCritic, object]:
     """
     actor, critic = _small_update_models()
     rollout = collect_self_play(actor, games=2, seed_start=90, episode_steps=8, sampling_seed=3)
+    rollout = replace(rollout, reward_mode="shaped")
     generator = np.random.default_rng(11)
     for rows, scale in ((_QUIET_ROWS, 0.05), (_LOUD_ROWS, 5.0)):
         rollout.rewards[rows] = generator.normal(

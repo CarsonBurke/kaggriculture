@@ -13,6 +13,7 @@ from kaggriculture.inference import (
     CheckpointAgent,
     load_actor_artifact,
 )
+from kaggriculture.lejepa_model import LejepaConfig
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import (
     actor_model_config,
@@ -27,6 +28,30 @@ from kaggriculture.registry import (
     resolve_architecture,
 )
 from kaggriculture.structured import StructuredActor, StructuredConfig
+
+
+def test_new_lejepa_defaults_do_not_reinterpret_saved_architectures() -> None:
+    fresh = LejepaConfig()
+    assert fresh.observation_schema_version == 4
+    assert fresh.unit_target_navigation and fresh.market_resource_conditioning
+    assert fresh.action_interface == 2 and fresh.unit_affordance_scorer and fresh.wdl_value
+    saved = {"observation_schema_version": 3}
+    restored = resolve_architecture("lejepa").build_config(saved)
+    assert not restored.unit_target_navigation and not restored.market_resource_conditioning
+    assert restored.action_interface == 1 and not restored.unit_affordance_scorer
+    assert not restored.wdl_value
+    assert saved == {"observation_schema_version": 3}
+    explicit = resolve_architecture("lejepa").build_config(
+        {
+            **saved,
+            "unit_target_navigation": True,
+            "market_resource_conditioning": True,
+            "action_interface": 2,
+            "unit_affordance_scorer": True,
+        }
+    )
+    assert explicit.unit_target_navigation and explicit.market_resource_conditioning
+    assert explicit.action_interface == 2 and explicit.unit_affordance_scorer
 
 
 def test_resolution_defaults_untagged_payloads_to_the_conv_family() -> None:
@@ -57,9 +82,11 @@ def test_architecture_of_maps_constructed_actors_back() -> None:
     assert architecture_of(conv).name == "entity-cnn"
 
 
-@pytest.mark.parametrize("schema_version,farm_width", [(3, 4), (4, 5)])
+@pytest.mark.parametrize(
+    "schema_version,farm_width,town_width", [(3, 4, 14), (4, 5, 14), (5, 5, 22)]
+)
 def test_structured_artifact_loads_and_acts_on_a_real_observation(
-    tmp_path, schema_version, farm_width
+    tmp_path, schema_version, farm_width, town_width
 ) -> None:
     torch.manual_seed(0)
     config = StructuredConfig(
@@ -91,6 +118,7 @@ def test_structured_artifact_loads_and_acts_on_a_real_observation(
     assert loaded_payload["architecture"] == "structured"
     assert loaded.config.observation_schema_version == schema_version
     assert loaded.trunk.economy.farm_projection.in_features == farm_width
+    assert loaded.trunk.economy.town_projection.in_features == town_width
 
     agent = CheckpointAgent(path)
     environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 11})
@@ -170,7 +198,7 @@ def test_entity_config_rejects_attention_without_strict_gqa(heads, kv_heads) -> 
 
 
 @pytest.mark.parametrize("builder", ["build_actor", "build_critic"])
-@pytest.mark.parametrize("version", [None, 1, 2, 5])
+@pytest.mark.parametrize("version", [None, 1, 2, 6])
 @pytest.mark.parametrize("architecture", ["structured", "entity-attention"])
 def test_structured_artifacts_reject_stale_observation_schema(
     builder, version, architecture

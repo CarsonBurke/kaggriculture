@@ -83,6 +83,17 @@ class Architecture:
             raise ValueError(
                 "stale structured observation schema; fresh encoding and training required"
             )
+        if self.name == LEJEPA:
+            # Saved policies predate these parameterized heads, the WDL
+            # critic, the all-quantities interface and the affordance scorer.
+            # New-model defaults must not silently change a checkpoint's
+            # architecture.
+            model_config = dict(model_config)
+            model_config.setdefault("action_interface", 1)
+            model_config.setdefault("unit_affordance_scorer", False)
+            model_config.setdefault("unit_target_navigation", False)
+            model_config.setdefault("market_resource_conditioning", False)
+            model_config.setdefault("wdl_value", False)
         return self.config_class(**model_config)
 
 

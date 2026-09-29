@@ -53,7 +53,9 @@ from kaggriculture.orientation import (
 )
 from kaggriculture.policy import PolicyStep, act_batch, categorical_statistics
 from kaggriculture.registry import CONV_ENTITY, architecture_of, resolve_architecture
+from kaggriculture.resource_conditioning import RESOURCE_FEATURES
 from kaggriculture.rust_env import load_native
+from kaggriculture.script_opponents import ScriptAgentPool, ScriptOpponent, ScriptSegment
 from kaggriculture.strategic_actor import PlanChoice, StrategicActor, StrategicOutput
 from kaggriculture.structured import StructuredActor, StructuredInputs
 from kaggriculture.tokens import (
@@ -81,6 +83,9 @@ _POPULATION_PAIRING_SEED_SALT = 0x5041_4952
 # from the network, anything else hands the row to the named engine reference
 # agent inside Rust. Mirrors `BuiltinAgent::from_code` in rust/kagg_env.
 BUILTIN_AGENT_CODES = {name: code for code, name in enumerate(BUILTIN_AGENT_ORDER, start=1)}
+# A row whose action a Python agent file chose off the native step and staged
+# with `BatchEnv.set_external_actions`. Mirrors `EXTERNAL_AGENT_CODE` in Rust.
+EXTERNAL_AGENT_CODE = 255
 REWARD_MODES = ("shaped", "terminal-bank", "terminal-outcome")
 SAMPLED_HEAD_FAMILIES = frozenset(("units", "kinds", "quantities"))
 
@@ -208,6 +213,11 @@ def _state_field_specs(architecture: str) -> dict[str, tuple[tuple[int, ...], ty
                 else {}
             ),
             **({"policy_ledger": ((593,), np.int64)} if architecture == "causal-execution" else {}),
+            **(
+                {"market_resources": ((MAX_MARKET_ORDERS, RESOURCE_FEATURES), np.float32)}
+                if architecture == "lejepa"
+                else {}
+            ),
             "tile_categorical": ((2 * TILE_COUNT, N_TILE_CATEGORICAL), np.int8),
             "tile_continuous": ((2 * TILE_COUNT, N_TILE_CONTINUOUS), np.float16),
             "unit_categorical": ((MAX_UNITS, N_UNIT_CATEGORICAL), np.int8),
@@ -264,17 +274,24 @@ def _rollout_factor_fields(batch: RolloutBatch) -> tuple[str, ...]:
     return (*_SHARED_ROLLOUT_FIELDS, *_MARKET_SET_ROLLOUT_FIELDS)
 
 
+def _paired_columns(fields: tuple[str, ...], private_fields: tuple[str, ...]) -> slice:
+    """The actor columns whose paired-seat values are the critic's private ones.
+
+    Each private field ``opponent_<name>`` is the opponent's own ``<name>``
+    column; they stay one contiguous run so staging slices rather than gathers.
+    """
+    columns = [fields.index(name.removeprefix("opponent_")) for name in private_fields]
+    if columns != list(range(columns[0], columns[0] + len(columns))):
+        raise AssertionError(f"private columns {private_fields} are not contiguous in {fields}")
+    return slice(columns[0], columns[-1] + 1)
+
+
 # Opponent-viewpoint columns the centralized critic reads from the paired
-# row's economy tokens: their own shed/carried product stock and seed counts.
-_PRODUCT_STOCK_COLUMNS = slice(
-    PRODUCT_TOKEN_FIELDS.index("shed_stock"), PRODUCT_TOKEN_FIELDS.index("carried_stock") + 1
-)
-_ANIMAL_STOCK_COLUMNS = slice(
-    ANIMAL_TOKEN_FIELDS.index("shed_stock"), ANIMAL_TOKEN_FIELDS.index("carried_stock") + 1
-)
-_CROP_SEED_COLUMNS = slice(
-    CROP_TOKEN_FIELDS.index("seeds_held"), CROP_TOKEN_FIELDS.index("seeds_held") + 1
-)
+# row's economy tokens: their own product stock and its liquidation proceeds,
+# animal stock, and seed counts.
+_PRODUCT_STOCK_COLUMNS = _paired_columns(PRODUCT_TOKEN_FIELDS, PRODUCT_PRIVATE_FIELDS)
+_ANIMAL_STOCK_COLUMNS = _paired_columns(ANIMAL_TOKEN_FIELDS, ANIMAL_PRIVATE_FIELDS)
+_CROP_SEED_COLUMNS = _paired_columns(CROP_TOKEN_FIELDS, CROP_PRIVATE_FIELDS)
 
 
 def _rollout_array(batch: RolloutBatch, field: str) -> np.ndarray:
@@ -299,6 +316,11 @@ def _record_policy_step(
                 else factors.plan[:, 0 if name == "plan_indices" else 1]
             )
             fields[name].append(values.astype(dtype, copy=False))
+            continue
+        if name == "market_resources":
+            if factors.market_resources is None:
+                raise ValueError("LeJEPA rollout requires exact pre-order resource state")
+            fields[name].append(factors.market_resources.astype(dtype, copy=False))
             continue
         if name == "policy_ledger":
             if factors.policy_ledger is None:
@@ -438,6 +460,26 @@ def _native_rollout_storage(
             raise ValueError(f"rollout storage field {name} has the wrong shape or dtype")
     storage["valid"][:] = True
     return storage
+
+
+def _set_market_resource_heads(environment: Any, actors: tuple[Any, ...]) -> None:
+    rank = actors[0].config.quantity_rank
+    kinds, quantities = [], []
+    for actor in actors:
+        conditioner = getattr(actor, "market_resource_conditioner", None)
+        kinds.append(
+            np.zeros((N_MARKET_KINDS, RESOURCE_FEATURES), dtype=np.float32)
+            if conditioner is None
+            else conditioner.kind.weight.detach().float().cpu().numpy()
+        )
+        quantities.append(
+            np.zeros((rank, RESOURCE_FEATURES), dtype=np.float32)
+            if conditioner is None
+            else conditioner.quantity.weight.detach().float().cpu().numpy()
+        )
+    environment.set_market_resource_heads(
+        np.ascontiguousarray(kinds), np.ascontiguousarray(quantities)
+    )
 
 
 def _quantity_heads(
@@ -1134,6 +1176,7 @@ _GPU_STATISTIC_INPUT_NAMES = (
     "market_active",
     "market_quantity_active",
     "entropy",
+    "market_kind_deltas",
 )
 _GPU_STATISTIC_OUTPUT_NAMES = ("unit_logprobs", "market_kind_logprobs", "entropy")
 _GPU_STATISTICS_CACHE: dict[tuple[Any, ...], Any] = {}
@@ -1152,6 +1195,7 @@ def _gpu_policy_statistics(
     kind_active: torch.Tensor,
     quantity_active: torch.Tensor,
     quantity_entropy_contribution: torch.Tensor,
+    market_kind_deltas: torch.Tensor,
     plan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-only FP32 statistics and packing, independent of model compilation."""
@@ -1160,7 +1204,7 @@ def _gpu_policy_statistics(
         unit_logits / scale, unit_masks, unit_actions, validate_mask=False
     )
     kind_logprob, kind_entropy = categorical_statistics(
-        kind_logits / scale, kind_masks, market_kinds, validate_mask=False
+        (kind_logits + market_kind_deltas) / scale, kind_masks, market_kinds, validate_mask=False
     )
     learned = (builtin_agents == 0)[:, None]
     unit_logprob = unit_logprob * learned
@@ -1646,6 +1690,40 @@ def _league_layout(lanes: int, width: int, *, device: torch.device, mode: str) -
     return 1 << (lanes - 1).bit_length(), 1 << (width - 1).bit_length()
 
 
+def _league_segment_layout(
+    assignments: np.ndarray, neural_lanes: int, *, device: torch.device, mode: str
+) -> tuple[int, int]:
+    """The bucketed ensemble shape one segment's league games run through.
+
+    Lanes at or past `neural_lanes` are built-ins, which never enter the ensemble.
+    """
+    counts = np.bincount(assignments, minlength=neural_lanes)[:neural_lanes]
+    return _league_layout(
+        int(np.count_nonzero(counts)), int(counts.max(initial=0)), device=device, mode=mode
+    )
+
+
+def league_wave_layouts(
+    self_play_games: int,
+    assignments: np.ndarray,
+    neural_lanes: int,
+    *,
+    device: torch.device,
+    mode: str,
+) -> tuple[tuple[int, int], ...]:
+    """Each collection segment's ensemble shape for one mixed-play wave.
+
+    The shapes a wave compiles for are per segment, not per wave: a wave whose
+    league games straddle the segment split gives the first segment only a
+    share of each opponent's games, and that share can land in a smaller bucket
+    than the wave's totals would.
+    """
+    return tuple(
+        _league_segment_layout(assignments[segment.league], neural_lanes, device=device, mode=mode)
+        for segment in _mixed_wave_segments(self_play_games, len(assignments))
+    )
+
+
 @torch.inference_mode()
 def _warmup_league_layout(
     ensemble: _StackedActorEnsemble,
@@ -2037,6 +2115,8 @@ def _store_native_wave(
         fields["critic_crops"][:, step] = np.asarray(encoded["crops"])[pair_rows][
             :, :, _CROP_SEED_COLUMNS
         ]
+    if "market_resources" in fields:
+        fields["market_resources"][:, step] = np.asarray(sampled["market_resources"])[rows]
     for destination, source in _SAMPLED_FIELD_SOURCES.items():
         fields[destination][:, step] = np.asarray(sampled[source])[rows]
     if "market_set_values" in fields:
@@ -2093,7 +2173,7 @@ def _collect_market_set_rust_wave(
     league_games: int,
     assignments: np.ndarray,
     builtin_lanes: tuple[str, ...],
-    seed_start: int,
+    seeds: np.ndarray,
     horizon: int,
     deterministic: bool,
     temperature: float,
@@ -2115,7 +2195,6 @@ def _collect_market_set_rust_wave(
     device = next(actor.parameters()).device
     games = self_play_games + league_games
     rows = games * 2
-    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
     sampled = environment.sample_buffers()
     wave = _native_wave(architecture_of(actor).name, environment, device)
@@ -2150,6 +2229,7 @@ def _collect_market_set_rust_wave(
         deterministic_rows[selected] = frozen_deterministic[lane]
         temperatures[selected] = frozen_temperatures[lane]
     quantity_kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
+    _set_market_resource_heads(environment, (actor, *opponents))
     generator = np.random.default_rng(sampling_seed)
     entropy_sums = np.zeros(learner_rows.size, dtype=np.float64)
     final = None
@@ -2248,7 +2328,11 @@ def _collect_mixed_play_rust_wave(
     league_games: int = 0,
     opponent_indices: Sequence[int] | np.ndarray | None = None,
     builtin_lanes: Sequence[str] = (),
+    script_lanes: Sequence[ScriptOpponent] = (),
+    script_pool: ScriptAgentPool | None = None,
     seed_start: int,
+    self_play_seed_group: int = 1,
+    paired_league_seats: bool = False,
     episode_steps: int = 720,
     deterministic: bool = False,
     sampled_heads: tuple[str, ...] | None = None,
@@ -2289,6 +2373,18 @@ def _collect_mixed_play_rust_wave(
     Each actual (neural lane count, padded width) layout compiles on first use
     and reuses the persistent ensemble thereafter.
 
+    ``script_lanes`` follow the built-ins in that index space: Python agent
+    files whose seats ``script_pool``'s workers play, one fresh agent
+    namespace per game seat. Each step a segment sends its script seats the
+    state right after its native step and collects their actions right before
+    the next one, so the agents run while the device forward does.
+
+    League game `j` normally plays seed `seed_start + self_play_games + j`
+    with the learner in seat `seed % 2`. ``paired_league_seats`` instead plays
+    each seed from both seats: game `j` takes seed
+    `seed_start + self_play_games + j // 2` with the learner in seat `j % 2`,
+    the official evaluator's paired-seat protocol.
+
     Rollouts capture only behavior policy state. Value predictions for GAE
     are replayed from the stored features in one large batched critic pass
     at update time, where the critic weights are still exactly the behavior
@@ -2308,6 +2404,13 @@ def _collect_mixed_play_rust_wave(
         raise ValueError("game counts cannot be negative")
     if self_play_games + league_games < 1:
         raise ValueError("at least one game is required")
+    seeds = wave_game_seeds(seed_start, self_play_games, league_games, self_play_seed_group)
+    league_seats = (seeds[self_play_games:] % 2).astype(np.int64)
+    if paired_league_seats:
+        if league_games % 2:
+            raise ValueError("paired league seats need an even number of league games")
+        league_seats = np.arange(league_games, dtype=np.int64) % 2
+        seeds[self_play_games:] = seed_start + self_play_games + np.arange(league_games) // 2
     if episode_steps != 720:
         raise ValueError("the native simulator currently supports the competition horizon 720")
     if sampled_heads is not None:
@@ -2325,9 +2428,16 @@ def _collect_mixed_play_rust_wave(
         raise ValueError(f"unknown built-in league agents: {', '.join(unknown)}")
     if len(set(builtin_lanes)) != len(builtin_lanes):
         raise ValueError("built-in league agents must be distinct")
-    lane_count = len(opponents) + len(builtin_lanes)
+    script_lanes = tuple(script_lanes)
+    if len({lane.name for lane in script_lanes}) != len(script_lanes):
+        raise ValueError("script league opponents must be distinct")
+    if script_lanes and script_pool is None:
+        raise ValueError("script league opponents need a script agent pool")
+    if script_pool is not None and not set(script_lanes) <= set(script_pool.opponents):
+        raise ValueError("every script league opponent must be loaded in the script agent pool")
+    lane_count = len(opponents) + len(builtin_lanes) + len(script_lanes)
     if league_games and not lane_count:
-        raise ValueError("league games require at least one frozen or built-in opponent")
+        raise ValueError("league games require at least one frozen, built-in or script opponent")
     if lane_count and not league_games:
         raise ValueError("league opponents require league games")
     if len(opponents) > np.iinfo(np.uint16).max:
@@ -2396,7 +2506,6 @@ def _collect_mixed_play_rust_wave(
     ):
         raise ValueError("collected behavior values need a lejepa critic on the actor's backbone")
 
-    games = self_play_games + league_games
     horizon = episode_steps - 1
     trajectories = self_play_games * 2 + league_games
     fields = _native_rollout_storage(
@@ -2406,25 +2515,24 @@ def _collect_mixed_play_rust_wave(
         horizon,
         action_interface=actor.config.action_interface,
     )
+    if script_lanes and (causal or actor.config.action_interface == 3):
+        raise ValueError("script league opponents need the flat factored action interface")
     if actor.config.action_interface == 3:
         if not isinstance(actor, EntityActor) or critic is not None or sampled_heads is not None:
             raise ValueError("market-set rollout requires an entity actor without value tail")
+        if paired_league_seats:
+            raise ValueError("market-set rollout plays league seats by seed parity only")
         market_batches = []
-        for index, (first_game, last_game) in enumerate(_wave_segments(games)):
-            segment_self_play = max(0, min(last_game, self_play_games) - first_game)
-            segment_league = max(0, last_game - max(first_game, self_play_games))
-            first_trajectory = first_game + min(first_game, self_play_games)
-            last_trajectory = last_game + min(last_game, self_play_games)
-            league_start = max(first_game, self_play_games) - self_play_games
+        for index, segment in enumerate(_mixed_wave_segments(self_play_games, league_games)):
             market_batches.append(
                 _collect_market_set_rust_wave(
                     actor,
                     opponents,
-                    self_play_games=segment_self_play,
-                    league_games=segment_league,
-                    assignments=assignments[league_start : league_start + segment_league],
+                    self_play_games=segment.self_play_games,
+                    league_games=segment.league_games,
+                    assignments=assignments[segment.league],
                     builtin_lanes=builtin_lanes,
-                    seed_start=seed_start + first_game,
+                    seeds=seeds[segment.game_range],
                     horizon=horizon,
                     deterministic=deterministic,
                     temperature=temperature,
@@ -2435,10 +2543,7 @@ def _collect_mixed_play_rust_wave(
                     sampling_seed=sampling_seed ^ (index * _SEGMENT_SAMPLING_SALT),
                     forward_mode=forward_mode,
                     forward_autocast=forward_autocast,
-                    fields={
-                        name: array[first_trajectory:last_trajectory]
-                        for name, array in fields.items()
-                    },
+                    fields={name: array[segment.trajectories] for name, array in fields.items()},
                     started=started,
                 )
             )
@@ -2454,21 +2559,19 @@ def _collect_mixed_play_rust_wave(
     # game range maps to one contiguous trajectory range.
     segments = []
     batches: list[RolloutBatch | None] = []
-    for index, (first_game, last_game) in enumerate(_wave_segments(games)):
-        segment_self_play = max(0, min(last_game, self_play_games) - first_game)
-        segment_league = max(0, last_game - max(first_game, self_play_games))
-        first_trajectory = first_game + min(first_game, self_play_games)
-        last_trajectory = last_game + min(last_game, self_play_games)
-        league_start = max(first_game, self_play_games) - self_play_games
+    for index, segment in enumerate(_mixed_wave_segments(self_play_games, league_games)):
         segments.append(
             _mixed_play_segment(
                 actor,
                 opponents,
-                self_play_games=segment_self_play,
-                league_games=segment_league,
-                assignments=assignments[league_start : league_start + segment_league],
+                self_play_games=segment.self_play_games,
+                league_games=segment.league_games,
+                assignments=assignments[segment.league],
                 builtin_lanes=builtin_lanes,
-                seed_start=seed_start + first_game,
+                script_lanes=script_lanes,
+                script_pool=script_pool,
+                seeds=seeds[segment.game_range],
+                league_seats=league_seats[segment.league],
                 horizon=horizon,
                 deterministic=deterministic,
                 sampled_heads=sampled_heads,
@@ -2480,10 +2583,12 @@ def _collect_mixed_play_rust_wave(
                 sampling_seed=sampling_seed ^ (index * _SEGMENT_SAMPLING_SALT),
                 forward_mode=forward_mode,
                 forward_autocast=forward_autocast,
-                fields={
-                    name: array[first_trajectory:last_trajectory] for name, array in fields.items()
-                },
+                fields={name: array[segment.trajectories] for name, array in fields.items()},
                 started=started,
+                # Interleaved segments each hold their own opponents' weights: a
+                # shared ensemble would be refilled by the next segment's setup
+                # while this one's captured steps still read it.
+                ensemble_namespace=index,
                 critic=critic,
             )
         )
@@ -2514,14 +2619,38 @@ def _collect_mixed_play_rust_wave(
                 torch.cuda.current_stream(device).wait_stream(_rollout_value_stream(device))
         # Release a suspended segment's graphs here, behind that join, rather
         # than whenever the exception's traceback lets go of its frame. This is
-        # a no-op for a segment that finished, or raised, before the join.
-        for segment in segments:
-            segment.close()
+        # a no-op for a segment that finished, or raised, before the join. The
+        # stack closes every segment even if closing one raises.
+        with ExitStack() as closing:
+            for segment in segments:
+                closing.callback(segment.close)
     if len(batches) == 1:
         assert batches[0] is not None
         return batches[0]
     merged = merge_contiguous_rollouts(fields, [batch for batch in batches if batch is not None])
     return replace(merged, elapsed_seconds=time.perf_counter() - started)
+
+
+def wave_game_seeds(
+    seed_start: int, self_play_games: int, league_games: int, self_play_seed_group: int = 1
+) -> np.ndarray:
+    """Map seed of every game in a mixed wave, self-play games first.
+
+    Self-play game `g` plays seed `seed_start + g // self_play_seed_group`, so
+    consecutive blocks of that many games share a map. League game `j` keeps
+    `seed_start + self_play_games + j`, the seed it has with no grouping. That
+    keeps its seat (`seed % 2`) and leaves grouping of one bit-identical to
+    all-distinct seeds. The native engine's initial state ignores the seed,
+    which only drives the daily weed draws, so same-seed games differ only by
+    what their policies sampled.
+    """
+    if self_play_seed_group < 1:
+        raise ValueError("self-play seed group must be positive")
+    if self_play_games % self_play_seed_group:
+        raise ValueError("self-play games must divide into whole seed groups")
+    self_play = seed_start + np.arange(self_play_games) // self_play_seed_group
+    league = seed_start + self_play_games + np.arange(league_games)
+    return np.concatenate((self_play, league)).astype(np.uint64)
 
 
 #: Waves with at least this many games collect as two interleaved segments.
@@ -2539,6 +2668,43 @@ def _wave_segments(games: int) -> tuple[tuple[int, int], ...]:
     return ((0, split), (split, games))
 
 
+@dataclass(frozen=True)
+class _MixedWaveSegment:
+    """One segment of a mixed wave, whose self-play games precede its league games."""
+
+    first_game: int
+    self_play_games: int
+    #: This segment's league games, as a slice of the wave's opponent assignments.
+    league: slice
+    #: Self-play games store both seats and league games only the learner's.
+    trajectories: slice
+
+    @property
+    def league_games(self) -> int:
+        return self.league.stop - self.league.start
+
+    @property
+    def game_range(self) -> slice:
+        """This segment's games as a slice of the wave's game order."""
+        return slice(self.first_game, self.first_game + self.self_play_games + self.league_games)
+
+
+def _mixed_wave_segments(self_play_games: int, league_games: int) -> tuple[_MixedWaveSegment, ...]:
+    """Split a wave's self-play-then-league games into its collection segments."""
+    return tuple(
+        _MixedWaveSegment(
+            first_game=first_game,
+            self_play_games=max(0, min(last_game, self_play_games) - first_game),
+            league=slice(max(first_game - self_play_games, 0), max(last_game - self_play_games, 0)),
+            trajectories=slice(
+                first_game + min(first_game, self_play_games),
+                last_game + min(last_game, self_play_games),
+            ),
+        )
+        for first_game, last_game in _wave_segments(self_play_games + league_games)
+    )
+
+
 @torch.inference_mode()
 def _mixed_play_segment(
     actor: FarmActor | StructuredActor | EntityActor,
@@ -2548,7 +2714,10 @@ def _mixed_play_segment(
     league_games: int,
     assignments: np.ndarray,
     builtin_lanes: tuple[str, ...],
-    seed_start: int,
+    script_lanes: tuple[ScriptOpponent, ...],
+    script_pool: ScriptAgentPool | None,
+    seeds: np.ndarray,
+    league_seats: np.ndarray,
     horizon: int,
     deterministic: bool,
     sampled_heads: tuple[str, ...] | None,
@@ -2562,6 +2731,7 @@ def _mixed_play_segment(
     forward_autocast: bool,
     fields: dict[str, np.ndarray],
     started: float,
+    ensemble_namespace: int,
     critic: LejepaCritic | None = None,
 ) -> Generator[None, None, RolloutBatch]:
     """Collect one validated game range of a mixed-play wave, yielding per step.
@@ -2577,9 +2747,8 @@ def _mixed_play_segment(
     causal = architecture == "causal-execution"
     if causal:
         from kaggriculture.causal_actor import CausalChoice, CausalOutput
-    lane_count = len(opponents) + len(builtin_lanes)
+    lane_count = len(opponents) + len(builtin_lanes) + len(script_lanes)
     games = self_play_games + league_games
-    seeds = np.arange(seed_start, seed_start + games, dtype=np.uint64)
     environment = load_native().BatchEnv(seeds)
     rows = games * 2
     self_play_rows = self_play_games * 2
@@ -2616,7 +2785,6 @@ def _mixed_play_segment(
         for name in _GPU_STATISTIC_INPUT_NAMES:
             sampled[name] = torch.from_numpy(np.asarray(sampled[name])).pin_memory().numpy()
 
-    league_seats = (seeds[self_play_games:] % 2).astype(np.int64)
     league_game_rows = self_play_rows + 2 * np.arange(league_games, dtype=np.int64)
     league_current_rows = league_game_rows + league_seats
     frozen_rows = league_game_rows + (1 - league_seats)
@@ -2624,10 +2792,15 @@ def _mixed_play_segment(
     generator = np.random.default_rng(sampling_seed)
     frozen_generator = np.random.default_rng(sampling_seed ^ 0x5EED_1EAF)
     kind_gate, quantity_values, quantity_bias = _quantity_heads((actor, *opponents))
-    # Per-lane decode of everything a frozen row needs. A built-in lane has no
-    # network, so it borrows the learner's quantity head and neutral sampling
-    # settings; the native agent replaces that row's whole action regardless.
-    lane_names = (*(f"frozen-{index}" for index in range(len(opponents))), *builtin_lanes)
+    _set_market_resource_heads(environment, (actor, *opponents))
+    # Per-lane decode of everything a frozen row needs. A built-in or script
+    # lane has no network, so it borrows the learner's quantity head and neutral
+    # sampling settings; its agent replaces that row's whole action regardless.
+    lane_names = (
+        *(f"frozen-{index}" for index in range(len(opponents))),
+        *builtin_lanes,
+        *(lane.key for lane in script_lanes),
+    )
     lane_heads = np.zeros(lane_count, dtype=np.uint16)
     lane_heads[: len(opponents)] = np.arange(1, len(opponents) + 1, dtype=np.uint16)
     lane_temperatures = np.ones(lane_count, dtype=np.float32)
@@ -2635,7 +2808,11 @@ def _mixed_play_segment(
     lane_deterministic = np.zeros(lane_count, dtype=np.bool_)
     lane_deterministic[: len(opponents)] = frozen_deterministic
     lane_codes = np.zeros(lane_count, dtype=np.uint8)
-    lane_codes[len(opponents) :] = [BUILTIN_AGENT_CODES[name] for name in builtin_lanes]
+    first_script_lane = len(opponents) + len(builtin_lanes)
+    lane_codes[len(opponents) : first_script_lane] = [
+        BUILTIN_AGENT_CODES[name] for name in builtin_lanes
+    ]
+    lane_codes[first_script_lane:] = EXTERNAL_AGENT_CODE
     head_ids = np.zeros(rows, dtype=np.uint16)
     head_ids[frozen_rows] = lane_heads[assignments]
     deterministic_rows = np.full(rows, deterministic, dtype=np.bool_)
@@ -2814,11 +2991,8 @@ def _mixed_play_segment(
         active_groups = [frozen_groups[index] for index in active_indices]
         # Bucket only the neural inference buffers. Padding duplicates real
         # inputs/weights, but is never scattered or sampled as a physical row.
-        lanes, lane_width = _league_layout(
-            len(active_indices),
-            max((group.size for group in active_groups), default=0),
-            device=device,
-            mode=forward_mode,
+        lanes, lane_width = _league_segment_layout(
+            assignments, len(opponents), device=device, mode=forward_mode
         )
         lane_rows = np.full(
             (lanes, lane_width), active_groups[0][0] if active_groups else 0, dtype=np.int64
@@ -2839,7 +3013,9 @@ def _mixed_play_segment(
         lane_valid_indices = torch.as_tensor(np.flatnonzero(lane_valid_flat), device=device)
         padded_indices = active_indices + active_indices[:1] * (lanes - len(active_indices))
         ensemble = (
-            _stacked_actor_ensemble([opponents[index] for index in padded_indices])
+            _stacked_actor_ensemble(
+                [opponents[index] for index in padded_indices], namespace=ensemble_namespace
+            )
             if active_indices
             else None
         )
@@ -3085,221 +3261,248 @@ def _mixed_play_segment(
             autocast=autocast_forward,
         )
 
-    for step in range(horizon):
-        current_ledger = ledger_staging.current if ledger_staging is not None else None
-        if graphed and step_graph is None:
-            # Capture on the first real uploaded wave and replay the static
-            # device region for the remaining steps.
-            step_generators: tuple[torch.Generator, ...] = ()
-            if device_sampling:
-                assert gpu_current_generator is not None
-                assert gpu_frozen_generator is not None
-                step_generators = (gpu_current_generator, gpu_frozen_generator)
-            step_graph = _CapturedStep(step_region, generators=step_generators)
-            if value_critic is not None:
-                assert value_pair_rows is not None
-                value_graph = _capture_value_tail(
-                    value_critic,
-                    # The learner forward's rows, which are the stored rows in
-                    # stored order: the whole wave, or the league gather.
-                    wave_inputs[0] if current_gather is None else current_gather[0],
-                    wave_inputs[0],
-                    value_pair_rows,
-                    learner_belief[0],
-                    mode=forward_mode,
-                    autocast=autocast_forward,
-                )
-        if pending_outputs is not None:
-            full_output, current_output, frozen_output = pending_outputs
-            pending_outputs = None
-        else:
-            full_output, current_output, frozen_output = launch_region(step)
-        if league_games and not gpu_sampling:
-            assert current_output is not None
-            assert isinstance(unit_logits, np.ndarray)
-            assert isinstance(kind_logits, np.ndarray)
-            assert isinstance(quantity_context, np.ndarray)
-            assert frozen_store_rows is not None
-            assert lane_valid_flat is not None
-            transfer_outputs = (
-                (current_output,) if frozen_output is None else (current_output, frozen_output)
-            )
-            host_outputs, packed_transfer = _packed_outputs_to_host(
-                transfer_outputs, packed_transfer
-            )
-            current_host = host_outputs[0]
-            frozen_host = None if frozen_output is None else host_outputs[1]
-            for destination, current_values, frozen_values in zip(
-                (unit_logits, kind_logits, quantity_context),
-                (
-                    current_host.unit_logits,
-                    current_host.market_kind_logits,
-                    current_host.market_quantity_context,
-                ),
-                (
-                    (None, None, None)
-                    if frozen_host is None
-                    else (
-                        frozen_host.unit_logits,
-                        frozen_host.market_kind_logits,
-                        frozen_host.market_quantity_context,
+    script: ScriptSegment | None = None
+    script_games = np.flatnonzero(assignments >= first_script_lane)
+    if script_games.size:
+        assert script_pool is not None
+        script_lane_pool_indices = np.asarray(
+            [script_pool.opponents.index(lane) for lane in script_lanes], dtype=np.int64
+        )
+        script = script_pool.segment(
+            environment,
+            game_indices=self_play_games + script_games,
+            players=1 - league_seats[script_games],
+            opponents=script_lane_pool_indices[assignments[script_games] - first_script_lane],
+        )
+    try:
+        if script is not None:
+            script.request()
+        for step in range(horizon):
+            current_ledger = ledger_staging.current if ledger_staging is not None else None
+            if graphed and step_graph is None:
+                # Capture on the first real uploaded wave and replay the static
+                # device region for the remaining steps.
+                step_generators: tuple[torch.Generator, ...] = ()
+                if device_sampling:
+                    assert gpu_current_generator is not None
+                    assert gpu_frozen_generator is not None
+                    step_generators = (gpu_current_generator, gpu_frozen_generator)
+                step_graph = _CapturedStep(step_region, generators=step_generators)
+                if value_critic is not None:
+                    assert value_pair_rows is not None
+                    value_graph = _capture_value_tail(
+                        value_critic,
+                        # The learner forward's rows, which are the stored rows in
+                        # stored order: the whole wave, or the league gather.
+                        wave_inputs[0] if current_gather is None else current_gather[0],
+                        wave_inputs[0],
+                        value_pair_rows,
+                        learner_belief[0],
+                        mode=forward_mode,
+                        autocast=autocast_forward,
                     )
-                ),
-                strict=True,
-            ):
-                destination[stored_rows] = current_values
-                if frozen_values is not None:
-                    destination[frozen_store_rows] = frozen_values[lane_valid_flat]
-            full_output = current_output
-
-        assert full_output is not None
-        if causal:
-            if selected_transfer is None:
-                selected_transfer = SelectedFactorTransfer(full_output)
-            selected_transfer.copy(full_output)
-            environment.step_factors_into(*selected_transfer.factors, builtin_agents, sampled)
-            selected_transfer.store_statistics(sampled)
-        elif gpu_sampling:
-            assert preference_arrays is not None
-            assert statistics_transfer is not None
-            assert gpu_builtin_agents is not None
-            assert gpu_temperatures is not None
-            assert outputs_ready is not None
-            # The one host join of a step: the region has downloaded this
-            # step's sampler inputs and the previous step's statistics.
-            outputs_ready.synchronize()
-            if pending_statistics is not None:
-                pending_step, pending_counts = pending_statistics
-                store_statistics(pending_step, pending_counts)
-                pending_statistics = None
-            unit_utilities, kind_utilities, step_quantity_context, quantity_draws = (
-                preference_arrays
-            )
-            environment.select_and_step_into(
-                unit_utilities,
-                kind_utilities,
-                step_quantity_context,
-                kind_gate,
-                quantity_values,
-                quantity_bias,
-                head_ids,
-                quantity_draws,
-                deterministic_rows,
-                temperatures,
-                builtin_agents,
-                sampled,
-            )
-            _upload_gpu_statistics_inputs(sampled, full_output, statistics_transfer)
-            if step + 1 == horizon:
-                # No further region computes these; launch and join directly.
-                _launch_gpu_statistics(
-                    full_output, gpu_builtin_agents, gpu_temperatures, statistics_transfer
-                )
-                outputs_ready.record()
-                outputs_ready.synchronize()
-        else:
-            if not league_games:
-                host_outputs, packed_transfer = _packed_outputs_to_host(
-                    (full_output,), packed_transfer
-                )
-                host = host_outputs[0]
-                step_unit_logits = host.unit_logits
-                step_kind_logits = host.market_kind_logits
-                step_quantity_context = host.market_quantity_context
-                unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+            if pending_outputs is not None:
+                full_output, current_output, frozen_output = pending_outputs
+                pending_outputs = None
             else:
+                full_output, current_output, frozen_output = launch_region(step)
+            if league_games and not gpu_sampling:
+                assert current_output is not None
                 assert isinstance(unit_logits, np.ndarray)
                 assert isinstance(kind_logits, np.ndarray)
                 assert isinstance(quantity_context, np.ndarray)
-                step_unit_logits = np.asarray(unit_logits)
-                step_kind_logits = np.asarray(kind_logits)
-                step_quantity_context = np.asarray(quantity_context)
-                unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
-                kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-                quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
-                current_draws = _categorical_draws(generator, stored_rows.size)
-                frozen_draws = _categorical_draws(frozen_generator, league_games)
+                assert frozen_store_rows is not None
+                assert lane_valid_flat is not None
+                transfer_outputs = (
+                    (current_output,) if frozen_output is None else (current_output, frozen_output)
+                )
+                host_outputs, packed_transfer = _packed_outputs_to_host(
+                    transfer_outputs, packed_transfer
+                )
+                current_host = host_outputs[0]
+                frozen_host = None if frozen_output is None else host_outputs[1]
                 for destination, current_values, frozen_values in zip(
-                    (unit_draws, kind_draws, quantity_draws),
-                    current_draws,
-                    frozen_draws,
+                    (unit_logits, kind_logits, quantity_context),
+                    (
+                        current_host.unit_logits,
+                        current_host.market_kind_logits,
+                        current_host.market_quantity_context,
+                    ),
+                    (
+                        (None, None, None)
+                        if frozen_host is None
+                        else (
+                            frozen_host.unit_logits,
+                            frozen_host.market_kind_logits,
+                            frozen_host.market_quantity_context,
+                        )
+                    ),
                     strict=True,
                 ):
                     destination[stored_rows] = current_values
-                    destination[frozen_rows] = frozen_values
-            environment.sample_and_step_into(
-                step_unit_logits,
-                step_kind_logits,
-                step_quantity_context,
-                kind_gate,
-                quantity_values,
-                quantity_bias,
-                head_ids,
-                unit_draws,
-                kind_draws,
-                quantity_draws,
-                deterministic_rows,
-                temperatures,
-                builtin_agents,
+                    if frozen_values is not None:
+                        destination[frozen_store_rows] = frozen_values[lane_valid_flat]
+                full_output = current_output
+
+            assert full_output is not None
+            if causal:
+                if selected_transfer is None:
+                    selected_transfer = SelectedFactorTransfer(full_output)
+                selected_transfer.copy(full_output)
+                environment.step_factors_into(*selected_transfer.factors, builtin_agents, sampled)
+                selected_transfer.store_statistics(sampled)
+            elif gpu_sampling:
+                assert preference_arrays is not None
+                assert statistics_transfer is not None
+                assert gpu_builtin_agents is not None
+                assert gpu_temperatures is not None
+                assert outputs_ready is not None
+                # The one host join of a step: the region has downloaded this
+                # step's sampler inputs and the previous step's statistics.
+                outputs_ready.synchronize()
+                if pending_statistics is not None:
+                    pending_step, pending_counts = pending_statistics
+                    store_statistics(pending_step, pending_counts)
+                    pending_statistics = None
+                unit_utilities, kind_utilities, step_quantity_context, quantity_draws = (
+                    preference_arrays
+                )
+                if script is not None:
+                    script.stage()
+                environment.select_and_step_into(
+                    unit_utilities,
+                    kind_utilities,
+                    step_quantity_context,
+                    kind_gate,
+                    quantity_values,
+                    quantity_bias,
+                    head_ids,
+                    quantity_draws,
+                    deterministic_rows,
+                    temperatures,
+                    builtin_agents,
+                    sampled,
+                )
+                _upload_gpu_statistics_inputs(sampled, full_output, statistics_transfer)
+                if step + 1 == horizon:
+                    # No further region computes these; launch and join directly.
+                    _launch_gpu_statistics(
+                        full_output, gpu_builtin_agents, gpu_temperatures, statistics_transfer
+                    )
+                    outputs_ready.record()
+                    outputs_ready.synchronize()
+            else:
+                if not league_games:
+                    host_outputs, packed_transfer = _packed_outputs_to_host(
+                        (full_output,), packed_transfer
+                    )
+                    host = host_outputs[0]
+                    step_unit_logits = host.unit_logits
+                    step_kind_logits = host.market_kind_logits
+                    step_quantity_context = host.market_quantity_context
+                    unit_draws, kind_draws, quantity_draws = _categorical_draws(generator, rows)
+                else:
+                    assert isinstance(unit_logits, np.ndarray)
+                    assert isinstance(kind_logits, np.ndarray)
+                    assert isinstance(quantity_context, np.ndarray)
+                    step_unit_logits = np.asarray(unit_logits)
+                    step_kind_logits = np.asarray(kind_logits)
+                    step_quantity_context = np.asarray(quantity_context)
+                    unit_draws = np.empty((rows, MAX_UNITS), dtype=np.float32)
+                    kind_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+                    quantity_draws = np.empty((rows, MAX_MARKET_ORDERS), dtype=np.float32)
+                    current_draws = _categorical_draws(generator, stored_rows.size)
+                    frozen_draws = _categorical_draws(frozen_generator, league_games)
+                    for destination, current_values, frozen_values in zip(
+                        (unit_draws, kind_draws, quantity_draws),
+                        current_draws,
+                        frozen_draws,
+                        strict=True,
+                    ):
+                        destination[stored_rows] = current_values
+                        destination[frozen_rows] = frozen_values
+                if script is not None:
+                    script.stage()
+                environment.sample_and_step_into(
+                    step_unit_logits,
+                    step_kind_logits,
+                    step_quantity_context,
+                    kind_gate,
+                    quantity_values,
+                    quantity_bias,
+                    head_ids,
+                    unit_draws,
+                    kind_draws,
+                    quantity_draws,
+                    deterministic_rows,
+                    temperatures,
+                    builtin_agents,
+                    sampled,
+                )
+            if script is not None and step + 1 < horizon:
+                # First, so the agents' next turn overlaps everything below and
+                # the other segment's step.
+                script.request()
+            if step + 1 < horizon:
+                # Both host waves share fixed device destinations. Upload and graph
+                # replay use the sampling/statistics stream, so all reads of this
+                # step's outputs finish before the next replay overwrites them.
+                # The next step joins that stream before the native step or either
+                # pinned host buffer can be refilled.
+                next_encoded_wave.refresh(environment)
+                if value_done is not None:
+                    torch.cuda.current_stream(device).wait_event(value_done)
+                next_encoded_wave.copy_to_device()
+                if ledger_staging is not None:
+                    ledger_staging.refresh(environment, advance=True)
+                refresh_plan_draws()
+                if step_graph is not None:
+                    # Launch ahead of CPU arena storage and consume once at the
+                    # next loop head. Bootstrap runs above; the final step never
+                    # queues a speculative extra forward.
+                    pending_outputs = launch_region(step + 1)
+            rewards = _native_pair_rewards(sampled, gamma, reward_mode).reshape(-1)
+            _store_native_wave(
+                architecture,
+                fields,
+                step,
+                encoded_wave.arrays,
                 sampled,
+                rewards[store_rows],
+                store_rows,
+                stored_pair_rows,
+                store_policy_statistics=causal or not gpu_sampling,
             )
-        if step + 1 < horizon:
-            # Both host waves share fixed device destinations. Upload and graph
-            # replay use the sampling/statistics stream, so all reads of this
-            # step's outputs finish before the next replay overwrites them.
-            # The next step joins that stream before the native step or either
-            # pinned host buffer can be refilled.
-            next_encoded_wave.refresh(environment)
-            if value_done is not None:
-                torch.cuda.current_stream(device).wait_event(value_done)
-            next_encoded_wave.copy_to_device()
-            if ledger_staging is not None:
-                ledger_staging.refresh(environment, advance=True)
-            refresh_plan_draws()
-            if step_graph is not None:
-                # Launch ahead of CPU arena storage and consume once at the
-                # next loop head. Bootstrap runs above; the final step never
-                # queues a speculative extra forward.
-                pending_outputs = launch_region(step + 1)
-        rewards = _native_pair_rewards(sampled, gamma, reward_mode).reshape(-1)
-        _store_native_wave(
-            architecture,
-            fields,
-            step,
-            encoded_wave.arrays,
-            sampled,
-            rewards[store_rows],
-            store_rows,
-            stored_pair_rows,
-            store_policy_statistics=causal or not gpu_sampling,
-        )
-        if current_ledger is not None:
-            fields["policy_ledger"][:, step] = current_ledger[store_rows]
-        counts = (
-            np.asarray(sampled["unit_active"])[store_rows].sum(axis=1)
-            + np.asarray(sampled["market_active"])[store_rows].sum(axis=1)
-            + np.asarray(sampled["market_quantity_active"])[store_rows].sum(axis=1)
-        )
-        if strategic:
-            counts = counts + 1
-        if device_sampling:
-            fields["old_market_quantity_logprobs"][:, step] = np.asarray(
-                sampled["market_quantity_logprobs"]
-            )[store_rows]
-            pending_statistics = (step, counts)
-        else:
-            entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
-        dones = np.asarray(sampled["dones"], dtype=np.bool_)
-        if step + 1 < horizon and dones.any():
-            raise RuntimeError("native rollout terminated before the competition horizon")
-        if step + 1 == horizon and not dones.all():
-            raise RuntimeError("native rollout did not terminate at the competition horizon")
-        final = np.asarray(sampled["final_money"], dtype=np.float32)
-        if step + 1 < horizon:
-            encoded_wave, next_encoded_wave = next_encoded_wave, encoded_wave
-        # The next region is in flight and this step is stored: the driver may
-        # now run the other segment's host work against it.
-        yield
+            if current_ledger is not None:
+                fields["policy_ledger"][:, step] = current_ledger[store_rows]
+            counts = (
+                np.asarray(sampled["unit_active"])[store_rows].sum(axis=1)
+                + np.asarray(sampled["market_active"])[store_rows].sum(axis=1)
+                + np.asarray(sampled["market_quantity_active"])[store_rows].sum(axis=1)
+            )
+            if strategic:
+                counts = counts + 1
+            if device_sampling:
+                fields["old_market_quantity_logprobs"][:, step] = np.asarray(
+                    sampled["market_quantity_logprobs"]
+                )[store_rows]
+                pending_statistics = (step, counts)
+            else:
+                entropy_sums += np.asarray(sampled["entropy"])[store_rows] * counts
+            dones = np.asarray(sampled["dones"], dtype=np.bool_)
+            if step + 1 < horizon and dones.any():
+                raise RuntimeError("native rollout terminated before the competition horizon")
+            if step + 1 == horizon and not dones.all():
+                raise RuntimeError("native rollout did not terminate at the competition horizon")
+            final = np.asarray(sampled["final_money"], dtype=np.float32)
+            if step + 1 < horizon:
+                encoded_wave, next_encoded_wave = next_encoded_wave, encoded_wave
+            # The next region is in flight and this step is stored: the driver may
+            # now run the other segment's host work against it.
+            yield
+    finally:
+        if script is not None:
+            script.finish()
 
     if pending_statistics is not None:
         pending_step, pending_counts = pending_statistics
@@ -3369,7 +3572,11 @@ def collect_mixed_play_rust(
     league_games: int = 0,
     opponent_indices: Sequence[int] | np.ndarray | None = None,
     builtin_lanes: Sequence[str] = (),
+    script_lanes: Sequence[ScriptOpponent] = (),
+    script_pool: ScriptAgentPool | None = None,
     seed_start: int,
+    self_play_seed_group: int = 1,
+    paired_league_seats: bool = False,
     episode_steps: int = 720,
     deterministic: bool = False,
     sampled_heads: tuple[str, ...] | None = None,
@@ -3389,7 +3596,8 @@ def collect_mixed_play_rust(
     """Collect every game in one native wave and preserve trajectory order.
 
     A `lejepa` ``critic`` also returns its behavior values on the batch; see
-    `_collect_mixed_play_rust_wave`.
+    `_collect_mixed_play_rust_wave`. ``self_play_seed_group`` makes consecutive
+    blocks of that many self-play games share a map seed (`wave_game_seeds`).
     """
     _validate_forward_mode(forward_mode)
     return _collect_mixed_play_rust_wave(
@@ -3399,7 +3607,11 @@ def collect_mixed_play_rust(
         league_games=league_games,
         opponent_indices=opponent_indices,
         builtin_lanes=builtin_lanes,
+        script_lanes=script_lanes,
+        script_pool=script_pool,
         seed_start=seed_start,
+        self_play_seed_group=self_play_seed_group,
+        paired_league_seats=paired_league_seats,
         episode_steps=episode_steps,
         deterministic=deterministic,
         sampled_heads=sampled_heads,
@@ -3573,6 +3785,7 @@ def collect_population_play_rust(
     encoded = encoded_wave.arrays
     sampled = environment.sample_buffers()
     kind_gate, quantity_values, quantity_bias = _quantity_heads(actors)
+    _set_market_resource_heads(environment, actors)
     head_ids = agents.astype(np.uint16)
     deterministic_rows = np.zeros(rows, dtype=np.bool_)
     temperatures = np.full(rows, temperature, dtype=np.float32)

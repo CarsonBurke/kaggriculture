@@ -107,7 +107,8 @@ def _economic_features(states: Mapping[str, np.ndarray], row: int) -> np.ndarray
             ).sum(axis=-1) / MAX_UNITS
     features[:, _PRODUCT_START:_ANIMAL_START, :2] = products[..., :2]
     features[:, _PRODUCT_START:_ANIMAL_START, 2:4] = products[..., 3:5]
-    features[:, _PRODUCT_START:_ANIMAL_START, 4:6] = states["critic_products"][row]
+    # Opponent shed and carried stock: the private columns matching own 3:5.
+    features[:, _PRODUCT_START:_ANIMAL_START, 4:6] = states["critic_products"][row, ..., :2]
     features[:, _ANIMAL_START:_CROP_START, :2] = states["animals"][row, ..., 1:3]
     features[:, _ANIMAL_START:_CROP_START, 2:4] = states["critic_animals"][row]
     features[:, _CROP_START:_FARM_START, 0] = states["crops"][row, ..., 1]

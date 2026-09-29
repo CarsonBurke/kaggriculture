@@ -1062,21 +1062,22 @@ def test_the_bundle_smoke_test_refuses_an_agent_that_never_acts(tmp_path: Path) 
         builder._smoke_test(
             _bundle(tmp_path / "raising", "def agent(obs):\n    raise ValueError('bad')\n")
         )
-    # The trap the entrypoint template exists to avoid: `getfullargspec` counts
-    # `self`, so a callable object is invoked with two arguments, the TypeError is
-    # swallowed, and the seat submits nothing for the whole episode.
-    with pytest.raises(ValueError, match="failed to run"):
-        builder._smoke_test(
-            _bundle(
-                tmp_path / "callable",
-                "from pathlib import Path\n"
-                "import kaggriculture\n"
-                "from kaggriculture.inference import CheckpointAgent\n"
-                "agent = CheckpointAgent(\n"
-                "    Path(kaggriculture.__file__).resolve().parent.parent / 'model.pt'\n"
-                ")\n",
-            )
+    # `getfullargspec` counts `self`, so a callable object is always invoked with
+    # the observation and the configuration. The agent must accept both, or the
+    # TypeError is swallowed and the seat submits nothing for the whole episode.
+    bare = builder._smoke_test(
+        _bundle(
+            tmp_path / "callable",
+            "from pathlib import Path\n"
+            "import kaggriculture\n"
+            "from kaggriculture.inference import CheckpointAgent\n"
+            "agent = CheckpointAgent(\n"
+            "    Path(kaggriculture.__file__).resolve().parent.parent / 'model.pt'\n"
+            ")\n",
         )
+    )
+    assert bare["submitted"] == builder._SMOKE_STEPS - 1
+    assert bare["acting"] > 0
 
 
 def _load_build_plan_submission():

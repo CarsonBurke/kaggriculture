@@ -44,10 +44,14 @@ def test_action_diagnostics_excludes_inactive_and_invalid_rows() -> None:
     unit_actions[0, 0, 1] = UnitAction.PLACE_WHEAT
     unit_actions[0, 718, 0] = UnitAction.FEED
     unit_actions[1, 0, 0] = UnitAction.PICKUP_FERTILIZER_8
-    unit_masks[0, 0, :, UnitAction.PICKUP_WHEAT_16] = True
-    unit_masks[0, 718, 0, UnitAction.PICKUP_FERTILIZER_8] = True
-    unit_masks[1, 0, 0, UnitAction.PICKUP_FERTILIZER_8] = True
-    unit_masks[1, 718, 0, UnitAction.PICKUP_WHEAT_16] = True
+    # A pickup is legal when the shed holds at least its quantity, so a legal
+    # cap bin implies every smaller bin of its family (core.rs `pickup_spec`).
+    wheat = slice(UnitAction.PICKUP_WHEAT_1, UnitAction.PICKUP_WHEAT_16 + 1)
+    fertilizer = slice(UnitAction.PICKUP_FERTILIZER_1, UnitAction.PICKUP_FERTILIZER_8 + 1)
+    unit_masks[0, 0, :, wheat] = True
+    unit_masks[0, 718, 0, fertilizer] = True
+    unit_masks[1, 0, 0, fertilizer] = True
+    unit_masks[1, 718, 0, wheat] = True
 
     rollout = SimpleNamespace(
         valid=valid,
@@ -74,3 +78,12 @@ def test_action_diagnostics_excludes_inactive_and_invalid_rows() -> None:
     }
     assert report["place_wheat"] == 1
     assert report["feed"] == 1
+    # Only valid, active rows count; each selected pickup took its cap.
+    assert report["pickup_amounts"]["wheat"] == {
+        "selected": 1,
+        "legal_opportunities": 2,
+        "nonmaximum_selected": 0,
+        "units": 16,
+        "amounts": {"16": 1},
+    }
+    assert report["pickup_amounts"]["fertilizer"]["amounts"] == {"8": 1}

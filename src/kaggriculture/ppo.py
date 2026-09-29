@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -19,8 +20,9 @@ from kaggriculture.actor_dynamics import (
     actor_horizon_loss,
     actor_window_loss,
 )
+from kaggriculture.bank_advantage import UNGROUPED, own_bank_advantages
 from kaggriculture.causal_actor import CausalActor, CausalReplay
-from kaggriculture.constants import DEFAULT_REWARD_GAMMA, EPISODE_STEPS, STARTING_MONEY
+from kaggriculture.constants import DEFAULT_REWARD_GAMMA, STARTING_MONEY
 from kaggriculture.economic_forecasting import (
     build_economic_forecast_targets,
     economic_forecast_loss,
@@ -43,6 +45,12 @@ from kaggriculture.model import (
     scalar_value_loss,
 )
 from kaggriculture.optim import NorMuon, route_parameters
+from kaggriculture.outcome_value import (
+    match_score_calibration,
+    outcome_value_loss,
+    validate_outcome_objective,
+    validate_terminal_outcome_rewards,
+)
 from kaggriculture.policy import (
     categorical_logprob,
     categorical_statistics,
@@ -83,9 +91,15 @@ from kaggriculture.tokens import TILE_SLOT_CATEGORICAL
 Critic = DistributionalCritic | StructuredCritic | EntityCritic
 Actor = FarmActor | StructuredActor | EntityActor
 
-#: VAPO temporal defaults: Monte Carlo critic targets, shorter actor GAE traces.
-#: Actor lambda uses alpha=0.05 and the full game's EPISODE_STEPS - 1 transitions.
-DEFAULT_ACTOR_GAE_LAMBDA = 1.0 - 1.0 / (0.05 * (EPISODE_STEPS - 1))
+#: Monte Carlo credit for both towers. The actor's lambda was VAPO's shorter
+#: trace, `1 - 1 / (0.05 * (EPISODE_STEPS - 1))` = 0.972, a 36-step horizon in a
+#: 720-step game that scores early decisions by the critic -- whose Monte Carlo
+#: R-squared stays at 0.10-0.23 through a warm-started run. From the clone every
+#: 0.972 arm collapsed (zero argmax wins against V27 at wave 50) while lambda one
+#: beat the clone itself 0.992 argmax at the same wave while keeping V27 at 0.977,
+#: the only arm to improve on the clone against both (artifacts/probes/ppo-ablations-20260927).
+#: The two stay separate knobs, so the decoupled VAPO trace remains selectable.
+DEFAULT_ACTOR_GAE_LAMBDA = 1.0
 DEFAULT_CRITIC_GAE_LAMBDA = 1.0
 
 #: Optimizers `make_optimizers` can build, named by `PpoConfig.optimizer`.
@@ -243,8 +257,14 @@ UPDATE_COMPILE_MODES = (
 
 @dataclass(frozen=True)
 class PpoConfig:
-    # Promoted HL-Gauss VAPO terminal-outcome LR3 recipe.
-    actor_learning_rate: float = 1.5e-4
+    # A third of the promoted HL-Gauss VAPO terminal-outcome LR3 recipe's 1.5e-4.
+    # With Monte Carlo credit every full-rate arm peaked against its own clone by
+    # wave 50 and then drifted, the plain one to 0.68 argmax by the endpoint while
+    # V27 held at 1.00. 5e-5 learns a little less by wave 50 (0.90 against 0.99) but still
+    # beats the clone 0.936 at the thirty-minute endpoint, which makes the drift
+    # accumulated step size rather than bad credit
+    # (artifacts/probes/ppo-stage2-20260927, confirmed in ppo-stage3-20260927).
+    actor_learning_rate: float = 5e-5
     critic_learning_rate: float = 1.5e-4
     # Optional absolute LR for value_head only, independent of trunk Adam gains.
     critic_head_learning_rate: float | None = None
@@ -285,13 +305,15 @@ class PpoConfig:
     # a second same-wave critic pass memorized holdout, and a second actor pass
     # is a replay at a KL that does not bind.
     critic_epochs: int | None = None
-    # Keep physical batches larger without consuming the last VRAM headroom.
     # Fixed-shape partitioning covers the full wave; the final batch pads with
-    # zero weights. The size divides the production wave: 230,080 states make
-    # 29 minibatches with 64 padded rows, where an 8192 ceiling made the same
-    # 29 with 7,488 -- a 3.2% padded tail computed for nothing, and a final
-    # step averaged over 704 states rather than a full batch.
-    minibatch_size: int = 7936
+    # zero weights. 4096 is the size every measured LeJEPA recipe ran -- the WDL
+    # reference and all three PPO stages of 2026-09-27 -- so the promoted actor
+    # rate is calibrated per step at it. The production wave's 230,080 states
+    # make 57 minibatches with a 3,392-row padded tail (1.5%). The update with
+    # retained activations peaks at 17.2 GiB here, and 16384 does not fit the
+    # device at all (artifacts/probes/ppo-speed-20260927). The former 7936 was
+    # sized for the entity-attention family's padded tail, not measured on play.
+    minibatch_size: int = 4096
     # Component scope clips each conditional decision independently; joint scope
     # clips the product of all active conditional probabilities in one state.
     policy_ratio_scope: str = "components"
@@ -337,13 +359,27 @@ class PpoConfig:
     # Sampling temperature cannot supply the exploration instead: `rollout.py`
     # rejects any learner temperature other than 1.0, because the replay-parity
     # contract needs the update forward to reproduce the sampler's likelihoods.
-    # So the policy's own entropy is the only exploration that exists. The
-    # coefficient measured below is zero, leaving entropy as a liveness metric
-    # rather than an objective term.
+    # So the policy's own entropy is the only exploration that exists, and this
+    # coefficient is the one knob over it. The bonus maximizes the same
+    # per-component entropy `entropy` reports, summed over every factored head
+    # the ratio covers and divided by the surrogate's own denominator, so it
+    # scales with `policy_loss_reduction` exactly as the surrogate does. Zero
+    # builds the pre-bonus graph unchanged: entropy stays detached telemetry and
+    # the optimized loss is the surrogate alone, bit for bit.
     #
-    # Measured, and the answer is zero. Four coefficients ran 12 iterations each
-    # from the same warm checkpoint on the same wave sequence, against the native
-    # built-ins (`scripts/probe_schedule_sweep.py`, `artifacts/probes/entropy.json`).
+    # The earlier null result below does not transfer to today's policies. It
+    # was measured on a policy at 0.14-0.29 nats per active component; the
+    # v16-clone PPO runs sit near 0.002 nats per decision, effectively
+    # deterministic, and a controlled test found own bank flat across reward
+    # variants (`runs/ppo-frontier-20260928`,
+    # `artifacts/probes/ppo-frontier-20260928/ablations/evaluation`). A policy
+    # that never samples an alternative gets no gradient toward one, whatever
+    # the reward says, so the knob is back -- at zero until a run measures it.
+    #
+    # Measured once, and the answer was zero. Four coefficients ran 12 iterations
+    # each from the same warm checkpoint on the same wave sequence, against the
+    # native built-ins (`scripts/probe_schedule_sweep.py`,
+    # `artifacts/probes/entropy.json`).
     # The mechanism works and is monotone -- terminal entropy 0.294, 0.303, 0.324,
     # 0.371 nats at 0, 0.003, 0.01, 0.03 -- but it buys no play. Money against
     # `starter` over the last six iterations was 649 +/- 74 at zero against
@@ -351,11 +387,13 @@ class PpoConfig:
     # 0.01 and 0.03 were worse, and 0.03 much worse: 52-341 money over its last
     # six iterations, scoring 0.000 against `starter` in five of them.
     # That is a policy paying for noise.
-    #
+    entropy_coefficient: float = 0.0
     # Collection and PPO share gamma. At the default gamma one, terminal
     # win/loss/draw rewards retain the undiscounted game outcome.
-    # The critic fits full Monte Carlo returns; the actor's shorter GAE trace
-    # uses that critic to carry long-term credit with lower variance.
+    # The critic fits full Monte Carlo returns, and by default the actor's
+    # advantage is the same return less the critic's baseline: the shorter
+    # trace's variance reduction bought only the critic's bias (see
+    # `DEFAULT_ACTOR_GAE_LAMBDA`).
     actor_gae_lambda: float = DEFAULT_ACTOR_GAE_LAMBDA
     critic_gae_lambda: float = DEFAULT_CRITIC_GAE_LAMBDA
     gamma: float = DEFAULT_REWARD_GAMMA
@@ -383,6 +421,26 @@ class PpoConfig:
     #    late: mean advantage over advantage std averages -0.005 to -0.010 in the
     #    second half, positive in only 15-20 of 50 waves.
     normalize_advantages: bool = False
+    # Weight of the group-relative own-bank stream added to the actor's
+    # advantage (`bank_advantage.py`). Every reward mode scores a symmetric
+    # margin, which mirror self-play cannot use to raise absolute bank: a gain
+    # both copies share cancels out of it. Over 141 waves of the promoted recipe,
+    # self-play bank stayed at 86-92k while the copies' mean |margin| fell from
+    # 15.3k to about 3k. Against demand-advance4 the clone and the wave-50
+    # checkpoint both lost 64/64, at the same -35.6k margin. Zero keeps the
+    # outcome-only actor. The critic never sees this stream.
+    bank_advantage_coefficient: float = 0.0
+    # Which games the bank stream compares, always per (opponent, learner seat)
+    # within one wave, and per map seed for seed-grouped self-play. "all" also
+    # scores league lanes: against an opponent the learner always loses to, the
+    # outcome advantage is about zero, and own bank relative to the other games
+    # against it is the only signal left. "self-play" leaves league rows out of
+    # it. The trainer builds the groups.
+    bank_advantage_groups: str = "all"
+    # Money below which the bank stream's standardizer does not shrink. A wave
+    # of near-identical copies would otherwise turn a few coins of difference
+    # into unit advantages. About 1% of a self-play bank.
+    bank_advantage_scale_floor: float = 1000.0
     # The PPO actor and critic gradients are intentionally unclipped. NorMuon
     # already normalizes matrix directions; the value head is Adam-managed.
     # Keep this threshold only for the actor/critic NextLat predictors, where
@@ -409,6 +467,14 @@ class PpoConfig:
     # each one costs in importance-ratio drift against the stored behavior
     # likelihoods is gated end to end by `update_replay_parity`.
     update_compile_mode: str = "default"
+    # Whether the actor's grad-mode update forward replays trunk activations in
+    # backward rather than retaining them when an auxiliary reads its belief
+    # (`forward_with_auxiliary_belief(rematerialize=...)`). A memory-for-compute
+    # trade over the same function, so it belongs beside the compile mode; it is
+    # worth paying only when the minibatch's retained activations would not fit.
+    # Replay stays the default because a family's memory without it has to be
+    # measured first; `lejepa`'s was, and it retains them (`LEJEPA_PPO_DEFAULTS`).
+    rematerialize_actor_update: bool = True
 
     # Training-only typed NextLat objectives. All coefficients default to zero,
     # which leaves construction, optimizer membership, PPO ordering, checkpoint
@@ -454,7 +520,9 @@ class PpoConfig:
     jepa_detach_target: bool = False
     # Observable multi-horizon delta supervision, used only by the feed-forward
     # forecast critic. Its heads share the critic optimizer, never a predictor.
-    economic_forecast_coefficient: float = 1.0
+    # Off like every other auxiliary term here; a forecast critic's launch
+    # inherits `FORECAST_CRITIC_COEFFICIENT` through `family_ppo_defaults`.
+    economic_forecast_coefficient: float = 0.0
 
     @property
     def resolved_structured_learning_rate(self) -> float:
@@ -501,6 +569,58 @@ class PpoConfig:
         return self.structured_actor_auxiliary_active or self.structured_critic_auxiliary_active
 
 
+#: The `lejepa` family's objective and backbone rate. `PpoConfig` keeps every
+#: auxiliary off because it is shared by all families and the objective is
+#: refused on any other; a `lejepa` launch that states none of these inherits
+#: them from `family_ppo_defaults`.
+#:
+#: * The objective's weights are `../le-wm`'s: unit prediction, SIGReg 0.09. It
+#:   stays on for PPO from a clone: at the promoted actor rate, dropping it let
+#:   the policy drift from 0.936 to 0.714 argmax against its own clone at the
+#:   thirty-minute endpoint, which reads as the objective anchoring the shared
+#:   backbone (artifacts/probes/ppo-stage3-20260927). The reward head stays off:
+#:   under terminal-outcome rewards it predicts one sparse step per episode, and
+#:   every measured recipe ran without it.
+#: * The backbone steps at 1.5e-5 rather than the actor's rate. It moves under
+#:   the summed objective and policy gradient every minibatch, and the slower
+#:   backbone beat the full-rate run from the same clone (JEPA_RUNS.md, job 9281
+#:   against 9275); every 2026-09-27 stage ran it.
+#: * The update retains the actor's farm activations rather than replaying them
+#:   for the objective's belief: at the 4096-row minibatch it fits, 17.2 GiB at
+#:   peak (+4 GiB), and is 0.36 s (5.4%) faster per wave for the same function
+#:   (artifacts/probes/ppo-speed-20260927). Other families' memory without
+#:   replay is unmeasured, so they keep `PpoConfig`'s replay.
+LEJEPA_PPO_DEFAULTS: dict[str, float | bool] = {
+    "jepa_prediction_coefficient": 1.0,
+    "jepa_sigreg_coefficient": 0.09,
+    "structured_learning_rate": 1.5e-5,
+    "rematerialize_actor_update": False,
+}
+#: The forecast critic's delta-supervision weight, one against its value loss.
+FORECAST_CRITIC_COEFFICIENT = 1.0
+
+
+def family_ppo_defaults(
+    architecture: str, critic_architecture: str | None = None
+) -> dict[str, float | bool]:
+    """The `PpoConfig` fields whose default belongs to the model, not the algorithm.
+
+    Every entry point that resolves a launch -- the trainer's and benchmark's
+    parsers and the production factory -- applies these over `PpoConfig`'s own
+    defaults, so a family's objective switches on with the family and cannot be
+    inherited by a family that refuses it. `critic_architecture` is the model's
+    field; None, unstated, resolves to the family's own default.
+    """
+    if critic_architecture is None:
+        critic_architecture = getattr(
+            resolve_architecture(architecture).config_class(), "critic_architecture", None
+        )
+    defaults = dict(LEJEPA_PPO_DEFAULTS) if architecture == LEJEPA else {}
+    if critic_architecture == "forecast":
+        defaults["economic_forecast_coefficient"] = FORECAST_CRITIC_COEFFICIENT
+    return defaults
+
+
 @dataclass(frozen=True)
 class AdvantageBatch:
     advantages: np.ndarray
@@ -513,9 +633,11 @@ class AdvantageBatch:
     # `value_targets` equal those suffix returns.
     policy_lambda_returns: np.ndarray
     monte_carlo_returns: np.ndarray
-    # Location and scale of the advantages the surrogate sees.
+    # Location and scale of the outcome advantages, before any bank stream.
     raw_advantage_mean: float
     raw_advantage_std: float
+    # The own-bank stream's telemetry; empty when its coefficient is zero.
+    bank_metrics: dict[str, float]
 
 
 def generalized_advantage_and_targets(
@@ -616,13 +738,30 @@ def _validate_config(config: PpoConfig) -> None:
         )
     if not math.isfinite(config.tpo_eta) or config.tpo_eta <= 0.0:
         raise ValueError("TPO eta must be finite and positive")
+    # Negative would reward driving the policy deterministic, the collapse this
+    # term exists to oppose, so it is rejected rather than allowed as exotic.
+    if not math.isfinite(config.entropy_coefficient) or config.entropy_coefficient < 0.0:
+        raise ValueError("entropy coefficient must be finite and non-negative")
     if not math.isfinite(config.gamma) or not 0.0 < config.gamma <= 1.0:
         raise ValueError("gamma must be finite and in (0, 1]")
     if not math.isfinite(config.actor_gae_lambda) or not 0.0 <= config.actor_gae_lambda <= 1.0:
         raise ValueError("actor GAE lambda must be finite and in [0, 1]")
     if not math.isfinite(config.critic_gae_lambda) or not 0.0 <= config.critic_gae_lambda <= 1.0:
         raise ValueError("critic GAE lambda must be finite and in [0, 1]")
+    if not math.isfinite(config.bank_advantage_scale_floor) or (
+        config.bank_advantage_scale_floor <= 0.0
+    ):
+        raise ValueError("bank advantage scale floor must be finite and positive")
+    if config.bank_advantage_groups not in ("self-play", "all"):
+        raise ValueError("bank advantage groups must be 'self-play' or 'all'")
+    if config.bank_advantage_coefficient and (
+        config.gamma != 1.0 or config.actor_gae_lambda != 1.0
+    ):
+        # The terminal bank is every state's return-to-go only without
+        # discounting or bootstrapping.
+        raise ValueError("the bank advantage requires gamma 1 and actor GAE lambda 1")
     coefficients = {
+        "bank advantage": config.bank_advantage_coefficient,
         "economic forecast": config.economic_forecast_coefficient,
         "structured latent": config.structured_latent_coefficient,
         "structured decision": config.structured_decision_coefficient,
@@ -893,6 +1032,8 @@ def _actor_batch_args(
                 _batch_tensor(staged["market_quantities"], indices, torch.long),
             ),
         )
+    if architecture == "lejepa" and "market_resources" in staged:
+        args += (_batch_tensor(staged["market_resources"], indices, torch.float32),)
     return args
 
 
@@ -1206,6 +1347,7 @@ def prepare_advantages(
     config: PpoConfig,
     *,
     rows: np.ndarray | None = None,
+    bank_groups: np.ndarray | None = None,
 ) -> AdvantageBatch:
     """VAPO decoupled GAE: policy advantages at actor lambda, critic targets at critic lambda.
 
@@ -1213,10 +1355,21 @@ def prepare_advantages(
     it come back exactly zero. A population wave partitions before it updates
     because a game's two seats belong to two members; no storage order makes
     one member's rows a contiguous block.
+
+    With a positive `bank_advantage_coefficient`, the actor's advantages also
+    carry that weight times each trajectory's standardized own-bank deviation
+    within its `bank_groups` group (`bank_advantage.opponent_bank_groups`).
+    Critic targets and the outcome statistics are unchanged.
     """
     _validate_config(config)
     if values.shape != rollout.rewards.shape:
         raise ValueError("behavior values must match the rollout reward shape")
+    if config.bank_advantage_coefficient and bank_groups is None:
+        raise ValueError("a bank advantage coefficient needs the wave's bank groups")
+    if config.bank_advantage_coefficient and rows is not None:
+        # A population's self-play opponents are other members, so one member's
+        # games do not share an opponent the way the groups assume.
+        raise ValueError("the bank advantage requires a single learner")
     rewards = torch.from_numpy(rollout.rewards).float()
     values = torch.from_numpy(values).float()
     valid = torch.from_numpy(_owned_valid(rollout, rows)).float()
@@ -1245,6 +1398,13 @@ def prepare_advantages(
         # member's offset, and the partition is by seat, not by contiguous rows.
         advantages = (advantages - raw_mean) / max(raw_std, 1e-6)
     advantages = advantages * valid
+    bank_metrics: dict[str, float] = {}
+    if config.bank_advantage_coefficient:
+        assert bank_groups is not None
+        bank_advantages, bank_metrics = _bank_advantage_stream(
+            rollout, bank_groups, advantages, valid, config
+        )
+        advantages = advantages + bank_advantages
     # Lambda one against a zero reference: the residuals telescope, so the
     # advantage is the exact suffix return and the same recurrence yields it.
     monte_carlo = generalized_advantage_and_targets(
@@ -1261,7 +1421,59 @@ def prepare_advantages(
         monte_carlo_returns=monte_carlo.numpy(),
         raw_advantage_mean=raw_mean,
         raw_advantage_std=raw_std,
+        bank_metrics=bank_metrics,
     )
+
+
+def _bank_advantage_stream(
+    rollout: RolloutBatch,
+    bank_groups: np.ndarray,
+    outcome_advantages: Tensor,
+    valid: Tensor,
+    config: PpoConfig,
+) -> tuple[Tensor, dict[str, float]]:
+    """The weighted own-bank advantage on the rollout grid, and its telemetry.
+
+    Comparisons with the outcome advantage use only the grouped trajectories,
+    which are the only ones the stream touches. Sign disagreement is per
+    trajectory: the sign of its standardized bank deviation against the sign
+    of its mean outcome advantage over valid states. Trajectories where either
+    is exactly zero are left out. Under `normalize_advantages` the outcome
+    advantage is centered over the whole batch first, so a sign reads "better
+    or worse than the batch's average state" rather than "won or lost"; the
+    fraction measures how often the bank stream pushes a trajectory against
+    that per-state credit, not against its game result.
+    """
+    if bank_groups.shape != rollout.rewards.shape[:1]:
+        raise ValueError("bank groups must have one entry per trajectory")
+    if not (bank_groups != UNGROUPED).any():
+        raise ValueError("a bank advantage coefficient needs at least one grouped trajectory")
+    bank = own_bank_advantages(
+        rollout.final_money, bank_groups, scale_floor=config.bank_advantage_scale_floor
+    )
+    weighted = torch.from_numpy(bank.z).float()[:, None] * config.bank_advantage_coefficient
+    stream = weighted * valid
+    grouped = torch.from_numpy(bank_groups != UNGROUPED)
+    grouped_states = valid.bool() & grouped[:, None]
+    lengths = valid[grouped].sum(dim=1).clamp_min(1.0)
+    trajectory_outcome = outcome_advantages[grouped].sum(dim=1) / lengths
+    bank_sign = torch.sign(weighted[grouped, 0])
+    outcome_sign = torch.sign(trajectory_outcome)
+    compared = (bank_sign != 0) & (outcome_sign != 0)
+    disagreement = (
+        float((bank_sign[compared] != outcome_sign[compared]).float().mean())
+        if bool(compared.any())
+        else 0.0
+    )
+    return stream, {
+        "bank_advantage_own_bank_mean": bank.own_bank_mean,
+        "bank_advantage_deviation_std": bank.deviation_std,
+        "bank_advantage_scale": bank.scale,
+        "bank_advantage_weighted_std": float(stream[grouped_states].std(unbiased=False)),
+        "bank_advantage_outcome_std": float(outcome_advantages[grouped_states].std(unbiased=False)),
+        "bank_advantage_sign_disagreement": disagreement,
+        "bank_advantage_grouped_fraction": float(grouped.float().mean()),
+    }
 
 
 def prepare_entity_advantages(
@@ -1343,11 +1555,20 @@ def make_optimizers(
     ):
         raise ValueError("structured critic auxiliary coefficients require a structured critic")
     # The `lejepa` actor carries the shared world-model backbone as a submodule
-    # so one flat state dict still serializes the deployed model, but the
-    # policy's optimizer does not own it: `make_structured_dynamics_optimizer`
-    # does, beside the objective, and steps the policy's gradient into it with
-    # the objective's. Everything below therefore steps the actor's heads alone.
+    # so one flat state dict still serializes the deployed model. While its
+    # objective runs, the policy's optimizer does not own it:
+    # `make_structured_dynamics_optimizer` does, beside the objective, and steps
+    # the policy's gradient into it with the objective's. Without the objective
+    # the policy's loss is the only one left to train it, so the backbone joins
+    # the actor's optimizer instead -- in groups of its own, at the structured
+    # rate the objective would have stepped it at.
     actor_owned = list(policy_owned_parameters(actor))
+    policy_backbone = backbone_parameters(actor) if not config.jepa_active else []
+    if policy_backbone and not actor.config.policy_shapes_backbone:
+        raise ValueError(
+            "without its objective a lejepa backbone detached from the policy has no loss "
+            "to train it; enable policy_shapes_backbone or keep the objective"
+        )
     if config.optimizer == "normuon":
         # One learning rate per network drives both halves: the matrices under
         # NorMuon and the gains, biases and heads under Adam. They are not the
@@ -1362,6 +1583,9 @@ def make_optimizers(
             momentum=config.normuon_momentum,
             beta2=config.normuon_beta2,
         )
+        if policy_backbone:
+            for group in _normuon_backbone_groups(actor, config):
+                actor_optimizer.add_param_group(group)
         critic_optimizer = NorMuon(
             *route_parameters(critic),
             learning_rate=config.critic_learning_rate,
@@ -1388,8 +1612,36 @@ def make_optimizers(
     )
     _initialize_optimizer_schedule(actor_optimizer, config.actor_learning_rate)
     _initialize_optimizer_schedule(critic_optimizer, config.critic_learning_rate)
+    if policy_backbone:
+        actor_optimizer.add_param_group(
+            {
+                "params": policy_backbone,
+                "lr": config.resolved_structured_learning_rate,
+                "base_lr": config.resolved_structured_learning_rate,
+                "warmup_step": 0,
+                "role": BACKBONE_ROLE,
+            }
+        )
     _configure_critic_head_rate(critic_optimizer, critic, config.critic_head_learning_rate)
     return actor_optimizer, critic_optimizer
+
+
+def _normuon_backbone_groups(actor: Actor, config: PpoConfig) -> list[dict[str, Any]]:
+    """The `lejepa` backbone's NorMuon groups, tagged `BACKBONE_ROLE`.
+
+    Routed as they would be inside the actor -- the backbone's names and module
+    types are unchanged by who steps it -- at the structured rate, whichever
+    optimizer they join: the objective's while it runs, the policy's otherwise.
+    """
+    learning_rate = config.resolved_structured_learning_rate
+    optimizer = NorMuon(
+        *route_parameters(actor.trunk),
+        learning_rate=learning_rate,
+        adam_learning_rate=learning_rate * config.adam_learning_rate_ratio,
+        momentum=config.normuon_momentum,
+        beta2=config.normuon_beta2,
+    )
+    return [{**group, "role": BACKBONE_ROLE} for group in optimizer.param_groups]
 
 
 def make_structured_dynamics_optimizer(
@@ -1442,23 +1694,17 @@ def make_structured_dynamics_optimizer(
         else config.resolved_structured_learning_rate
     )
     if config.optimizer == "normuon":
-
-        def normuon(module: torch.nn.Module) -> NorMuon:
-            return NorMuon(
-                *route_parameters(module),
-                learning_rate=learning_rate,
-                adam_learning_rate=learning_rate * config.adam_learning_rate_ratio,
-                momentum=config.normuon_momentum,
-                beta2=config.normuon_beta2,
-            )
-
-        optimizer = normuon(dynamics)
+        optimizer = NorMuon(
+            *route_parameters(dynamics),
+            learning_rate=learning_rate,
+            adam_learning_rate=learning_rate * config.adam_learning_rate_ratio,
+            momentum=config.normuon_momentum,
+            beta2=config.normuon_beta2,
+        )
         if actor is not None:
-            # Routed as they would be inside the actor -- the backbone's names
-            # and module types are unchanged by who steps it -- but into groups
-            # of their own, so the backbone keeps its own warmup clock.
-            for group in normuon(actor.trunk).param_groups:
-                optimizer.add_param_group({**group, "role": BACKBONE_ROLE})
+            # Groups of their own, so the backbone keeps its own warmup clock.
+            for group in _normuon_backbone_groups(actor, config):
+                optimizer.add_param_group(group)
         return optimizer
     groups: list[dict[str, Any]] = [{"params": list(dynamics.parameters())}]
     if actor is not None:
@@ -1697,6 +1943,11 @@ def _restore_skipped_optimizer_steps(
             group["lr"] = base_lr * scale * float(group.get("cooldown_scale", 1.0))
 
 
+def _require_market_replay(actor: Actor, actor_args: tuple[Any, ...]) -> None:
+    if getattr(actor, "market_resource_conditioner", None) is not None and len(actor_args) != 2:
+        raise ValueError("resource-conditioned policy replay requires recorded pre-order ledgers")
+
+
 def _replayed_component_logprobs(
     actor: Actor,
     unit_actions: Tensor,
@@ -1714,6 +1965,7 @@ def _replayed_component_logprobs(
     every actor minibatch. The behavior side is the sampler likelihood stored
     by the rollout. Autocast keeps log_softmax in fp32 by policy.
     """
+    _require_market_replay(actor, actor_args)
     with torch.autocast(
         device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
@@ -1760,6 +2012,7 @@ def _replayed_selected_logprobs(
     log-likelihoods, so this variant skips the per-head entropy reductions the
     minibatch objective needs for its metrics.
     """
+    _require_market_replay(actor, actor_args)
     with torch.autocast(
         device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
@@ -1858,6 +2111,7 @@ def _market_set_minibatch_terms(
     policy_ratio_scope: str = "joint",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
+    entropy_gradient: bool = False,
 ) -> tuple[Tensor, ...]:
     """Joint PPO surrogate for unit actions and effective market-set values."""
     if policy_ratio_scope != "joint":
@@ -1883,6 +2137,7 @@ def _market_set_minibatch_terms(
         policy_ratio_scope="joint",
         policy_objective=policy_objective,
         tpo_eta=tpo_eta,
+        entropy_gradient=entropy_gradient,
     )
 
 
@@ -2046,6 +2301,7 @@ def _actor_minibatch_terms(
     policy_ratio_scope: str = "components",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
+    entropy_gradient: bool = False,
 ) -> tuple[Tensor, ...]:
     """One actor minibatch: update likelihood plus clipped surrogate reductions.
 
@@ -2053,10 +2309,11 @@ def _actor_minibatch_terms(
     scoped clipped count, component k3 KL sum, joint k3 KL sum). Normalization
     stays outside so host integers never enter the graph.
 
-    Entropy and KL are telemetry, not objective terms. Detaching their sums
-    inside this compiled region preserves their exact forward values while
-    keeping their softmax-sized derivative branches and saved intermediates
-    out of the actor backward.
+    KL is telemetry, not an objective term, and so is entropy unless
+    `entropy_gradient` enables the bonus. Detaching their sums inside this
+    compiled region preserves their exact forward values while keeping their
+    softmax-sized derivative branches and saved intermediates out of the actor
+    backward.
     """
     replayed = _replayed_component_logprobs(
         actor,
@@ -2090,6 +2347,7 @@ def _actor_minibatch_terms(
         policy_ratio_scope=policy_ratio_scope,
         policy_objective=policy_objective,
         tpo_eta=tpo_eta,
+        entropy_gradient=entropy_gradient,
     )
 
 
@@ -2153,17 +2411,26 @@ def _structured_actor_minibatch_terms(
     policy_ratio_scope: str = "components",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
+    entropy_gradient: bool = False,
+    rematerialize: bool = True,
 ) -> tuple[Tensor, ...]:
-    """PPO terms and the belief from one structured actor forward."""
-    (inputs,) = actor_args
+    """PPO terms and the belief from one structured actor forward.
+
+    `rematerialize` selects the forward that replays activations in backward;
+    see `PpoConfig.rematerialize_actor_update`.
+    """
+    inputs = actor_args[0]
     if not isinstance(inputs, StructuredInputs):
         raise TypeError("structured actor minibatches require StructuredInputs")
+    _require_market_replay(actor, actor_args)
     with torch.autocast(
         device_type=unit_actions.device.type,
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
-        output, belief = actor.forward_with_auxiliary_belief(inputs)
+        output, belief = actor.forward_with_auxiliary_belief(
+            *actor_args, rematerialize=rematerialize
+        )
         (
             new_unit,
             new_kind,
@@ -2195,9 +2462,17 @@ def _structured_actor_minibatch_terms(
             policy_ratio_scope=policy_ratio_scope,
             policy_objective=policy_objective,
             tpo_eta=tpo_eta,
+            entropy_gradient=entropy_gradient,
         ),
         *belief,
     )
+
+
+# A stable callable per mode: eager updates use it uncompiled, and the warmed
+# update-graph key names it, so a fresh partial per wave would never match.
+_retained_structured_actor_minibatch_terms = functools.partial(
+    _structured_actor_minibatch_terms, rematerialize=False
+)
 
 
 def _value_objective(
@@ -2237,6 +2512,8 @@ def _value_objective(
             per_state = -(projected[:, None] * critic_logits.float().log_softmax(dim=-1)).sum(
                 dim=-1
             )
+    elif getattr(critic.config, "wdl_value", False):
+        per_state = outcome_value_loss(critic_logits, value_targets, validate=False)
     elif critic.config.scalar_value:
         per_state = scalar_value_loss(critic.value(critic_logits), value_targets)
     else:
@@ -2504,6 +2781,7 @@ def update_replay_parity(
     compile_mode: str,
     autocast_enabled: bool,
     rows: np.ndarray | None = None,
+    entropy_gradient: bool = False,
 ) -> dict[str, float | int]:
     """Measure rollout-sampling versus update-replay likelihood divergence.
 
@@ -2528,7 +2806,8 @@ def update_replay_parity(
     `rows` restricts the audit to those trajectory rows. In a population wave
     every row was sampled by its own member, so replaying the whole wave
     through one member's actor would measure the distance between two policies
-    and report it as a staging defect.
+    and report it as a staging defect. `entropy_gradient` mirrors a positive
+    entropy coefficient, so the audited minibatch graph is the optimizer's.
     """
     if minibatch_size < 1:
         raise ValueError("minibatch size must be positive")
@@ -2693,6 +2972,7 @@ def update_replay_parity(
         minibatch_size=minibatch_size,
         compile_mode=compile_mode,
         autocast_enabled=autocast_enabled,
+        entropy_gradient=entropy_gradient,
     )
     total_active = sum(active_counts.values())
     total_kl_sum = sum(kl_sums.values())
@@ -2742,6 +3022,7 @@ def _replay_to_update_minibatch_kl(
     minibatch_size: int,
     compile_mode: str,
     autocast_enabled: bool,
+    entropy_gradient: bool = False,
 ) -> tuple[float, float]:
     """Worst and mean per-minibatch KL from sampler to update forward.
 
@@ -2827,6 +3108,9 @@ def _replay_to_update_minibatch_kl(
                     if market_set or rollout.architecture == "strategic-plan"
                     else "components"
                 ),
+                # The optimizer's own graph, entropy derivative included when
+                # the bonus differentiates it.
+                entropy_gradient=entropy_gradient,
             )
         minibatch_kl_sum = float(component_kl_sum.detach().double())
         minibatch_kl = minibatch_kl_sum / max(1, component_count)
@@ -2849,6 +3133,7 @@ def _component_policy_sums(
     sample_weight: Tensor | None = None,
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
+    entropy_gradient: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Sum independent component objectives and expose joint KL telemetry."""
     objective = torch.zeros((), device=advantages.device)
@@ -2883,7 +3168,9 @@ def _component_policy_sums(
         torch.ones_like(joint_log_ratio) if sample_weight is None else sample_weight
     )
     joint_kl = ((torch.expm1(joint_log_ratio) - joint_log_ratio) * joint_state_weight).sum()
-    return objective, entropy_sum.detach(), kl.detach(), clipped, kl.detach(), joint_kl.detach()
+    if not entropy_gradient:
+        entropy_sum = entropy_sum.detach()
+    return objective, entropy_sum, kl.detach(), clipped, kl.detach(), joint_kl.detach()
 
 
 def _policy_sums(
@@ -2899,8 +3186,13 @@ def _policy_sums(
     policy_ratio_scope: str = "components",
     policy_objective: str = "clip",
     tpo_eta: float = 1.0,
+    entropy_gradient: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Keep component KL and joint product-ratio KL independently observable."""
+    """Keep component KL and joint product-ratio KL independently observable.
+
+    The entropy sum is detached telemetry unless `entropy_gradient` asks for the
+    bonus, so the default graph carries no softmax-sized entropy derivative.
+    """
     if policy_ratio_scope == "components":
         terms = _component_policy_sums(
             new_logprobs,
@@ -2913,6 +3205,7 @@ def _policy_sums(
             sample_weight=sample_weight,
             policy_objective=policy_objective,
             tpo_eta=tpo_eta,
+            entropy_gradient=entropy_gradient,
         )
         return terms
     if policy_ratio_scope != "joint":
@@ -2957,7 +3250,7 @@ def _policy_sums(
     )
     return (
         objective,
-        entropy_sum.detach(),
+        entropy_sum if entropy_gradient else entropy_sum.detach(),
         kl.detach(),
         clipped,
         component_kl_sum.detach(),
@@ -3499,7 +3792,7 @@ def _jepa_auxiliary_terms(
     """
     if complete_windows:
         raise ValueError("the LeJEPA objective has no complete-window variant")
-    (inputs,) = _actor_batch_args(LEJEPA, staged, indices)
+    inputs = _actor_batch_args(LEJEPA, staged, indices)[0]
     if not isinstance(inputs, StructuredInputs):
         raise TypeError("the LeJEPA auxiliary requires StructuredInputs")
     factors = _jepa_factors(staged, indices, steps_per_trajectory)
@@ -3516,7 +3809,7 @@ def _jepa_auxiliary_terms(
                 raise ValueError("actor-gradient auxiliary cannot reuse unique-row beliefs")
             belief = actor.auxiliary_belief(inputs)
         elif belief_indices is not None and belief_inverse is not None:
-            (belief_inputs,) = _actor_batch_args(LEJEPA, staged, belief_indices)
+            belief_inputs = _actor_batch_args(LEJEPA, staged, belief_indices)[0]
             if not isinstance(belief_inputs, StructuredInputs):
                 raise TypeError("the LeJEPA auxiliary requires StructuredInputs")
             with torch.no_grad():
@@ -3755,6 +4048,7 @@ def _warm_actor_update_graphs(
         policy_ratio_scope=config.policy_ratio_scope,
         policy_objective=config.policy_objective,
         tpo_eta=config.tpo_eta,
+        entropy_gradient=config.entropy_coefficient > 0.0,
     )
     if config.policy_loss_reduction == "states":
         policy_denominator = (
@@ -3774,6 +4068,8 @@ def _warm_actor_update_graphs(
             for name in active_names
         ).clamp_min(1)
     loss = -actor_pack[0] / policy_denominator
+    if config.entropy_coefficient > 0.0:
+        loss = loss - config.entropy_coefficient * actor_pack[1] / policy_denominator
     if structured_terms_fn is not None:
         assert architecture_of_config(actor.config).structured_inputs
         assert structured_dynamics is not None
@@ -3824,6 +4120,7 @@ def update_ppo(
     auxiliary_generator: np.random.Generator | None = None,
     diagnostic_groups: Mapping[str, np.ndarray] | None = None,
     diagnostic_gradients: bool = False,
+    bank_groups: np.ndarray | None = None,
 ) -> dict[str, float | int]:
     """Replay one rollout with asymmetric, per-component clipped policy updates.
 
@@ -3839,6 +4136,9 @@ def update_ppo(
     rows belong to two different members, so no storage order makes one
     member's rows a contiguous block and slicing would copy the wave's state
     arrays.
+
+    `bank_groups` assigns trajectories to the own-bank stream's
+    (opponent, seat) groups; `prepare_advantages` reads it when the stream's coefficient is on.
     """
     _validate_config(config)
     if isinstance(actor, (StrategicActor, CausalActor)):
@@ -3868,6 +4168,9 @@ def update_ppo(
             raise ValueError("per-entity critic requires component policy ratio scope")
     if not rollout.learner_stochastic:
         raise ValueError("PPO updates require stochastic learner collection")
+    if getattr(critic.config, "wdl_value", False):
+        validate_outcome_objective(rollout.reward_mode, config.gamma, config.critic_gae_lambda)
+        validate_terminal_outcome_rewards(rollout.rewards, rollout.valid)
     _validate_structured_auxiliary_modules(actor, structured_dynamics, config)
     _validate_structured_critic_auxiliary_modules(critic, structured_critic_dynamics, config)
     actor_predictor_active = structured_dynamics is not None
@@ -3934,6 +4237,12 @@ def update_ppo(
     # whole module and this reads exactly as it did.
     actor_owned = policy_owned_parameters(actor)
     world_model = backbone_parameters(actor)
+    if world_model and structured_dynamics is None:
+        # No objective runs, so the policy's optimizer owns the backbone and the
+        # policy's gradient is the only one that trains it; see
+        # `make_optimizers`. From here on it is simply part of the actor.
+        actor_owned = actor_owned + world_model
+        world_model = []
     ownership_pairs: list[tuple[str, Any, torch.optim.Optimizer]] = [
         ("actor", actor_owned, actor_optimizer),
         ("critic", critic, critic_optimizer),
@@ -3946,8 +4255,6 @@ def update_ppo(
                 structured_dynamics_optimizer,
             )
         )
-    elif world_model:
-        raise ValueError("the lejepa backbone has no optimizer; its objective is what trains it")
     if structured_critic_dynamics is not None and structured_critic_dynamics_optimizer is not None:
         ownership_pairs.append(
             (
@@ -4118,11 +4425,29 @@ def update_ppo(
     if structured_critic_dynamics is not None:
         structured_critic_dynamics.train()
         refresh_fused_mlp_fp8(structured_critic_dynamics)
-    prepared = prepare_advantages(rollout, behavior_values, config, rows=rows)
+    if entity_critic and config.bank_advantage_coefficient:
+        raise ValueError("the bank advantage does not reach per-entity critic advantages")
+    prepared = prepare_advantages(
+        rollout, behavior_values, config, rows=rows, bank_groups=bank_groups
+    )
+    outcome_metrics = (
+        match_score_calibration(
+            behavior_values[owned_valid], prepared.monte_carlo_returns[owned_valid]
+        )
+        if rollout.reward_mode == "terminal-outcome" and config.gamma == 1.0
+        else {}
+    )
     valid_value_targets = prepared.value_targets[owned_valid]
     if not np.isfinite(valid_value_targets).all():
         raise ValueError("value targets must be finite")
-    if critic.config.scalar_value:
+    if getattr(critic.config, "wdl_value", False):
+        # Use the exact zero-baseline suffix returns: lambda-one arithmetic
+        # against nonzero values can leave rounding residue around class labels.
+        value_targets = prepared.monte_carlo_returns
+        if not np.isin(value_targets[owned_valid], (-1, 0, 1)).all():
+            raise ValueError("WDL critic requires exact completed-game outcomes")
+        saturated = 0
+    elif critic.config.scalar_value:
         # No support, so nothing to clip and nothing to escape: the reference's
         # scalar critic regresses on the return as it stands. The saturation
         # reading stays in the telemetry layout and reads zero.
@@ -4250,15 +4575,28 @@ def update_ppo(
     critic_auxiliary_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] | None = (
         [] if critic_predictor_active and device.type == "cuda" else None
     )
+    # Only a positive coefficient differentiates entropy, so the zero default
+    # traces, compiles and optimizes exactly the surrogate-only graph.
+    entropy_bonus_active = config.entropy_coefficient > 0.0
+    if entropy_bonus_active:
+        totals["entropy_bonus"] = torch.zeros((), device=device, dtype=torch.float64)
     actor_terms = _cached_update_callable(
         actor,
         (
-            "_kaggriculture_structured_update_terms"
+            (
+                "_kaggriculture_structured_update_terms"
+                if config.rematerialize_actor_update
+                else "_kaggriculture_retained_structured_update_terms"
+            )
             if actor_predictor_active
             else "_kaggriculture_update_terms"
         ),
         (
-            _structured_actor_minibatch_terms
+            (
+                _structured_actor_minibatch_terms
+                if config.rematerialize_actor_update
+                else _retained_structured_actor_minibatch_terms
+            )
             if actor_predictor_active
             else _market_set_minibatch_terms
             if market_set
@@ -4310,8 +4648,11 @@ def update_ppo(
     # Separate actor/critic streams strand each branch's cached blocks; at
     # production shape their combined reservations force eviction every batch.
     # Ordered execution lets the critic reuse the actor's released activations.
+    # The optimized actor loss differs from the reported surrogate whenever an
+    # auxiliary or the entropy bonus is added to it, and is then guarded too.
+    guard_combined_actor_loss = actor_predictor_active or config.entropy_coefficient > 0.0
     guard_host = torch.empty(
-        6 if actor_predictor_active else 5,
+        6 if guard_combined_actor_loss else 5,
         dtype=torch.float64,
         pin_memory=device.type == "cuda",
     )
@@ -4477,6 +4818,7 @@ def update_ppo(
                     policy_ratio_scope=config.policy_ratio_scope,
                     policy_objective=config.policy_objective,
                     tpo_eta=config.tpo_eta,
+                    entropy_gradient=entropy_bonus_active,
                 )
                 (
                     policy_sum,
@@ -4495,6 +4837,14 @@ def update_ppo(
                 )
                 policy_loss = -policy_sum / policy_denominator
                 entropy_mean = entropy_sum / component_denominator
+                # `policy_loss` stays the surrogate, reported and finiteness-
+                # checked under its own name; the bonus enters only what is
+                # optimized, over the surrogate's own denominator.
+                actor_objective = policy_loss
+                if entropy_bonus_active:
+                    actor_objective = (
+                        policy_loss - config.entropy_coefficient * entropy_sum / policy_denominator
+                    )
                 if actor_predictor_active:
                     assert architecture_of_config(actor.config).structured_inputs
                     assert structured_dynamics is not None
@@ -4564,7 +4914,7 @@ def update_ppo(
                                         actor_auxiliary_metrics,
                                     )
                                 )
-                    combined_actor_loss = policy_loss + actor_auxiliary_loss
+                    combined_actor_loss = actor_objective + actor_auxiliary_loss
                     combined_actor_loss.backward()
                     if actor_gradient_diagnostic:
                         gradient_metrics["structured_gradient_source_norm"] = (
@@ -4590,7 +4940,7 @@ def update_ppo(
                     else:
                         actor_auxiliary_seconds += time.perf_counter() - actor_auxiliary_started
                 else:
-                    combined_actor_loss = policy_loss
+                    combined_actor_loss = actor_objective
                     combined_actor_loss.backward()
                     # The policy's own parameters, which under `lejepa` are the
                     # actor minus the backbone: whatever reaches the backbone is
@@ -4605,7 +4955,7 @@ def update_ppo(
                     batch_joint_kl,
                     batch_component_kl,
                 ]
-                if actor_predictor_active:
+                if guard_combined_actor_loss:
                     guard_values.insert(2, combined_actor_loss.detach().double())
                 guard_tensor = torch.stack(guard_values)
                 actor_finite = torch.isfinite(guard_tensor[:-1]).all()
@@ -4619,7 +4969,7 @@ def update_ppo(
                 assert structured_dynamics_optimizer is not None
                 assert structured_terms_fn is not None
                 assert actor_args is not None
-                (inputs,) = actor_args
+                inputs = actor_args[0]
                 if not isinstance(inputs, StructuredInputs):
                     raise TypeError("structured actor minibatches require StructuredInputs")
                 _zero_world_model_grads(actor, structured_dynamics)
@@ -4941,7 +5291,7 @@ def update_ppo(
                 guard_values_list = guard_host.tolist()
                 batch_kl_value = guard_values_list[0]
                 policy_loss_value = guard_values_list[1]
-                if actor_predictor_active:
+                if guard_combined_actor_loss:
                     combined_actor_loss_value = guard_values_list[2]
                     actor_gradient_norm_value = guard_values_list[3]
                 else:
@@ -4963,7 +5313,11 @@ def update_ppo(
                 if not math.isfinite(policy_loss_value):
                     nonfinite_message = "non-finite policy loss"
                 elif not math.isfinite(combined_actor_loss_value):
-                    nonfinite_message = "non-finite structured auxiliary loss"
+                    nonfinite_message = (
+                        "non-finite structured auxiliary loss"
+                        if actor_predictor_active
+                        else "non-finite entropy bonus"
+                    )
                 elif not math.isfinite(actor_gradient_norm_value):
                     nonfinite_message = "non-finite actor gradient norm"
                 elif not math.isfinite(batch_kl_value):
@@ -4992,6 +5346,10 @@ def update_ppo(
                     refresh_fused_mlp_fp8(actor, bootstrap_down=False)
                     totals["policy_loss"] -= policy_sum.detach().double()
                     totals["entropy"] += entropy_mean.detach().double() * component_count
+                    if entropy_bonus_active:
+                        totals["entropy_bonus"] += (
+                            config.entropy_coefficient * entropy_sum.detach().double()
+                        )
                     totals["approx_kl"] += batch_kl * diagnostic_count
                     totals["component_kl"] += batch_component_kl * component_count
                     totals["joint_kl"] += batch_joint_kl * states
@@ -5203,6 +5561,7 @@ def update_ppo(
         "states": valid_indices.size,
         # Whether GAE read the collector's values instead of replaying them.
         "update_behavior_values_carried": int(behavior_values_carried),
+        **outcome_metrics,
         "policy_loss": float(
             totals["policy_loss"]
             / max(1, actor_states if config.policy_loss_reduction == "states" else total_components)
@@ -5222,6 +5581,23 @@ def update_ppo(
         "value_loss_first_epoch": first_epoch_value_loss,
         "value_loss_last_epoch": last_epoch_value_loss,
         "entropy": float(totals["entropy"] / max(1, total_components)),
+        # The optimized bonus in `policy_loss` units, reported beside rather
+        # than folded into the surrogate.
+        **(
+            {
+                "entropy_bonus": float(
+                    totals["entropy_bonus"]
+                    / max(
+                        1,
+                        actor_states
+                        if config.policy_loss_reduction == "states"
+                        else total_components,
+                    )
+                )
+            }
+            if entropy_bonus_active
+            else {}
+        ),
         "approx_kl": float(totals["approx_kl"] / max(1, diagnostic_total)),
         "component_kl": float(totals["component_kl"] / max(1, total_components)),
         "joint_kl": float(totals["joint_kl"] / max(1, actor_states)),
@@ -5243,6 +5619,7 @@ def update_ppo(
         ),
         "advantage_mean": prepared.raw_advantage_mean,
         "advantage_std": prepared.raw_advantage_std,
+        **prepared.bank_metrics,
         **entity_metrics,
         "value_target_mean": float(prepared.value_targets[owned_valid].mean()),
         "value_target_std": float(prepared.value_targets[owned_valid].std()),

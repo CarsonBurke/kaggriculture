@@ -886,7 +886,13 @@ def main() -> None:
     actor, payload = load_actor_artifact(args.actor, device=device)
     architecture = resolve_architecture(payload)
     model_config = payload["model_config"]
-    config = PpoConfig(**production_ppo_config(update_compile_mode=args.update_compile_mode))
+    config = PpoConfig(
+        **production_ppo_config(
+            update_compile_mode=args.update_compile_mode,
+            architecture=architecture.name,
+            critic_architecture=model_config.get("critic_architecture"),
+        )
+    )
     critic, critic_provenance = _load_critic(args, architecture, model_config, device, actor)
 
     arena = allocate_rollout_storage(

@@ -56,9 +56,192 @@ def test_default_promotions_and_explicit_league_control(monkeypatch, tmp_path, s
     )
 
 
+def _promoted_recipe(tmp_path: Path) -> list[str]:
+    """The adopted recipe's complete command, as the core campaign records it."""
+    path = Path(__file__).parents[1] / "scripts" / "queue_core_campaign.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_queue_core_campaign", path)
+    assert spec is not None and spec.loader is not None
+    campaign = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(campaign)
+    return campaign.commands(tmp_path, tmp_path, "control")["ppo"][2:]
+
+
+def _resolved_launch(module, monkeypatch, arguments: list[str]):
+    monkeypatch.setattr(sys, "argv", ["train_ppo.py", *arguments])
+    args = module.parse_args()
+    module._validate_args(args)
+    model = model_config_from_args(resolve_architecture(args.architecture), args)
+    return {name: value for name, value in vars(args).items() if name not in model.to_dict()}, model
+
+
+def test_a_plain_launch_resolves_to_the_promoted_recipe(monkeypatch, tmp_path) -> None:
+    """Only what names the run is stated; the parse, the family's resolved model
+    configuration and hence `PpoConfig` all match the recipe's full command."""
+    module = _training_script()
+    recipe = _promoted_recipe(tmp_path)
+    run_specific = ("--run-dir", "--init-actor-from", "--iterations", "--max-hours", "--seed")
+    plain = [token for flag in run_specific for token in (flag, recipe[recipe.index(flag) + 1])]
+
+    stated, stated_model = _resolved_launch(module, monkeypatch, recipe)
+    implicit, implicit_model = _resolved_launch(module, monkeypatch, plain)
+
+    assert implicit == stated
+    assert implicit_model == stated_model
+    assert implicit["architecture"] == "lejepa"
+    assert (implicit["actor_lr"], implicit["actor_gae_lambda"]) == (5e-5, 1.0)
+    assert (implicit["jepa_prediction_coefficient"], implicit["jepa_sigreg_coefficient"]) == (
+        1.0,
+        0.09,
+    )
+    assert implicit["structured_learning_rate"] == 1.5e-5
+    assert implicit["minibatch_size"] == 4096 and not implicit["rematerialize_actor_update"]
+    assert implicit["architecture_panel"] == 25 and implicit["league_builtin_lanes"] == 4
+
+
+def test_the_production_command_restates_the_promoted_recipe(monkeypatch, tmp_path) -> None:
+    from kaggriculture.production import PRODUCTION_UPDATE_COMPILE_MODE, build_training_command
+
+    module = _training_script()
+    recipe = _promoted_recipe(tmp_path)
+    command = build_training_command(
+        Path(recipe[recipe.index("--run-dir") + 1]),
+        iterations=int(recipe[recipe.index("--iterations") + 1]),
+        max_hours=float(recipe[recipe.index("--max-hours") + 1]),
+        seed=int(recipe[recipe.index("--seed") + 1]),
+        rollout_forward_mode=recipe[recipe.index("--rollout-forward-mode") + 1],
+        update_compile_mode=PRODUCTION_UPDATE_COMPILE_MODE,
+        initial_actors=(Path(recipe[recipe.index("--init-actor-from") + 1]),),
+    )
+
+    stated, stated_model = _resolved_launch(module, monkeypatch, recipe)
+    production, production_model = _resolved_launch(module, monkeypatch, command[2:])
+
+    # External evaluation is production's asynchronous diagnostic, not training.
+    diagnostic = {"external_eval", "external_eval_opponents", "external_eval_seed_start"}
+    assert production["external_eval"]
+    assert {k: v for k, v in production.items() if k not in diagnostic} == {
+        k: v for k, v in stated.items() if k not in diagnostic
+    }
+    assert production_model == stated_model
+
+
+@pytest.mark.parametrize(
+    ("architecture", "extra", "expected"),
+    [
+        (
+            "entity-attention",
+            (),
+            {
+                "jepa_prediction_coefficient": 0.0,
+                "jepa_sigreg_coefficient": 0.0,
+                "structured_learning_rate": None,
+                "economic_forecast_coefficient": 0.0,
+                "rematerialize_actor_update": True,
+            },
+        ),
+        (
+            "entity-attention",
+            ("--critic-architecture", "forecast"),
+            {"jepa_prediction_coefficient": 0.0, "economic_forecast_coefficient": 1.0},
+        ),
+        (
+            "lejepa",
+            (
+                "--jepa-sigreg-coefficient",
+                "0.2",
+                "--structured-learning-rate",
+                "3e-5",
+                "--rematerialize-actor-update",
+            ),
+            {
+                "jepa_prediction_coefficient": 1.0,
+                "jepa_sigreg_coefficient": 0.2,
+                "structured_learning_rate": 3e-5,
+                "rematerialize_actor_update": True,
+            },
+        ),
+    ],
+)
+def test_family_owned_ppo_settings_follow_the_chosen_family(
+    monkeypatch, tmp_path, architecture, extra, expected
+) -> None:
+    """A non-lejepa launch must not inherit an objective its family refuses,
+    and an explicit flag still wins over the family's default."""
+    module = _training_script()
+    args, _ = _resolved_launch(
+        module,
+        monkeypatch,
+        ["--run-dir", str(tmp_path), "--architecture", architecture, *extra],
+    )
+    assert {name: args[name] for name in expected} == expected
+
+
+def test_single_learner_only_defaults_step_aside_for_populations_and_autocull(
+    monkeypatch, tmp_path
+) -> None:
+    module = _training_script()
+    population, _ = _resolved_launch(
+        module, monkeypatch, ["--run-dir", str(tmp_path), "--population", "4"]
+    )
+    assert population["league_builtin_opponents"] == ""
+    assert population["league_builtin_lanes"] == 0
+    assert population["architecture_panel"] == 0
+
+    culled, _ = _resolved_launch(module, monkeypatch, ["--run-dir", str(tmp_path), "--autocull"])
+    assert culled["architecture_panel"] == 0
+    assert culled["league_builtin_lanes"] == 4
+
+
+def test_a_half_stated_built_in_pair_does_not_borrow_the_other_default(
+    monkeypatch, tmp_path
+) -> None:
+    """The agents and their lanes default together; naming one leaves the other
+    absent, so zero lanes disables built-ins and agents without lanes are refused."""
+    module = _training_script()
+    base = ["--run-dir", str(tmp_path)]
+    disabled, _ = _resolved_launch(module, monkeypatch, [*base, "--league-builtin-lanes", "0"])
+    assert (disabled["league_builtin_opponents"], disabled["league_builtin_lanes"]) == ("", 0)
+    monkeypatch.setattr(
+        sys, "argv", ["train_ppo.py", *base, "--league-builtin-opponents", "starter"]
+    )
+    args = module.parse_args()
+    assert args.league_builtin_lanes == 0
+    with pytest.raises(ValueError):
+        module._validate_args(args)
+
+
+def test_an_unflagged_wdl_critic_refuses_other_objectives_at_launch(monkeypatch, tmp_path) -> None:
+    """`lejepa` builds the WDL critic by default, so the objective check has to
+    read the resolved configuration rather than wait for an explicit flag."""
+    module = _training_script()
+    arguments = ["--run-dir", str(tmp_path), "--architecture-panel", "0"]
+    monkeypatch.setattr(sys, "argv", ["train_ppo.py", *arguments, "--reward-mode", "shaped"])
+    with pytest.raises(ValueError, match="WDL critic requires terminal-outcome"):
+        module._validate_args(module.parse_args())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_ppo.py", *arguments, "--reward-mode", "shaped", "--wdl-value", "false"],
+    )
+    module._validate_args(module.parse_args())
+
+
 def test_training_rejects_invalid_checkpoint_gamma_and_kl_boundaries(monkeypatch, tmp_path) -> None:
     module = _training_script()
-    monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path)])
+    # The WDL critic and the panel both pin gamma to one before the range check.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ppo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--wdl-value",
+            "false",
+            "--architecture-panel",
+            "0",
+        ],
+    )
 
     args = module.parse_args()
     module._validate_args(args)
@@ -84,6 +267,39 @@ def test_training_rejects_invalid_checkpoint_gamma_and_kl_boundaries(monkeypatch
         args.target_kl = rejected
         with pytest.raises(ValueError, match="target KL"):
             module._validate_args(args)
+
+
+def test_entropy_coefficient_flag_defaults_off_validates_and_reaches_the_ppo_config(
+    monkeypatch, tmp_path
+) -> None:
+    module = _training_script()
+
+    def parsed(*flags: str):
+        monkeypatch.setattr(
+            sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path), "--device", "cpu", *flags]
+        )
+        return module.parse_args()
+
+    assert parsed().entropy_coefficient == PpoConfig.entropy_coefficient == 0.0
+    args = parsed("--entropy-coefficient", "0.003")
+    module._validate_args(args)
+    assert args.entropy_coefficient == 0.003
+    # Refused at launch rather than at the first update, hours into collection.
+    for rejected in ("-0.001", "nan", "inf"):
+        with pytest.raises(ValueError, match="entropy coefficient"):
+            module._validate_args(parsed("--entropy-coefficient", rejected))
+
+    class Built(Exception):
+        pass
+
+    class RecordingConfig(PpoConfig):
+        def __init__(self, **kwargs) -> None:
+            raise Built(kwargs)
+
+    monkeypatch.setattr(module, "PpoConfig", RecordingConfig)
+    with pytest.raises(Built) as built:
+        module._train(args, [], None)
+    assert built.value.args[0]["entropy_coefficient"] == 0.003
 
 
 def test_structured_auxiliary_cli_is_typed_population_safe_and_resume_bound(
@@ -225,6 +441,10 @@ def test_hardness_league_flag_reaches_selection_and_resume_provenance(
             str(tmp_path),
             "--league-selection",
             "hardness",
+            "--league-builtin-opponents",
+            "",
+            "--league-builtin-lanes",
+            "0",
         ],
     )
     args = module.parse_args()
@@ -291,6 +511,7 @@ def test_built_in_league_configuration_must_be_admitted_and_reserved_together(
     args = module.parse_args()
 
     args.league_builtin_opponents = "starter"
+    args.league_builtin_lanes = 0
     with pytest.raises(ValueError, match="must be set together"):
         module._validate_args(args)
 
@@ -747,6 +968,67 @@ def test_external_eval_opponent_resolution_degrades_instead_of_blocking(capsys, 
     assert "disabled" in capsys.readouterr().err
 
 
+def test_the_bank_stream_is_off_by_default_and_needs_one_learner(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    base = ["--run-dir", str(tmp_path), "--architecture-panel", "0"]
+    default, _ = _resolved_launch(module, monkeypatch, base)
+    assert (default["bank_advantage_coefficient"], default["self_play_seed_group"]) == (0.0, 1)
+    assert default["bank_advantage_groups"] == "all"
+
+    grouped, _ = _resolved_launch(
+        module,
+        monkeypatch,
+        [
+            *base,
+            "--bank-advantage-coefficient",
+            "0.5",
+            "--bank-advantage-groups",
+            "self-play",
+            "--self-play-seed-group",
+            "4",
+        ],
+    )
+    assert (grouped["bank_advantage_coefficient"], grouped["self_play_seed_group"]) == (0.5, 4)
+    assert grouped["bank_advantage_groups"] == "self-play"
+    # Neither needs the other: the stream can pool a seat's games across seeds,
+    # and grouping alone is a control arm on the same maps.
+    _resolved_launch(module, monkeypatch, [*base, "--bank-advantage-coefficient", "0.5"])
+    _resolved_launch(module, monkeypatch, [*base, "--self-play-seed-group", "4"])
+
+    for arguments, message in (
+        (["--bank-advantage-coefficient", "-0.5"], "nonnegative"),
+        (["--bank-advantage-coefficient", "nan"], "finite"),
+        (["--bank-advantage-coefficient", "0.5", "--population", "2"], "--population 1"),
+        (
+            [
+                "--bank-advantage-coefficient",
+                "0.5",
+                "--architecture",
+                "structured",
+                "--per-entity-critic",
+                "true",
+            ],
+            "per-entity critic",
+        ),
+        (["--self-play-seed-group", "0"], "divide --games"),
+        (["--self-play-seed-group", "3"], "divide --games"),
+        (["--self-play-seed-group", "2", "--population", "2"], "--population 1"),
+    ):
+        monkeypatch.setattr(sys, "argv", ["train_ppo.py", *base, *arguments])
+        with pytest.raises(ValueError, match=message):
+            module._validate_args(module.parse_args())
+
+
+def test_self_play_seed_grouping_is_part_of_the_data_generator(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path)])
+    args = module.parse_args()
+    config = module._training_data_config(args, module._device("cpu"))
+    assert config["self_play_seed_group"] == 1
+    args.self_play_seed_group = 4
+    assert module._training_data_config(args, module._device("cpu")) != config
+
+
 def test_training_data_config_captures_rollout_semantics(monkeypatch, tmp_path) -> None:
     module = _training_script()
     monkeypatch.setattr(sys, "argv", ["train_ppo.py", "--run-dir", str(tmp_path)])
@@ -1077,6 +1359,10 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "0",
             "--device",
             "cpu",
+            "--architecture",
+            CONV_ENTITY,
+            "--architecture-panel",
+            "0",
             "--cnn-width",
             "8",
             "--cnn-blocks",
@@ -1542,6 +1828,10 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
             "0",
             "--device",
             "cpu",
+            "--architecture",
+            CONV_ENTITY,
+            "--architecture-panel",
+            "0",
             "--cnn-width",
             "8",
             "--cnn-blocks",
@@ -2345,6 +2635,10 @@ def _population_arguments(
         "0",
         "--device",
         "cpu",
+        "--architecture",
+        architecture,
+        "--architecture-panel",
+        "0",
         "--model-dim",
         "16",
         "--attention-heads",
@@ -2353,8 +2647,6 @@ def _population_arguments(
     ]
     if architecture == CONV_ENTITY:
         arguments.extend(("--cnn-width", "8", "--cnn-blocks", "1", "--transformer-layers", "3"))
-    else:
-        arguments.extend(("--architecture", architecture))
     return arguments
 
 
@@ -3000,3 +3292,73 @@ def test_autocull_terminal_boundary_commits_before_exit_and_stays_terminal_on_re
         assert updates == 50
     assert len(observed_terminal) == 2
     assert not (tmp_path / "checkpoint-000051.pt").exists()
+
+
+def test_actor_wave_budget_excludes_warmup_and_uses_restored_count(tmp_path) -> None:
+    from kaggriculture.architecture_panel import ArchitecturePanelGuard
+
+    module = _training_script()
+    panel = ArchitecturePanelGuard(25)
+    checkpoint = tmp_path / "initial.pt"
+    checkpoint.touch()
+    panel.observe({"score_rate": 0.5, "critic_mse": 0.25}, checkpoint)
+    for iteration in range(1, 36):
+        panel.advance(iteration, actor_active=iteration > 10)
+        if iteration < 35:
+            assert not module._actor_wave_budget_reached(25, panel)
+    assert module._actor_wave_budget_reached(25, panel)
+    panel.observe({"score_rate": 0.5, "critic_mse": 0.25}, Path("final.pt"))
+    restored = ArchitecturePanelGuard(25, panel.snapshot(), iteration=35)
+    assert module._actor_wave_budget_reached(25, restored)
+    assert not module._actor_wave_budget_reached(50, restored)
+    assert not module._actor_wave_budget_reached(None, None)
+    with pytest.raises(ValueError, match="persisted architecture panel"):
+        module._actor_wave_budget_reached(25, None)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({}, None),
+        ({"actor_waves": 0}, "must be positive"),
+        ({"population": 2}, "one learner"),
+        ({"architecture_panel": 0}, "architecture panel"),
+        ({"actor_waves": 499}, "divisible"),
+        ({"iterations": 539}, "maximum critic warmup"),
+        ({"max_hours": 1.0}, "max-hours 0"),
+    ],
+)
+def test_actor_wave_budget_requires_matched_exposure(monkeypatch, tmp_path, overrides, error):
+    module = _training_script()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ppo.py",
+            "--run-dir",
+            str(tmp_path),
+            "--actor-waves",
+            "500",
+            "--iterations",
+            "540",
+            "--architecture-panel",
+            "25",
+            "--max-hours",
+            "0",
+            "--device",
+            "cuda",
+            "--reward-mode",
+            "terminal-outcome",
+            "--gamma",
+            "1",
+        ],
+    )
+    args = module.parse_args()
+    assert args.actor_waves == 500
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            module._validate_args(args)
+    else:
+        module._validate_args(args)

@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 from kaggriculture.entity import EntityActor, EntityConfig
-from kaggriculture.production import production_model_config
 from kaggriculture.rollout import collect_mixed_play_rust
 
 
@@ -20,18 +19,18 @@ def main() -> None:
     parser.add_argument("--forward-mode", default="eager")
     parser.add_argument("--games", type=int, default=1)
     parser.add_argument("--league-games", type=int, default=0)
-    parser.add_argument("--production-model", action="store_true")
+    parser.add_argument(
+        "--production-model",
+        action="store_true",
+        help="the entity-attention family at its full default width, as production ran it "
+        "before adopting lejepa",
+    )
     parser.add_argument("--seed-start", type=int, default=7_310_000)
     args = parser.parse_args()
     if args.games < 0 or args.league_games < 0 or args.games + args.league_games < 1:
         parser.error("at least one nonnegative game count must be positive")
     config = (
-        EntityConfig(
-            **(
-                production_model_config()
-                | {"action_interface": 3, "observation_schema_version": 4}
-            )
-        )
+        EntityConfig(action_interface=3, observation_schema_version=4)
         if args.production_model
         else EntityConfig(
             action_interface=3,

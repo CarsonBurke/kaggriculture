@@ -71,6 +71,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--deposit-all-products",
+        action="store_true",
+        help=(
+            "label a teacher's partial product deposit as depositing everything held, "
+            "the nearest factored action, instead of aborting. demand-advance4 needs "
+            "it on about 1%% of steps; recorded in the manifest and counted per episode"
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -96,6 +105,7 @@ def extract_episode(
     seat: int,
     *,
     episode_steps: int,
+    deposit_all_products: bool = False,
 ) -> dict[str, np.ndarray | bytes]:
     """Project one recorded seat of a complete episode into training arrays.
 
@@ -115,7 +125,9 @@ def extract_episode(
         if not isinstance(action, dict):
             raise DemonstrationError(f"step {step_index} seat {seat}: no recorded action")
         try:
-            projected = project_demonstration(observation, action)
+            projected = project_demonstration(
+                observation, action, deposit_all_products=deposit_all_products
+            )
             verify_round_trip(observation, action, projected)
         except DemonstrationError as error:
             raise DemonstrationError(f"step {step_index} seat {seat}: {error}") from error
@@ -141,6 +153,7 @@ def extract_episode(
         "unit_active": stacked("unit_active"),
         "market_active": stacked("market_active"),
         "market_quantity_active": stacked("market_quantity_active"),
+        "relabeled_partial_deposits": stacked("relabeled_partial_deposits").astype(np.int8),
         "raw_json_zlib": zlib.compress(
             json.dumps(raw, separators=(",", ":"), allow_nan=False).encode("utf-8"), level=6
         ),
@@ -195,6 +208,7 @@ def _extract_seed(
     seed: int,
     episode_steps: int,
     output_dir: Path,
+    deposit_all_products: bool = False,
 ) -> list[dict[str, Any]]:
     """Play one seed and archive every teacher seat of it.
 
@@ -209,7 +223,9 @@ def _extract_seed(
     for left, right, seats in teacher_jobs(teacher, opponent):
         steps = _play_episode(left, right, seed, episode_steps)
         for seat in seats:
-            arrays = extract_episode(steps, seat, episode_steps=episode_steps)
+            arrays = extract_episode(
+                steps, seat, episode_steps=episode_steps, deposit_all_products=deposit_all_products
+            )
             path = output_dir / f"episode-{seed:08d}-seat{seat}.npz"
             np.savez_compressed(path, **arrays)
             records.append(_archived_record(path, seed, seat, episode_steps))
@@ -234,6 +250,11 @@ def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> di
     """
     with np.load(path, allow_pickle=False) as archive:
         raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()).decode("utf-8"))
+        relabeled = (
+            int(archive["relabeled_partial_deposits"].sum())
+            if "relabeled_partial_deposits" in archive.files
+            else 0
+        )
     farms = raw["observations"][-1]["observation"]["farms"]
     return {
         "file": path.name,
@@ -242,6 +263,7 @@ def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> di
         "steps": episode_steps - 1,
         "teacher_money": float(farms[seat]["money"]),
         "opponent_money": float(farms[1 - seat]["money"]),
+        "relabeled_partial_deposits": relabeled,
         "sha256": file_sha256(path),
     }
 
@@ -255,8 +277,9 @@ def _manifest_configuration(
     episode_steps: int,
     seed_start: int,
     episode_count: int,
+    deposit_all_products: bool = False,
 ) -> dict[str, Any]:
-    return {
+    configuration = {
         "format_version": DATASET_FORMAT_VERSION,
         "teacher": {"label": teacher_label, "sha256": _agent_digest(teacher)},
         "opponent": {"label": opponent_label, "sha256": _agent_digest(opponent)},
@@ -265,6 +288,11 @@ def _manifest_configuration(
         "episode_count": episode_count,
         "extractor_source_identity": source_identity(),
     }
+    # Stated only when used, so strictly projected datasets keep the manifest
+    # they were written with and remain resumable.
+    if deposit_all_products:
+        configuration["relabels"] = ["deposit_all_products"]
+    return configuration
 
 
 def _load_resumable_records(
@@ -417,6 +445,7 @@ def main() -> None:
         episode_steps=args.episode_steps,
         seed_start=args.seed_start,
         episode_count=args.episodes,
+        deposit_all_products=args.deposit_all_products,
     )
 
     with tempfile.TemporaryDirectory(
@@ -450,6 +479,7 @@ def main() -> None:
                         seed,
                         args.episode_steps,
                         staging_dir,
+                        args.deposit_all_products,
                     ): seed
                     for seed in seeds
                 }

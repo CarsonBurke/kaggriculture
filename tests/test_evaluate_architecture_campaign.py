@@ -34,7 +34,19 @@ def _rollout():
     )
 
 
-@pytest.mark.parametrize("decoding", ["argmax", "sampled", "units", "kinds", "quantities"])
+@pytest.mark.parametrize(
+    "decoding",
+    [
+        "argmax",
+        "sampled",
+        "units",
+        "kinds",
+        "unit_kind",
+        "unit_quantity",
+        "kind_quantity",
+        "quantities",
+    ],
+)
 def test_panel_accepts_independent_head_decoding(evaluator, monkeypatch, decoding, tmp_path):
     monkeypatch.setattr(
         sys,
@@ -57,9 +69,22 @@ def test_panel_accepts_independent_head_decoding(evaluator, monkeypatch, decodin
             "sampled": ("units", "kinds", "quantities"),
             "units": ("units",),
             "kinds": ("kinds",),
+            "unit_kind": ("units", "kinds"),
+            "unit_quantity": ("units", "quantities"),
+            "kind_quantity": ("kinds", "quantities"),
             "quantities": ("quantities",),
         }[decoding]
     )
+
+
+def test_panel_counts_low_money_with_strict_admission_boundary(evaluator):
+    rows = evaluator.panel_rows(_rollout(), seed_start=4_501_000, games=4)
+    for row, money in zip(rows, [999.0, 1_000.0, 1_001.0, 0.0], strict=True):
+        row["money"] = money
+    summary = evaluator.summarize(rows)
+    assert summary["low_money_threshold"] == 1_000
+    assert summary["low_money_count"] == 2
+    assert summary["low_money_fraction"] == 0.5
 
 
 def test_panel_scores_ties_and_preserves_matched_keys(evaluator):
@@ -115,3 +140,58 @@ def test_bootstrap_keeps_opponents_in_the_same_seed_cluster(evaluator):
     candidate["starter"] = candidate["starter"][::-1]
     with pytest.raises(ValueError, match="identical seeds and seats"):
         evaluator.paired_comparison(candidate, reference)
+
+
+def test_bootstrap_pools_neural_reference_opponents_into_overall(evaluator):
+    rows = evaluator.panel_rows(_rollout(), seed_start=4_501_000, games=4)
+    opponents = (*evaluator.OPPONENTS, "bc")
+    reference = {opponent: [dict(row, score=0.5) for row in rows] for opponent in opponents}
+    candidate = {opponent: [dict(row, score=0.5) for row in rows] for opponent in opponents}
+    candidate["bc"] = [dict(row, score=1.0) for row in rows]
+
+    comparison = evaluator.paired_comparison(candidate, reference, opponents)
+
+    assert comparison["panels"]["bc"]["score"]["difference"] == 0.5
+    assert comparison["panels"]["starter"]["score"]["difference"] == 0.0
+    assert comparison["panels"]["overall"]["score"]["difference"] == pytest.approx(0.5 / 3)
+    with pytest.raises(ValueError, match="complete opponent panel"):
+        evaluator.paired_comparison(candidate, reference)
+
+
+def _reference_args(evaluator, monkeypatch, tmp_path, *extra):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_architecture_campaign.py",
+            "--artifact",
+            "actor=actor.pt",
+            "--output",
+            str(tmp_path / "panel.json"),
+            *extra,
+        ],
+    )
+    return evaluator.parse_args()
+
+
+def test_reference_opponents_are_labelled_and_decoded_like_the_candidate(
+    evaluator, monkeypatch, tmp_path
+):
+    args = _reference_args(
+        evaluator,
+        monkeypatch,
+        tmp_path,
+        "--reference-opponent",
+        "bc=bc.pt",
+        "--decoding",
+        "sampled",
+    )
+    assert args.reference_opponent == [("bc", Path("bc.pt"))]
+    assert _reference_args(evaluator, monkeypatch, tmp_path).reference_opponent == []
+    for extra in (
+        ("--reference-opponent", "starter=bc.pt"),
+        ("--reference-opponent", "bc=a.pt", "--reference-opponent", "bc=b.pt"),
+        ("--reference-opponent", "bc=bc.pt", "--decoding", "units"),
+    ):
+        with pytest.raises(SystemExit):
+            _reference_args(evaluator, monkeypatch, tmp_path, *extra)

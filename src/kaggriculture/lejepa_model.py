@@ -13,14 +13,15 @@ something sits *after* it.
   loss, then PPO's -- shapes the encoder beside the objective; the critic's tower
   reads `JepaBelief.detach()`, so no value gradient reaches it.
 
-  The policy has to reach it. A backbone fitted only to predict the teacher's
+  Policy attachment is the current game default. A backbone fitted only to predict the teacher's
   trajectory cloned to teacher accuracy at argmax and went bankrupt in every
   sampled game: once a sampled departure left the trajectory, nothing in the
   features said which plant needed water. The value gradient is the one kept out,
   because the value target is the noisiest signal in the trainer and the policy
-  reads the same features. One backbone is still the right count: the critic
-  folds its privileged inputs in downstream, so a second encoder would only be
-  the same observation fitted twice.
+  reads the same features. This motivates the current split, but does not establish
+  that an independent self-supervised encoder with raw task-trained actor and
+  critic paths would be worse. Here the critic folds its privileged inputs in
+  downstream of the shared encoder.
 
 * **The towers are what comes after.** Both towers read the belief through
   private rounds of cross-attention, the critic's detached. The actor's decision slots read the
@@ -96,6 +97,8 @@ from kaggriculture.model import (
     categorical_value_support,
     softcap_value_logits,
 )
+from kaggriculture.navigation import TargetNavigation, assemble_unit_logits
+from kaggriculture.resource_conditioning import MarketResourceConditioner
 from kaggriculture.structured import (
     Attention,
     EconomyEmbedder,
@@ -130,6 +133,19 @@ class LejepaConfig(EntityConfig):
     # The current-rules money-margin arm is the working basis for future LeJEPA
     # runs. Saved v3 artifacts still name their schema explicitly when loaded.
     observation_schema_version: int = 4
+    # Every quantity choice a market kind admits (interface 2), and the local
+    # unit affordance scorer below: the promoted core's configuration, which the
+    # WDL clone and every PPO stage behind the default recipe trained
+    # (CORE_MODEL_20260926.md; artifacts/probes/ppo-stage2-20260927). Saved
+    # artifacts from before either default load as absolute quantities without
+    # the scorer (`Architecture.build_config`).
+    action_interface: int = 2
+    # Exact loss/draw/win classifier, the default critic head: its PPO value is
+    # P(win) - P(loss), the match score the campaign selects on, and it requires
+    # hard terminal outcomes with gamma and critic lambda one. HL-Gauss support
+    # settings are inert in this mode; the three outcome values are always -1, 0,
+    # 1. Off selects the HL-Gauss head, or the scalar one with `scalar_value`.
+    wdl_value: bool = True
 
     #: Hidden width of every projector, of the predictor's output head, and of
     #: the reward body. `../le-wm` runs a 192-wide encoder through a 2048-wide
@@ -161,6 +177,9 @@ class LejepaConfig(EntityConfig):
     #: market-kind accuracy where the end-to-end entity actor reaches 0.999,
     #: because a market slot is not where the world model keeps the economy.
     policy_readout_layers: int = 1
+    # Stateless tile pointer marginalized into the four existing movement actions.
+    unit_target_navigation: bool = True
+    market_resource_conditioning: bool = True
     #: Let the policy's loss -- the clone loss, then PPO's -- reach the backbone
     #: beside the LeJEPA objective instead of stopping at a detach. The backbone
     #: stays owned, clipped and stepped by the objective's optimizer; it now
@@ -181,10 +200,12 @@ class LejepaConfig(EntityConfig):
     critic_readout_ffn: bool = True
     # A8: score each primitive against its destination/current tile and the
     # resource it changes. Zero-initialized query preserves a loaded A2 actor.
-    unit_affordance_scorer: bool = False
+    unit_affordance_scorer: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.wdl_value and self.scalar_value:
+            raise ValueError("the scalar value head requires wdl_value=False")
         if self.action_interface == 3:
             raise ValueError("LeJEPA decision layout does not support market-set interface 3")
         for name in ("jepa_hidden_dim", "jepa_slices", "jepa_tile_samples", "jepa_sigreg_rows"):
@@ -350,7 +371,8 @@ class _UnitAffordanceScorer(nn.Module):
         self.register_buffer("has_item", torch.tensor(has_item), persistent=False)
         self.register_buffer("amount", torch.tensor(amount), persistent=False)
         self.register_buffer(
-            "crop", torch.tensor([min(4, max(0, a - 45)) for a in range(N_UNIT_ACTIONS)]),
+            "crop",
+            torch.tensor([min(4, max(0, a - 45)) for a in range(N_UNIT_ACTIONS)]),
             persistent=False,
         )
         self.register_buffer(
@@ -371,9 +393,7 @@ class _UnitAffordanceScorer(nn.Module):
             + self.tile_occupant(own_occupant)
             + self.tile_continuous(own_features)
         )
-        here = tiles.gather(
-            1, inputs.unit_tile_gather[..., 0, None].expand(-1, -1, self.rank)
-        )
+        here = tiles.gather(1, inputs.unit_tile_gather[..., 0, None].expand(-1, -1, self.rank))
         here = torch.where(inputs.unit_tile_gather_valid[..., 0, None], here, 0.0)
 
         # Product and animal shed stock are observable private fields; seeds
@@ -420,6 +440,13 @@ class LejepaActor(EntityActor):
     def _initialize_heads(self, config: EntityConfig) -> None:
         super()._initialize_heads(config)
         assert isinstance(config, LejepaConfig)
+        if config.unit_target_navigation:
+            # Initialize using the canonical action-index priors, then retain
+            # only PASS/local-operation rows. No unused movement parameters.
+            head = self.unit_head[-1]
+            head.weight = nn.Parameter(torch.cat((head.weight[:1], head.weight[5:])).detach())
+            head.bias = nn.Parameter(torch.cat((head.bias[:1], head.bias[5:])).detach())
+            head.out_features = N_UNIT_ACTIONS - 4
         layers = config.policy_readout_layers
         # A state read with no live shortcut to protect, as in the critic's tower.
         readout_config = (
@@ -434,6 +461,14 @@ class LejepaActor(EntityActor):
         self.unit_affordance = (
             _UnitAffordanceScorer(config.model_dim) if config.unit_affordance_scorer else None
         )
+        self.navigation = (
+            TargetNavigation(config.model_dim) if config.unit_target_navigation else None
+        )
+        self.market_resource_conditioner = (
+            MarketResourceConditioner(config.quantity_rank)
+            if config.market_resource_conditioning
+            else None
+        )
 
     def backbone_parameters(self):
         """The world model's parameters, which the actor's optimizer must not own."""
@@ -447,18 +482,32 @@ class LejepaActor(EntityActor):
     def encode_belief(self, inputs: StructuredInputs) -> JepaBelief:
         return self.trunk(inputs)
 
-    def auxiliary_belief(self, inputs: StructuredInputs) -> JepaBelief:
-        return self.trunk.rematerialized(inputs)
+    def auxiliary_belief(
+        self, inputs: StructuredInputs, *, rematerialize: bool = True
+    ) -> JepaBelief:
+        """The belief the objective reads; `rematerialize` replays the farm blocks."""
+        return self.trunk.rematerialized(inputs) if rematerialize else self.trunk(inputs)
 
-    def forward_with_belief(self, inputs: StructuredInputs) -> tuple[ActorOutput, JepaBelief]:
+    def forward_with_belief(
+        self, inputs: StructuredInputs, market_resources: Tensor | None = None
+    ) -> tuple[ActorOutput, JepaBelief]:
         belief = self.encode_belief(inputs)
-        return self.decode_belief(belief, inputs.unit_active, inputs), belief
+        return self.decode_belief(belief, inputs.unit_active, inputs, market_resources), belief
 
     def forward_with_auxiliary_belief(
-        self, inputs: StructuredInputs
+        self,
+        inputs: StructuredInputs,
+        market_resources: Tensor | None = None,
+        *,
+        rematerialize: bool = True,
     ) -> tuple[ActorOutput, JepaBelief]:
-        belief = self.auxiliary_belief(inputs)
-        return self.decode_belief(belief, inputs.unit_active, inputs), belief
+        belief = self.auxiliary_belief(inputs, rematerialize=rematerialize)
+        return self.decode_belief(belief, inputs.unit_active, inputs, market_resources), belief
+
+    def forward(
+        self, inputs: StructuredInputs, market_resources: Tensor | None = None
+    ) -> ActorOutput:
+        return self.forward_with_belief(inputs, market_resources)[0]
 
     def _read(
         self, units: Tensor, markets: Tensor, belief: JepaBelief, unit_active: Tensor
@@ -487,7 +536,11 @@ class LejepaActor(EntityActor):
         return self.unit_readout_norm(units), self.market_readout_norm(markets)
 
     def decode_belief(
-        self, belief: JepaBelief, unit_active: Tensor, inputs: StructuredInputs | None = None
+        self,
+        belief: JepaBelief,
+        unit_active: Tensor,
+        inputs: StructuredInputs | None = None,
+        market_resources: Tensor | None = None,
     ) -> ActorOutput:
         """Read the belief through the heads, attached unless the config detaches.
 
@@ -514,12 +567,27 @@ class LejepaActor(EntityActor):
         if self.unit_affordance is not None:
             if inputs is None:
                 raise ValueError("unit affordance scorer needs the policy observation")
-            unit_logits = unit_logits + self.unit_affordance(units, inputs).to(unit_logits.dtype)
-        return ActorOutput(
+            affordance = self.unit_affordance(units, inputs).to(unit_logits.dtype)
+            if self.navigation is not None:
+                affordance = torch.cat((affordance[..., :1], affordance[..., 5:]), dim=-1)
+            unit_logits = unit_logits + affordance
+        if self.navigation is not None:
+            if inputs is None:
+                raise ValueError("target navigation needs unit positions")
+            unit_logits = assemble_unit_logits(
+                unit_logits, self.navigation(units, belief.tiles, inputs.unit_categorical)
+            )
+        output = ActorOutput(
             unit_logits=unit_logits.contiguous(),
             market_kind_logits=self.market_kind(markets).contiguous(),
             market_quantity_context=self.market_quantity_context(markets).contiguous(),
         )
+        if market_resources is not None and self.market_resource_conditioner is not None:
+            kinds, quantities = self.market_resource_conditioner.condition(
+                output.market_kind_logits, output.market_quantity_context, market_resources
+            )
+            output = output._replace(market_kind_logits=kinds, market_quantity_context=quantities)
+        return output
 
 
 class _OpponentUnitEmbedder(nn.Module):
@@ -584,12 +652,17 @@ class LejepaCritic(nn.Module):
         )
         self.value_ffn_gate = GatedResidual(config.model_dim) if config.critic_readout_ffn else None
         self.value_norm = RMSNorm(config.model_dim, eps=1e-5)
-        self.value_head = Linear(config.model_dim, 1 if config.scalar_value else config.value_atoms)
+        value_outputs = (
+            3 if config.wdl_value else (1 if config.scalar_value else config.value_atoms)
+        )
+        self.value_head = Linear(config.model_dim, value_outputs)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
         self.register_buffer(
             "support",
-            categorical_value_support(config.value_min, config.value_max, config.value_atoms),
+            categorical_value_support(-1.0, 1.0, 3)
+            if config.wdl_value
+            else categorical_value_support(config.value_min, config.value_max, config.value_atoms),
             persistent=True,
         )
 

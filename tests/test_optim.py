@@ -12,7 +12,7 @@ from kaggriculture.optim import (
 )
 from kaggriculture.ppo import PpoConfig, make_optimizers
 from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
-from kaggriculture.registry import resolve_architecture
+from kaggriculture.registry import ENTITY_ATTENTION, resolve_architecture
 from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredDynamics
 
@@ -492,15 +492,26 @@ def test_an_optimizer_needs_at_least_one_parameter() -> None:
         NorMuon([], [], learning_rate=1e-2, adam_learning_rate=1e-3)
 
 
-def _production_modules() -> tuple[torch.nn.Module, torch.nn.Module]:
-    payload = production_model_config()
-    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
-    config = architecture.config_class(**payload)
+def _production_modules(
+    family: str = PRODUCTION_ARCHITECTURE,
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    architecture = resolve_architecture(family)
+    config = (
+        architecture.config_class(**production_model_config())
+        if family == PRODUCTION_ARCHITECTURE
+        else architecture.config_class()
+    )
     return architecture.actor_class(config), architecture.critic_class(config)
 
 
-def test_every_production_parameter_is_routed_exactly_once() -> None:
-    for module in _production_modules():
+# Production's family and the entity-attention trunk it wraps, whose query banks
+# and attention the `lejepa` critic reads but does not own.
+ROUTED_FAMILIES = pytest.mark.parametrize("family", [PRODUCTION_ARCHITECTURE, ENTITY_ATTENTION])
+
+
+@ROUTED_FAMILIES
+def test_every_production_parameter_is_routed_exactly_once(family) -> None:
+    for module in _production_modules(family):
         matrices, vectors, multipliers = route_parameters(module)
         assert len(multipliers) == len(vectors)
         routed = {id(parameter) for parameter in matrices} | {
@@ -510,19 +521,15 @@ def test_every_production_parameter_is_routed_exactly_once() -> None:
         assert routed == {id(parameter) for parameter in module.parameters()}
 
 
-def test_production_lookup_and_head_roles_are_not_hidden_matrices() -> None:
-    for module in _production_modules():
+@ROUTED_FAMILIES
+def test_production_lookup_and_head_roles_are_not_hidden_matrices(family) -> None:
+    for module in _production_modules(family):
         matrices, vectors, _ = route_parameters(module)
         matrix_ids = {id(parameter) for parameter in matrices}
         vector_ids = {id(parameter) for parameter in vectors}
         for name, child in module.named_modules():
             if isinstance(child, torch.nn.Embedding):
                 assert id(child.weight) in vector_ids, name
-        for name in ("opponent_queries", "latent_queries", "market_queries"):
-            query = getattr(module.trunk, name, None)
-            if query is not None:
-                parameter = query.weight if isinstance(query, torch.nn.Embedding) else query
-                assert id(parameter) in vector_ids
         if hasattr(module, "value_query"):
             assert id(module.value_query) in vector_ids
             assert id(module.value_head.weight) in vector_ids
@@ -530,7 +537,18 @@ def test_production_lookup_and_head_roles_are_not_hidden_matrices() -> None:
             assert id(module.unit_head[-1].weight) in vector_ids
             assert id(module.market_kind.weight) in vector_ids
             assert id(module.market_quantity_bias) in vector_ids
-        core = module.trunk.core[0]
+        # A `lejepa` critic owns no trunk: it reads the actor's backbone, which
+        # wraps the entity trunk its world model trains, through its own rounds.
+        if not hasattr(module, "trunk"):
+            assert id(module.pool_attention.query.weight) in matrix_ids
+            continue
+        trunk = getattr(module.trunk, "trunk", module.trunk)
+        for name in ("opponent_queries", "latent_queries", "market_queries"):
+            query = getattr(trunk, name, None)
+            if query is not None:
+                parameter = query.weight if isinstance(query, torch.nn.Embedding) else query
+                assert id(parameter) in vector_ids
+        core = trunk.core[0]
         attention = core.attention if hasattr(core, "attention") else core.self_attention
         assert id(attention.query.weight) in matrix_ids
 
@@ -578,14 +596,15 @@ def test_lookup_updates_ignore_other_rows_even_with_a_tied_projection() -> None:
         )
 
 
-def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
-    actor, critic = _production_modules()
+@ROUTED_FAMILIES
+def test_make_optimizers_builds_normuon_for_both_networks_by_default(family) -> None:
+    actor, critic = _production_modules(family)
     config = PpoConfig()
     assert config.optimizer == "normuon"
-    assert config.actor_learning_rate == 1.5e-4
+    assert (config.actor_learning_rate, config.critic_learning_rate) == (5e-5, 1.5e-4)
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
     for module, optimizer, learning_rate in (
-        (actor, actor_optimizer, 1.5e-4),
+        (actor, actor_optimizer, 5e-5),
         (critic, critic_optimizer, 1.5e-4),
     ):
         assert isinstance(optimizer, NorMuon)
@@ -596,7 +615,8 @@ def test_make_optimizers_builds_normuon_for_both_networks_by_default() -> None:
         adam_rate = learning_rate * PpoConfig().adam_learning_rate_ratio
         assert rates[("normuon", None)] == pytest.approx(learning_rate)
         assert rates[("adam", 1.0)] == pytest.approx(adam_rate)
-        if hasattr(module.trunk, "opponent_queries"):
+        # A `lejepa` backbone steps in the world model's optimizer, not these.
+        if hasattr(getattr(module, "trunk", None), "opponent_queries"):
             # Query banks initialized at 0.02 RMS take 0.02 of the shared Adam
             # rate, so every Adam parameter moves by the same fraction of itself.
             assert rates[("adam", 0.02)] == pytest.approx(adam_rate * 0.02)

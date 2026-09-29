@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import itertools
 import threading
 import weakref
 from dataclasses import replace
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+import kaggriculture.rollout as rollout_module
 from kaggriculture.actions import (
     N_MARKET_KINDS,
     N_QUANTITIES,
@@ -52,11 +54,14 @@ from kaggriculture.rollout import (
     _fill_gpu_policy_statistics,
     _gumbel_utilities,
     _head_determinism_rows,
+    _league_layout,
+    _mixed_wave_segments,
     _native_pair_rewards,
     _quantity_heads,
     _stacked_actor_ensemble,
     _stage_gpu_preferences,
     _state_field_specs,
+    _wave_segments,
     allocate_rollout_storage,
     collect_frozen_opponent_play,
     collect_frozen_opponent_play_rust,
@@ -66,9 +71,11 @@ from kaggriculture.rollout import (
     collect_self_play,
     collect_self_play_rust,
     concatenate_rollouts,
+    league_wave_layouts,
     merge_contiguous_rollouts,
     population_pairings,
     slice_trajectories,
+    wave_game_seeds,
 )
 from kaggriculture.rust_env import load_native
 from kaggriculture.structured import StructuredActor, StructuredConfig, StructuredInputs
@@ -274,6 +281,9 @@ def test_subfloor_gpu_sampling_and_statistics_use_the_native_temperature_floor()
 
     def statistics(temperature: float) -> dict[str, np.ndarray]:
         sampled = {
+            "market_kind_deltas": np.zeros(
+                (rows, MAX_MARKET_ORDERS, N_MARKET_KINDS), dtype=np.float32
+            ),
             "unit_actions": np.zeros((rows, MAX_UNITS), dtype=np.uint8),
             "market_kinds": np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.uint8),
             "market_quantities": np.zeros((rows, MAX_MARKET_ORDERS), dtype=np.uint8),
@@ -1638,6 +1648,102 @@ def test_structured_mixed_wave_stores_and_replays_in_one_arena() -> None:
     _assert_structured_rows_replay_from_current_actor(actor, rollout, atol=5e-6)
 
 
+@pytest.mark.parametrize(
+    ("self_play_games", "league_games"), [(0, 5), (7, 0), (3, 4), (128, 64), (64, 128), (16, 17)]
+)
+def test_mixed_wave_segments_partition_games_and_trajectories(
+    self_play_games: int, league_games: int
+) -> None:
+    segments = _mixed_wave_segments(self_play_games, league_games)
+    ranges = _wave_segments(self_play_games + league_games)
+    assert len(segments) == len(ranges)
+    for segment, (first_game, last_game) in zip(segments, ranges, strict=True):
+        assert segment.first_game == first_game
+        assert segment.self_play_games + segment.league_games == last_game - first_game
+        # Self-play games store both seats and league games only the learner's.
+        assert (
+            segment.trajectories.stop - segment.trajectories.start
+            == 2 * segment.self_play_games + segment.league_games
+        )
+    # League slices tile the wave's assignments, and trajectory ranges the
+    # arena, contiguously and in order.
+    assert segments[0].league.start == 0 and segments[-1].league.stop == league_games
+    assert segments[0].trajectories.start == 0
+    assert segments[-1].trajectories.stop == 2 * self_play_games + league_games
+    for segment, following in itertools.pairwise(segments):
+        assert segment.league.stop == following.league.start
+        assert segment.trajectories.stop == following.trajectories.start
+        # Every self-play game precedes every league game.
+        assert not (segment.league_games and following.self_play_games)
+
+
+def test_league_layouts_follow_the_segments_a_wave_compiles_for() -> None:
+    # Job 10412's shape: 64 self-play and 128 league games over eight snapshot
+    # lanes and four built-ins. The first segment holds all self-play and only
+    # 32 league games, so its per-lane share buckets smaller than the wave's.
+    assignments = np.arange(128) % 12
+    cuda = torch.device("cuda")
+    wave = np.bincount(assignments, minlength=8)[:8]
+    assert _league_layout(8, int(wave.max()), device=cuda, mode="inductor_graph") == (8, 16)
+    assert league_wave_layouts(64, assignments, 8, device=cuda, mode="inductor_graph") == (
+        (8, 4),
+        (8, 8),
+    )
+    # With self-play filling the first segment, every league game is in the
+    # second and it compiles for the wave's own totals.
+    assert league_wave_layouts(128, assignments[:64], 8, device=cuda, mode="inductor_graph") == (
+        (0, 0),
+        (8, 8),
+    )
+    # Uncompiled forwards run the exact shapes, and built-in lanes never count.
+    assert league_wave_layouts(0, np.array([8, 9, 0, 0]), 8, device=cuda, mode="eager") == ((1, 2),)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_segments_straddling_league_games_keep_their_own_opponent_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Both segments hold league games, one lane each, against different
+    # snapshots. A shared ensemble would be refilled by the second segment's
+    # setup after the first had captured its step, so the first segment's
+    # games would be played by the second segment's opponent.
+    config = _small_structured_config()
+    actor = StructuredActor(config).cuda()
+    opponents = [StructuredActor(config).cuda() for _ in range(2)]
+    self_play_games, league_games = 4, _SEGMENTED_WAVE_MIN_GAMES - 2
+    (first, second) = _mixed_wave_segments(self_play_games, league_games)
+    assert first.league_games and second.league_games
+    assignments = np.zeros(league_games, dtype=np.int64)
+    assignments[first.league] = 1
+
+    built: list[tuple[object, list[StructuredActor]]] = []
+    stacked = rollout_module._stacked_actor_ensemble
+
+    def recording(models, namespace=0):
+        ensemble = stacked(models, namespace)
+        built.append((ensemble, list(models)))
+        return ensemble
+
+    monkeypatch.setattr("kaggriculture.rollout._stacked_actor_ensemble", recording)
+    collect_mixed_play_rust(
+        actor,
+        opponents,
+        self_play_games=self_play_games,
+        league_games=league_games,
+        opponent_indices=assignments,
+        seed_start=5200,
+        sampling_seed=29,
+        forward_mode="graph",
+        reward_mode="terminal-bank",
+    )
+
+    assert [models for _, models in built] == [[opponents[1]], [opponents[0]]]
+    for ensemble, models in built:
+        for name, parameter in models[0].named_parameters():
+            assert torch.equal(ensemble.params[name][0], parameter.detach()), name
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_segmented_mixed_wave_keeps_trajectory_order_and_replays_across_the_split() -> None:
@@ -1940,6 +2046,50 @@ def test_builtin_agent_rows_refuses_a_built_in_on_a_learner_seat() -> None:
         _builtin_agent_rows(
             4, frozen_rows, learner_rows, np.asarray([0, 1]), lane_codes, ("frozen-0", "random")
         )
+
+
+def test_wave_game_seeds_group_self_play_and_keep_league_seeds() -> None:
+    np.testing.assert_array_equal(wave_game_seeds(50, 6, 3), np.arange(50, 59, dtype=np.uint64))
+    grouped = wave_game_seeds(50, 6, 3, self_play_seed_group=3)
+    assert grouped.dtype == np.uint64
+    # League games keep the seed, and so the seat, an ungrouped wave gives them.
+    assert grouped.tolist() == [50, 50, 50, 51, 51, 51, 56, 57, 58]
+    with pytest.raises(ValueError, match="whole seed groups"):
+        wave_game_seeds(50, 6, 3, self_play_seed_group=4)
+    with pytest.raises(ValueError, match="positive"):
+        wave_game_seeds(50, 6, 3, self_play_seed_group=0)
+
+
+@pytest.mark.parametrize(("self_play_games", "league_games"), [(128, 64), (64, 128), (3, 4)])
+def test_segment_game_ranges_tile_the_wave(self_play_games: int, league_games: int) -> None:
+    segments = _mixed_wave_segments(self_play_games, league_games)
+    covered = np.concatenate(
+        [np.arange(self_play_games + league_games)[segment.game_range] for segment in segments]
+    )
+    np.testing.assert_array_equal(covered, np.arange(self_play_games + league_games))
+
+
+def test_grouped_self_play_games_share_a_map_but_sample_independently() -> None:
+    config = ModelConfig(
+        cnn_width=8, cnn_blocks=1, model_dim=16, transformer_layers=3, attention_heads=2
+    )
+    actor = FarmActor(config)
+
+    rollout = collect_mixed_play_rust(
+        actor,
+        (FarmActor(config),),
+        self_play_games=4,
+        league_games=1,
+        seed_start=130,
+        self_play_seed_group=2,
+        sampling_seed=3,
+        forward_mode="eager",
+    )
+
+    assert rollout.episode_seeds.tolist() == [130, 130, 130, 130, 131, 131, 131, 131, 134]
+    assert rollout.seats.tolist() == [0, 1, 0, 1, 0, 1, 0, 1, 134 % 2]
+    # Same map, independent draws: the copies' sampled actions diverge.
+    assert (rollout.unit_actions[0] != rollout.unit_actions[2]).any()
 
 
 def test_native_builtin_lanes_are_played_by_the_engine_reference_agents() -> None:

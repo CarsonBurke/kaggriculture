@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -11,11 +11,16 @@ from typing import Any
 from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.evaluation import DEVELOPMENT_SEED_START
 from kaggriculture.modelargs import model_config_arguments
-from kaggriculture.provenance import repository_root
-from kaggriculture.registry import ENTITY_ATTENTION, resolve_architecture
+from kaggriculture.outcome_value import validate_outcome_objective
+from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, repository_root
+from kaggriculture.registry import LEJEPA, resolve_architecture
 from kaggriculture.rollout import REWARD_MODES
 
-PRODUCTION_ARCHITECTURE = ENTITY_ATTENTION
+# The attached LeJEPA world model under its own objective, with the family's
+# default configuration. Its eight-epoch WDL clone already beats V27 97.5% of
+# games at argmax, and it is the model every September 27 PPO stage fine-tuned
+# (CORE_MODEL_20260926.md; artifacts/probes/ppo-ablations-20260927).
+PRODUCTION_ARCHITECTURE = LEJEPA
 PRODUCTION_CRITIC_WARMUP_ITERATIONS = 10
 PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 
@@ -27,7 +32,7 @@ PRODUCTION_LEAGUE_GAMES = 64
 PRODUCTION_LEAGUE_SELECTION = "hardness"
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
 # Hardness pools the active/historical budget with the admitted built-in
-# budget: eleven distinct opponents, including discovery and stale refresh.
+# budget: twelve distinct opponents, including discovery and stale refresh.
 # The explicit stratified ablation uses two active and six log-age slots.
 PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 6
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
@@ -38,7 +43,8 @@ PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
 # using PFSP weights, releasing easy-agent lanes back to the active stratum.
 # External evaluation below remains a separate fixed diagnostic panel.
 PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter,scripted-v27"
-PRODUCTION_LEAGUE_BUILTIN_LANES = 3
+# One lane per admitted agent, as every measured LeJEPA recipe ran.
+PRODUCTION_LEAGUE_BUILTIN_LANES = 4
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_SECONDS = 420
 # Every seat in a wave decodes at this one temperature, learner and league
@@ -110,33 +116,74 @@ PRODUCTION_UPDATE_COMPILE_MODE = "default"
 # agents we already beat would saturate exactly where the interesting failure
 # lives. `starter` stays as the cheap floor that catches total collapse.
 PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
+# The fixed native development panel (`kaggriculture.architecture_panel`) every
+# 25 actor-active waves: synchronous argmax and sampled strength against starter
+# and V27 plus the critic's calibration, the milestone cadence the September 27
+# stages were compared on. It culls only a run that has lost strength from its
+# initialization and stalled on both signals; it never selects.
+PRODUCTION_ARCHITECTURE_PANEL = 25
+
+
+def production_architecture_panel(
+    *,
+    population: int,
+    autocull: bool,
+    device: str,
+    update_compile_mode: str,
+    reward_mode: str,
+    gamma: float,
+) -> int:
+    """The panel interval a launch defaults to: production's wherever it can run.
+
+    The panel scores one learner in compiled CUDA BF16 and is calibrated on
+    undiscounted terminal outcomes, and it is the other stop rule beside
+    autocull. A launch outside those conditions -- a population, a CPU or eager
+    update, a shaped or discounted objective -- defaults to no panel, as every
+    run did before it was adopted; an explicit interval there is still refused.
+    """
+    hosted = (
+        population == 1
+        and not autocull
+        and device.startswith("cuda")
+        and update_compile_mode != UNCOMPILED_UPDATE_COMPILE_MODE
+        and reward_mode == "terminal-outcome"
+        and gamma == 1.0
+    )
+    return PRODUCTION_ARCHITECTURE_PANEL if hosted else 0
 
 
 def production_model_config() -> dict[str, Any]:
-    """Return the complete JSON-persisted entity-attention production contract."""
-    from kaggriculture.entity import EntityConfig
-
-    return EntityConfig().to_dict()
+    """Return the complete JSON-persisted production model contract."""
+    return resolve_architecture(PRODUCTION_ARCHITECTURE).config_class().to_dict()
 
 
 def production_ppo_config(
-    *, update_compile_mode: str
+    *,
+    update_compile_mode: str,
+    architecture: str = PRODUCTION_ARCHITECTURE,
+    critic_architecture: str | None = None,
 ) -> dict[str, int | float | bool | str | None]:
     """The schedule the calibrated launcher runs and every benchmark measures.
 
-    With 230,080 states, a 7936-row ceiling produces 29 fixed-shape minibatches per
-    epoch with a 64-row padded tail (8192 made the same 29 with a 7,488-row tail).
-    Production is one actor epoch and one critic epoch on the same wave:
+    `PpoConfig` owns the algorithm's defaults and `family_ppo_defaults` the
+    family's objective and backbone rate; for the production family together
+    they are the measured recipe of artifacts/probes/ppo-stage2-20260927, arm
+    lambda-1-actor-lr-5e-5. Another family, as a historical campaign names,
+    takes the same schedule under its own family's settings; an unstated
+    critic is that family's default. Production is one actor epoch and one
+    critic epoch on the same wave:
     a second same-wave critic pass memorized holdout, and a second actor pass
     is a replay at a KL that does not bind. Actor and critic run on the same
     CUDA stream to reuse their activation allocation pool without eviction.
     Both NextLat objectives are opt-in. Ordinary PPO shuffles individual states;
-    enabling NextLat instead groups contiguous episode runs for successor targets.
+    an active self-predictive objective, NextLat or LeJEPA, instead groups
+    contiguous episode runs for successor targets.
     """
-    from kaggriculture.ppo import PpoConfig
+    from kaggriculture.ppo import PpoConfig, family_ppo_defaults
 
     return asdict(
         PpoConfig(
+            **family_ppo_defaults(architecture, critic_architecture),
             critic_epochs=PpoConfig.epochs,
             target_kl=PpoConfig.target_kl,
             update_compile_mode=update_compile_mode,
@@ -147,13 +194,14 @@ def production_ppo_config(
             # Cross-run evidence favors ordinary value fitting: critic NextLat
             # adds little prediction beyond persistence, while the off recipe
             # preserves substantially more deployed strength. See
-            # RUN_COMPARISON_20260918.md for the evidence and confounds.
+            # RUN_COMPARISON_20260918.md for the evidence and confounds. The
+            # `lejepa` world-model objective excludes them regardless, and the
+            # terms' horizons, inert while they are off, keep `PpoConfig`'s
+            # defaults as the measured recipe did.
             structured_latent_coefficient=0.0,
             structured_decision_coefficient=0.0,
-            structured_decision_horizon=1,
             structured_critic_latent_coefficient=0.0,
             structured_critic_value_coefficient=0.0,
-            structured_critic_horizon=1,
         )
     )
 
@@ -210,8 +258,15 @@ def build_training_command(
     initial_actors: Sequence[Path] = (),
     critic_warmup_iterations: int | None = None,
     reward_mode: str = DEFAULT_REWARD_MODE,
+    architecture: str = PRODUCTION_ARCHITECTURE,
+    model_config: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """Build the exact production train_ppo.py invocation."""
+    """Build the exact production train_ppo.py invocation.
+
+    `architecture` and `model_config` (that family's defaults when omitted)
+    let a campaign run the production schedule on another family; the command
+    then carries that family's own model flags and PPO settings.
+    """
     if (expected_source_digest is None) != (calibration_decision is None):
         raise ValueError("source digest and calibration decision must be provided together")
     if reward_mode not in REWARD_MODES:
@@ -262,8 +317,15 @@ def build_training_command(
             f"a fresh production population needs one BC actor per member; "
             f"{len(initial_actors)} were given for {population} members"
         )
-    model = production_model_config()
-    ppo = production_ppo_config(update_compile_mode=update_compile_mode)
+    family = resolve_architecture(architecture)
+    model = dict(model_config) if model_config is not None else family.config_class().to_dict()
+    ppo = production_ppo_config(
+        update_compile_mode=update_compile_mode,
+        architecture=architecture,
+        critic_architecture=model.get("critic_architecture"),
+    )
+    if model.get("wdl_value"):
+        validate_outcome_objective(reward_mode, ppo["gamma"], ppo["critic_gae_lambda"])
     command = [
         sys.executable,
         str(repository_root() / "scripts" / "train_ppo.py"),
@@ -293,6 +355,14 @@ def build_training_command(
     # measurement: one worker probes every member from each immutable event and
     # can see a member's bank falling while its relative score rate rises.
     league = population == 1
+    panel = production_architecture_panel(
+        population=population,
+        autocull=False,
+        device="cuda",
+        update_compile_mode=update_compile_mode,
+        reward_mode=reward_mode,
+        gamma=float(ppo["gamma"]),
+    )
     command.extend(
         (
             "--device",
@@ -326,9 +396,11 @@ def build_training_command(
             PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
             "--external-eval-seed-start",
             str(DEVELOPMENT_SEED_START),
+            "--architecture-panel",
+            str(panel),
             "--architecture",
-            PRODUCTION_ARCHITECTURE,
-            *model_config_arguments(resolve_architecture(PRODUCTION_ARCHITECTURE), model),
+            architecture,
+            *model_config_arguments(family, model),
             "--actor-lr",
             str(ppo["actor_learning_rate"]),
             "--critic-lr",
@@ -378,6 +450,30 @@ def build_training_command(
             "--structured-critic-horizon",
             str(ppo["structured_critic_horizon"]),
         )
+    )
+    # The world-model objective exists only in `lejepa`; any other family
+    # refuses it, and the parser resolves it to its absence there.
+    if architecture == LEJEPA:
+        command.extend(
+            (
+                "--jepa-prediction-coefficient",
+                str(ppo["jepa_prediction_coefficient"]),
+                "--jepa-sigreg-coefficient",
+                str(ppo["jepa_sigreg_coefficient"]),
+                "--jepa-reward-coefficient",
+                str(ppo["jepa_reward_coefficient"]),
+                "--jepa-horizon",
+                str(ppo["jepa_horizon"]),
+            )
+        )
+    # None is "the actor's rate", which has no flag spelling; the parser's own
+    # default states it.
+    if ppo["structured_learning_rate"] is not None:
+        command.extend(("--structured-learning-rate", str(ppo["structured_learning_rate"])))
+    command.append(
+        "--rematerialize-actor-update"
+        if ppo["rematerialize_actor_update"]
+        else "--no-rematerialize-actor-update"
     )
     command.append(
         "--structured-critic-gradient-balance"

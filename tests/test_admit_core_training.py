@@ -55,6 +55,21 @@ def test_competent_clone_is_admitted(gate, evidence):
     assert gate(reports, variant="control", artifact=artifact, source_digest="source")["admitted"]
 
 
+def test_current_native_panel_is_admitted(gate, evidence):
+    reports, artifact = evidence
+    for report in reports.values():
+        del report["artifacts"]["control"]["panels"]["scripted-v16"]
+    assert gate(reports, variant="control", artifact=artifact, source_digest="source")["admitted"]
+
+
+@pytest.mark.parametrize("opponent", ["starter", "scripted-v16"])
+def test_missing_or_mismatched_opponents_are_rejected(gate, evidence, opponent):
+    reports, artifact = evidence
+    del reports["sampled"]["artifacts"]["control"]["panels"][opponent]
+    with pytest.raises(ValueError, match="opponents"):
+        gate(reports, variant="control", artifact=artifact, source_digest="source")
+
+
 def test_sampled_collapse_blocks_otherwise_strong_greedy_clone(gate, evidence):
     reports, artifact = evidence
     rows = reports["sampled"]["artifacts"]["control"]["panels"]["scripted-v16"]["games"]

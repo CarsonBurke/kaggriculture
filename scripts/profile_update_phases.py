@@ -49,7 +49,6 @@ from kaggriculture.ppo import (
     update_replay_parity,
 )
 from kaggriculture.production import (
-    PRODUCTION_ARCHITECTURE,
     PRODUCTION_EPISODE_STEPS,
     PRODUCTION_LEAGUE_ACTIVE_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
@@ -58,11 +57,10 @@ from kaggriculture.production import (
     PRODUCTION_SELF_PLAY_GAMES,
     PRODUCTION_TEMPERATURE,
     PRODUCTION_UPDATE_COMPILE_MODE,
-    production_model_config,
     production_ppo_config,
 )
 from kaggriculture.provenance import file_sha256, source_identity
-from kaggriculture.registry import pair_towers, resolve_architecture
+from kaggriculture.registry import ENTITY_ATTENTION, pair_towers, resolve_architecture
 from kaggriculture.rollout import allocate_rollout_storage, collect_mixed_play_rust
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
@@ -225,11 +223,16 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
     torch.backends.cudnn.benchmark = True
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    architecture = resolve_architecture(PRODUCTION_ARCHITECTURE)
-    model_config = architecture.build_config(production_model_config())
+    # The phase table instruments the entity-attention update, whose actor
+    # carries no world-model objective; production's `lejepa` adds phases this
+    # profiler does not attribute.
+    architecture = resolve_architecture(ENTITY_ATTENTION)
+    model_config = architecture.config_class()
     config = PpoConfig(
         **{
-            **production_ppo_config(update_compile_mode=args.update_compile_mode),
+            **production_ppo_config(
+                update_compile_mode=args.update_compile_mode, architecture=ENTITY_ATTENTION
+            ),
             "minibatch_size": args.minibatch_size,
         }
     )

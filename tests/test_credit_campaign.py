@@ -57,10 +57,10 @@ def test_credit_commands_use_bounded_budget_and_only_change_named_mechanisms(tmp
             assert argument(train, flag) == value
         assert train[1] == str(source / "scripts/train_ppo.py")
         assert "--autocull" in train and "--external-eval" not in train
+        assert argument(train, "--architecture-panel") == "0"
+        assert argument(train, "--architecture") == "entity-attention"
         assert argument(train, "--actor-gae-lambda") == (
-            "1.0"
-            if arm == "monte-carlo"
-            else str(production_ppo_config(update_compile_mode="default")["actor_gae_lambda"])
+            "1.0" if arm == "monte-carlo" else str(module.HISTORICAL_ACTOR_GAE_LAMBDA)
         )
         assert argument(values["benchmark"], "--actor-gae-lambda") == argument(
             train, "--actor-gae-lambda"

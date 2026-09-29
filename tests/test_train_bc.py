@@ -1554,10 +1554,16 @@ def test_lejepa_bc_trains_the_backbone_with_its_objective(
         ppo_script._load_initial_actor(
             stripped, fresh_actor, LEJEPA, config, torch.device("cpu"), JepaObjective(config)
         )
-    with pytest.raises(ValueError, match="no use for"):
-        ppo_script._load_initial_actor(
-            output / "bc-actor.pt", fresh_actor, LEJEPA, config, torch.device("cpu")
-        )
+    # A run with its objective switched off fine-tunes the clone by the policy's
+    # gradient alone, so it takes the backbone and leaves the objective behind.
+    ablated_actor, _critic = build_lejepa_pair(config)
+    ppo_script._load_initial_actor(
+        output / "bc-actor.pt", ablated_actor, LEJEPA, config, torch.device("cpu")
+    )
+    assert all(
+        torch.equal(value, payload["actor"][name])
+        for name, value in ablated_actor.state_dict().items()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1584,3 +1590,38 @@ def test_lejepa_bc_refuses_everything_but_its_objective(
         }
     with pytest.raises(ValueError, match=match):
         trainer.train(**_lejepa_bc_kwargs(tmp_path / "refused", dataset_dir, **overrides))
+
+
+def test_lejepa_bc_batches_include_exact_teacher_prefix_resources(dataset_dir: Path) -> None:
+    from kaggriculture.resource_conditioning import RESOURCE_FEATURES, replay_market_resources
+
+    trainer = _load_trainer()
+    train_split, _, _ = trainer.load_dataset(
+        [dataset_dir],
+        architecture=LEJEPA,
+        holdout_seeds=1,
+        encode_workers=1,
+    )
+    args, _ = trainer._batch(LEJEPA, train_split, slice(None), torch.device("cpu"))
+    assert len(args) == 2
+    assert args[1].dtype == torch.float32
+    assert args[1].shape == (train_split.rows, 10, RESOURCE_FEATURES)
+    manifest = json.loads((dataset_dir / "manifest.json").read_text())
+    held_out = max(int(entry["seed"]) for entry in manifest["episodes"])
+    expected = []
+    for entry in manifest["episodes"]:
+        if int(entry["seed"]) == held_out:
+            continue
+        with np.load(dataset_dir / entry["file"]) as archive:
+            raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()))
+            for observation, units, kinds, quantities in zip(
+                raw["observations"],
+                archive["unit_actions"],
+                archive["market_kinds"],
+                archive["market_quantities"],
+                strict=True,
+            ):
+                expected.append(
+                    replay_market_resources(observation["observation"], units, kinds, quantities)
+                )
+    np.testing.assert_array_equal(args[1], np.stack(expected))

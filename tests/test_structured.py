@@ -11,7 +11,7 @@ from kaggle_environments import make
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.compilewatch import CompileWatch
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
 from kaggriculture.entity import EntityConfig
 from kaggriculture.latent_dynamics import DecodeHeads
 from kaggriculture.model import (
@@ -47,7 +47,16 @@ from kaggriculture.structured_dynamics import (
     _latent_smooth_l1,
     structured_critic_window_loss,
 )
-from kaggriculture.tokens import FARM_TOKEN_FIELDS, encode_structured_observation
+from kaggriculture.tokens import (
+    FARM_TOKEN_FIELDS,
+    PRODUCT_PRIVATE_FIELDS,
+    PRODUCT_TOKEN_FIELDS,
+    TOWN_TOKEN_FIELDS,
+    encode_structured_observation,
+    product_private_fields,
+    product_token_fields,
+    town_token_fields,
+)
 from kaggriculture.triton_mlp import _fused_relu_squared_mlp_bf16
 
 
@@ -1153,7 +1162,8 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
     assert extras is not None
     stacked = StructuredInputs(*(value.cuda() for value in stacked))
     extras = type(extras)(*(value.cuda() for value in extras))
-    assert extras.products.shape[-1] == 2 and extras.crops.shape[-1] == 1
+    assert extras.products.shape[-1] == len(PRODUCT_PRIVATE_FIELDS)
+    assert extras.crops.shape[-1] == 1
     batch = stacked.tile_categorical.shape[0]
     inputs = stacked._replace(
         products=torch.cat((stacked.products, extras.products), dim=-1),
@@ -1475,13 +1485,19 @@ def test_economy_reads_only_its_schemas_farm_columns(config_class) -> None:
     generator = torch.Generator().manual_seed(3)
 
     def economy(width: int) -> tuple[torch.Tensor, ...]:
-        shapes = ((9, 5), (3, 3), (5, 6), (2, width), (14,))
+        shapes = (
+            (9, len(PRODUCT_TOKEN_FIELDS)),
+            (3, 3),
+            (5, 6),
+            (2, width),
+            (len(TOWN_TOKEN_FIELDS),),
+        )
         return tuple(torch.randn(2, *shape, generator=generator) for shape in shapes)
 
     products, animals, crops, farms, town = economy(len(FARM_TOKEN_FIELDS))
     moved = farms.clone()
     moved[..., margin] += 1.0
-    for version, width in ((3, 4), (4, 5)):
+    for version, width in ((3, 4), (4, 5), (5, 5), (6, 7)):
         torch.manual_seed(0)
         embedder = EconomyEmbedder(
             config_class(observation_schema_version=version), private_columns=False
@@ -1493,3 +1509,83 @@ def test_economy_reads_only_its_schemas_farm_columns(config_class) -> None:
             prefix = embedder(products, animals, crops, farms[..., :width].clone(), town)
         assert torch.equal(prefix, baseline)
         assert torch.equal(shifted, baseline) == (version == 3)
+
+
+@pytest.mark.parametrize(
+    "config_class,split_clock",
+    [(StructuredConfig, False), (StructuredConfig, True), (EntityConfig, False)],
+    ids=["structured", "structured-split-clock", "entity"],
+)
+def test_economy_reads_only_its_schemas_town_columns(config_class, split_clock) -> None:
+    """v3/v4 weights see exactly their 14 town inputs; only v5 reads unlock ranks."""
+    ranks = len(town_token_fields(4))
+    generator = torch.Generator().manual_seed(5)
+    shapes = (
+        (9, len(PRODUCT_TOKEN_FIELDS)),
+        (3, 3),
+        (5, 6),
+        (2, len(FARM_TOKEN_FIELDS)),
+        (len(TOWN_TOKEN_FIELDS),),
+    )
+    products, animals, crops, farms, town = (
+        torch.randn(2, *shape, generator=generator) for shape in shapes
+    )
+    reordered = town.clone()
+    reordered[..., ranks:] = reordered[..., ranks:].flip(-1)
+    for version, width in ((3, 14), (4, 14), (5, 22), (6, 22)):
+        torch.manual_seed(0)
+        embedder = EconomyEmbedder(
+            config_class(observation_schema_version=version, split_clock_token=split_clock),
+            private_columns=False,
+        )
+        assert embedder.town_projection.in_features == width - 6 * split_clock
+        with torch.no_grad():
+            baseline = embedder(products, animals, crops, farms, town)
+            shifted = embedder(products, animals, crops, farms, reordered)
+            prefix = embedder(products, animals, crops, farms, town[..., :width].clone())
+        assert torch.equal(prefix, baseline)
+        assert torch.equal(shifted, baseline) == (version < 5)
+
+
+@pytest.mark.parametrize("private_columns", [False, True], ids=["actor", "critic"])
+@pytest.mark.parametrize(
+    "config_class", [StructuredConfig, EntityConfig], ids=["structured", "entity"]
+)
+def test_economy_reads_only_its_schemas_product_columns(config_class, private_columns) -> None:
+    """v3-v5 weights see exactly their product inputs, public and private alike."""
+    staged = len(PRODUCT_TOKEN_FIELDS)
+    held = [PRODUCT_TOKEN_FIELDS.index("held_value")]
+    if private_columns:
+        held.append(staged + PRODUCT_PRIVATE_FIELDS.index("opponent_held_value"))
+    generator = torch.Generator().manual_seed(7)
+    width = staged + len(PRODUCT_PRIVATE_FIELDS) * private_columns
+    shapes = (
+        (9, width),
+        (3, 3 + 2 * private_columns),
+        (5, 6 + private_columns),
+        (2, len(FARM_TOKEN_FIELDS)),
+        (len(TOWN_TOKEN_FIELDS),),
+    )
+    products, animals, crops, farms, town = (
+        torch.randn(2, *shape, generator=generator) for shape in shapes
+    )
+    moved = products.clone()
+    moved[..., held] += 1.0
+    for version in (3, 4, 5, 6):
+        public = len(product_token_fields(version))
+        private = len(product_private_fields(version)) * private_columns
+        torch.manual_seed(0)
+        embedder = EconomyEmbedder(
+            config_class(observation_schema_version=version), private_columns=private_columns
+        )
+        assert embedder.product_projection.in_features == public + private
+        with torch.no_grad():
+            baseline = embedder(products, animals, crops, farms, town)
+            shifted = embedder(moved, animals, crops, farms, town)
+            # The pre-v6 embedder projected its own contiguous columns.
+            legacy = torch.cat(
+                (products[..., :public], products[..., staged : staged + private]), dim=-1
+            )
+            expected = embedder.product_projection(legacy) + embedder.product_identity.weight
+        assert torch.equal(baseline[:, : len(PRODUCTS)], expected)
+        assert torch.equal(shifted, baseline) == (version < 6)

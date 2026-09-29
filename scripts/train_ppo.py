@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from kaggriculture.architecture_panel import (
     ArchitecturePanelGuard,
     evaluate_architecture_panel,
 )
+from kaggriculture.bank_advantage import UNGROUPED, opponent_bank_groups
 from kaggriculture.compilewatch import CompileWatch
 from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.critic_diagnostics import terminal_outcomes
@@ -71,11 +72,13 @@ from kaggriculture.modelargs import (
     model_config_from_args,
 )
 from kaggriculture.opponents import BUILTIN_OPPONENTS, normalize_opponent
+from kaggriculture.outcome_value import validate_outcome_objective
 from kaggriculture.policy import mean_off_diagonal, population_disagreement
 from kaggriculture.ppo import (
     BACKBONE_ROLE,
     DEFAULT_ACTOR_GAE_LAMBDA,
     DEFAULT_CRITIC_GAE_LAMBDA,
+    LEJEPA_PPO_DEFAULTS,
     MAX_FIRST_MINIBATCH_KL,
     MAX_UPDATE_REPLAY_KL,
     MAX_UPDATE_REPLAY_TAIL_FRACTION,
@@ -85,6 +88,7 @@ from kaggriculture.ppo import (
     PpoConfig,
     actor_forward_args,
     actor_lr_cooldown_scale,
+    family_ppo_defaults,
     make_optimizers,
     make_structured_dynamics_optimizer,
     set_lr_cooldown,
@@ -92,12 +96,17 @@ from kaggriculture.ppo import (
     update_replay_parity,
 )
 from kaggriculture.production import (
+    PRODUCTION_ARCHITECTURE,
+    PRODUCTION_ARCHITECTURE_PANEL,
     PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS,
+    PRODUCTION_LEAGUE_BUILTIN_LANES,
+    PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
     PRODUCTION_LEAGUE_SELECTION,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
+    production_architecture_panel,
     production_ppo_config,
 )
 from kaggriculture.provenance import (
@@ -110,7 +119,6 @@ from kaggriculture.provenance import (
 )
 from kaggriculture.registry import (
     ARCHITECTURES,
-    CONV_ENTITY,
     LEJEPA,
     pair_towers,
     resolve_architecture,
@@ -119,13 +127,14 @@ from kaggriculture.rollout import (
     REWARD_MODES,
     ROLLOUT_FORWARD_MODES,
     RolloutBatch,
-    _league_layout,
     allocate_rollout_storage,
     collect_mixed_play_rust,
     collect_population_play_rust,
+    league_wave_layouts,
     slice_trajectories,
 )
 from kaggriculture.rust_env import toolchain_identity
+from kaggriculture.script_opponents import ScriptAgentPool, ScriptOpponent, parse_script_opponent
 from kaggriculture.structured import StructuredConfig
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.telemetry import (
@@ -323,11 +332,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument(
+        "--actor-waves",
+        type=int,
+        default=None,
+        help="stop after this many completed actor-active waves, excluding critic warmup; "
+        "requires a single learner, architecture panels and no wall-time cutoff",
+    )
+    parser.add_argument(
         "--architecture-panel",
         type=int,
-        default=0,
+        default=None,
         help="fixed native BF16 development evaluation every N actor-active waves (0 disables); "
-        "cull persistent score deterioration only after strength and critic calibration stall",
+        "cull persistent score deterioration only after strength and critic calibration stall. "
+        f"Defaults to {PRODUCTION_ARCHITECTURE_PANEL} wherever the run can host it -- one "
+        "learner without --autocull, a compiled CUDA update, terminal-outcome and gamma 1 -- "
+        "and to 0 otherwise",
     )
     parser.add_argument(
         "--autocull",
@@ -388,15 +407,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--league-active-pool-size", type=int, default=16)
     parser.add_argument(
         "--league-builtin-opponents",
-        default="",
-        help="comma-separated engine reference agents admitted to the training league",
+        default=None,
+        help="comma-separated engine reference agents admitted to the training league; "
+        f"defaults, with --league-builtin-lanes, to {PRODUCTION_LEAGUE_BUILTIN_OPPONENTS} for a "
+        "single learner and none for a population; stating only the lanes leaves none",
     )
     parser.add_argument(
         "--league-builtin-lanes",
         type=int,
-        default=0,
+        default=None,
         help="built-in lane budget; hardness pools it with snapshot lanes, "
-        "stratified contests reserved lanes; zero disables built-ins",
+        "stratified contests reserved lanes; zero disables built-ins. Defaults to "
+        f"{PRODUCTION_LEAGUE_BUILTIN_LANES} for a single learner and 0 for a population when "
+        "neither built-in flag is given, and to 0 when only the agents are",
+    )
+    parser.add_argument(
+        "--league-script-opponent",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="a Kaggle agent file played natively as a fixed league lane (repeatable); "
+        "journaled as league_script_NAME_*",
+    )
+    parser.add_argument(
+        "--league-script-games",
+        type=int,
+        default=0,
+        help="script-opponent games per wave, on top of --league-games and never "
+        "contested by league selection: split evenly over the script opponents and "
+        "seats, trained as league rows, and excluded from PFSP and hardness evidence",
+    )
+    parser.add_argument(
+        "--league-script-workers",
+        type=int,
+        default=8,
+        help="processes running script-opponent agents alongside the native wave",
     )
     parser.add_argument(
         "--external-eval",
@@ -424,9 +469,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--architecture",
         choices=sorted(ARCHITECTURES),
-        default=CONV_ENTITY,
+        default=PRODUCTION_ARCHITECTURE,
         help="actor/critic family; each family's structural flags default to that "
-        "family's model configuration and a flag from another family is rejected",
+        "family's model configuration and a flag from another family is rejected. "
+        "Family-owned PPO settings (the LeJEPA objective and backbone rate, the "
+        "forecast critic's weight) likewise default to the chosen family's",
     )
     add_model_config_arguments(parser)
     # Direct launches read PPO defaults from the algorithm configuration rather
@@ -469,8 +516,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ACTOR_GAE_LAMBDA,
         help=(
-            f"policy GAE lambda; defaults to {DEFAULT_ACTOR_GAE_LAMBDA:.8f} "
-            "(VAPO alpha=0.05 over 719 transitions). Critic targets use --critic-gae-lambda"
+            f"policy GAE lambda; defaults to {DEFAULT_ACTOR_GAE_LAMBDA:g}, Monte Carlo "
+            "credit. Critic targets use --critic-gae-lambda"
         ),
     )
     parser.add_argument(
@@ -488,6 +535,38 @@ def parse_args() -> argparse.Namespace:
             "every matrix update's spectrum; the mean half removes the "
             "common-mode offset that pushes every sampled action's logprob the "
             "same way"
+        ),
+    )
+    parser.add_argument(
+        "--bank-advantage-coefficient",
+        type=float,
+        default=PpoConfig.bank_advantage_coefficient,
+        help=(
+            "weight of the group-relative own-bank stream added to the actor's "
+            "advantage: each trajectory's final bank against the leave-one-out "
+            "mean of the wave's other games against the same opponent from the "
+            "same seat and, with --self-play-seed-group, on the same map seed; "
+            "standardized over the wave. Requires --population 1"
+        ),
+    )
+    parser.add_argument(
+        "--bank-advantage-groups",
+        choices=("self-play", "all"),
+        default=PpoConfig.bank_advantage_groups,
+        help=(
+            "games the bank stream scores: every opponent lane, self-play "
+            "included (default), or self-play only"
+        ),
+    )
+    parser.add_argument(
+        "--self-play-seed-group",
+        type=int,
+        default=1,
+        help=(
+            "consecutive self-play games that share one map seed; must divide "
+            "--games. 1 keeps every game's seed distinct. The seed dominates a "
+            "near-deterministic policy's bank, so the bank stream compares "
+            "self-play games within a seed when this is 2 or more"
         ),
     )
     parser.add_argument(
@@ -528,6 +607,17 @@ def parse_args() -> argparse.Namespace:
     # Sourced from the dataclass rather than restated, so the justification
     # recorded there cannot drift out of agreement with what the CLI ships.
     parser.add_argument(
+        "--entropy-coefficient",
+        type=float,
+        default=PpoConfig.entropy_coefficient,
+        help=(
+            "weight on the policy entropy bonus, over the same per-head entropy "
+            "reported as `entropy` and reduced like the surrogate; zero keeps the "
+            "surrogate-only update. The only exploration knob, since replay "
+            "parity pins the sampling temperature to 1.0"
+        ),
+    )
+    parser.add_argument(
         "--optimizer",
         choices=("normuon", "adamw"),
         default=PpoConfig.optimizer,
@@ -560,6 +650,14 @@ def parse_args() -> argparse.Namespace:
         help="execution mode of the update-path forward/backward, and the whole compile "
         "decision for the update: eager does not compile; default `default`, Inductor "
         "fusion without CUDA graph capture",
+    )
+    parser.add_argument(
+        "--rematerialize-actor-update",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="replay the actor's update-forward activations in backward when an auxiliary "
+        "reads its belief, trading a second forward for memory; the same function either way. "
+        "Defaults to the chosen family's: lejepa retains them, every other family replays",
     )
     parser.add_argument("--no-bfloat16", action="store_true")
     # Collection execution and precision are explicit and independent of the
@@ -617,8 +715,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--economic-forecast-coefficient",
         type=float,
-        default=PpoConfig.economic_forecast_coefficient,
-        help="observable multi-horizon forecast loss weight for critic-architecture forecast",
+        default=None,
+        help="observable multi-horizon forecast loss weight for critic-architecture forecast; "
+        "defaults to that critic's weight and to 0 for every other critic",
     )
     parser.add_argument(
         "--structured-critic-gradient-balance",
@@ -640,17 +739,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--jepa-prediction-coefficient",
         type=float,
-        default=PpoConfig.jepa_prediction_coefficient,
+        default=None,
         help="weight on the LeJEPA next-embedding regression, whose target is ATTACHED; "
-        "requires --architecture lejepa and a positive --jepa-sigreg-coefficient",
+        "requires --architecture lejepa and a positive --jepa-sigreg-coefficient. "
+        f"Defaults to {LEJEPA_PPO_DEFAULTS['jepa_prediction_coefficient']:g} for lejepa "
+        "and 0 for every other family",
     )
     parser.add_argument(
         "--jepa-sigreg-coefficient",
         type=float,
-        default=PpoConfig.jepa_sigreg_coefficient,
+        default=None,
         help="weight on SIGReg, the only thing preventing the attached target above from "
         "being solved by a constant encoder; `../le-wm` uses 0.09 against a unit "
-        "prediction weight",
+        f"prediction weight. Defaults to {LEJEPA_PPO_DEFAULTS['jepa_sigreg_coefficient']:g} "
+        "for lejepa and 0 for every other family",
     )
     parser.add_argument(
         "--jepa-reward-coefficient",
@@ -675,8 +777,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--structured-learning-rate",
         type=float,
-        default=PpoConfig.structured_learning_rate,
-        help="actor predictor optimizer rate; defaults to --actor-lr",
+        default=None,
+        help="actor predictor optimizer rate, and the shared backbone's under lejepa; "
+        f"defaults to {LEJEPA_PPO_DEFAULTS['structured_learning_rate']:g} for lejepa and "
+        "to --actor-lr for every other family",
     )
     parser.add_argument(
         "--structured-critic-learning-rate",
@@ -717,7 +821,8 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "abort the run if anything compiles once the actor is released and "
-            "neural ensemble bucket is unchanged from the previous wave. "
+            "every wave segment's neural ensemble bucket is unchanged from the "
+            "previous wave. "
             "New buckets compile on first use; changed opponent assignments "
             "within a bucket reuse the same compiled callable. "
             "Compiles in settled waves indicate a guard failure or a frame "
@@ -743,14 +848,47 @@ def parse_args() -> argparse.Namespace:
     # A population wave is all learners; the single-learner defaults (128 live
     # games plus 64 frozen) are not a valid population configuration, so they
     # must not be the implicit ones. An explicit flag still wins either way.
+    single = args.population == 1
     if args.games is None:
         args.games = (
-            args.population * (args.population - 1) * 13
-            if args.population > 1
-            else PRODUCTION_SELF_PLAY_GAMES
+            PRODUCTION_SELF_PLAY_GAMES if single else args.population * (args.population - 1) * 13
         )
     if args.league_games is None:
-        args.league_games = 0 if args.population > 1 else PRODUCTION_LEAGUE_GAMES
+        args.league_games = PRODUCTION_LEAGUE_GAMES if single else 0
+    # The built-in agents and their lanes are one decision: production's pair
+    # when neither is stated, and otherwise the unstated one is absent, so a
+    # half-stated pair is refused exactly as before these defaulted.
+    if args.league_builtin_opponents is None and args.league_builtin_lanes is None:
+        args.league_builtin_opponents = PRODUCTION_LEAGUE_BUILTIN_OPPONENTS if single else ""
+        args.league_builtin_lanes = PRODUCTION_LEAGUE_BUILTIN_LANES if single else 0
+    if args.league_builtin_opponents is None:
+        args.league_builtin_opponents = ""
+    if args.league_builtin_lanes is None:
+        args.league_builtin_lanes = 0
+    if args.architecture_panel is None:
+        args.architecture_panel = production_architecture_panel(
+            population=args.population,
+            autocull=args.autocull,
+            device=args.device,
+            update_compile_mode=args.update_compile_mode,
+            reward_mode=args.reward_mode,
+            gamma=args.gamma,
+        )
+    # Family-owned PPO settings resolve from the chosen family, as its model
+    # flags do, so switching families never inherits an objective the other
+    # family refuses. They are resolved here rather than at `PpoConfig`
+    # construction because validation, `config.json` and resume identity all
+    # read the parsed values.
+    family = family_ppo_defaults(args.architecture, args.critic_architecture)
+    for name in (
+        "economic_forecast_coefficient",
+        "jepa_prediction_coefficient",
+        "jepa_sigreg_coefficient",
+        "structured_learning_rate",
+        "rematerialize_actor_update",
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, family.get(name, getattr(PpoConfig, name)))
     return args
 
 
@@ -808,27 +946,61 @@ def _validate_population(args: argparse.Namespace) -> None:
     # Every seat in a population wave is a learner, so nothing in it reads the
     # frozen archive or plays an engine reference agent. Leaving either configured
     # would accept a launch command claiming opponents the run never meets.
-    if args.league_games or args.league_builtin_lanes or _league_builtin_opponents(args):
+    if (
+        args.league_games
+        or args.league_builtin_lanes
+        or _league_builtin_opponents(args)
+        or args.league_script_games
+    ):
         raise ValueError(
-            "a population wave has no frozen or built-in lanes; pass --league-games 0 "
-            "and no built-in opponents"
+            "a population wave has no frozen, built-in or script lanes; pass --league-games 0 "
+            "and no built-in or script opponents"
         )
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.actor_waves is not None:
+        if args.actor_waves <= 0:
+            raise ValueError("--actor-waves must be positive")
+        if args.population != 1 or args.architecture_panel <= 0:
+            raise ValueError("--actor-waves requires one learner and an architecture panel")
+        if args.actor_waves % args.architecture_panel:
+            raise ValueError("--actor-waves must be divisible by --architecture-panel")
+        if args.iterations < args.actor_waves + MAX_CRITIC_WARMUP_ITERATIONS:
+            raise ValueError("--iterations must cover --actor-waves plus maximum critic warmup")
+        if args.max_hours != 0:
+            raise ValueError("--actor-waves requires --max-hours 0 for matched training exposure")
+    # The resolved family configuration, not the flag: `lejepa` builds the WDL
+    # critic by default, and an unflagged run must be refused here rather than
+    # by its first update.
+    model_config = model_config_from_args(resolve_architecture(args.architecture), args)
+    if getattr(model_config, "wdl_value", False):
+        validate_outcome_objective(args.reward_mode, args.gamma, args.critic_gae_lambda)
     if args.architecture_panel < 0:
         raise ValueError("--architecture-panel must be nonnegative")
     if args.architecture_panel:
         if args.population != 1 or args.autocull:
             raise ValueError("architecture panel requires one learner and no online-proxy autocull")
         if not args.device.startswith("cuda") or args.update_compile_mode == "eager":
-            raise ValueError("architecture panel requires compiled CUDA BF16")
+            raise ValueError(
+                "architecture panel requires compiled CUDA BF16; pass --architecture-panel 0"
+            )
         if args.reward_mode != "terminal-outcome" or args.gamma != 1.0:
             raise ValueError(
                 "architecture panel calibration requires terminal-outcome and gamma one"
             )
     if args.autocull and args.population != 1:
         raise ValueError("--autocull requires --population 1")
+    if args.self_play_seed_group < 1 or args.games % args.self_play_seed_group:
+        raise ValueError("--self-play-seed-group must be positive and divide --games")
+    if args.self_play_seed_group > 1 and args.population != 1:
+        raise ValueError("--self-play-seed-group requires --population 1")
+    if not math.isfinite(args.bank_advantage_coefficient) or args.bank_advantage_coefficient < 0:
+        raise ValueError("--bank-advantage-coefficient must be finite and nonnegative")
+    if args.bank_advantage_coefficient and getattr(model_config, "per_entity_critic", False):
+        raise ValueError("--bank-advantage-coefficient does not reach per-entity critic advantages")
+    if args.bank_advantage_coefficient and args.population != 1:
+        raise ValueError("--bank-advantage-coefficient requires --population 1")
     # Model-configuration flags are validated by the config dataclass itself,
     # so every entry point that builds one gets the same rules.
     positive = {
@@ -862,6 +1034,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     # the update to near-zero optimizer steps silently rather than erroring.
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
+    if not math.isfinite(args.entropy_coefficient) or args.entropy_coefficient < 0.0:
+        raise ValueError("entropy coefficient must be finite and non-negative")
     if args.policy_ratio_scope == "joint" and args.policy_loss_reduction != "states":
         raise ValueError("joint policy ratio scope requires state policy loss reduction")
     if (
@@ -913,11 +1087,20 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("LeJEPA coefficients must be finite and nonnegative")
     if any(jepa_coefficients) and args.architecture != LEJEPA:
         raise ValueError("LeJEPA coefficients require --architecture lejepa")
-    if args.architecture == LEJEPA and not any(jepa_coefficients):
+    if (
+        args.architecture == LEJEPA
+        and not any(jepa_coefficients)
+        and args.init_actor_from is None
+        and args.resume is None
+    ):
+        # Fine-tuning a cloned world model by the policy's gradient alone is a
+        # real ablation of the objective; training one from scratch that way is
+        # the entity architecture with extra head parameters.
         raise ValueError(
             "the lejepa architecture without its objective is the entity architecture "
             "with extra head parameters; set --jepa-prediction-coefficient and "
-            "--jepa-sigreg-coefficient, or use --architecture entity-attention"
+            "--jepa-sigreg-coefficient, fine-tune a clone with --init-actor-from, or use "
+            "--architecture entity-attention"
         )
     if args.jepa_horizon < 1:
         raise ValueError("LeJEPA horizons must be positive")
@@ -979,6 +1162,17 @@ def _validate_args(args: argparse.Namespace) -> None:
             "league games must cover the initial anchor and every configured "
             f"active/historical/built-in lane ({configured_opponents})"
         )
+    scripts = _league_script_opponents(args)
+    if args.league_script_games < 0:
+        raise ValueError("league script games cannot be negative")
+    if args.league_script_workers < 1:
+        raise ValueError("league script workers must be positive")
+    if len({script.name for script in scripts}) != len(scripts):
+        raise ValueError("league script opponent names must be distinct")
+    if bool(scripts) != bool(args.league_script_games):
+        raise ValueError("--league-script-opponent and --league-script-games must be set together")
+    if args.league_script_games and args.league_script_games < len(scripts):
+        raise ValueError("league script games must cover every script opponent")
     _validate_population(args)
     if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 0:
         raise ValueError("critic warmup iterations cannot be negative")
@@ -1031,9 +1225,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.seed < 0:
         raise ValueError("seed cannot be negative")
     validate_seed_interval(
-        "online_rl",
-        args.seed,
-        max(1, (args.games + (args.league_games if args.population == 1 else 0)) * args.iterations),
+        "online_rl", args.seed, max(1, _wave_games(args, args.population) * args.iterations)
     )
     if args.temperature != 1.0:
         raise ValueError("on-policy PPO currently requires --temperature 1.0")
@@ -1088,17 +1280,28 @@ def _load_initial_actor(
     incompatible = actor.load_state_dict(pretrained.state_dict(), strict=not affordance_upgrade)
     if affordance_upgrade:
         scorer = actor.unit_affordance
-        if scorer is None or set(incompatible.missing_keys) != {
-            f"unit_affordance.{key}" for key in scorer.state_dict()
-        } or incompatible.unexpected_keys:
+        if (
+            scorer is None
+            or set(incompatible.missing_keys)
+            != {f"unit_affordance.{key}" for key in scorer.state_dict()}
+            or incompatible.unexpected_keys
+        ):
             raise ValueError("affordance warm start has unexpected state-dict differences")
         if torch.count_nonzero(scorer.query.weight).item() != 0:
             raise ValueError("affordance warm start did not preserve zero residual")
-    if architecture_name == "lejepa" and "jepa_objective" not in payload:
-        stored_objective = payload.get("structured_dynamics")
-        if not isinstance(stored_objective, dict) or not stored_objective:
-            raise ValueError("LeJEPA PPO warm start has no saved objective")
-        load_artifact_objective({**payload, "jepa_objective": stored_objective}, objective)
+    if architecture_name == "lejepa" and objective is None:
+        # The run drops the objective on purpose: the policy's gradient alone
+        # fine-tunes the backbone, so the projector and predictor it was cloned
+        # beside have nothing left to train.
+        pass
+    elif (
+        architecture_name == "lejepa"
+        and "jepa_objective" not in payload
+        and payload.get("structured_dynamics")
+    ):
+        load_artifact_objective(
+            {**payload, "jepa_objective": payload["structured_dynamics"]}, objective
+        )
     else:
         load_artifact_objective(payload, objective)
     return {
@@ -1648,6 +1851,20 @@ def _critic_warmup_decision(
     return True, "waiting_for_monte_carlo_r_squared"
 
 
+def _actor_wave_budget_reached(target: int | None, panel: ArchitecturePanelGuard | None) -> bool:
+    """Use the checkpointed panel count, including on an already-complete resume.
+
+    A wave counts only after the update's functional checks succeed. This is a
+    rollout-wave budget, not a count of optimizer minibatches: KL may shorten
+    actor updates within a wave, and deterioration culling can still end a run.
+    """
+    if target is None:
+        return False
+    if panel is None:
+        raise ValueError("actor-wave budget requires a persisted architecture panel")
+    return panel.state["actor_waves"] >= target
+
+
 def _validate_league_score_rates(rates: object) -> dict[str, float]:
     if not isinstance(rates, dict):
         raise ValueError("resume checkpoint has no valid league score-rate state")
@@ -1682,6 +1899,14 @@ def _blend_league_score_rates(
         )
 
 
+def _league_outcomes(league: RolloutBatch) -> np.ndarray:
+    """Per-game learner outcome in {-1, 0, 1}."""
+    if league.reward_mode == "terminal-outcome":
+        return terminal_outcomes(league)
+    margins = league.final_money - league.opponent_money
+    return (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
+
+
 def _league_opponent_diagnostics(
     league: RolloutBatch,
     assignments: np.ndarray,
@@ -1690,11 +1915,7 @@ def _league_opponent_diagnostics(
     diagnostics: dict[str, float | int | str] = {}
     score_rates: dict[str, float] = {}
     margins = league.final_money - league.opponent_money
-    outcomes = (
-        terminal_outcomes(league)
-        if league.reward_mode == "terminal-outcome"
-        else (margins > 0).astype(np.float32) - (margins < 0).astype(np.float32)
-    )
+    outcomes = _league_outcomes(league)
     for index, selection in enumerate(selections):
         selected = assignments == index
         games = int(selected.sum())
@@ -1711,6 +1932,33 @@ def _league_opponent_diagnostics(
         diagnostics[f"{prefix}_mean_margin"] = float(margins[selected].mean())
         score_rates[selection.key] = score_rate
     return diagnostics, score_rates
+
+
+def _league_script_diagnostics(
+    league: RolloutBatch,
+    assignments: np.ndarray,
+    first_lane: int,
+    scripts: Sequence[ScriptOpponent],
+    statistics: Mapping[str, float | int],
+) -> dict[str, float | int]:
+    """Per-script-opponent results and the wave's script-seat accounting."""
+    diagnostics: dict[str, float | int] = {
+        f"league_script_{name}": value for name, value in statistics.items()
+    }
+    outcomes = _league_outcomes(league)
+    for index, script in enumerate(scripts):
+        selected = assignments == first_lane + index
+        if not selected.any():
+            continue
+        own = league.final_money[selected]
+        opponent = league.opponent_money[selected]
+        prefix = f"league_{script.key}"
+        diagnostics[f"{prefix}_games"] = int(selected.sum())
+        diagnostics[f"{prefix}_score_rate"] = float(((outcomes[selected] + 1.0) / 2.0).mean())
+        diagnostics[f"{prefix}_mean_margin"] = float((own - opponent).mean())
+        diagnostics[f"{prefix}_own_bank"] = float(own.mean())
+        diagnostics[f"{prefix}_opponent_bank"] = float(opponent.mean())
+    return diagnostics
 
 
 def _resolve_external_eval_opponents(args: argparse.Namespace) -> None:
@@ -1958,6 +2206,18 @@ def _league_builtin_opponents(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def _league_script_opponents(args: argparse.Namespace) -> list[ScriptOpponent]:
+    """Script opponents in launch-command order, each pinned to its file's digest."""
+    return [parse_script_opponent(spec) for spec in args.league_script_opponent]
+
+
+def _wave_games(args: argparse.Namespace, population: int) -> int:
+    """Games, and so seeds, one wave consumes."""
+    if population > 1:
+        return args.games
+    return args.games + args.league_games + args.league_script_games
+
+
 def _select_league_opponents(
     args: argparse.Namespace,
     refs: Sequence[SnapshotRef],
@@ -2011,9 +2271,16 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
         # either would be generating different data under the same run.
         "league_builtin_opponents": ",".join(_league_builtin_opponents(args)),
         "league_builtin_lanes": args.league_builtin_lanes,
+        # A script opponent is its file's content, not its path.
+        "league_script_opponents": [
+            {"name": script.name, "sha256": script.sha256}
+            for script in _league_script_opponents(args)
+        ],
+        "league_script_games": args.league_script_games,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
         "reward_mode": args.reward_mode,
+        "self_play_seed_group": args.self_play_seed_group,
         # Both calibrated knobs are modes, and both are cross-checked against the
         # calibration decision by name (`provenance.CALIBRATION_KNOBS`), so the
         # record stores the mode itself rather than any boolean projection of it.
@@ -2247,6 +2514,7 @@ def _audit_replay_parity(
         compile_mode=ppo_config.update_compile_mode,
         autocast_enabled=ppo_config.use_bfloat16 and device.type == "cuda",
         rows=rows,
+        entropy_gradient=ppo_config.entropy_coefficient > 0.0,
     )
     # A head with no active components reports zero divergence, which would pass
     # the bound without having audited anything. The calibration benchmark already
@@ -2663,6 +2931,22 @@ def main() -> None:
         torch.set_num_interop_threads(1)
     args = parse_args()
     _validate_args(args)
+    script_opponents = _league_script_opponents(args)
+    # The script agents' worker processes serve the whole run and are stopped
+    # here however it ends; a hung agent would otherwise outlive the trainer.
+    with (
+        ScriptAgentPool(script_opponents, args.league_script_workers)
+        if script_opponents
+        else nullcontext()
+    ) as script_pool:
+        _train(args, script_opponents, script_pool)
+
+
+def _train(
+    args: argparse.Namespace,
+    script_opponents: list[ScriptOpponent],
+    script_pool: ScriptAgentPool | None,
+) -> None:
     _configure_training_determinism(args.deterministic_training)
     _resolve_external_eval_opponents(args)
     current_source_identity = source_identity()
@@ -2722,11 +3006,15 @@ def main() -> None:
         actor_gae_lambda=args.actor_gae_lambda,
         critic_gae_lambda=args.critic_gae_lambda,
         normalize_advantages=args.normalize_advantages,
+        bank_advantage_coefficient=args.bank_advantage_coefficient,
+        bank_advantage_groups=args.bank_advantage_groups,
         nextlat_max_gradient_norm=args.nextlat_max_gradient_norm,
         target_kl=args.target_kl,
+        entropy_coefficient=args.entropy_coefficient,
         optimizer=args.optimizer,
         use_bfloat16=not args.no_bfloat16,
         update_compile_mode=args.update_compile_mode,
+        rematerialize_actor_update=args.rematerialize_actor_update,
         structured_latent_coefficient=args.structured_latent_coefficient,
         structured_decision_coefficient=args.structured_decision_coefficient,
         structured_decision_horizon=args.structured_decision_horizon,
@@ -2966,9 +3254,7 @@ def main() -> None:
             for row in record["seed_usage"]
         ]
     )
-    planned_games = (args.games + (args.league_games if population == 1 else 0)) * max(
-        0, args.iterations - iteration
-    )
+    planned_games = _wave_games(args, population) * max(0, args.iterations - iteration)
     if planned_games:
         online_interval = validate_seed_interval(
             "online_rl",
@@ -3125,19 +3411,19 @@ def main() -> None:
     # One reusable trajectory-major pinned arena receives the whole mixed
     # wave (self-play rows first, league rows after) directly from the
     # collector, so the replay stages to the accelerator without any host
-    # concatenation. The self-play prefix serves iterations without league
-    # play, which produce fewer trajectories. A population wave has no league
-    # rows at all and both of its seats are stored, so it fills exactly the
-    # self-play prefix, which is the whole arena.
+    # concatenation. A wave fills the prefix its games need: without league
+    # play only the self-play rows, and before any lane is selectable only the
+    # script lane's league rows. A population wave has no league rows at all
+    # and both of its seats are stored, so it fills exactly the self-play
+    # prefix, which is the whole arena.
     self_play_rows = args.games * 2
     rollout_arena = allocate_rollout_storage(
         architecture.name,
-        self_play_rows + args.league_games,
+        self_play_rows + args.league_games + args.league_script_games,
         args.episode_steps - 1,
         pin_memory=device.type == "cuda",
         action_interface=model_config.action_interface,
     )
-    self_play_storage = {name: array[:self_play_rows] for name, array in rollout_arena.items()}
 
     commit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="commit")
     pending_commit: Future[tuple[tuple[Path, int] | None, SnapshotRef | None]] | None = None
@@ -3312,10 +3598,11 @@ def main() -> None:
     last_parity_audit: dict[str, int] = {}
     external_eval_process: subprocess.Popen | None = None
     compile_watch = CompileWatch()
-    previous_lane_signature: tuple[int, int] | None = None
+    previous_lane_signature: tuple[tuple[int, int], ...] | None = None
     previous_warmup_active: bool | None = None
     while (
         iteration < args.iterations
+        and not _actor_wave_budget_reached(args.actor_waves, architecture_panel)
         and not (autocull is not None and autocull.culled)
         and not (architecture_panel is not None and architecture_panel.culled)
     ):
@@ -3378,7 +3665,7 @@ def main() -> None:
         indivisible_timings = ("rollout_seconds", "rollout_states_per_second")
         # A population wave has no frozen or built-in lane, so its layout is the
         # population itself and never moves.
-        lane_signature: tuple[int, int] = (population, 0)
+        lane_signature: tuple[tuple[int, int], ...] = ((population, 0),)
         if population > 1:
             # One ensemble forward over N lanes covering every row, lane index =
             # agent index. Both seats belong to learners and both are stored, so
@@ -3443,11 +3730,13 @@ def main() -> None:
                 pretrained_start=initial_actor_provenance is not None,
                 matchup_evidence=league_matchup_evidence,
             )
-            league_games = args.league_games if selections else 0
+            selected_games = args.league_games if selections else 0
+            script_games = args.league_script_games
+            league_games = selected_games + script_games
             opponents = []
             assignments = None
             builtin_lanes: list[str] = []
-            if league_games:
+            if selected_games:
                 # The selection's contract puts every snapshot lane before every
                 # built-in lane, which is exactly the lane index space the wave
                 # addresses: frozen modules first, built-ins after them.
@@ -3457,23 +3746,33 @@ def main() -> None:
                 ]
                 opponents = opponent_pool.acquire([row.ref.path for row in snapshots])
                 assignments = _balanced_assignments(
-                    league_games,
+                    selected_games,
                     len(selections),
                     generator,
                     seed_start=next_seed + args.games,
                 )
                 opponent_checkpoint = ",".join(row.label for row in selections)
-            # Track the collector's physical inference bucket, not raw neural
-            # assignments. Changing opponents within a bucket must not excuse
-            # a new compile. Built-ins never occupy neural lanes.
-            neural_counts = (
-                np.bincount(assignments, minlength=len(selections))[: len(opponents)]
-                if assignments is not None
-                else np.empty(0, dtype=np.int64)
-            )
-            lane_signature = _league_layout(
-                int(np.count_nonzero(neural_counts)),
-                int(neural_counts.max(initial=0)),
+            if script_games:
+                # Script lanes follow every selected lane, the collector's lane
+                # order, and play fixed games that selection never contests.
+                script_assignments = len(selections) + _balanced_assignments(
+                    script_games,
+                    len(script_opponents),
+                    generator,
+                    seed_start=next_seed + args.games + selected_games,
+                )
+                assignments = (
+                    script_assignments
+                    if assignments is None
+                    else np.concatenate((assignments, script_assignments))
+                )
+            # Track the collector's physical inference buckets, one per wave
+            # segment, not raw neural assignments. Changing opponents within a
+            # bucket must not excuse a new compile.
+            lane_signature = league_wave_layouts(
+                args.games,
+                assignments if assignments is not None else np.empty(0, dtype=np.int64),
+                len(opponents),
                 device=device,
                 mode=args.rollout_forward_mode,
             )
@@ -3487,7 +3786,10 @@ def main() -> None:
                 league_games=league_games,
                 opponent_indices=assignments,
                 builtin_lanes=builtin_lanes,
+                script_lanes=script_opponents,
+                script_pool=script_pool,
                 seed_start=next_seed,
+                self_play_seed_group=args.self_play_seed_group,
                 episode_steps=args.episode_steps,
                 temperature=args.temperature,
                 gamma=args.gamma,
@@ -3514,7 +3816,10 @@ def main() -> None:
                 # ensemble eager.
                 forward_mode=args.rollout_forward_mode,
                 forward_autocast=args.rollout_bfloat16,
-                storage=rollout_arena if league_games else self_play_storage,
+                storage={
+                    name: array[: self_play_rows + league_games]
+                    for name, array in rollout_arena.items()
+                },
                 # A `lejepa` critic reads its behavior values off the learner's own
                 # encoding here, which spares the update its whole-wave replay.
                 critic=critic if isinstance(critic, LejepaCritic) else None,
@@ -3525,12 +3830,13 @@ def main() -> None:
                 "league": np.arange(rollout.trajectories) >= self_play_rows,
             }
             if assignments is not None:
-                for selection_index, selection in enumerate(selections):
-                    diagnostic_groups[f"opponent_{selection.key}"] = np.concatenate(
-                        (
-                            np.zeros(self_play_rows, dtype=bool),
-                            assignments == selection_index,
-                        )
+                lane_keys = [
+                    *(selection.key for selection in selections),
+                    *(script.key for script in script_opponents),
+                ]
+                for lane, key in enumerate(lane_keys):
+                    diagnostic_groups[f"opponent_{key}"] = np.concatenate(
+                        (np.zeros(self_play_rows, dtype=bool), assignments == lane)
                     )
             next_seed += args.games + league_games
             self_play_diagnostics = {
@@ -3549,10 +3855,24 @@ def main() -> None:
                     if name not in indivisible_timings
                 }
                 assert assignments is not None
+            if selected_games:
                 opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
                     league_part, assignments, selections
                 )
                 league_diagnostics.update(opponent_diagnostics)
+            if script_games:
+                assert script_pool is not None
+                # Reported beside the selected lanes but never folded into PFSP
+                # rates or hardness evidence: selection does not choose them.
+                league_diagnostics.update(
+                    _league_script_diagnostics(
+                        league_part,
+                        assignments,
+                        len(selections),
+                        script_opponents,
+                        script_pool.take_statistics(),
+                    )
+                )
             _blend_league_score_rates(league_score_rates, measured_rates)
             if args.league_selection == "hardness":
                 update_matchup_evidence(
@@ -3563,6 +3883,19 @@ def main() -> None:
                     },
                     iteration=iteration,
                 )
+        bank_groups = None
+        if ppo_config.bank_advantage_coefficient:
+            # Self-play is opponent 0 and league lane `k` is opponent `k + 1`.
+            self_play = diagnostic_groups["self_play"]
+            opponents = np.full(rollout.trajectories, UNGROUPED, dtype=np.int64)
+            opponents[self_play] = 0
+            if assignments is not None and ppo_config.bank_advantage_groups == "all":
+                opponents[self_play_rows:] = assignments + 1
+            # Only seed-grouped self-play repeats a map; every other game's is its own.
+            maps = np.zeros(rollout.trajectories, dtype=np.int64)
+            if args.self_play_seed_group > 1:
+                maps[self_play] = rollout.episode_seeds[self_play]
+            bank_groups = opponent_bank_groups(opponents, rollout.seats, maps)
         # The audit is per member, on that member's own rows: in a population wave
         # every row was sampled by its own policy, so a whole-wave replay through
         # one of them measures a policy difference and calls it a staging defect.
@@ -3643,6 +3976,7 @@ def main() -> None:
                 auxiliary_generator=auxiliary_generator,
                 diagnostic_groups=diagnostic_groups,
                 diagnostic_gradients=iteration % 25 == 0,
+                bank_groups=bank_groups,
             )
             for kind, active, jepa in (
                 (
@@ -3726,8 +4060,9 @@ def main() -> None:
         #    actor optimizer and its objective have traced -- its forward and
         #    backward are warmed while frozen, but the release wave is still the
         #    first to step the actor, so it keeps a one-wave grace;
-        #  * this wave's neural inference bucket repeats the previous one,
-        #    regardless of changes to the opponents or their game counts.
+        #  * this wave's neural inference buckets, one per collection segment,
+        #    repeat the previous wave's, regardless of changes to the opponents
+        #    or their game counts.
         # Everything else -- minibatch rows, replay chunks, rollout batch,
         # episode horizon -- is fixed by configuration from wave one, and every
         # frame is warmed in wave one, so a settled wave must compile nothing at
@@ -3770,6 +4105,7 @@ def main() -> None:
         checkpoint_now = time.monotonic()
         clean_final = (
             iteration >= args.iterations
+            or _actor_wave_budget_reached(args.actor_waves, architecture_panel)
             or bool(args.max_hours and (checkpoint_now - started) / 3600.0 >= args.max_hours)
             or (autocull is not None and autocull.culled)
             or (architecture_panel is not None and architecture_panel.culled)

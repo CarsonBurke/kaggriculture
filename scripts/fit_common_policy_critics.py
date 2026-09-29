@@ -107,6 +107,7 @@ def main() -> None:
         update_ppo,
     )
     from kaggriculture.production import production_ppo_config
+    from kaggriculture.registry import ENTITY_ATTENTION
     from kaggriculture.rollout import collect_mixed_play_rust
     from kaggriculture.structured_dynamics import StructuredCriticDynamics
 
@@ -128,7 +129,11 @@ def main() -> None:
         SELF_PLAY_GAMES + LEAGUE_GAMES,
         usage=artifact_seed_usage(metadata),
     )
-    config = PpoConfig(**production_ppo_config(update_compile_mode="reduce-overhead"))
+    config = PpoConfig(
+        **production_ppo_config(
+            update_compile_mode="reduce-overhead", architecture=ENTITY_ATTENTION
+        )
+    )
     if config.gamma != 1.0 or config.critic_gae_lambda != 1.0 or config.critic_epochs != 1:
         raise ValueError("common-policy fit requires Monte Carlo critic targets and one epoch")
     assignments = np.arange(LEAGUE_GAMES) % 3

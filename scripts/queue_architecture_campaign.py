@@ -12,7 +12,6 @@ from pathlib import Path
 from kaggriculture.modelargs import model_config_arguments
 from kaggriculture.production import (
     build_training_command,
-    production_model_config,
     production_ppo_config,
 )
 from kaggriculture.provenance import file_sha256, freeze_source, source_identity
@@ -130,8 +129,9 @@ def main() -> None:
         return [sys.executable, str(source / "scripts" / name)]
 
     architecture = resolve_architecture(ENTITY_ATTENTION)
-    # Preserve the historical control after production promotes successful arms.
-    control_config = production_model_config() | {"critic_source_read": False}
+    # Preserve the historical control after production promotes successful arms,
+    # or moves to another family: this campaign's control is the entity family's.
+    control_config = architecture.config_class().to_dict() | {"critic_source_read": False}
     configs = {arm: control_config | changes for arm, changes in ARMS.items()}
     if any(config["shared_memory_kv"] for config in configs.values()):
         raise ValueError("This experiment requires the untied-K/V control")
@@ -233,13 +233,13 @@ def main() -> None:
             rollout_forward_mode="inductor_graph",
             update_compile_mode="reduce-overhead",
             initial_actors=(bc_paths[arm],),
+            architecture=ENTITY_ATTENTION,
+            model_config=configs[arm],
         )
         command[1] = str(source / "scripts" / "train_ppo.py")
         command.remove("--external-eval")
         for term in ("latent", "value"):
             replace_argument(command, f"--structured-critic-{term}-coefficient", "1.0")
-        for flag, value in zip(model_args[arm][::2], model_args[arm][1::2], strict=True):
-            replace_argument(command, flag, value)
         replace_argument(
             command, "--league-selection", "hardness" if arm == "hardness-league" else "stratified"
         )

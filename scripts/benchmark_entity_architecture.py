@@ -79,10 +79,13 @@ FACTOR_NAMES = (
 
 
 def historical_ppo_config() -> PpoConfig:
-    """Retain the measured critic-NextLat workload after production disables it."""
+    """Retain the critic-NextLat workload after production disables it.
+
+    The rest of the schedule is production's current one for entity-attention.
+    """
     return PpoConfig(
         **{
-            **production_ppo_config(update_compile_mode="default"),
+            **production_ppo_config(update_compile_mode="default", architecture=ENTITY_ATTENTION),
             "structured_latent_coefficient": 0.0,
             "structured_decision_coefficient": 0.0,
             "structured_critic_latent_coefficient": 1.0,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
@@ -208,6 +208,7 @@ class MarketLedger:
     hires: int
     extra_land: int
     inventory: dict[str, int]
+    seeds: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_observation(
@@ -215,6 +216,7 @@ class MarketLedger:
         observation: dict[str, Any],
         *,
         shed: dict[str, int] | None = None,
+        seeds: dict[str, int] | None = None,
     ) -> MarketLedger:
         """Initialize market state, retaining an optional post-unit shed ledger."""
         player = int(observation.get("player", 0) or 0)
@@ -230,6 +232,9 @@ class MarketLedger:
             hires=int(farm.get("hires_today", 0) or 0),
             extra_land=max(0, len(farm.get("unlocked_quadrants") or []) - 1),
             inventory={item: int(inventory.get(item, MARKET_I0)) for item in PRODUCTS},
+            seeds=dict((observation.get("private") or {}).get("seeds") or {})
+            if seeds is None
+            else dict(seeds),
         )
 
 
@@ -453,7 +458,9 @@ def _apply_ledger_order(
         ledger.money -= LAND_PRICES[ledger.extra_land]
         ledger.extra_land += 1
     elif kind in _BUY_SEED:
-        ledger.money -= SEED_COST[_BUY_SEED[kind]] * quantity
+        crop = _BUY_SEED[kind]
+        ledger.money -= SEED_COST[crop] * quantity
+        ledger.seeds[crop] = ledger.seeds.get(crop, 0) + quantity
     elif kind in _BUY_PRODUCT:
         item = _BUY_PRODUCT[kind]
         for _ in range(quantity):

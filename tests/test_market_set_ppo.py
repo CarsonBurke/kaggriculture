@@ -124,3 +124,56 @@ def test_market_set_rejects_component_ratio() -> None:
         assert "joint" in str(error)
     else:
         raise AssertionError("component ratios must be rejected")
+
+
+def test_market_set_entropy_gradient_is_the_masked_active_entropy() -> None:
+    """Both interface-3 factors carry the bonus, over active decisions only."""
+    actor = _SetActor()
+    factors = _factors()
+    set_masks = factors[3]
+    inputs = torch.zeros(2, 1)
+    old_unit, old_set = _market_set_selected_logprobs(actor, *factors, False, inputs)
+    # The first state's second slot is active with two masked entries, which is
+    # where a differentiated near-minimum log-probability overflows; the first
+    # state's inactive unit keeps the active weighting in view.
+    active_unit = torch.tensor([[0.0], [1.0]])
+    active_set = torch.ones(2, 2)
+    arguments = (
+        actor,
+        *factors,
+        active_unit,
+        active_set,
+        old_unit.detach(),
+        old_set.detach(),
+        torch.zeros(2),
+        0.8,
+        1.2,
+        False,
+        inputs,
+    )
+    assert not _market_set_minibatch_terms(*arguments)[1].requires_grad
+    entropy_sum = _market_set_minibatch_terms(*arguments, entropy_gradient=True)[1]
+    # A cotangent above one is what overflowed the masked log-probabilities.
+    (4.0 * entropy_sum).backward()
+
+    # By hand, over only the legal entries of each active decision.
+    reference = _SetActor()
+
+    def entropy(logits: torch.Tensor) -> torch.Tensor:
+        logprob = logits.log_softmax(-1)
+        return -(logprob.exp() * logprob).sum()
+
+    expected = sum(
+        entropy(reference.units[0, 0]) * active_unit[row, 0]
+        + sum(
+            entropy(reference.sets[0, slot][set_masks[row, slot]]) * active_set[row, slot]
+            for slot in range(2)
+        )
+        for row in range(2)
+    )
+    torch.testing.assert_close(entropy_sum, expected)
+    (4.0 * expected).backward()
+    for name in ("units", "sets"):
+        gradient = getattr(actor, name).grad
+        assert gradient is not None and torch.isfinite(gradient).all(), name
+        torch.testing.assert_close(gradient, getattr(reference, name).grad, msg=name)

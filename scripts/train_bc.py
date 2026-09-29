@@ -78,7 +78,12 @@ from kaggriculture.modelargs import add_model_config_arguments, model_config_fro
 from kaggriculture.optim import NorMuon, route_parameters
 from kaggriculture.orientation import ORIENTATION_CYCLE, augment_demonstration_rows
 from kaggriculture.policy import component_logprobs, component_selected_logprobs, mask_logits
-from kaggriculture.ppo import _actor_batch_args, _batch_tensor, _fixed_minibatch_positions
+from kaggriculture.ppo import (
+    LEJEPA_PPO_DEFAULTS,
+    _actor_batch_args,
+    _batch_tensor,
+    _fixed_minibatch_positions,
+)
 from kaggriculture.production import PRODUCTION_ARCHITECTURE, production_model_config
 from kaggriculture.provenance import source_identity
 from kaggriculture.registry import (
@@ -103,10 +108,11 @@ from kaggriculture.tokens import encode_structured_observation
 from kaggriculture.training import replace_checkpoint_alias, write_immutable_checkpoint
 
 SUPPORTED_DATASET_FORMAT_VERSIONS = frozenset((1, 3))
-BC_ENCODING_CACHE_FORMAT_VERSION = 2
+BC_ENCODING_CACHE_FORMAT_VERSION = 3
 _ENCODING_SOURCE_FILES = frozenset(
     {
         "src/kaggriculture/actions.py",
+        "src/kaggriculture/resource_conditioning.py",
         "src/kaggriculture/constants.py",
         "src/kaggriculture/encoding.py",
         "src/kaggriculture/tokens.py",
@@ -355,18 +361,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--jepa-prediction-coefficient",
         type=float,
-        default=0.0,
+        default=None,
         help=(
             "weight on the LeJEPA next-embedding regression, the lejepa family's "
             "backbone objective; requires --architecture lejepa, a positive "
-            "--jepa-sigreg-coefficient, and --run-length above --jepa-horizon"
+            "--jepa-sigreg-coefficient, and --run-length above --jepa-horizon. "
+            "Defaults to the weight its PPO run inherits for lejepa and 0 otherwise"
         ),
     )
     parser.add_argument(
         "--jepa-sigreg-coefficient",
         type=float,
-        default=0.0,
-        help="weight on SIGReg, the term that keeps the attached target from collapsing",
+        default=None,
+        help="weight on SIGReg, the term that keeps the attached target from collapsing; "
+        "defaults to the weight its PPO run inherits for lejepa and 0 otherwise",
     )
     parser.add_argument(
         "--jepa-horizon",
@@ -435,7 +443,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="intra-op threads for the parent and each encode worker",
     )
-    return _apply_production_model_defaults(parser, parser.parse_args())
+    args = _apply_production_model_defaults(parser, parser.parse_args())
+    # The lejepa family is cloned only beside its objective, at the weights the
+    # PPO run it warm-starts inherits; every other family refuses the objective.
+    for name in ("jepa_prediction_coefficient", "jepa_sigreg_coefficient"):
+        if getattr(args, name) is None:
+            setattr(args, name, LEJEPA_PPO_DEFAULTS[name] if args.architecture == LEJEPA else 0.0)
+    return args
 
 
 def _pin_host_threads(threads: int = 1) -> None:
@@ -545,7 +559,7 @@ def _encode_episode_file(
     if architecture_name == "causal-execution":
         state_fields.add("policy_ledger")
     factor_fields = (*_FACTOR_FIELDS, *(_MARKET_SET_FIELDS if action_interface == 3 else ()))
-    expected = set(factor_fields) | state_fields
+    expected = set(factor_fields) | state_fields | {"market_resources"}
     cache = None if cache_text is None else Path(cache_text)
     if cache is not None:
         cached = _cached_episode_arrays(cache, expected)
@@ -563,6 +577,20 @@ def _encode_episode_file(
         raw = json.loads(zlib.decompress(archive["raw_json_zlib"].tobytes()))
         arrays = {name: archive[name] for name in factor_fields}
     _validate_market_rules(raw["observations"], path_text)
+    from kaggriculture.resource_conditioning import replay_market_resources
+
+    arrays["market_resources"] = np.stack(
+        [
+            replay_market_resources(entry["observation"], units, kinds, quantities)
+            for entry, units, kinds, quantities in zip(
+                raw["observations"],
+                arrays["unit_actions"],
+                arrays["market_kinds"],
+                arrays["market_quantities"],
+                strict=True,
+            )
+        ]
+    )
     if architecture_name == CONV_ENTITY:
         encoded = [
             encode_observation(entry["observation"], entry["opponent_private"])
@@ -1222,7 +1250,7 @@ def _clone_and_structured_loss(
         dtype=torch.bfloat16,
         enabled=autocast,
     ):
-        output, belief = actor.forward_with_belief(inputs)
+        output, belief = actor.forward_with_belief(*actor_args)
         clone = _clone_loss_from_output(actor, output, factors)
         decode = (
             DecodeContext(
@@ -1290,7 +1318,7 @@ def _clone_and_jepa_loss(
         dtype=torch.bfloat16,
         enabled=autocast,
     ):
-        output, belief = actor.forward_with_belief(inputs)
+        output, belief = actor.forward_with_belief(*actor_args)
         clone = _clone_loss_from_output(actor, output, factors)
         terms = jepa_horizon_loss(
             objective,

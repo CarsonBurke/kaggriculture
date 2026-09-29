@@ -52,6 +52,9 @@ def inputs() -> StructuredInputs:
 
 
 def tiny_config(**kwargs) -> LejepaConfig:
+    # The scorer-free control arm, now that the family defaults it on; each
+    # test opts into the scorer it exercises.
+    kwargs.setdefault("unit_affordance_scorer", False)
     return LejepaConfig(
         action_interface=2,
         model_dim=32,
@@ -201,7 +204,11 @@ def test_nonzero_scorer_matches_both_seat_encodings_and_native_replay() -> None:
             for name in StructuredInputs._fields
         }
     )
-    actor = LejepaActor(tiny_config(unit_affordance_scorer=True)).eval()
+    # The native step below samples markets from the static quantity heads
+    # alone; resource-conditioned market parity is test_resource_conditioning's.
+    actor = LejepaActor(
+        tiny_config(unit_affordance_scorer=True, market_resource_conditioning=False)
+    ).eval()
     assert actor.unit_affordance is not None
     baseline = LejepaActor(replace(actor.config, unit_affordance_scorer=False)).eval()
     baseline.load_state_dict(

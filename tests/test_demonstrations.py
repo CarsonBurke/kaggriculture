@@ -83,6 +83,52 @@ def test_place_product_over_ask_clamps_to_held_like_the_engine() -> None:
     assert projected.canonical_action["farmer"] == ["PLACE", "MILK", 3]
 
 
+def test_partial_product_deposit_is_unrepresentable_when_strict() -> None:
+    # demand-advance4 keeps wheat back to FEED: ["PLACE", item] deposits one.
+    observation = _observation()
+    observation["private"]["inventories"][0]["WHEAT"] = 3
+    action = {"farmer": ["PLACE", "WHEAT"], "hands": [], "market": []}
+
+    with pytest.raises(DemonstrationError, match="round trip diverged"):
+        _project(observation, action)
+
+
+def test_partial_product_deposit_relabels_to_the_whole_deposit_when_opted_in() -> None:
+    observation = _observation()
+    observation["private"]["inventories"][0]["WHEAT"] = 3
+    action = {"farmer": ["PLACE", "WHEAT"], "hands": [], "market": []}
+
+    projected = project_demonstration(observation, action, deposit_all_products=True)
+    verify_round_trip(observation, action, projected)
+
+    assert projected.unit_actions[0] == UnitAction.PLACE_WHEAT
+    assert projected.canonical_action["farmer"] == ["PLACE", "WHEAT", 3]
+    assert projected.relabeled_partial_deposits == 1
+
+
+def test_whole_product_deposit_is_not_counted_as_a_relabel() -> None:
+    observation = _observation()
+    observation["private"]["inventories"][0]["WOOL"] = 4
+    action = {"farmer": ["PLACE", "WOOL", 4], "hands": [], "market": []}
+
+    projected = project_demonstration(observation, action, deposit_all_products=True)
+
+    assert projected.canonical_action["farmer"] == ["PLACE", "WOOL", 4]
+    assert projected.relabeled_partial_deposits == 0
+
+
+def test_empty_market_order_is_unread_like_the_engine() -> None:
+    # The engine's `_parse_order([])` is None: a hole that reads nothing.
+    observation = _observation()
+    action = {"farmer": ["PASS"], "hands": [], "market": [[], ["HIRE"]]}
+
+    projected = _project(observation, action)
+
+    assert projected.market_kinds[0] == MarketKind.HIRE
+    assert projected.market_kinds[1] == MarketKind.STOP
+    assert projected.canonical_action["market"] == [["HIRE"]]
+
+
 def test_zero_quantity_market_order_is_discarded() -> None:
     observation = _observation()
     action = {

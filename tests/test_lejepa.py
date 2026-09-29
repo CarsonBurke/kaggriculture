@@ -68,13 +68,25 @@ from kaggriculture.structured import (
     stack_structured,
 )
 from kaggriculture.structured_dynamics import StructuredCriticDynamics, structured_horizon_plan
-from kaggriculture.tokens import TILE_COUNT, encode_structured_observation
+from kaggriculture.tokens import (
+    FARM_TOKEN_FIELDS,
+    PRODUCT_PRIVATE_FIELDS,
+    PRODUCT_TOKEN_FIELDS,
+    TILE_COUNT,
+    encode_structured_observation,
+)
 
 _ROWS_PER_SEAT = 4
 
 
 def _tiny_config(**overrides) -> LejepaConfig:
     base = dict(
+        # These contracts isolate the original readout/world-model family;
+        # destination/resource/affordance-head contracts live in their
+        # dedicated tests.
+        unit_target_navigation=False,
+        market_resource_conditioning=False,
+        unit_affordance_scorer=False,
         model_dim=32,
         attention_heads=2,
         attention_kv_heads=1,
@@ -607,7 +619,7 @@ def _carried_rollout(critic: LejepaCritic):
         seed_start=227,
         episode_steps=6,
         sampling_seed=19,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
     )
     values = np.arange(rollout.rewards.size, dtype=np.float32).reshape(rollout.rewards.shape)
     return replace(
@@ -666,7 +678,7 @@ def test_the_update_reports_whether_it_carried_the_collected_values() -> None:
         seed_start=229,
         episode_steps=6,
         sampling_seed=23,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -795,6 +807,41 @@ def test_the_critic_sees_its_privileged_inputs_and_the_actor_cannot(
     assert public.products.shape[-1] == actor_inputs.products.shape[-1]
     for left, right in zip(encoded, own, strict=True):
         assert torch.equal(left, right)
+
+
+@pytest.mark.parametrize("schema", [4, 5, 6])
+def test_only_a_v6_pair_reads_the_liquidation_columns(actor_inputs, critic_inputs, schema) -> None:
+    """Saved v4/v5 pairs act and value bit-identically on v6-staged tokens."""
+    inputs, opponent = critic_inputs
+    held_value = PRODUCT_TOKEN_FIELDS.index("held_value")
+    opponent_held_value = len(PRODUCT_TOKEN_FIELDS) + PRODUCT_PRIVATE_FIELDS.index(
+        "opponent_held_value"
+    )
+    liquidation = slice(FARM_TOKEN_FIELDS.index("liquidation"), len(FARM_TOKEN_FIELDS))
+
+    def moved(tokens: StructuredInputs) -> StructuredInputs:
+        products, farms = tokens.products.clone(), tokens.farms.clone()
+        products[..., held_value] += 1.0
+        if products.shape[-1] > opponent_held_value:
+            products[..., opponent_held_value] += 1.0
+        farms[..., liquidation] -= 1.0
+        return tokens._replace(products=products, farms=farms)
+
+    torch.manual_seed(0)
+    actor, critic = build_lejepa_pair(_tiny_config(observation_schema_version=schema))
+    with torch.no_grad():
+        acted = actor.encode_belief(actor_inputs)
+        acted_moved = actor.encode_belief(moved(actor_inputs))
+        valued = critic.encode_belief(inputs, *opponent).value_decision
+        valued_moved = critic.encode_belief(moved(inputs), *opponent).value_decision
+
+    if schema >= 6:
+        assert not torch.equal(acted.economy, acted_moved.economy)
+        assert not torch.equal(valued, valued_moved)
+    else:
+        for left, right in zip(acted, acted_moved, strict=True):
+            assert (left is None and right is None) or torch.equal(left, right)
+        assert torch.equal(valued, valued_moved)
 
 
 # --------------------------------------------------------------------------
@@ -1441,8 +1488,30 @@ def test_train_ppo_binds_the_coefficients_to_the_architecture(monkeypatch, tmp_p
                 module, monkeypatch, tmp_path, "--architecture", "entity-attention", *objective
             )
         )
+    # An unflagged launch inherits the family's objective, and only an explicit
+    # zero can switch it off.
+    inherited = _cli_args(module, monkeypatch, tmp_path, "--architecture", LEJEPA)
+    assert (inherited.jepa_prediction_coefficient, inherited.jepa_sigreg_coefficient) == (
+        1.0,
+        0.09,
+    )
+    module._validate_args(inherited)
+    ablated = (
+        "--architecture",
+        LEJEPA,
+        "--jepa-prediction-coefficient",
+        "0",
+        "--jepa-sigreg-coefficient",
+        "0",
+    )
     with pytest.raises(ValueError, match="without its objective"):
-        module._validate_args(_cli_args(module, monkeypatch, tmp_path, "--architecture", LEJEPA))
+        module._validate_args(_cli_args(module, monkeypatch, tmp_path, *ablated))
+    # Fine-tuning a clone by the policy's gradient alone ablates the objective.
+    module._validate_args(
+        _cli_args(
+            module, monkeypatch, tmp_path, *ablated, "--init-actor-from", str(tmp_path / "clone.pt")
+        )
+    )
     with pytest.raises(ValueError, match="finite and nonnegative"):
         module._validate_args(
             _cli_args(
@@ -1582,7 +1651,7 @@ def test_update_ppo_trains_the_shared_backbone_and_nothing_else_does() -> None:
         seed_start=225,
         episode_steps=8,
         sampling_seed=53,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -1656,6 +1725,131 @@ def test_update_ppo_trains_the_shared_backbone_and_nothing_else_does() -> None:
     assert _moved(critic.named_parameters(), before_critic)
 
 
+def test_update_rematerialization_trades_memory_and_nothing_else() -> None:
+    """Replaying the farm blocks in backward recomputes the same function."""
+
+    def update(rematerialize_actor_update: bool) -> dict[str, torch.Tensor]:
+        torch.manual_seed(0)
+        model_config = _tiny_config()
+        actor, critic = build_lejepa_pair(model_config)
+        _pin_quantity_orders(actor)
+        rollout = collect_self_play(
+            actor,
+            games=1,
+            seed_start=225,
+            episode_steps=8,
+            sampling_seed=53,
+            reward_mode="terminal-outcome",
+        )
+        config = PpoConfig(
+            optimizer="adamw",
+            epochs=1,
+            minibatch_size=1 << 12,
+            lr_warmup_steps=0,
+            target_kl=1.0,
+            use_bfloat16=False,
+            structured_learning_rate=1.0e-2,
+            jepa_prediction_coefficient=1.0,
+            jepa_sigreg_coefficient=0.09,
+            rematerialize_actor_update=rematerialize_actor_update,
+        )
+        objective = JepaObjective(model_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+        update_ppo(
+            actor,
+            critic,
+            actor_optimizer,
+            critic_optimizer,
+            rollout,
+            config,
+            generator=np.random.default_rng(43),
+            auxiliary_generator=np.random.default_rng(44),
+            structured_dynamics=objective,
+            structured_dynamics_optimizer=make_structured_dynamics_optimizer(
+                objective, config, critic=False, actor=actor
+            ),
+            structured_actor_auxiliary=True,
+        )
+        return _snapshot(actor.named_parameters())
+
+    reference = update(True)
+    for name, value in update(False).items():
+        torch.testing.assert_close(value, reference[name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize("rematerialize", [False, True])
+def test_the_entropy_bonus_trains_beside_the_world_model(rematerialize: bool) -> None:
+    """The bonus reaches the policy through the promoted recipe's update path.
+
+    Three waves over the same states, with and without the bonus. The world
+    model and the surrogate are identical between the arms, so the higher
+    entropy the bonus arm reports on its last wave is the bonus's doing, and
+    `policy_loss` still reports the surrogate beside a separate bonus column.
+    Both arms are seeded CPU eager runs, so the comparison is deterministic;
+    the measured gap is 0.634 against 0.677 nats.
+    """
+
+    def waves(entropy_coefficient: float) -> dict[str, float]:
+        torch.manual_seed(0)
+        model_config = _tiny_config()
+        actor, critic = build_lejepa_pair(model_config)
+        _pin_quantity_orders(actor)
+        rollout = collect_self_play(
+            actor,
+            games=2,
+            seed_start=225,
+            episode_steps=16,
+            sampling_seed=53,
+            reward_mode="terminal-outcome",
+        )
+        # Opposed outcomes, so the surrogate has a real gradient in both arms.
+        last = rollout.valid.shape[1] - 1 - rollout.valid[:, ::-1].argmax(axis=1)
+        rollout.rewards[np.arange(last.size), last] = np.where(np.arange(last.size) % 2, -1.0, 1.0)
+        config = PpoConfig(
+            optimizer="adamw",
+            epochs=1,
+            minibatch_size=1 << 12,
+            lr_warmup_steps=0,
+            target_kl=10.0,
+            use_bfloat16=False,
+            actor_learning_rate=1.0e-2,
+            structured_learning_rate=1.0e-3,
+            jepa_prediction_coefficient=1.0,
+            jepa_sigreg_coefficient=0.09,
+            jepa_reward_coefficient=0.1,
+            rematerialize_actor_update=rematerialize,
+            entropy_coefficient=entropy_coefficient,
+        )
+        objective = JepaObjective(model_config)
+        actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+        dynamics_optimizer = make_structured_dynamics_optimizer(
+            objective, config, critic=False, actor=actor
+        )
+        for wave in range(3):
+            metrics = update_ppo(
+                actor,
+                critic,
+                actor_optimizer,
+                critic_optimizer,
+                rollout,
+                config,
+                generator=np.random.default_rng(43 + wave),
+                auxiliary_generator=np.random.default_rng(44 + wave),
+                structured_dynamics=objective,
+                structured_dynamics_optimizer=dynamics_optimizer,
+                structured_actor_auxiliary=True,
+            )
+            assert metrics["actor_updates"] == 1
+            assert metrics["structured_actor_predictor_updates"] >= 1
+        return metrics
+
+    plain = waves(0.0)
+    bonus = waves(1.0)
+    assert "entropy_bonus" not in plain
+    assert math.isfinite(bonus["policy_loss"]) and bonus["entropy_bonus"] > 0.0
+    assert bonus["entropy"] > plain["entropy"]
+
+
 def test_update_ppo_hands_the_detached_target_switch_to_the_objective(monkeypatch) -> None:
     """The config field is read inside the compiled update, not only validated."""
     import kaggriculture.ppo as ppo_module
@@ -1669,7 +1863,7 @@ def test_update_ppo_hands_the_detached_target_switch_to_the_objective(monkeypatc
         seed_start=225,
         episode_steps=8,
         sampling_seed=53,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -1710,7 +1904,8 @@ def test_update_ppo_hands_the_detached_target_switch_to_the_objective(monkeypatc
     assert seen and all(seen)
 
 
-def test_update_ppo_encodes_each_minibatch_once_for_both_towers(monkeypatch) -> None:
+@pytest.mark.parametrize("wdl_value", [False, True])
+def test_update_ppo_encodes_each_minibatch_once_for_both_towers(monkeypatch, wdl_value) -> None:
     """Only the whole-wave behavior replay runs the critic's own backbone pass.
 
     Every minibatch's critic forward must read the encoding the actor side of the
@@ -1718,11 +1913,16 @@ def test_update_ppo_encodes_each_minibatch_once_for_both_towers(monkeypatch) -> 
     the identical trunk forward twice per minibatch.
     """
     torch.manual_seed(0)
-    model_config = _tiny_config()
+    model_config = _tiny_config(wdl_value=wdl_value)
     actor, critic = build_lejepa_pair(model_config)
     _pin_quantity_orders(actor)
     rollout = collect_self_play(
-        actor, games=1, seed_start=225, episode_steps=8, sampling_seed=53, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=225,
+        episode_steps=8,
+        sampling_seed=53,
+        reward_mode="terminal-outcome" if wdl_value else "shaped",
     )
     config = _jepa_ppo_config(
         optimizer="adamw", epochs=2, minibatch_size=4, lr_warmup_steps=0, use_bfloat16=False
@@ -1758,6 +1958,10 @@ def test_update_ppo_encodes_each_minibatch_once_for_both_towers(monkeypatch) -> 
     assert handed.count(True) == minibatches
     # The behavior replay is the one pass that has no actor encoding to borrow.
     assert not handed[0]
+    if wdl_value:
+        assert critic.value_head.out_features == 3
+        assert math.isfinite(metrics["behavior_match_score_mse"])
+        assert metrics["behavior_match_score_out_of_range_fraction"] == 0
 
 
 def test_the_detached_ablation_stops_both_gradients_at_the_backbone(
@@ -1824,12 +2028,13 @@ def test_ppo_carries_the_policy_gradient_into_the_backbone(monkeypatch, shapes) 
     What the backbone's optimizer then clips and steps is the policy's gradient
     alone: nonzero when the heads read the attached belief, a true zero under
     the detached ablation. The rewards are replaced by noise because this
-    fixture's own are zero, and zero advantages carry no policy gradient.
+    fixture's own are zero, and zero advantages carry no policy gradient. Noise
+    is not a completed-game outcome, so the critic is the HL-Gauss head.
     """
     import kaggriculture.ppo as ppo_module
 
     torch.manual_seed(0)
-    model_config = _tiny_config(policy_shapes_backbone=shapes)
+    model_config = _tiny_config(policy_shapes_backbone=shapes, wdl_value=False)
     actor, critic = build_lejepa_pair(model_config)
     _pin_quantity_orders(actor)
     rollout = collect_self_play(
@@ -1903,7 +2108,12 @@ def test_a_frozen_copy_traces_whole_under_grad_mode() -> None:
     torch.manual_seed(0)
     actor, _critic = build_lejepa_pair(_tiny_config())
     rollout = collect_self_play(
-        actor, games=1, seed_start=225, episode_steps=4, sampling_seed=53, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=225,
+        episode_steps=4,
+        sampling_seed=53,
+        reward_mode="terminal-outcome",
     )
     states = {name: array[rollout.valid] for name, array in rollout.states.items()}
     states["unit_active"] = rollout.unit_active[rollout.valid]
@@ -1918,14 +2128,94 @@ def test_a_frozen_copy_traces_whole_under_grad_mode() -> None:
     torch.testing.assert_close(traced.unit_logits, eager.unit_logits)
 
 
-def test_the_backbone_does_not_step_without_its_objective() -> None:
-    """With no world-model objective the backbone has no owner, so no update.
+@pytest.mark.parametrize("optimizer", ["adamw", "normuon"])
+def test_without_its_objective_the_actor_optimizer_owns_the_backbone(optimizer) -> None:
+    """The backbone joins the policy's optimizer, in groups of its own.
 
-    The objective's optimizer is the only one that may step the encoder; without
-    it the family is an entity trunk under another name, and its detached
-    ablation would train heads over a random encoder while reporting a
-    perfectly healthy policy loss.
+    At the structured rate the objective would have stepped it at, tagged
+    `BACKBONE_ROLE`, and never both ways at once: while the objective runs the
+    actor's optimizer holds the heads alone.
     """
+    model_config = _tiny_config()
+    actor, critic = build_lejepa_pair(model_config)
+    config = PpoConfig(optimizer=optimizer, structured_learning_rate=2e-5)
+
+    actor_optimizer, _ = make_optimizers(actor, critic, config)
+    backbone = {id(p) for p in actor.backbone_parameters()}
+    tagged = [g for g in actor_optimizer.param_groups if g.get("role") == BACKBONE_ROLE]
+
+    assert {id(p) for g in actor_optimizer.param_groups for p in g["params"]} == {
+        id(p) for p in actor.parameters()
+    }
+    assert {id(p) for g in tagged for p in g["params"]} == backbone
+    for group in tagged:
+        rate = config.resolved_structured_learning_rate
+        if group.get("kind") == "adam":
+            rate *= config.adam_learning_rate_ratio
+        assert group["base_lr"] == pytest.approx(rate)
+    for group in actor_optimizer.param_groups:
+        if group.get("role") != BACKBONE_ROLE:
+            assert not ({id(p) for p in group["params"]} & backbone)
+
+
+def test_a_detached_backbone_without_its_objective_is_refused() -> None:
+    actor, critic = build_lejepa_pair(_tiny_config(policy_shapes_backbone=False))
+
+    with pytest.raises(ValueError, match="no loss"):
+        make_optimizers(actor, critic, PpoConfig())
+    # With the objective the detached ablation is well defined.
+    make_optimizers(actor, critic, _jepa_ppo_config())
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "normuon"])
+def test_without_its_objective_the_policy_gradient_alone_trains_the_backbone(optimizer) -> None:
+    """Through the whole update: the heads and the backbone step together.
+
+    The rewards are replaced by noise because this fixture's own are zero, and
+    zero advantages carry no policy gradient. Noise is not a completed-game
+    outcome, so the critic is the HL-Gauss head.
+    """
+    torch.manual_seed(0)
+    model_config = _tiny_config(wdl_value=False)
+    actor, critic = build_lejepa_pair(model_config)
+    _pin_quantity_orders(actor)
+    rollout = collect_self_play(
+        actor, games=1, seed_start=225, episode_steps=8, sampling_seed=53, reward_mode="shaped"
+    )
+    noise = np.random.default_rng(7).standard_normal(rollout.rewards.shape)
+    rollout = replace(rollout, rewards=noise.astype(rollout.rewards.dtype))
+    config = PpoConfig(
+        optimizer=optimizer,
+        epochs=1,
+        minibatch_size=1 << 12,
+        lr_warmup_steps=0,
+        target_kl=1.0,
+        use_bfloat16=False,
+    )
+    actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before_backbone = _snapshot(actor.trunk.named_parameters())
+
+    metrics = update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(43),
+    )
+
+    assert metrics["actor_updates"] >= 1
+    assert _moved(actor.trunk.named_parameters(), before_backbone)
+    # The critic reads the backbone detached and holds none of it, so the
+    # backbone moved by the policy's gradient and nothing else.
+    assert not ({id(p) for p in critic.parameters()} & {id(p) for p in actor.backbone_parameters()})
+    backbone_clocks, head_clocks = _warmup_clocks(actor_optimizer)
+    assert backbone_clocks == head_clocks == {metrics["actor_updates"]}
+
+
+def test_frozen_waves_leave_an_objective_free_backbone_untouched() -> None:
+    """Critic warmup (`actor_epochs=0`) steps neither the heads nor the backbone."""
     torch.manual_seed(0)
     model_config = _tiny_config()
     actor, critic = build_lejepa_pair(model_config)
@@ -1936,7 +2226,7 @@ def test_the_backbone_does_not_step_without_its_objective() -> None:
         seed_start=225,
         episode_steps=8,
         sampling_seed=53,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -1947,17 +2237,20 @@ def test_the_backbone_does_not_step_without_its_objective() -> None:
         use_bfloat16=False,
     )
     actor_optimizer, critic_optimizer = make_optimizers(actor, critic, config)
+    before = _snapshot(actor.named_parameters())
 
-    with pytest.raises(ValueError, match="no optimizer"):
-        update_ppo(
-            actor,
-            critic,
-            actor_optimizer,
-            critic_optimizer,
-            rollout,
-            config,
-            generator=np.random.default_rng(43),
-        )
+    update_ppo(
+        actor,
+        critic,
+        actor_optimizer,
+        critic_optimizer,
+        rollout,
+        config,
+        generator=np.random.default_rng(43),
+        actor_epochs=0,
+    )
+
+    assert not _moved(actor.named_parameters(), before)
 
 
 def _snapshot(named) -> dict[str, Tensor]:
@@ -2054,7 +2347,12 @@ def test_a_warmup_wave_freezes_the_backbone_and_fits_the_objective(monkeypatch) 
     actor, critic = build_lejepa_pair(model_config)
     _pin_quantity_orders(actor)
     rollout = collect_self_play(
-        actor, games=1, seed_start=231, episode_steps=8, sampling_seed=67, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=231,
+        episode_steps=8,
+        sampling_seed=67,
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -2114,7 +2412,12 @@ def test_the_backbone_steps_exactly_when_the_policy_does(monkeypatch) -> None:
     actor, critic = build_lejepa_pair(model_config)
     _pin_quantity_orders(actor)
     rollout = collect_self_play(
-        actor, games=1, seed_start=231, episode_steps=8, sampling_seed=67, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=231,
+        episode_steps=8,
+        sampling_seed=67,
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -2182,7 +2485,12 @@ def test_the_frozen_actor_warm_pass_traces_the_branch_the_release_wave_uses(
     actor, critic = build_lejepa_pair(model_config)
     _pin_quantity_orders(actor)
     rollout = collect_self_play(
-        actor, games=1, seed_start=229, episode_steps=8, sampling_seed=61, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=229,
+        episode_steps=8,
+        sampling_seed=61,
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -2257,7 +2565,12 @@ def test_a_jepa_objective_is_refused_outside_its_family() -> None:
     actor = EntityActor(entity_config)
     critic = EntityCritic(entity_config)
     rollout = collect_self_play(
-        actor, games=1, seed_start=231, episode_steps=6, sampling_seed=17, reward_mode="shaped"
+        actor,
+        games=1,
+        seed_start=231,
+        episode_steps=6,
+        sampling_seed=17,
+        reward_mode="terminal-outcome",
     )
     config = PpoConfig(
         optimizer="adamw",
@@ -2317,7 +2630,7 @@ def test_the_compiled_bf16_update_settles_and_a_slice_refresh_never_retraces() -
         seed_start=233,
         episode_steps=EPISODE_STEPS,
         sampling_seed=61,
-        reward_mode="shaped",
+        reward_mode="terminal-outcome",
         forward_mode="inductor_graph",
         forward_autocast=True,
     )

@@ -132,6 +132,9 @@ class ProjectedStep:
     # engine's shed clamp. `compile_action` on the factors must reproduce this
     # dict exactly (verify_round_trip).
     canonical_action: dict[str, Any]
+    # Units whose partial product deposit was relabeled as a whole deposit
+    # under `deposit_all_products`; always zero when projecting strictly.
+    relabeled_partial_deposits: int = 0
 
 
 def _canonical_unit_command(command: Any) -> list[Any]:
@@ -174,6 +177,8 @@ def _parse_unit_command(
     command: Any,
     shed_available: dict[str, int],
     inventory: dict[str, int],
+    *,
+    deposit_all_products: bool = False,
 ) -> tuple[UnitAction, list[Any]]:
     """Map a demonstrated command to its factored variant and executed form.
 
@@ -182,6 +187,14 @@ def _parse_unit_command(
     must reproduce. Stateful reductions are PICKUP's shed clamp and PLACE
     product deposits, which the engine fills with ``min(requested, held,
     shed room)``.
+
+    ``PLACE_<product>`` deposits everything held, so a teacher that deposits
+    part of its stock (demand-advance4 keeps wheat back to FEED, and writes
+    ``["PLACE", item]`` for a single unit) is unrepresentable. Strict
+    projection raises on it through the round trip; ``deposit_all_products``
+    instead labels it as the whole deposit, the nearest factored action and
+    the same unit-action class. Observations stay the teacher's own, so later
+    states remain consistent with what it actually did.
     """
     canonical = _canonical_unit_command(command)
     opcode = str(canonical[0])
@@ -205,7 +218,8 @@ def _parse_unit_command(
                 raise DemonstrationError(f"unknown PLACE target in {command!r}") from None
         held = max(0, int(inventory.get(item, 0) or 0))
         room = max(0, SHED_CAPACITY - sum(int(value or 0) for value in shed_available.values()))
-        executed = min(int(canonical[2]), held, room)
+        requested = held if deposit_all_products else int(canonical[2])
+        executed = min(requested, held, room)
         if executed <= 0:
             return UnitAction.PASS, ["PASS"]
         try:
@@ -244,7 +258,11 @@ def _canonical_market_order(order: Any) -> list[Any]:
 
 
 def _parse_market_order(order: Any) -> tuple[MarketKind, int] | None:
-
+    if isinstance(order, (list, tuple)) and not order:
+        # Engine: `_parse_order([])` is None, the same unread order as a
+        # non-positive quantity below. demand-advance4 leaves these holes when
+        # it closes gaps in its queue.
+        return None
     canonical = _canonical_market_order(order)
     opcode = str(canonical[0])
     if opcode == "HIRE":
@@ -442,7 +460,12 @@ def _engine_would_execute(
     raise DemonstrationError(f"no engine-execution model for {selected.name}")
 
 
-def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -> ProjectedStep:
+def project_demonstration(
+    observation: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    deposit_all_products: bool = False,
+) -> ProjectedStep:
     """Project one demonstrated engine action through the sequential ledger.
 
     Runs the exact mask evolution the sampler uses (`act_batch` semantics),
@@ -452,6 +475,9 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
     On success the factors round-trip through `compile_action` to the
     projection's canonical action — verified by :func:`verify_round_trip`,
     which extraction must always call.
+
+    `deposit_all_products` is the one opt-in relabel (see
+    :func:`_parse_unit_command`); the returned step counts where it applied.
     """
     player = int(observation.get("player", 0) or 0)
     farm = (observation.get("farms") or [])[player]
@@ -474,6 +500,7 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
     remaining_shed = dict((observation.get("private") or {}).get("shed") or {})
     tiles = copy_tile_grid(farm.get("tiles") or [])
     canonical_commands: list[list[Any]] = []
+    relabeled_partial_deposits = 0
     for unit in range(MAX_UNITS):
         if unit >= unit_count:
             unit_masks[unit, UnitAction.PASS] = True
@@ -482,11 +509,15 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
         unit_masks[unit] = unit_action_mask(
             observation, unit, remaining_seeds, remaining_shed, tiles
         )
+        inventory = _unit_inventory(observation.get("private") or {}, unit)
         selected, canonical = _parse_unit_command(
-            commands[unit],
-            remaining_shed,
-            _unit_inventory(observation.get("private") or {}, unit),
+            commands[unit], remaining_shed, inventory, deposit_all_products=deposit_all_products
         )
+        if (
+            deposit_all_products
+            and canonical != _parse_unit_command(commands[unit], remaining_shed, inventory)[1]
+        ):
+            relabeled_partial_deposits += 1
 
         if not unit_masks[unit, selected]:
             if _engine_would_execute(
@@ -602,6 +633,7 @@ def project_demonstration(observation: dict[str, Any], action: dict[str, Any]) -
             "hands": canonical_commands[1:],
             "market": canonical_orders,
         },
+        relabeled_partial_deposits=relabeled_partial_deposits,
     )
 
 

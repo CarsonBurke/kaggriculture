@@ -19,6 +19,7 @@ def admission(
     measurements = {}
     failures = []
     expected_pairs = None
+    expected_opponents = None
     for mode in ("argmax", "sampled"):
         report = reports[mode]
         if report.get("complete") is not True or report.get("decoding") != mode:
@@ -33,7 +34,13 @@ def admission(
         if entry.get("source_identity", {}).get("sha256") != source_digest:
             raise ValueError(f"{mode}: clone has a different source identity")
         panels = entry["panels"]
-        for opponent in ("starter", "scripted-v27", "scripted-v16"):
+        if not {"starter", "scripted-v27"}.issubset(panels):
+            raise ValueError(f"{mode}: missing required admission opponents")
+        if expected_opponents is None:
+            expected_opponents = set(panels)
+        elif set(panels) != expected_opponents:
+            raise ValueError(f"{mode}: mismatched admission opponents")
+        for opponent in panels:
             rows = panels[opponent]["games"]
             if len(rows) != report["games_per_opponent"]:
                 raise ValueError(f"{mode}/{opponent}: incomplete game records")
@@ -58,7 +65,7 @@ def admission(
         if mode == "argmax" and measurements[f"{mode}/scripted-v27"]["score"] < 0.5:
             failures.append("argmax V27 score below 0.5")
         if mode == "sampled":
-            for opponent in ("starter", "scripted-v27", "scripted-v16"):
+            for opponent in panels:
                 if measurements[f"{mode}/{opponent}"]["low_money"] > 0.25:
                     failures.append(f"sampled {opponent} bankrupt tail above 25%")
     return {

@@ -14,8 +14,8 @@ back on held-out physical seeds after every epoch:
   with the entity baseline's critic options (`--entity-reference`).
 
 A `lejepa` actor cannot sit in `update_ppo`'s actor slot for this. Without its
-LeJEPA objective the update refuses a backbone no optimizer owns, and with it the
-update hands the actor's belief to the critic as a fifth argument that
+LeJEPA objective the actor's optimizer would own and step the backbone, and with
+it the update hands the actor's belief to the critic as a fifth argument that
 `EntityCritic` does not take. The slot therefore holds an inert entity actor.
 With `actor_epochs=0` and no predictor the update never steps it, and nothing
 the critic fits depends on it: Monte Carlo targets (gamma and critic GAE lambda
@@ -136,7 +136,7 @@ def main() -> None:
     from kaggriculture.lejepa_model import LejepaActor, LejepaCritic
     from kaggriculture.ppo import PpoConfig, make_optimizers, replay_behavior_values, update_ppo
     from kaggriculture.production import production_ppo_config
-    from kaggriculture.registry import pair_towers
+    from kaggriculture.registry import ENTITY_ATTENTION, pair_towers
     from kaggriculture.rollout import collect_mixed_play_rust
     from kaggriculture.training import checkpoint_agent_states
 
@@ -166,8 +166,14 @@ def main() -> None:
         usage=artifact_seed_usage(metadata),
     )
     # The trainer's default update compile mode, which `lejepa-anchored-20260922`
-    # recorded. Compilation changes kernels, not the fitted objective.
-    config = PpoConfig(**production_ppo_config(update_compile_mode=PpoConfig.update_compile_mode))
+    # recorded. Compilation changes kernels, not the fitted objective. The fit
+    # trains critics only, so it takes the schedule without the `lejepa`
+    # family's world-model objective, which would make the actor slot trainable.
+    config = PpoConfig(
+        **production_ppo_config(
+            update_compile_mode=PpoConfig.update_compile_mode, architecture=ENTITY_ATTENTION
+        )
+    )
     if config.gamma != 1.0 or config.critic_gae_lambda != 1.0 or config.critic_epochs != 1:
         raise ValueError("lejepa critic fit requires Monte Carlo critic targets and one epoch")
     if config.structured_actor_auxiliary_active or config.structured_critic_auxiliary_active:

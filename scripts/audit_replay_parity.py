@@ -235,7 +235,13 @@ def main() -> None:
     architecture_name = resolve_architecture(payload).name
     # The launcher chooses compilation from a measured speedup rather than
     # unconditionally, so the audit has to be able to follow it either way.
-    ppo_config = PpoConfig(**production_ppo_config(update_compile_mode=args.update_compile_mode))
+    ppo_config = PpoConfig(
+        **production_ppo_config(
+            update_compile_mode=args.update_compile_mode,
+            architecture=architecture_name,
+            critic_architecture=payload["model_config"].get("critic_architecture"),
+        )
+    )
 
     # One arena for the whole audit, exactly as training holds one for the
     # whole run. A defect in "every field is rewritten each wave" leaves the
