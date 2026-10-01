@@ -21,6 +21,7 @@ from kaggriculture.league import (
 )
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.modelargs import model_config_from_args
+from kaggriculture.opponents import LEAGUE_REFERENCE_AGENTS
 from kaggriculture.ppo import PpoConfig
 from kaggriculture.registry import CONV_ENTITY, STRUCTURED, resolve_architecture
 from kaggriculture.rollout import population_pairings
@@ -63,7 +64,13 @@ def _promoted_recipe(tmp_path: Path) -> list[str]:
     assert spec is not None and spec.loader is not None
     campaign = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(campaign)
-    return campaign.commands(tmp_path, tmp_path, "control")["ppo"][2:]
+    recipe = campaign.commands(tmp_path, tmp_path, "control")["ppo"][2:]
+    # The recipe was measured on observation schema 4; the family has since
+    # moved to 8, whose leaderboard clone fits and plays as the v4 one does.
+    schema = recipe.index("--observation-schema-version") + 1
+    assert recipe[schema] == "4"
+    recipe[schema] = "8"
+    return recipe
 
 
 def _resolved_launch(module, monkeypatch, arguments: list[str]):
@@ -95,7 +102,8 @@ def test_a_plain_launch_resolves_to_the_promoted_recipe(monkeypatch, tmp_path) -
     )
     assert implicit["structured_learning_rate"] == 1.5e-5
     assert implicit["minibatch_size"] == 4096 and not implicit["rematerialize_actor_update"]
-    assert implicit["architecture_panel"] == 25 and implicit["league_builtin_lanes"] == 4
+    assert implicit["architecture_panel"] == 25 and implicit["league_builtin_lanes"] == 0
+    assert implicit["league_script_opponent"] == list(LEAGUE_REFERENCE_AGENTS)
 
 
 def test_the_production_command_restates_the_promoted_recipe(monkeypatch, tmp_path) -> None:
@@ -189,7 +197,7 @@ def test_single_learner_only_defaults_step_aside_for_populations_and_autocull(
 
     culled, _ = _resolved_launch(module, monkeypatch, ["--run-dir", str(tmp_path), "--autocull"])
     assert culled["architecture_panel"] == 0
-    assert culled["league_builtin_lanes"] == 4
+    assert culled["league_script_games"] == 8 * len(LEAGUE_REFERENCE_AGENTS)
 
 
 def test_a_half_stated_built_in_pair_does_not_borrow_the_other_default(
@@ -320,6 +328,8 @@ def test_structured_auxiliary_cli_is_typed_population_safe_and_resume_bound(
             "--games",
             "2",
             "--league-games",
+            "0",
+            "--league-script-games",
             "0",
             "--structured-decision-coefficient",
             "0.5",
@@ -461,8 +471,20 @@ def test_hardness_league_flag_reaches_selection_and_resume_provenance(
         pretrained_start=False,
         matchup_evidence=evidence,
     )
-    assert len(selections) == 8
-    assert {row.role for row in selections} == {"hardness", "discovery", "probe"}
+    # Eight lanes: discovery, five hardness, and two screening eight stale
+    # snapshots at two games apiece.
+    assert args.league_screen_lanes == 2
+    assert [row.role for row in selections].count("screen") == 8
+    assert {row.role for row in selections} == {"hardness", "discovery", "screen"}
+    assert "00000001" in {row.key for row in selections if row.role == "hardness"}
+    games = module._league_selection_games(args, selections)
+    assert games.sum() == args.league_games
+    assert {
+        int(count) for count, row in zip(games, selections, strict=True) if row.role == "screen"
+    } == {2}
+    assert {
+        int(count) for count, row in zip(games, selections, strict=True) if row.role != "screen"
+    } == {8}
 
 
 def test_hardness_evidence_survives_initial_and_recovery_checkpoint_serialization(tmp_path) -> None:
@@ -1224,6 +1246,94 @@ def test_league_manifest_restore_is_portable_crash_tolerant_and_rejects_rewinds(
         )
 
 
+def test_thinned_archive_retires_from_every_selection_state_and_resumes_after_a_crash(
+    tmp_path,
+) -> None:
+    module = _training_script()
+    actor = FarmActor(_TINY_CONFIG)
+    run = tmp_path / "run"
+    league = run / "league"
+    checkpoint = run / "checkpoint-000040.pt"
+    refs, manifest = [], {}
+    for iteration in range(40):
+        ref = save_actor_snapshot(league, actor, iteration)
+        refs.append(ref)
+        manifest[iteration] = snapshot_sha256(ref.path)
+    checkpoint.touch()
+    easy = {"score_sum": 95.0, "games": 100.0, "last_iteration": 30}
+    evidence = {f"{i:08d}": dict(easy) for i in range(40)}
+    evidence["00000005"] = {"score_sum": 40.0, "games": 100.0, "last_iteration": 30}
+    evidence["script_rival"] = {"score_sum": 1.0, "games": 8.0, "last_iteration": 39}
+    score_rates = {f"{i:08d}": 0.9 for i in range(40)}
+
+    retired = module._retire_league_snapshots(
+        refs, manifest, evidence, score_rates, iteration=40, recent=8
+    )
+
+    gone = {ref.iteration for ref in retired}
+    assert gone and 0 not in gone and 5 not in gone
+    assert not gone & set(range(32, 40))
+    assert not gone & set(manifest)
+    assert not gone & {ref.iteration for ref in refs}
+    assert not {f"{i:08d}" for i in gone} & (set(evidence) | set(score_rates))
+    assert "script_rival" in evidence
+    assert (
+        module._retire_league_snapshots(
+            refs, dict(manifest), dict(evidence), {}, iteration=40, recent=0
+        )
+        == []
+    )
+
+    # Interrupted after the checkpoint without them was written, before they
+    # were deleted: resuming removes them rather than refusing the archive.
+    module._restore_league_archive(
+        checkpoint=checkpoint,
+        destination=league,
+        manifest=manifest,
+        current_iteration=40,
+        model_config=_TINY_CONFIG,
+        archive_recent=8,
+    )
+    assert {ref.iteration for ref in module.list_actor_snapshots(league)} == set(manifest)
+    # A snapshot the grid would keep is not one thinning dropped.
+    save_actor_snapshot(league, actor, 36)
+    manifest.pop(36)
+    with pytest.raises(ValueError, match="missing from the checkpoint manifest"):
+        module._restore_league_archive(
+            checkpoint=checkpoint,
+            destination=league,
+            manifest=manifest,
+            current_iteration=40,
+            model_config=_TINY_CONFIG,
+            archive_recent=8,
+        )
+
+
+def test_seat_balanced_assignments_give_each_opponent_its_exact_games() -> None:
+    module = _training_script()
+    totals = np.array([8, 8, 2, 2, 2, 6, 0, 4])
+    for seed_start in (0, 1):
+        assignments = module._seat_balanced_assignments(
+            totals, np.random.default_rng(seed_start), seed_start=seed_start
+        )
+        seats = (seed_start + np.arange(assignments.size)) % 2
+        assert np.bincount(assignments, minlength=totals.size).tolist() == totals.tolist()
+        for opponent, total in enumerate(totals):
+            # every even allotment is split exactly across the two seats
+            assert np.bincount(seats[assignments == opponent], minlength=2).tolist() == [
+                total // 2,
+                total // 2,
+            ]
+    # the even split keeps its RNG stream: existing runs replay identically
+    for seed in range(5):
+        np.testing.assert_array_equal(
+            module._balanced_assignments(10, 3, np.random.default_rng(seed), seed_start=seed),
+            module._seat_balanced_assignments(
+                np.array([4, 3, 3]), np.random.default_rng(seed), seed_start=seed
+            ),
+        )
+
+
 def test_league_manifest_accepts_sparse_warmup_history_but_requires_the_anchor() -> None:
     module = _training_script()
 
@@ -1357,6 +1467,8 @@ def test_main_writes_complete_manifests_and_portably_resumes(
             "1",
             "--league-games",
             "0",
+            "--league-script-games",
+            "0",
             "--device",
             "cpu",
             "--architecture",
@@ -1483,6 +1595,172 @@ def test_main_writes_complete_manifests_and_portably_resumes(
     with pytest.raises(ValueError):
         module.main()
     assert not (tmp_path / "missing-reward" / "latest.pt").exists()
+
+
+def _stub_training_main(monkeypatch, module) -> None:
+    """Stub rollout and update around `main` so a tiny run completes on CPU."""
+    run_provenance = module.run_provenance_from_decision(
+        {
+            "source_identity": module.source_identity(),
+            "rollout_forward_mode": "inductor_graph",
+            "update_compile_mode": "default",
+            "eager_report_sha256": "a" * 64,
+            "eager_report_size_bytes": 100,
+            "mixed_report_sha256": "b" * 64,
+            "mixed_report_size_bytes": 110,
+            "compiled_report_sha256": "c" * 64,
+            "compiled_report_size_bytes": 120,
+            "minimum_compile_speedup": 1.05,
+            "attributed_knob_speedups": {
+                "rollout_forward_mode": 1.1,
+                "update_compile_mode": 1.1,
+            },
+        }
+    )
+    monkeypatch.setattr(module, "_load_run_provenance", lambda *_args, **_kwargs: run_provenance)
+
+    class Writer:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_scalar(self, *args, **kwargs) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    rollout = SimpleNamespace(state_count=1, trajectories=2)
+    monkeypatch.setattr(module, "SummaryWriter", Writer)
+    monkeypatch.setattr(module, "collect_mixed_play_rust", lambda *args, **kwargs: rollout)
+    monkeypatch.setattr(module, "slice_trajectories", lambda batch, start, stop: batch)
+    monkeypatch.setattr(module, "rollout_diagnostics", lambda batch: {})
+    monkeypatch.setattr(
+        module, "update_replay_parity", lambda *args, **kwargs: _parity_metrics(module)
+    )
+    monkeypatch.setattr(
+        module,
+        "update_ppo",
+        lambda *args, **kwargs: {
+            "actor_updates": 1,
+            "actor_minibatches_intended": 1,
+            "critic_updates": 1,
+            "first_minibatch_component_kl": 0.0,
+            "value_target_saturated_fraction": 0.0,
+            "entropy": 0.2,
+        },
+    )
+
+
+def _stub_arguments(run_dir: Path, iterations: int, *extra: str) -> list[str]:
+    return [
+        "train_ppo.py",
+        "--run-dir",
+        str(run_dir),
+        "--iterations",
+        str(iterations),
+        "--games",
+        "1",
+        "--league-games",
+        "0",
+        "--league-script-games",
+        "0",
+        "--device",
+        "cpu",
+        "--architecture",
+        CONV_ENTITY,
+        "--architecture-panel",
+        "0",
+        "--cnn-width",
+        "8",
+        "--cnn-blocks",
+        "1",
+        "--model-dim",
+        "16",
+        "--transformer-layers",
+        "3",
+        "--attention-heads",
+        "2",
+        "--no-bfloat16",
+        *extra,
+    ]
+
+
+def test_low_disk_checkpoints_and_exits_with_its_own_status(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    _stub_training_main(monkeypatch, module)
+    # Plenty at startup and after the first wave; short from the second on.
+    calls: list[Path] = []
+
+    def disk_usage(path):
+        calls.append(path)
+        return SimpleNamespace(free=10e9 if len(calls) <= 2 else 1e9)
+
+    monkeypatch.setattr(module.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(sys, "argv", _stub_arguments(tmp_path, 5, "--min-free-disk-gb", "5"))
+    with pytest.raises(SystemExit) as exited:
+        module.main()
+    assert exited.value.code == module.LOW_DISK != module.CULL
+    # The wave that saw the shortfall is committed and is what `latest` names.
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["iteration"] == 2
+    assert (tmp_path / "checkpoint-000002.pt").stat().st_ino == (
+        tmp_path / "latest.pt"
+    ).stat().st_ino
+    # Once space is freed the committed wave resumes like any other.
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=10e9))
+    resumed = tmp_path / "resumed"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _stub_arguments(
+            resumed, 3, "--min-free-disk-gb", "5", "--resume", str(tmp_path / "latest.pt")
+        ),
+    )
+    module.main()
+    assert torch.load(resumed / "latest.pt", weights_only=False)["iteration"] == 3
+
+
+def test_low_disk_on_the_final_wave_keeps_the_normal_exit(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    _stub_training_main(monkeypatch, module)
+    # Short only when the last wave ends: the run finished, so it exits normally.
+    calls: list[Path] = []
+
+    def disk_usage(path):
+        calls.append(path)
+        return SimpleNamespace(free=10e9 if len(calls) <= 2 else 1e9)
+
+    monkeypatch.setattr(module.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(sys, "argv", _stub_arguments(tmp_path, 2, "--min-free-disk-gb", "5"))
+    module.main()
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["iteration"] == 2
+
+
+def test_disk_guard_is_off_by_default(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    _stub_training_main(monkeypatch, module)
+
+    def disk_usage(path):
+        raise AssertionError("the default guard must not measure the disk")
+
+    monkeypatch.setattr(module.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(sys, "argv", _stub_arguments(tmp_path, 2))
+    module.main()
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["iteration"] == 2
+
+
+def test_low_disk_at_startup_writes_nothing(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    _stub_training_main(monkeypatch, module)
+    monkeypatch.setattr(module.shutil, "disk_usage", lambda path: SimpleNamespace(free=1e9))
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(sys, "argv", _stub_arguments(run_dir, 2, "--min-free-disk-gb", "5"))
+    with pytest.raises(SystemExit) as exited:
+        module.main()
+    assert exited.value.code == module.LOW_DISK
+    assert list(run_dir.iterdir()) == []
 
 
 def test_parity_audit_is_due_per_staging_configuration_and_on_a_cadence() -> None:
@@ -1825,6 +2103,8 @@ def test_replay_parity_is_re_audited_on_a_cadence_and_on_every_resume(
             "--games",
             "1",
             "--league-games",
+            "0",
+            "--league-script-games",
             "0",
             "--device",
             "cpu",
@@ -2628,6 +2908,8 @@ def _population_arguments(
         "--games",
         str(games),
         "--league-games",
+        "0",
+        "--league-script-games",
         "0",
         "--league-builtin-opponents",
         "",

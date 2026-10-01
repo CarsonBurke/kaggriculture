@@ -131,6 +131,10 @@ def _rollout_states(
         )
         for name, dtype in _actor_forward_fields(architecture)
     }
+    # A LeJEPA actor conditions its market heads on the sampled orders' resources;
+    # `_actor_batch_args` passes them only when the batch carries them.
+    if "market_resources" in rollout.states:
+        fields["market_resources"] = (np.asarray(rollout.states["market_resources"]), torch.float32)
     for _, _, mask_field, active_field in _HEADS:
         fields[mask_field] = (np.asarray(getattr(rollout, mask_field)), torch.bool)
         fields[active_field] = (np.asarray(getattr(rollout, active_field)), torch.bool)

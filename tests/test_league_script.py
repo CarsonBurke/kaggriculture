@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from kaggriculture import opponents
 from kaggriculture.registry import CONV_ENTITY
 from kaggriculture.script_opponents import ScriptOpponent
 
@@ -39,14 +40,34 @@ def _parsed(module, monkeypatch, tmp_path: Path, *extra: str):
     return module.parse_args()
 
 
-def test_script_lane_flags_are_off_by_default_and_recorded_when_set(monkeypatch, tmp_path) -> None:
+def test_script_lanes_default_to_the_league_reference_agents(monkeypatch, tmp_path) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    for name in opponents.REFERENCE_AGENTS:
+        (references / f"{name}.py").write_text("def agent(observation):\n    return {}\n")
+    monkeypatch.setattr(opponents, "REFERENCE_AGENT_DIR", references)
     module = _training_script()
     default = _parsed(module, monkeypatch, tmp_path)
     module._validate_args(default)
-    assert (default.league_script_opponent, default.league_script_games) == ([], 0)
-    assert module._wave_games(default, 1) == default.games + default.league_games
+    assert default.league_script_opponent == list(opponents.LEAGUE_REFERENCE_AGENTS)
+    assert default.league_script_games == 8 * len(opponents.LEAGUE_REFERENCE_AGENTS)
+    assert (default.league_builtin_opponents, default.league_builtin_lanes) == ("", 0)
+    assert module._wave_games(default, 1) == (
+        default.games + default.league_games + default.league_script_games
+    )
     recorded = module._training_data_config(default, torch.device("cpu"))
-    assert (recorded["league_script_opponents"], recorded["league_script_games"]) == ([], 0)
+    assert [lane["name"] for lane in recorded["league_script_opponents"]] == list(
+        opponents.LEAGUE_REFERENCE_AGENTS
+    )
+    population = _parsed(module, monkeypatch, tmp_path, "--population", "2")
+    assert (population.league_script_opponent, population.league_script_games) == ([], 0)
+
+
+def test_script_lane_flags_are_recorded_when_set(monkeypatch, tmp_path) -> None:
+    module = _training_script()
+    default = _parsed(module, monkeypatch, tmp_path, "--league-script-games", "0")
+    module._validate_args(default)
+    assert (default.league_script_opponent, default.league_script_games) == ([], 0)
 
     path = _agent_file(tmp_path)
     args = _parsed(

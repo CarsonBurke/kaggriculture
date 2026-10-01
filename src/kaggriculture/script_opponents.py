@@ -3,27 +3,34 @@
 A scripted Kaggle agent (a `main.py` whose last callable is the policy) cannot
 run inside Rust, but it can play a seat of a native `BatchEnv` game: each step
 the engine's state is serialized, shaped into the official observation, handed
-to the agent, and the agent's action dict is projected back into factor codes
-(`project_demonstration`) that the next native step plays under the
-interpreter's submitted-dict rules. The agents run in worker processes so their
-pure-Python cost overlaps the device forward instead of stalling it.
+to the agent, and the agent's action dict is encoded (`encode_submitted_turn`)
+into the turn the native step executes exactly as the official interpreter
+executes the dict. The agents run in worker processes so their pure-Python
+cost overlaps the device forward instead of stalling it.
 
 Kaggle executes every episode's agent source into a fresh namespace, and agents
 keep per-episode state in module globals (demand-advance4's routing, sale
 reservations and terminal plans). Each game seat here therefore owns its own
 namespace, built with Kaggle's last-callable rule and never shared or reused.
 
-Parity with the official engine is near exact rather than exact: the one
-projection relabel (`deposit_all_products`: a partial shed deposit becomes a
-full one) moves demand-advance4's final banks by about 0.1% at most
-(`scripts/evaluate_script_native.py --parity-seeds` measures it against
-`kaggle_environments` directly).
+The turn is never projected into our policy's action space. That space fixes
+pickup and deposit quantities, caps order quantities at 100, and ends a market
+queue at its first STOP where the interpreter skips an unreadable order and
+keeps its slot, which reshapes which of the two seats' orders share a quote. A
+turn the projection could not express played PASS whole: kaito-v48's one
+`PICKUP COW 5` took its BUY_LAND order down with it, and the lost land left it
+banking about 44k natively against 113k officially. Script seats therefore
+play their own turns (`scripts/evaluate_script_native.py --parity-seeds`
+measures the result against `kaggle_environments` directly).
 
-Two further departures from the official runner are deliberate and counted.
-An agent that raises, or a turn `project_demonstration` cannot express, plays
-PASS for that whole turn (the runner would forfeit the seat, or play the
-representable part); both tallies reach the journal. The configuration omits
-the runner's `__raw_path__` key, which no fielded agent reads.
+Two departures from the official runner are deliberate and counted. An agent
+that raises, or submits arguments the interpreter itself could raise on (an
+unparseable quantity, an unhashable command or item), plays PASS for that whole
+turn where the runner would forfeit the seat or fail the episode; both tallies
+reach the journal. The second is judged from the dict alone, so it also counts
+an argument the interpreter would have raised on only from a tile the unit was
+not standing on. The configuration omits the runner's `__raw_path__` key, which no
+fielded agent reads.
 
 A worker's request carries every seat it holds in the segment, one state
 snapshot each (about 3 KB at the first step, 16 KB at the largest). Past the
@@ -54,7 +61,9 @@ from typing import Any, TextIO
 
 import numpy as np
 
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS
+from kaggriculture.actions import MarketKind, UnitAction
+from kaggriculture.constants import CROPS, MAX_MARKET_ORDERS, PRIVATE_ITEMS
+from kaggriculture.opponents import REFERENCE_AGENTS, reference_agent_path
 
 #: The configuration an official agent receives (kaggle-environments 1.32.7).
 #: Agents read it: demand-advance4 refuses its terminal planners unless the
@@ -111,10 +120,12 @@ class ScriptOpponent:
 
 
 def parse_script_opponent(spec: str) -> ScriptOpponent:
-    """Parse ``NAME=PATH``."""
+    """Parse ``NAME=PATH``, or a reference agent's bare name."""
     name, separator, path = spec.partition("=")
+    if not separator and name.strip() in REFERENCE_AGENTS:
+        return ScriptOpponent.from_path(name.strip(), str(reference_agent_path(name.strip())))
     if not separator or not name.strip() or not path.strip():
-        raise ValueError(f"script opponent must be NAME=PATH, got {spec!r}")
+        raise ValueError(f"script opponent must be NAME=PATH or a reference agent, got {spec!r}")
     return ScriptOpponent.from_path(name.strip(), path.strip())
 
 
@@ -123,7 +134,7 @@ class Struct(dict):
 
     Vendored with `structify` so a worker needs neither `kaggle_environments`,
     whose import alone costs ~150 MB of game registrations per process, nor
-    anything else outside this module and the projection. Faithful to its
+    anything heavier than this module and the action codes. Faithful to its
     quirks, including silently dropping an ``items`` key.
     """
 
@@ -180,19 +191,151 @@ def load_script_agent(code: Any, path: Path) -> Callable[..., Any]:
     return callables[-1]
 
 
+#: `BatchEnv.set_submitted_actions` unit command forms; mirrors
+#: `UNIT_COMMAND_*` in Rust.
+UNIT_COMMAND_ACTION = 0
+UNIT_COMMAND_PICKUP = 1
+UNIT_COMMAND_PLACE = 2
+_UNIT_COMMAND_OPCODES = {
+    name: int(UnitAction[name])
+    for name in (
+        "PASS",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "DROP",
+        "WATER",
+        "HARVEST",
+        "FERTILIZE",
+        "DIG",
+        "BUILD_COOP",
+        "BUILD_PASTURE",
+        "FEED",
+        "COLLECT_FERTILIZER",
+        "CARE",
+    )
+}
+_PLANT_OPCODES = {crop: int(UnitAction[f"PLANT_{crop}"]) for crop in CROPS}
+_PRIVATE_ITEM_INDEX = {item: index for index, item in enumerate(PRIVATE_ITEMS)}
+_QUANTIFIED_ORDERS = {
+    (operation, kind.name.removeprefix(f"{operation}_")): int(kind)
+    for kind in MarketKind
+    for operation in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL")
+    if kind.name.startswith(f"{operation}_")
+}
+_MAX_SUBMITTED_QUANTITY = np.iinfo(np.uint32).max
+
+
+class SubmittedActionError(ValueError):
+    """A submitted action the official interpreter would itself raise on."""
+
+
+def _submitted_quantity(command: list[Any]) -> int:
+    """The interpreter's ``int(command[2])``, default 1, clamped to the engine's u32."""
+    try:
+        quantity = int(command[2]) if len(command) >= 3 else 1
+    except (TypeError, ValueError, OverflowError) as error:
+        raise SubmittedActionError(f"unparseable quantity in {command!r}") from error
+    return min(max(quantity, 0), _MAX_SUBMITTED_QUANTITY)
+
+
+def _unit_command(command: Any) -> tuple[int, int, int]:
+    """One unit command as `_apply_unit_action` (kaggriculture.py:312) reads it.
+
+    Anything the interpreter cannot act on is PASS. A negative or zero quantity
+    stays zero rather than PASS: PLACE still installs an animal without reading
+    it.
+    """
+    if not isinstance(command, list) or not command:
+        return UNIT_COMMAND_ACTION, int(UnitAction.PASS), 0
+    operation = command[0]
+    try:
+        opcode = _UNIT_COMMAND_OPCODES.get(operation)
+        if opcode is not None:
+            return UNIT_COMMAND_ACTION, opcode, 0
+        if len(command) >= 2 and operation in ("PICKUP", "PLACE"):
+            item = _PRIVATE_ITEM_INDEX.get(command[1])
+            if item is not None:
+                form = UNIT_COMMAND_PICKUP if operation == "PICKUP" else UNIT_COMMAND_PLACE
+                return form, item, _submitted_quantity(command)
+        if len(command) >= 2 and operation == "PLANT":
+            opcode = _PLANT_OPCODES.get(command[1])
+            if opcode is not None:
+                return UNIT_COMMAND_ACTION, opcode, 0
+    except TypeError as error:
+        raise SubmittedActionError(f"unhashable unit command {command!r}") from error
+    return UNIT_COMMAND_ACTION, int(UnitAction.PASS), 0
+
+
+def _market_order(order: Any) -> tuple[int, int]:
+    """One order as `_parse_order` (kaggriculture.py:631) reads it; kind 0 is unread.
+
+    An item the operation does not trade is unread too: the interpreter aborts
+    that order at its first quote, before it touches anything. An infinite
+    quantity and an unhashable item are the orders the interpreter raises on.
+    """
+    if not isinstance(order, list) or not order:
+        return 0, 0
+    operation = order[0]
+    if operation == "HIRE":
+        return int(MarketKind.HIRE), 0
+    if operation == "BUY_LAND":
+        return int(MarketKind.BUY_LAND), 0
+    if operation not in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL") or len(order) < 3:
+        return 0, 0
+    try:
+        quantity = int(order[2])
+    except (TypeError, ValueError):
+        return 0, 0
+    except OverflowError as error:
+        raise SubmittedActionError(f"infinite quantity in {order!r}") from error
+    if quantity <= 0:
+        return 0, 0
+    try:
+        kind = _QUANTIFIED_ORDERS.get((operation, order[1]), 0)
+    except TypeError as error:
+        raise SubmittedActionError(f"unhashable market item in {order!r}") from error
+    if not kind:
+        return 0, 0
+    return kind, min(quantity, _MAX_SUBMITTED_QUANTITY)
+
+
+def encode_submitted_turn(action: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Encode an agent's action dict for `BatchEnv.set_submitted_actions`.
+
+    Returns the ``[units, 3]`` unit command rows, farmer first and every
+    submitted hand command kept (a command for a hand the farm lacks still
+    counts toward the turn's PLANT demand), and the ``[MAX_MARKET_ORDERS, 2]``
+    market orders, which keep their submitted slots: the interpreter pairs the
+    two seats' queues slot by slot. Raises :class:`SubmittedActionError` where
+    the interpreter itself would raise.
+    """
+    farmer = action.get("farmer", ["PASS"])
+    hands = action.get("hands", [])
+    commands = [farmer, *(hands if isinstance(hands, list) else [])]
+    units = np.asarray([_unit_command(command) for command in commands], dtype=np.uint32)
+    market = action.get("market", [])
+    orders = np.zeros((MAX_MARKET_ORDERS, 2), dtype=np.uint32)
+    for slot, order in enumerate(market[:MAX_MARKET_ORDERS] if isinstance(market, list) else []):
+        orders[slot] = _market_order(order)
+    return units, orders
+
+
 def _empty_statistics() -> dict[str, float | int]:
     """Zeroed script-seat totals.
 
-    Seats and seat-steps played; steps whose agent raised or whose action could
-    not be projected (both then play PASS); the per-step slowest worker's
-    compute, summed, and its single slowest reply, the headroom under the reply
-    timeout; and the host time spent blocked on the workers.
+    Seats and seat-steps played; steps whose agent raised or whose action the
+    interpreter would have raised on (both then play PASS); the per-step
+    slowest worker's compute, summed, and its single slowest reply, the
+    headroom under the reply timeout; and the host time spent blocked on the
+    workers.
     """
     return {
         "seats": 0,
         "seat_steps": 0,
         "agent_errors": 0,
-        "projection_errors": 0,
+        "action_errors": 0,
         "worker_seconds": 0.0,
         "slowest_reply_seconds": 0.0,
         "wait_seconds": 0.0,
@@ -261,8 +404,6 @@ def _call_agent(agent: Callable[..., Any], observation: Any, configuration: Any)
 
 
 def _worker_main(connection: Connection, stack_dump: TextIO) -> None:
-    from kaggriculture.demonstrations import DemonstrationError, project_demonstration
-
     # The host signals a hung worker before killing it; the dump says where
     # the agent was stuck.
     faulthandler.register(signal.SIGUSR1, file=stack_dump, all_threads=False)
@@ -288,17 +429,15 @@ def _worker_main(connection: Connection, stack_dump: TextIO) -> None:
             raise ValueError(f"unknown script worker message {kind!r}")
         _, tag, requests = message
         started = time.perf_counter()
-        count = len(requests)
-        units = np.zeros((count, MAX_UNITS), dtype=np.uint8)
-        kinds = np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8)
-        quantities = np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8)
+        unit_counts = np.zeros(len(requests), dtype=np.int64)
+        unit_commands = []
+        market_orders = np.zeros((len(requests), MAX_MARKET_ORDERS, 2), dtype=np.uint32)
         agent_errors = 0
-        projection_errors = 0
+        action_errors = 0
         for index, (slot, player, snapshot_json) in enumerate(requests):
             observation = shaped_observation(json.loads(snapshot_json), player)
             try:
-                # Structified copies, as the runner hands every agent its own:
-                # the projection below still reads the untouched observation.
+                # A structified copy, as the runner hands every agent its own.
                 action = _call_agent(
                     agents.live[(tag, slot)][1],
                     structify(observation),
@@ -313,22 +452,22 @@ def _worker_main(connection: Connection, stack_dump: TextIO) -> None:
                 agent_errors += 1
                 action = _PASS_ACTION
             try:
-                projected = project_demonstration(observation, action, deposit_all_products=True)
-            except DemonstrationError:
-                projection_errors += 1
-                projected = project_demonstration(observation, _PASS_ACTION)
-            units[index] = projected.unit_actions
-            kinds[index] = projected.market_kinds
-            quantities[index] = projected.market_quantities
+                units, orders = encode_submitted_turn(action)
+            except SubmittedActionError:
+                action_errors += 1
+                units, orders = encode_submitted_turn(_PASS_ACTION)
+            unit_counts[index] = len(units)
+            unit_commands.append(units)
+            market_orders[index] = orders
         connection.send(
             (
                 "acted",
                 tag,
-                units,
-                kinds,
-                quantities,
+                unit_counts,
+                np.concatenate(unit_commands),
+                market_orders,
                 agent_errors,
-                projection_errors,
+                action_errors,
                 time.perf_counter() - started,
             )
         )
@@ -565,7 +704,7 @@ class ScriptSegment:
     finished: bool = False
     steps: int = 0
     agent_errors: int = 0
-    projection_errors: int = 0
+    action_errors: int = 0
     #: Summed per-step maximum worker compute, its largest single value, and
     #: host time blocked waiting.
     worker_seconds: float = 0.0
@@ -602,28 +741,26 @@ class ScriptSegment:
         """Collect the requested actions and stage them for the next native step."""
         if not self.pending:
             raise RuntimeError("script actions were staged before being requested")
-        count = len(self.rows)
-        units = np.zeros((count, MAX_UNITS), dtype=np.uint8)
-        kinds = np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8)
-        quantities = np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8)
+        replies = []
         started = time.perf_counter()
         slowest = 0.0
         for worker, slots in self._groups:
-            _, _, worker_units, worker_kinds, worker_quantities, agent, projection, seconds = (
+            _, _, unit_counts, unit_commands, market_orders, agent, action, seconds = (
                 self.pool._receive(worker, self.tag)
             )
-            units[slots] = worker_units
-            kinds[slots] = worker_kinds
-            quantities[slots] = worker_quantities
+            replies.append((self.rows[slots], unit_counts, unit_commands, market_orders))
             self.agent_errors += int(agent)
-            self.projection_errors += int(projection)
+            self.action_errors += int(action)
             slowest = max(slowest, float(seconds))
         self.wait_seconds += time.perf_counter() - started
         self.worker_seconds += slowest
         self.slowest_reply_seconds = max(self.slowest_reply_seconds, slowest)
         self.pending = False
         self.steps += 1
-        self.environment.set_external_actions(self.rows, units, kinds, quantities)
+        # One call stages every seat or, refused, none of them.
+        self.environment.set_submitted_actions(
+            *(np.concatenate(parts) for parts in zip(*replies, strict=True))
+        )
 
     def finish(self) -> None:
         """Release the seats; an abandoned in-flight request is discarded."""
@@ -644,7 +781,7 @@ class ScriptSegment:
         totals["seats"] += len(self.rows)
         totals["seat_steps"] += len(self.rows) * self.steps
         totals["agent_errors"] += self.agent_errors
-        totals["projection_errors"] += self.projection_errors
+        totals["action_errors"] += self.action_errors
         totals["worker_seconds"] += self.worker_seconds
         totals["slowest_reply_seconds"] = max(
             totals["slowest_reply_seconds"], self.slowest_reply_seconds

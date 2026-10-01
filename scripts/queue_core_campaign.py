@@ -128,8 +128,11 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
             "league-active-opponents": 2,
             "league-historical-opponents": 6,
             "league-active-pool-size": 16,
-            "league-builtin-opponents": "pass,random,starter,scripted-v27",
-            "league-builtin-lanes": 4,
+            # The league trains against dynamic public agents, not engine floors
+            # and tapes (`kaggriculture.opponents.LEAGUE_REFERENCE_AGENTS`).
+            "league-builtin-opponents": "",
+            "league-builtin-lanes": 0,
+            "league-script-games": 40,
             "episode-steps": 720,
             "temperature": 1.0,
             "checkpoint-seconds": 420,
@@ -171,6 +174,17 @@ def commands(root: Path, source: Path, variant: str) -> dict[str, list[str]]:
     # same function, 0.36 s less per wave at a 17.2 GiB peak on this model
     # (artifacts/probes/ppo-speed-20260927).
     ppo += [
+        *(
+            part
+            for name in (
+                "demand-timing",
+                "hybrid-2965",
+                "harvest-ledger",
+                "master-engine-v53",
+                "bronze-v31",
+            )
+            for part in ("--league-script-opponent", name)
+        ),
         "--rollout-bfloat16",
         "--no-structured-critic-gradient-balance",
         "--no-rematerialize-actor-update",

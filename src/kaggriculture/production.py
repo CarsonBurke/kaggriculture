@@ -11,6 +11,7 @@ from typing import Any
 from kaggriculture.constants import DEFAULT_REWARD_MODE
 from kaggriculture.evaluation import DEVELOPMENT_SEED_START
 from kaggriculture.modelargs import model_config_arguments
+from kaggriculture.opponents import HELDOUT_REFERENCE_AGENTS, LEAGUE_REFERENCE_AGENTS
 from kaggriculture.outcome_value import validate_outcome_objective
 from kaggriculture.provenance import UNCOMPILED_UPDATE_COMPILE_MODE, repository_root
 from kaggriculture.registry import LEJEPA, resolve_architecture
@@ -41,10 +42,32 @@ PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
 # count adds to the total budget, and zero disables built-ins. In stratified
 # mode each reserved built-in lane instead contests one additional snapshot
 # using PFSP weights, releasing easy-agent lanes back to the active stratum.
-# External evaluation below remains a separate fixed diagnostic panel.
-PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = "pass,random,starter,scripted-v27"
-# One lane per admitted agent, as every measured LeJEPA recipe ran.
-PRODUCTION_LEAGUE_BUILTIN_LANES = 4
+# Production admits none: pass, random and starter are floors every clone
+# clears, and scripted-v27 replays one hardcoded action per step, so none of
+# them answers what the learner does. The dynamic reference agents below replace
+# them. External evaluation remains a separate fixed diagnostic panel.
+PRODUCTION_LEAGUE_BUILTIN_OPPONENTS = ""
+PRODUCTION_LEAGUE_BUILTIN_LANES = 0
+# Fixed league lanes against public agents that react to the state
+# (`kaggriculture.opponents.LEAGUE_REFERENCE_AGENTS`), played natively with
+# exact official-engine parity, split evenly over agents and seats and on top of
+# the snapshot league. Eight games per agent per wave.
+PRODUCTION_LEAGUE_SCRIPT_OPPONENTS = LEAGUE_REFERENCE_AGENTS
+PRODUCTION_LEAGUE_SCRIPT_GAMES = 8 * len(LEAGUE_REFERENCE_AGENTS)
+# Script games go two per agent, the rest by (1 - estimated score)^2, so an
+# agent the learner beats every time stops taking games from ones it does not.
+PRODUCTION_LEAGUE_SCRIPT_ALLOCATION = "hardness"
+# Two of the eight hardness lanes screen the most uncertain stale snapshots two
+# games apiece instead of refreshing one with a lane's eight. Simulated over a
+# 1,300-iteration run, this found a forgotten opponent in about 6-9 iterations
+# rather than about 70, and missed 52-77% of forgetting episodes rather than
+# 94-100%, at no cost in how hard the hardness lanes' opponents were.
+PRODUCTION_LEAGUE_SCREEN_LANES = 2
+# The archive keeps the latest sixteen snapshots and older ones at spacing
+# that doubles with age (`kaggriculture.league.retired_snapshots`), about 116
+# of 1,300 iterations plus any the learner is not clearly beating, and deletes
+# the rest, so a long run's disk use and selection pool stay bounded.
+PRODUCTION_LEAGUE_ARCHIVE_RECENT = 16
 PRODUCTION_EPISODE_STEPS = 720
 PRODUCTION_CHECKPOINT_SECONDS = 420
 # Every seat in a wave decodes at this one temperature, learner and league
@@ -110,12 +133,11 @@ PRODUCTION_UPDATE_COMPILE_MODE = "default"
 # emitted explicitly so the launch command is the complete record; unavailable
 # ones are dropped at launch with a warning, never fatal.
 #
-# `public-v16` is here because it is the strongest reference on hand: measured in
-# the official engine over three seeds and both seat orders it beat `public-v27`
-# 6/6, median bank 77,261 against 59,489. An absolute axis anchored only on
-# agents we already beat would saturate exactly where the interesting failure
-# lives. `starter` stays as the cheap floor that catches total collapse.
-PRODUCTION_EXTERNAL_EVAL_OPPONENTS = "starter,public-v27,public-v16"
+# The opponents are the held-out reference agents
+# (`kaggriculture.opponents.HELDOUT_REFERENCE_AGENTS`): the strongest public
+# family and three others the league never plays, so the axis measures transfer
+# to the ladder rather than progress against the lanes the learner trains on.
+PRODUCTION_EXTERNAL_EVAL_OPPONENTS = ",".join(HELDOUT_REFERENCE_AGENTS)
 # The fixed native development panel (`kaggriculture.architecture_panel`) every
 # 25 actor-active waves: synchronous argmax and sampled strength against starter
 # and V27 plus the critic's calibration, the milestone cadence the September 27
@@ -385,6 +407,13 @@ def build_training_command(
             PRODUCTION_LEAGUE_BUILTIN_OPPONENTS if league else "",
             "--league-builtin-lanes",
             str(PRODUCTION_LEAGUE_BUILTIN_LANES if league else 0),
+            *(
+                part
+                for name in (PRODUCTION_LEAGUE_SCRIPT_OPPONENTS if league else ())
+                for part in ("--league-script-opponent", name)
+            ),
+            "--league-script-games",
+            str(PRODUCTION_LEAGUE_SCRIPT_GAMES if league else 0),
             "--episode-steps",
             str(PRODUCTION_EPISODE_STEPS),
             "--temperature",

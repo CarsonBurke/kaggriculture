@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -15,14 +18,26 @@ from kaggriculture.actions import (
     MarketKind,
     UnitAction,
 )
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS, SEED_COST
+from kaggriculture.constants import (
+    ANIMALS,
+    CROPS,
+    MAX_MARKET_ORDERS,
+    MAX_UNITS,
+    PRIVATE_ITEMS,
+    SEED_COST,
+)
 from kaggriculture.model import FarmActor, ModelConfig
 from kaggriculture.rollout import EXTERNAL_AGENT_CODE, collect_mixed_play_rust
 from kaggriculture.rust_env import load_native
 from kaggriculture.script_opponents import (
     SCRIPT_AGENT_CONFIGURATION,
+    UNIT_COMMAND_ACTION,
+    UNIT_COMMAND_PICKUP,
+    UNIT_COMMAND_PLACE,
     ScriptAgentPool,
     ScriptOpponent,
+    SubmittedActionError,
+    encode_submitted_turn,
     parse_script_opponent,
     shaped_observation,
     structify,
@@ -111,17 +126,17 @@ def _step(environment, codes: np.ndarray) -> dict:
     return sampled
 
 
-def _staged(environment, rows: list[int], *, kind: int = 0, unit: int = 0) -> None:
-    count = len(rows)
-    kinds = np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8)
-    kinds[:, 0] = kind
-    units = np.full((count, MAX_UNITS), unit, dtype=np.uint8)
-    environment.set_external_actions(
-        np.asarray(rows, dtype=np.int64),
-        units,
-        kinds,
-        np.zeros((count, MAX_MARKET_ORDERS), dtype=np.uint8),
+def _staged(environment, turns: dict[int, dict]) -> None:
+    encoded = [encode_submitted_turn(action) for action in turns.values()]
+    environment.set_submitted_actions(
+        np.asarray(list(turns), dtype=np.int64),
+        np.asarray([len(units) for units, _ in encoded], dtype=np.int64),
+        np.concatenate([units for units, _ in encoded]).reshape(-1, 3),
+        np.stack([orders for _, orders in encoded]).reshape(-1, MAX_MARKET_ORDERS, 2),
     )
+
+
+_PASS = {"farmer": ["PASS"], "hands": [], "market": []}
 
 
 def test_staged_external_actions_play_exactly_the_coded_rows_once() -> None:
@@ -132,7 +147,7 @@ def test_staged_external_actions_play_exactly_the_coded_rows_once() -> None:
     # Coded external with nothing staged, and staged but not coded, both refuse.
     with pytest.raises(ValueError, match="no action was staged"):
         _step(environment, codes)
-    _staged(environment, [1])
+    _staged(environment, {1: _PASS})
     with pytest.raises(ValueError, match="coded 0"):
         _step(environment, np.zeros(4, dtype=np.uint8))
     # Nothing else may step past a staged row either.
@@ -146,11 +161,10 @@ def test_staged_external_actions_play_exactly_the_coded_rows_once() -> None:
 
     # A HIRE on row 1 is what that seat plays, with zero policy statistics.
     environment.reset(np.asarray([5, 6], dtype=np.uint64))
-    hire = int(MarketKind.HIRE)
-    _staged(environment, [1], kind=hire)
+    _staged(environment, {1: {"market": [["HIRE"]]}})
     sampled = _step(environment, codes)
-    assert int(np.asarray(sampled["market_kinds"])[1, 0]) == hire
     np.testing.assert_array_equal(np.asarray(sampled["unit_logprobs"])[1], 0.0)
+    np.testing.assert_array_equal(np.asarray(sampled["market_kind_logprobs"])[1], 0.0)
     snapshot = json.loads(environment.snapshot_json(0, False))
     assert len(snapshot["farms"][1]["hands"]) == 1
     assert len(snapshot["farms"][0]["hands"]) == 0
@@ -159,20 +173,241 @@ def test_staged_external_actions_play_exactly_the_coded_rows_once() -> None:
         _step(environment, codes)
 
 
-def test_external_action_staging_validates_rows_and_values() -> None:
+def test_submitted_action_staging_validates_rows_and_values() -> None:
     environment = load_native().BatchEnv(np.asarray([5], dtype=np.uint64))
+    no_orders = np.zeros((1, MAX_MARKET_ORDERS, 2), dtype=np.uint32)
+
+    def stage(units, *, orders=no_orders, counts=None, rows=(0,)) -> None:
+        units = np.asarray(units, dtype=np.uint32).reshape(-1, 3)
+        environment.set_submitted_actions(
+            np.asarray(rows, dtype=np.int64),
+            np.asarray([len(units)] if counts is None else counts, dtype=np.int64),
+            units,
+            orders,
+        )
+
     with pytest.raises(IndexError):
-        _staged(environment, [2])
+        _staged(environment, {2: _PASS})
     with pytest.raises(ValueError, match="already staged"):
-        _staged(environment, [0, 0])
-    with pytest.raises(ValueError, match="unit action"):
-        _staged(environment, [0], unit=N_UNIT_ACTIONS)
-    with pytest.raises(ValueError, match="market kind"):
-        _staged(environment, [0], kind=N_MARKET_KINDS)
+        stage(
+            [[UNIT_COMMAND_ACTION, 0, 0]] * 2,
+            counts=[1, 1],
+            rows=[0, 0],
+            orders=np.zeros((2, MAX_MARKET_ORDERS, 2), dtype=np.uint32),
+        )
+    with pytest.raises(ValueError, match="action"):
+        stage([[UNIT_COMMAND_ACTION, N_UNIT_ACTIONS, 0]])
+    # PICKUP and PLACE carry their own quantity, never a fixed factor code.
+    with pytest.raises(ValueError, match="fixes its quantity"):
+        stage([[UNIT_COMMAND_ACTION, int(UnitAction.PICKUP_WHEAT_1), 0]])
+    with pytest.raises(ValueError, match="item"):
+        stage([[UNIT_COMMAND_PICKUP, len(PRIVATE_ITEMS), 1]])
+    with pytest.raises(ValueError, match="form"):
+        stage([[3, 0, 0]])
+    with pytest.raises(ValueError, match="claims"):
+        stage([[UNIT_COMMAND_ACTION, 0, 0]], counts=[2])
+    with pytest.raises(ValueError, match="unit counts claim"):
+        stage([[UNIT_COMMAND_ACTION, 0, 0]] * 2, counts=[1])
+    bad_orders = no_orders.copy()
+    bad_orders[0, 3] = (N_MARKET_KINDS, 1)
+    with pytest.raises(ValueError, match="kind"):
+        stage([[UNIT_COMMAND_ACTION, 0, 0]], orders=bad_orders)
+    bad_orders[0, 3] = (int(MarketKind.SELL_WHEAT), 0)
+    with pytest.raises(ValueError, match="quantity 0"):
+        stage([[UNIT_COMMAND_ACTION, 0, 0]], orders=bad_orders)
     # A refused call stages nothing, so a clean retry succeeds.
-    _staged(environment, [0], unit=int(UnitAction.PASS))
+    _staged(environment, {0: _PASS})
     with pytest.raises(ValueError, match="already staged"):
-        _staged(environment, [0])
+        _staged(environment, {0: _PASS})
+
+
+def test_unit_command_forms_mirror_the_native_binding() -> None:
+    native = load_native()
+    assert (
+        native.UNIT_COMMAND_ACTION,
+        native.UNIT_COMMAND_PICKUP,
+        native.UNIT_COMMAND_PLACE,
+    ) == (UNIT_COMMAND_ACTION, UNIT_COMMAND_PICKUP, UNIT_COMMAND_PLACE)
+
+
+def test_submitted_turns_keep_what_the_factored_space_cannot_carry() -> None:
+    units, orders = encode_submitted_turn(
+        {
+            "farmer": ["PICKUP", "COW", 5],
+            "hands": [
+                ["PLACE", "WHEAT", 3],
+                ["PLANT", "WHEAT"],
+                ["PICKUP", "WHEAT"],
+                ["PLACE", "GOOSE", -2],
+                ["FLY"],
+                "PASS",
+            ],
+            "market": [
+                ["SELL", "WHEAT", 0],
+                ["SELL", "WHEAT", 250],
+                ["SELL", "BREAD", 3],
+                ["BUY_SEED", "WHEAT", "2"],
+                ["BUY_LAND", "ignored"],
+                [],
+                ["HIRE"],
+            ],
+        }
+    )
+    cow = PRIVATE_ITEMS.index("COW")
+    np.testing.assert_array_equal(
+        units,
+        [
+            [UNIT_COMMAND_PICKUP, cow, 5],
+            [UNIT_COMMAND_PLACE, 0, 3],
+            [UNIT_COMMAND_ACTION, int(UnitAction.PLANT_WHEAT), 0],
+            [UNIT_COMMAND_PICKUP, 0, 1],
+            [UNIT_COMMAND_PLACE, PRIVATE_ITEMS.index("GOOSE"), 0],
+            [UNIT_COMMAND_ACTION, int(UnitAction.PASS), 0],
+            [UNIT_COMMAND_ACTION, int(UnitAction.PASS), 0],
+        ],
+    )
+    # Unread orders stay holes in their own slots, so later orders keep the
+    # opponent orders they share a quote with.
+    expected = np.zeros((MAX_MARKET_ORDERS, 2), dtype=np.uint32)
+    expected[1] = (int(MarketKind.SELL_WHEAT), 250)
+    expected[3] = (int(MarketKind.BUY_SEED_WHEAT), 2)
+    expected[4] = (int(MarketKind.BUY_LAND), 0)
+    expected[6] = (int(MarketKind.HIRE), 0)
+    np.testing.assert_array_equal(orders, expected)
+
+    # Only the first maxMarketOrdersPerTurn orders are read; non-list parts
+    # are the interpreter's defaults.
+    _, orders = encode_submitted_turn({"market": [["HIRE"]] * 12})
+    assert (orders[:, 0] == int(MarketKind.HIRE)).all()
+    units, orders = encode_submitted_turn({"farmer": "NORTH", "hands": "x", "market": "y"})
+    np.testing.assert_array_equal(units, [[UNIT_COMMAND_ACTION, int(UnitAction.PASS), 0]])
+    assert not orders.any()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"farmer": ["PICKUP", "WHEAT", "many"]},
+        {"hands": [["PLACE", "EGG", None]]},
+        {"farmer": [["NORTH"]]},
+        {"farmer": ["PLANT", ["WHEAT"]]},
+        {"market": [["SELL", ["WHEAT"], 1]]},
+        {"market": [["SELL", "WHEAT", float("inf")]]},
+    ],
+)
+def test_arguments_the_interpreter_raises_on_are_refused(action) -> None:
+    with pytest.raises(SubmittedActionError):
+        encode_submitted_turn(action)
+
+
+def _parity_oracle():
+    path = Path(__file__).parents[1] / "rust" / "kagg_env" / "tests" / "parity_oracle.py"
+    spec = importlib.util.spec_from_file_location("kaggriculture_parity_oracle", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_FUZZ_QUANTITIES = (-1, 0, 1, 2, 3, 4, 5, 7, 16, 40, 101, 250, "3", 2.5)
+_FUZZ_OPERATIONS = (
+    "PASS",
+    "DROP",
+    "WATER",
+    "HARVEST",
+    "FERTILIZE",
+    "DIG",
+    "BUILD_COOP",
+    "BUILD_PASTURE",
+    "FEED",
+    "COLLECT_FERTILIZER",
+    "CARE",
+)
+
+
+def _fuzz_action(rng: random.Random, observation: Any) -> dict:
+    """A turn full of what the factored space cannot express, plus ordinary play.
+
+    Its money goes round trips through wheat and fertilizer, whose quotes both
+    seats move, so which of their orders share a slot decides who pays or
+    earns what. Seeds, animals and hands, which never sell back, it buys only
+    while it has money to spare, and only wheat seeds by the hundred.
+    """
+    farm = observation.farms[observation.player]
+    spare = farm.money > 1_200
+
+    def quantity() -> list:
+        return [] if rng.random() < 0.1 else [rng.choice(_FUZZ_QUANTITIES)]
+
+    def unit() -> Any:
+        roll = rng.random()
+        if roll < 0.35:
+            return [rng.choice(("NORTH", "SOUTH", "EAST", "WEST"))]
+        if roll < 0.5:
+            return ["PICKUP", rng.choice(PRIVATE_ITEMS), *quantity()]
+        if roll < 0.65:
+            return ["PLACE", rng.choice(PRIVATE_ITEMS), *quantity()]
+        if roll < 0.75:
+            # Mostly one crop, so turns regularly ask for more seeds than held.
+            return ["PLANT", rng.choice(("WHEAT", "WHEAT", "CARROT", "BREAD"))]
+        if roll < 0.95:
+            return [rng.choice(_FUZZ_OPERATIONS)]
+        return rng.choice((["FLY"], [], "PASS", ["PICKUP"], ["PLACE"]))
+
+    def order() -> Any:
+        roll = rng.random()
+        if roll < 0.15:
+            return rng.choice(([], ["SELL", "WHEAT"], ["SELL", "BREAD", 3], "SELL"))
+        if roll < 0.3 and spare:
+            if len(farm.hands) < 2 and rng.random() < 0.5:
+                return ["HIRE"]
+            if rng.random() < 0.5:
+                # Cheap enough to fill past the factored space's 100.
+                return ["BUY_SEED", "WHEAT", rng.choice(_FUZZ_QUANTITIES)]
+            operation, items = rng.choice((("BUY_SEED", CROPS), ("BUY_ANIMAL", ANIMALS)))
+            return [operation, rng.choice(items), rng.randrange(1, 4)]
+        operation = rng.choice(("SELL", "BUY_PRODUCT") if farm.money > 800 else ("SELL",))
+        return [operation, rng.choice(("WHEAT", "FERTILIZER")), rng.choice(_FUZZ_QUANTITIES)]
+
+    return {
+        "farmer": unit(),
+        # Sometimes more hand commands than hands: they still count toward PLANT demand.
+        "hands": [unit() for _ in range(len(farm.hands) + rng.randrange(2))],
+        "market": [order() for _ in range(rng.randrange(13))],
+    }
+
+
+@pytest.mark.parametrize("seed", [20260929, 20260930, 20260931, 20260932])
+def test_submitted_turns_match_the_official_interpreter_for_a_full_episode(seed) -> None:
+    from kaggle_environments import make
+    from kaggle_environments.envs.kaggriculture.kaggriculture import starter_agent
+
+    oracle = _parity_oracle()
+    official = make("kaggriculture", configuration={"episodeSteps": 720, "seed": seed})
+    official.reset(2)
+    environment = load_native().BatchEnv(np.asarray([seed], dtype=np.uint64))
+    codes = np.full(2, EXTERNAL_AGENT_CODE, dtype=np.uint8)
+    rng = random.Random(seed)
+    transitions = 0
+    while not official.done:
+        observations = [state.observation for state in official.state]
+        # The starter half the time keeps seat 1's farm stocked; the other half
+        # both queues are fuzz, pairing their holes and oversized orders.
+        actions = [
+            _fuzz_action(rng, observations[0]),
+            starter_agent(observations[1])
+            if rng.random() < 0.5
+            else _fuzz_action(rng, observations[1]),
+        ]
+        _staged(environment, dict(enumerate(actions)))
+        _step(environment, codes)
+        official.step(actions)
+        transitions += 1
+        difference = oracle._first_difference(
+            oracle._official_snapshot(official), json.loads(environment.snapshot_json(0))
+        )
+        assert difference is None, f"transition {transitions}: {difference}"
+    assert transitions == HORIZON
 
 
 def test_worker_structify_and_shaping_match_the_official_runner() -> None:
@@ -235,7 +470,7 @@ def test_script_lanes_play_fresh_namespaces_every_step_of_every_wave(tmp_path, m
     assert statistics["seats"] == 6
     assert statistics["seat_steps"] == 6 * HORIZON
     assert statistics["agent_errors"] == 2 * HORIZON
-    assert statistics["projection_errors"] == 0
+    assert statistics["action_errors"] == 0
     rows = _log_rows(log)
     assert len(rows) == 4
     for calls in rows.values():

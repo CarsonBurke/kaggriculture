@@ -43,13 +43,15 @@ from pathlib import Path
 
 import torch
 
-from kaggriculture.constants import ANIMALS
+from kaggriculture.constants import ANIMALS, CROPS
 from kaggriculture.registry import resolve_architecture
 from kaggriculture.structured import StructuredConfig, StructuredInputs
 from kaggriculture.tokens import (
     ANIMAL_TOKEN_FIELDS,
+    CROP_TOKEN_FIELDS,
     FARM_TOKEN_FIELDS,
     N_TILE_CONTINUOUS,
+    PRODUCT_TOKEN_FIELDS,
     TOWN_TOKEN_FIELDS,
 )
 
@@ -64,9 +66,9 @@ _FIELDS: tuple[tuple[str, torch.dtype, tuple[int, ...]], ...] = (
     ("unit_active", torch.bool, (16,)),
     ("unit_tile_gather", torch.int64, (16, 5)),
     ("unit_tile_gather_valid", torch.bool, (16, 5)),
-    ("products", torch.float32, (9, 5)),
+    ("products", torch.float32, (9, len(PRODUCT_TOKEN_FIELDS))),
     ("animals", torch.float32, (len(ANIMALS), len(ANIMAL_TOKEN_FIELDS))),
-    ("crops", torch.float32, (5, 6)),
+    ("crops", torch.float32, (len(CROPS), len(CROP_TOKEN_FIELDS))),
     ("farms", torch.float32, (2, len(FARM_TOKEN_FIELDS))),
     ("town", torch.float32, (len(TOWN_TOKEN_FIELDS),)),
 )

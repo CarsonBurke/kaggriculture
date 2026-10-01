@@ -5,14 +5,19 @@ import pytest
 import torch
 
 from kaggriculture.league import (
+    LEAGUE_ARCHIVE_PROTECTED_ESTIMATE,
     MATCHUP_EVIDENCE_RETENTION,
     FrozenActorPool,
     SnapshotRef,
     copy_actor_snapshot,
     list_actor_snapshots,
     load_actor_snapshot,
+    matchup_estimate,
+    retired_snapshots,
     save_actor_snapshot,
+    script_game_counts,
     select_league_mix,
+    snapshot_on_archive_grid,
     snapshot_sha256,
     update_matchup_evidence,
     validate_matchup_evidence,
@@ -871,3 +876,144 @@ def test_hardness_discovers_unseen_builtins_before_snapshots_and_sorts_lanes(tmp
     assert selected[-1].key == "builtin_starter"
     assert selected[-1].role == "discovery"
     assert all(row.category != "builtin" for row in selected[:-1])
+
+
+def test_staleness_does_not_make_a_beaten_snapshot_look_hard(tmp_path) -> None:
+    # Snapshot 1 was beaten 90% of the time long ago; snapshots 2-4 are beaten
+    # 70% of the time now. Shrinking stale evidence to even odds would rank 1
+    # as the hardest; its estimate as last measured ranks it the easiest.
+    refs = _snapshot_refs(tmp_path, [1, 2, 3, 4, 5])
+    evidence = {
+        "00000001": {"score_sum": 90.0, "games": 100.0, "last_iteration": 10},
+        **{
+            f"{i:08d}": {"score_sum": 70.0, "games": 100.0, "last_iteration": 499}
+            for i in (2, 3, 4, 5)
+        },
+    }
+    assert matchup_estimate(evidence["00000001"]) == pytest.approx(91 / 102)
+    for seed in range(20):
+        selected = select_league_mix(
+            refs,
+            current_iteration=500,
+            active_count=3,
+            historical_count=0,
+            active_pool_size=16,
+            generator=np.random.default_rng(seed),
+            matchup_evidence=evidence,
+        )
+        hardness = {row.ref.iteration for row in selected if row.role == "hardness"}
+        assert len(hardness) == 2 and 1 not in hardness
+        # The stale snapshot is instead the one refreshed.
+        assert [row.ref.iteration for row in selected if row.role == "probe"] == [1]
+
+
+def test_screening_spreads_lanes_over_the_most_uncertain_stale_snapshots(tmp_path) -> None:
+    refs = _snapshot_refs(tmp_path, range(1, 41))
+    # 1-5 are hard and fresh, 6-39 beaten, older ones longer ago; 40 is unseen.
+    evidence = {
+        f"{i:08d}": {
+            "score_sum": 30.0 if i <= 5 else 90.0,
+            "games": 100.0,
+            "last_iteration": 199 if i <= 5 else 100 + i,
+        }
+        for i in range(1, 40)
+    }
+    selected = select_league_mix(
+        refs,
+        current_iteration=200,
+        active_count=2,
+        historical_count=6,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        matchup_evidence=evidence,
+        screen_lanes=2,
+        screen_opponents=8,
+    )
+    roles = {row.ref.iteration: row.role for row in selected}
+    assert len(selected) == len(roles) == 14
+    assert [i for i, role in roles.items() if role == "discovery"] == [40]
+    assert {i for i, role in roles.items() if role == "hardness"} == {1, 2, 3, 4, 5}
+    # Equal evidence, so the longest unplayed are the most uncertain.
+    assert {i for i, role in roles.items() if role == "screen"} == set(range(6, 14))
+    assert "probe" not in roles.values()
+
+
+def test_screening_needs_room_for_discovery_and_a_hardness_lane(tmp_path) -> None:
+    refs = _snapshot_refs(tmp_path, range(1, 11))
+    selected = select_league_mix(
+        refs,
+        current_iteration=11,
+        active_count=3,
+        historical_count=0,
+        active_pool_size=16,
+        generator=np.random.default_rng(0),
+        screen_lanes=2,
+        screen_opponents=8,
+    )
+    assert sorted(row.role for row in selected) == ["discovery", "hardness", "probe"]
+    with pytest.raises(ValueError, match="both be positive"):
+        select_league_mix(
+            refs,
+            current_iteration=11,
+            active_count=3,
+            historical_count=0,
+            active_pool_size=16,
+            generator=np.random.default_rng(0),
+            screen_lanes=2,
+        )
+
+
+def test_thinned_archive_is_logarithmic_stable_and_keeps_protected_snapshots(tmp_path) -> None:
+    refs = _snapshot_refs(tmp_path, range(1300))
+    retired = {
+        ref.iteration
+        for ref in retired_snapshots(refs, current_iteration=1300, recent=16, evidence={})
+    }
+    kept = set(range(1300)) - retired
+    assert len(kept) == 116
+    assert set(range(1284, 1300)) <= kept and 0 in kept
+    # Spacing only grows with age: nothing retired earlier is due again later.
+    for later in (1301, 1400, 2600):
+        assert not any(snapshot_on_archive_grid(i, later, 16) for i in retired)
+    # A snapshot the learner is not clearly beating is kept whatever its age.
+    hard, easy = sorted(retired)[:2]
+    evidence = {
+        f"{hard:08d}": {"score_sum": 50.0, "games": 100.0, "last_iteration": 3},
+        f"{easy:08d}": {"score_sum": 95.0, "games": 100.0, "last_iteration": 3},
+    }
+    assert matchup_estimate(evidence[f"{hard:08d}"]) < LEAGUE_ARCHIVE_PROTECTED_ESTIMATE
+    again = {
+        ref.iteration
+        for ref in retired_snapshots(refs, current_iteration=1300, recent=16, evidence=evidence)
+    }
+    assert again == retired - {hard}
+
+
+def test_script_games_go_two_each_then_to_opponents_not_yet_beaten() -> None:
+    keys = ["script_a", "script_b", "script_c", "script_d", "script_e"]
+
+    def beaten(rate: float) -> dict:
+        return {"score_sum": 100.0 * rate, "games": 100.0, "last_iteration": 3}
+
+    # Unmeasured opponents are even odds, so the first wave splits evenly.
+    assert script_game_counts(keys, 40, {}).tolist() == [8] * 5
+    counts = script_game_counts(
+        keys,
+        40,
+        {"script_a": beaten(1.0), "script_b": beaten(0.9), "script_c": beaten(0.5)},
+    )
+    assert counts.sum() == 40 and np.all(counts % 2 == 0) and np.all(counts >= 2)
+    assert counts[0] == 2 and counts[0] <= counts[1] < counts[2]
+    everything_beaten = {key: beaten(1.0) for key in keys}
+    assert np.ptp(script_game_counts(keys, 40, everything_beaten)) <= 2
+    with pytest.raises(ValueError, match="at least two"):
+        script_game_counts(keys, 8, {})
+    with pytest.raises(ValueError, match="even"):
+        script_game_counts(keys, 41, {})
+
+
+def test_matchup_evidence_accepts_script_opponent_keys() -> None:
+    record = {"score_sum": 3.0, "games": 8.0, "last_iteration": 4}
+    assert validate_matchup_evidence({"script_bronze-v31": record}, current_iteration=4)
+    with pytest.raises(ValueError, match="invalid league matchup evidence"):
+        validate_matchup_evidence({"script_bad name": record}, current_iteration=4)

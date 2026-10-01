@@ -123,10 +123,11 @@ def arm_config(arm: str):
     # it was designed against, whatever production has since become.
     base = resolve_architecture(ENTITY_ATTENTION).config_class().to_dict()
     if family == LEJEPA:
-        # That contract uses v3; the LeJEPA arms take their family's promoted
-        # schema, and `build_config` keeps the family as these arms defined it,
-        # before its later action-interface and head defaults.
-        base["observation_schema_version"] = architecture.config_class().observation_schema_version
+        # That contract uses v3; the LeJEPA arms take v4, their family's
+        # promoted schema when the campaign was designed, and `build_config`
+        # keeps the family as these arms defined it, before its later schema,
+        # action-interface and head defaults.
+        base["observation_schema_version"] = 4
         return architecture, architecture.build_config(base | changes)
     config = architecture.config_class(**(base | changes))
     return architecture, config

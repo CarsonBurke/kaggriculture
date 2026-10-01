@@ -18,12 +18,65 @@ PUBLIC_V27_ALIASES = frozenset(("v27", "public-v27"))
 PUBLIC_V16_TEACHER = Path("/var/tmp/kaggriculture-boatlee-v16-rc5-main.py")
 PUBLIC_V16_ALIASES = frozenset(("v16", "public-v16"))
 
+# Dynamic reference agents: public Kaggle agents whose play reacts to the state,
+# pinned as machine-local copies like the references above (the files are not
+# ours to commit). An official-engine round robin ranked them
+# (artifacts/probes/teachers-20260930/round-robin.jsonl: fourteen agents, four
+# seeds, both seats); agents that played identically there are one family and
+# appear once, under its first member (flex and cha22 are demand-timing,
+# top-2-master-v4 is demand-preserving). Every one matches the official engine
+# exactly when played natively. Families of near-identical play stay on one
+# side of the split below.
+REFERENCE_AGENT_DIR = Path("/var/tmp/kaggriculture-reference-agents")
+REFERENCE_AGENTS = (
+    "demand-preserving",
+    "demand-timing",
+    "demand-advance4",
+    "hybrid-2965",
+    "harvest-ledger",
+    "idle-seller",
+    "shepherds-ledger",
+    "master-engine-v53",
+    "bronze-v31",
+    "kaito-v48",
+)
+# What the learner trains against as fixed league lanes...
+LEAGUE_REFERENCE_AGENTS = (
+    "demand-timing",
+    "hybrid-2965",
+    "harvest-ledger",
+    "master-engine-v53",
+    "bronze-v31",
+)
+# ...and what it is scored against and never trains on, so a gain there is
+# transfer. It holds the strongest family (demand-preserving, first in the
+# round robin), demand-advance4, the idle-seller/shepherds family, and kaito-v48,
+# whose early sales collapse the prices a neural agent sells into.
+HELDOUT_REFERENCE_AGENTS = (
+    "demand-preserving",
+    "demand-advance4",
+    "idle-seller",
+    "shepherds-ledger",
+    "kaito-v48",
+)
+
+
+def reference_agent_path(name: str) -> Path:
+    """The pinned copy of a named reference agent."""
+    if name not in REFERENCE_AGENTS:
+        raise KeyError(f"not a reference agent: {name!r}")
+    path = REFERENCE_AGENT_DIR / f"{name}.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"reference agent {name} is unavailable: {path}")
+    return path
+
 
 def normalize_opponent(opponent: str) -> tuple[str, str]:
     """Resolve an opponent spec to a stable label and a runnable reference.
 
     Built-in engine agents pass through by name; the public v27 and v16 aliases
-    pin the known local copies; anything else must be an existing Python agent file.
+    and the reference agents' names pin the known local copies; anything else
+    must be an existing Python agent file.
 
     Labels are display names and may collide with built-ins (an agent file
     literally named ``starter``). Consumers deciding whether a digest exists
@@ -42,6 +95,8 @@ def normalize_opponent(opponent: str) -> tuple[str, str]:
         if not path.is_file():
             raise FileNotFoundError(f"public v16 teacher is unavailable: {path}")
         return "public-v16", str(path)
+    if opponent in REFERENCE_AGENTS:
+        return opponent, str(reference_agent_path(opponent))
     path = Path(opponent).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"opponent does not exist: {path}")

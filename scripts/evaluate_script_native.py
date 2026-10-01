@@ -10,11 +10,11 @@ worker processes (`kaggriculture.script_opponents`), a fresh agent namespace
 per game seat as Kaggle gives it.
 
 The summary has the official evaluator's shape and statistics, but this is a
-screening instrument, not admission evidence: the native engine and the
-opponent's action projection agree with the official engine to about 0.1% of
-bank rather than bit-exactly. ``--parity-seeds`` measures that directly on the
-report's own games: it replays the candidate's recorded native actions in
-`kaggle_environments` against the real opponent file and compares both banks.
+screening instrument, not admission evidence: the opponent's turns execute
+natively exactly as submitted, yet only a replay proves this report's games
+match. ``--parity-seeds`` measures that directly: it replays the candidate's
+recorded native actions in `kaggle_environments` against the real opponent
+file and compares both banks.
 """
 
 from __future__ import annotations
@@ -135,9 +135,9 @@ def parity_check(
 
     The replay is open-loop, so it measures exactly what this report depends
     on: whether the opponent file, run natively, meets the candidate's actions
-    the way it would in the official engine. Any divergence it finds (the
-    projection's partial-deposit relabel, an engine mismatch) compounds over
-    the game, so a small final gap bounds every step's.
+    the way it would in the official engine. Any divergence it finds (an
+    engine mismatch, an agent that behaves differently natively) compounds
+    over the game, so a small final gap bounds every step's.
     """
     tasks = [
         (
@@ -238,11 +238,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         for game in range(games)
     ]
     summary = summarize(results, args.seeds)
-    # A seed's agent errors play PASS, which the official runner would forfeit.
+    # An errored turn plays PASS, where the official runner would forfeit the
+    # seat or fail the episode.
     summary["valid_for_selection"] = bool(
         summary["valid_for_selection"]
         and not script_statistics["agent_errors"]
-        and not script_statistics["projection_errors"]
+        and not script_statistics["action_errors"]
     )
     parity = (
         parity_check(
@@ -378,7 +379,7 @@ def main() -> None:
     headline["wave_seconds"] = payload["timing"]["wave_seconds"]
     headline["elapsed_seconds"] = payload["elapsed_seconds"]
     headline["script_errors"] = (
-        payload["script_opponent"]["agent_errors"] + payload["script_opponent"]["projection_errors"]
+        payload["script_opponent"]["agent_errors"] + payload["script_opponent"]["action_errors"]
     )
     parity = payload["parity"]
     if parity is not None:

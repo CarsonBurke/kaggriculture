@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -56,9 +57,13 @@ from kaggriculture.league import (
     copy_actor_snapshot,
     list_actor_snapshots,
     load_actor_snapshot,
+    opponent_key,
+    retired_snapshots,
     save_actor_snapshot,
     save_actor_state_snapshot,
+    script_game_counts,
     select_league_mix,
+    snapshot_on_archive_grid,
     snapshot_sha256,
     update_matchup_evidence,
     validate_matchup_evidence,
@@ -100,9 +105,15 @@ from kaggriculture.production import (
     PRODUCTION_ARCHITECTURE_PANEL,
     PRODUCTION_CRITIC_WARMUP_ITERATIONS,
     PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS,
+    PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
+    PRODUCTION_LEAGUE_ARCHIVE_RECENT,
     PRODUCTION_LEAGUE_BUILTIN_LANES,
     PRODUCTION_LEAGUE_BUILTIN_OPPONENTS,
     PRODUCTION_LEAGUE_GAMES,
+    PRODUCTION_LEAGUE_SCREEN_LANES,
+    PRODUCTION_LEAGUE_SCRIPT_ALLOCATION,
+    PRODUCTION_LEAGUE_SCRIPT_GAMES,
+    PRODUCTION_LEAGUE_SCRIPT_OPPONENTS,
     PRODUCTION_LEAGUE_SELECTION,
     PRODUCTION_ROLLOUT_FORWARD_MODE,
     PRODUCTION_SELF_PLAY_GAMES,
@@ -135,7 +146,7 @@ from kaggriculture.rollout import (
 )
 from kaggriculture.rust_env import toolchain_identity
 from kaggriculture.script_opponents import ScriptAgentPool, ScriptOpponent, parse_script_opponent
-from kaggriculture.structured import StructuredConfig
+from kaggriculture.structured import StructuredConfig, schema_upgraded_state
 from kaggriculture.structured_dynamics import StructuredCriticDynamics
 from kaggriculture.telemetry import (
     TensorboardMirror,
@@ -166,6 +177,10 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 from autocull_hook import CULL, _better, _ema  # noqa: E402
+
+#: EX_IOERR from sysexits.h, distinct from the autocull hook's `CULL`: the run
+#: stopped cleanly on a committed checkpoint and resumes once space is freed.
+LOW_DISK = 74
 
 MIN_CHECKPOINT_SECONDS = 300.0
 MAX_CHECKPOINT_SECONDS = 600.0
@@ -426,16 +441,49 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="a Kaggle agent file played natively as a fixed league lane (repeatable); "
-        "journaled as league_script_NAME_*",
+        help="a Kaggle agent file, or a reference agent's name, played natively as a "
+        "fixed league lane (repeatable); journaled as league_script_NAME_*. With "
+        "--league-script-games, defaults to the reference agents "
+        f"{','.join(PRODUCTION_LEAGUE_SCRIPT_OPPONENTS)} for a single learner",
     )
     parser.add_argument(
         "--league-script-games",
         type=int,
-        default=0,
+        default=None,
         help="script-opponent games per wave, on top of --league-games and never "
-        "contested by league selection: split evenly over the script opponents and "
-        "seats, trained as league rows, and excluded from PFSP and hardness evidence",
+        "contested by league selection: split over the script opponents per "
+        "--league-script-allocation, balanced over seats, trained as league rows, and "
+        "excluded from PFSP and snapshot hardness evidence. "
+        f"Defaults to {PRODUCTION_LEAGUE_SCRIPT_GAMES} for a single learner and 0 for a "
+        "population when neither script flag is given, and to 0 when only the agents are",
+    )
+    parser.add_argument(
+        "--league-script-allocation",
+        choices=("hardness", "even"),
+        default=PRODUCTION_LEAGUE_SCRIPT_ALLOCATION,
+        help="hardness (default): two games per script opponent and the rest by "
+        "(1 - estimated learner score)^2, from discounted per-opponent evidence; "
+        "even: the same games against every opponent",
+    )
+    parser.add_argument(
+        "--league-screen-lanes",
+        type=int,
+        default=None,
+        help="hardness lanes whose games are spread two apiece (one per seat) over the "
+        "most uncertain stale opponents instead of refreshing one; defaults to "
+        f"{PRODUCTION_LEAGUE_SCREEN_LANES} for a single learner in hardness selection "
+        "whose league has room for it, else 0 (one refresh lane)",
+    )
+    parser.add_argument(
+        "--league-archive-recent",
+        type=int,
+        default=None,
+        help="thin the snapshot archive at each checkpoint: keep this many latest "
+        "snapshots, older ones at spacing doubling with age, iteration zero, and any "
+        "the learner is not clearly beating, and delete the rest. A thinned run "
+        "resumes only from a checkpoint whose archive is still on disk, normally "
+        f"the latest. Defaults to {PRODUCTION_LEAGUE_ARCHIVE_RECENT} for a single "
+        "learner; 0 keeps every snapshot",
     )
     parser.add_argument(
         "--league-script-workers",
@@ -450,8 +498,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--external-eval-opponents",
-        default="starter,public-v27",
-        help="comma-separated opponents forwarded to external_eval_worker.py",
+        default=PRODUCTION_EXTERNAL_EVAL_OPPONENTS,
+        help="comma-separated opponents forwarded to external_eval_worker.py; defaults to "
+        "the held-out reference agents",
     )
     parser.add_argument("--external-eval-seeds", type=int, default=2)
     parser.add_argument("--external-eval-seed-start", type=int, default=DEVELOPMENT_SEED_START)
@@ -842,6 +891,19 @@ def parse_args() -> argparse.Namespace:
             "comes from uses 0.60"
         ),
     )
+    parser.add_argument(
+        "--min-free-disk-gb",
+        type=float,
+        default=0.0,
+        help=(
+            "checkpoint and exit with status "
+            f"{LOW_DISK} once the run directory's filesystem has less than this "
+            "many GB free; zero disables it. It is measured before each wave's "
+            "snapshot and checkpoint are written, so it must exceed one of each. "
+            "Without --league-archive-recent, league snapshots are never pruned and "
+            "a long run grows by roughly 1.5 GB an hour"
+        ),
+    )
     args = parser.parse_args()
     if args.init_actor_from is not None and args.critic_warmup_iterations is None:
         args.critic_warmup_iterations = DEFAULT_CRITIC_WARMUP_ITERATIONS
@@ -865,6 +927,28 @@ def parse_args() -> argparse.Namespace:
         args.league_builtin_opponents = ""
     if args.league_builtin_lanes is None:
         args.league_builtin_lanes = 0
+    # The script lanes and their games are one decision in the same way.
+    if not args.league_script_opponent and args.league_script_games is None:
+        args.league_script_opponent = list(PRODUCTION_LEAGUE_SCRIPT_OPPONENTS) if single else []
+        args.league_script_games = PRODUCTION_LEAGUE_SCRIPT_GAMES if single else 0
+    if args.league_script_games is None:
+        args.league_script_games = 0
+    if args.league_screen_lanes is None:
+        # Only a league with room beside screening for discovery and a hardness
+        # lane, and two games per screen lane, screens by default.
+        lanes = _league_lanes(args)
+        args.league_screen_lanes = (
+            PRODUCTION_LEAGUE_SCREEN_LANES
+            if single
+            and args.league_selection == "hardness"
+            and lanes >= PRODUCTION_LEAGUE_SCREEN_LANES + 2
+            and args.league_games // lanes >= 2
+            else 0
+        )
+    if args.league_archive_recent is None:
+        args.league_archive_recent = (
+            PRODUCTION_LEAGUE_ARCHIVE_RECENT if single and args.league_games else 0
+        )
     if args.architecture_panel is None:
         args.architecture_panel = production_architecture_panel(
             population=args.population,
@@ -1034,6 +1118,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     # the update to near-zero optimizer steps silently rather than erroring.
     if not math.isfinite(args.target_kl) or args.target_kl <= 0.0:
         raise ValueError("target KL must be finite and positive")
+    if not math.isfinite(args.min_free_disk_gb) or args.min_free_disk_gb < 0.0:
+        raise ValueError("minimum free disk must be finite and non-negative")
     if not math.isfinite(args.entropy_coefficient) or args.entropy_coefficient < 0.0:
         raise ValueError("entropy coefficient must be finite and non-negative")
     if args.policy_ratio_scope == "joint" and args.policy_loss_reduction != "states":
@@ -1173,6 +1259,26 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--league-script-opponent and --league-script-games must be set together")
     if args.league_script_games and args.league_script_games < len(scripts):
         raise ValueError("league script games must cover every script opponent")
+    if (
+        scripts
+        and args.league_script_allocation == "hardness"
+        and (args.league_script_games % 2 or args.league_script_games < 2 * len(scripts))
+    ):
+        raise ValueError(
+            "hardness script allocation needs even script games, at least two per opponent"
+        )
+    if args.league_archive_recent < 0:
+        raise ValueError("league archive recent count cannot be negative")
+    if args.league_screen_lanes < 0:
+        raise ValueError("league screen lanes cannot be negative")
+    if args.league_screen_lanes:
+        if args.league_selection != "hardness":
+            raise ValueError("league screening is part of hardness selection")
+        # Discovery, at least one hardness lane, and the screen lanes.
+        if args.league_screen_lanes + 2 > configured_opponents:
+            raise ValueError("league screen lanes leave no room for discovery and a hardness lane")
+        if _league_screen_opponents(args) < 1:
+            raise ValueError("league screen lanes need at least two games per lane")
     _validate_population(args)
     if args.critic_warmup_iterations is not None and args.critic_warmup_iterations < 0:
         raise ValueError("critic warmup iterations cannot be negative")
@@ -1251,7 +1357,9 @@ def _load_initial_actor(
     """Initialize a fresh run's actor from a pretrained actor artifact.
 
     The artifact must carry the same actor configuration; critic-only fields
-    may differ. The critic and both optimizers deliberately start fresh —
+    may differ, and so may two upgrades that start out acting as the artifact
+    does: a zero-residual affordance scorer, and a newer observation schema
+    (`schema_upgraded_state`). The critic and both optimizers deliberately start fresh —
     a clone brings no value function — and the pre-loop league snapshot seeds
     the archive with the pretrained policy automatically, so the learner must keep
     beating its own starting point.
@@ -1269,15 +1377,35 @@ def _load_initial_actor(
         artifact_architecture.build_config(payload["model_config"])
     )
     expected_config = actor_model_config(model_config)
+    differences = {
+        name
+        for name in expected_config.keys() | artifact_config.keys()
+        if expected_config.get(name) != artifact_config.get(name)
+    }
     affordance_upgrade = (
         architecture_name == "lejepa"
         and expected_config.get("unit_affordance_scorer") is True
         and artifact_config.get("unit_affordance_scorer") is False
-        and {**expected_config, "unit_affordance_scorer": False} == artifact_config
     )
-    if artifact_config != expected_config and not affordance_upgrade:
+    # A newer observation schema only appends input columns, and the economy
+    # embedders give the ones the artifact's schema lacks zero weight, so the
+    # upgraded actor starts out acting as the artifact did.
+    # A config without the field (a non-structured family) cannot upgrade.
+    artifact_schema = artifact_config.get("observation_schema_version")
+    expected_schema = expected_config.get("observation_schema_version")
+    schema_upgrade = (
+        artifact_schema is not None
+        and expected_schema is not None
+        and artifact_schema < expected_schema
+    )
+    upgrades = {
+        "unit_affordance_scorer": affordance_upgrade,
+        "observation_schema_version": schema_upgrade,
+    }
+    if differences - {name for name, allowed in upgrades.items() if allowed}:
         raise ValueError("initial actor artifact model configuration does not match arguments")
-    incompatible = actor.load_state_dict(pretrained.state_dict(), strict=not affordance_upgrade)
+    state = schema_upgraded_state(actor, pretrained) if schema_upgrade else pretrained.state_dict()
+    incompatible = actor.load_state_dict(state, strict=not affordance_upgrade)
     if affordance_upgrade:
         scorer = actor.unit_affordance
         if (
@@ -1361,8 +1489,22 @@ def _balanced_assignments(
     """Balance total games and seed-determined seats for every opponent."""
     if games < 1 or opponents < 1:
         raise ValueError("balanced assignments require positive games and opponents")
-
     totals = np.bincount(np.arange(games, dtype=np.int64) % opponents, minlength=opponents)
+    return _seat_balanced_assignments(totals, generator, seed_start=seed_start)
+
+
+def _seat_balanced_assignments(
+    totals: np.ndarray,
+    generator: np.random.Generator,
+    *,
+    seed_start: int = 0,
+) -> np.ndarray:
+    """Give opponent `k` exactly `totals[k]` games, its seats as even as they can be."""
+    totals = np.asarray(totals, dtype=np.int64)
+    if totals.ndim != 1 or totals.size < 1 or np.any(totals < 0) or totals.sum() < 1:
+        raise ValueError("seat-balanced assignments require non-negative per-opponent games")
+    opponents = totals.size
+    games = int(totals.sum())
     seat_zero_games = (games + (seed_start % 2 == 0)) // 2
     seat_zero_counts = totals // 2
     odd_opponents = np.flatnonzero(totals % 2)
@@ -2218,6 +2360,35 @@ def _wave_games(args: argparse.Namespace, population: int) -> int:
     return args.games + args.league_games + args.league_script_games
 
 
+def _league_lanes(args: argparse.Namespace) -> int:
+    """Snapshot and built-in lanes the league budget is divided over."""
+    return (
+        args.league_active_opponents
+        + args.league_historical_opponents
+        + min(args.league_builtin_lanes, len(_league_builtin_opponents(args)))
+    )
+
+
+def _league_screen_opponents(args: argparse.Namespace) -> int:
+    """Opponents the screen lanes cover at two games apiece."""
+    if not args.league_screen_lanes:
+        return 0
+    return args.league_screen_lanes * (args.league_games // _league_lanes(args)) // 2
+
+
+def _league_selection_games(
+    args: argparse.Namespace, selections: Sequence[LeagueSelection]
+) -> np.ndarray:
+    """Games per selected opponent: two per screened one, the rest split evenly."""
+    screened = np.asarray([row.role == "screen" for row in selections])
+    counts = np.zeros(len(selections), dtype=np.int64)
+    counts[screened] = 2
+    full = np.flatnonzero(~screened)
+    remaining = args.league_games - int(counts.sum())
+    counts[full] = np.bincount(np.arange(remaining) % full.size, minlength=full.size)
+    return counts
+
+
 def _select_league_opponents(
     args: argparse.Namespace,
     refs: Sequence[SnapshotRef],
@@ -2244,6 +2415,8 @@ def _select_league_opponents(
         pretrained_start=pretrained_start,
         selection_mode=args.league_selection,
         matchup_evidence=matchup_evidence,
+        screen_lanes=args.league_screen_lanes,
+        screen_opponents=_league_screen_opponents(args),
     )
     if len(selections) > args.league_games:
         raise ValueError("league game budget cannot cover the selected opponent mix")
@@ -2277,6 +2450,9 @@ def _training_data_config(args: argparse.Namespace, device: torch.device) -> dic
             for script in _league_script_opponents(args)
         ],
         "league_script_games": args.league_script_games,
+        "league_script_allocation": args.league_script_allocation,
+        "league_screen_lanes": args.league_screen_lanes,
+        "league_archive_recent": args.league_archive_recent,
         "episode_steps": args.episode_steps,
         "temperature": args.temperature,
         "reward_mode": args.reward_mode,
@@ -2398,6 +2574,32 @@ def _rollback_metrics_journal(
         temporary.unlink(missing_ok=True)
 
 
+def _retire_league_snapshots(
+    refs: list[SnapshotRef],
+    manifest: dict[int, str],
+    evidence: dict[str, MatchupEvidence],
+    score_rates: dict[str, float],
+    *,
+    iteration: int,
+    recent: int,
+) -> list[SnapshotRef]:
+    """Drop the snapshots a thinned archive retires from all selection state.
+
+    Returns them for the caller to delete once a checkpoint without them is
+    written; ``recent`` zero keeps every snapshot.
+    """
+    if not recent:
+        return []
+    retired = retired_snapshots(refs, current_iteration=iteration, recent=recent, evidence=evidence)
+    for ref in retired:
+        del manifest[ref.iteration]
+        evidence.pop(opponent_key(ref), None)
+        score_rates.pop(opponent_key(ref), None)
+    gone = set(retired)
+    refs[:] = [ref for ref in refs if ref not in gone]
+    return retired
+
+
 def _restore_league_archive(
     *,
     checkpoint: Path,
@@ -2405,6 +2607,7 @@ def _restore_league_archive(
     manifest: dict[int, str],
     current_iteration: int,
     model_config: ModelConfig | StructuredConfig | EntityConfig,
+    archive_recent: int = 0,
 ) -> None:
     """Restore exactly the immutable archive bound to a training checkpoint."""
     source_directory = checkpoint.resolve().parent / "league"
@@ -2416,6 +2619,17 @@ def _restore_league_archive(
     rollback: list[SnapshotRef] = []
     for name in sorted(unexpected):
         ref = existing_by_name[name]
+        if (
+            archive_recent
+            and ref.iteration < current_iteration
+            and not snapshot_on_archive_grid(ref.iteration, current_iteration, archive_recent)
+        ):
+            # Retired into this checkpoint, then interrupted before deletion:
+            # a thinned archive keeps nothing off its grid that the manifest
+            # does not name.
+            load_actor_snapshot(ref.path, expected_model_config=model_config, device="cpu")
+            rollback.append(ref)
+            continue
         if ref.iteration <= current_iteration:
             raise ValueError(
                 "resume destination contains a league snapshot missing from the "
@@ -2645,6 +2859,11 @@ def _structured_persistence_diagnostics(
             }
         )
     return telemetry
+
+
+def _disk_below(path: Path, min_free_gb: float) -> bool:
+    """Whether `path`'s filesystem has less than `min_free_gb` free; zero never is."""
+    return bool(min_free_gb) and shutil.disk_usage(path).free < min_free_gb * 1e9
 
 
 def _entropy_reference_record(
@@ -3290,6 +3509,23 @@ def _train(
             seed_usage.append(panel_interval)
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
+    # Refused before anything is written: a supervisor that restarts on this
+    # status must not churn a checkpoint per attempt into the last free space.
+    if _disk_below(args.run_dir, args.min_free_disk_gb):
+        print(
+            "LOW_DISK "
+            + json.dumps(
+                {
+                    "exit_code": LOW_DISK,
+                    "run_dir": str(args.run_dir),
+                    "free_gb": shutil.disk_usage(args.run_dir).free / 1e9,
+                    "min_free_gb": args.min_free_disk_gb,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(LOW_DISK)
     journal_path = args.run_dir / "metrics.jsonl"
     journal_iteration = metrics_journal_iteration(journal_path)
     if resume_payload is not None and journal_iteration > iteration:
@@ -3377,6 +3613,7 @@ def _train(
                 manifest=league_snapshot_manifest,
                 current_iteration=iteration,
                 model_config=model_config,
+                archive_recent=args.league_archive_recent,
             )
     serialized_arguments = {name: _recorded_argument(value) for name, value in vars(args).items()}
     serialized_arguments["resume"] = str(args.resume or "")
@@ -3464,6 +3701,21 @@ def _train(
 
     def publish_checkpoint(payload: dict[str, Any]) -> Path:
         committed = int(payload["iteration"])
+        # Thin the archive into this checkpoint: it records the archive without
+        # the retired snapshots, and they are deleted only once it is written.
+        # A crash in between leaves them on disk, off the manifest; resuming
+        # recognizes them as retired (`_restore_league_archive`).
+        retired = _retire_league_snapshots(
+            league_snapshot_refs,
+            league_snapshot_manifest,
+            league_matchup_evidence,
+            league_score_rates,
+            iteration=committed,
+            recent=args.league_archive_recent,
+        )
+        if retired:
+            payload["league_matchup_evidence"] = copy.deepcopy(league_matchup_evidence)
+            payload["league_score_rates"] = dict(league_score_rates)
         payload["league_snapshot_manifest"] = dict(league_snapshot_manifest)
         checkpoint = args.run_dir / f"checkpoint-{committed:06d}.pt"
         if checkpoint.exists():
@@ -3476,6 +3728,9 @@ def _train(
         else:
             write_immutable_checkpoint(checkpoint, payload)
         replace_checkpoint_alias(checkpoint, args.run_dir / "latest.pt")
+        if retired:
+            for ref in retired:
+                ref.path.unlink()
         return checkpoint
 
     def commit_iteration(
@@ -3600,8 +3855,10 @@ def _train(
     compile_watch = CompileWatch()
     previous_lane_signature: tuple[tuple[int, int], ...] | None = None
     previous_warmup_active: bool | None = None
+    disk_low = False
     while (
-        iteration < args.iterations
+        not disk_low
+        and iteration < args.iterations
         and not _actor_wave_budget_reached(args.actor_waves, architecture_panel)
         and not (autocull is not None and autocull.culled)
         and not (architecture_panel is not None and architecture_panel.culled)
@@ -3745,9 +4002,8 @@ def _train(
                     row.ref.name for row in selections if isinstance(row, BuiltinSelection)
                 ]
                 opponents = opponent_pool.acquire([row.ref.path for row in snapshots])
-                assignments = _balanced_assignments(
-                    selected_games,
-                    len(selections),
+                assignments = _seat_balanced_assignments(
+                    _league_selection_games(args, selections),
                     generator,
                     seed_start=next_seed + args.games,
                 )
@@ -3755,9 +4011,20 @@ def _train(
             if script_games:
                 # Script lanes follow every selected lane, the collector's lane
                 # order, and play fixed games that selection never contests.
-                script_assignments = len(selections) + _balanced_assignments(
-                    script_games,
-                    len(script_opponents),
+                script_totals = (
+                    script_game_counts(
+                        [script.key for script in script_opponents],
+                        script_games,
+                        league_matchup_evidence,
+                    )
+                    if args.league_script_allocation == "hardness"
+                    else np.bincount(
+                        np.arange(script_games) % len(script_opponents),
+                        minlength=len(script_opponents),
+                    )
+                )
+                script_assignments = len(selections) + _seat_balanced_assignments(
+                    script_totals,
                     generator,
                     seed_start=next_seed + args.games + selected_games,
                 )
@@ -3854,6 +4121,7 @@ def _train(
                     for name, value in rollout_diagnostics(league_part).items()
                     if name not in indivisible_timings
                 }
+                league_diagnostics["league_archive_snapshots"] = len(league_snapshot_refs)
                 assert assignments is not None
             if selected_games:
                 opponent_diagnostics, measured_rates = _league_opponent_diagnostics(
@@ -3863,16 +4131,28 @@ def _train(
             if script_games:
                 assert script_pool is not None
                 # Reported beside the selected lanes but never folded into PFSP
-                # rates or hardness evidence: selection does not choose them.
-                league_diagnostics.update(
-                    _league_script_diagnostics(
-                        league_part,
-                        assignments,
-                        len(selections),
-                        script_opponents,
-                        script_pool.take_statistics(),
-                    )
+                # rates or snapshot hardness: selection does not choose them.
+                # Their own evidence decides how their games are split.
+                script_diagnostics = _league_script_diagnostics(
+                    league_part,
+                    assignments,
+                    len(selections),
+                    script_opponents,
+                    script_pool.take_statistics(),
                 )
+                league_diagnostics.update(script_diagnostics)
+                if args.league_script_allocation == "hardness":
+                    update_matchup_evidence(
+                        league_matchup_evidence,
+                        {
+                            script.key: (
+                                int(script_diagnostics[f"league_{script.key}_games"]),
+                                float(script_diagnostics[f"league_{script.key}_score_rate"]),
+                            )
+                            for script in script_opponents
+                        },
+                        iteration=iteration,
+                    )
             _blend_league_score_rates(league_score_rates, measured_rates)
             if args.league_selection == "hardness":
                 update_matchup_evidence(
@@ -4110,6 +4390,12 @@ def _train(
             or (autocull is not None and autocull.culled)
             or (architecture_panel is not None and architecture_panel.culled)
         )
+        # Only a stop for want of space is one: a finished or culled run keeps
+        # its own status, so a supervisor never restarts it into the refusal
+        # below. Measured before this wave's snapshot and checkpoint land, so
+        # the threshold has to leave room for them.
+        disk_low = not clean_final and _disk_below(args.run_dir, args.min_free_disk_gb)
+        clean_final = clean_final or disk_low
         recovery_due = clean_final or panel_evaluated or checkpoint_timer.due(checkpoint_now)
         recovery_payload = build_recovery_payload(metrics) if recovery_due else None
         if recovery_due:
@@ -4155,7 +4441,18 @@ def _train(
     # The max-hours boundary can become true while the last asynchronous
     # journal/snapshot commit finishes. Force that clean terminal state once,
     # but never rewrite an iteration already committed as periodic or final.
-    if last_checkpoint_iteration != iteration:
+    if disk_low:
+        # The stop committed its own checkpoint. Its evaluation is queued for
+        # the resume rather than run into the last free space here; a worker
+        # already running finishes, so the resume never races it.
+        if args.external_eval and completed_checkpoint is not None:
+            pending = _external_eval_pending(args)
+            if completed_checkpoint not in pending:
+                pending.append(completed_checkpoint)
+                _persist_external_eval_pending(args, pending)
+        if external_eval_process is not None:
+            external_eval_process.wait()
+    elif last_checkpoint_iteration != iteration:
         final_checkpoint = publish_checkpoint(build_recovery_payload(last_metrics))
         external_eval_process = _maybe_launch_external_eval(
             args,
@@ -4178,6 +4475,30 @@ def _train(
         )
     commit_executor.shutdown(wait=True)
     writer.close()
+    if disk_low:
+        # A resume validates the league archive against the checkpoint's
+        # manifest, so the last snapshot must be as durable as the checkpoint.
+        with destination_latest.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if league_snapshot_refs:
+            with league_snapshot_refs[-1].path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            _fsync_directory(league_directory)
+        _fsync_directory(args.run_dir)
+        print(
+            "LOW_DISK "
+            + json.dumps(
+                {
+                    "exit_code": LOW_DISK,
+                    "checkpoint": str(destination_latest),
+                    "free_gb": shutil.disk_usage(args.run_dir).free / 1e9,
+                    "min_free_gb": args.min_free_disk_gb,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise SystemExit(LOW_DISK)
     if architecture_panel is not None and architecture_panel.culled:
         with destination_latest.open("rb") as stream:
             os.fsync(stream.fileno())
