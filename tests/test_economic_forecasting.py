@@ -49,11 +49,16 @@ def test_future_indices_respect_terminal_holes_and_owned_rows():
 
 def test_features_have_fixed_scales_ownership_and_no_static_clock_targets():
     states = _states(1, 3)
-    states["products"][0, :, 0] = [1, 2, 99, 3, 4]
-    states["critic_products"][0, :, 0] = [5, 6]
-    states["animals"][0, :, 0] = [99, 7, 8]
+    # Through the stock columns; later schemas' valuation columns are not labels.
+    states["products"][0, :, 0, :5] = [1, 2, 99, 3, 4]
+    states["products"][0, :, 0, 5:] = 99
+    states["critic_products"][0, :, 0, :2] = [5, 6]
+    states["critic_products"][0, :, 0, 2:] = 99
+    states["animals"][0, :, 0, :3] = [99, 7, 8]
+    states["animals"][0, :, 0, 3:] = 99
     states["critic_animals"][0, :, 0] = [9, 10]
     states["crops"][0, :, 0, 1] = 11
+    states["crops"][0, :, 0, 6:] = 99
     states["critic_crops"][0, :, 0, 0] = 12
     states["town"][..., :6] = 99
     states["town"][..., 6:14] = np.arange(8) / 8

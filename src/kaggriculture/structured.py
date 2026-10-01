@@ -55,7 +55,6 @@ from kaggriculture.tokens import (
     DEFAULT_OBSERVATION_SCHEMA_VERSION,
     N_TILE_CONTINUOUS,
     N_UNIT_CONTINUOUS,
-    PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
     QUADRANT_COUNT,
     SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
@@ -64,6 +63,8 @@ from kaggriculture.tokens import (
     TILE_OCCUPANTS,
     UNIT_ROLES,
     UNIT_TILE_GATHERS,
+    animal_token_fields,
+    crop_token_fields,
     farm_token_fields,
     product_private_fields,
     product_token_fields,
@@ -987,18 +988,18 @@ class EconomyEmbedder(nn.Module):
         super().__init__()
         width = config.model_dim
         schema = config.observation_schema_version
-        # Staged product tokens carry the newest schema's columns and, in a
-        # critic's input, the newest private columns after them; this model
-        # reads the prefix of each its own schema defines.
+        # Staged product, animal and crop tokens carry the newest schema's
+        # columns and, in a critic's input, the newest private columns after
+        # them; this model reads the prefix of each its own schema defines.
         self.product_width = len(product_token_fields(schema))
-        self.product_private_width = (
-            len(product_private_fields(schema)) if private_columns else 0
-        )
+        self.product_private_width = len(product_private_fields(schema)) if private_columns else 0
         product_width = self.product_width + self.product_private_width
-        crop_width = len(CROP_TOKEN_FIELDS) + (len(CROP_PRIVATE_FIELDS) if private_columns else 0)
-        animal_width = len(ANIMAL_TOKEN_FIELDS) + (
-            len(ANIMAL_PRIVATE_FIELDS) if private_columns else 0
-        )
+        self.animal_width = len(animal_token_fields(schema))
+        self.animal_private_width = len(ANIMAL_PRIVATE_FIELDS) if private_columns else 0
+        animal_width = self.animal_width + self.animal_private_width
+        self.crop_width = len(crop_token_fields(schema))
+        self.crop_private_width = len(CROP_PRIVATE_FIELDS) if private_columns else 0
+        crop_width = self.crop_width + self.crop_private_width
         self.private_columns = private_columns
         self.split_clock = config.split_clock_token
         self.product_identity = nn.Embedding(len(PRODUCTS), width)
@@ -1028,6 +1029,12 @@ class EconomyEmbedder(nn.Module):
         products = _schema_columns(
             products, self.product_width, len(PRODUCT_TOKEN_FIELDS), self.product_private_width
         )
+        animals = _schema_columns(
+            animals, self.animal_width, len(ANIMAL_TOKEN_FIELDS), self.animal_private_width
+        )
+        crops = _schema_columns(
+            crops, self.crop_width, len(CROP_TOKEN_FIELDS), self.crop_private_width
+        )
         tokens = [
             self.product_projection(products.to(dtype)) + self.product_identity.weight,
             self.animal_projection(animals.to(dtype)) + self.animal_identity.weight,
@@ -1046,6 +1053,64 @@ class EconomyEmbedder(nn.Module):
                 )
             )
         return torch.cat(tokens, dim=1)
+
+    def widened_state(self, source: EconomyEmbedder) -> dict[str, Tensor]:
+        """``source``'s parameters laid out for this embedder's newer schema.
+
+        Every schema appends its columns (the private ones after the public
+        prefix), so each of ``source``'s input columns has a place here. Its
+        weights move there and every column only this schema reads gets zero
+        weight; the raw columns meet nothing before the projection, so the
+        widened embedder computes ``source``'s embedding plus exact zeros on
+        any staged tokens. GEMM kernels may still reassociate the older terms
+        differently for a wider operand, so equality is exact in real
+        arithmetic and to rounding in floating point.
+        """
+        if (self.private_columns, self.split_clock) != (source.private_columns, source.split_clock):
+            raise ValueError("a schema upgrade cannot change the embedder's token layout")
+
+        def placed(public: int, private: int, widened_public: int) -> list[int]:
+            # The source's public prefix, then its private one after ours.
+            return [*range(public), *range(widened_public, widened_public + private)]
+
+        columns = {
+            "product_projection": placed(
+                source.product_width, source.product_private_width, self.product_width
+            ),
+            "animal_projection": placed(
+                source.animal_width, source.animal_private_width, self.animal_width
+            ),
+            "crop_projection": placed(
+                source.crop_width, source.crop_private_width, self.crop_width
+            ),
+            "farm_projection": range(source.farm_width),
+            # With a split clock this projection reads the columns after the six
+            # clock ones, which are a prefix there too.
+            "town_projection": range(source.town_projection.in_features),
+        }
+        state = source.state_dict()
+        for name, placement in columns.items():
+            weight = state[f"{name}.weight"]
+            widened = weight.new_zeros(getattr(self, name).weight.shape)
+            widened[:, list(placement)] = weight
+            state[f"{name}.weight"] = widened
+        return state
+
+
+def schema_upgraded_state(target: nn.Module, source: nn.Module) -> dict[str, Tensor]:
+    """``source``'s state dict for ``target``, the same model on a newer schema.
+
+    Each of ``target``'s economy embedders takes ``source``'s at the same path,
+    widened by `EconomyEmbedder.widened_state`; every other parameter is
+    ``source``'s own, which a strict load then checks for shape.
+    """
+    state = source.state_dict()
+    for name, module in target.named_modules():
+        if isinstance(module, EconomyEmbedder):
+            prefix = f"{name}." if name else ""
+            widened = module.widened_state(source.get_submodule(name))
+            state.update({prefix + key: value for key, value in widened.items()})
+    return state
 
 
 class TrunkOutput(NamedTuple):

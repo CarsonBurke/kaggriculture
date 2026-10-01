@@ -84,7 +84,7 @@ _POPULATION_PAIRING_SEED_SALT = 0x5041_4952
 # agent inside Rust. Mirrors `BuiltinAgent::from_code` in rust/kagg_env.
 BUILTIN_AGENT_CODES = {name: code for code, name in enumerate(BUILTIN_AGENT_ORDER, start=1)}
 # A row whose action a Python agent file chose off the native step and staged
-# with `BatchEnv.set_external_actions`. Mirrors `EXTERNAL_AGENT_CODE` in Rust.
+# with `BatchEnv.set_submitted_actions`. Mirrors `EXTERNAL_AGENT_CODE` in Rust.
 EXTERNAL_AGENT_CODE = 255
 REWARD_MODES = ("shaped", "terminal-bank", "terminal-outcome")
 SAMPLED_HEAD_FAMILIES = frozenset(("units", "kinds", "quantities"))
@@ -287,8 +287,8 @@ def _paired_columns(fields: tuple[str, ...], private_fields: tuple[str, ...]) ->
 
 
 # Opponent-viewpoint columns the centralized critic reads from the paired
-# row's economy tokens: their own product stock and its liquidation proceeds,
-# animal stock, and seed counts.
+# row's economy tokens: their own product stock, its liquidation proceeds and
+# forecast price, animal stock, and seed counts.
 _PRODUCT_STOCK_COLUMNS = _paired_columns(PRODUCT_TOKEN_FIELDS, PRODUCT_PRIVATE_FIELDS)
 _ANIMAL_STOCK_COLUMNS = _paired_columns(ANIMAL_TOKEN_FIELDS, ANIMAL_PRIVATE_FIELDS)
 _CROP_SEED_COLUMNS = _paired_columns(CROP_TOKEN_FIELDS, CROP_PRIVATE_FIELDS)

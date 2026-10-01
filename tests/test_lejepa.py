@@ -52,6 +52,7 @@ from kaggriculture.ppo import (
     set_lr_cooldown,
     update_ppo,
 )
+from kaggriculture.provenance import source_identity
 from kaggriculture.registry import LEJEPA, architecture_of_config, resolve_architecture
 from kaggriculture.rollout import (
     behavior_value_key,
@@ -69,11 +70,16 @@ from kaggriculture.structured import (
 )
 from kaggriculture.structured_dynamics import StructuredCriticDynamics, structured_horizon_plan
 from kaggriculture.tokens import (
-    FARM_TOKEN_FIELDS,
-    PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
+    SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
     TILE_COUNT,
+    animal_token_fields,
+    crop_token_fields,
     encode_structured_observation,
+    farm_token_fields,
+    product_private_fields,
+    product_token_fields,
+    town_token_fields,
 )
 
 _ROWS_PER_SEAT = 4
@@ -809,39 +815,197 @@ def test_the_critic_sees_its_privileged_inputs_and_the_actor_cannot(
         assert torch.equal(left, right)
 
 
-@pytest.mark.parametrize("schema", [4, 5, 6])
-def test_only_a_v6_pair_reads_the_liquidation_columns(actor_inputs, critic_inputs, schema) -> None:
-    """Saved v4/v5 pairs act and value bit-identically on v6-staged tokens."""
-    inputs, opponent = critic_inputs
-    held_value = PRODUCT_TOKEN_FIELDS.index("held_value")
-    opponent_held_value = len(PRODUCT_TOKEN_FIELDS) + PRODUCT_PRIVATE_FIELDS.index(
-        "opponent_held_value"
-    )
-    liquidation = slice(FARM_TOKEN_FIELDS.index("liquidation"), len(FARM_TOKEN_FIELDS))
+@pytest.mark.parametrize("schema", [4, 5, 6, 7, 8])
+def test_a_pair_reads_only_its_schemas_columns(actor_inputs, critic_inputs, schema) -> None:
+    """Saved pairs act and value bit-identically on tokens staged for newer schemas.
 
-    def moved(tokens: StructuredInputs) -> StructuredInputs:
+    Each schema's added product (public and private), animal, crop and farm
+    columns move the actor and the critic exactly when the pair's schema
+    reads them.
+    """
+    inputs, opponent = critic_inputs
+    staged = len(PRODUCT_TOKEN_FIELDS)
+
+    def added(fields, version: int) -> list[int]:
+        return list(range(len(fields(version - 1)), len(fields(version))))
+
+    def moved(tokens: StructuredInputs, version: int) -> StructuredInputs:
         products, farms = tokens.products.clone(), tokens.farms.clone()
-        products[..., held_value] += 1.0
-        if products.shape[-1] > opponent_held_value:
-            products[..., opponent_held_value] += 1.0
-        farms[..., liquidation] -= 1.0
-        return tokens._replace(products=products, farms=farms)
+        animals, crops = tokens.animals.clone(), tokens.crops.clone()
+        products[..., added(product_token_fields, version)] += 1.0
+        private = [staged + column for column in added(product_private_fields, version)]
+        if products.shape[-1] > staged:
+            products[..., private] += 1.0
+        animals[..., added(animal_token_fields, version)] += 1.0
+        crops[..., added(crop_token_fields, version)] += 1.0
+        farms[..., added(farm_token_fields, version)] -= 1.0
+        return tokens._replace(products=products, animals=animals, crops=crops, farms=farms)
 
     torch.manual_seed(0)
     actor, critic = build_lejepa_pair(_tiny_config(observation_schema_version=schema))
     with torch.no_grad():
         acted = actor.encode_belief(actor_inputs)
-        acted_moved = actor.encode_belief(moved(actor_inputs))
         valued = critic.encode_belief(inputs, *opponent).value_decision
-        valued_moved = critic.encode_belief(moved(inputs), *opponent).value_decision
+        for version in (6, 7, 8):
+            acted_moved = actor.encode_belief(moved(actor_inputs, version))
+            valued_moved = critic.encode_belief(moved(inputs, version), *opponent).value_decision
+            if schema >= version:
+                assert not torch.equal(acted.economy, acted_moved.economy)
+                assert not torch.equal(valued, valued_moved)
+            else:
+                for left, right in zip(acted, acted_moved, strict=True):
+                    assert (left is None and right is None) or torch.equal(left, right)
+                assert torch.equal(valued, valued_moved)
 
-    if schema >= 6:
-        assert not torch.equal(acted.economy, acted_moved.economy)
-        assert not torch.equal(valued, valued_moved)
-    else:
-        for left, right in zip(acted, acted_moved, strict=True):
-            assert (left is None and right is None) or torch.equal(left, right)
-        assert torch.equal(valued, valued_moved)
+
+def _save_actor_artifact(path: Path, config: LejepaConfig) -> tuple[LejepaActor, JepaObjective]:
+    actor, objective = LejepaActor(config), JepaObjective(config)
+    torch.save(
+        {
+            "format_version": 17,
+            "architecture": "lejepa",
+            "model_config": config.to_dict(),
+            "actor": actor.state_dict(),
+            "structured_dynamics": objective.state_dict(),
+            "iteration": 5,
+            "source_identity": source_identity(),
+            "run_provenance": None,
+            "seed_usage": [{"domain": "online_rl", "start": 20_500_000, "count": 16}],
+        },
+        path,
+    )
+    return actor, objective
+
+
+def _schema_upgrade(
+    path: Path, inputs: StructuredInputs, source: int, target: int
+) -> tuple[LejepaActor, LejepaActor, dict[str, StructuredInputs]]:
+    """A schema-``source`` artifact, its warm start at ``target``, and their inputs.
+
+    The artifact reads its own schema's encodings at their legacy widths
+    (``legacy``); the upgraded actor reads the newest staged tokens as encoded
+    (``staged``) and with every column the artifact's schema lacks redrawn as
+    noise (``noised``).
+    """
+    torch.manual_seed(0)
+    config = _tiny_config(observation_schema_version=source)
+    pretrained, objective = _save_actor_artifact(path, config)
+    upgraded_config = replace(config, observation_schema_version=target)
+    actor, warm_objective = LejepaActor(upgraded_config), JepaObjective(upgraded_config)
+    _training_script()._load_initial_actor(
+        path, actor, "lejepa", upgraded_config, torch.device("cpu"), warm_objective
+    )
+    for key, value in objective.state_dict().items():
+        assert torch.equal(warm_objective.state_dict()[key], value)
+
+    widths = {
+        "products": len(product_token_fields(source)),
+        "animals": len(animal_token_fields(source)),
+        "crops": len(crop_token_fields(source)),
+        "farms": len(farm_token_fields(source)),
+        "town": len(town_token_fields(source)),
+    }
+    assert any(getattr(inputs, name).shape[-1] > width for name, width in widths.items()), (
+        "the upgrade adds no columns to read"
+    )
+    generator = torch.Generator().manual_seed(1)
+    noised = {}
+    for name, width in widths.items():
+        tokens = getattr(inputs, name).clone()
+        tokens[..., width:] = torch.randn(tokens[..., width:].shape, generator=generator)
+        noised[name] = tokens
+    return (
+        pretrained.eval(),
+        actor.eval(),
+        {
+            "legacy": inputs._replace(
+                **{
+                    name: getattr(inputs, name)[..., :width].contiguous()
+                    for name, width in widths.items()
+                }
+            ),
+            "staged": inputs,
+            "noised": inputs._replace(**noised),
+        },
+    )
+
+
+_SCHEMA_UPGRADES = [
+    (source, target)
+    for source in sorted(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+    for target in sorted(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+    if source < target
+]
+
+
+@pytest.mark.parametrize(("source", "target"), _SCHEMA_UPGRADES)
+def test_a_schema_upgrade_warm_start_acts_as_its_artifact(
+    tmp_path, actor_inputs, source, target
+) -> None:
+    """An older-schema clone starts a newer-schema PPO run acting as it did.
+
+    The new columns meet zero weights only, so the upgraded actor ignores them
+    exactly. Against the artifact itself its logits agree to float32 rounding:
+    the one difference is each widened projection's GEMM, which may
+    reassociate the older terms.
+    """
+    pretrained, actor, inputs = _schema_upgrade(tmp_path / "clone.pt", actor_inputs, source, target)
+    with torch.no_grad():
+        for path in ("forward_with_belief", "forward_with_auxiliary_belief"):
+            original = getattr(pretrained, path)(inputs["legacy"])[0]
+            candidate = getattr(actor, path)(inputs["staged"])[0]
+            noised = getattr(actor, path)(inputs["noised"])[0]
+            for left, right, redrawn in zip(original, candidate, noised, strict=True):
+                assert torch.equal(right, redrawn)
+                torch.testing.assert_close(right, left)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("source", "target"), _SCHEMA_UPGRADES)
+def test_a_schema_upgrade_warm_start_preserves_the_compiled_bf16_policy(
+    tmp_path, actor_inputs, source, target
+) -> None:
+    """The same on the update path's compiled BF16 arithmetic.
+
+    A run compiles only its upgraded actor. Each case here compiles two
+    schemas' actors, and every one guards the same `forward`, so the cases
+    start from an empty Dynamo cache instead of accumulating past its
+    recompile limit.
+    """
+    torch._dynamo.reset()
+    pretrained, actor, inputs = _schema_upgrade(tmp_path / "clone.pt", actor_inputs, source, target)
+    inputs = {
+        name: tokens._replace(**{field: value.cuda() for field, value in tokens._asdict().items()})
+        for name, tokens in inputs.items()
+    }
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        expected = torch.compile(pretrained.cuda(), fullgraph=True)(inputs["legacy"])
+        upgraded = torch.compile(actor.cuda(), fullgraph=True)
+        actual = upgraded(inputs["staged"])
+        noised = upgraded(inputs["noised"])
+    for expected_field, actual_field, noised_field in zip(expected, actual, noised, strict=True):
+        assert torch.equal(actual_field, noised_field)
+        torch.testing.assert_close(actual_field, expected_field)
+
+
+def test_a_warm_start_refuses_a_schema_downgrade_or_another_difference(tmp_path) -> None:
+    newest = max(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+    config = _tiny_config(observation_schema_version=newest)
+    _save_actor_artifact(tmp_path / "clone.pt", config)
+    module = _training_script()
+    for mismatched in (
+        replace(config, observation_schema_version=newest - 1),
+        replace(config, core_layers=3),
+    ):
+        with pytest.raises(ValueError, match="model configuration does not match"):
+            module._load_initial_actor(
+                tmp_path / "clone.pt",
+                LejepaActor(mismatched),
+                "lejepa",
+                mismatched,
+                torch.device("cpu"),
+            )
 
 
 # --------------------------------------------------------------------------

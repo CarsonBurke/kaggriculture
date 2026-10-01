@@ -5,8 +5,9 @@ use crate::core::{
     MARKET_SET_KINDS, MARKET_SET_RAW_CHOICES, MAX_MARKET_ORDERS, MAX_SAFE_SEED, MAX_UNITS,
     MarketSetFactors, OBSERVATION_SCHEMA_VERSION, PLAYERS, POLICY_LEDGER_SCHEMA_VERSION,
     POLICY_LEDGER_WIDTH, PRODUCT_TOKEN_FIELDS, PRODUCTS, PyRandom, SampledFactors, StepResult,
-    TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS, UNIT_ACTIONS,
-    UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS, V27State,
+    SubmittedTurn, TILE_CATEGORICAL, TILE_CONTINUOUS, TILE_TOKENS, TOWN_TOKEN_FIELDS, Turn,
+    UNIT_ACTIONS, UNIT_CATEGORICAL, UNIT_CONTINUOUS, UNIT_FEATURES, UNIT_GATHERS, UnitCommand,
+    V27State,
 };
 use crate::v27_script::{V27_SOURCE_NAME, V27_SOURCE_SHA256, V27_STEPS};
 use half::f16;
@@ -135,16 +136,31 @@ pub(crate) struct BatchEnv {
     /// clears its own row when the step index restarts, exactly as the
     /// reference's module-level state does.
     v27_states: Vec<V27State>,
-    /// Actions an outside agent submitted for the coming step, one slot per
-    /// game seat. Rows coded `EXTERNAL_AGENT_CODE` consume their slot on the
-    /// next sampling step; every step starts with all slots empty again.
-    external_actions: Vec<Option<CompactAction>>,
+    /// Turns an outside agent submitted for the coming step, one slot per game
+    /// seat. Rows coded `EXTERNAL_AGENT_CODE` consume their slot on the next
+    /// sampling step; every step starts with all slots empty again.
+    external_actions: Vec<Option<SubmittedTurn>>,
 }
 
 /// Row code for a seat whose action an outside agent supplied through
-/// `set_external_actions` for this step, rather than a native built-in. It sits
-/// far from the built-in codes, which track `opponents.BUILTIN_AGENT_ORDER`.
+/// `set_submitted_actions` for this step, rather than a native built-in. It
+/// sits far from the built-in codes, which track `opponents.BUILTIN_AGENT_ORDER`.
 pub(crate) const EXTERNAL_AGENT_CODE: u8 = 255;
+
+/// Forms of a `set_submitted_actions` unit command row `(form, argument,
+/// quantity)`: a unit action code, or PICKUP / PLACE of a private item index.
+pub(crate) const UNIT_COMMAND_ACTION: u32 = 0;
+pub(crate) const UNIT_COMMAND_PICKUP: u32 = 1;
+pub(crate) const UNIT_COMMAND_PLACE: u32 = 2;
+
+/// The factor row reported for a seat that plays a submitted turn: a PASS the
+/// network never produced, kept only so every row's outputs stay well formed.
+const SUBMITTED_FACTOR_ROW: CompactAction = CompactAction {
+    units: [0; MAX_UNITS],
+    market_kinds: [0; MAX_MARKET_ORDERS],
+    market_quantities: [0; MAX_MARKET_ORDERS],
+    external: true,
+};
 
 #[pymethods]
 impl BatchEnv {
@@ -248,40 +264,43 @@ impl BatchEnv {
         Ok(())
     }
 
-    /// Stage outside agents' factor rows for the next sampling step.
+    /// Stage outside agents' submitted turns for the next sampling step.
     ///
     /// Each listed row must be coded `EXTERNAL_AGENT_CODE` in that step's
     /// `builtin_agents`, and every such row must have been staged here: the
     /// step refuses either mismatch instead of playing a stale or default
-    /// action. Rows execute under the interpreter's submitted-dict rules, as
-    /// `step_factors(external=True)` does, since they come from a real agent.
-    #[pyo3(signature = (rows, unit_actions, market_kinds, market_quantities))]
-    fn set_external_actions(
+    /// action. Row `i` owns the next `unit_counts[i]` rows of `unit_commands`,
+    /// each `(form, argument, quantity)` in the `UNIT_COMMAND_*` forms, farmer
+    /// first; `market_orders[i]` holds its `(kind, quantity)` orders, kind 0
+    /// where the interpreter reads no order. The turns execute exactly as the
+    /// interpreter executes the dicts they encode, never through our factors.
+    #[pyo3(signature = (rows, unit_counts, unit_commands, market_orders))]
+    fn set_submitted_actions(
         &mut self,
         rows: PyReadonlyArray1<'_, i64>,
-        unit_actions: PyReadonlyArray2<'_, u8>,
-        market_kinds: PyReadonlyArray2<'_, u8>,
-        market_quantities: PyReadonlyArray2<'_, u8>,
+        unit_counts: PyReadonlyArray1<'_, i64>,
+        unit_commands: PyReadonlyArray2<'_, u32>,
+        market_orders: PyReadonlyArray3<'_, u32>,
     ) -> PyResult<()> {
         let count = rows.shape()[0];
-        ensure_shape(unit_actions.shape(), &[count, MAX_UNITS], "unit_actions")?;
+        ensure_shape(unit_counts.shape(), &[count], "unit_counts")?;
+        let commands = unit_commands.as_array();
+        ensure_shape(commands.shape(), &[commands.nrows(), 3], "unit_commands")?;
         ensure_shape(
-            market_kinds.shape(),
-            &[count, MAX_MARKET_ORDERS],
-            "market_kinds",
+            market_orders.shape(),
+            &[count, MAX_MARKET_ORDERS, 2],
+            "market_orders",
         )?;
-        ensure_shape(
-            market_quantities.shape(),
-            &[count, MAX_MARKET_ORDERS],
-            "market_quantities",
-        )?;
-        let rows = rows.as_array();
-        let units = unit_actions.as_array();
-        let kinds = market_kinds.as_array();
-        let quantities = market_quantities.as_array();
+        let orders = market_orders.as_array();
         let total = self.external_actions.len();
         let mut staged = self.external_actions.clone();
-        for (index, &row) in rows.iter().enumerate() {
+        let mut next_command = 0;
+        for (index, (&row, &units)) in rows
+            .as_array()
+            .iter()
+            .zip(unit_counts.as_array().iter())
+            .enumerate()
+        {
             let slot = usize::try_from(row)
                 .ok()
                 .filter(|&slot| slot < total)
@@ -293,43 +312,51 @@ impl BatchEnv {
                     "external row {slot} is already staged for this step"
                 )));
             }
-            let action = CompactAction {
-                units: std::array::from_fn(|unit| units[[index, unit]]),
-                market_kinds: std::array::from_fn(|order| kinds[[index, order]]),
-                market_quantities: std::array::from_fn(|order| quantities[[index, order]]),
-                external: true,
-            };
-            if let Some(&unit) = action
-                .units
-                .iter()
-                .find(|&&unit| usize::from(unit) >= UNIT_ACTIONS)
-            {
-                return Err(PyValueError::new_err(format!(
-                    "external row {slot} unit action {unit}, expected 0..{}",
-                    UNIT_ACTIONS - 1
-                )));
-            }
-            if let Some(&kind) = action
-                .market_kinds
-                .iter()
-                .find(|&&kind| usize::from(kind) >= MARKET_KINDS)
-            {
-                return Err(PyValueError::new_err(format!(
-                    "external row {slot} market kind {kind}, expected 0..{}",
-                    MARKET_KINDS - 1
-                )));
-            }
-            if let Some(&quantity) = action
-                .market_quantities
-                .iter()
-                .find(|&&quantity| usize::from(quantity) >= MARKET_QUANTITIES)
-            {
-                return Err(PyValueError::new_err(format!(
-                    "external row {slot} market quantity {quantity}, expected 0..{}",
-                    MARKET_QUANTITIES - 1
-                )));
-            }
-            staged[slot] = Some(action);
+            let end = usize::try_from(units)
+                .ok()
+                .map(|units| next_command + units)
+                .filter(|&end| end <= commands.nrows())
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "external row {slot} claims {units} unit commands, beyond the {} left",
+                        commands.nrows() - next_command
+                    ))
+                })?;
+            let units = (next_command..end)
+                .map(|command| {
+                    let (form, argument, quantity) = (
+                        commands[[command, 0]],
+                        commands[[command, 1]],
+                        commands[[command, 2]],
+                    );
+                    let item = usize::try_from(argument).unwrap_or(usize::MAX);
+                    match form {
+                        UNIT_COMMAND_ACTION => Ok(UnitCommand::Action(
+                            u8::try_from(argument).unwrap_or(u8::MAX),
+                        )),
+                        UNIT_COMMAND_PICKUP => Ok(UnitCommand::Pickup { item, quantity }),
+                        UNIT_COMMAND_PLACE => Ok(UnitCommand::Place { item, quantity }),
+                        _ => Err(format!("unit command form {form}")),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| PyValueError::new_err(format!("external row {slot} {error}")))?;
+            next_command = end;
+            let market: Vec<(u8, u32)> = (0..MAX_MARKET_ORDERS)
+                .map(|order| {
+                    let kind = u8::try_from(orders[[index, order, 0]]).unwrap_or(u8::MAX);
+                    (kind, orders[[index, order, 1]])
+                })
+                .collect();
+            let turn = SubmittedTurn::new(units, &market)
+                .map_err(|error| PyValueError::new_err(format!("external row {slot} {error}")))?;
+            staged[slot] = Some(turn);
+        }
+        if next_command != commands.nrows() {
+            return Err(PyValueError::new_err(format!(
+                "unit_commands has {} rows, but the unit counts claim {next_command}",
+                commands.nrows()
+            )));
         }
         self.external_actions = staged;
         Ok(())
@@ -1388,7 +1415,8 @@ impl BatchEnv {
                         // src/kaggriculture/rollout.py is where that invariant
                         // is enforced.
                         let scripted = if builtin_agents[row] == EXTERNAL_AGENT_CODE {
-                            external[row]
+                            // The submitted turn itself plays at the step.
+                            Some(SUBMITTED_FACTOR_ROW)
                         } else {
                             BuiltinAgent::from_code(builtin_agents[row])
                                 .expect("codes are validated above")
@@ -1478,7 +1506,10 @@ impl BatchEnv {
                     .enumerate()
                     .for_each(|(game_index, (game, result))| {
                         let row = game_index * PLAYERS;
-                        *result = game.step(&[sampled[row].action, sampled[row + 1].action]);
+                        *result = game.step_turns(row_turns(
+                            &sampled[row..row + PLAYERS],
+                            &external[row..row + PLAYERS],
+                        ));
                     });
             });
         }
@@ -1687,7 +1718,8 @@ impl BatchEnv {
                         let row = first_row + player;
                         let sampled_row = &mut sampled_rows[player];
                         let scripted = if builtin_agents[row] == EXTERNAL_AGENT_CODE {
-                            external[row]
+                            // The submitted turn itself plays at the step.
+                            Some(SUBMITTED_FACTOR_ROW)
                         } else {
                             BuiltinAgent::from_code(builtin_agents[row])
                                 .expect("codes are validated above")
@@ -1762,7 +1794,10 @@ impl BatchEnv {
                             temperatures[row],
                         );
                     }
-                    *result = game.step(&[sampled_rows[0].action, sampled_rows[1].action]);
+                    *result = game.step_turns(row_turns(
+                        sampled_rows,
+                        &external[first_row..first_row + PLAYERS],
+                    ));
                 });
             fill_sample_step_output(games, sampled, results, potential_cache, &mut output_slices);
         });
@@ -2774,7 +2809,7 @@ impl BatchEnv {
         }
     }
 
-    fn take_external_actions(&mut self, codes: &[u8]) -> PyResult<Vec<Option<CompactAction>>> {
+    fn take_external_actions(&mut self, codes: &[u8]) -> PyResult<Vec<Option<SubmittedTurn>>> {
         for (row, (&code, staged)) in codes.iter().zip(&self.external_actions).enumerate() {
             match (code == EXTERNAL_AGENT_CODE, staged.is_some()) {
                 (true, false) => {
@@ -2797,8 +2832,19 @@ impl BatchEnv {
     }
 }
 
+/// Each seat's step action: its staged submitted turn, else its factor row.
+fn row_turns<'a>(
+    sampled: &'a [SampledFactors],
+    external: &'a [Option<SubmittedTurn>],
+) -> [Turn<'a>; PLAYERS] {
+    std::array::from_fn(|player| match &external[player] {
+        Some(turn) => Turn::Submitted(turn),
+        None => Turn::Factors(&sampled[player].action),
+    })
+}
+
 /// `validate_builtin_agents` for the sampling steps, which also play rows
-/// staged through `set_external_actions`.
+/// staged through `set_submitted_actions`.
 fn validate_row_agents(codes: &[u8]) -> PyResult<()> {
     if let Some(&code) = codes
         .iter()
@@ -3101,6 +3147,9 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("V27_SOURCE_NAME", V27_SOURCE_NAME)?;
     module.add("V27_STEPS", V27_STEPS)?;
     module.add("EXTERNAL_AGENT_CODE", EXTERNAL_AGENT_CODE)?;
+    module.add("UNIT_COMMAND_ACTION", UNIT_COMMAND_ACTION)?;
+    module.add("UNIT_COMMAND_PICKUP", UNIT_COMMAND_PICKUP)?;
+    module.add("UNIT_COMMAND_PLACE", UNIT_COMMAND_PLACE)?;
     Ok(())
 }
 

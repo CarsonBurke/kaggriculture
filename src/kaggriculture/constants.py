@@ -57,12 +57,22 @@ CROP_MAX_YIELD = {
     "STRAWBERRY": 4,
     "MELON": 6,
 }
+# Days between an ongoing crop's productions (the engine's CROPS "interval");
+# zero for the crops that yield once.
+CROP_YIELD_INTERVAL = {
+    "WHEAT": 0,
+    "CARROT": 0,
+    "TOMATO": 1,
+    "STRAWBERRY": 2,
+    "MELON": 0,
+}
 ONGOING_CROPS = frozenset(("TOMATO", "STRAWBERRY"))
 ANIMAL_COST = {"GOOSE": 300, "COW": 400, "SHEEP": 500}
 ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
 ANIMAL_FIRST_YIELD_DAY = {"GOOSE": 4, "COW": 8, "SHEEP": 6}
 ANIMAL_YIELD_INTERVAL = {"GOOSE": 1, "COW": 2, "SHEEP": 3}
 ANIMAL_MAX_HELD = {"GOOSE": 4, "COW": 6, "SHEEP": 6}
+ANIMAL_PRODUCT = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
 BASE_PRICE = {
     "WHEAT": 25,
     "CARROT": 35,
@@ -161,6 +171,29 @@ MARKET_PARAMS = {
 }
 LAND_PRICES = (1000, 2000, 4000)
 
+# The town (the engine's SHOPS, `_town_consume` and `_end_of_day`, at the
+# default configuration). Every `TOWN_SHOP_SELL_INTERVAL` steps each unlocked
+# shop instance takes one unit of each product it sells -- two when it sells
+# only one -- from the market; every `TOWN_CENTER_SELL_INTERVAL` steps the town
+# center takes one of every product but fertilizer. On each day divisible by
+# `TOWN_SHOP_UNLOCK_INTERVAL`, until `MAX_SHOP_INSTANCES` are open, one more
+# instance opens, drawn uniformly (with replacement) from the shops.
+SHOP_PRODUCTS = {
+    "BAKERY": ("EGG", "WHEAT"),
+    "BRUNCH_SPOT": ("EGG", "WHEAT", "STRAWBERRY"),
+    "FARMERS_MARKET": ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY"),
+    "ICE_CREAM_SHOP": ("STRAWBERRY", "MILK", "WHEAT"),
+    "PET_CAFE": ("CARROT",),
+    "PIZZA_SHOP": ("MILK", "TOMATO", "WHEAT"),
+    "SMOOTHIE_SHOP": ("STRAWBERRY", "MILK"),
+    "YARN_STORE": ("WOOL",),
+}
+TOWN_CENTER_PRODUCTS = tuple(item for item in PRODUCTS if item != "FERTILIZER")
+TOWN_SHOP_SELL_INTERVAL = 4
+TOWN_CENTER_SELL_INTERVAL = 24
+TOWN_SHOP_UNLOCK_INTERVAL = 3
+MAX_SHOP_INSTANCES = 8
+
 STARTING_MONEY = 3_000
 DEFAULT_REWARD_GAMMA = 1.0
 DEFAULT_REWARD_MODE = "terminal-outcome"
@@ -251,6 +284,28 @@ def sale_proceeds(
         proceeds += price
         inventory += 1
     return proceeds
+
+
+def restocked_inventory(
+    item: str,
+    units: int,
+    inventory: int,
+    params: dict[str, dict[str, int | float | str]] | None = None,
+) -> int:
+    """The market inventory after selling ``units`` of ``item`` one at a time.
+
+    The engine's sell arithmetic, as in `sale_proceeds`: a sale restocks the
+    market only while its quote sits above the price floor. Quotes never rise
+    with inventory, so the first floored sale is found by bisection.
+    """
+    restocking, floored = 0, units
+    while restocking < floored:
+        middle = (restocking + floored) // 2
+        if market_price(item, inventory + middle, params) <= PRICE_FLOOR:
+            floored = middle
+        else:
+            restocking = middle + 1
+    return inventory + floored
 
 
 def fibonacci_hire_cost(hires_today: int) -> int:

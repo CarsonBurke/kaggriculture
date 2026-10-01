@@ -11,7 +11,7 @@ from kaggle_environments import make
 from kaggriculture import structured
 from kaggriculture.actions import N_MARKET_KINDS, N_UNIT_ACTIONS
 from kaggriculture.compilewatch import CompileWatch
-from kaggriculture.constants import MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
+from kaggriculture.constants import ANIMALS, CROPS, MAX_MARKET_ORDERS, MAX_UNITS, PRODUCTS
 from kaggriculture.entity import EntityConfig
 from kaggriculture.latent_dynamics import DecodeHeads
 from kaggriculture.model import (
@@ -48,11 +48,19 @@ from kaggriculture.structured_dynamics import (
     structured_critic_window_loss,
 )
 from kaggriculture.tokens import (
+    ANIMAL_PRIVATE_FIELDS,
+    ANIMAL_TOKEN_FIELDS,
+    CROP_PRIVATE_FIELDS,
+    CROP_TOKEN_FIELDS,
     FARM_TOKEN_FIELDS,
     PRODUCT_PRIVATE_FIELDS,
     PRODUCT_TOKEN_FIELDS,
+    SUPPORTED_OBSERVATION_SCHEMA_VERSIONS,
     TOWN_TOKEN_FIELDS,
+    animal_token_fields,
+    crop_token_fields,
     encode_structured_observation,
+    farm_token_fields,
     product_private_fields,
     product_token_fields,
     town_token_fields,
@@ -1236,8 +1244,15 @@ def test_structured_critic_exposes_only_normalized_value_head_input(
             )
             assert not torch.equal(entity_logits[:, 0], entity_logits[:, 1])
 
+        # The last private column this critic's schema reads; the staged tokens
+        # carry newer ones after it, which it rightly ignores.
+        private_column = (
+            len(PRODUCT_TOKEN_FIELDS)
+            + len(product_private_fields(config.observation_schema_version))
+            - 1
+        )
         product_values = inputs.products.clone()
-        product_values[..., -1] += 0.25
+        product_values[..., private_column] += 0.25
         _, product_belief = critic.forward_with_belief(
             inputs._replace(products=product_values),
             extras.unit_categorical,
@@ -1487,8 +1502,8 @@ def test_economy_reads_only_its_schemas_farm_columns(config_class) -> None:
     def economy(width: int) -> tuple[torch.Tensor, ...]:
         shapes = (
             (9, len(PRODUCT_TOKEN_FIELDS)),
-            (3, 3),
-            (5, 6),
+            (3, len(ANIMAL_TOKEN_FIELDS)),
+            (5, len(CROP_TOKEN_FIELDS)),
             (2, width),
             (len(TOWN_TOKEN_FIELDS),),
         )
@@ -1497,7 +1512,7 @@ def test_economy_reads_only_its_schemas_farm_columns(config_class) -> None:
     products, animals, crops, farms, town = economy(len(FARM_TOKEN_FIELDS))
     moved = farms.clone()
     moved[..., margin] += 1.0
-    for version, width in ((3, 4), (4, 5), (5, 5), (6, 7)):
+    for version, width in ((3, 4), (4, 5), (5, 5), (6, 7), (7, 7), (8, 7)):
         torch.manual_seed(0)
         embedder = EconomyEmbedder(
             config_class(observation_schema_version=version), private_columns=False
@@ -1522,8 +1537,8 @@ def test_economy_reads_only_its_schemas_town_columns(config_class, split_clock) 
     generator = torch.Generator().manual_seed(5)
     shapes = (
         (9, len(PRODUCT_TOKEN_FIELDS)),
-        (3, 3),
-        (5, 6),
+        (3, len(ANIMAL_TOKEN_FIELDS)),
+        (5, len(CROP_TOKEN_FIELDS)),
         (2, len(FARM_TOKEN_FIELDS)),
         (len(TOWN_TOKEN_FIELDS),),
     )
@@ -1532,7 +1547,7 @@ def test_economy_reads_only_its_schemas_town_columns(config_class, split_clock) 
     )
     reordered = town.clone()
     reordered[..., ranks:] = reordered[..., ranks:].flip(-1)
-    for version, width in ((3, 14), (4, 14), (5, 22), (6, 22)):
+    for version, width in ((3, 14), (4, 14), (5, 22), (6, 22), (7, 22), (8, 22)):
         torch.manual_seed(0)
         embedder = EconomyEmbedder(
             config_class(observation_schema_version=version, split_clock_token=split_clock),
@@ -1547,45 +1562,145 @@ def test_economy_reads_only_its_schemas_town_columns(config_class, split_clock) 
         assert torch.equal(shifted, baseline) == (version < 5)
 
 
+# The schema-sliced economy families: each one's position among the
+# embedder's inputs, its public fields and its private fields for a schema.
+_SLICED_FAMILIES = {
+    "product": (0, product_token_fields, product_private_fields),
+    "animal": (1, animal_token_fields, lambda version: ANIMAL_PRIVATE_FIELDS),
+    "crop": (2, crop_token_fields, lambda version: CROP_PRIVATE_FIELDS),
+}
+_NEWEST_SCHEMA = max(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+
+
+def _sliced_layout(family: str, version: int, private_columns: bool) -> tuple[int, int, int]:
+    """A family's public and private widths for ``version``, and its staged public width."""
+    _, public, private = _SLICED_FAMILIES[family]
+    return (
+        len(public(version)),
+        len(private(version)) * private_columns,
+        len(public(_NEWEST_SCHEMA)),
+    )
+
+
+def _sliced_shapes(private_columns: bool) -> tuple[tuple[int, ...], ...]:
+    """The staged economy input shapes, the critic's with its private columns."""
+    shapes = []
+    for family, rows in zip(
+        _SLICED_FAMILIES, (len(PRODUCTS), len(ANIMALS), len(CROPS)), strict=True
+    ):
+        _, private, staged = _sliced_layout(family, _NEWEST_SCHEMA, private_columns)
+        shapes.append((rows, staged + private))
+    return (*shapes, (2, len(FARM_TOKEN_FIELDS)), (len(TOWN_TOKEN_FIELDS),))
+
+
 @pytest.mark.parametrize("private_columns", [False, True], ids=["actor", "critic"])
 @pytest.mark.parametrize(
     "config_class", [StructuredConfig, EntityConfig], ids=["structured", "entity"]
 )
-def test_economy_reads_only_its_schemas_product_columns(config_class, private_columns) -> None:
-    """v3-v5 weights see exactly their product inputs, public and private alike."""
-    staged = len(PRODUCT_TOKEN_FIELDS)
-    held = [PRODUCT_TOKEN_FIELDS.index("held_value")]
-    if private_columns:
-        held.append(staged + PRODUCT_PRIVATE_FIELDS.index("opponent_held_value"))
+def test_economy_reads_only_its_schemas_sliced_columns(config_class, private_columns) -> None:
+    """Each schema's weights see exactly its product, animal and crop inputs, public and private."""
+
+    def introduced(family: str, version: int) -> list[int]:
+        """The staged columns of ``family`` schema ``version`` added."""
+        before, before_private, staged = _sliced_layout(family, version - 1, private_columns)
+        public, private, _ = _sliced_layout(family, version, private_columns)
+        return [*range(before, public), *range(staged + before_private, staged + private)]
+
     generator = torch.Generator().manual_seed(7)
-    width = staged + len(PRODUCT_PRIVATE_FIELDS) * private_columns
-    shapes = (
-        (9, width),
-        (3, 3 + 2 * private_columns),
-        (5, 6 + private_columns),
-        (2, len(FARM_TOKEN_FIELDS)),
-        (len(TOWN_TOKEN_FIELDS),),
-    )
-    products, animals, crops, farms, town = (
-        torch.randn(2, *shape, generator=generator) for shape in shapes
-    )
-    moved = products.clone()
-    moved[..., held] += 1.0
-    for version in (3, 4, 5, 6):
-        public = len(product_token_fields(version))
-        private = len(product_private_fields(version)) * private_columns
+    inputs = [
+        torch.randn(2, *shape, generator=generator) for shape in _sliced_shapes(private_columns)
+    ]
+    versions = sorted(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+    widening = {
+        family: [version for version in versions[1:] if introduced(family, version)]
+        for family in _SLICED_FAMILIES
+    }
+    assert widening == {"product": [6, 7], "animal": [8], "crop": [8]}
+    for version in versions:
         torch.manual_seed(0)
         embedder = EconomyEmbedder(
             config_class(observation_schema_version=version), private_columns=private_columns
         )
-        assert embedder.product_projection.in_features == public + private
         with torch.no_grad():
-            baseline = embedder(products, animals, crops, farms, town)
-            shifted = embedder(moved, animals, crops, farms, town)
-            # The pre-v6 embedder projected its own contiguous columns.
-            legacy = torch.cat(
-                (products[..., :public], products[..., staged : staged + private]), dim=-1
+            baseline = embedder(*inputs)
+            row = 0
+            for family, (position, _, _) in _SLICED_FAMILIES.items():
+                public, private, staged = _sliced_layout(family, version, private_columns)
+                projection = getattr(embedder, f"{family}_projection")
+                identity = getattr(embedder, f"{family}_identity").weight
+                assert projection.in_features == public + private
+                tokens = inputs[position]
+                # An older embedder projected its own contiguous columns.
+                legacy = torch.cat(
+                    (tokens[..., :public], tokens[..., staged : staged + private]), dim=-1
+                )
+                rows = tokens.shape[1]
+                assert torch.equal(baseline[:, row : row + rows], projection(legacy) + identity)
+                row += rows
+                for added in widening[family]:
+                    moved = [value.clone() for value in inputs]
+                    moved[position][..., introduced(family, added)] += 1.0
+                    shifted = embedder(*moved)
+                    assert torch.equal(shifted, baseline) == (version < added), (
+                        family,
+                        version,
+                        added,
+                    )
+
+
+@pytest.mark.parametrize("private_columns", [False, True], ids=["actor", "critic"])
+@pytest.mark.parametrize(
+    "config_class,split_clock",
+    [(StructuredConfig, False), (StructuredConfig, True), (EntityConfig, False)],
+    ids=["structured", "structured-split-clock", "entity"],
+)
+def test_a_widened_economy_embeds_as_its_older_schema(
+    config_class, split_clock, private_columns
+) -> None:
+    """A schema upgrade's embedder reads the new columns through zero weights only."""
+    generator = torch.Generator().manual_seed(11)
+    shapes = _sliced_shapes(private_columns)
+    tokens = [torch.randn(2, *shape, generator=generator) for shape in shapes]
+    versions = sorted(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS)
+    for source in versions:
+        torch.manual_seed(0)
+        older = EconomyEmbedder(
+            config_class(observation_schema_version=source, split_clock_token=split_clock),
+            private_columns=private_columns,
+        )
+        # The staged columns `older` does not read, redrawn.
+        unread = {
+            3: range(len(farm_token_fields(source)), len(FARM_TOKEN_FIELDS)),
+            4: range(len(town_token_fields(source)), len(TOWN_TOKEN_FIELDS)),
+        }
+        for family, (position, _, _) in _SLICED_FAMILIES.items():
+            public, private, staged = _sliced_layout(family, source, private_columns)
+            unread[position] = [
+                *range(public, staged),
+                *range(staged + private, shapes[position][-1]),
+            ]
+        redrawn = [value.clone() for value in tokens]
+        for family, columns in unread.items():
+            columns = list(columns)
+            redrawn[family][..., columns] = torch.randn(
+                redrawn[family][..., columns].shape, generator=generator
             )
-            expected = embedder.product_projection(legacy) + embedder.product_identity.weight
-        assert torch.equal(baseline[:, : len(PRODUCTS)], expected)
-        assert torch.equal(shifted, baseline) == (version < 6)
+        for target in (version for version in versions if version > source):
+            newer = EconomyEmbedder(
+                config_class(observation_schema_version=target, split_clock_token=split_clock),
+                private_columns=private_columns,
+            )
+            newer.load_state_dict(newer.widened_state(older))
+            with torch.no_grad():
+                embedded = newer(*tokens)
+                # Zero weight exactly: the operand's shape, and so its GEMM, is
+                # unchanged, and every redrawn term is still an exact zero.
+                assert torch.equal(newer(*redrawn), embedded)
+                # A wider GEMM may reassociate the older terms, so against
+                # `older` itself the embedding agrees to float32 rounding.
+                torch.testing.assert_close(embedded, older(*tokens))
+    with pytest.raises(ValueError, match="token layout"):
+        EconomyEmbedder(
+            config_class(observation_schema_version=versions[-1]),
+            private_columns=not private_columns,
+        ).widened_state(older)

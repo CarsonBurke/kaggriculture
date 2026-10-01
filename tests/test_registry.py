@@ -28,11 +28,12 @@ from kaggriculture.registry import (
     resolve_architecture,
 )
 from kaggriculture.structured import StructuredActor, StructuredConfig
+from kaggriculture.tokens import SUPPORTED_OBSERVATION_SCHEMA_VERSIONS
 
 
 def test_new_lejepa_defaults_do_not_reinterpret_saved_architectures() -> None:
     fresh = LejepaConfig()
-    assert fresh.observation_schema_version == 4
+    assert fresh.observation_schema_version == 8
     assert fresh.unit_target_navigation and fresh.market_resource_conditioning
     assert fresh.action_interface == 2 and fresh.unit_affordance_scorer and fresh.wdl_value
     saved = {"observation_schema_version": 3}
@@ -198,7 +199,7 @@ def test_entity_config_rejects_attention_without_strict_gqa(heads, kv_heads) -> 
 
 
 @pytest.mark.parametrize("builder", ["build_actor", "build_critic"])
-@pytest.mark.parametrize("version", [None, 1, 2, 6])
+@pytest.mark.parametrize("version", [None, 1, 2, max(SUPPORTED_OBSERVATION_SCHEMA_VERSIONS) + 1])
 @pytest.mark.parametrize("architecture", ["structured", "entity-attention"])
 def test_structured_artifacts_reject_stale_observation_schema(
     builder, version, architecture

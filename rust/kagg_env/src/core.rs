@@ -42,12 +42,12 @@ pub const TILE_CONTINUOUS: usize = 20;
 pub const UNIT_CATEGORICAL: usize = 4;
 pub const UNIT_CONTINUOUS: usize = 2 * PRIVATE_ITEMS + 2;
 pub const UNIT_GATHERS: usize = 5;
-pub const PRODUCT_TOKEN_FIELDS: usize = 6;
-pub const ANIMAL_TOKEN_FIELDS: usize = 3;
+pub const PRODUCT_TOKEN_FIELDS: usize = 13;
+pub const ANIMAL_TOKEN_FIELDS: usize = 5;
 // The newest schema; its layout is a superset every supported schema reads a
 // prefix of (see src/kaggriculture/tokens.py).
-pub const OBSERVATION_SCHEMA_VERSION: usize = 6;
-pub const CROP_TOKEN_FIELDS: usize = 6;
+pub const OBSERVATION_SCHEMA_VERSION: usize = 8;
+pub const CROP_TOKEN_FIELDS: usize = 8;
 pub const FARM_TOKEN_FIELDS: usize = 7;
 pub const TOWN_TOKEN_FIELDS: usize = 22;
 
@@ -296,6 +296,145 @@ impl Default for CompactAction {
     }
 }
 
+impl CompactAction {
+    fn legality_scope(&self) -> LegalityScope {
+        if self.external {
+            LegalityScope::SubmittedDict
+        } else {
+            LegalityScope::PolicyMask
+        }
+    }
+
+    /// The market queue these factors submit: every order up to the first STOP.
+    fn market_queue(&self) -> [Option<MarketOrder>; MAX_MARKET_ORDERS] {
+        let mut active = true;
+        std::array::from_fn(|slot| {
+            active &= self.market_kinds[slot] != 0;
+            if active {
+                parse_order(self.market_kinds[slot], self.market_quantities[slot])
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// One unit command of an outside agent's submitted turn, reduced to what the
+/// official interpreter reads from it (`_apply_unit_action`,
+/// kaggriculture.py:312).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitCommand {
+    /// A command whose only argument is PLANT's crop, by unit action code:
+    /// PASS, the moves, DROP, PLANT and the tile commands. Anything the
+    /// interpreter cannot read is PASS.
+    Action(u8),
+    /// `["PICKUP", item, n]`: up to `n` of any shed item.
+    Pickup { item: usize, quantity: u32 },
+    /// `["PLACE", item, n]`: an animal onto its empty structure, otherwise up
+    /// to `n` of any carried item into the shed.
+    Place { item: usize, quantity: u32 },
+}
+
+/// An outside agent's turn as it submitted it, for a seat whose actions never
+/// pass through our policy's factored action space.
+///
+/// The factored space cannot carry a whole turn: its pickups and placements
+/// have fixed quantities, its market queue ends at the first STOP where the
+/// interpreter skips an unreadable order and keeps the slot, and its quantities
+/// stop at 100. Each of those reshapes which of the two seats' orders share a
+/// quote, so a market-crowding opponent played through it is another agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubmittedTurn {
+    /// Farmer first, then every submitted hand command, including commands for
+    /// hands the farm does not have: they execute nothing, but their PLANTs
+    /// still count toward the turn's seed demand.
+    units: Vec<UnitCommand>,
+    /// The first `maxMarketOrdersPerTurn` orders in submitted order; `None` is
+    /// an order `_parse_order` reads nothing from, which skips its slot.
+    market: [Option<MarketOrder>; MAX_MARKET_ORDERS],
+}
+
+impl SubmittedTurn {
+    /// A turn from unit commands and `(kind, quantity)` market orders, where
+    /// kind 0 is an unread order and the kinds are the market factor codes.
+    /// Quantified kinds need a positive quantity; HIRE and BUY_LAND ignore it.
+    pub fn new(units: Vec<UnitCommand>, orders: &[(u8, u32)]) -> Result<Self, String> {
+        for (unit, command) in units.iter().enumerate() {
+            match *command {
+                UnitCommand::Action(action) => {
+                    if usize::from(action) >= UNIT_ACTIONS {
+                        return Err(format!(
+                            "unit {unit} action {action}, expected 0..{}",
+                            UNIT_ACTIONS - 1
+                        ));
+                    }
+                    if pickup_spec(action).is_some()
+                        || place_animal(action).is_some()
+                        || place_product(action).is_some()
+                    {
+                        return Err(format!(
+                            "unit {unit} action {action} fixes its quantity; submit PICKUP and \
+                             PLACE as their own commands"
+                        ));
+                    }
+                }
+                UnitCommand::Pickup { item, .. } | UnitCommand::Place { item, .. } => {
+                    if item >= PRIVATE_ITEMS {
+                        return Err(format!(
+                            "unit {unit} item {item}, expected 0..{}",
+                            PRIVATE_ITEMS - 1
+                        ));
+                    }
+                }
+            }
+        }
+        if orders.len() > MAX_MARKET_ORDERS {
+            return Err(format!(
+                "{} market orders, above the {MAX_MARKET_ORDERS} the interpreter reads",
+                orders.len()
+            ));
+        }
+        let mut market = [None; MAX_MARKET_ORDERS];
+        for (slot, &(kind, quantity)) in orders.iter().enumerate() {
+            if usize::from(kind) >= MARKET_KINDS {
+                return Err(format!(
+                    "market slot {slot} kind {kind}, expected 0..{}",
+                    MARKET_KINDS - 1
+                ));
+            }
+            if kind == 0 {
+                continue;
+            }
+            let atomic = matches!(kind, 1 | 2);
+            if !atomic && quantity == 0 {
+                return Err(format!("market slot {slot} kind {kind} has quantity 0"));
+            }
+            market[slot] = Some(MarketOrder {
+                kind,
+                item: market_order_item(kind),
+                remaining: if atomic { 0 } else { quantity },
+            });
+        }
+        Ok(Self { units, market })
+    }
+}
+
+/// One seat's action for a step.
+#[derive(Clone, Copy, Debug)]
+pub enum Turn<'a> {
+    /// Factors from our policy or a built-in port, under the legality scope
+    /// their `external` flag names.
+    Factors(&'a CompactAction),
+    /// An outside agent's turn, executed as the interpreter executes its dict.
+    Submitted(&'a SubmittedTurn),
+}
+
+/// The unit half of a turn, as `step_inner` applies it.
+enum UnitTurn<'a> {
+    Codes(&'a [u8], LegalityScope),
+    Commands(&'a [UnitCommand]),
+}
+
 /// A built-in reference agent from `kaggle_environments`, ported so the league
 /// can field it inside the batched wave instead of only at evaluation time.
 ///
@@ -364,11 +503,11 @@ impl Default for V27State {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MarketOrder {
     kind: u8,
     item: usize,
-    remaining: u16,
+    remaining: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -950,15 +1089,20 @@ impl Game {
     }
 
     pub fn step(&mut self, actions: &[CompactAction; PLAYERS]) -> StepResult {
-        let unit_actions = [&actions[0].units[..], &actions[1].units[..]];
-        let scopes = std::array::from_fn(|player| {
-            if actions[player].external {
-                LegalityScope::SubmittedDict
-            } else {
-                LegalityScope::PolicyMask
-            }
+        self.step_turns([Turn::Factors(&actions[0]), Turn::Factors(&actions[1])])
+    }
+
+    /// Advance one step with each seat's factors or submitted turn.
+    pub fn step_turns(&mut self, turns: [Turn<'_>; PLAYERS]) -> StepResult {
+        let units = turns.map(|turn| match turn {
+            Turn::Factors(action) => UnitTurn::Codes(&action.units, action.legality_scope()),
+            Turn::Submitted(submitted) => UnitTurn::Commands(&submitted.units),
         });
-        self.step_inner(actions, unit_actions, scopes)
+        let market = turns.map(|turn| match turn {
+            Turn::Factors(action) => action.market_queue(),
+            Turn::Submitted(submitted) => submitted.market,
+        });
+        self.step_inner(units, market)
     }
 
     /// Apply submitted-dict unit commands without imposing the policy's
@@ -973,26 +1117,29 @@ impl Game {
         unit_actions: [&[u8]; PLAYERS],
     ) -> StepResult {
         self.step_inner(
-            market_actions,
-            unit_actions,
-            [LegalityScope::SubmittedDict; PLAYERS],
+            unit_actions.map(|actions| UnitTurn::Codes(actions, LegalityScope::SubmittedDict)),
+            std::array::from_fn(|player| market_actions[player].market_queue()),
         )
     }
 
     fn step_inner(
         &mut self,
-        market_actions: &[CompactAction; PLAYERS],
-        unit_actions: [&[u8]; PLAYERS],
-        scopes: [LegalityScope; PLAYERS],
+        units: [UnitTurn<'_>; PLAYERS],
+        market: [[Option<MarketOrder>; MAX_MARKET_ORDERS]; PLAYERS],
     ) -> StepResult {
         if self.done {
             return self.step_result();
         }
         let day = self.step / self.config.turns_per_day;
-        for player in 0..PLAYERS {
-            self.apply_unit_actions(player, unit_actions[player], day, scopes[player]);
+        for (player, turn) in units.into_iter().enumerate() {
+            match turn {
+                UnitTurn::Codes(actions, scope) => {
+                    self.apply_unit_actions(player, actions, day, scope);
+                }
+                UnitTurn::Commands(commands) => self.apply_unit_commands(player, commands, day),
+            }
         }
-        self.process_market(market_actions);
+        self.process_market(market);
         self.town_consume(self.step);
         for player in 0..PLAYERS {
             self.decay_plants(player, self.step);
@@ -1325,6 +1472,19 @@ impl Game {
             .fold(0.0, f64::max);
         let held_value_scale = f64::from(self.config.shed_capacity) * max_base_price;
         let held = self.held_products(player);
+        // Schema v7 outlook: both farms' nominal-care supply, [soon, to end]
+        // each, and the town's expected draw in 1/SHOP_PRODUCTS.len() parts.
+        let (own_supply, own_feeds) = self.farm_supply(player);
+        let (opponent_supply, opponent_feeds) = self.farm_supply(opponent);
+        let supply = [own_supply, opponent_supply];
+        let turns = i64::from(self.config.turns_per_day);
+        let outlook_end = i64::from(self.config.episode_steps) - 1;
+        let draw_soon = self.town_draw((i64::from(self.step) + 2 * turns).min(outlook_end));
+        let draw_to_end = self.town_draw(outlook_end);
+        let choices = SHOP_PRODUCTS.len() as i64;
+        let draw_scale = (choices * i64::from(self.config.shed_capacity)) as f64;
+        let supply_scale = f64::from(self.config.shed_capacity);
+        let mut forecast = [0_i64; PRODUCTS];
         // Schema v6: the seat's liquidation value, money plus every product's
         // proceeds; integers, so it is exact.
         let mut liquidation = farm.money;
@@ -1345,7 +1505,31 @@ impl Game {
             row[4] = (carried / f64::from(self.config.shed_capacity)) as f32;
             // Schema v6 held value: this stock's exact sale proceeds.
             row[5] = (proceeds as f64 / held_value_scale) as f32;
+            // Schema v7 forecast: the quote at the inventory left once the held
+            // stock and both farms' supply sell and the town draws, formed in
+            // exact parts and rounded half up to a unit.
+            // The sales restock only above the price floor, and the WHEAT the
+            // animals eat then leaves the market.
+            let sold = held[item] + supply[0][1][item] + supply[1][1][item];
+            let mut units = restocked_inventory(item, sold, self.market_inventory[item]);
+            if item == 0 {
+                units -= own_feeds + opponent_feeds;
+            }
+            let parts = choices * units - draw_to_end[item];
+            forecast[item] = market_price(item, (parts + choices / 2).div_euclid(choices) as i32);
+            row[6] = (forecast[item] as f64 / (2.0 * base)) as f32;
+            row[7] = (supply[0][0][item] as f64 / supply_scale) as f32;
+            row[8] = (supply[0][1][item] as f64 / supply_scale) as f32;
+            row[9] = (supply[1][0][item] as f64 / supply_scale) as f32;
+            row[10] = (supply[1][1][item] as f64 / supply_scale) as f32;
+            row[11] = (draw_soon[item] as f64 / draw_scale) as f32;
+            row[12] = (draw_to_end[item] as f64 / draw_scale) as f32;
         }
+        // Schema v8: what a crop sown or an animal placed now pays back, at
+        // the current quotes and at the forecast ones.
+        let yields = self.started_now_yields();
+        let payback = self.paybacks(&yields, &self.market_prices);
+        let forecast_payback = self.paybacks(&yields, &forecast);
         let max_animal_cost = ANIMAL_COST.iter().copied().max().unwrap() as f64;
         for animal in 0..ANIMALS {
             let item = PRODUCTS + animal;
@@ -1359,6 +1543,8 @@ impl Game {
             row[0] = (ANIMAL_COST[animal] as f64 / max_animal_cost) as f32;
             row[1] = (f64::from(private.shed[item]) / f64::from(self.config.shed_capacity)) as f32;
             row[2] = (carried / f64::from(self.config.shed_capacity)) as f32;
+            row[3] = payback[CROPS + animal];
+            row[4] = forecast_payback[CROPS + animal];
         }
         let max_seed_cost = SEED_COST.iter().copied().max().unwrap() as f64;
         let max_yield_day = f64::from(*MAX_YIELD_DAY.iter().max().unwrap());
@@ -1371,6 +1557,8 @@ impl Game {
             row[3] = (f64::from(MAX_YIELD_DAY[crop]) / max_yield_day) as f32;
             row[4] = (f64::from(CROP_MAX_HELD[crop]) / max_yield) as f32;
             row[5] = f32::from(u8::from(CROP_ONGOING[crop]));
+            row[6] = payback[crop];
+            row[7] = forecast_payback[crop];
         }
         // Held stock is private: the opponent row's liquidation is its money.
         let liquidations = [liquidation, self.farms[opponent].money];
@@ -1431,6 +1619,222 @@ impl Game {
             value += sale_proceeds(item, count, self.market_inventory[item]) as f64;
         }
         value
+    }
+
+    /// This farm's nominal-care yields that sell, `[soon, to end]`, and the
+    /// WHEAT its animals eat meanwhile.
+    ///
+    /// Mirrors `_farm_supply` in src/kaggriculture/tokens.py: each tile's
+    /// `tile_arrivals` that `sells_by_the_end`, soon within two days of now,
+    /// and one feed an animal a day before the last acting day, less today's
+    /// if given.
+    fn farm_supply(&self, player: usize) -> ([[i64; PRODUCTS]; 2], i64) {
+        let turns = i64::from(self.config.turns_per_day);
+        let step = i64::from(self.step);
+        let soon = step + 2 * turns;
+        let days = self.last_acting_day() - step / turns;
+        let mut supply = [[0_i64; PRODUCTS]; 2];
+        let mut feeds = 0;
+        for (index, tile) in self.farms[player].tiles.iter().enumerate() {
+            let steps = shed_steps(index % BOARD_SIZE, index / BOARD_SIZE);
+            self.tile_arrivals(tile, None, &mut |item, units, at| {
+                if self.sells_by_the_end(at, steps) {
+                    supply[1][item] += units;
+                    if at < soon {
+                        supply[0][item] += units;
+                    }
+                }
+            });
+            if tile.has_animal {
+                feeds += (days - i64::from(tile.watered_or_fed)).max(0);
+            }
+        }
+        (supply, feeds)
+    }
+
+    /// Whether a harvest at step `at`, `shed_steps` moves from the shed, can
+    /// still sell: `_sells_by_the_end` in tokens.py. The unit walks up and
+    /// drops it in the shed, the market clearing that step, or the day's end
+    /// drops it there to sell on the next day's first step.
+    fn sells_by_the_end(&self, at: i64, shed_steps: i64) -> bool {
+        let turns = i64::from(self.config.turns_per_day);
+        let end = i64::from(self.config.episode_steps) - 1;
+        (at + shed_steps + 1).min((at / turns + 1) * turns) < end
+    }
+
+    /// Units each crop sown, then each animal placed, now yields before the
+    /// game ends: `_started_now_yields` in tokens.py, the fresh tile's
+    /// `tile_arrivals` with a crop still growing on the last acting day
+    /// harvested then.
+    fn started_now_yields(&self) -> [[i64; PRODUCTS]; CROPS + ANIMALS] {
+        let turns = self.config.turns_per_day;
+        let day = self.step / turns;
+        let last_day = self.last_acting_day();
+        std::array::from_fn(|started| {
+            let tile = if started < CROPS {
+                Tile::plant(started, day, turns)
+            } else {
+                Tile::animal(started - CROPS, day)
+            };
+            let mut units = [0_i64; PRODUCTS];
+            // Started beside the shed.
+            self.tile_arrivals(&tile, Some(last_day), &mut |item, count, at| {
+                if self.sells_by_the_end(at, 0) {
+                    units[item] += count;
+                }
+            });
+            units
+        })
+    }
+
+    /// log1p of each started crop's, then animal's, yield value over its cost
+    /// at `prices`: `_paybacks` in tokens.py. An animal also costs the fewest
+    /// WHEAT that keep it from escaping through the refreshes from today up to
+    /// but not including the last acting day's: one every second refresh,
+    /// since production does not need feeding and a fresh animal earns no
+    /// care bonus to spend.
+    fn paybacks(
+        &self,
+        yields: &[[i64; PRODUCTS]; CROPS + ANIMALS],
+        prices: &[i64; PRODUCTS],
+    ) -> [f32; CROPS + ANIMALS] {
+        let day = i64::from(self.step / self.config.turns_per_day);
+        let feeds = (self.last_acting_day() - day).max(0) / 2;
+        std::array::from_fn(|started| {
+            let value: i64 = yields[started]
+                .iter()
+                .zip(prices)
+                .map(|(count, price)| count * price)
+                .sum();
+            let cost = if started < CROPS {
+                SEED_COST[started]
+            } else {
+                ANIMAL_COST[started - CROPS] + feeds * prices[0]
+            };
+            (value as f64 / cost as f64).ln_1p() as f32
+        })
+    }
+
+    /// The last day whose first step still acts; `_LAST_DAY` in tokens.py.
+    fn last_acting_day(&self) -> i64 {
+        (i64::from(self.config.episode_steps) - 2) / i64::from(self.config.turns_per_day)
+    }
+
+    /// Calls `arrive(item, units, at)` for each harvest of `tile` under
+    /// nominal care from now on (`at` may pass the end of the game).
+    ///
+    /// Mirrors `_tile_arrivals` in src/kaggriculture/tokens.py, which cites
+    /// the engine rules: every plant watered and every animal fed daily, each
+    /// harvested once its yield stops growing, no fertilizer or care beyond
+    /// what the tile holds. Given `harvest_by_day`, a single-yield crop stops
+    /// growing after that day.
+    fn tile_arrivals(
+        &self,
+        tile: &Tile,
+        harvest_by_day: Option<i64>,
+        arrive: &mut impl FnMut(usize, i64, i64),
+    ) {
+        let turns = i64::from(self.config.turns_per_day);
+        let step = i64::from(self.step);
+        let day = step / turns;
+        let stock = i64::from(tile.yield_units);
+        let fertilized_until = i64::from(tile.fertilized_until_day);
+        let origin = i64::from(tile.origin_day);
+        if tile.kind == TileKind::Plant {
+            let crop = usize::from(tile.species);
+            let first = i64::from(FIRST_YIELD[crop]);
+            let cap = i64::from(CROP_MAX_HELD[crop]);
+            if CROP_ONGOING[crop] {
+                arrive(crop, stock, step);
+                for production in 0..cap {
+                    let at_day = origin + first + production * i64::from(CROP_INTERVAL[crop]);
+                    if at_day > day {
+                        let units = if fertilized_until >= at_day - 1 { 2 } else { 1 };
+                        arrive(crop, units, at_day * turns);
+                    }
+                }
+                return;
+            }
+            let max_day = i64::from(MAX_YIELD_DAY[crop]);
+            let mut stock = stock;
+            let mut grown = day.max(origin + first);
+            let first_watering =
+                (day + i64::from(tile.watered_or_fed)).max(origin + (max_day + 1) / 2);
+            let last_watering =
+                harvest_by_day.map_or(origin + max_day, |by| by.min(origin + max_day));
+            for watering in first_watering..=last_watering {
+                if stock < cap {
+                    let bonus = if fertilized_until >= watering { 2 } else { 1 };
+                    stock = cap.min(stock + bonus);
+                    grown = grown.max(watering);
+                }
+            }
+            arrive(crop, stock, step.max(grown * turns));
+        } else if tile.has_animal {
+            let animal = usize::from(tile.species);
+            let product = ANIMAL_PRODUCT[animal];
+            arrive(product, stock, step);
+            arrive(PRODUCTS - 1, i64::from(tile.fertilizer_available), step);
+            let mut pending = i64::from(tile.pending_care_bonus);
+            for at_day in day + 1..=self.last_acting_day() {
+                let since_first = at_day - origin - i64::from(ANIMAL_FIRST_YIELD[animal]);
+                if since_first >= 0 && since_first % i64::from(ANIMAL_INTERVAL[animal]) == 0 {
+                    let units = i64::from(ANIMAL_MAX_HELD[animal]).min(1 + pending);
+                    arrive(product, units, at_day * turns);
+                    pending = 0;
+                }
+                if at_day == day + 1 && tile.cared_today {
+                    pending += 1;
+                }
+                arrive(PRODUCTS - 1, 1, at_day * turns);
+            }
+        }
+    }
+
+    /// Units the town is expected to take from now until `stop`, in
+    /// 1/SHOP_PRODUCTS.len() parts; mirrors `_town_draw` in tokens.py.
+    ///
+    /// The open instances sell as `town_consume` does, the town center too,
+    /// and from each unlock day (`end_of_day`) until eight are open one more
+    /// instance sells as each shop with equal chance.
+    fn town_draw(&self, stop: i64) -> [i64; PRODUCTS] {
+        let turns = i64::from(self.config.turns_per_day);
+        let step = i64::from(self.step);
+        let sell = i64::from(self.config.shop_sell_interval);
+        let choices = SHOP_PRODUCTS.len() as i64;
+        let events = |interval: i64, start: i64| {
+            let ceiling = |value: i64| (value + interval - 1).div_euclid(interval);
+            (ceiling(stop) - ceiling(start)).max(0)
+        };
+        let multiplier = |products: &[usize]| if products.len() == 1 { 2 } else { 1 };
+        let mut draw = [0_i64; PRODUCTS];
+        let shop_events = events(sell, step);
+        for &shop in &self.shops[..usize::from(self.shop_count)] {
+            let products = SHOP_PRODUCTS[usize::from(shop)];
+            for &item in products {
+                draw[item] += choices * multiplier(products) * shop_events;
+            }
+        }
+        let center_events = events(i64::from(self.config.town_center_sell_interval), step);
+        for count in &mut draw[..PRODUCTS - 1] {
+            *count += choices * center_events;
+        }
+        let mut opened = usize::from(self.shop_count);
+        for day in step / turns + 1..(stop + turns - 1).div_euclid(turns) {
+            if opened >= self.shops.len() {
+                break;
+            }
+            if day % i64::from(self.config.shop_unlock_interval) == 0 {
+                opened += 1;
+                let unopened_events = events(sell, day * turns);
+                for products in SHOP_PRODUCTS {
+                    for &item in products {
+                        draw[item] += multiplier(products) * unopened_events;
+                    }
+                }
+            }
+        }
+        draw
     }
 
     /// Each product's units in this seat's shed and unit hands.
@@ -2509,6 +2913,39 @@ impl Game {
         }
     }
 
+    /// Apply a submitted turn's unit commands as the interpreter applies its dict.
+    fn apply_unit_commands(&mut self, player: usize, commands: &[UnitCommand], day: u16) {
+        // kaggriculture.py:907-920, as in `apply_unit_actions`: every PLANT of
+        // an over-demanded crop is dropped, and every submitted command counts.
+        let mut demand = [0usize; CROPS];
+        for command in commands {
+            if let UnitCommand::Action(action) = *command
+                && let Some(crop) = unit_plant_crop(action)
+            {
+                demand[crop] += 1;
+            }
+        }
+        let seeds = self.privates[player].seeds;
+        let blocked: [bool; CROPS] =
+            std::array::from_fn(|crop| demand[crop] > usize::from(seeds[crop]));
+        let units = self.farms[player].positions.len().min(commands.len());
+        for (unit, &command) in commands[..units].iter().enumerate() {
+            match command {
+                UnitCommand::Action(action) => {
+                    if !unit_plant_crop(action).is_some_and(|crop| blocked[crop]) {
+                        self.apply_unit_action(player, unit, action, day);
+                    }
+                }
+                UnitCommand::Pickup { item, quantity } => {
+                    self.pickup(player, unit, item, quantity);
+                }
+                UnitCommand::Place { item, quantity } => {
+                    self.place(player, unit, item, quantity, day);
+                }
+            }
+        }
+    }
+
     pub fn unit_action_valid(
         &self,
         player: usize,
@@ -2561,31 +2998,15 @@ impl Game {
             return;
         }
         if let Some((item, requested)) = pickup_spec(action) {
-            if is_shed_access(x, y) {
-                let quantity = self.privates[player].shed[item].min(requested);
-                self.privates[player].shed[item] -= quantity;
-                self.add_inventory(player, unit, item, quantity);
-            }
+            self.pickup(player, unit, item, u32::from(requested));
             return;
         }
         if let Some(animal) = place_animal(action) {
-            let tile = self.farms[player].tiles[tile_index];
-            let private_item = 9 + animal;
-            if tile.kind == animal_structure(animal)
-                && !tile.has_animal
-                && self.privates[player].inventories[unit][private_item] > 0
-            {
-                self.take_inventory(player, unit, private_item, 1);
-                self.farms[player].tiles[tile_index] = Tile::animal(animal, day);
-            } else if is_shed_access(x, y) {
-                self.place_to_shed(player, unit, private_item, 1);
-            }
+            self.place(player, unit, PRODUCTS + animal, 1, day);
             return;
         }
         if let Some(item) = place_product(action) {
-            if is_shed_access(x, y) {
-                self.place_to_shed(player, unit, item, u16::MAX);
-            }
+            self.place(player, unit, item, u32::MAX, day);
             return;
         }
 
@@ -2733,6 +3154,41 @@ impl Game {
         self.privates[player].inventory_order[unit] = [u8::MAX; PRIVATE_ITEMS];
     }
 
+    /// PICKUP (kaggriculture.py:351): up to `requested` of the shed's stock of
+    /// `item`, from a shed-access tile.
+    fn pickup(&mut self, player: usize, unit: usize, item: usize, requested: u32) {
+        let Position(x, y) = self.farms[player].positions[unit];
+        if !is_shed_access(usize::from(x), usize::from(y)) {
+            return;
+        }
+        let requested = u16::try_from(requested).unwrap_or(u16::MAX);
+        let quantity = self.privates[player].shed[item].min(requested);
+        self.privates[player].shed[item] -= quantity;
+        self.add_inventory(player, unit, item, quantity);
+    }
+
+    /// PLACE (kaggriculture.py:372): a carried animal onto the empty structure
+    /// it lives in, otherwise up to `requested` of `item` into the shed from a
+    /// shed-access tile.
+    fn place(&mut self, player: usize, unit: usize, item: usize, requested: u32, day: u16) {
+        let Position(x, y) = self.farms[player].positions[unit];
+        let (x, y) = (usize::from(x), usize::from(y));
+        let tile_index = y * BOARD_SIZE + x;
+        if let Some(animal) = item.checked_sub(PRODUCTS) {
+            let tile = self.farms[player].tiles[tile_index];
+            if tile.kind == animal_structure(animal) && !tile.has_animal {
+                if self.take_inventory(player, unit, item, 1) {
+                    self.farms[player].tiles[tile_index] = Tile::animal(animal, day);
+                }
+                return;
+            }
+        }
+        if is_shed_access(x, y) {
+            let requested = u16::try_from(requested).unwrap_or(u16::MAX);
+            self.place_to_shed(player, unit, item, requested);
+        }
+    }
+
     fn place_to_shed(&mut self, player: usize, unit: usize, item: usize, requested: u16) {
         let available = self.privates[player].inventories[unit][item];
         let room = self
@@ -2747,20 +3203,14 @@ impl Game {
         self.privates[player].shed[item] += take;
     }
 
-    fn process_market(&mut self, actions: &[CompactAction; PLAYERS]) {
-        let mut queue_active = [true; PLAYERS];
+    /// `_process_market` (kaggriculture.py:544): slot by slot, each seat's order
+    /// in that slot fills one unit at a time against a quote both seats share.
+    fn process_market(&mut self, queues: [[Option<MarketOrder>; MAX_MARKET_ORDERS]; PLAYERS]) {
+        /// The interpreter's runaway guard on one slot's lockstep loop, which a
+        /// submitted quantity above 100 can in principle reach.
+        const MAX_SLOT_ITERATIONS: u32 = 100_000;
         for slot in 0..MAX_MARKET_ORDERS {
-            let mut orders: [Option<MarketOrder>; PLAYERS] = std::array::from_fn(|player| {
-                if !queue_active[player] || actions[player].market_kinds[slot] == 0 {
-                    queue_active[player] = false;
-                    None
-                } else {
-                    parse_order(
-                        actions[player].market_kinds[slot],
-                        actions[player].market_quantities[slot],
-                    )
-                }
-            });
+            let mut orders: [Option<MarketOrder>; PLAYERS] = queues.map(|queue| queue[slot]);
             #[allow(clippy::needless_range_loop)]
             for player in 0..PLAYERS {
                 let Some(order) = orders[player] else {
@@ -2778,7 +3228,7 @@ impl Game {
                     _ => {}
                 }
             }
-            loop {
+            for _ in 1..MAX_SLOT_ITERATIONS {
                 let mut quoted = [None; PLAYERS];
                 for player in 0..PLAYERS {
                     let Some(order) = orders[player] else {
@@ -3055,20 +3505,24 @@ fn parse_order(kind: u8, quantity_index: u8) -> Option<MarketOrder> {
     if kind == 0 || kind >= MARKET_KINDS as u8 {
         return None;
     }
-    let quantity = u16::from(quantity_index.min(99)) + 1;
-    let item = match kind {
+    let quantity = u32::from(quantity_index.min(99)) + 1;
+    Some(MarketOrder {
+        kind,
+        item: market_order_item(kind),
+        remaining: if matches!(kind, 1 | 2) { 0 } else { quantity },
+    })
+}
+
+/// The seed, product or animal index a market kind trades; 0 for HIRE and BUY_LAND.
+fn market_order_item(kind: u8) -> usize {
+    match kind {
         3..=7 => usize::from(kind - 3),
         8 => 0,
         9 => 8,
         10..=12 => usize::from(kind - 10),
         13..=21 => usize::from(kind - 13),
         _ => 0,
-    };
-    Some(MarketOrder {
-        kind,
-        item,
-        remaining: if matches!(kind, 1 | 2) { 0 } else { quantity },
-    })
+    }
 }
 
 fn fill_market_kind_mask(config: &GameConfig, ledger: &PolicyMarketLedger, mask: &mut [bool]) {
@@ -3411,6 +3865,13 @@ fn animal_structure(animal: usize) -> TileKind {
     } else {
         TileKind::Pasture
     }
+}
+
+/// Moves from a tile to the nearest shed-access tile, one tile a step: the
+/// distance to the 4..=5 access band along each axis.
+fn shed_steps(x: usize, y: usize) -> i64 {
+    let axis = |value: usize| (4 - value as i64).max(0) + (value as i64 - 5).max(0);
+    axis(x) + axis(y)
 }
 
 #[inline]
@@ -3776,6 +4237,23 @@ pub fn market_price(item: usize, inventory: i32) -> i64 {
 /// inventory, and a sale restocks the market only while the quote sits above
 /// the price floor -- so once a quote reaches the floor, every remaining unit
 /// sells at it.
+/// The market inventory after selling `units` one at a time: a sale restocks
+/// only while its quote sits above the floor; `restocked_inventory` in
+/// src/kaggriculture/constants.py. Quotes never rise with inventory, so the
+/// first floored sale is found by bisection.
+fn restocked_inventory(item: usize, units: i64, inventory: i32) -> i64 {
+    let (mut restocking, mut floored) = (0, units);
+    while restocking < floored {
+        let middle = (restocking + floored) / 2;
+        if market_price(item, inventory + middle as i32) <= PRICE_FLOOR {
+            floored = middle;
+        } else {
+            restocking = middle + 1;
+        }
+    }
+    i64::from(inventory) + floored
+}
+
 fn sale_proceeds(item: usize, units: i64, mut inventory: i32) -> i64 {
     let mut proceeds = 0;
     for sold in 0..units {
@@ -4389,6 +4867,117 @@ mod tests {
         assert_eq!(game.farms[1].money, 3000 + 25 + second_quote);
         // Town-center demand at step zero consumes one after the four sales.
         assert_eq!(game.market_inventory[0], MARKET_I0 + 3);
+    }
+
+    fn submitted(units: Vec<UnitCommand>, orders: &[(u8, u32)]) -> SubmittedTurn {
+        SubmittedTurn::new(units, orders).unwrap()
+    }
+
+    #[test]
+    fn submitted_market_holes_keep_the_slots_both_seats_share() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[0] = 2;
+        game.privates[1].shed[0] = 2;
+        // Seat 0's first order is unreadable; its sale still waits for slot 1,
+        // after the opponent's slot-0 sale has moved the quote.
+        let holed = submitted(vec![], &[(0, 0), (13, 2)]);
+        let opponent = submitted(vec![], &[(13, 2)]);
+        game.step_turns([Turn::Submitted(&holed), Turn::Submitted(&opponent)]);
+        let quote = |sold: i32| market_price(0, MARKET_I0 + sold);
+        assert_eq!(game.farms[1].money, 3000 + quote(0) + quote(1));
+        assert_eq!(game.farms[0].money, 3000 + quote(2) + quote(3));
+    }
+
+    #[test]
+    fn submitted_turns_carry_quantities_the_factors_cannot() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].shed[PRODUCTS + 1] = 6;
+        game.privates[0].inventories[0][0] = 7;
+        game.privates[0].inventory_order[0][0] = 0;
+        let turn = submitted(
+            vec![UnitCommand::Pickup {
+                item: PRODUCTS + 1,
+                quantity: 5,
+            }],
+            &[(3, 150)],
+        );
+        game.step_turns([
+            Turn::Submitted(&turn),
+            Turn::Factors(&CompactAction::default()),
+        ]);
+        // Five cows where the factors stop at four, and 150 seeds past 100.
+        assert_eq!(game.privates[0].inventories[0][PRODUCTS + 1], 5);
+        assert_eq!(game.privates[0].shed[PRODUCTS + 1], 1);
+        assert_eq!(game.privates[0].seeds[0], 150);
+        assert_eq!(game.farms[0].money, 3000 - 150 * 10);
+
+        // A partial deposit, where the factors only deposit everything.
+        let turn = submitted(
+            vec![UnitCommand::Place {
+                item: 0,
+                quantity: 3,
+            }],
+            &[],
+        );
+        game.step_turns([
+            Turn::Submitted(&turn),
+            Turn::Factors(&CompactAction::default()),
+        ]);
+        assert_eq!(game.privates[0].inventories[0][0], 4);
+        assert_eq!(game.privates[0].shed[0], 3);
+    }
+
+    #[test]
+    fn submitted_plant_demand_counts_commands_for_absent_hands() {
+        let mut game = Game::new(0, GameConfig::default());
+        game.privates[0].seeds[0] = 1;
+        let plants = submitted(vec![UnitCommand::Action(45); 2], &[]);
+        let pass = SubmittedTurn::default();
+        let mut blocked = game.clone();
+        blocked.step_turns([Turn::Submitted(&plants), Turn::Submitted(&pass)]);
+        assert_eq!(blocked.farms[0].tiles[44].kind, TileKind::Empty);
+        assert_eq!(blocked.privates[0].seeds[0], 1);
+
+        let plant = submitted(vec![UnitCommand::Action(45)], &[]);
+        game.step_turns([Turn::Submitted(&plant), Turn::Submitted(&pass)]);
+        assert_eq!(game.farms[0].tiles[44].kind, TileKind::Plant);
+        assert_eq!(game.privates[0].seeds[0], 0);
+    }
+
+    #[test]
+    fn submitted_turn_refuses_what_the_interpreter_never_reads() {
+        let pass = UnitCommand::Action(0);
+        for (units, orders, error) in [
+            (
+                vec![UnitCommand::Action(UNIT_ACTIONS as u8)],
+                vec![],
+                "action",
+            ),
+            (vec![UnitCommand::Action(7)], vec![], "fixes its quantity"),
+            (
+                vec![UnitCommand::Pickup {
+                    item: PRIVATE_ITEMS,
+                    quantity: 1,
+                }],
+                vec![],
+                "item",
+            ),
+            (vec![pass], vec![(MARKET_KINDS as u8, 1)], "kind"),
+            (vec![pass], vec![(13, 0)], "quantity 0"),
+            (
+                vec![pass],
+                vec![(1, 0); MAX_MARKET_ORDERS + 1],
+                "market orders",
+            ),
+        ] {
+            let refused = SubmittedTurn::new(units, &orders).unwrap_err();
+            assert!(refused.contains(error), "{refused}");
+        }
+        // HIRE and BUY_LAND ignore a quantity; holes read nothing.
+        let turn = submitted(vec![pass], &[(1, 9), (0, 5), (2, 0)]);
+        assert_eq!(turn.market[0].unwrap().remaining, 0);
+        assert!(turn.market[1].is_none());
+        assert_eq!(turn.market[2].unwrap().kind, 2);
     }
 
     #[test]
@@ -5052,5 +5641,264 @@ mod tests {
         // The reference `starter` banks a few hundred over its stake across an
         // episode; anything near the stake means the carrot loop stalled.
         assert!(game.farms[0].money > game.config.starting_money + 300);
+    }
+
+    const WATER: u8 = 50;
+    const HARVEST: u8 = 51;
+    const FERTILIZE: u8 = 52;
+    const FEED: u8 = 56;
+    const COLLECT_FERTILIZER: u8 = 57;
+    const CARE: u8 = 58;
+
+    /// One engine step on player zero's tiles, returning what was picked up
+    /// on each.
+    ///
+    /// The farmer stands on every tile in turn and takes `ops` there, handed
+    /// the WHEAT or FERTILIZER an op consumes; then the plants decay and, on
+    /// the day's last step, the daily refresh runs.
+    fn engine_step(
+        game: &mut Game,
+        step: u16,
+        mut ops: impl FnMut(&Tile, u16) -> Vec<u8>,
+    ) -> [[i64; PRODUCTS]; TILE_COUNT] {
+        let day = step / game.config.turns_per_day;
+        let mut picked_up = [[0_i64; PRODUCTS]; TILE_COUNT];
+        for (index, tile_picked_up) in picked_up.iter_mut().enumerate() {
+            game.farms[0].positions[0] =
+                Position((index % BOARD_SIZE) as u8, (index / BOARD_SIZE) as u8);
+            for op in ops(&game.farms[0].tiles[index], day) {
+                let supplied = match op {
+                    FEED => Some(0),
+                    FERTILIZE => Some(PRODUCTS - 1),
+                    _ => None,
+                };
+                if let Some(item) = supplied {
+                    game.add_inventory(0, 0, item, 1);
+                }
+                game.apply_unit_action(0, 0, op, day);
+                if let Some(item) = supplied {
+                    game.take_inventory(0, 0, item, 1);
+                }
+            }
+            let carried = &mut game.privates[0].inventories[0];
+            for (units, held) in tile_picked_up.iter_mut().zip(&mut carried[..PRODUCTS]) {
+                *units += i64::from(*held);
+                *held = 0;
+            }
+            game.privates[0].inventory_order[0] = [u8::MAX; PRIVATE_ITEMS];
+        }
+        game.decay_plants(0, step);
+        if (step + 1).is_multiple_of(game.config.turns_per_day) {
+            game.daily_refresh_plants(0, day);
+            game.daily_refresh_animals(0, day);
+        }
+        picked_up
+    }
+
+    /// The care `farm_supply` assumes: water and feed daily, harvest once
+    /// grown, judged after the watering the same step's ops begin with.
+    fn nominal_care(tile: &Tile, day: u16) -> Vec<u8> {
+        if tile.has_animal {
+            return vec![FEED, HARVEST, COLLECT_FERTILIZER];
+        }
+        if tile.kind != TileKind::Plant {
+            return Vec::new();
+        }
+        let crop = usize::from(tile.species);
+        let age = day - tile.origin_day;
+        let growing = !CROP_ONGOING[crop]
+            && !tile.watered_or_fed
+            && MAX_YIELD_DAY[crop].div_ceil(2) <= age
+            && age <= MAX_YIELD_DAY[crop];
+        let bonus = if i32::from(tile.fertilized_until_day) >= i32::from(day) {
+            2
+        } else {
+            1
+        };
+        let watered = if growing {
+            CROP_MAX_HELD[crop].min(tile.yield_units + bonus)
+        } else {
+            tile.yield_units
+        };
+        let grown =
+            CROP_ONGOING[crop] || watered >= CROP_MAX_HELD[crop] || age >= MAX_YIELD_DAY[crop];
+        if grown {
+            vec![WATER, HARVEST]
+        } else {
+            vec![WATER]
+        }
+    }
+
+    #[test]
+    fn farm_supply_is_the_engines_yield_under_nominal_care() {
+        // Mirrors the Python test against the official engine: a random history
+        // of sparse care, then from each checkpoint the engine plays nominal
+        // care to the last acting step.
+        for seed in [3, 11] {
+            let mut rng = PyRandom::seed_u64(seed);
+            let mut game = Game::new(seed, GameConfig::default());
+            game.farms[0].tiles = [Tile::default(); TILE_COUNT];
+            let turns = game.config.turns_per_day;
+            let last = game.config.episode_steps - 1;
+            let mut supplied = [0_i64; PRODUCTS];
+            let mut seen = [0_usize; 5];
+            for step in 0..last {
+                let day = step / turns;
+                for tile in &mut game.farms[0].tiles {
+                    if tile.kind == TileKind::Empty && rng.random() < 0.004 {
+                        let species = rng.randbelow((CROPS + ANIMALS) as u32) as usize;
+                        *tile = if species < CROPS {
+                            Tile::plant(species, day, turns)
+                        } else {
+                            Tile::animal(species - CROPS, day)
+                        };
+                    }
+                }
+                let checkpoint = step.is_multiple_of(29)
+                    || step.is_multiple_of(7 * turns)
+                    || (step >= last - 30 && (step - (last - 30)).is_multiple_of(5))
+                    || step == last - 1;
+                if checkpoint {
+                    game.step = step;
+                    for tile in &game.farms[0].tiles {
+                        let plant = tile.kind == TileKind::Plant;
+                        seen[0] += usize::from(tile.has_animal && tile.pending_care_bonus > 0);
+                        seen[1] += usize::from(tile.has_animal && tile.cared_today);
+                        seen[2] += usize::from(tile.has_animal && tile.fertilizer_available);
+                        seen[3] += usize::from(plant && tile.watered_or_fed);
+                        seen[4] += usize::from(
+                            plant
+                                && CROP_ONGOING[usize::from(tile.species)]
+                                && tile.fertilized_until_day >= day as i16,
+                        );
+                    }
+                    let mut nominal = game.clone();
+                    let mut expected = [[0_i64; PRODUCTS]; 2];
+                    let mut feeds = 0;
+                    for now in step..last {
+                        let care = |tile: &Tile, day: u16| {
+                            // A feed counts before the last acting day.
+                            feeds += i64::from(
+                                tile.has_animal && !tile.watered_or_fed && day < last / turns,
+                            );
+                            nominal_care(tile, day)
+                        };
+                        let picked_up = engine_step(&mut nominal, now, care);
+                        for (index, tile_picked_up) in picked_up.into_iter().enumerate() {
+                            // Walk to the shed and drop it, or wait for the
+                            // day's end drop, then sell on a step that acts.
+                            let walked = i64::from(now)
+                                + shed_steps(index % BOARD_SIZE, index / BOARD_SIZE)
+                                + 1;
+                            let dropped = i64::from((now / turns + 1) * turns);
+                            if walked.min(dropped) >= i64::from(last) {
+                                continue;
+                            }
+                            for (item, units) in tile_picked_up.into_iter().enumerate() {
+                                expected[1][item] += units;
+                                if now < step + 2 * turns {
+                                    expected[0][item] += units;
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        game.farm_supply(0),
+                        (expected, feeds),
+                        "seed {seed}, step {step}"
+                    );
+                    for (total, units) in supplied.iter_mut().zip(expected[1]) {
+                        *total += units;
+                    }
+                }
+                engine_step(&mut game, step, |tile, _| {
+                    let chances: &[(u8, f64)] = if tile.has_animal {
+                        &[
+                            (FEED, 0.15),
+                            (CARE, 0.05),
+                            (HARVEST, 0.03),
+                            (COLLECT_FERTILIZER, 0.05),
+                        ]
+                    } else if tile.kind == TileKind::Plant {
+                        &[(FERTILIZE, 0.01), (WATER, 0.15), (HARVEST, 0.03)]
+                    } else {
+                        &[]
+                    };
+                    chances
+                        .iter()
+                        .filter(|&&(_, chance)| rng.random() < chance)
+                        .map(|&(op, _)| op)
+                        .collect()
+                });
+            }
+            // The history reached every product and every tile state read.
+            assert!(supplied.iter().all(|&units| units > 0), "{supplied:?}");
+            assert!(seen.iter().all(|&count| count > 0), "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn town_draw_is_the_mean_engine_consumption_over_every_unlock() {
+        // Shop indices in SHOP_NAMES_SORTED order, and the observation step.
+        let cases: [(&[u8], u16); 7] = [
+            (&[4; 6], 0),
+            (&[0, 4, 0, 4, 0, 4], 61),
+            (&[7; 7], 1),
+            (&[1], 620),
+            (&[6, 6, 6, 6, 2, 2, 2, 2], 575),
+            (&[4], 716),
+            (&[], 718),
+        ];
+        for (shops, step) in cases {
+            let mut game = Game::new(0, GameConfig::default());
+            game.shops[..shops.len()].copy_from_slice(shops);
+            game.shop_count = shops.len() as u8;
+            game.step = step;
+            let turns = game.config.turns_per_day;
+            let end = game.config.episode_steps - 1;
+            // The engine's town over [step, stop), opening `drawn` in order.
+            let consumed = |stop: u16, drawn: &[u8]| {
+                let mut town = game.clone();
+                let mut drawn = drawn.iter();
+                let mut unlocks = 0_u32;
+                for now in step..stop {
+                    let unlocking = now > step
+                        && now.is_multiple_of(turns)
+                        && (now / turns).is_multiple_of(town.config.shop_unlock_interval)
+                        && usize::from(town.shop_count) < town.shops.len();
+                    if unlocking {
+                        town.shops[usize::from(town.shop_count)] = *drawn.next().unwrap();
+                        town.shop_count += 1;
+                        unlocks += 1;
+                    }
+                    town.town_consume(now);
+                }
+                let units: [i64; PRODUCTS] =
+                    std::array::from_fn(|item| i64::from(MARKET_I0 - town.market_inventory[item]));
+                (units, unlocks)
+            };
+            for stop in [(step + 2 * turns).min(end), end] {
+                let choices = SHOP_PRODUCTS.len();
+                let (_, unlocks) = consumed(stop, &[0; 8]);
+                let outcomes = choices.pow(unlocks);
+                let mut total = [0_i64; PRODUCTS];
+                for outcome in 0..outcomes {
+                    let drawn: Vec<u8> = (0..unlocks)
+                        .map(|unlock| (outcome / choices.pow(unlock) % choices) as u8)
+                        .collect();
+                    for (sum, units) in total.iter_mut().zip(consumed(stop, &drawn).0) {
+                        *sum += units;
+                    }
+                }
+                // `draw` is the mean over the outcomes, in 1 / choices parts.
+                for (sum, draw) in total.into_iter().zip(game.town_draw(i64::from(stop))) {
+                    assert_eq!(
+                        sum * choices as i64,
+                        draw * outcomes as i64,
+                        "shops {shops:?}, [{step}, {stop})"
+                    );
+                }
+            }
+        }
     }
 }

@@ -130,9 +130,11 @@ class LejepaConfig(EntityConfig):
     which fix nothing, stay on `PpoConfig` where the rest of the trade-offs are.
     """
 
-    # The current-rules money-margin arm is the working basis for future LeJEPA
-    # runs. Saved v3 artifacts still name their schema explicitly when loaded.
-    observation_schema_version: int = 4
+    # Schema 8 adds liquidation value, price and supply forecasts and the
+    # payback of starting each crop or animal now; its leaderboard clone fits
+    # and plays as the v4 one does (artifacts/probes/ppo-frontier-20260928/
+    # replay). Saved artifacts still name their schema explicitly when loaded.
+    observation_schema_version: int = 8
     # Every quantity choice a market kind admits (interface 2), and the local
     # unit affordance scorer below: the promoted core's configuration, which the
     # WDL clone and every PPO stage behind the default recipe trained

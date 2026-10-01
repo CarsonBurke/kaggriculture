@@ -14,6 +14,8 @@ summaries, town/clock), and critic-only opponent-private columns.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,15 +24,20 @@ from kaggriculture.constants import (
     ANIMAL_COST,
     ANIMAL_FIRST_YIELD_DAY,
     ANIMAL_MAX_HELD,
+    ANIMAL_PRODUCT,
+    ANIMAL_STRUCTURE,
+    ANIMAL_YIELD_INTERVAL,
     ANIMALS,
     BASE_PRICE,
     BOARD_SIZE,
     CROP_FIRST_YIELD_DAY,
     CROP_MAX_YIELD,
     CROP_MAX_YIELD_DAY,
+    CROP_YIELD_INTERVAL,
     CROPS,
     EPISODE_STEPS,
     MARKET_I0,
+    MAX_SHOP_INSTANCES,
     MAX_UNITS,
     ONGOING_CROPS,
     PRIVATE_ITEMS,
@@ -38,7 +45,14 @@ from kaggriculture.constants import (
     SEED_COST,
     SHED_CAPACITY,
     SHOP_NAMES,
+    SHOP_PRODUCTS,
+    TOWN_CENTER_PRODUCTS,
+    TOWN_CENTER_SELL_INTERVAL,
+    TOWN_SHOP_SELL_INTERVAL,
+    TOWN_SHOP_UNLOCK_INTERVAL,
     TURNS_PER_DAY,
+    market_price,
+    restocked_inventory,
     sale_proceeds,
     shed_access_tiles,
 )
@@ -60,8 +74,11 @@ TILE_COUNT = BOARD_SIZE * BOARD_SIZE
 # v5: adds the town token's per-shop `first_unlock` positions.
 # v6: adds the product token's `held_value` and the farm token's `liquidation`
 #     and `liquidation_margin` (and the critic's `opponent_held_value`).
-OBSERVATION_SCHEMA_VERSION = 6
-SUPPORTED_OBSERVATION_SCHEMA_VERSIONS = frozenset((3, 4, 5, 6))
+# v7: adds the product token's supply/demand outlook, `forecast_price` through
+#     `town_draw_to_end` (and the critic's `opponent_forecast_price`).
+# v8: adds the crop and animal tokens' `payback` and `forecast_payback`.
+OBSERVATION_SCHEMA_VERSION = 8
+SUPPORTED_OBSERVATION_SCHEMA_VERSIONS = frozenset((3, 4, 5, 6, 7, 8))
 # The common model-config default remains v3 for entity-attention and the other
 # structured families. Fresh LeJEPA configs, production's, override it to v4; saved v3 model
 # configs still carry their explicit version for loading and resume.
@@ -155,16 +172,18 @@ TILE_SLOT_CATEGORICAL = np.concatenate(
 TILE_SLOT_CATEGORICAL.setflags(write=False)
 
 
-def _shed_distance_map(board_size: int) -> np.ndarray:
+def _shed_steps_map(board_size: int) -> np.ndarray:
+    """Moves from each tile to the nearest shed-access tile, one tile a step."""
     access = shed_access_tiles(board_size)
-    grid = np.empty((board_size, board_size), dtype=np.float32)
+    grid = np.empty((board_size, board_size), dtype=np.int64)
     for y in range(board_size):
         for x in range(board_size):
             grid[y, x] = min(abs(x - ax) + abs(y - ay) for ax, ay in access)
-    return grid / grid.max()
+    return grid
 
 
-_SHED_DISTANCE = _shed_distance_map(BOARD_SIZE)
+_SHED_STEPS = _shed_steps_map(BOARD_SIZE)
+_SHED_DISTANCE = _SHED_STEPS.astype(np.float32) / np.float32(_SHED_STEPS.max())
 _SHED_ACCESS = frozenset(shed_access_tiles(BOARD_SIZE))
 
 
@@ -406,15 +425,52 @@ PRODUCT_TOKEN_FIELDS = (
     # full shed of melons at base price is 1. `price` times the stock
     # overstates a large stock by exactly the impact this prices in.
     "held_value",
+    # Schema v7: the product's outlook to the end of the game. Supply is what
+    # the public tiles will yield under nominal care (`_farm_supply`): every
+    # plant watered and every animal fed daily, each harvested when its yield
+    # stops growing, no fertilizer or care beyond what the tiles already hold;
+    # a harvest counts if it can still reach the shed and sell before the end
+    # (`_sells_by_the_end`). Demand is the town's draw (`_town_draw`): the
+    # open shop instances plus the ones still to open, each an expected
+    # (uniform) shop. "Soon" is the next `OUTLOOK_SOON_STEPS` steps, "to end"
+    # every step still to act.
+    #
+    # The quote, / (2 * BASE_PRICE) like `price`, at the market inventory
+    # left if this seat sold everything it holds and both farms' supply to the
+    # end, the animals ate their daily WHEAT, and the town drew its expected
+    # demand (`_forecast_prices`), rounded to a unit. The opponent's holdings
+    # are private, so the critic reads its own view as
+    # `opponent_forecast_price`.
+    "forecast_price",
+    "supply_soon",  # units this farm's tiles yield soon / SHED_CAPACITY
+    "supply_to_end",  # units this farm's tiles yield to the end / SHED_CAPACITY
+    "opponent_supply_soon",  # the other farm's, the same way
+    "opponent_supply_to_end",
+    "town_draw_soon",  # expected units the town takes soon / SHED_CAPACITY
+    "town_draw_to_end",  # expected units the town takes to the end / SHED_CAPACITY
 )
-_PRODUCT_TOKEN_WIDTHS = {3: 5, 4: 5, 5: 5, 6: 6}
+_PRODUCT_TOKEN_WIDTHS = {3: 5, 4: 5, 5: 5, 6: 6, 7: 13, 8: 13}
 # Coins per unit of `held_value`: a full shed at the highest base price.
 HELD_VALUE_SCALE = float(SHED_CAPACITY * max(BASE_PRICE.values()))
+# The outlook's near horizon: two days, about one crop or animal cycle.
+OUTLOOK_SOON_STEPS = 2 * TURNS_PER_DAY
+# Schema v8, on the crop and animal tokens: what starting one more now
+# returns before the game ends. A crop sown, or an animal placed, this day
+# yields what `_tile_arrivals` gives a fresh tile under nominal care, a crop
+# still growing on the last acting day harvested then (`_started_now_yields`):
+# for an animal, its product and a FERTILIZER a day. `payback` values that
+# yield at the current prices over its cost -- the seed, or the animal and the
+# WHEAT that feeds it daily until the last acting day (`_paybacks`) -- and
+# `forecast_payback` at the seat's `forecast_price`s. Both are log1p of that
+# ratio, unscaled: 0 once nothing more can be harvested, log 2 at breakeven.
+_PAYBACK_FIELDS = ("payback", "forecast_payback")
 ANIMAL_TOKEN_FIELDS = (
     "purchase_price",  # ANIMAL_COST / max ANIMAL_COST; animals have no market quote
     "shed_stock",  # own shed count / SHED_CAPACITY
     "carried_stock",  # summed across own units / SHED_CAPACITY
+    *_PAYBACK_FIELDS,
 )
+_ANIMAL_TOKEN_WIDTHS = {3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 5}
 CROP_TOKEN_FIELDS = (
     "seed_cost",  # SEED_COST / max SEED_COST
     "seeds_held",  # own private seed count / SHED_CAPACITY
@@ -422,7 +478,9 @@ CROP_TOKEN_FIELDS = (
     "max_yield_day",  # CROP_MAX_YIELD_DAY / max CROP_MAX_YIELD_DAY
     "max_yield",  # CROP_MAX_YIELD / max CROP_MAX_YIELD
     "ongoing",  # keeps producing after first yield
+    *_PAYBACK_FIELDS,
 )
+_CROP_TOKEN_WIDTHS = {3: 6, 4: 6, 5: 6, 6: 6, 7: 6, 8: 8}
 FARM_TOKEN_FIELDS = (
     "money",  # signed log1p scale shared with the flat encoder
     "unlocked_quadrants",  # / 4
@@ -452,7 +510,7 @@ FARM_TOKEN_FIELDS = (
     # only its bank: a stockpile no longer reads as a deficit.
     "liquidation_margin",
 )
-_FARM_TOKEN_WIDTHS = {3: 4, 4: 5, 5: 5, 6: 7}
+_FARM_TOKEN_WIDTHS = {3: 4, 4: 5, 5: 5, 6: 7, 7: 7, 8: 7}
 TOWN_TOKEN_FIELDS = (
     "day",
     "hour",
@@ -473,6 +531,8 @@ _TOWN_TOKEN_WIDTHS = {
     4: 6 + len(SHOP_NAMES),
     5: 6 + 2 * len(SHOP_NAMES),
     6: 6 + 2 * len(SHOP_NAMES),
+    7: 6 + 2 * len(SHOP_NAMES),
+    8: 6 + 2 * len(SHOP_NAMES),
 }
 
 
@@ -484,13 +544,18 @@ PRODUCT_PRIVATE_FIELDS = (
     "opponent_shed_stock",  # opponent shed count / SHED_CAPACITY
     "opponent_carried_stock",  # summed across opponent units / SHED_CAPACITY
     "opponent_held_value",  # schema v6: the opponent's `held_value`
+    "opponent_forecast_price",  # schema v7: the opponent's `forecast_price`
 )
-_PRODUCT_PRIVATE_WIDTHS = {3: 2, 4: 2, 5: 2, 6: 3}
+_PRODUCT_PRIVATE_WIDTHS = {3: 2, 4: 2, 5: 2, 6: 3, 7: 4, 8: 4}
 ANIMAL_PRIVATE_FIELDS = (
     "opponent_shed_stock",
     "opponent_carried_stock",
 )
 CROP_PRIVATE_FIELDS = ("opponent_seeds_held",)  # opponent seeds / SHED_CAPACITY
+# The opponent's `forecast_payback` has no private column: it is its
+# `forecast_price`s read through the public yields, which the critic already
+# has as `opponent_forecast_price`, and a column after `seeds_held` would break
+# the contiguous run the paired-seat staging slices.
 
 
 @dataclass(frozen=True)
@@ -516,6 +581,16 @@ def _schema_prefix(
 def product_token_fields(schema_version: int) -> tuple[str, ...]:
     """The prefix of ``PRODUCT_TOKEN_FIELDS`` a model of this schema consumes."""
     return _schema_prefix(PRODUCT_TOKEN_FIELDS, _PRODUCT_TOKEN_WIDTHS, schema_version)
+
+
+def animal_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``ANIMAL_TOKEN_FIELDS`` a model of this schema consumes."""
+    return _schema_prefix(ANIMAL_TOKEN_FIELDS, _ANIMAL_TOKEN_WIDTHS, schema_version)
+
+
+def crop_token_fields(schema_version: int) -> tuple[str, ...]:
+    """The prefix of ``CROP_TOKEN_FIELDS`` a model of this schema consumes."""
+    return _schema_prefix(CROP_TOKEN_FIELDS, _CROP_TOKEN_WIDTHS, schema_version)
 
 
 def farm_token_fields(schema_version: int) -> tuple[str, ...]:
@@ -552,22 +627,332 @@ def _carried_items(private: dict) -> dict[str, int]:
     }
 
 
-def _held_proceeds(shed: dict, carried: dict[str, int], market: dict) -> dict[str, int]:
-    """Each product's exact coins if one seat sold its shed and carried stock now."""
+def _held_units(shed: dict, carried: dict[str, int]) -> dict[str, int]:
+    """Each product one seat holds, in its shed and its units' hands."""
+    return {item: int(shed.get(item, 0) or 0) + carried[item] for item in PRODUCTS}
+
+
+def _held_proceeds(held: dict[str, int], market: dict) -> dict[str, int]:
+    """Each product's exact coins if one seat sold its ``held`` stock now."""
     inventory = market.get("inventory") or {}
     return {
         item: sale_proceeds(
-            item,
-            int(shed.get(item, 0) or 0) + carried[item],
-            int(inventory.get(item, MARKET_I0) or 0),
-            market.get("params"),
+            item, held[item], int(inventory.get(item, MARKET_I0) or 0), market.get("params")
         )
         for item in PRODUCTS
     }
 
 
-def tokenize_economy(observation: dict) -> EconomyTokens:
-    """Tokenize market, crop, farm-summary, and town state for the actor."""
+# The outlook reads the default game's rules from `kaggriculture.constants`,
+# which a test pins to the official engine; an observation carries no game
+# configuration. The native tokenizer reads its own `GameConfig`, which the
+# extension only ever builds at these defaults, so the two always agree.
+#
+# The steps still to act: the engine applies actions through step
+# EPISODE_STEPS - 2 and ends the game there, so an arrival counts before this.
+_OUTLOOK_END = EPISODE_STEPS - 1
+# The last day whose first step still acts.
+_LAST_DAY = (_OUTLOOK_END - 1) // TURNS_PER_DAY
+# Units of the town's expected draw: a shop still to open is each of the
+# SHOP_NAMES with equal chance, so its draw is a whole number of these parts.
+_SHOP_CHOICES = len(SHOP_NAMES)
+# Parts of a unit each product loses to one sell event of one unopened shop.
+_UNOPENED_SHOP_DRAW = {
+    item: sum(
+        (2 if len(products) == 1 else 1) * (item in products) for products in SHOP_PRODUCTS.values()
+    )
+    for item in PRODUCTS
+}
+
+
+@dataclass(frozen=True)
+class MarketOutlook:
+    """Public supply and the town's expected demand, per product (`PRODUCT_TOKEN_FIELDS`)."""
+
+    supply_soon: tuple[dict[str, int], dict[str, int]]  # own farm, then the other's
+    supply_to_end: tuple[dict[str, int], dict[str, int]]
+    draw_soon: dict[str, int]  # in 1/_SHOP_CHOICES parts of a unit
+    draw_to_end: dict[str, int]
+    feeds_to_end: int  # WHEAT both farms' animals eat (`_feeds_by_the_end`)
+
+
+def _tile_arrivals(
+    tile: dict, step: int, *, harvest_by_day: int | None = None
+) -> Iterator[tuple[str, int, int]]:
+    """Each harvest ``(item, units, at)`` of ``tile`` under nominal care.
+
+    Mirrors the engine's yield rules (kaggriculture.py `_apply_unit_action`
+    WATER and HARVEST, `_daily_refresh_plants`, `_daily_refresh_animals`) with
+    CROP_* and ANIMAL_* constants, for a farm that waters and feeds every tile
+    daily and harvests each one as soon as its yield stops growing, from
+    ``step`` on (``at`` may pass the end of the game). Several units may
+    stand on a tile and the engine applies their actions in turn, so a
+    harvest can follow the day's watering in the same step:
+
+    - a single-yield crop's `yield_units` grows by one (two while fertilized,
+      `fertilized_until_day >= day`) on each watered day whose age is in
+      [ceil(max_yield_day / 2), max_yield_day], up to its max yield; it is
+      harvested from `first_yield_day` on, on the last day it grew, and past
+      its lifespan it is harvested at once; given ``harvest_by_day``, it
+      stops growing after that day, so one still growing is harvested then;
+    - an ongoing crop's standing yield is harvested now, and each of its
+      max-yield productions lands at the start of day planted_day +
+      first_yield_day + k * interval (two units if fertilized the day before);
+    - an animal's standing yield is harvested now, and each production day
+      placed_day + first_yield_day + k * interval adds one unit plus the care
+      bonus it has pending (today's care joins it after tomorrow's
+      production), up to its max held; each animal also gives one FERTILIZER
+      a day, and one now if it is still available.
+    """
+    day = step // TURNS_PER_DAY
+    stock = int(tile.get("yield_units", 0) or 0)
+    fertilized_until = int(tile.get("fertilized_until_day", -1))
+    if tile.get("kind") == "PLANT":
+        crop = tile["crop"]
+        planted = int(tile["planted_day"])
+        if crop in ONGOING_CROPS:
+            yield crop, stock, step
+            for production in range(CROP_MAX_YIELD[crop]):
+                at_day = (
+                    planted + CROP_FIRST_YIELD_DAY[crop] + production * CROP_YIELD_INTERVAL[crop]
+                )
+                if at_day > day:
+                    units = 2 if fertilized_until >= at_day - 1 else 1
+                    yield crop, units, at_day * TURNS_PER_DAY
+            return
+        grown = max(day, planted + CROP_FIRST_YIELD_DAY[crop])
+        first_watering = max(
+            day + bool(tile.get("watered_today")),
+            planted + (CROP_MAX_YIELD_DAY[crop] + 1) // 2,
+        )
+        last_watering = planted + CROP_MAX_YIELD_DAY[crop]
+        if harvest_by_day is not None:
+            last_watering = min(last_watering, harvest_by_day)
+        for watering in range(first_watering, last_watering + 1):
+            if stock < CROP_MAX_YIELD[crop]:
+                bonus = 2 if fertilized_until >= watering else 1
+                stock = min(CROP_MAX_YIELD[crop], stock + bonus)
+                grown = max(grown, watering)
+        yield crop, stock, max(step, grown * TURNS_PER_DAY)
+        return
+    animal = tile.get("animal")
+    if animal is None:
+        return
+    product = ANIMAL_PRODUCT[animal]
+    yield product, stock, step
+    yield "FERTILIZER", int(bool(tile.get("fertilizer_available"))), step
+    pending = int(tile.get("pending_care_bonus", 0) or 0)
+    # A production at the start of a day lands at that day's first step.
+    for at_day in range(day + 1, _LAST_DAY + 1):
+        since_first = at_day - int(tile["placed_day"]) - ANIMAL_FIRST_YIELD_DAY[animal]
+        if since_first >= 0 and since_first % ANIMAL_YIELD_INTERVAL[animal] == 0:
+            units = min(ANIMAL_MAX_HELD[animal], 1 + pending)
+            yield product, units, at_day * TURNS_PER_DAY
+            pending = 0
+        if at_day == day + 1 and tile.get("cared_today"):
+            pending += 1
+        yield "FERTILIZER", 1, at_day * TURNS_PER_DAY
+
+
+def _sells_by_the_end(at: int, shed_steps: int) -> bool:
+    """Whether a harvest at step ``at``, ``shed_steps`` moves from the shed, can still sell.
+
+    Markets clear after units act (kaggriculture.py `interpreter`), so the
+    harvesting unit sells on the step it walks up and drops the harvest in
+    the shed (`_apply_unit_action` DROP), or the day's end drops it there
+    (`_drop_inventories_to_shed`) to sell on the next day's first step.
+    """
+    walked = at + shed_steps + 1
+    return min(walked, (at // TURNS_PER_DAY + 1) * TURNS_PER_DAY) < _OUTLOOK_END
+
+
+def _feeds_by_the_end(tile: dict, step: int) -> int:
+    """WHEAT nominal care feeds an animal: one each day before the last acting day.
+
+    A feed on that day keeps no production (`_tile_arrivals`); one already
+    given today is spent.
+    """
+    days = _LAST_DAY - step // TURNS_PER_DAY
+    return max(0, days - bool(tile.get("fed_today")))
+
+
+def _farm_supply(farm: dict, step: int) -> tuple[dict[str, int], dict[str, int], int]:
+    """The farm's nominal-care yields that sell (`_tile_arrivals`), soon and to the end.
+
+    Also the WHEAT its animals eat meanwhile (`_feeds_by_the_end`).
+    """
+    soon = dict.fromkeys(PRODUCTS, 0)
+    to_end = dict.fromkeys(PRODUCTS, 0)
+    feeds = 0
+    for y, row in enumerate(farm.get("tiles") or []):
+        for x, tile in enumerate(row):
+            if not isinstance(tile, dict):
+                continue
+            for item, units, at in _tile_arrivals(tile, step):
+                if _sells_by_the_end(at, int(_SHED_STEPS[y, x])):
+                    to_end[item] += units
+                    if at < step + OUTLOOK_SOON_STEPS:
+                        soon[item] += units
+            if tile.get("animal"):
+                feeds += _feeds_by_the_end(tile, step)
+    return soon, to_end, feeds
+
+
+def _started_now(step: int) -> dict[str, dict]:
+    """A fresh tile of each crop sown and each animal placed at ``step``.
+
+    The engine's `_new_plant` and `_new_animal`, keeping the fields
+    `_tile_arrivals` reads.
+    """
+    day = step // TURNS_PER_DAY
+    tiles = {
+        crop: {
+            "kind": "PLANT",
+            "crop": crop,
+            "planted_day": day,
+            "watered_today": False,
+            "yield_units": 0 if crop in ONGOING_CROPS else 1,
+            "fertilized_until_day": -1,
+        }
+        for crop in CROPS
+    }
+    for animal in ANIMALS:
+        tiles[animal] = {
+            "kind": ANIMAL_STRUCTURE[animal],
+            "animal": animal,
+            "placed_day": day,
+            "yield_units": 0,
+            "cared_today": False,
+            "fertilizer_available": False,
+            "pending_care_bonus": 0,
+        }
+    return tiles
+
+
+def _yield_by_the_end(tile: dict, step: int) -> dict[str, int]:
+    """Units ``tile``, beside the shed, yields and sells under nominal care (`_tile_arrivals`).
+
+    A crop still growing on the last acting day is harvested then with what
+    it holds.
+    """
+    units = dict.fromkeys(PRODUCTS, 0)
+    for item, count, at in _tile_arrivals(tile, step, harvest_by_day=_LAST_DAY):
+        if _sells_by_the_end(at, 0):
+            units[item] += count
+    return units
+
+
+def _started_now_yields(step: int) -> dict[str, dict[str, int]]:
+    """Units each crop sown and each animal placed at ``step`` yields before the game ends."""
+    return {name: _yield_by_the_end(tile, step) for name, tile in _started_now(step).items()}
+
+
+def _paybacks(
+    yields: dict[str, dict[str, int]], step: int, prices: dict[str, int]
+) -> dict[str, float]:
+    """log1p of each started crop's or animal's yield value over its cost at ``prices``.
+
+    The cost is the seed, or the animal plus the fewest WHEAT (the engine's
+    FEED) that keep it from escaping through the daily refreshes from today up
+    to but not including the last acting day's. `_daily_refresh_animals`
+    produces whether or not the animal was fed, and a fresh one earns no care
+    bonus for feeding to spend, so one feed every _DECAY_LETHAL refreshes
+    yields as much as daily feeding. FERTILIZER an animal gives counts at its
+    price like its product. `math.log1p` is the C library's, like Rust's
+    `f64::ln_1p`.
+    """
+    refreshes = max(0, _LAST_DAY - step // TURNS_PER_DAY)
+    feeds = refreshes // int(_DECAY_LETHAL)
+    paybacks = {}
+    for name, units in yields.items():
+        value = sum(count * prices[item] for item, count in units.items())
+        cost = ANIMAL_COST[name] + feeds * prices["WHEAT"] if name in ANIMALS else SEED_COST[name]
+        paybacks[name] = math.log1p(value / cost)
+    return paybacks
+
+
+def _sell_events(interval: int, start: int, stop: int) -> int:
+    """Steps in [start, stop) divisible by ``interval``: the town's sell events."""
+    return max(0, -(-stop // interval) - -(-start // interval))
+
+
+def _town_draw(shops: list[str], step: int, stop: int) -> dict[str, int]:
+    """Units the town is expected to take in [step, stop), in 1/_SHOP_CHOICES parts.
+
+    Mirrors the engine's `_town_consume`, and `_end_of_day`'s shop draw: the
+    open instances sell at every TOWN_SHOP_SELL_INTERVAL step, the town
+    center at every TOWN_CENTER_SELL_INTERVAL step, and from each day
+    divisible by TOWN_SHOP_UNLOCK_INTERVAL one more instance sells too, until
+    MAX_SHOP_INSTANCES are open, as each shop with equal chance.
+    """
+    draw = dict.fromkeys(PRODUCTS, 0)
+    shop_events = _sell_events(TOWN_SHOP_SELL_INTERVAL, step, stop)
+    for shop in shops:
+        products = SHOP_PRODUCTS[shop]
+        for item in products:
+            draw[item] += _SHOP_CHOICES * (2 if len(products) == 1 else 1) * shop_events
+    center_events = _sell_events(TOWN_CENTER_SELL_INTERVAL, step, stop)
+    for item in TOWN_CENTER_PRODUCTS:
+        draw[item] += _SHOP_CHOICES * center_events
+    opened = len(shops)
+    for day in range(step // TURNS_PER_DAY + 1, -(-stop // TURNS_PER_DAY)):
+        if opened >= MAX_SHOP_INSTANCES:
+            break
+        if day % TOWN_SHOP_UNLOCK_INTERVAL == 0:
+            opened += 1
+            events = _sell_events(TOWN_SHOP_SELL_INTERVAL, day * TURNS_PER_DAY, stop)
+            for item in PRODUCTS:
+                draw[item] += _UNOPENED_SHOP_DRAW[item] * events
+    return draw
+
+
+def market_outlook(observation: dict) -> MarketOutlook:
+    """The seat's view of every product's public supply and expected demand."""
+    player = int(observation.get("player", 0) or 0)
+    farms = observation.get("farms") or []
+    day = int(observation.get("day", 0) or 0)
+    step = int(observation.get("step", day * TURNS_PER_DAY + int(observation.get("hour", 0) or 0)))
+    own_soon, own_to_end, own_feeds = _farm_supply(farms[player], step)
+    other_soon, other_to_end, other_feeds = _farm_supply(farms[1 - player], step)
+    shops = (observation.get("town") or {}).get("unlocked_shops") or []
+    return MarketOutlook(
+        supply_soon=(own_soon, other_soon),
+        supply_to_end=(own_to_end, other_to_end),
+        draw_soon=_town_draw(shops, step, min(step + OUTLOOK_SOON_STEPS, _OUTLOOK_END)),
+        draw_to_end=_town_draw(shops, step, _OUTLOOK_END),
+        feeds_to_end=own_feeds + other_feeds,
+    )
+
+
+def _forecast_prices(outlook: MarketOutlook, held: dict[str, int], market: dict) -> dict[str, int]:
+    """Each product's quote once ``held`` and all supply sell, the animals eat, and the town draws.
+
+    The sales come first and restock the market only while above the price
+    floor (`restocked_inventory`); the WHEAT the animals eat, bought or kept
+    back from sale, then leaves it. The inventory is formed in exact
+    1/_SHOP_CHOICES parts and rounded half up to a unit before the engine's
+    price curve reads it.
+    """
+    inventory = market.get("inventory") or {}
+    prices = {}
+    for item in PRODUCTS:
+        sold = held[item] + outlook.supply_to_end[0][item] + outlook.supply_to_end[1][item]
+        units = restocked_inventory(
+            item, sold, int(inventory.get(item, MARKET_I0) or 0), market.get("params")
+        )
+        if item == "WHEAT":
+            units -= outlook.feeds_to_end
+        parts = _SHOP_CHOICES * units - outlook.draw_to_end[item]
+        rounded = (parts + _SHOP_CHOICES // 2) // _SHOP_CHOICES
+        prices[item] = market_price(item, rounded, market.get("params"))
+    return prices
+
+
+def tokenize_economy(observation: dict, outlook: MarketOutlook | None = None) -> EconomyTokens:
+    """Tokenize market, crop, farm-summary, and town state for the actor.
+
+    ``outlook`` is the observation's `market_outlook`, when already computed.
+    """
     player = int(observation.get("player", 0) or 0)
     farms = observation.get("farms") or []
     if len(farms) != 2:
@@ -579,8 +964,18 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
     shed = private.get("shed") or {}
     seeds = private.get("seeds") or {}
     carried = _carried_items(private)
-    proceeds = _held_proceeds(shed, carried, market)
+    held = _held_units(shed, carried)
+    proceeds = _held_proceeds(held, market)
+    outlook = outlook or market_outlook(observation)
+    forecast = _forecast_prices(outlook, held, market)
+    quotes = {item: int(prices.get(item, BASE_PRICE[item]) or 0) for item in PRODUCTS}
+    day = int(observation.get("day", 0) or 0)
+    step = int(observation.get("step", day * TURNS_PER_DAY + int(observation.get("hour", 0) or 0)))
+    yields = _started_now_yields(step)
+    payback = _paybacks(yields, step, quotes)
+    forecast_payback = _paybacks(yields, step, forecast)
     max_base_price = float(max(BASE_PRICE.values()))
+    draw_scale = float(_SHOP_CHOICES * SHED_CAPACITY)
 
     products = np.asarray(
         [
@@ -591,6 +986,13 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 float(shed.get(item, 0) or 0) / SHED_CAPACITY,
                 carried[item] / SHED_CAPACITY,
                 proceeds[item] / HELD_VALUE_SCALE,
+                forecast[item] / (2.0 * BASE_PRICE[item]),
+                outlook.supply_soon[0][item] / SHED_CAPACITY,
+                outlook.supply_to_end[0][item] / SHED_CAPACITY,
+                outlook.supply_soon[1][item] / SHED_CAPACITY,
+                outlook.supply_to_end[1][item] / SHED_CAPACITY,
+                outlook.draw_soon[item] / draw_scale,
+                outlook.draw_to_end[item] / draw_scale,
             )
             for item in PRODUCTS
         ],
@@ -603,6 +1005,8 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 ANIMAL_COST[animal] / max_animal_cost,
                 float(shed.get(animal, 0) or 0) / SHED_CAPACITY,
                 carried[animal] / SHED_CAPACITY,
+                payback[animal],
+                forecast_payback[animal],
             )
             for animal in ANIMALS
         ],
@@ -620,6 +1024,8 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
                 CROP_MAX_YIELD_DAY[crop] / max_yield_day,
                 CROP_MAX_YIELD[crop] / max_yield,
                 float(crop in ONGOING_CROPS),
+                payback[crop],
+                forecast_payback[crop],
             )
             for crop in CROPS
         ],
@@ -667,23 +1073,30 @@ def tokenize_economy(observation: dict) -> EconomyTokens:
 
 
 def opponent_economy_columns(
+    observation: dict,
     opponent_private: dict,
-    market: dict,
+    outlook: MarketOutlook | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Critic-only columns from the opponent's private shed, hands, and seeds.
 
-    ``market`` is the shared observation's; held stock is valued against it.
+    ``observation`` is the seat's own; the opponent values its held stock
+    against the same market and forecasts it against the same public outlook,
+    ``outlook`` when already computed.
     """
+    market = observation.get("market") or {}
     shed = opponent_private.get("shed") or {}
     seeds = opponent_private.get("seeds") or {}
     carried = _carried_items(opponent_private)
-    proceeds = _held_proceeds(shed, carried, market)
+    held = _held_units(shed, carried)
+    proceeds = _held_proceeds(held, market)
+    forecast = _forecast_prices(outlook or market_outlook(observation), held, market)
     products = np.asarray(
         [
             (
                 float(shed.get(item, 0) or 0) / SHED_CAPACITY,
                 carried[item] / SHED_CAPACITY,
                 proceeds[item] / HELD_VALUE_SCALE,
+                forecast[item] / (2.0 * BASE_PRICE[item]),
             )
             for item in PRODUCTS
         ],
@@ -749,13 +1162,14 @@ def encode_structured_observation(
     own = tokenize_farm_tiles(farms[player], day, step, opponent=False)
     other = tokenize_farm_tiles(farms[1 - player], day, step, opponent=True)
     units = tokenize_units(farms[player], observation.get("private") or {})
-    economy = tokenize_economy(observation)
+    outlook = market_outlook(observation)
+    economy = tokenize_economy(observation, outlook)
 
     critic_products = critic_animals = critic_crops = None
     opponent_categorical = opponent_continuous = opponent_active = None
     if opponent_private is not None:
         critic_products, critic_animals, critic_crops = opponent_economy_columns(
-            opponent_private, observation.get("market") or {}
+            observation, opponent_private, outlook
         )
         critic_products = critic_products.astype(np.float16)
         critic_animals = critic_animals.astype(np.float16)
@@ -820,6 +1234,7 @@ __all__ = [
     "N_UNIT_CATEGORICAL",
     "N_UNIT_CONTINUOUS",
     "OBSERVATION_SCHEMA_VERSION",
+    "OUTLOOK_SOON_STEPS",
     "PRODUCT_PRIVATE_FIELDS",
     "PRODUCT_TOKEN_FIELDS",
     "QUADRANT_COUNT",
@@ -837,12 +1252,16 @@ __all__ = [
     "UNIT_ROLES",
     "UNIT_TILE_GATHERS",
     "EconomyTokens",
+    "MarketOutlook",
     "StructuredObservation",
     "TileTokens",
     "UnitTokens",
+    "animal_token_fields",
     "clock_features",
+    "crop_token_fields",
     "encode_structured_observation",
     "farm_token_fields",
+    "market_outlook",
     "opponent_economy_columns",
     "product_private_fields",
     "product_token_fields",
