@@ -274,14 +274,22 @@ def _actor_loss(
             action_index = source + offset - 1
             target_index = source + offset
             if "episode_index" in factors and "step" in factors:
-                _, eligible = _target_index(factors["episode_index"], factors["step"], offset)
+                _, eligible = _target_index(
+                    factors["episode_index"],
+                    factors["step"],
+                    offset,
+                    factors.get("transition_valid"),
+                )
                 eligible = eligible[source]
             else:
                 eligible = torch.ones_like(source, dtype=torch.bool)
         elif plan is None:
             action_index = (all_rows + offset - 1).clamp_max(rows - 1)
             target_index, eligible = _target_index(
-                factors["episode_index"], factors["step"], offset
+                factors["episode_index"],
+                factors["step"],
+                offset,
+                factors.get("transition_valid"),
             )
         else:
             action_index = plan.indices[offset]

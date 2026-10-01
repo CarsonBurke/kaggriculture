@@ -135,6 +135,9 @@ class ProjectedStep:
     # Units whose partial product deposit was relabeled as a whole deposit
     # under `deposit_all_products`; always zero when projecting strictly.
     relabeled_partial_deposits: int = 0
+    # Units whose FERTILIZE of an already fertilized tile was relabeled as PASS
+    # under `redundant_fertilize_as_pass`; always zero when projecting strictly.
+    relabeled_redundant_fertilize: int = 0
 
 
 def _canonical_unit_command(command: Any) -> list[Any]:
@@ -170,6 +173,10 @@ def _canonical_unit_command(command: Any) -> list[Any]:
             raise DemonstrationError(f"PICKUP without an item: {command!r}")
         quantity = int(command[2]) if len(command) >= 3 else 1
         return ["PICKUP", str(command[1]), quantity]
+    # The interpreter falls through every branch on an opcode it does not know
+    # (hosted agents emit ``["NOOP"]``), so the unit does exactly what PASS does.
+    if isinstance(command[0], str):
+        return ["PASS"]
     raise DemonstrationError(f"unknown unit opcode: {command!r}")
 
 
@@ -229,18 +236,21 @@ def _parse_unit_command(
     item, quantity = str(canonical[1]), int(canonical[2])
     if quantity <= 0:
         return UnitAction.PASS, ["PASS"]
-    maximum = _PICKUP_MAX.get(item)
-    if maximum is None:
-        raise DemonstrationError(f"unknown pickup item in {command!r}")
     executed = min(quantity, int(shed_available.get(item, 0) or 0))
     if executed <= 0:
         return UnitAction.PASS, ["PASS"]
+    maximum = _PICKUP_MAX.get(item)
+    if maximum is None:
+        raise DemonstrationError(f"unknown pickup item in {command!r}")
     if executed > maximum:
         raise DemonstrationError(
             f"executed pickup of {executed} {item} is outside the factored "
             f"action space (1..{maximum})"
         )
     return UnitAction[f"PICKUP_{item}_{executed}"], ["PICKUP", item, executed]
+
+
+_MARKET_OPCODES = frozenset(("HIRE", "BUY_LAND", "BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"))
 
 
 def _canonical_market_order(order: Any) -> list[Any]:
@@ -262,6 +272,14 @@ def _parse_market_order(order: Any) -> tuple[MarketKind, int] | None:
         # Engine: `_parse_order([])` is None, the same unread order as a
         # non-positive quantity below. demand-advance4 leaves these holes when
         # it closes gaps in its queue.
+        return None
+    if (
+        isinstance(order, (list, tuple))
+        and isinstance(order[0], str)
+        and order[0] not in _MARKET_OPCODES
+    ):
+        # Engine: `_parse_order` returns None for an opcode it does not know
+        # (hosted agents emit ``["NOOP"]``), so the order is unread too.
         return None
     canonical = _canonical_market_order(order)
     opcode = str(canonical[0])
@@ -465,6 +483,7 @@ def project_demonstration(
     action: dict[str, Any],
     *,
     deposit_all_products: bool = False,
+    redundant_fertilize_as_pass: bool = False,
 ) -> ProjectedStep:
     """Project one demonstrated engine action through the sequential ledger.
 
@@ -476,8 +495,14 @@ def project_demonstration(
     projection's canonical action — verified by :func:`verify_round_trip`,
     which extraction must always call.
 
-    `deposit_all_products` is the one opt-in relabel (see
+    `deposit_all_products` is an opt-in relabel (see
     :func:`_parse_unit_command`); the returned step counts where it applied.
+    `redundant_fertilize_as_pass` is the other: the mask forbids fertilizing a
+    tile already fertilized through day+2, but the engine executes it, spending
+    a fertilizer to no effect. Scripted teachers never do this on their own
+    route, only from the off-route states recovery demonstrations reach, but
+    hosted leaderboard agents do. PASS is the nearest factored action (the same
+    tile, one fertilizer kept).
     """
     player = int(observation.get("player", 0) or 0)
     farm = (observation.get("farms") or [])[player]
@@ -501,6 +526,7 @@ def project_demonstration(
     tiles = copy_tile_grid(farm.get("tiles") or [])
     canonical_commands: list[list[Any]] = []
     relabeled_partial_deposits = 0
+    relabeled_redundant_fertilize = 0
     for unit in range(MAX_UNITS):
         if unit >= unit_count:
             unit_masks[unit, UnitAction.PASS] = True
@@ -523,13 +549,17 @@ def project_demonstration(
             if _engine_would_execute(
                 observation, unit, selected, tiles, remaining_seeds, remaining_shed
             ):
-                raise DemonstrationError(
-                    f"unit {unit} demonstrated {selected.name}, which our legality "
-                    "model forbids but the engine would execute — mask divergence"
-                )
-            # The engine silently no-ops this command at this ledger state
-            # (e.g. WATER on an empty tile from v27's open-loop trace), so the
-            # executed behavior is exactly PASS.
+                # An executable yet masked FERTILIZE means the tile is already
+                # fertilized through day+2: possession is in both predicates.
+                if not (redundant_fertilize_as_pass and selected == UnitAction.FERTILIZE):
+                    raise DemonstrationError(
+                        f"unit {unit} demonstrated {selected.name}, which our legality "
+                        "model forbids but the engine would execute — mask divergence"
+                    )
+                relabeled_redundant_fertilize += 1
+            # Otherwise the engine silently no-ops this command at this ledger
+            # state (e.g. WATER on an empty tile from v27's open-loop trace), so
+            # the executed behavior is exactly PASS.
             selected, canonical = UnitAction.PASS, ["PASS"]
         canonical_commands.append(canonical)
         unit_actions[unit] = int(selected)
@@ -634,6 +664,7 @@ def project_demonstration(
             "market": canonical_orders,
         },
         relabeled_partial_deposits=relabeled_partial_deposits,
+        relabeled_redundant_fertilize=relabeled_redundant_fertilize,
     )
 
 
@@ -691,3 +722,91 @@ def verify_round_trip(
             f"compiled {_normalized_action(compiled)!r} != canonical {canonical!r} "
             f"(demonstrated {_normalized_action(action)!r})"
         )
+
+
+def perturb_action(
+    observation: dict[str, Any],
+    action: dict[str, Any],
+    rng: np.random.Generator,
+    *,
+    deposit_all_products: bool = False,
+    redundant_fertilize_as_pass: bool = False,
+) -> dict[str, Any] | None:
+    """A random legal one-step deviation from a demonstrated action, for DART.
+
+    Recovery demonstrations execute this in place of the teacher's action and
+    keep the teacher's own action as the label, so a clone sees states off the
+    teacher's route paired with how the teacher gets back. Half the deviations
+    swap one active unit's selection for another legal one; the other half
+    append one extra legal market order at the turn's STOP slot, with a
+    log-uniform quantity the engine fills as far as resources allow. Both are
+    single decisions a sampling policy could make. The deviation is built on
+    the projected factors and compiled through `compile_action`, so every
+    command is legal under the same sequential ledger the sampler uses.
+
+    The deviation is spliced into the teacher's own action, one unit command
+    replaced or one order appended, so everything else executes exactly as the
+    teacher wrote it, relabeled commands included. Returns None when the drawn
+    kind of deviation has no legal alternative, or when it would change more
+    than the one decision drawn: a unit deviation that spends a seed or moves
+    the shed can make a later unit's taught action illegal, which
+    `compile_action` then replaces with PASS, or change a later unit's command;
+    such a draw is skipped rather than executed as several.
+    """
+    projected = project_demonstration(
+        observation,
+        action,
+        deposit_all_products=deposit_all_products,
+        redundant_fertilize_as_pass=redundant_fertilize_as_pass,
+    )
+    unit_actions = projected.unit_actions.astype(np.int64)
+    market_kinds = projected.market_kinds.astype(np.int64)
+    market_quantities = projected.market_quantities.astype(np.int64)
+    teacher = compile_action(observation, unit_actions, market_kinds, market_quantities)
+    commands = [teacher["farmer"], *teacher["hands"]]
+    written = [list(action.get("farmer") or ["PASS"]), *map(list, action.get("hands") or [])]
+    market = [list(order) for order in action.get("market") or []]
+    if len(written) != len(commands):
+        return None
+    if rng.random() < 0.5:
+        units = np.flatnonzero(projected.unit_active)
+        if units.size == 0:
+            return None
+        unit = int(rng.choice(units))
+        alternatives = np.flatnonzero(projected.unit_masks[unit])
+        alternatives = alternatives[alternatives != unit_actions[unit]]
+        if alternatives.size == 0:
+            return None
+        unit_actions[unit] = int(rng.choice(alternatives))
+        deviation = compile_action(observation, unit_actions, market_kinds, market_quantities)
+        deviated = [deviation["farmer"], *deviation["hands"]]
+        others_kept = all(
+            command == deviated[index] for index, command in enumerate(commands) if index != unit
+        )
+        single = others_kept and deviated[unit] not in (commands[unit], written[unit])
+        if not single or deviation["market"] != teacher["market"]:
+            return None
+        written[unit] = deviated[unit]
+        return {"farmer": written[0], "hands": written[1:], "market": market}
+    stops = np.flatnonzero(projected.market_active & (market_kinds == MarketKind.STOP))
+    if stops.size == 0:
+        return None
+    slot = int(stops[0])
+    alternatives = np.flatnonzero(projected.market_kind_masks[slot])
+    alternatives = alternatives[alternatives != MarketKind.STOP]
+    if alternatives.size == 0:
+        return None
+    market_kinds[slot] = int(rng.choice(alternatives))
+    # Log-uniform over the whole quantity space: floor(exp(U[0, ln(n + 1)))) is
+    # 1..n, each at least as likely as the next.
+    bins = len(QUANTITY_BINS)
+    quantity = min(int(np.exp(rng.uniform(0.0, np.log(bins + 1)))), bins)
+    market_quantities[slot] = quantity - 1
+    deviation = compile_action(observation, unit_actions, market_kinds, market_quantities)
+    if len(deviation["market"]) != len(teacher["market"]) + 1 or len(market) >= MAX_MARKET_ORDERS:
+        return None
+    return {
+        "farmer": written[0],
+        "hands": written[1:],
+        "market": [*market, deviation["market"][-1]],
+    }

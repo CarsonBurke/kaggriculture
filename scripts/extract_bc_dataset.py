@@ -12,6 +12,11 @@ architecture), factored targets, teacher-forced masks, and active flags.
 
 Any representability gap or mask divergence aborts extraction with the
 offending step — silent clamping would corrupt the dataset. CPU-only.
+
+`--perturbation-rate` makes recovery demonstrations (DART): the teacher's
+seats sometimes execute a random legal deviation, and the archived label is
+still the teacher's own action at every state, so the clone also sees the
+off-route states a deviation leads to and how the teacher acts from them.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import tempfile
 import time
 import zlib
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +43,7 @@ import numpy as np
 
 from kaggriculture.demonstrations import (
     DemonstrationError,
+    perturb_action,
     project_demonstration,
     verify_round_trip,
 )
@@ -80,6 +87,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--perturbation-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "DART recovery demonstrations: per-step probability that a teacher seat "
+            "executes a random legal deviation (`perturb_action`) instead of its own "
+            "action. The archived label is always the teacher's own action at the "
+            "state, so the clone learns how the teacher recovers from off-route "
+            "states. Default 0: clean demonstrations"
+        ),
+    )
+    parser.add_argument(
+        "--perturbation-seed",
+        type=int,
+        default=0,
+        help="seeds the deviation draws together with each game's map seed and seat",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -106,44 +131,80 @@ def extract_episode(
     *,
     episode_steps: int,
     deposit_all_products: bool = False,
+    redundant_fertilize_as_pass: bool = False,
+    recovery: RecoveryRecord | None = None,
 ) -> dict[str, np.ndarray | bytes]:
     """Project one recorded seat of a complete episode into training arrays.
 
     `steps[t+1][seat].action` is the action applied to `steps[t][seat]`'s
-    observation, so a T-step episode yields T-1 demonstration pairs.
+    observation, so a T-step episode yields T-1 demonstration pairs. With a
+    `recovery` record the label is the teacher's own action instead, which
+    differs from the executed one exactly at the perturbed steps. The factor
+    arrays then hold the labels while `raw["actions"]` stays the executed game,
+    so replaying it still reproduces the recorded states; the labels travel as
+    `raw["teacher_actions"]` and a `perturbed` flag marks each step whose
+    recorded transition is not the dynamics of its label. Recovery labels come
+    from off-route states where a scripted teacher may fertilize an already
+    fertilized tile, so they always project with `redundant_fertilize_as_pass`;
+    hosted replays opt into it. Wherever it may apply, a per-step count
+    travels as `relabeled_redundant_fertilize`, since the recorded transition
+    spent a fertilizer its PASS label does not.
     """
     if len(environment_steps) != episode_steps:
         raise DemonstrationError(
             f"episode has {len(environment_steps)} steps; expected {episode_steps}"
         )
+    if recovery is not None and not (
+        len(recovery.labels) == len(recovery.perturbed) == episode_steps - 1
+    ):
+        raise DemonstrationError(
+            f"seat {seat}: recovery record holds {len(recovery.labels)} labels and "
+            f"{len(recovery.perturbed)} flags for {episode_steps - 1} steps"
+        )
     observations: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
+    labels: list[dict[str, Any]] = []
     projections = []
+    redundant_fertilize_as_pass = redundant_fertilize_as_pass or recovery is not None
     for step_index in range(episode_steps - 1):
         observation = _seat_observation(environment_steps, step_index, seat)
         action = environment_steps[step_index + 1][seat].action
         if not isinstance(action, dict):
             raise DemonstrationError(f"step {step_index} seat {seat}: no recorded action")
+        label = action if recovery is None else recovery.label(step_index, action, seat)
         try:
             projected = project_demonstration(
-                observation, action, deposit_all_products=deposit_all_products
+                observation,
+                label,
+                deposit_all_products=deposit_all_products,
+                redundant_fertilize_as_pass=redundant_fertilize_as_pass,
             )
-            verify_round_trip(observation, action, projected)
+            verify_round_trip(observation, label, projected)
         except DemonstrationError as error:
             raise DemonstrationError(f"step {step_index} seat {seat}: {error}") from error
         opponent_private = environment_steps[step_index][1 - seat].observation.get("private")
         observations.append({"observation": observation, "opponent_private": opponent_private})
         actions.append(action)
+        labels.append(label)
         projections.append(projected)
 
     def stacked(name: str) -> np.ndarray:
         return np.stack([getattr(projection, name) for projection in projections])
 
-    raw = {
+    raw: dict[str, Any] = {
         "observations": observations,
         "actions": actions,
     }
+    relabel_arrays = {}
+    if recovery is not None:
+        raw["teacher_actions"] = labels
+        relabel_arrays["perturbed"] = np.asarray(recovery.perturbed, dtype=np.bool_)
+    if redundant_fertilize_as_pass:
+        relabel_arrays["relabeled_redundant_fertilize"] = stacked(
+            "relabeled_redundant_fertilize"
+        ).astype(np.int8)
     return {
+        **relabel_arrays,
         "unit_actions": stacked("unit_actions"),
         "market_kinds": stacked("market_kinds"),
         "market_quantities": stacked("market_quantities"),
@@ -160,7 +221,127 @@ def extract_episode(
     }
 
 
-def _play_episode(teacher: str, opponent: str, seed: int, episode_steps: int) -> list[Any]:
+@dataclass
+class RecoveryRecord:
+    """A teacher seat's own actions and where a deviation replaced them."""
+
+    labels: list[dict[str, Any]] = field(default_factory=list)
+    perturbed: list[bool] = field(default_factory=list)
+
+    def label(self, step: int, executed: dict[str, Any], seat: int) -> dict[str, Any]:
+        """The teacher's action at `step`, checked against the executed one.
+
+        Off the perturbed steps the two must be identical; a mismatch means the
+        record is misaligned with the engine's steps, which would silently
+        pair every later state with a neighbour's label.
+        """
+        if step >= len(self.labels):
+            raise DemonstrationError(f"step {step} seat {seat}: no teacher action recorded")
+        if (_json_form(executed) == self.labels[step]) == self.perturbed[step]:
+            where = (
+                "equals the teacher's at a perturbed"
+                if self.perturbed[step]
+                else "differs from the teacher's at an unperturbed"
+            )
+            raise DemonstrationError(
+                f"step {step} seat {seat}: the executed action {where} step; "
+                "recovery record is misaligned"
+            )
+        return self.labels[step]
+
+
+def _json_form(value: Any) -> Any:
+    return json.loads(json.dumps(value, allow_nan=False))
+
+
+class RecoveryTeacher:
+    """A teacher seat that executes a random legal deviation with probability `rate`.
+
+    The teacher is asked for its action at every step, so its own state keeps
+    evolving exactly as when it plays, and that action is recorded as the
+    label whether or not a deviation replaces it (DART, Laskey et al. 2017).
+    The teacher is built and called exactly as `kaggle_environments` would
+    (`build_agent`, then only as many arguments as its code takes), and its
+    label is normalized through the action schema the engine applies, so off
+    the perturbed steps label and executed action are the same object.
+
+    Any exception here, the teacher's own included, would reach the engine as
+    an agent error, and the seat would then play PASS to the end and still
+    finish DONE. So the first one is kept in `error` for `_play_episode` to
+    raise after the game, and this seat passes until then.
+    """
+
+    def __init__(
+        self,
+        runnable: str,
+        environment: Any,
+        rate: float,
+        rng: np.random.Generator,
+        *,
+        deposit_all_products: bool = False,
+    ) -> None:
+        from kaggle_environments.agent import build_agent
+
+        self.agent = build_agent(runnable, environment.agents, environment.name)[0]
+        self.action_schema = environment.specification.action
+        self.rate = rate
+        self.rng = rng
+        self.deposit_all_products = deposit_all_products
+        self.record = RecoveryRecord()
+        self.error: Exception | None = None
+
+    def __call__(self, observation: Any, configuration: Any) -> dict[str, Any]:
+        if self.error is not None:
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+        step = len(self.record.labels)
+        try:
+            return self._act(observation, configuration, step)
+        except Exception as error:
+            self.error = DemonstrationError(f"step {step}: {type(error).__name__}: {error}")
+            self.error.__cause__ = error
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    def _act(self, observation: Any, configuration: Any, step: int) -> dict[str, Any]:
+        from kaggle_environments.utils import process_schema
+
+        if int(observation.get("step", step)) != step:
+            raise DemonstrationError(f"observation step {observation.get('step')} is not {step}")
+        arguments = (observation, configuration)
+        code = getattr(self.agent, "__code__", None)
+        if code is not None:
+            arguments = arguments[: code.co_argcount]
+        error, label = process_schema(self.action_schema, self.agent(*arguments))
+        if error:
+            raise DemonstrationError(f"the teacher's action is invalid: {error}")
+        label = _json_form(label)
+        executed = None
+        if self.rng.random() < self.rate:
+            state = _json_form(dict(observation))
+            state.setdefault("step", step)
+            executed = perturb_action(
+                state,
+                label,
+                self.rng,
+                deposit_all_products=self.deposit_all_products,
+                redundant_fertilize_as_pass=True,
+            )
+        self.record.labels.append(label)
+        self.record.perturbed.append(executed is not None)
+        return label if executed is None else executed
+
+
+def _play_episode(
+    teacher: str,
+    opponent: str,
+    seed: int,
+    episode_steps: int,
+    *,
+    recovery_seats: tuple[int, ...] = (),
+    perturbation_rate: float = 0.0,
+    perturbation_seed: int = 0,
+    deposit_all_products: bool = False,
+) -> tuple[list[Any], dict[int, RecoveryRecord]]:
+    """Play one official game; the `recovery_seats` play as `RecoveryTeacher`s."""
     from kaggle_environments import make
 
     environment = make(
@@ -168,14 +349,33 @@ def _play_episode(teacher: str, opponent: str, seed: int, episode_steps: int) ->
         configuration={"episodeSteps": episode_steps, "seed": seed},
         debug=False,
     )
-    environment.run([teacher, opponent])
+    agents: list[Any] = [teacher, opponent]
+    recoveries: dict[int, RecoveryTeacher] = {}
+    for seat in recovery_seats:
+        recoveries[seat] = RecoveryTeacher(
+            agents[seat],
+            environment,
+            perturbation_rate,
+            np.random.default_rng((perturbation_seed, seed, seat)),
+            deposit_all_products=deposit_all_products,
+        )
+        agents[seat] = recoveries[seat]
+    environment.run(agents)
+    for seat, agent in recoveries.items():
+        if agent.error is not None:
+            raise DemonstrationError(f"seed {seed} seat {seat}: {agent.error}") from agent.error
+        if len(agent.record.labels) != episode_steps - 1:
+            raise DemonstrationError(
+                f"seed {seed} seat {seat}: the teacher acted {len(agent.record.labels)} "
+                f"times in {episode_steps - 1} steps"
+            )
     if not environment.done:
         raise RuntimeError(f"seed {seed}: environment did not finish")
     for seat in (0, 1):
         status = str(environment.steps[-1][seat].status)
         if status != "DONE":
             raise RuntimeError(f"seed {seed}: seat {seat} ended with status {status}")
-    return environment.steps
+    return environment.steps, {seat: agent.record for seat, agent in recoveries.items()}
 
 
 def _agent_digest(runnable: str) -> str | None:
@@ -209,6 +409,8 @@ def _extract_seed(
     episode_steps: int,
     output_dir: Path,
     deposit_all_products: bool = False,
+    perturbation_rate: float = 0.0,
+    perturbation_seed: int = 0,
 ) -> list[dict[str, Any]]:
     """Play one seed and archive every teacher seat of it.
 
@@ -221,10 +423,23 @@ def _extract_seed(
     """
     records = []
     for left, right, seats in teacher_jobs(teacher, opponent):
-        steps = _play_episode(left, right, seed, episode_steps)
+        steps, recoveries = _play_episode(
+            left,
+            right,
+            seed,
+            episode_steps,
+            recovery_seats=seats if perturbation_rate > 0 else (),
+            perturbation_rate=perturbation_rate,
+            perturbation_seed=perturbation_seed,
+            deposit_all_products=deposit_all_products,
+        )
         for seat in seats:
             arrays = extract_episode(
-                steps, seat, episode_steps=episode_steps, deposit_all_products=deposit_all_products
+                steps,
+                seat,
+                episode_steps=episode_steps,
+                deposit_all_products=deposit_all_products,
+                recovery=recoveries.get(seat),
             )
             path = output_dir / f"episode-{seed:08d}-seat{seat}.npz"
             np.savez_compressed(path, **arrays)
@@ -255,6 +470,15 @@ def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> di
             if "relabeled_partial_deposits" in archive.files
             else 0
         )
+        # Recovery archives also count their deviations and relabels.
+        recovery = {
+            name: int(archive[key].sum())
+            for name, key in (
+                ("perturbed_steps", "perturbed"),
+                ("relabeled_redundant_fertilize", "relabeled_redundant_fertilize"),
+            )
+            if key in archive.files
+        }
     farms = raw["observations"][-1]["observation"]["farms"]
     return {
         "file": path.name,
@@ -265,6 +489,7 @@ def _archived_record(path: Path, seed: int, seat: int, episode_steps: int) -> di
         "opponent_money": float(farms[1 - seat]["money"]),
         "relabeled_partial_deposits": relabeled,
         "sha256": file_sha256(path),
+        **recovery,
     }
 
 
@@ -278,6 +503,8 @@ def _manifest_configuration(
     seed_start: int,
     episode_count: int,
     deposit_all_products: bool = False,
+    perturbation_rate: float = 0.0,
+    perturbation_seed: int = 0,
 ) -> dict[str, Any]:
     configuration = {
         "format_version": DATASET_FORMAT_VERSION,
@@ -292,6 +519,12 @@ def _manifest_configuration(
     # they were written with and remain resumable.
     if deposit_all_products:
         configuration["relabels"] = ["deposit_all_products"]
+    if perturbation_rate > 0:
+        configuration["perturbation"] = {"rate": perturbation_rate, "seed": perturbation_seed}
+        configuration["relabels"] = [
+            *configuration.get("relabels", []),
+            "redundant_fertilize_as_pass",
+        ]
     return configuration
 
 
@@ -304,7 +537,11 @@ def _load_resumable_records(
     if not manifest_path.is_file():
         raise ValueError("--resume requires a previously committed manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    actual_configuration = {key: manifest.get(key) for key in expected_configuration}
+    # Every committed key, not only the ones this run configures: a key this run
+    # would not write (a perturbation, a relabel) still describes the archives.
+    actual_configuration = {
+        key: value for key, value in manifest.items() if key not in {"episodes", "command"}
+    }
     if actual_configuration != expected_configuration:
         raise ValueError("--resume extraction provenance does not match the committed dataset")
 
@@ -433,6 +670,10 @@ def main() -> None:
         raise ValueError("extraction needs at least one episode at the competition horizon")
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if not 0.0 <= args.perturbation_rate < 1.0:
+        raise ValueError("--perturbation-rate must lie in [0, 1)")
+    if args.perturbation_seed < 0:
+        raise ValueError("--perturbation-seed must be non-negative")
     teacher_label, teacher = normalize_opponent(args.teacher)
     opponent_label, opponent = normalize_opponent(args.opponent)
     output_dir = args.output_dir.expanduser().resolve()
@@ -446,6 +687,8 @@ def main() -> None:
         seed_start=args.seed_start,
         episode_count=args.episodes,
         deposit_all_products=args.deposit_all_products,
+        perturbation_rate=args.perturbation_rate,
+        perturbation_seed=args.perturbation_seed,
     )
 
     with tempfile.TemporaryDirectory(
@@ -480,6 +723,8 @@ def main() -> None:
                         args.episode_steps,
                         staging_dir,
                         args.deposit_all_products,
+                        args.perturbation_rate,
+                        args.perturbation_seed,
                     ): seed
                     for seed in seeds
                 }

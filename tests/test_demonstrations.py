@@ -11,6 +11,7 @@ from kaggriculture.constants import QUANTITY_BINS, SEED_COST
 from kaggriculture.demonstrations import (
     DemonstrationError,
     _canonical_unit_command,
+    perturb_action,
     project_demonstration,
     verify_round_trip,
 )
@@ -129,6 +130,34 @@ def test_empty_market_order_is_unread_like_the_engine() -> None:
     assert projected.canonical_action["market"] == [["HIRE"]]
 
 
+def test_unknown_unit_opcode_is_the_engine_no_op_pass() -> None:
+    # Hosted agents emit ["NOOP"]; the interpreter falls through every branch.
+    environment = make("kaggriculture", configuration={"episodeSteps": 8, "seed": 7})
+    observation = environment.reset(2)[0].observation
+    noop = {"farmer": ["NOOP"], "hands": [], "market": []}
+    passing = {"farmer": ["PASS"], "hands": [], "market": []}
+    after_noop = environment.step([noop, passing])[0].observation
+    environment.reset(2)
+    after_pass = environment.step([passing, passing])[0].observation
+    assert after_noop == after_pass
+
+    projected = _project(observation, noop)
+
+    assert projected.unit_actions[0] == UnitAction.PASS
+    assert projected.canonical_action["farmer"] == ["PASS"]
+
+
+def test_unknown_market_opcode_is_unread_like_the_engine() -> None:
+    # The engine's `_parse_order(["NOOP"])` is None, like an empty order.
+    observation = _observation()
+    action = {"farmer": ["PASS"], "hands": [], "market": [["NOOP"], ["HIRE"]]}
+
+    projected = _project(observation, action)
+
+    assert projected.market_kinds[0] == MarketKind.HIRE
+    assert projected.canonical_action["market"] == [["HIRE"]]
+
+
 def test_zero_quantity_market_order_is_discarded() -> None:
     observation = _observation()
     action = {
@@ -175,6 +204,27 @@ def test_pickup_from_empty_shed_is_the_engine_no_op_pass() -> None:
     assert projected.canonical_action["farmer"] == ["PASS"]
 
 
+def test_pickup_of_an_item_the_shed_lacks_is_pass_whatever_the_item() -> None:
+    # The engine clamps to shed stock before anything else, so a pickup the
+    # factored space has no action for is still PASS when nothing moves.
+    observation = _observation()
+    observation["private"]["shed"].pop("MILK", None)
+    action = {"farmer": ["PICKUP", "MILK", 2], "hands": [], "market": []}
+
+    projected = _project(observation, action)
+
+    assert projected.unit_actions[0] == UnitAction.PASS
+
+
+def test_pickup_of_a_product_the_shed_holds_is_unrepresentable() -> None:
+    observation = _observation()
+    observation["private"]["shed"]["MILK"] = 3
+    action = {"farmer": ["PICKUP", "MILK", 2], "hands": [], "market": []}
+
+    with pytest.raises(DemonstrationError, match="unknown pickup item"):
+        project_demonstration(observation, action)
+
+
 def test_masked_command_the_engine_would_no_op_projects_to_pass() -> None:
     observation = _observation()
     # The farmer starts on an empty tile: WATER is masked out and the engine
@@ -185,6 +235,67 @@ def test_masked_command_the_engine_would_no_op_projects_to_pass() -> None:
 
     assert projected.unit_actions[0] == UnitAction.PASS
     assert projected.canonical_action["farmer"] == ["PASS"]
+
+
+def _refertilize_observation():
+    # The farmer stands on a crop already fertilized through day+2 and holds
+    # fertilizer: the mask forbids FERTILIZE, yet the engine would spend one.
+    observation = _observation()
+    x, y = observation["farms"][0]["farmer"]
+    observation["farms"][0]["tiles"][y][x] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 0,
+        "fertilized_until_day": int(observation["day"]) + 2,
+    }
+    observation["private"]["inventories"][0]["FERTILIZER"] = 1
+    return observation
+
+
+def test_redundant_fertilize_is_a_mask_divergence_when_strict() -> None:
+    observation = _refertilize_observation()
+    action = {"farmer": ["FERTILIZE"], "hands": [], "market": []}
+
+    with pytest.raises(DemonstrationError, match="mask divergence"):
+        _project(observation, action)
+
+
+def test_redundant_fertilize_relabels_to_pass_when_opted_in() -> None:
+    observation = _refertilize_observation()
+    action = {"farmer": ["FERTILIZE"], "hands": [], "market": []}
+
+    projected = project_demonstration(observation, action, redundant_fertilize_as_pass=True)
+    verify_round_trip(observation, action, projected)
+
+    assert projected.unit_actions[0] == UnitAction.PASS
+    assert projected.canonical_action["farmer"] == ["PASS"]
+    assert projected.relabeled_redundant_fertilize == 1
+
+
+def test_perturbed_action_is_a_legal_single_deviation() -> None:
+    """One decision changes; the rest executes exactly as the teacher wrote it."""
+    observation = _observation()
+    observation["farms"][0]["hands"] = [[4, 4], [5, 4]]
+    # A decorated command the projection canonicalizes stays as written.
+    action = {"farmer": ["PASS"], "hands": [["NORTH", "IGNORED"], ["PASS"]], "market": []}
+    teacher = _project(observation, action)
+    kinds = {"unit": 0, "market": 0}
+    for seed in range(64):
+        deviation = perturb_action(observation, action, np.random.default_rng(seed))
+        if deviation is None:
+            continue
+        projected = _project(observation, deviation)
+        written = [action["farmer"], *action["hands"]]
+        executed = [deviation["farmer"], *deviation["hands"]]
+        changed = [index for index, command in enumerate(written) if command != executed[index]]
+        if deviation["market"] == action["market"]:
+            assert len(changed) == 1
+            assert int((projected.unit_actions != teacher.unit_actions).sum()) == 1
+            kinds["unit"] += 1
+        else:
+            assert changed == [] and len(deviation["market"]) == 1
+            kinds["market"] += 1
+    assert kinds["unit"] >= 16 and kinds["market"] >= 16
 
 
 def test_hire_beyond_the_unit_cap_is_a_representability_error() -> None:

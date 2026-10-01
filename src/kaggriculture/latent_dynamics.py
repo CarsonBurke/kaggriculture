@@ -454,7 +454,9 @@ def latent_decode_kl(
     ).pooled
 
 
-def consecutive_rows(episode_index: Tensor, step: Tensor) -> Tensor:
+def consecutive_rows(
+    episode_index: Tensor, step: Tensor, transition_valid: Tensor | None = None
+) -> Tensor:
     """Rows whose successor step is the very next row of the minibatch.
 
     The pairing contract in one place: staged rows carry an episode index and a
@@ -462,12 +464,20 @@ def consecutive_rows(episode_index: Tensor, step: Tensor) -> Tensor:
     order, so row j's successor is row j+1 exactly when they agree on the episode
     and their steps are adjacent. The last row of a minibatch is never eligible,
     having no successor to compare against.
+
+    ``transition_valid`` additionally drops rows whose recorded action is not the
+    one that produced their successor: a recovery demonstration's perturbed step,
+    labelled with the teacher's action while the engine ran a deviation.
     """
     if episode_index.ndim != 1 or step.shape != episode_index.shape:
         raise ValueError("episode index and step must be one flat entry per row")
+    if transition_valid is not None and transition_valid.shape != episode_index.shape:
+        raise ValueError("transition validity must be one flat entry per row")
     if episode_index.numel() == 0:
         return torch.zeros_like(episode_index, dtype=torch.bool)
     paired = (episode_index[:-1] == episode_index[1:]) & (step[1:] == step[:-1] + 1)
+    if transition_valid is not None:
+        paired = paired & transition_valid[:-1]
     return torch.cat((paired, paired.new_zeros(1)))
 
 
@@ -505,6 +515,7 @@ def latent_horizon_loss(
     *,
     horizon: int = 1,
     decode: DecodeContext | None = None,
+    transition_valid: Tensor | None = None,
 ) -> LatentHorizonLoss:
     """Unroll p_psi for ``horizon`` steps, averaging both terms over the horizon.
 
@@ -523,11 +534,14 @@ def latent_horizon_loss(
     decode term, which is the reference's ``lambda_kl = 0`` configuration; the
     decode is by far the more expensive of the two and there is no reason to run
     it for a coefficient of zero.
+
+    ``transition_valid`` (see `consecutive_rows`) breaks the chain at every row
+    whose recorded action did not produce its successor.
     """
     if horizon < 1:
         raise ValueError("latent horizon must be at least one step")
     rows = belief.shape[0]
-    paired = consecutive_rows(episode_index, step)
+    paired = consecutive_rows(episode_index, step, transition_valid)
     if paired.shape[0] != rows:
         raise ValueError("row metadata and beliefs must describe the same rows")
     dynamics_total = torch.zeros((), dtype=torch.float32, device=belief.device)

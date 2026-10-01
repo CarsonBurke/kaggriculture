@@ -119,6 +119,10 @@ def main() -> None:
     source = args.source.resolve()
     manifest_path = source / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    if "perturbation" in manifest:
+        # Recovery corpora label with the teacher's actions, not the executed ones
+        # this rebuild relabels, and replay against the unperturbed teacher diverges.
+        raise ValueError(f"{source}: recovery (perturbed) corpora cannot be relabeled")
     opponent_label = manifest["opponent"]["label"]
     _, opponent = normalize_opponent(opponent_label)
     opponent_digest = manifest["opponent"].get("sha256")

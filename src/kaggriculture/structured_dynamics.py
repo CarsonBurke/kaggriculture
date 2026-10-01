@@ -333,18 +333,29 @@ def _target_index(
     episode_index: Tensor,
     step: Tensor,
     offset: int,
+    transition_valid: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
+    """The row ``offset`` steps on, and whether every edge up to it is a real transition.
+
+    ``transition_valid[j]`` says row j's recorded action is the one that produced
+    row j + 1. A recovery demonstration labels a perturbed step with the teacher's
+    action while the engine ran a deviation, so that edge is not the dynamics of
+    its own label, and no chain through it is either.
+    """
     rows = torch.arange(episode_index.shape[0], device=episode_index.device)
+    last = episode_index.shape[0] - 1
     unclamped = rows + offset
-    index = unclamped.clamp_max(episode_index.shape[0] - 1)
+    index = unclamped.clamp_max(last)
     eligible = unclamped < episode_index.shape[0]
     for distance in range(1, offset + 1):
-        intermediate = (rows + distance).clamp_max(episode_index.shape[0] - 1)
+        intermediate = (rows + distance).clamp_max(last)
         eligible = (
             eligible
             & (episode_index[intermediate] == episode_index)
             & (step[intermediate] == step + distance)
         )
+        if transition_valid is not None:
+            eligible = eligible & transition_valid[(rows + distance - 1).clamp_max(last)]
     return index, eligible
 
 
@@ -574,7 +585,10 @@ def structured_horizon_loss(
         )
         if plan is None:
             target_index, eligible = _target_index(
-                factors["episode_index"], factors["step"], offset
+                factors["episode_index"],
+                factors["step"],
+                offset,
+                factors.get("transition_valid"),
             )
         else:
             target_index = plan.indices[plan.eligible.shape[0] + offset]
@@ -759,6 +773,10 @@ def structured_window_loss(
     if rows % width:
         raise ValueError("structured window rows do not contain complete windows")
     windows = rows // width
+    if "transition_valid" in factors:
+        # Every edge inside a window is taken as a transition, with no mask to
+        # drop one; a recovery demonstration's perturbed steps need the flat path.
+        raise ValueError("the window objective cannot mask invalid transitions")
 
     def window(value: Tensor) -> Tensor:
         return value.reshape(windows, width, *value.shape[1:])
@@ -1056,6 +1074,10 @@ def structured_critic_window_loss(
             raise ValueError(f"structured critic factor {name} must match belief rows")
 
     windows = rows // width
+    if "transition_valid" in factors:
+        # Every edge inside a window is taken as a transition, with no mask to
+        # drop one; a recovery demonstration's perturbed steps need the flat path.
+        raise ValueError("the window objective cannot mask invalid transitions")
 
     def window(value: Tensor) -> Tensor:
         return value.reshape(windows, width, *value.shape[1:])
@@ -1176,7 +1198,10 @@ def structured_critic_horizon_loss(
         )
         if plan is None:
             target_index, eligible = _target_index(
-                factors["episode_index"], factors["step"], offset
+                factors["episode_index"],
+                factors["step"],
+                offset,
+                factors.get("transition_valid"),
             )
         else:
             target_index = plan.indices[plan.eligible.shape[0] + offset]

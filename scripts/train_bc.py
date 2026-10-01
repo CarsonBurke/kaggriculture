@@ -31,7 +31,7 @@ import os
 import sys
 import time
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -198,6 +198,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, required=True, help="run directory to create")
+    parser.add_argument(
+        "--shard-seats",
+        type=int,
+        default=None,
+        help=(
+            "stream the training split from the encoded cache in shards of this many "
+            "episode-seats, dealt anew each epoch, instead of staging it whole at "
+            "~10 MiB per seat; for corpora larger than host memory"
+        ),
+    )
+    parser.add_argument(
+        "--warm-cache-only",
+        action="store_true",
+        help="encode every seat the cache lacks with --encode-workers processes, then exit",
+    )
     parser.add_argument(
         "--encoded-cache",
         type=Path,
@@ -489,7 +504,9 @@ class DemonstrationTensors:
     a dense index over staged episode-seats in staging order, and `step`, the
     step number inside that episode-seat. They are what lets a consumer pair
     row j with row j+1 -- eligible exactly when the episode index matches and
-    the step advances by one -- without trusting a batch's provenance.
+    the step advances by one -- without trusting a batch's provenance. A bool
+    `transition_valid` beside them clears that pairing for a row whose recorded
+    action did not produce row j+1 (`_transition_valid`).
     """
 
     staged: dict[str, torch.Tensor]
@@ -640,6 +657,36 @@ def _encode_episode_file(
     return arrays
 
 
+# Per-step fields that mark a label whose engine effect differs from what ran:
+# a recovery deviation, and the relabels that change what the step consumes
+# (a whole deposit for the partial one executed, PASS for a redundant FERTILIZE
+# the engine still charges a fertilizer for).
+_TRANSITION_BREAKS = ("perturbed", "relabeled_partial_deposits", "relabeled_redundant_fertilize")
+
+
+def _transition_valid(path: Path, rows: int) -> np.ndarray:
+    """Whether each row's recorded label is the action that produced the next row.
+
+    A recovery corpus (`extract_bc_dataset.py --perturbation-rate`) labels every
+    step with the teacher's action but has the engine execute a deviation at its
+    `perturbed` steps, and a relabel can name an action whose effect differs
+    from the one executed. Those rows stay clone targets, yet the transition out
+    of them is not the dynamics of their label, so the world-model terms must
+    not see it. Read beside the encoding rather than cached with it: it is a
+    fact about how the episode was played, not an encoding of what was observed.
+    """
+    valid = np.ones(rows, dtype=np.bool_)
+    with np.load(path) as archive:
+        for name in _TRANSITION_BREAKS:
+            if name not in archive.files:
+                continue
+            flags = archive[name]
+            if flags.shape != (rows,):
+                raise ValueError(f"{path}: {name} has shape {flags.shape}, not ({rows},)")
+            valid &= flags == 0
+    return valid
+
+
 def _validate_market_rules(observations: list[dict], name: str) -> None:
     """Reject demonstrations recorded under other market rules than these.
 
@@ -686,11 +733,23 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
     corpus stages identically however it was built.
     """
     rows = sum(member["unit_actions"].shape[0] for member in members)
-    template = members[0]
-    stacked = {
-        name: np.empty((rows, *value.shape[1:]), dtype=value.dtype)
-        for name, value in template.items()
-    }
+
+    def released() -> Iterator[dict[str, np.ndarray]]:
+        for position, member in enumerate(members):
+            members[position] = {}
+            yield member
+
+    return _stage_members(released(), rows)
+
+
+def _stage_members(members: Iterable[dict[str, np.ndarray]], rows: int) -> DemonstrationTensors:
+    """Stage `rows` rows of episodes drawn one at a time from `members`.
+
+    The arrays are allocated from the first episode's shapes, so a caller that
+    loads each episode only as it is drawn holds one episode beyond the staged
+    whole, which is what lets a streamed shard be staged in place.
+    """
+    stacked: dict[str, np.ndarray] = {}
     components = np.zeros(rows, dtype=np.float64)
     # Pairing metadata, derived from row order rather than read from a field:
     # `extract_episode` walks `range(episode_steps - 1)` and stacks in that
@@ -700,8 +759,16 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
     episode_index = np.empty(rows, dtype=np.int32)
     step = np.empty(rows, dtype=np.int32)
     offset = 0
+    position = -1
     for position, member in enumerate(members):
+        if not stacked:
+            stacked = {
+                name: np.empty((rows, *value.shape[1:]), dtype=value.dtype)
+                for name, value in member.items()
+            }
         span = member["unit_actions"].shape[0]
+        if offset + span > rows:
+            raise ValueError(f"episodes hold more than the {rows} rows staged for them")
         for name, value in member.items():
             expected = (span, *stacked[name].shape[1:])
             if value.shape != expected:
@@ -722,7 +789,8 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
         episode_index[offset : offset + span] = position
         step[offset : offset + span] = np.arange(span, dtype=np.int32)
         offset += span
-        members[position] = {}
+    if position < 0 or offset != rows:
+        raise ValueError(f"{position + 1} episodes held {offset} rows, not the {rows} staged")
     stacked["episode_index"] = episode_index
     stacked["step"] = step
     return DemonstrationTensors(
@@ -731,33 +799,139 @@ def _stage_split(members: list[dict[str, np.ndarray]]) -> DemonstrationTensors:
     )
 
 
-def load_dataset(
+@dataclass(frozen=True)
+class CorpusPlan:
+    """Every episode-seat of a mixture: where it lives, its split, and how to encode it."""
+
+    entries: list[tuple[int, Path, dict[str, Any]]]
+    held_out: set[tuple[int, int]]
+    records: list[dict[str, Any]]
+    paths: list[str]
+    cache_paths: list[str | None]
+    encode: Callable[[str, str | None], dict[str, np.ndarray]]
+    # Every archive stages one row per recorded decision, and the horizon is
+    # one across the mixture, so every episode-seat has the same row count.
+    episode_rows: int
+
+    def is_held_out(self, position: int) -> bool:
+        index, _, entry = self.entries[position]
+        return (index, int(entry["seed"])) in self.held_out
+
+    def member(self, position: int) -> dict[str, np.ndarray]:
+        """One episode-seat's staged arrays, validated, with its transition flags."""
+        arrays = self.encode(self.paths[position], self.cache_paths[position])
+        _validate_targets_satisfy_masks(arrays, self.paths[position])
+        arrays["transition_valid"] = _transition_valid(
+            Path(self.paths[position]), arrays["unit_actions"].shape[0]
+        )
+        return arrays
+
+
+def _encoded_rows(
+    path_text: str,
+    cache_text: str | None,
+    *,
+    encode: Callable[[str, str | None], dict[str, np.ndarray]],
+) -> int:
+    """Encode one episode-seat into the cache; only its row count crosses back."""
+    return int(encode(path_text, cache_text)["unit_actions"].shape[0])
+
+
+def warm_encoded_cache(plan: CorpusPlan, *, encode_workers: int, torch_threads: int = 1) -> int:
+    """Encode every episode-seat the cache lacks; returns how many were encoded.
+
+    Encoding is pure-Python tokenization at most of a second per seat, so a
+    corpus of thousands of seats is a pass of its own, parallel and holding no
+    arrays: a streamed corpus is staged from the cache a shard at a time and
+    must never pay for tokenization while the accelerator waits.
+    """
+    if any(cache is None for cache in plan.cache_paths):
+        raise ValueError("warming needs an encoded cache")
+    missing = [
+        position
+        for position, cache in enumerate(plan.cache_paths)
+        if cache is not None and not Path(cache).exists()
+    ]
+    if not missing:
+        return 0
+    started = time.perf_counter()
+    workers = min(encode_workers, len(missing))
+    with ProcessPoolExecutor(
+        max_workers=workers, initializer=_pin_host_threads, initargs=(torch_threads,)
+    ) as pool:
+        counts = pool.map(
+            partial(_encoded_rows, encode=plan.encode),
+            [plan.paths[position] for position in missing],
+            [plan.cache_paths[position] for position in missing],
+            chunksize=4,
+        )
+        for done, (position, rows) in enumerate(zip(missing, counts, strict=True), start=1):
+            if rows != plan.episode_rows:
+                raise ValueError(
+                    f"{plan.paths[position]}: {rows} rows, not the horizon's {plan.episode_rows}"
+                )
+            if done % 1000 == 0 or done == len(missing):
+                print(
+                    f"encoded {done}/{len(missing)} episode-seats "
+                    f"({time.perf_counter() - started:.0f}s)",
+                    flush=True,
+                )
+    return len(missing)
+
+
+@dataclass(frozen=True)
+class StreamedSplit:
+    """A training split staged a shard of whole episode-seats at a time.
+
+    At ~10 MiB per staged episode-seat, host memory holds a couple of thousand
+    seats, far fewer than a corpus of hosted leaderboard games offers. Each
+    epoch deals the seats into shards at random and stages one shard at a time
+    from the encoded cache, so an epoch is still one pass over every row, rows
+    are shuffled within a shard, and no episode is split across shards, which
+    keeps every transition pair inside one staged episode. What is lost against
+    a resident corpus is only mixing across shards within one stretch of
+    minibatches, and the shards are dealt anew every epoch.
+    """
+
+    plan: CorpusPlan
+    positions: list[int]
+    shard_seats: int
+
+    @property
+    def rows(self) -> int:
+        return len(self.positions) * self.plan.episode_rows
+
+    @property
+    def shard_count(self) -> int:
+        return math.ceil(len(self.positions) / self.shard_seats)
+
+    def shard_rows(self) -> list[int]:
+        """Rows per shard; the deal permutes seats, never the shard sizes."""
+        sizes = np.array_split(np.arange(len(self.positions)), self.shard_count)
+        return [len(size) * self.plan.episode_rows for size in sizes]
+
+    def deal(self, rng: np.random.Generator) -> list[np.ndarray]:
+        return np.array_split(rng.permutation(np.asarray(self.positions)), self.shard_count)
+
+    def stage(self, shard: np.ndarray) -> DemonstrationTensors:
+        return _stage_members(
+            (self.plan.member(int(position)) for position in shard),
+            len(shard) * self.plan.episode_rows,
+        )
+
+
+def plan_corpus(
     dataset_dirs: Sequence[Path],
     *,
     architecture: str,
     holdout_seeds: int,
-    encode_workers: int,
-    torch_threads: int = 1,
     seeds_per_dataset: int | None = None,
     encoded_cache: Path | None = None,
     action_interface: int = 1,
     market_set_sell_order: str = "fixed",
     market_set_hire_last: bool = False,
-) -> tuple[DemonstrationTensors, DemonstrationTensors, list[dict[str, Any]]]:
-    """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
-
-    Several directories are merged into one corpus because a single-opponent
-    corpus teaches the wrong precondition: the clone of `public-v27` trained
-    on v27-vs-v27 games alone earned 92 money against `starter` while earning
-    ~28.9k against a copy of itself, having latched onto "opponent is rich" —
-    a constant in that corpus — as a condition for farming at all.
-
-    `seeds_per_dataset` caps how many seeds each directory contributes. The whole
-    corpus is staged in host memory at ~10 MiB per episode-seat, so it is the knob
-    that trades breadth against that ceiling -- and breadth is what wins: the
-    uncapped clone reached 99.996% accuracy on the distribution it saw and still
-    could not act off it, so a fifth of four opponents beats all of one.
-    """
+) -> CorpusPlan:
+    """Resolve a mixture's episode-seats, split, cache paths and encoder."""
     # Reject an unknown family before paying for the encode, not inside a
     # worker process after every episode has been tokenized.
     resolve_architecture(architecture)
@@ -849,8 +1023,72 @@ def load_dataset(
         if action_interface == 3
         else partial(_encode_episode_file, architecture_name=architecture)
     )
+    return CorpusPlan(
+        entries=entries,
+        held_out=held_out,
+        records=records,
+        paths=paths,
+        cache_paths=cache_paths,
+        encode=encode,
+        episode_rows=int(manifests[0]["episode_steps"]) - 1,
+    )
+
+
+def load_dataset(
+    dataset_dirs: Sequence[Path],
+    *,
+    architecture: str,
+    holdout_seeds: int,
+    encode_workers: int,
+    torch_threads: int = 1,
+    seeds_per_dataset: int | None = None,
+    encoded_cache: Path | None = None,
+    action_interface: int = 1,
+    market_set_sell_order: str = "fixed",
+    market_set_hire_last: bool = False,
+    shard_seats: int | None = None,
+) -> tuple[DemonstrationTensors | StreamedSplit, DemonstrationTensors, list[dict[str, Any]]]:
+    """Load, encode, and stage a mixture of datasets; returns (train, holdout, records).
+
+    Several directories are merged into one corpus because a single-opponent
+    corpus teaches the wrong precondition: the clone of `public-v27` trained
+    on v27-vs-v27 games alone earned 92 money against `starter` while earning
+    ~28.9k against a copy of itself, having latched onto "opponent is rich" —
+    a constant in that corpus — as a condition for farming at all.
+
+    `seeds_per_dataset` caps how many seeds each directory contributes. A
+    resident corpus is staged in host memory at ~10 MiB per episode-seat, so it
+    is the knob that trades breadth against that ceiling -- and breadth is what
+    wins: the uncapped clone reached 99.996% accuracy on the distribution it saw
+    and still could not act off it, so a fifth of four opponents beats all of
+    one. `shard_seats` lifts the ceiling instead: the training split streams
+    from the encoded cache in shards of that many seats (`StreamedSplit`), and
+    only the holdout is staged whole.
+    """
     if encode_workers < 1:
         raise ValueError("encode workers must be positive")
+    plan = plan_corpus(
+        dataset_dirs,
+        architecture=architecture,
+        holdout_seeds=holdout_seeds,
+        seeds_per_dataset=seeds_per_dataset,
+        encoded_cache=encoded_cache,
+        action_interface=action_interface,
+        market_set_sell_order=market_set_sell_order,
+        market_set_hire_last=market_set_hire_last,
+    )
+    if shard_seats is not None:
+        if shard_seats < 1:
+            raise ValueError("shard seats must be positive")
+        if encoded_cache is None:
+            raise ValueError("a streamed corpus is staged from the encoded cache; give one")
+        warm_encoded_cache(plan, encode_workers=encode_workers, torch_threads=torch_threads)
+        positions = range(len(plan.entries))
+        holdout = _stage_split([plan.member(k) for k in positions if plan.is_held_out(k)])
+        train_positions = [k for k in positions if not plan.is_held_out(k)]
+        return StreamedSplit(plan, train_positions, shard_seats), holdout, plan.records
+    entries, held_out, records = plan.entries, plan.held_out, plan.records
+    paths, cache_paths, encode = plan.paths, plan.cache_paths, plan.encode
     workers = min(encode_workers, len(paths))
     if workers > 1:
         with ProcessPoolExecutor(
@@ -865,6 +1103,9 @@ def load_dataset(
     splits: dict[bool, list[dict[str, np.ndarray]]] = {False: [], True: []}
     for (index, directory, entry), arrays in zip(entries, encoded, strict=True):
         _validate_targets_satisfy_masks(arrays, str(directory / entry["file"]))
+        arrays["transition_valid"] = _transition_valid(
+            directory / entry["file"], arrays["unit_actions"].shape[0]
+        )
         splits[(index, int(entry["seed"])) in held_out].append(arrays)
     # The split lists alias the same dicts, so dropping this one only frees the
     # list itself -- but it is what lets `stage` below release each episode as it
@@ -940,6 +1181,9 @@ def _batch(
     # rows actually have.
     factors["episode_index"] = _batch_tensor(rows["episode_index"], whole, torch.long)
     factors["step"] = _batch_tensor(rows["step"], whole, torch.long)
+    # Only the world-model terms read this; the clone loss scores every row.
+    if "transition_valid" in rows:
+        factors["transition_valid"] = rows["transition_valid"]
     return actor_args, factors
 
 
@@ -1175,6 +1419,7 @@ def _clone_and_latent_loss(
         factors["step"],
         horizon=horizon,
         decode=decode,
+        transition_valid=factors.get("transition_valid"),
     )
     # The halves come back from the unroll rather than from a second prediction:
     # they are reported for attribution, not optimized separately, and the two
@@ -1716,6 +1961,54 @@ def _run_epoch_order(
     return torch.repeat_interleave(shuffled_starts - offsets, shuffled_lengths) + torch.arange(rows)
 
 
+def _epoch_batches(
+    architecture: str,
+    split: DemonstrationTensors | StreamedSplit,
+    *,
+    minibatch_rows: int,
+    run_length: int,
+    generator: torch.Generator,
+    shard_rng: np.random.Generator,
+    device: torch.device,
+    orientation_rng: np.random.Generator,
+) -> Iterator[tuple[tuple[Any, ...], dict[str, torch.Tensor], torch.Tensor, float]]:
+    """One epoch's minibatches: (actor args, factors, row weights, active components).
+
+    A resident split is one shard, drawn exactly as before streaming existed. A
+    streamed split is dealt into shards and each is staged only when the
+    previous one is spent, and no reference to a spent shard survives staging
+    the next, so host memory holds one shard at a time.
+
+    The row weights zero the rows the last minibatch wraps to the head of its
+    shard's ordering: the LeJEPA objective scores SIGReg over every row rather
+    than per transition, so it is told which rows are those duplicates, exactly
+    as in the PPO update. The component count is what the epoch loss is
+    weighted by, since the clone loss is a mean over active components.
+    """
+    shards = [split] if isinstance(split, DemonstrationTensors) else split.deal(shard_rng)
+    while shards:
+        shard = shards.pop(0)
+        tensors = shard if isinstance(shard, DemonstrationTensors) else split.stage(shard)
+        del shard
+        positions, counts = _fixed_minibatch_positions(tensors.rows, minibatch_rows)
+        weights = torch.from_numpy(
+            (np.arange(minibatch_rows)[None, :] < counts[:, None]).astype(np.float32)
+        ).to(device)
+        # The order indexes host storage and also selects the epoch weights
+        # from precomputed host-side counts, which needs the same order.
+        # Re-cut every epoch at freshly drawn phases, so every transition
+        # of every episode is a source in expectation.
+        starts, lengths = _run_blocks(tensors.staged["episode_index"], run_length, generator)
+        order = _run_epoch_order(starts, lengths, generator)
+        components = tensors.row_components[order.numpy()]
+        for batch_number, indices in enumerate(positions):
+            actor_args, factors = _batch(
+                architecture, tensors, order[indices], device, orientation_rng=orientation_rng
+            )
+            yield actor_args, factors, weights[batch_number], float(components[indices].sum())
+        del tensors, order, components
+
+
 def train(
     *,
     dataset_dirs: Sequence[Path],
@@ -1753,6 +2046,7 @@ def train(
     encode_workers: int,
     torch_threads: int = 1,
     seeds_per_dataset: int | None = None,
+    shard_seats: int | None = None,
 ) -> dict[str, float]:
     """Run the full clone; returns the best holdout metrics."""
     if torch_threads < 1:
@@ -1904,30 +2198,28 @@ def train(
         action_interface=getattr(config, "action_interface", 1),
         market_set_sell_order=getattr(config, "market_set_sell_order", "fixed"),
         market_set_hire_last=getattr(config, "market_set_hire_last", False),
+        shard_seats=shard_seats,
     )
-    # `train_split.rows` is fixed for the life of the process, so the partition
-    # is computed once: every epoch reshuffles only the order these positions
-    # index into, and every minibatch is exactly `batch_size` rows wide -- or
-    # the whole split, when that is narrower, rather than one split padded out
-    # to `batch_size` with copies of itself.
-    minibatch_positions, minibatch_counts = _fixed_minibatch_positions(
-        train_split.rows, min(batch_size, train_split.rows)
+    # Shard sizes are fixed for the life of the process (a deal permutes seats,
+    # not sizes), so every minibatch is exactly `batch_size` rows wide -- or the
+    # narrowest shard, when that is narrower, rather than one shard padded out
+    # to `batch_size` with copies of itself -- and the epoch's step count is known.
+    shard_rows = (
+        train_split.shard_rows() if isinstance(train_split, StreamedSplit) else [train_split.rows]
     )
-    minibatch_rows = int(minibatch_positions.shape[1])
-    # The last minibatch wraps to the head of the ordering. The LeJEPA
-    # objective scores SIGReg over every row rather than per transition, so it
-    # is told which rows are those duplicates, exactly as in the PPO update.
-    minibatch_weights = torch.from_numpy(
-        (np.arange(minibatch_rows)[None, :] < minibatch_counts[:, None]).astype(np.float32)
-    ).to(device)
+    minibatch_rows = min(batch_size, *shard_rows)
+    # The seat deal draws from a stream of its own, so a resident corpus
+    # consumes every other stream exactly as before streaming existed.
+    shard_rng = np.random.default_rng((seed, 2))
     if auxiliary_horizon and minibatch_rows <= auxiliary_horizon:
         raise ValueError(
             f"an auxiliary horizon of {auxiliary_horizon} needs a wider minibatch; "
             f"every minibatch has {minibatch_rows} rows"
         )
     print(
-        f"dataset: {len(datasets)} corpora, {train_split.rows} train rows, "
-        f"{holdout_split.rows} holdout rows ({holdout_seeds} held-out seeds each)",
+        f"dataset: {len(datasets)} corpora, {train_split.rows} train rows "
+        f"in {len(shard_rows)} shard(s), {holdout_split.rows} holdout rows "
+        f"({holdout_seeds} held-out seeds each)",
         flush=True,
     )
 
@@ -1982,7 +2274,7 @@ def train(
         if isinstance(actor, LejepaActor) and isinstance(dynamics, JepaObjective)
         else (matrices + vectors,)
     )
-    steps_per_epoch = math.ceil(train_split.rows / batch_size)
+    steps_per_epoch = sum(math.ceil(rows / minibatch_rows) for rows in shard_rows)
     total_steps = max(epochs * steps_per_epoch, 1)
     step_index = 0
     autocast = device.type == "cuda"
@@ -2024,6 +2316,7 @@ def train(
         "batch_size": batch_size,
         # The width actually trained, which the split can clamp below the request.
         "minibatch_rows": minibatch_rows,
+        "shard_seats": shard_seats,
         "run_length": run_length,
         "compile_mode": compile_mode,
         "latent_dynamics_coefficient": latent_dynamics_coefficient,
@@ -2064,15 +2357,6 @@ def train(
         for epoch in range(epochs):
             actor.train()
             started = time.perf_counter()
-            # The order indexes host storage and also selects the epoch weights
-            # from precomputed host-side counts, which needs the same order.
-            # Re-cut every epoch at freshly drawn phases, so every transition
-            # of every episode is a source in expectation.
-            run_starts, run_lengths = _run_blocks(
-                train_split.staged["episode_index"], run_length, generator
-            )
-            order = _run_epoch_order(run_starts, run_lengths, generator)
-            shuffled_components = train_split.row_components[order.numpy()]
             # The rate and coefficient this epoch opens with, read from the
             # schedule rather than from the optimizer, whose groups still hold
             # the previous epoch's last step until the first step below sets it.
@@ -2088,14 +2372,16 @@ def train(
                 else _LATENT_FIELDS
             )
             diagnostic_sums = dict.fromkeys(diagnostic_fields, 0.0)
-            for batch_number, indices in enumerate(minibatch_positions):
-                actor_args, factors = _batch(
-                    architecture,
-                    train_split,
-                    order[indices],
-                    device,
-                    orientation_rng=orientation_rng,
-                )
+            for actor_args, factors, batch_weights, components in _epoch_batches(
+                architecture,
+                train_split,
+                minibatch_rows=minibatch_rows,
+                run_length=run_length,
+                generator=generator,
+                shard_rng=shard_rng,
+                device=device,
+                orientation_rng=orientation_rng,
+            ):
                 terms: Any = 0
 
                 if dynamics is None:
@@ -2110,7 +2396,7 @@ def train(
                         factors,
                         autocast,
                         jepa_horizon,
-                        minibatch_weights[batch_number],
+                        batch_weights,
                     )
                     loss = (
                         terms.clone
@@ -2194,7 +2480,6 @@ def train(
                 # The loss is a mean over active components, so the epoch
                 # average must weight by that same count, exactly as the PPO
                 # update aggregates its per-minibatch losses.
-                components = float(shuffled_components[indices].sum())
                 # The CLONE term is what the journal's `train_loss` has always
                 # meant, and it stays comparable across arms only if the
                 # auxiliary is excluded from it. The combined objective is not a
@@ -2377,6 +2662,23 @@ def train(
 
 def main() -> None:
     args = parse_args()
+    if args.warm_cache_only:
+        config = model_config_from_args(resolve_architecture(args.architecture), args)
+        plan = plan_corpus(
+            args.dataset,
+            architecture=args.architecture,
+            holdout_seeds=args.holdout_seeds,
+            seeds_per_dataset=args.seeds_per_dataset,
+            encoded_cache=args.encoded_cache,
+            action_interface=getattr(config, "action_interface", 1),
+            market_set_sell_order=getattr(config, "market_set_sell_order", "fixed"),
+            market_set_hire_last=getattr(config, "market_set_hire_last", False),
+        )
+        encoded = warm_encoded_cache(
+            plan, encode_workers=args.encode_workers, torch_threads=args.torch_threads
+        )
+        print(f"encoded {encoded} of {len(plan.entries)} episode-seats", flush=True)
+        return
     train(
         dataset_dirs=args.dataset,
         output_dir=args.output,
@@ -2384,6 +2686,7 @@ def main() -> None:
         config=model_config_from_args(resolve_architecture(args.architecture), args),
         holdout_seeds=args.holdout_seeds,
         seeds_per_dataset=args.seeds_per_dataset,
+        shard_seats=args.shard_seats,
         epochs=args.epochs,
         patience=args.patience,
         batch_size=args.batch_size,

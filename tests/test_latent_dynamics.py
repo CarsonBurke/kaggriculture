@@ -299,6 +299,16 @@ def test_consecutive_rows_pairs_only_adjacent_steps_of_one_episode() -> None:
         consecutive_rows(torch.zeros(2, 2, dtype=torch.long), torch.zeros(2, 2, dtype=torch.long))
 
 
+def test_consecutive_rows_drops_a_row_whose_action_did_not_produce_its_successor() -> None:
+    episode = torch.tensor([0, 0, 0, 1, 1, 2])
+    step = torch.tensor([5, 6, 7, 0, 1, 9])
+    valid = torch.tensor([False, True, True, True, False, True])
+    paired = consecutive_rows(episode, step, valid)
+    assert paired.tolist() == [False, True, False, True, False, False]
+    with pytest.raises(ValueError, match="transition validity"):
+        consecutive_rows(episode, step, valid[:-1])
+
+
 def test_horizon_one_equals_the_single_step_call_bit_for_bit() -> None:
     dynamics = LatentDynamics(16)
     rows = 6

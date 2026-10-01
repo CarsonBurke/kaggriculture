@@ -250,6 +250,10 @@ def main() -> None:
         raise FileExistsError(output)
     manifest_path = source / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    if "perturbation" in manifest:
+        # Recovery corpora label with the teacher's actions, not the executed ones
+        # this rebuild relabels, and replay against the unperturbed teacher diverges.
+        raise ValueError(f"{source}: recovery (perturbed) corpora cannot be relabeled")
     mirror = manifest["teacher"] == manifest["opponent"]
     _, teacher = normalize_opponent(manifest["teacher"]["label"])
     _, opponent = normalize_opponent(manifest["opponent"]["label"])

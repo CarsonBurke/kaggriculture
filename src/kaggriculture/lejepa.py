@@ -924,7 +924,10 @@ def jepa_horizon_loss(
         predicted = objective.prediction(predicted, actions_at(action_index), token_valid)
         if plan is None:
             target_index, eligible = _target_index(
-                factors["episode_index"], factors["step"], offset
+                factors["episode_index"],
+                factors["step"],
+                offset,
+                factors.get("transition_valid"),
             )
         else:
             target_index = plan.indices[plan.eligible.shape[0] + offset]

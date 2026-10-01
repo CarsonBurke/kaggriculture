@@ -427,6 +427,9 @@ def test_one_directory_splits_exactly_as_it_did_before_mixing(
     for position, entry in enumerate(manifest["episodes"]):
         expected[int(entry["seed"]) in held_out].append(position)
     monkeypatch.setattr(trainer, "_encode_episode_file", _tagging_encoder())
+    # The stand-in encodes one row per archive, which the archive's per-step
+    # transition flags would rightly refuse to describe.
+    monkeypatch.setattr(trainer, "_transition_valid", lambda _path, rows: np.ones(rows, bool))
 
     train_split, holdout_split, _ = trainer.load_dataset(
         [dataset_dir],
@@ -1625,3 +1628,194 @@ def test_lejepa_bc_batches_include_exact_teacher_prefix_resources(dataset_dir: P
                     replay_market_resources(observation["observation"], units, kinds, quantities)
                 )
     np.testing.assert_array_equal(args[1], np.stack(expected))
+
+
+def test_perturbed_steps_train_the_clone_but_never_the_world_model(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """A recovery corpus labels a perturbed step with the teacher's action while
+    the engine executed a deviation, so the transition out of that row is not the
+    dynamics of its label. The clone loss scores the row; the LeJEPA transition
+    must neither admit it nor read its action."""
+    trainer = _load_trainer()
+    directory = _copy_dataset(dataset_dir, tmp_path / "recovery")
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    held_out = max(int(entry["seed"]) for entry in manifest["episodes"])
+    kept = [entry for entry in manifest["episodes"] if int(entry["seed"]) != held_out]
+    # One perturbation mid-episode and one on the final row, which has no
+    # successor to lose.
+    perturbed = np.zeros(EPISODE_STEPS - 1, dtype=np.bool_)
+    perturbed[[2, EPISODE_STEPS - 2]] = True
+    archive_path = directory / kept[0]["file"]
+    with np.load(archive_path) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    np.savez_compressed(archive_path, **arrays, perturbed=perturbed)
+    # An unperturbed step whose label is a relabel with another engine effect
+    # (PASS for a redundant FERTILIZE that still spends a fertilizer).
+    relabeled = np.zeros(EPISODE_STEPS - 1, dtype=np.int8)
+    relabeled[4] = 1
+    second_path = directory / kept[1]["file"]
+    with np.load(second_path) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    np.savez_compressed(second_path, **arrays, relabeled_redundant_fertilize=relabeled)
+
+    train_split, _, _ = trainer.load_dataset(
+        [directory], architecture=LEJEPA, holdout_seeds=1, encode_workers=1
+    )
+    expected_valid = np.ones(train_split.rows, dtype=np.bool_)
+    expected_valid[: EPISODE_STEPS - 1] = ~perturbed
+    expected_valid[EPISODE_STEPS - 1 : 2 * (EPISODE_STEPS - 1)] = relabeled == 0
+    assert train_split.staged["transition_valid"].numpy().tolist() == expected_valid.tolist()
+
+    torch.manual_seed(0)
+    config = _tiny_lejepa_config()
+    actor, _critic = build_lejepa_pair(config)
+    objective = JepaObjective(config)
+    with torch.no_grad():
+        # A non-identity transition, so the action a source row carries matters.
+        for parameter in objective.predictor.output.parameters():
+            parameter.normal_(0.0, 0.2)
+    args, factors = trainer._batch(LEJEPA, train_split, slice(None), torch.device("cpu"))
+    assert factors["transition_valid"].tolist() == expected_valid.tolist()
+    weight = torch.ones(train_split.rows)
+
+    def terms(batch_factors):
+        with torch.no_grad():
+            return trainer._clone_and_jepa_loss(
+                actor, objective, args, batch_factors, False, 1, weight
+            )
+
+    masked = terms(factors)
+    unmasked = terms({name: value for name, value in factors.items() if name != "transition_valid"})
+    # The mid-episode perturbation and the relabel each had a successor to drop.
+    assert float(unmasked.jepa.eligible) - float(masked.jepa.eligible) == 2.0
+    assert float(masked.clone) == float(unmasked.clone)
+
+    # Relabel the perturbed row: the clone sees it, the masked transition does not.
+    relabeled = dict(factors)
+    relabeled["unit_actions"] = factors["unit_actions"].clone()
+    active = factors["unit_active"][2]
+    assert active.any()
+    choices = factors["unit_masks"][2].clone()
+    choices[torch.arange(choices.shape[0]), factors["unit_actions"][2]] = False
+    choices &= active[:, None]
+    slot = int(torch.nonzero(choices.any(dim=1))[0])
+    relabeled["unit_actions"][2, slot] = int(torch.nonzero(choices[slot])[0])
+    changed = terms(relabeled)
+    assert float(changed.clone) != float(masked.clone)
+    assert float(changed.jepa.prediction) == float(masked.jepa.prediction)
+    changed_unmasked = terms(
+        {name: value for name, value in relabeled.items() if name != "transition_valid"}
+    )
+    assert float(changed_unmasked.jepa.prediction) != float(unmasked.jepa.prediction)
+
+
+def _streamable_dataset(dataset_dir: Path, tmp_path: Path) -> list[Path]:
+    """Two corpora, so the training split holds four episode-seats to deal."""
+    return [dataset_dir, _copy_dataset(dataset_dir, tmp_path / "second", seed_shift=10)]
+
+
+def test_a_streamed_split_stages_the_resident_rows_a_shard_at_a_time(
+    dataset_dir: Path, tmp_path: Path
+) -> None:
+    """Streaming changes where the rows live, never which rows an epoch sees."""
+    trainer = _load_trainer()
+    directories = _streamable_dataset(dataset_dir, tmp_path)
+    options = {"architecture": CONV_ENTITY, "holdout_seeds": 1, "encode_workers": 1}
+    resident, resident_holdout, _ = trainer.load_dataset(directories, **options)
+    streamed, streamed_holdout, _ = trainer.load_dataset(
+        directories, **options, encoded_cache=tmp_path / "cache", shard_seats=3
+    )
+
+    assert isinstance(streamed, trainer.StreamedSplit)
+    assert streamed.rows == resident.rows
+    assert streamed.shard_rows() == [2 * (EPISODE_STEPS - 1)] * 2
+    for name, value in resident_holdout.staged.items():
+        np.testing.assert_array_equal(streamed_holdout.staged[name].numpy(), value.numpy())
+    shards = streamed.deal(np.random.default_rng(0))
+    assert sorted(np.concatenate(shards).tolist()) == streamed.positions
+    staged = [streamed.stage(shard) for shard in shards]
+    # A shard is whole episode-seats, each staged exactly as the resident corpus
+    # stages it: the multiset of rows is the resident split's.
+    for name, value in resident.staged.items():
+        if name == "episode_index":
+            continue
+        rows = np.concatenate([shard.staged[name].numpy() for shard in staged])
+        expected = value.numpy()
+        order = lambda array: np.lexsort(array.reshape(len(array), -1).T)  # noqa: E731
+        np.testing.assert_array_equal(rows[order(rows)], expected[order(expected)])
+
+    batches = list(
+        trainer._epoch_batches(
+            CONV_ENTITY,
+            streamed,
+            # a divisor of each shard's 14 rows, so no minibatch wraps
+            minibatch_rows=7,
+            run_length=2,
+            generator=torch.Generator().manual_seed(0),
+            shard_rng=np.random.default_rng(0),
+            device=torch.device("cpu"),
+            orientation_rng=np.random.default_rng(0),
+        )
+    )
+    assert sum(float(weights.sum()) for _, _, weights, _ in batches) == streamed.rows
+    assert sum(components for *_, components in batches) == pytest.approx(
+        float(resident.row_components.sum())
+    )
+
+
+def test_a_streamed_split_needs_the_encoded_cache(dataset_dir: Path) -> None:
+    trainer = _load_trainer()
+    with pytest.raises(ValueError, match="encoded cache"):
+        trainer.load_dataset(
+            [dataset_dir],
+            architecture=CONV_ENTITY,
+            holdout_seeds=1,
+            encode_workers=1,
+            shard_seats=1,
+        )
+
+
+def test_staging_refuses_episodes_that_do_not_fill_the_rows_given() -> None:
+    module = _load_trainer()
+    member = {
+        "unit_actions": np.zeros((3, 4), dtype=np.int8),
+        "unit_active": np.ones((3, 4), dtype=bool),
+        "market_active": np.ones((3, 2), dtype=bool),
+        "market_quantity_active": np.ones((3, 2), dtype=bool),
+    }
+    with pytest.raises(ValueError, match="not the 4 staged"):
+        module._stage_members(iter([member]), 4)
+    with pytest.raises(ValueError, match="more than the 2 rows"):
+        module._stage_members(iter([member]), 2)
+
+
+def test_a_streamed_clone_trains_and_records_its_shards(dataset_dir: Path, tmp_path: Path) -> None:
+    trainer = _load_trainer()
+    output = tmp_path / "run"
+
+    trainer.train(
+        dataset_dirs=_streamable_dataset(dataset_dir, tmp_path),
+        output_dir=output,
+        architecture=CONV_ENTITY,
+        config=_tiny_config(),
+        holdout_seeds=1,
+        epochs=2,
+        patience=2,
+        batch_size=8,
+        matrix_learning_rate=1e-3,
+        matrix_weight_decay=0.0,
+        adam_learning_rate_ratio=0.35,
+        adam_weight_decay=0.0,
+        seed=0,
+        device=torch.device("cpu"),
+        encode_workers=1,
+        encoded_cache=tmp_path / "cache",
+        shard_seats=1,
+    )
+
+    records = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+    assert len(records) == 2
+    assert all(np.isfinite(record["train_loss"]) for record in records)
+    _, payload = load_actor_artifact(output / "bc-actor.pt")
+    assert payload["bc_provenance"]["shard_seats"] == 1

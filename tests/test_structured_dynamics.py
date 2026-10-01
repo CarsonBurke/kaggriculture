@@ -323,3 +323,22 @@ def test_categorical_critic_kl_matches_the_actual_capped_value_readout(bfloat16:
     assert target.grad is None
     assert head.weight.grad is None
     assert head.bias.grad is None
+
+
+def test_an_invalid_transition_breaks_every_chain_through_it() -> None:
+    """Row 2's recorded action did not produce row 3 (a recovery demonstration's
+    perturbed step), so no horizon may cross the edge 2 -> 3."""
+    episode = torch.zeros(6, dtype=torch.long)
+    step = torch.arange(6)
+    valid = torch.tensor([True, True, False, True, True, True])
+    expected = {
+        1: [True, True, False, True, True, False],
+        2: [True, False, False, True, False, False],
+        3: [False, False, False, False, False, False],
+    }
+    for offset, rows in expected.items():
+        index, eligible = _target_index(episode, step, offset, valid)
+        assert eligible.tolist() == rows
+        _, unmasked = _target_index(episode, step, offset)
+        assert unmasked.tolist() == [source + offset < 6 for source in range(6)]
+        assert index.tolist() == [min(source + offset, 5) for source in range(6)]
