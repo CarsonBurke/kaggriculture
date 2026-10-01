@@ -33,9 +33,10 @@ The categorical arm uses neither symlog nor a critic EMA.
 The production model family is **`lejepa`** ([LeJEPA world model](#lejepa-world-model)):
 one `entity-attention` trunk, described next, shared by actor and critic and trained
 by its world-model objective beside the policy's loss. Its defaults are the promoted
-core -- schema v4, every market quantity choice (`--action-interface 2`), the local unit
+core -- schema v8, every market quantity choice (`--action-interface 2`), the local unit
 affordance scorer, unit target navigation, market resource conditioning, the critic
-readout FFN and the WDL critic -- which the adopted PPO recipe was measured on.
+readout FFN and the WDL critic -- which the adopted PPO recipe was measured on
+(on v4; the v8 leaderboard clone fits and plays as the v4 one does).
 
 The `entity-attention` trunk has width **96** for both
 encoded memory and entities. Two shared-weight local transformer blocks encode
@@ -174,20 +175,71 @@ rollout keeps the dense compiled primitive. This is not a fused attention kernel
 production memory and throughput are measured in the experiment gates.
 
 The default `--league-selection hardness` pools the configured lane budgets
-and selects distinct opponents with the lowest recent posterior learner score.
-One lane refreshes stale/uncertain evidence. When unseen opponents remain, a
-separate discovery lane first admits untested built-ins, then the newest untested
-snapshot. This prevents a large stale archive from starving new strategies;
-older unseen snapshots remain eligible for refresh. With the production twelve
-lanes (two active, six historical, four built-in), ten remain for known hardness
-while discovery is needed, otherwise eleven. One- and
-two-lane budgets rotate exploration purposes deterministically across waves.
-Beta(1,1) shrinkage handles sparse evidence, exact ties are randomized, and
-effective game counts decay by 0.98 per learner wave. Games remain evenly
-distributed across selected opponents with balanced seats. Evidence comes only
-from current-learner games, uses native terminal outcomes, and persists in
-recovery checkpoints. `--league-builtin-lanes 0` disables built-ins.
-`--league-selection stratified` retains the earlier age-stratified PFSP ablation.
+and selects distinct opponents with the lowest estimated learner score: the
+Beta(1,1) posterior mean of each opponent's stored games, so an opponent not
+played for a while keeps the score it was last measured at rather than drifting
+back to a coin flip (which, while the learner improves, would rank long-beaten
+snapshots as hard). When unseen opponents remain, a separate discovery lane
+first admits untested built-ins, then the newest untested snapshot, so a large
+archive cannot starve new strategies.
+
+A snapshot beaten long ago can become hard again when the learner's strategy
+drifts, and it is never picked for hardness until someone measures it. The
+screen (`--league-screen-lanes`, two by default) spends two lanes' games two
+at a time on the stale opponents with the largest (age + 1) x posterior standard
+deviation, where age counts waves since last played and effective game counts
+decay by 0.98 per wave; a forgotten matchup reaches hardness selection within
+a few waves. With too few lanes for a screen, one lane instead refreshes the
+single stalest opponent. With the production eight snapshot lanes (two active,
+six historical) and no built-ins, that leaves five lanes of eight games for
+known hardness while discovery is needed, otherwise six, plus eight screened
+opponents. One- and two-lane budgets rotate exploration purposes
+deterministically across waves. Exact ties are randomized and every opponent's
+games are seat-balanced. Evidence comes only from current-learner games, uses
+native terminal outcomes, and persists in recovery checkpoints.
+`--league-builtin-lanes 0` disables built-ins. `--league-selection stratified`
+retains the earlier age-stratified PFSP ablation.
+
+The snapshot archive thins itself at every checkpoint
+(`--league-archive-recent`, R = 16 by default). A snapshot younger than R waves
+stays; one aged between R x 2^k and R x 2^(k+1) waves stays only when its
+iteration is a multiple of 2^k, so each doubling of age keeps R of them and the
+spacing grows as they age. Iteration zero stays, and so does every snapshot
+the learner is estimated to score under 0.6 against, however old. A
+1,300-wave run keeps about 116 snapshots of 3.8 MB rather than 1,300, and an
+old strategy that still beats the learner is never retired. Retired files are deleted only after the checkpoint that no
+longer names them is written; a resume deletes any left behind by a crash.
+
+The script lanes split their games by hardness too
+(`--league-script-allocation hardness`): two per agent, and the rest in seat
+pairs in proportion to (1 - estimated score)^2 from the same stored evidence,
+so a beaten agent keeps a measurement without taking the games that could go
+to one the learner still loses to. `even` splits them equally.
+
+Production trains against no engine built-ins or tapes: the weak ones taught
+nothing a strong opponent does. Ten top public Kaggle agents, all dynamic (they
+react to the game rather than replay a fixed tape), are split in two
+(`kaggriculture.opponents`; copies live in `REFERENCE_AGENT_DIR`). The five
+league agents -- demand-timing, hybrid-2965, harvest-ledger, master-engine-v53
+and bronze-v31 -- are fixed native script lanes, eight games each a wave
+(`--league-script-opponent`, `--league-script-games`). The five held-out agents
+-- demand-preserving, demand-advance4, idle-seller, shepherds-ledger and
+kaito-v48 -- are never played in training and are the default external
+evaluation (`--external-eval-opponents`). A 728-game official round robin ranked
+them; the native engine plays every one with exact official parity. A run
+succeeds when its endpoint beats every held-out agent, and a shorter run must
+show its score against them improving over its waves.
+
+Behaviour cloning starts from the hosted leaderboard rather than a chosen
+teacher. `scripts/extract_replay_dataset.py` replays each daily episode dump
+(`kaggle/kaggriculture-episodes-YYYY-MM-DD`) between two agents rated at least
+2600 through the local engine, admits an episode only when both hosted rewards
+reproduce exactly, and archives each seat as live extraction would. About 4% of
+seats hold a move the factored action space cannot represent (picking up a
+product already held, for one) and are skipped and counted. Episodes on
+evaluation map seeds are dropped. The corpus outgrows host memory, so
+`train_bc.py --shard-seats N` stages the training split N seats at a time from
+the encoded cache (`--warm-cache-only` fills it ahead of the GPU job).
 
 Cross-attention RoPE uses unit `(column, row)` coordinates and each farm's local
 board grid; farm ownership remains in the encoded features, not an invented
@@ -1014,13 +1066,68 @@ the shaping potential's input -- and `liquidation_margin`, its float64 signed
 liquidation is its money alone; the centralized critic reads the opponent's own
 `held_value` as the private `opponent_held_value` column.
 
-v3 through v6 coexist: both tokenizers always emit the v6 layout, and each
-model's `observation_schema_version` selects the product-, farm- and town-token
-prefixes its embedder reads (and a critic's private product prefix), so v3, v4
-and v5 artifacts load and act unchanged. Fresh LeJEPA
-model configs, production's, default to v4; `entity-attention` and the other
+Schema v7 forecasts each product's market to the end of the game. Supply is
+what the public tiles will yield under nominal care (`market_outlook`): every
+plant watered and every animal fed daily, each harvested as soon as its yield
+stops growing, with no fertilizer or care beyond what the tiles already hold.
+Several units can share a tile, so a harvest may follow the same step's
+watering. A harvest counts only if it can still sell: carried from its tile to
+the shed (one tile a step, or the end-of-day drop) by the last acting step.
+The tests check these yields against the official engine playing that care;
+the model does not play the units' routes, and the engine rules it mirrors
+(`constants.py`, and `GameConfig::default()` in Rust, which the native
+extension always builds) are cited where they are used. Demand is the town's
+draw: the open shop instances and the town center selling on their intervals,
+plus each instance still to open counted as every shop with equal chance, and
+for WHEAT also the feed both farms' animals eat each remaining day. Each
+product token appends, in order:
+
+| Column | Definition | Scale |
+| --- | --- | --- |
+| `forecast_price` | The price curve read at the inventory left once this seat sells what it holds and both farms sell their supply to the end (sales at the $1 floor add no inventory), while the town draws its expected demand (rounded half up to a unit) | / (2 * base price), like `price` |
+| `supply_soon`, `supply_to_end` | Units this farm's tiles yield in the next 48 steps, and before the game ends | / shed capacity (100) |
+| `opponent_supply_soon`, `opponent_supply_to_end` | The same for the other farm, whose tiles are public | / shed capacity |
+| `town_draw_soon`, `town_draw_to_end` | Units the town is expected to take over the same windows | / shed capacity |
+
+The opponent's holdings are private, so the centralized critic reads the
+opponent's own forecast as `opponent_forecast_price`.
+
+Schema v8 prices starting one more of each crop or animal now. A crop sown, or
+an animal placed, this step yields what the same nominal-care model gives a
+fresh tile (the engine's `_new_plant` or `_new_animal`) before the game ends,
+except that a crop still growing on the last acting day is harvested then with
+what it holds, and a crop is watered on the step it is sown, as a second unit
+on its tile can; an animal also gives one FERTILIZER a day. The tile is taken
+to be beside the shed, so only a harvest too late to sell at all is left out.
+The cost is the seed, or the animal plus the fewest WHEAT that keep it from
+escaping until the last acting day: one every other day, since the engine's
+daily refresh produces whether or not the animal was fed, and a fresh animal
+has no care bonus for feeding to spend. Each crop and animal token appends, in
+order:
+
+| Column | Definition | Scale |
+| --- | --- | --- |
+| `payback` | log1p(yield value / cost), every unit and each feed's WHEAT at the current market price | unscaled: 0 once nothing more can be harvested, log 2 at breakeven |
+| `forecast_payback` | The same at this seat's `forecast_price`s | unscaled |
+
+The tests check the yields and feeding against the official engine playing
+that care from starts across the game. `forecast_payback` has no critic
+column: the opponent's differs only through its forecast prices, which the
+critic reads as `opponent_forecast_price`.
+
+v3 through v8 coexist: both tokenizers always emit the v8 layout, and each
+model's `observation_schema_version` selects the product-, animal-, crop-,
+farm- and town-token prefixes its embedder reads (and a critic's private
+product prefix), so v3 through v7 artifacts load and act unchanged. Fresh LeJEPA
+model configs, production's, default to v8; `entity-attention` and the other
 structured families continue to default to v3. Override a fresh run with
 `--observation-schema-version` when making an explicit schema comparison.
+A PPO warm start (`--init-actor-from`) may also upgrade an older-schema artifact to
+the run's newer schema: every schema only appends columns, so the economy
+embedders copy the artifact's projection weights into its columns and give the
+new ones zero weight (`schema_upgraded_state`). The upgraded actor ignores the new
+columns exactly and acts as the artifact did, its logits differing only by the
+float rounding of each widened projection's GEMM; the critic starts fresh anyway.
 
 Python action helpers and inference use the default shed capacity of100.
 `CheckpointAgent.__call__(observation, configuration)` and the generated submission
