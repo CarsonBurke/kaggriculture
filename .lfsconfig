@@ -1,0 +1,3 @@
+[lfs]
+	# The TensorBoard logs are large and optional; fetch them on request.
+	fetchexclude = results/tensorboard/**
