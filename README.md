@@ -31,8 +31,7 @@ leaderboard replays ──► behavior cloning ──► self-play PPO ──►
   navigation. Each market slot chooses an order kind, then a quantity, checked
   against a resource ledger that updates after every order.
 - **LeJEPA world model.** An action-conditioned latent-prediction objective,
-  regularized with SIGReg, trains the shared backbone alongside the policy. The
-  submitted agent keeps that backbone. Only the projector and predictor heads,
+  regularized with SIGReg, trains the shared backbone alongside the policy. The projector and predictor heads,
   which exist just to compute the training loss, are left out.
 - **Centralized critic.** The critic reads a detached copy of the shared belief
   plus the opponent's private state, and predicts win, draw, or loss.
