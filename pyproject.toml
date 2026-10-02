@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "kaggriculture-agent"
 version = "0.1.0"
 description = "Research and evaluation tooling for the Kaggriculture simulation competition"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "kaggle-environments==1.32.7",

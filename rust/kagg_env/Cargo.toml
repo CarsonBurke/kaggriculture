@@ -2,6 +2,7 @@
 name = "kagg_env"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [lib]
 name = "_kagg_env"
