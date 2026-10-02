@@ -212,78 +212,25 @@ also accept the path to any agent file as an opponent.
 
 ## Usage
 
-Each entry point documents its options in `--help`. The model and PPO defaults
-live in `src/kaggriculture/production.py`. The commands below follow the recipe
-behind the final submissions. [`results/`](results/README.md) shows where
-those runs departed from the current defaults.
-
-**1. Build a demonstration corpus** from Kaggle's daily leaderboard episode
-datasets (`kaggle/kaggriculture-episodes-YYYY-MM-DD`). Each episode is replayed
-through the official engine, and kept only if both players' final balances
-reproduce exactly:
+The basic pipeline is: extract a replay corpus from Kaggle's daily episode
+datasets (`kaggle/kaggriculture-episodes-YYYY-MM-DD`), behavior-clone, train
+with PPO, then evaluate against the public v27 agent:
 
 ```bash
 uv run python scripts/extract_replay_dataset.py \
   --archives data/episodes/*.zip --key-start 0 --output-dir data/bc/replays
-```
-
-**2. Behavior-clone the production actor.** `--production-model` fixes the
-architecture, but the training schedule is set separately. The submitted clone
-used the following schedule:
-
-```bash
 uv run python scripts/train_bc.py --production-model \
-  --dataset data/bc/replays --output runs/bc \
-  --epochs 16 --holdout-seeds 16 --run-length 2 --shard-seats 1000
-```
-
-**3. Train with PPO**, starting from the cloned actor. Training stops after
-`--iterations` (default 500) or `--max-hours`. To resume, rerun with the same
-`--run-dir`; training continues from its latest checkpoint. The default league
-plays the five league reference agents, so install them first.
-
-```bash
+  --dataset data/bc/replays --output runs/bc --epochs 16
 uv run python scripts/launch_production.py \
   --init-actor-from runs/bc/bc-actor.pt --run-dir runs/ppo --max-hours 10
+uv run python scripts/evaluate_checkpoint.py --artifact runs/ppo/latest.pt
 ```
 
-For full control over every training option, use `scripts/train_ppo.py`.
-`scripts/launch_calibrated_training.py` takes matched eager, mixed, and
-compiled benchmark reports, chooses the compile mode from them, and records
-that decision in the run's provenance.
-
-**4. Select and evaluate.** First, score every checkpoint in a run on one seed
-panel and keep the best. Then evaluate that checkpoint on finalist seeds that
-were not used for selection. Run this evaluation twice. The first run uses the
-default opponent, the public v27 agent, which the submission builder requires.
-The second uses the engine's `starter` agent:
-
-```bash
-uv run python scripts/select_checkpoint.py --run-dir runs/ppo \
-  --output evaluations/screen.json --best-output runs/ppo/best.pt
-uv run python scripts/evaluate_checkpoint.py --artifact runs/ppo/best.pt \
-  --seed-domain finalist --selection-report evaluations/screen.json \
-  --output evaluations/finalist.json
-uv run python scripts/evaluate_checkpoint.py --artifact runs/ppo/best.pt \
-  --opponent starter --seed-domain finalist --selection-report evaluations/screen.json \
-  --output evaluations/starter.json
-```
-
-**5. Package and validate a submission.** The builder will not package a
-checkpoint unless its provenance and evaluation evidence match. The checkpoint
-must also score at least 0.5 against v27 and 0.9 against `starter`. The validator
-then plays the exact archive in full-length games on the official engine:
-
-```bash
-uv run python scripts/build_submission.py --checkpoint runs/ppo/best.pt \
-  --evaluation-report evaluations/finalist.json \
-  --builtin-evaluation-report evaluations/starter.json \
-  --output artifacts/submission.tar.gz
-uv run python scripts/validate_submission.py --archive artifacts/submission.tar.gz
-```
-
-Training metrics are written to TensorBoard and to `metrics.jsonl` in each run
-directory.
+Rerunning PPO with the same `--run-dir` resumes it. Metrics go to TensorBoard
+and `metrics.jsonl` in the run directory. Defaults live in
+`src/kaggriculture/production.py`, and every script documents its options in
+`--help`. `scripts/build_submission.py` and `scripts/validate_submission.py`
+package and check a submission.
 
 ## Documentation
 
