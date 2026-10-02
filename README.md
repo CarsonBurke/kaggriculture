@@ -1,16 +1,17 @@
 # Kaggriculture
 
 My solution for the 
-[Kaggriculture](https://www.kaggle.com/competitions/kaggriculture) competition,
-along with the simulator, training, and evaluation tooling used to build it.
-The final submissions placed 12th of 10,246 teams on the public leaderboard.
+[Kaggriculture](https://www.kaggle.com/competitions/kaggriculture) competition.
+The final submissions placed ~10th of 10,246 teams on the public leaderboard.
 
-Kaggriculture is a two-player farming economy. Each player runs a 10×10 farm
-for 30 in-game days (719 turns). Players plant and harvest crops, raise animals,
-hire hands, buy land, and trade on a shared market where prices respond to both
-players' sales. Whoever ends with more money in the bank wins. The rules, as
-implemented by the pinned `kaggle-environments==1.32.7`, are written up in
-[`docs/mechanics/`](docs/mechanics/overview.md).
+I trained an ~947k parameter actor for about 10 hours on an RTX 5090. Behavioural Cloning on leaderboard data from Sept. 27/28 and then a PPO self play league.
+
+Highlights:
+- About 2 hours before submission I recognized it was buying 3/4 land plots every game, so I gave it an entropy bonus. It seemed to improve its movement and trading Δ. but did not fix its collapsed strategy in time.
+- I should have pretrained my critic on either the leaderboard data I cloned or my BC'd actor, and then it probably wouldn't have suffered from said strategy collapse.
+- An ~800k parameter [lejepa](https://arxiv.org/html/2511.08544v3) backbone improved learning speed a lot, and made it easier to share parameters between the actor and critic without worrying about gradient conflict.
+- A good league is incredibly important. You want only the toughest opponents, but that is a dynamic class, so I did screening of old versions with high posterior σ.
+- Win/Draw/Loss CE critic seems to perform better than any soft reward based on bank-margin, or dense rewards on asset liquidity (which I figured might work as a proxy for final bank).
 
 ## Approach
 
