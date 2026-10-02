@@ -15,7 +15,9 @@ implemented by the pinned `kaggle-environments==1.32.7`, are written up in
 ## Approach
 
 <img width="2754" height="1906" alt="image" src="https://github.com/user-attachments/assets/1662c281-2652-4c4c-89dd-6599a25dd252" />
+
 *My final run before submission, in tensorboard. See results/*
+
 
 ```text
 leaderboard replays ──► behavior cloning ──► self-play PPO ──► evaluation ──► submission
