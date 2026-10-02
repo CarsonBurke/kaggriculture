@@ -27,3 +27,6 @@ evaluations/
 .cargo-target/
 # Historical run archives
 runs_old/
+
+# Local Claude Code settings
+.claude/
