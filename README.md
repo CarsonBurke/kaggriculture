@@ -21,10 +21,10 @@ Highlights:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/league-3379-dark.png">
-  <img alt="Iteration 3379's league score against 239 archived snapshots: 89% against iterations 0 to 999, falling to about 50% against the last few hundred iterations" src="results/league-3379-light.png">
+  <img alt="Each archived snapshot's win rate against the final submission, rising from about 15% for the earliest snapshots to about 50% for the last 100 iterations" src="results/league-3379-light.png">
 </picture>
 
-*The final submission against every archived predecessor in its league. See
+*How often each archived predecessor beats the final submission. See
 [`results/`](results/README.md#against-its-predecessors).*
 
 ```mermaid

@@ -19,21 +19,22 @@ leaderboard (snapshot of 2026-10-02 UTC).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="league-3379-dark.png">
-  <img alt="Iteration 3379's league score against 239 archived snapshots: 89% against iterations 0 to 999, falling to about 50% against snapshots from the last few hundred iterations" src="league-3379-light.png">
+  <img alt="Each archived snapshot's win rate against iteration 3379: about 15% for the earliest snapshots, 28% pooled over snapshots more than 1,000 iterations older, rising to about 50% for the last 100 iterations" src="league-3379-light.png">
 </picture>
 
-Iteration 3379 beats early snapshots almost every time. Against the first
-1,000 iterations it scores 89%. Its edge shrinks toward even against recent
-snapshots: 55% against the start of the resumed run and 49% against the last
-80 iterations. That is expected, since nearby snapshots play almost the same
-policy.
+Each bar is one archived snapshot's win rate against iteration 3379, counting
+a draw as half a win. Snapshots more than 1,000 iterations older win 28% of
+the time. The earliest ones win about 15%. Snapshots from the last 100
+iterations win 51%, which is expected because they play almost the same
+policy. The bars run in archive order, and the archive's spacing doubles with
+age, so the x-axis is roughly logarithmic.
 
 The data is the league's own matchup record, stored in the checkpoint. Each
 snapshot's record is a decayed tally of its most recent games against the
 learner, all played within 44 iterations of 3379 at temperature 1. A single
-snapshot's record is often only five to eight games, so each dot is shrunk
-toward 50% by the selector's Beta(1, 1) prior. The pooled bars carry the
-signal. The underlying numbers are in [`league-3379.json`](league-3379.json),
+record is often only five to eight games, so each bar is shrunk toward 50% by
+the selector's Beta(1, 1) prior. The line pools neighbouring snapshots and
+carries the signal. The numbers are in [`league-3379.json`](league-3379.json),
 and [`scripts/plot_league_evidence.py`](../scripts/plot_league_evidence.py)
 regenerates both from a checkpoint.
 
