@@ -7,6 +7,9 @@
 //!
 //! Regenerate with `--check` in the test gate so this cannot drift from the
 //! agent file it mirrors.
+//!
+//! The table is derived from a public Kaggle notebook by kaitofukami, used
+//! under the Apache License 2.0; see THIRD_PARTY_NOTICES.md.
 
 use crate::core::{MAX_MARKET_ORDERS, MAX_UNITS};
 
