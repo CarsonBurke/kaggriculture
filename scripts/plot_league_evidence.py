@@ -40,7 +40,7 @@ THEMES = {
         "text": "#f0f6fc",
         "muted": "#9198a1",
         "grid": "#262c36",
-        "series": "#3987e5",
+        "series": "#9ec5f4",
         "snapshot": "#1c5cab",
         "band": "#161b22",
     },
@@ -57,17 +57,10 @@ def parse_args() -> argparse.Namespace:
         help="path prefix; writes <prefix>.json, <prefix>-light.png and <prefix>-dark.png",
     )
     parser.add_argument(
-        "--eras",
+        "--window",
         type=int,
-        nargs="+",
-        default=[0, 1000, 2000, 2536, 3000, 3200, 3300],
-        help="left edges of the pooled eras, in training iterations",
-    )
-    parser.add_argument(
-        "--run-boundary",
-        type=int,
-        default=2536,
-        help="first iteration of the resumed run, shaded on the chart; 0 disables it",
+        default=8,
+        help="snapshots on each side pooled into the trend line",
     )
     return parser.parse_args()
 
@@ -88,66 +81,87 @@ def beta_summary(score: float, games: float) -> tuple[float, float, float]:
     return a / (a + b), beta_dist.ppf(0.05, a, b), beta_dist.ppf(0.95, a, b)
 
 
-def plot(data: dict, eras: list[int], run_boundary: int, output: Path) -> list[dict]:
+def opponent_score(score: np.ndarray, games: np.ndarray, members: np.ndarray) -> dict:
+    """The snapshots' pooled score against the learner, from the learner's record."""
+    mean, low, high = beta_summary(score[members].sum(), games[members].sum())
+    return {
+        "snapshots": int(members.sum()),
+        "games": float(games[members].sum()),
+        "score": 1.0 - mean,
+        "low": 1.0 - high,
+        "high": 1.0 - low,
+    }
+
+
+def plot(data: dict, window: int, output: Path) -> dict:
     learner = data["learner_iteration"]
     rows = data["evidence"]
-    x = np.array([row["snapshot"] for row in rows])
+    iteration = np.array([row["snapshot"] for row in rows])
     score = np.array([row["score_sum"] for row in rows])
     games = np.array([row["games"] for row in rows])
-    single = (1.0 + score) / (2.0 + games)
+    single = 1.0 - (1.0 + score) / (2.0 + games)
+    index = np.arange(len(rows))
 
-    pooled = []
-    for left, right in zip(eras, [*eras[1:], learner], strict=True):
-        members = (x >= left) & (x < right)
-        mean, low, high = beta_summary(score[members].sum(), games[members].sum())
-        pooled.append(
-            {
-                "from": left,
-                "to": right,
-                "snapshots": int(members.sum()),
-                "games": float(games[members].sum()),
-                "score": mean,
-                "low": low,
-                "high": high,
-            }
-        )
+    # The archive keeps spacing that doubles with age, so plotting snapshots in
+    # order puts recent ones at full resolution and old ones roughly log-spaced.
+    trend = [
+        {
+            "snapshot": int(iteration[position]),
+            **opponent_score(score, games, np.abs(index - position) <= window),
+        }
+        for position in index
+    ]
+    old = opponent_score(score, games, iteration < learner - 1000)
+    recent = opponent_score(score, games, iteration >= learner - 100)
 
     for mode, theme in THEMES.items():
         plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11})
-        fig, ax = plt.subplots(figsize=(10, 4.6), dpi=200)
+        fig, ax = plt.subplots(figsize=(10, 4.8), dpi=200)
         fig.patch.set_facecolor(theme["surface"])
         ax.set_facecolor(theme["surface"])
 
-        if run_boundary:
-            ax.axvspan(run_boundary - 0.5, learner, color=theme["band"], zorder=0, lw=0)
-            ax.text(run_boundary + 10, 0.32, "resumed run", color=theme["muted"], fontsize=9)
-            ax.text(15, 0.32, "first run", color=theme["muted"], fontsize=9)
-        ax.axhline(0.5, color=theme["muted"], lw=1, ls=(0, (4, 3)), zorder=1)
+        ax.bar(index, single, width=0.8, color=theme["snapshot"], linewidth=0, zorder=2)
+        ax.fill_between(
+            index,
+            [point["low"] for point in trend],
+            [point["high"] for point in trend],
+            color=theme["series"],
+            alpha=0.12,
+            lw=0,
+            zorder=3,
+        )
+        ax.plot(index, [point["score"] for point in trend], color=theme["series"], lw=2, zorder=4)
+        ax.axhline(0.5, color=theme["muted"], lw=1, ls=(0, (4, 3)), zorder=5)
 
-        ax.scatter(x, single, s=10, color=theme["snapshot"], linewidth=0, zorder=2)
-        for era in pooled:
-            span = [era["from"], era["to"]]
-            ax.fill_between(
-                span, era["low"], era["high"], color=theme["series"], alpha=0.18, lw=0, zorder=3
-            )
-            ax.hlines(era["score"], *span, color=theme["series"], lw=2.5, zorder=4)
+        older = iteration < learner - 1000
+        newer = iteration >= learner - 100
+        for members, pooled, label, align in (
+            (older, old, "snapshots over 1,000 iterations older", "left"),
+            (newer, recent, "the last 100 iterations", "right"),
+        ):
+            span = index[members]
+            ax.hlines(0.635, span.min(), span.max(), color=theme["text"], lw=1)
             ax.text(
-                sum(span) / 2,
-                era["high"] + 0.015,
-                f"{era['score']:.0%}",
+                span.min() if align == "left" else span.max(),
+                0.65,
+                f"{pooled['score']:.0%} for {label}",
+                ha=align,
                 color=theme["text"],
-                fontsize=9,
-                ha="center",
-                va="bottom",
-                zorder=5,
+                fontsize=10,
+                fontweight="bold",
             )
 
-        ax.set_xlim(-40, learner + 40)
-        ax.set_ylim(0.3, 1.0)
-        ticks = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        ax.set_yticks(ticks, [f"{tick:.0%}" for tick in ticks])
-        ax.set_xlabel("Opponent snapshot (training iteration)", color=theme["muted"])
-        ax.set_ylabel(f"Iteration {learner}'s score", color=theme["muted"])
+        labelled = [0, 2500, 3000, 3200, 3300, 3350, learner]
+        positions = [int(np.argmin(np.abs(iteration - target))) for target in labelled]
+        ax.set_xticks(positions, [f"{iteration[position]:,}" for position in positions])
+        ax.set_xlim(-1, len(rows))
+        ax.set_ylim(0, 0.7)
+        yticks = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        ax.set_yticks(yticks, [f"{tick:.0%}" for tick in yticks])
+        ax.set_xlabel(
+            "Predecessor snapshot (training iteration, archive order)", color=theme["muted"]
+        )
+        ax.set_ylabel(f"Win rate against {learner}", color=theme["muted"])
         ax.grid(axis="y", color=theme["grid"], lw=0.8)
         ax.set_axisbelow(True)
         for side in ("top", "right", "left"):
@@ -156,7 +170,7 @@ def plot(data: dict, eras: list[int], run_boundary: int, output: Path) -> list[d
         ax.tick_params(colors=theme["muted"], length=0)
 
         fig.suptitle(
-            f"Iteration {learner} against its {len(x)} archived predecessors",
+            f"How often each predecessor beats the final policy (iteration {learner})",
             x=0.065,
             ha="left",
             color=theme["text"],
@@ -164,29 +178,30 @@ def plot(data: dict, eras: list[int], run_boundary: int, output: Path) -> list[d
             fontweight="bold",
         )
         ax.set_title(
-            "Score counts a draw as ½. Bars pool each era with a 90% interval; "
-            "dots are single snapshots.",
+            "A draw counts as half a win. Each bar is one of the 239 archived snapshots; "
+            "the line pools neighbours with a 90% interval.",
             loc="left",
             color=theme["muted"],
-            fontsize=10,
+            fontsize=9.5,
             pad=8,
         )
         fig.tight_layout()
         fig.savefig(f"{output}-{mode}.png", facecolor=theme["surface"])
         plt.close(fig)
-    return pooled
+    return {"older_than_1000": old, "last_100": recent, "trend": trend}
 
 
 def main() -> None:
     args = parse_args()
     data = load_evidence(args.checkpoint)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    pooled = plot(data, args.eras, args.run_boundary, args.output)
-    Path(f"{args.output}.json").write_text(json.dumps({**data, "eras": pooled}, indent=1) + "\n")
-    for era in pooled:
+    summary = plot(data, args.window, args.output)
+    Path(f"{args.output}.json").write_text(json.dumps({**data, **summary}, indent=1) + "\n")
+    for name in ("older_than_1000", "last_100"):
+        pooled = summary[name]
         print(
-            f"{era['from']:>5}-{era['to']:<5} {era['snapshots']:>3} snapshots "
-            f"{era['score']:.1%} [{era['low']:.1%}, {era['high']:.1%}]"
+            f"{name}: {pooled['snapshots']} snapshots {pooled['score']:.1%} "
+            f"[{pooled['low']:.1%}, {pooled['high']:.1%}]"
         )
 
 
