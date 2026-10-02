@@ -34,7 +34,7 @@ DEFAULT_REDUCED_BUYS = ((241, 2),)
 
 PATCH = """
 
-# --- kraggiculture edit ------------------------------------------------------
+# --- kaggriculture edit ------------------------------------------------------
 # Steps whose market orders this plan is measurably better without, and one where
 # it over-buys. Found by a greedy per-step scan in a bit-exact port of this engine
 # and validated on four independent 256-game sets: 91-96% of games won against the
@@ -117,8 +117,8 @@ def _play(task: tuple[str, str, int, bool]) -> dict[str, Any]:
     from kaggle_environments import make
 
     candidate_path, reference_path, seed, candidate_first = task
-    candidate = _load(Path(candidate_path), "kraggiculture_candidate")
-    reference = _load(Path(reference_path), "kraggiculture_reference")
+    candidate = _load(Path(candidate_path), "kaggriculture_candidate")
+    reference = _load(Path(reference_path), "kaggriculture_reference")
     seats = [candidate.agent, reference.agent]
     if not candidate_first:
         seats.reverse()
@@ -203,13 +203,13 @@ def main() -> int:
     )
     text = patched_source(source, steps, reductions)
 
-    with tempfile.TemporaryDirectory(prefix="kraggiculture-plan-submission-") as name:
+    with tempfile.TemporaryDirectory(prefix="kaggriculture-plan-submission-") as name:
         root = Path(name)
         main_py = root / "main.py"
         main_py.write_text(text, encoding="utf-8")
         # Import once before playing: a syntax error in the patch must fail here
         # rather than as a silent per-step exception the interpreter swallows.
-        _load(main_py, "kraggiculture_patched")
+        _load(main_py, "kaggriculture_patched")
         measurement = verify(
             main_py,
             source,
