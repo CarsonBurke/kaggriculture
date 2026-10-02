@@ -18,10 +18,48 @@ implemented by the pinned `kaggle-environments==1.32.7`, are written up in
 
 *My final run before submission, in tensorboard. See results/*
 
+```mermaid
+flowchart TB
+    replays[("Leaderboard replays<br/>both players rated ≥ 2600")]
+    bc["<b>Behavior cloning</b><br/>actor + LeJEPA objective"]
+    replays -- "keep games the official<br/>engine reproduces exactly" --> bc
 
-```text
-leaderboard replays ──► behavior cloning ──► self-play PPO ──► evaluation ──► submission
+    subgraph ppo["Self-play PPO · one wave per iteration"]
+        direction TB
+        wave["<b>Rollout wave</b><br/>Rust BatchEnv<br/>128 mirror · 64 snapshot<br/>40 reference-agent games"]
+        update["<b>Update</b><br/>WDL critic · PPO actor<br/>LeJEPA objective<br/>critic alone until R² ≥ 0.10"]
+        archive[("Snapshot archive")]
+        selector["<b>Hardness selector</b><br/>lowest learner score<br/>plus stale screening"]
+        wave -- "360 trajectories<br/>terminal reward +1 / 0 / −1" --> update
+        wave -. "match results" .-> selector
+        update -- "snapshot" --> archive
+        archive --> selector
+        selector -- "next wave's<br/>snapshot opponents" --> wave
+    end
+
+    league["5 league reference agents"]
+    bc -- "initialize learner" --> wave
+    league --> wave
+    update --> ckpts[("Checkpoints")]
+    ckpts -.-> panel["<b>External panel</b><br/>diagnostic only"]
+    heldout["5 held-out reference agents"] -.-> panel
+    ckpts --> select["<b>Screen</b> checkpoints<br/>vs v27, screening seeds"]
+    select --> finalist["<b>Finalist gates</b><br/>v27 ≥ 0.5, unseen seeds<br/>starter ≥ 0.9"]
+    finalist --> submit["<b>Package and validate</b><br/>full games on<br/>the official engine"]
+
+    classDef step fill:#ffffff,stroke:#2d3142,color:#2d3142
+    classDef focal fill:#fde7dc,stroke:#eb6c36,stroke-width:2px,color:#2d3142
+    classDef store fill:#eef1f6,stroke:#2d3142,color:#2d3142
+    classDef external fill:#ffffff,stroke:#8a8fa3,stroke-dasharray:4 3,color:#2d3142
+    class bc,wave,selector,select,finalist,submit step
+    class update focal
+    class replays,archive,ckpts store
+    class league,heldout,panel external
 ```
+
+The wave counts are the current defaults. The submitted runs played 168 mirror
+and 64 snapshot games per wave, with no reference agents
+([`results/`](results/README.md)).
 
 - **Exact native simulator.** `rust/kagg_env` reimplements the game in Rust as a
   batched environment that runs games in parallel (Rayon) and is exposed to
@@ -48,6 +86,75 @@ leaderboard replays ──► behavior cloning ──► self-play PPO ──►
   The current defaults also add league lanes against public reference agents,
   played natively. A separate held-out set of reference agents is never trained
   against and is used only for evaluation.
+
+Three objectives share one backbone. Policy and LeJEPA gradients both train it.
+The critic reads its output detached, so fitting the value never moves the
+policy's representation.
+
+```mermaid
+flowchart TB
+    tiles["<b>200 farm tiles</b><br/>both 10×10 farms"]
+    economy["<b>20 economy tokens</b><br/>market · town · farms"]
+    ownunits["<b>16 own-unit slots</b>"]
+    private["<b>Opponent private state</b><br/>seeds · shed · inventories"]
+
+    subgraph backbone["Shared backbone"]
+        direction TB
+        farm["<b>Farm-local transformer</b> ×2<br/>per farm · axial 2D RoPE"]
+        reason["<b>Entity reasoning</b> ×4<br/>16 unit + 10 market states<br/>attend to each other, then<br/>to tile and economy tokens"]
+        farm --> reason
+    end
+    tiles --> farm
+    ownunits --> reason
+    economy -- "memory and<br/>modulation" --> reason
+
+    subgraph actor["Actor"]
+        direction TB
+        readout["Cross-attention readout"]
+        units["<b>Unit heads</b><br/>68 primitives<br/>legality masks · navigation"]
+        market["<b>Market heads</b><br/>order kind → quantity<br/>ledger updated per order"]
+        readout --> units & market
+    end
+
+    subgraph jepa["LeJEPA world model · training only"]
+        direction TB
+        predictor["<b>Predictor</b><br/>projected belief<br/>+ executed action"]
+        target["Projected belief<br/>at the next state"]
+        jepaLoss{{"prediction loss + SIGReg"}}
+        predictor --> jepaLoss
+        target --> jepaLoss
+    end
+
+    subgraph critic["Centralized critic"]
+        direction TB
+        tower["<b>Private tower</b><br/>cross-attends into the belief"]
+        wdl["<b>W/D/L head</b><br/>value = P(win) − P(loss)"]
+        tower --> wdl
+    end
+
+    reason -- "belief: 26 states<br/>+ 220 source tokens" --> readout
+    reason --> predictor
+    reason -. "next state" .-> target
+    reason -. "detached" .-> tower
+    private --> tower
+
+    ppoLoss{{"PPO clipped surrogate"}}
+    units & market -- "log-probabilities" --> ppoLoss
+    wdl -- "advantage =<br/>outcome − value" --> ppoLoss
+    outcome(["Game outcome"]) -- "cross-entropy target" --> wdl
+    outcome --> ppoLoss
+
+    classDef step fill:#ffffff,stroke:#2d3142,color:#2d3142
+    classDef focal fill:#fde7dc,stroke:#eb6c36,stroke-width:2px,color:#2d3142
+    classDef input fill:#eef1f6,stroke:#2d3142,color:#2d3142
+    classDef loss fill:#ffffff,stroke:#2d3142,color:#2d3142
+    classDef trainonly fill:#ffffff,stroke:#8a8fa3,stroke-dasharray:4 3,color:#2d3142
+    class farm,readout,units,market,tower,wdl step
+    class reason focal
+    class tiles,economy,ownunits,private,outcome input
+    class ppoLoss,jepaLoss loss
+    class predictor,target trainonly
+```
 
 [`docs/solution.md`](docs/solution.md) is the full technical reference.
 [`results/`](results/README.md) has the TensorBoard logs and lineage of the
