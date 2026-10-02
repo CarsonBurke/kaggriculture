@@ -1,0 +1,1504 @@
+{
+ "learner_iteration": 3379,
+ "evidence": [
+  {
+   "snapshot": 0,
+   "score_sum": 4.7368057895664775,
+   "games": 4.778862561957676,
+   "last_iteration": 3359
+  },
+  {
+   "snapshot": 128,
+   "score_sum": 4.537527273170207,
+   "games": 4.912238387561565,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 256,
+   "score_sum": 4.678716087784556,
+   "games": 4.718179302661579,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 384,
+   "score_sum": 4.736062538358851,
+   "games": 4.81013863332393,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 512,
+   "score_sum": 4.715542148652936,
+   "games": 4.871335405721263,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 640,
+   "score_sum": 4.263677781429927,
+   "games": 5.21009531089565,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 768,
+   "score_sum": 4.243724893212393,
+   "games": 4.952435782556774,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 896,
+   "score_sum": 4.041693765254163,
+   "games": 5.0785270909594455,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 1024,
+   "score_sum": 4.088928317416769,
+   "games": 5.441640616948716,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 1152,
+   "score_sum": 3.1534121808228543,
+   "games": 5.092825293849104,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 1280,
+   "score_sum": 3.152367741789272,
+   "games": 5.105176591975949,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 1344,
+   "score_sum": 4.714859929928712,
+   "games": 4.9870282887482675,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 1408,
+   "score_sum": 3.9848922757513874,
+   "games": 5.192726747752024,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 1472,
+   "score_sum": 4.168229679361118,
+   "games": 5.124003868579081,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 1536,
+   "score_sum": 3.152233548199365,
+   "games": 5.259185760561721,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 1600,
+   "score_sum": 8.951339863329911,
+   "games": 13.08015228403015,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 1664,
+   "score_sum": 3.0751181453028535,
+   "games": 5.096245630865042,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 1728,
+   "score_sum": 4.852504636679141,
+   "games": 9.27242687093479,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 1792,
+   "score_sum": 2.734229246613307,
+   "games": 5.281722797515104,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 1856,
+   "score_sum": 3.6339883360527487,
+   "games": 5.317342092210126,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 1920,
+   "score_sum": 4.750477440810032,
+   "games": 4.943900219023741,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 1984,
+   "score_sum": 4.498557650446823,
+   "games": 9.412224032376763,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 2048,
+   "score_sum": 9.017259781771505,
+   "games": 12.952353963921588,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 2112,
+   "score_sum": 4.510777824215044,
+   "games": 5.521316611241209,
+   "last_iteration": 3359
+  },
+  {
+   "snapshot": 2176,
+   "score_sum": 5.407638455605168,
+   "games": 9.133443788760314,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 2240,
+   "score_sum": 3.6475323213031747,
+   "games": 5.05047368061511,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 2304,
+   "score_sum": 3.618659855393656,
+   "games": 5.175097040944925,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 2336,
+   "score_sum": 2.8955799759327876,
+   "games": 5.3084147487830045,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 2368,
+   "score_sum": 2.871966915579286,
+   "games": 5.216254569286145,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 2400,
+   "score_sum": 8.12909367786351,
+   "games": 13.103614330470855,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 2432,
+   "score_sum": 4.179059695133607,
+   "games": 6.156614861179246,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 2464,
+   "score_sum": 2.3065879125292974,
+   "games": 5.095632795746115,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 2496,
+   "score_sum": 8.547206162104507,
+   "games": 13.112120385859475,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 2524,
+   "score_sum": 2.789383685017283,
+   "games": 5.619139195603645,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 2528,
+   "score_sum": 4.671188639514329,
+   "games": 5.749022145722664,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 2560,
+   "score_sum": 3.2894721551697375,
+   "games": 5.524350077989952,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 2588,
+   "score_sum": 3.2249516937894125,
+   "games": 6.030945709883541,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 2592,
+   "score_sum": 4.372318825056687,
+   "games": 8.334562665981966,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 2624,
+   "score_sum": 2.829928289065842,
+   "games": 5.182357465813267,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 2656,
+   "score_sum": 4.512871711968343,
+   "games": 5.403470738770732,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 2688,
+   "score_sum": 4.335064255554203,
+   "games": 9.20441525907679,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 2707,
+   "score_sum": 9.506850631320859,
+   "games": 17.096621581379495,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 2720,
+   "score_sum": 4.226355963724915,
+   "games": 5.155804590852169,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 2752,
+   "score_sum": 11.024133791208543,
+   "games": 21.231468334202027,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 2784,
+   "score_sum": 4.380690186151491,
+   "games": 5.924112426569883,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 2816,
+   "score_sum": 2.875078664891416,
+   "games": 5.348905576580915,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 2848,
+   "score_sum": 3.5323335061903847,
+   "games": 5.896216489885165,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 2856,
+   "score_sum": 6.63964099845615,
+   "games": 13.232340119051605,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 2864,
+   "score_sum": 2.7945642802767017,
+   "games": 5.365564508954998,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 2878,
+   "score_sum": 7.299481996082937,
+   "games": 14.541508541962008,
+   "last_iteration": 3348
+  },
+  {
+   "snapshot": 2880,
+   "score_sum": 3.5328968727692116,
+   "games": 5.383690679279951,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 2896,
+   "score_sum": 4.241104996780349,
+   "games": 5.080249769451917,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 2898,
+   "score_sum": 6.538049643456003,
+   "games": 13.993187767179897,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 2904,
+   "score_sum": 2.845890762238687,
+   "games": 5.688600243183564,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 2912,
+   "score_sum": 5.142743989960809,
+   "games": 8.24851959340919,
+   "last_iteration": 3353
+  },
+  {
+   "snapshot": 2928,
+   "score_sum": 3.328500212040071,
+   "games": 5.238893298925409,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 2944,
+   "score_sum": 11.508390371032148,
+   "games": 23.25410859596365,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 2952,
+   "score_sum": 4.4144278134616926,
+   "games": 8.960821608377877,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 2960,
+   "score_sum": 2.9525223978250335,
+   "games": 5.760703588199586,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 2973,
+   "score_sum": 10.856301006031302,
+   "games": 20.833439262267248,
+   "last_iteration": 3349
+  },
+  {
+   "snapshot": 2976,
+   "score_sum": 3.350905464729384,
+   "games": 5.389589051630761,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 2992,
+   "score_sum": 5.168752603146164,
+   "games": 11.052133614452627,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 2995,
+   "score_sum": 7.420127273952286,
+   "games": 12.979135436110809,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 3008,
+   "score_sum": 3.4316982915386047,
+   "games": 5.109166874515644,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3023,
+   "score_sum": 10.976779907356171,
+   "games": 23.41001424648735,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3024,
+   "score_sum": 37.53109063955469,
+   "games": 76.59329073447753,
+   "last_iteration": 3335
+  },
+  {
+   "snapshot": 3040,
+   "score_sum": 9.733694089310205,
+   "games": 16.82925783081933,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3052,
+   "score_sum": 4.7698109657982934,
+   "games": 9.96451985955866,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3056,
+   "score_sum": 22.225163565267945,
+   "games": 49.78532733220511,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3062,
+   "score_sum": 5.560876913795745,
+   "games": 9.66292157870308,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3066,
+   "score_sum": 3.0911330123444007,
+   "games": 5.822693484851554,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3072,
+   "score_sum": 3.2480042319508007,
+   "games": 6.669032813026134,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3076,
+   "score_sum": 4.95545401952295,
+   "games": 8.529147057121694,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3079,
+   "score_sum": 9.976014630382586,
+   "games": 18.239244392278426,
+   "last_iteration": 3347
+  },
+  {
+   "snapshot": 3080,
+   "score_sum": 24.18810173937048,
+   "games": 49.862344526006574,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 3088,
+   "score_sum": 2.8252858336339357,
+   "games": 5.727749136657277,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3096,
+   "score_sum": 2.996732194870231,
+   "games": 5.61356681000281,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 3098,
+   "score_sum": 6.224382011241092,
+   "games": 10.494502129749918,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3104,
+   "score_sum": 4.3719969771809355,
+   "games": 5.745691280665042,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3106,
+   "score_sum": 4.064835543424783,
+   "games": 7.982008907829666,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3109,
+   "score_sum": 3.42976563943626,
+   "games": 6.331432927825915,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3113,
+   "score_sum": 5.507865708081459,
+   "games": 11.204242702291348,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 3114,
+   "score_sum": 3.6962205912718082,
+   "games": 7.123804614376877,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3115,
+   "score_sum": 18.6993216627208,
+   "games": 34.24157663293308,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 3120,
+   "score_sum": 3.6493419810414007,
+   "games": 5.415048983960693,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3122,
+   "score_sum": 3.1889969204528983,
+   "games": 5.9338284583659915,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3127,
+   "score_sum": 8.872886069669747,
+   "games": 19.111706565447957,
+   "last_iteration": 3346
+  },
+  {
+   "snapshot": 3128,
+   "score_sum": 10.12091593273098,
+   "games": 18.573407004724118,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3134,
+   "score_sum": 6.829993957402615,
+   "games": 11.93476748034544,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3136,
+   "score_sum": 4.967761043994434,
+   "games": 7.606179391918498,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 3139,
+   "score_sum": 5.230984117950291,
+   "games": 9.643296569272431,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3140,
+   "score_sum": 15.592467603417555,
+   "games": 34.10117785664464,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3141,
+   "score_sum": 5.172640407707896,
+   "games": 10.36991062357447,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3144,
+   "score_sum": 12.029735533286324,
+   "games": 23.08598732831087,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3146,
+   "score_sum": 7.019108741244178,
+   "games": 14.03971928984025,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3149,
+   "score_sum": 6.995522252453935,
+   "games": 13.69991303481226,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3151,
+   "score_sum": 4.404389467544698,
+   "games": 8.389446815274091,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3152,
+   "score_sum": 5.760504496679602,
+   "games": 9.461354594752219,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3158,
+   "score_sum": 4.204051913365798,
+   "games": 8.20273210360953,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3160,
+   "score_sum": 4.0519911809951665,
+   "games": 5.502055303838338,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3163,
+   "score_sum": 2.970909392246555,
+   "games": 5.987288441842001,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3165,
+   "score_sum": 2.6759083568990722,
+   "games": 5.3518167137981445,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 3168,
+   "score_sum": 3.582384259678677,
+   "games": 5.051018534095288,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 3172,
+   "score_sum": 4.640215058247109,
+   "games": 9.535097941736158,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 3174,
+   "score_sum": 5.876153342584103,
+   "games": 10.082693836762507,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3176,
+   "score_sum": 10.604333893113742,
+   "games": 19.79600374817437,
+   "last_iteration": 3351
+  },
+  {
+   "snapshot": 3184,
+   "score_sum": 4.9373921293798215,
+   "games": 7.939860533461493,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3189,
+   "score_sum": 7.102819575907267,
+   "games": 12.590006214055796,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3192,
+   "score_sum": 6.124990631997057,
+   "games": 9.218974120016993,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3196,
+   "score_sum": 11.253580411730196,
+   "games": 22.248009838220998,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3198,
+   "score_sum": 4.660706023368895,
+   "games": 8.745395947063127,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 3199,
+   "score_sum": 5.0852538753889505,
+   "games": 8.80173905234168,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3200,
+   "score_sum": 3.604364190644893,
+   "games": 5.143316559278804,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 3207,
+   "score_sum": 5.413867628334138,
+   "games": 9.159757555670758,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3208,
+   "score_sum": 4.817269051922931,
+   "games": 6.183559509756809,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3209,
+   "score_sum": 11.440064927687486,
+   "games": 23.50909102393935,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3212,
+   "score_sum": 10.229485521702328,
+   "games": 20.266812637004655,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3213,
+   "score_sum": 10.76394030522457,
+   "games": 21.322200441573234,
+   "last_iteration": 3353
+  },
+  {
+   "snapshot": 3214,
+   "score_sum": 39.087526772734684,
+   "games": 79.90870943376147,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3216,
+   "score_sum": 5.260302078819068,
+   "games": 11.423017412897984,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3218,
+   "score_sum": 8.343579937622478,
+   "games": 16.61574052126973,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3222,
+   "score_sum": 11.845695465748571,
+   "games": 24.772269359419013,
+   "last_iteration": 3350
+  },
+  {
+   "snapshot": 3224,
+   "score_sum": 4.758894408321271,
+   "games": 7.1169945436572455,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3227,
+   "score_sum": 12.985985267489356,
+   "games": 28.00781952955603,
+   "last_iteration": 3343
+  },
+  {
+   "snapshot": 3232,
+   "score_sum": 7.8938536084865945,
+   "games": 15.56083254869866,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3233,
+   "score_sum": 3.939136650341286,
+   "games": 8.016560021509463,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3234,
+   "score_sum": 2.8072529884448856,
+   "games": 5.605434653757444,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3235,
+   "score_sum": 5.407781216235973,
+   "games": 9.92260158492553,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3236,
+   "score_sum": 2.8865959428134893,
+   "games": 5.345678530795336,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3240,
+   "score_sum": 13.290595357879663,
+   "games": 24.542484911101862,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3242,
+   "score_sum": 3.6363756740852957,
+   "games": 7.254170085653233,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3243,
+   "score_sum": 3.080660916293019,
+   "games": 6.327984107599416,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 3248,
+   "score_sum": 3.7568445653997538,
+   "games": 6.475583928526917,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 3250,
+   "score_sum": 8.490247541928667,
+   "games": 17.68555288584544,
+   "last_iteration": 3348
+  },
+  {
+   "snapshot": 3251,
+   "score_sum": 11.527335132434132,
+   "games": 21.75318149705783,
+   "last_iteration": 3344
+  },
+  {
+   "snapshot": 3252,
+   "score_sum": 7.940398325849736,
+   "games": 12.834406574126545,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3253,
+   "score_sum": 12.45296965457479,
+   "games": 26.871585007851024,
+   "last_iteration": 3342
+  },
+  {
+   "snapshot": 3254,
+   "score_sum": 2.7472549455608135,
+   "games": 5.488132367569219,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3256,
+   "score_sum": 7.008091595788913,
+   "games": 13.670281306951933,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3257,
+   "score_sum": 4.722374523258301,
+   "games": 8.516339945450556,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3258,
+   "score_sum": 3.490508695016978,
+   "games": 5.484217605226295,
+   "last_iteration": 3359
+  },
+  {
+   "snapshot": 3259,
+   "score_sum": 17.672128696995742,
+   "games": 33.76191322197455,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 3260,
+   "score_sum": 3.560900505720308,
+   "games": 5.466374495581928,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3263,
+   "score_sum": 6.045798006590017,
+   "games": 12.680964567382128,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 3264,
+   "score_sum": 9.91063690515534,
+   "games": 17.221630004148594,
+   "last_iteration": 3350
+  },
+  {
+   "snapshot": 3266,
+   "score_sum": 7.747990685031696,
+   "games": 15.274119498036344,
+   "last_iteration": 3351
+  },
+  {
+   "snapshot": 3267,
+   "score_sum": 6.7191836314113855,
+   "games": 13.39836726282277,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 3268,
+   "score_sum": 3.861466402918425,
+   "games": 5.462998476283134,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3269,
+   "score_sum": 7.123029526951469,
+   "games": 14.894077247495646,
+   "last_iteration": 3353
+  },
+  {
+   "snapshot": 3272,
+   "score_sum": 2.837233791337742,
+   "games": 5.4145332531217685,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3273,
+   "score_sum": 6.8291075556087755,
+   "games": 13.61821511121755,
+   "last_iteration": 3350
+  },
+  {
+   "snapshot": 3274,
+   "score_sum": 6.304407097929554,
+   "games": 13.463911257853812,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3276,
+   "score_sum": 3.6528896462455855,
+   "games": 5.533671914574626,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 3278,
+   "score_sum": 20.281472436380636,
+   "games": 42.80056232833167,
+   "last_iteration": 3365
+  },
+  {
+   "snapshot": 3279,
+   "score_sum": 9.426879808091238,
+   "games": 16.793301188513503,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3280,
+   "score_sum": 3.2380379956080527,
+   "games": 5.732872562466888,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3281,
+   "score_sum": 10.819116384652016,
+   "games": 20.708985603240823,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3282,
+   "score_sum": 12.261050682522374,
+   "games": 23.267953186084597,
+   "last_iteration": 3352
+  },
+  {
+   "snapshot": 3283,
+   "score_sum": 4.057181313353064,
+   "games": 7.507354215614203,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3284,
+   "score_sum": 2.8788407435045964,
+   "games": 5.499359850383108,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3286,
+   "score_sum": 3.078767804533391,
+   "games": 5.718008493891904,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 3287,
+   "score_sum": 33.21204482090582,
+   "games": 68.56022079014734,
+   "last_iteration": 3336
+  },
+  {
+   "snapshot": 3288,
+   "score_sum": 5.957653783670959,
+   "games": 12.242181800203486,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3289,
+   "score_sum": 4.465175300742305,
+   "games": 9.29133564740684,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3292,
+   "score_sum": 5.200692048378932,
+   "games": 8.551295043695738,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3293,
+   "score_sum": 17.35259215661511,
+   "games": 32.92449845844119,
+   "last_iteration": 3345
+  },
+  {
+   "snapshot": 3294,
+   "score_sum": 14.80602213675549,
+   "games": 30.375641120984387,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 3296,
+   "score_sum": 11.198905470947594,
+   "games": 20.69406725981204,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3300,
+   "score_sum": 4.930548128925495,
+   "games": 7.849194132143306,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 3301,
+   "score_sum": 7.2677791435504,
+   "games": 15.308754906616574,
+   "last_iteration": 3348
+  },
+  {
+   "snapshot": 3302,
+   "score_sum": 19.13845645910908,
+   "games": 36.54243160685978,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3303,
+   "score_sum": 47.29146330131425,
+   "games": 102.95336677950661,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 3304,
+   "score_sum": 7.356424441178126,
+   "games": 12.654788485000903,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3305,
+   "score_sum": 3.0310098757203945,
+   "games": 6.062019751440789,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3306,
+   "score_sum": 5.4090348972866416,
+   "games": 9.072344147031785,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3307,
+   "score_sum": 21.472147171979152,
+   "games": 44.516119937558294,
+   "last_iteration": 3339
+  },
+  {
+   "snapshot": 3308,
+   "score_sum": 48.07907313282322,
+   "games": 111.355531023268,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3310,
+   "score_sum": 5.601309241200744,
+   "games": 9.530156497340624,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 3312,
+   "score_sum": 3.3051633828860862,
+   "games": 5.924819586691066,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 3314,
+   "score_sum": 15.970414886873508,
+   "games": 31.174805254917835,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3315,
+   "score_sum": 35.93228400976983,
+   "games": 75.97132806690563,
+   "last_iteration": 3353
+  },
+  {
+   "snapshot": 3316,
+   "score_sum": 7.06545928589191,
+   "games": 13.004491363527682,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3317,
+   "score_sum": 27.38790170438112,
+   "games": 58.01238083058368,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 3318,
+   "score_sum": 3.9903896782059864,
+   "games": 5.980779356411973,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 3319,
+   "score_sum": 7.195372159351131,
+   "games": 13.366719057408709,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3320,
+   "score_sum": 3.0153911064984547,
+   "games": 5.869979012364578,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3321,
+   "score_sum": 39.47705661154112,
+   "games": 83.37299297115288,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3322,
+   "score_sum": 72.59136826724196,
+   "games": 153.68786539636858,
+   "last_iteration": 3346
+  },
+  {
+   "snapshot": 3323,
+   "score_sum": 6.950581884641867,
+   "games": 13.861163769283733,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 3324,
+   "score_sum": 6.159632134259045,
+   "games": 10.298308942904695,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3325,
+   "score_sum": 11.72308326215529,
+   "games": 22.213733219448464,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3326,
+   "score_sum": 3.318270105918609,
+   "games": 6.636540211837218,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3327,
+   "score_sum": 3.318270105918609,
+   "games": 6.636540211837218,
+   "last_iteration": 3355
+  },
+  {
+   "snapshot": 3328,
+   "score_sum": 6.034927324321482,
+   "games": 12.925599424228793,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3330,
+   "score_sum": 3.9569771759165935,
+   "games": 6.73116348146655,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3332,
+   "score_sum": 3.9569771759165935,
+   "games": 6.73116348146655,
+   "last_iteration": 3359
+  },
+  {
+   "snapshot": 3334,
+   "score_sum": 3.365581740733275,
+   "games": 6.73116348146655,
+   "last_iteration": 3361
+  },
+  {
+   "snapshot": 3335,
+   "score_sum": 25.741170012991997,
+   "games": 52.749786701312,
+   "last_iteration": 3342
+  },
+  {
+   "snapshot": 3336,
+   "score_sum": 3.365581740733275,
+   "games": 6.73116348146655,
+   "last_iteration": 3363
+  },
+  {
+   "snapshot": 3337,
+   "score_sum": 3.365581740733275,
+   "games": 6.73116348146655,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3338,
+   "score_sum": 18.371880479999998,
+   "games": 38.43168128,
+   "last_iteration": 3343
+  },
+  {
+   "snapshot": 3340,
+   "score_sum": 3.4078570557003554,
+   "games": 6.543809407600474,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 3341,
+   "score_sum": 3.8978376323982613,
+   "games": 6.636540211837218,
+   "last_iteration": 3369
+  },
+  {
+   "snapshot": 3342,
+   "score_sum": 13.321437469705732,
+   "games": 26.089867467043273,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3343,
+   "score_sum": 3.8978376323982613,
+   "games": 6.636540211837218,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 3344,
+   "score_sum": 3.318270105918609,
+   "games": 6.636540211837218,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 3345,
+   "score_sum": 22.0613375968,
+   "games": 45.663047654399996,
+   "last_iteration": 3351
+  },
+  {
+   "snapshot": 3346,
+   "score_sum": 7.9399999999999995,
+   "games": 15.84,
+   "last_iteration": 3348
+  },
+  {
+   "snapshot": 3347,
+   "score_sum": 3.839880879750296,
+   "games": 6.543809407600474,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 3348,
+   "score_sum": 7.9399999999999995,
+   "games": 15.84,
+   "last_iteration": 3350
+  },
+  {
+   "snapshot": 3349,
+   "score_sum": 3.365581740733275,
+   "games": 6.73116348146655,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 3350,
+   "score_sum": 3.9569771759165935,
+   "games": 6.73116348146655,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 3351,
+   "score_sum": 52.387147778099035,
+   "games": 115.70599379200293,
+   "last_iteration": 3372
+  },
+  {
+   "snapshot": 3352,
+   "score_sum": 15.373472479999998,
+   "games": 30.591681279999996,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3353,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3354
+  },
+  {
+   "snapshot": 3354,
+   "score_sum": 27.33943660268544,
+   "games": 59.694790967285755,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 3355,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3356
+  },
+  {
+   "snapshot": 3356,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3357
+  },
+  {
+   "snapshot": 3357,
+   "score_sum": 6.0,
+   "games": 8.0,
+   "last_iteration": 3358
+  },
+  {
+   "snapshot": 3358,
+   "score_sum": 5.0,
+   "games": 8.0,
+   "last_iteration": 3359
+  },
+  {
+   "snapshot": 3359,
+   "score_sum": 6.0,
+   "games": 8.0,
+   "last_iteration": 3360
+  },
+  {
+   "snapshot": 3360,
+   "score_sum": 18.94894612319616,
+   "games": 37.55494331288576,
+   "last_iteration": 3368
+  },
+  {
+   "snapshot": 3361,
+   "score_sum": 5.0,
+   "games": 8.0,
+   "last_iteration": 3362
+  },
+  {
+   "snapshot": 3362,
+   "score_sum": 7.96,
+   "games": 15.84,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3363,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3364
+  },
+  {
+   "snapshot": 3364,
+   "score_sum": 7.9399999999999995,
+   "games": 15.84,
+   "last_iteration": 3366
+  },
+  {
+   "snapshot": 3365,
+   "score_sum": 27.251337448895253,
+   "games": 57.64767724498124,
+   "last_iteration": 3375
+  },
+  {
+   "snapshot": 3366,
+   "score_sum": 7.0,
+   "games": 8.0,
+   "last_iteration": 3367
+  },
+  {
+   "snapshot": 3367,
+   "score_sum": 10.8012,
+   "games": 23.5232,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3368,
+   "score_sum": 29.845229757380373,
+   "games": 73.17087724498124,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3369,
+   "score_sum": 5.0,
+   "games": 8.0,
+   "last_iteration": 3370
+  },
+  {
+   "snapshot": 3370,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3371
+  },
+  {
+   "snapshot": 3371,
+   "score_sum": 7.9399999999999995,
+   "games": 15.84,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3372,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3373
+  },
+  {
+   "snapshot": 3373,
+   "score_sum": 7.0,
+   "games": 8.0,
+   "last_iteration": 3374
+  },
+  {
+   "snapshot": 3374,
+   "score_sum": 6.96,
+   "games": 15.84,
+   "last_iteration": 3376
+  },
+  {
+   "snapshot": 3375,
+   "score_sum": 8.860800000000001,
+   "games": 23.5232,
+   "last_iteration": 3378
+  },
+  {
+   "snapshot": 3376,
+   "score_sum": 4.0,
+   "games": 8.0,
+   "last_iteration": 3377
+  },
+  {
+   "snapshot": 3377,
+   "score_sum": 5.0,
+   "games": 8.0,
+   "last_iteration": 3378
+  }
+ ],
+ "eras": [
+  {
+   "from": 0,
+   "to": 1000,
+   "snapshots": 8,
+   "games": 39.33181247563788,
+   "score": 0.8940752428703936,
+   "low": 0.8067288375590728,
+   "high": 0.9596830808174456
+  },
+  {
+   "from": 1000,
+   "to": 2000,
+   "snapshots": 14,
+   "games": 88.60660109537059,
+   "score": 0.661222673273475,
+   "low": 0.5778381323697526,
+   "high": 0.7405381123199657
+  },
+  {
+   "from": 2000,
+   "to": 2536,
+   "snapshots": 13,
+   "games": 97.19349811813429,
+   "score": 0.6410897499171617,
+   "low": 0.5606179297367164,
+   "high": 0.7183102007435086
+  },
+  {
+   "from": 2536,
+   "to": 3000,
+   "snapshots": 28,
+   "games": 265.335716595387,
+   "score": 0.5504103687687716,
+   "low": 0.5002325792285462,
+   "high": 0.6001584888172989
+  },
+  {
+   "from": 3000,
+   "to": 3200,
+   "snapshots": 49,
+   "games": 705.3599721986434,
+   "score": 0.5232274673221083,
+   "low": 0.49231948838940615,
+   "high": 0.5540607164738185
+  },
+  {
+   "from": 3200,
+   "to": 3300,
+   "snapshots": 56,
+   "games": 921.6427299501423,
+   "score": 0.5144071866996115,
+   "low": 0.4873520926045723,
+   "high": 0.5414267888113684
+  },
+  {
+   "from": 3300,
+   "to": 3379,
+   "snapshots": 71,
+   "games": 1754.2848847085097,
+   "score": 0.48892475060619967,
+   "low": 0.4693169514528038,
+   "high": 0.5085468945275877
+  }
+ ]
+}
