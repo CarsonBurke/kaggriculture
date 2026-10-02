@@ -20,8 +20,8 @@ Highlights:
 *My final run before submission, in tensorboard. See results/*
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/league-3379-dark.png">
-  <img alt="Each archived snapshot's win rate against the final submission, rising from about 15% for the earliest snapshots to about 50% for the last 100 iterations" src="results/league-3379-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="results/predecessor-win-rate-dark.png">
+  <img alt="Each archived snapshot's win rate against the final submission, rising from about 15% for the earliest snapshots to about 50% for the last 100 iterations" src="results/predecessor-win-rate-light.png">
 </picture>
 
 *How often each archived predecessor beats the final submission. See

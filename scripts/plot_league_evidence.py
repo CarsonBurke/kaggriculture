@@ -8,7 +8,7 @@ decayed record is often only five to eight games.
 
     uv run --extra train --with matplotlib --with scipy \\
         python scripts/plot_league_evidence.py --checkpoint runs/ppo/latest.pt \\
-        --output results/league-3379
+        --output results/predecessor-win-rate
 """
 
 from __future__ import annotations

@@ -18,8 +18,8 @@ leaderboard (snapshot of 2026-10-02 UTC).
 ## Against its predecessors
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="league-3379-dark.png">
-  <img alt="Each archived snapshot's win rate against iteration 3379: about 15% for the earliest snapshots, 28% pooled over snapshots more than 1,000 iterations older, rising to about 50% for the last 100 iterations" src="league-3379-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="predecessor-win-rate-dark.png">
+  <img alt="Each archived snapshot's win rate against iteration 3379: about 15% for the earliest snapshots, 28% pooled over snapshots more than 1,000 iterations older, rising to about 50% for the last 100 iterations" src="predecessor-win-rate-light.png">
 </picture>
 
 Each bar is one archived snapshot's win rate against iteration 3379, counting
@@ -34,7 +34,7 @@ snapshot's record is a decayed tally of its most recent games against the
 learner, all played within 44 iterations of 3379 at temperature 1. A single
 record is often only five to eight games, so each bar is shrunk toward 50% by
 the selector's Beta(1, 1) prior. The line pools neighbouring snapshots and
-carries the signal. The numbers are in [`league-3379.json`](league-3379.json),
+carries the signal. The numbers are in [`predecessor-win-rate.json`](predecessor-win-rate.json),
 and [`scripts/plot_league_evidence.py`](../scripts/plot_league_evidence.py)
 regenerates both from a checkpoint.
 
