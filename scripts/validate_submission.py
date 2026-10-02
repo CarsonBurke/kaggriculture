@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from kaggriculture.evaluation import artifact_seed_usage, validate_finalist_protocol
+from kaggriculture.opponents import PUBLIC_V27_OPPONENT
 from kaggriculture.provenance import (
     file_sha256,
     validate_inference_equivalence,
@@ -29,7 +30,6 @@ from kaggriculture.provenance import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_submission import PACKAGE_FILES  # noqa: E402
 
-PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
 REQUIRED_MEMBERS = frozenset(
     {"main.py", "model.pt", "evaluation.json", "manifest.json"}
     | {f"kaggriculture/{name}" for name in PACKAGE_FILES}

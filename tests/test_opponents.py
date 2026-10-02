@@ -41,3 +41,21 @@ def test_a_missing_reference_copy_is_reported_not_guessed(reference_dir: Path) -
         opponents.normalize_opponent("kaito-v48")
     with pytest.raises(ValueError, match="NAME=PATH or a reference agent"):
         parse_script_opponent("not-a-reference")
+
+
+def test_agent_dir_precedence(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("KAGGRICULTURE_AGENT_DIR", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    default = tmp_path / "home" / ".local" / "share" / "kaggriculture" / "agents"
+    assert opponents._agent_dir() == default
+
+    monkeypatch.setenv("XDG_DATA_HOME", "relative/data")
+    assert opponents._agent_dir() == default
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert opponents._agent_dir() == tmp_path / "data" / "kaggriculture" / "agents"
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KAGGRICULTURE_AGENT_DIR", "agents")
+    assert opponents._agent_dir() == tmp_path.resolve() / "agents"

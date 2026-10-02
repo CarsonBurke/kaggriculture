@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # Ordered because the batched Rust wave addresses these agents by code
@@ -13,21 +14,41 @@ from pathlib import Path
 # evaluation measures the real opponent and never the port that mirrors it.
 BUILTIN_AGENT_ORDER = ("pass", "random", "starter", "scripted-v27")
 BUILTIN_OPPONENTS = frozenset(BUILTIN_AGENT_ORDER)
-PUBLIC_V27_OPPONENT = Path("/var/tmp/kaggriculture-kaito-v27-main.py")
+
+
+def _agent_dir() -> Path:
+    """Where this machine keeps its copies of other competitors' public agents.
+
+    The files are not ours to redistribute, so they live outside the checkout:
+    a frozen source snapshot must resolve the same copies as the live tree.
+    """
+    configured = os.environ.get("KAGGRICULTURE_AGENT_DIR")
+    if configured:
+        # Resolved now: a runnable reference must be absolute, and workers run
+        # from other directories.
+        return Path(configured).expanduser().resolve()
+    # The XDG spec says a relative XDG_DATA_HOME is invalid and must be ignored.
+    data_home = Path(os.environ.get("XDG_DATA_HOME", ""))
+    if not data_home.is_absolute():
+        data_home = Path.home() / ".local" / "share"
+    return data_home / "kaggriculture" / "agents"
+
+
+AGENT_DIR = _agent_dir()
+PUBLIC_V27_OPPONENT = AGENT_DIR / "kaggriculture-kaito-v27-main.py"
 PUBLIC_V27_ALIASES = frozenset(("v27", "public-v27"))
-PUBLIC_V16_TEACHER = Path("/var/tmp/kaggriculture-boatlee-v16-rc5-main.py")
+PUBLIC_V16_TEACHER = AGENT_DIR / "kaggriculture-boatlee-v16-rc5-main.py"
 PUBLIC_V16_ALIASES = frozenset(("v16", "public-v16"))
 
 # Dynamic reference agents: public Kaggle agents whose play reacts to the state,
-# pinned as machine-local copies like the references above (the files are not
-# ours to commit). An official-engine round robin ranked them
-# (artifacts/probes/teachers-20260930/round-robin.jsonl: fourteen agents, four
-# seeds, both seats); agents that played identically there are one family and
-# appear once, under its first member (flex and cha22 are demand-timing,
-# top-2-master-v4 is demand-preserving). Every one matches the official engine
-# exactly when played natively. Families of near-identical play stay on one
-# side of the split below.
-REFERENCE_AGENT_DIR = Path("/var/tmp/kaggriculture-reference-agents")
+# pinned as machine-local copies like the references above. An official-engine
+# round robin ranked them (artifacts/probes/teachers-20260930/round-robin.jsonl:
+# fourteen agents, four seeds, both seats); agents that played identically there
+# are one family and appear once, under its first member (flex and cha22 are
+# demand-timing, top-2-master-v4 is demand-preserving). Every one matches the
+# official engine exactly when played natively. Families of near-identical play
+# stay on one side of the split below.
+REFERENCE_AGENT_DIR = AGENT_DIR / "reference"
 REFERENCE_AGENTS = (
     "demand-preserving",
     "demand-timing",
