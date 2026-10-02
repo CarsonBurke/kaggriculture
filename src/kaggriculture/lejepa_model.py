@@ -138,7 +138,7 @@ class LejepaConfig(EntityConfig):
     # Every quantity choice a market kind admits (interface 2), and the local
     # unit affordance scorer below: the promoted core's configuration, which the
     # WDL clone and every PPO stage behind the default recipe trained
-    # (CORE_MODEL_20260926.md; artifacts/probes/ppo-stage2-20260927). Saved
+    # (docs/experiments/core-model-2026-09-26.md; artifacts/probes/ppo-stage2-20260927). Saved
     # artifacts from before either default load as absolute quantities without
     # the scorer (`Architecture.build_config`).
     action_interface: int = 2

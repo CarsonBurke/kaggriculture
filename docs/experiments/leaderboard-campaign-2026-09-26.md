@@ -47,7 +47,7 @@ and are used for the final leaderboard; five submissions per day are allowed.
 No campaign submission had been made at baseline capture.
 
 Immediately before finalist validation, the full downloaded leaderboard listed
-MarvinTMB (team 16714162) at rank 4819/10054, score 810.7. The top score was
+our team at rank 4819/10054, score 810.7. The top score was
 3077.5. The CSV snapshot is retained in `leaderboard-before/kaggriculture.zip`.
 
 The previous action-stack runs use much older v16/v27 opponents. The strongest
@@ -120,12 +120,12 @@ named final entrypoint, checked using the official discovery rule. Failed v1
 variant runs are not performance evidence. Corrected v2 batches hit the worker
 recycling issue above; v3 uses persistent workers.
 
-Private notebook IDs:
+Each of the following ran in its own private Kaggle notebook:
 
-- `marvintmb/kaggriculture-current-agent-tournament-20260926`
-- `marvintmb/kaggriculture-current-replay-panel-20260926`
-- `marvintmb/kaggriculture-market-ablation-20260926`
-- `marvintmb/kaggriculture-v48-ablation-20260926`
+- the current-agent tournament
+- the current replay panel
+- the market ablation
+- the V48 ablation
 
 The current notebook catalog also contains agents published more recently than
 V48/V20. Their source is being reviewed before expanding the benchmark; notebook
@@ -147,7 +147,7 @@ fourth candidate (flexonafft multi-route) duplicates the demand agent after
 line-ending normalization and is excluded. Source hashes were verified against
 the public notebooks' actual output files. The private evaluation notebook
 uses those public outputs as inputs and rejects any source-hash mismatch.
-Its ID is `marvintmb/kaggriculture-frontier-screen-20260926` (192 games).
+It is a separate private Kaggle notebook (192 games).
 The optional idle-seller external library environment variable is unset.
 
 ## Hybrid bookkeeping ablation and frozen finalists
@@ -254,7 +254,7 @@ These are real narrow improvements, not evidence of a competitive replacement
 for the frontier agents. No V20 variant is submitted.
 
 First verified public ladder result: demand submission 56589389 won episode
-113863774, 193,287 vs Mark Holloway's 44,477, with 720 states, environment 1.32.7,
+113863774, 193,287 vs another team's 44,477, with 720 states, environment 1.32.7,
 and no error statuses. Its rating rose from 600 to 668.6. This is an initial
 low-rated match, not evidence of top-ladder strength. The replay is compressed
 under `hosted-review/`; subsequent rating development is still being observed.

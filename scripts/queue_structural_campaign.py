@@ -79,15 +79,16 @@ FAMILIES = {
     "lejepa": ("component-control", "lejepa"),
     "quantity": ("lejepa", "lejepa-quantity-all"),
 }
-#: The LeJEPA objective's shipped weights (README, "LeJEPA world model"). The
-#: family trains its backbone with nothing else, in BC as in PPO, so every job
-#: of a `lejepa` arm carries them; demonstrations hold no reward, so the clone
-#: takes the two transition terms and PPO adds the reward head.
+#: The LeJEPA objective's shipped weights (docs/training-reference.md, "LeJEPA
+#: world model"). The family trains its backbone with nothing else, in BC as in
+#: PPO, so every job of a `lejepa` arm carries them; demonstrations hold no
+#: reward, so the clone takes the two transition terms and PPO adds the reward
+#: head.
 JEPA_COEFFICIENTS = {"prediction": 1.0, "sigreg": 0.09, "reward": 0.1}
 JEPA_HORIZON = 1
 #: PPO's backbone rate for a `lejepa` arm, a tenth of the actor's. The encoder
 #: takes the summed JEPA and policy gradient; at the actor's 1.5e-4 it moves
-#: under both heads every minibatch. At 1.5e-5 (JEPA_RUNS, job 9281) the
+#: under both heads every minibatch. At 1.5e-5 (docs/experiments/jepa-runs.md, job 9281) the
 #: same clone and recipe beat the full-rate run (9275).
 JEPA_BACKBONE_LEARNING_RATE = 1.5e-5
 MAX_JOB_MINUTES = 30

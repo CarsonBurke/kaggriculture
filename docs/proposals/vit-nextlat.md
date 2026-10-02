@@ -10,7 +10,7 @@ Keep the structured VIT as the actor baseline. Improve it along three independen
 
 Do not import diffusion sampling, full MUDD, XSA, FP8, or custom Triton kernels as a bundle. They solve different bottlenecks and would make attribution impossible.
 
-`RUNS.md` is the execution ledger. Every learning change is a champion-versus-challenger regression. Exact systems changes may be adopted after numerical parity and end-to-end timing; learning changes require complete BC and play evidence before PPO promotion.
+`docs/experiments/runs.md` is the execution ledger. Every learning change is a champion-versus-challenger regression. Exact systems changes may be adopted after numerical parity and end-to-end timing; learning changes require complete BC and play evidence before PPO promotion.
 
 ## Current model: what global fusion already does
 
@@ -136,7 +136,7 @@ Train the structured actor to preserve representations that predict both:
 1. what the policy will need to decide at the next step; and
 2. how each 1x1 board patch will evolve under the executed action.
 
-This combines the decision-decode result already measured in `NEXTLAT_AUX_PLAN.md` with the spatial feature-prediction principle demonstrated by V-JEPA and the action-conditioned world-model direction demonstrated by V-JEPA 2-AC.
+This combines the decision-decode result already measured in `docs/proposals/nextlat-aux.md` with the spatial feature-prediction principle demonstrated by V-JEPA and the action-conditioned world-model direction demonstrated by V-JEPA 2-AC.
 
 It remains an auxiliary representation objective. The actor still produces exact one-pass masked categorical policies; no world-model rollout enters deployment unless a later planning experiment explicitly proves useful.
 

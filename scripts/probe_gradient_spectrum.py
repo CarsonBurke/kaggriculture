@@ -175,7 +175,7 @@ NEWTON_SCHULZ_SAFETY = 1.0
 NEWTON_SCHULZ_EPSILON = 1e-7
 
 #: Polar Express (arXiv 2505.16932) as configured in
-#: `/home/marvin/Documents/repositories/modded-nanogpt/train_gpt.py`
+#: modded-nanogpt's `train_gpt.py` (https://github.com/KellerJordan/modded-nanogpt)
 #: (`polar_express_coeffs`, num_iters=5, safety_factor=2e-2, cushion=2), with
 #: that function's pre-scaling. The iteration is reproduced in plain torch
 #: rather than through its fused Triton kernels and distributed machinery; the

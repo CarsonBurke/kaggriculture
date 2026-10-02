@@ -20,20 +20,22 @@ from kaggriculture.rollout import REWARD_MODES
 # The attached LeJEPA world model under its own objective, with the family's
 # default configuration. Its eight-epoch WDL clone already beats V27 97.5% of
 # games at argmax, and it is the model every September 27 PPO stage fine-tuned
-# (CORE_MODEL_20260926.md; artifacts/probes/ppo-ablations-20260927).
+# (docs/experiments/core-model-2026-09-26.md; artifacts/probes/ppo-ablations-20260927).
 PRODUCTION_ARCHITECTURE = LEJEPA
 PRODUCTION_CRITIC_WARMUP_ITERATIONS = 10
 PRODUCTION_CRITIC_WARMUP_MAX_ITERATIONS = 40
 
 # A mirror self-play game contributes two current-policy trajectories; a
-# frozen-league game contributes one. 128 * 2 : 64 is therefore the intended
-# 80% current self-play / 20% past-and-reference-opponent training-data split.
+# frozen-league or reference-agent game contributes one. 128 * 2 : (64 + 40)
+# is therefore about 71% current self-play and 29% past and reference
+# opponents.
 PRODUCTION_SELF_PLAY_GAMES = 128
 PRODUCTION_LEAGUE_GAMES = 64
 PRODUCTION_LEAGUE_SELECTION = "hardness"
 PRODUCTION_LEAGUE_ACTIVE_OPPONENTS = 2
 # Hardness pools the active/historical budget with the admitted built-in
-# budget: twelve distinct opponents, including discovery and stale refresh.
+# budget: with no built-ins, eight distinct opponents, including discovery and
+# stale screening.
 # The explicit stratified ablation uses two active and six log-age slots.
 PRODUCTION_LEAGUE_HISTORICAL_OPPONENTS = 6
 PRODUCTION_LEAGUE_ACTIVE_POOL_SIZE = 16
@@ -216,7 +218,7 @@ def production_ppo_config(
             # Cross-run evidence favors ordinary value fitting: critic NextLat
             # adds little prediction beyond persistence, while the off recipe
             # preserves substantially more deployed strength. See
-            # RUN_COMPARISON_20260918.md for the evidence and confounds. The
+            # docs/experiments/run-comparison-2026-09-18.md for the evidence and confounds. The
             # `lejepa` world-model objective excludes them regardless, and the
             # terms' horizons, inert while they are off, keep `PpoConfig`'s
             # defaults as the measured recipe did.

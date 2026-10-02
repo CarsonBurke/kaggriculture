@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cost and replay parity of a population wave against the mixed wave it replaces.
 
-Stages 0(b) and 0(c) of `POPULATION_LEAGUE_PLAN.md`, measured together because
+Stages 0(b) and 0(c) of `docs/proposals/population-league.md`, measured together because
 they read the same wave.
 
 0(c) is the compute call the plan deliberately left open: cost parity runs

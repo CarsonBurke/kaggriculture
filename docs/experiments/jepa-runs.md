@@ -2,7 +2,7 @@
 
 Working list for the `lejepa` family (shared entity-attention backbone trained
 by the LeJEPA objective and the policy's loss; the critic reads it detached). The
-design itself is described in the README, section "LeJEPA world model".
+design itself is described in [the training reference](../training-reference.md#lejepa-world-model).
 
 ## Market rules moved to kaggle-environments 1.32.7 (2026-09-23)
 
@@ -230,8 +230,8 @@ corpora as 9300/9302. Only `--observation-schema-version 4` changes the model's
 input; the clone output and PPO run directory are separate. Job 9303 uses the
 two-epoch BC budget and a 30-minute queue limit. Job 9304 depends on 9303's
 success, uses the same seed and PPO recipe as 9302, and has a 35-minute trainer
-argument; its running queue limit was reduced from 40 to 30 minutes on user
-direction. Both use normal priority and
+argument; its running queue limit was reduced from 40 to 30 minutes by
+decision. Both use normal priority and
 `maxParallelRuns=1`. The baseline's schedule is unchanged. Compare sampled and
 argmax v27 panels, self-play money and its lower tail, critic fit, and executed
 sales by product before attributing any gain to the margin feature.
@@ -240,7 +240,7 @@ At matched actor wave 25, the margin arm improves panel critic MSE (0.337
 versus 0.497) and self-play money's 10th percentile (~5.8k versus ~1.4k),
 but loses ground against scripted v27: sampled score 0.078 versus 0.188 and
 argmax score 0/64 versus 61/64. Starter sampled score is 0.938 versus 0.906.
-This early result is mixed. On user direction, fresh LeJEPA runs now inherit
+This early result is mixed. By decision, fresh LeJEPA runs now inherit
 schema v4 immediately for its stronger critic and self-play economics; the
 v27 panel regression remains a measured risk to resolve, not a claimed win.
 Existing v3 artifacts still load with their saved schema. Promote later clear
@@ -249,7 +249,7 @@ winners into the next fresh run without waiting for a whole campaign to end.
 At actor wave 50, scripted-v27 scores remain below the matched v3 baseline:
 sampled **0.094 versus 0.250** and argmax **0/64 versus 64/64**. Starter sampled
 is 0.969 versus 0.938. Monitor this opponent result closely even though the
-fresh-run default was promoted by user decision.
+fresh-run default was promoted by explicit decision.
 
 At wave 75, margin critic MSE is **0.211** versus **0.529** for v3; self-play
 money mean is **69.0k** versus **64.0k**, and its 10th percentile is **10.0k**
@@ -276,10 +276,10 @@ pickup-cap use, wheat placement and feeding on the same 64 native self-play
 seeds. Both manifests are under `artifacts/probes/lejepa-{readout2,action-audit}-1327-20260923/`.
 Results are pending shared GPU admission. Each job is bounded by 30 minutes.
 The separate joint-ratio jobs **9321–9323** were cancelled before start after
-the user clarified that action *decoding* is the priority. The readout-depth
+the priority was clarified to be action *decoding*. The readout-depth
 arm remains queued. The dedicated execution-order causal decoder comparison,
 with compiled gates and a flat joint-PPO control, is recorded in
-[RUNS.md](RUNS.md); corrected jobs **9336–9347** are each bounded by 30
+[docs/experiments/runs.md](runs.md); corrected jobs **9336–9347** are each bounded by 30
 minutes. The first submission **9324–9335** was cancelled or skipped before
 starting because its GPU gate omitted the tests' required enable flags.
 

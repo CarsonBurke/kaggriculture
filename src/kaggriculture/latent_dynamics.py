@@ -2,7 +2,7 @@
 
 Transplants the next-latent objective of NextLat (Teoh et al., arXiv 2511.05963;
 reference implementation ``models/model_nextlat.py``) from "position t in a token
-sequence" to "step t in an episode", as NEXTLAT_AUX_PLAN.md argues it must be. A
+sequence" to "step t in an episode", as docs/proposals/nextlat-aux.md argues it must be. A
 small dynamics model p_psi predicts the actor's own next-step belief latent from
 the current one plus the executed joint action, and two terms hold it honest:
 
@@ -103,7 +103,7 @@ class LatentDynamics(nn.Module):
     ) -> Tensor:
         """Embed one executed joint action through the policy's own factors.
 
-        NEXTLAT_AUX_PLAN.md's factorization: the sum of per-unit action
+        docs/proposals/nextlat-aux.md's factorization: the sum of per-unit action
         embeddings plus the sum of per-order kind embeddings gated by the
         embedding of the quantity bin they were filled at, projected to
         model_dim. The sums are over slots, so the joint action is a multiset --

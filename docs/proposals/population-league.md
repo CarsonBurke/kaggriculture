@@ -237,7 +237,7 @@ and the pairwise policy disagreement matrix on a fixed state batch (the
 calibration point for the Stage 3 gate.
 
 *Measured.* Sixteen BC members -- eight seeds of the plain clone and eight of the
-NextLat-KL clone (`NEXTLAT_AUX_PLAN.md`), same corpora, same schedule -- scored on
+NextLat-KL clone (`docs/proposals/nextlat-aux.md`), same corpora, same schedule -- scored on
 one shared batch of 2,048 active unit decisions from a 4-game rollout
 (`artifacts/probes/population-floor.json`):
 

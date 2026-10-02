@@ -1,20 +1,20 @@
 # Structured VIT Regression Campaign
 
-Latest decision: [the cross-run comparison](RUN_COMPARISON_20260918.md) selects
+Latest decision: [the cross-run comparison](run-comparison-2026-09-18.md) selects
 hardness + source-read + NextLat off as the working production recipe. Both actor
 and critic auxiliary coefficients now default to zero. The comparison includes
 fixed-panel gameplay, critic fit, training trajectories and older long runs.
-[Structural architecture ablations](ARCHITECTURE_ABLATIONS_20260918.md) are selected;
+[Structural architecture ablations](architecture-ablations-2026-09-18.md) are selected;
 they are not implemented or queued. Historical pending statuses below describe
 submission time, not current queue state.
 
 The current LeJEPA experiments and the kaggle-environments 1.32.7 rules cutover
-are recorded in [JEPA_RUNS.md](JEPA_RUNS.md). Results produced under 1.32.6
+are recorded in [docs/experiments/jepa-runs.md](jepa-runs.md). Results produced under 1.32.6
 are historical comparisons, not current-rules performance estimates.
 
 ## Purpose
 
-This file is the execution ledger for `VIT_NEXTLAT_PROPOSAL.md`. The campaign improves the structured actor without losing attribution and then applies structured NextLat to the best architecture.
+This file is the execution ledger for `docs/proposals/vit-nextlat.md`. The campaign improves the structured actor without losing attribution and then applies structured NextLat to the best architecture.
 
 The loop is:
 
@@ -66,7 +66,7 @@ systems work; historical measurements are anchors, not substitutes.
 
 The clean cutover uses predictor gate v3 and observation schema v2. Deployment
 executes sampled/selected actions verbatim; no standing-weed rewrite remains.
-Seed-domain and finite-sample evaluation rules are documented in `README.md`.
+Seed-domain and finite-sample evaluation rules are documented in `docs/training-reference.md`.
 
 Verification:
 
@@ -119,7 +119,7 @@ screening/finalist certification. The benchmark forces enabled auxiliaries only
 to measure their cost; production still requires readiness.
 
 The completed 12-epoch job 4875 is a one-off retained initializer for this campaign
-by explicit user decision. Future BC runs inherit the CLI epoch default; do not
+by explicit project decision. Future BC runs inherit the CLI epoch default; do not
 repeat this job's override or retrain it for this RL run.
 
 ## Standard budgets
@@ -340,7 +340,7 @@ Append one row immediately when a run family completes.
 |---|---|---|---:|---:|---|---|---:|---:|---|---|
 | V0 | Recorded in artifacts | `runs/ab-structured-s1`, `runs/econ-pastself-100-structured` | 1 / 20260813 | 0.0008224 | Recorded external panel | 0.84375 score rate after PPO | 8.86 steady | 27.98 steady | Current anchor | V0 |
 | VRAM-20260908 | BC `1a92bd83`; RL `2f669120` | `runs/production-vram-bc-20260908`, `runs/production-vram-p100-20260908-r3` | BC default / 20260812 | 0.00178258 | Not evaluated | Not evaluated | 222.02 cold; 26.36 second | Not a matched throughput comparison | BC complete; P100 interrupted by kernel global OOM after iteration 56, recovery at 39; no promotion | — |
-| Joint-NextLat-VRAM-20260908 | Dense `dc651682` + corrected critic mask; compact `dc803236` | `artifacts/benchmarks/perf-joint-20260908-production-{dense,compact}.jsonl` | 20260812 | Existing BC initializer | Not evaluated | Not evaluated | — | 17.21 dense → 15.04 compact, warm median | Keep execution changes and user-selected ungated joint learning; no play-strength promotion | — |
+| Joint-NextLat-VRAM-20260908 | Dense `dc651682` + corrected critic mask; compact `dc803236` | `artifacts/benchmarks/perf-joint-20260908-production-{dense,compact}.jsonl` | 20260812 | Existing BC initializer | Not evaluated | Not evaluated | — | 17.21 dense → 15.04 compact, warm median | Keep execution changes and the selected ungated joint learning; no play-strength promotion | — |
 
 Promotion decisions must name the evidence and the rejected tradeoff. “Lower loss” or “faster” alone is not a decision.
 
@@ -379,7 +379,7 @@ source digest, job chain, validation, and exact continuation command are in
 
 ### Joint NextLat and execution comparison, 2026-09-08
 
-The user selected ungated joint representation learning. Actor NextLat joins
+Ungated joint representation learning was selected. Actor NextLat joins
 accepted actor PPO updates after critic warmup; critic NextLat joins critic
 updates throughout. Persistence is diagnostic only. Successors and auxiliary
 readouts remain stop-gradient. Gradient observation now uses auxiliary-only
@@ -505,8 +505,8 @@ unchanged BC actor were cancelled.
 
 The next configuration keeps actor/critic trunk LR at 3e-5 and raises only
 the critic value-head Adam LR to 8.75e-5. Other critic Adam parameters and
-predictor rates remain unchanged. The user selected a 4800-row physical
-minibatch ceiling with headroom rather than pushing the 5120 boundary.
+predictor rates remain unchanged. A 4800-row physical
+minibatch ceiling was selected with headroom rather than pushing the 5120 boundary.
 Each full critic epoch now covers all 230080 states in 48 balanced batches.
 
 Two exact memory-lifetime/work reductions accompany it: release prior
@@ -520,7 +520,7 @@ resume. Targeted Ruff and two independent reviews passed.
 
 First launch 5796 was killed by kernel global host-RAM OOM before its first
 completed iteration; a CUDA allocation warning preceded termination.
-After explicit user approval, only language servers 403230, 1219214, and
+After explicit approval, only language servers 403230, 1219214, and
 1495681 were terminated. Recovery job 5815 resumed the intact iteration-zero
 checkpoint and completed repeated full waves with 48 critic updates and
 the intended separate head rate. It stopped at the 40-iteration critic-readiness
@@ -608,7 +608,7 @@ Evidence: `artifacts/probes/vram-20260907/nextlat-head-contract.json`.
 
 ### Corrected head-only NextLat full run, 2026-09-09
 
-User authorized a fresh 100-iteration run from the same BC actor after the
+A fresh 100-iteration run was authorized from the same BC actor after the
 contract corrections. MLQ 5884 used frozen source
 `d92c4646ea6510c056ac56b8a148a58a8284d4654f2c6b80976ab43c019cfd1e`.
 It retains the previous 5120-row ceiling, 5e-5 actor/critic trunk rates,
@@ -663,7 +663,7 @@ Fused predictor lifecycle fixes are inactive in this non-fused, no-predictor run
 Matched full-wave compilation evidence is in `league-prewarm-evidence.json`
 under `artifacts/probes/vram-20260907/`.
 
-Training was stopped after 51 recorded waves following the user's direction to
+Training was stopped after 51 recorded waves following a decision to
 investigate persistent collapse and launch no new runs until resolved.
 Mean money was 16503.32 versus 38278.76 at actor release (wave 11);
 critic gradient norm rose from 2.5674 to 209.0152, almost entirely before the
@@ -678,7 +678,7 @@ moments localize large gradient magnitudes to early reinjection/residual gates,
 but their reconstructed last-step magnitudes decrease rather than explode.
 The head's centered effective spectral norm grows 2.28 to 5.74 between
 checkpoints 11 and 48; total critic parameter norm stays near 118.
-User-authorized read-only checkpoint diagnostics subsequently measured both
+Authorized read-only checkpoint diagnostics subsequently measured both
 activation conditioning and actor-credit direction; all used compiled CUDA BF16
 with zero optimizer steps and no checkpoint mutation. No causal fix or restart
 is claimed.
@@ -738,7 +738,7 @@ or historical failure. Results: `actor-direction-checkpoint11.json` and
 `actor-direction-checkpoint48.json`. Training remains frozen; a shared causal
 correction has not been established.
 
-The user then authorized a bounded finite-update diagnostic, not resumed
+A bounded finite-update diagnostic was then authorized, not resumed
 training: one PPO cycle per disposable GAE/Monte Carlo branch, followed by
 fixed-opponent checks, with no checkpoint writes. Final production-precision
 job 5973 used checkpoint 11, the same 230080-state rollout and minibatch RNG,
@@ -986,7 +986,7 @@ Checkpoint and rollout hashes remain unchanged, no model checkpoint was
 written, and no continuing training was launched. Historical optimizer state
 is not converted: NorMuon history lacks Adam second moments and cannot populate
 the corrected partition. Exact historical resumes retain their original source;
-adopting this correction requires fresh optimizer state. README records this
+adopting this correction requires fresh optimizer state. The training reference records this
 compatibility boundary.
 
 Reproducible launch, frozen optimizer implementations, diagnostic harness, raw
@@ -1106,7 +1106,7 @@ their raw results and launch manifests, `structural-claim-review.json`,
 
 ### Critic unit-RMS forward-model experiment, 2026-09-10
 
-The user authorized a full training run with a residual/RMS architecture change,
+A full training run was authorized with a residual/RMS architecture change,
 not the diagnostic backward rule. `StructuredConfig.critic_unit_rms` is an
 explicit opt-in, default false. It changes only the centralized critic:
 initialize central latent/value query rows at unit RMS, and normalize the
@@ -1201,7 +1201,7 @@ schema-3 auxiliary run released at wave 12. Those are contextual comparisons,
 not matched causal controls. Raw CE across the runs also sees different target
 distributions and cannot by itself establish relative fit quality.
 
-The assistant's subsequent suggestion that lower gradients/no collapse were
+An earlier suggestion that lower gradients/no collapse were
 encouraging was made without inspecting this trajectory and is retracted.
 The candidate failed to learn useful state-dependent scalar values. A plausible,
 unproven mechanism is that unit-scale learned query shortcuts overwhelm the
@@ -1218,7 +1218,7 @@ directory.
 
 ### Frozen cause attribution for failed unit-RMS critic, 2026-09-10
 
-The user requested determination of the failed critic's cause, not another
+The goal was to determine the failed critic's cause, not another
 training run. **The supported proximal mechanism is dominance by constant
 learned-query residuals:** the architecture attenuates state-dependent features
 at both the central latent read and the value read. Its head subsequently fits
@@ -1319,7 +1319,7 @@ not accepted small-signal evidence.
 
 ### State-dependent critic reads and full training, 2026-09-10
 
-The user authorized full implementation, training, and outcome evaluation of the
+Full implementation, training, and outcome evaluation were authorized for the
 state-carrying residual correction. The active `critic_unit_rms` experiment is
 replaced by opt-in `critic_state_read`. Only the critic's central latent read and
 value decoder use `Block(state_read=True)`: queries address context, but there is
@@ -1407,7 +1407,7 @@ CUDA BF16, exclusive admission, default priority, one attempt, and a 30-minute
 limit each. `evaluation-launch.json` preserves the exact commands. Frozen
 diagnostic **6091** compares uninstrumented compiled CE gradients on the same
 full-wave-derived sample across checkpoints 0, 15, 34, 70, and 100, with no
-optimizer steps or checkpoint mutations, to localize the user's reported
+optimizer steps or checkpoint mutations, to localize the previously reported
 late trunk-gradient growth.
 
 **Official evaluations 6086–6089 all completed successfully**, with zero
@@ -1456,7 +1456,7 @@ Evidence: `late-gradient-localization.json`, `late-gradient-analysis.json`,
 
 ### Critic gradient growth and money collapse are two separate mechanisms, 2026-09-10
 
-The user asked for an analytic investigation of the huge critic gradient norms
+This is an analytic investigation of the huge critic gradient norms
 and the money collapse across the last runs, against `../NextLat` and
 `../modded-nanogpt`. **They are not the same failure and neither causes the
 other.** The gradient growth is an inverse-radius readout that the optimizers
@@ -1724,8 +1724,8 @@ optimizer steps, and verified checkpoint SHA-256 identity before and after.
 
 ### Optimizer alignment against the references: measured, not resolved, 2026-09-10
 
-The user rejected reward shaping, self-play, and weight decay as causes and
-directed that the optimizer claims be checked against `../modded-nanogpt` and
+Reward shaping, self-play, and weight decay were rejected as causes, and
+the optimizer claims were to be checked against `../modded-nanogpt` and
 `../NextLat`, and, if genuinely misaligned, be tested aligned with the critic
 run past its warmup gate. Three 100-wave runs, identical seed 20260812,
 identical 140-argument launch, identical BC warm start, only the named change:
@@ -2093,7 +2093,7 @@ only once the actor first steps. The rollout share is dominated by
 lane count from 1 to `max_lanes`, plus the collector's own forward and the
 behavior replay. Inductor's FX graph cache and the AOTAutograd cache are both on
 by default in torch 2.13 with a stable cache directory
-(`/var/tmp/torchinductor_marvin`), so this is cold-cache cost that every arm in
+(`/var/tmp/torchinductor_$USER`), so this is cold-cache cost that every arm in
 this campaign paid afresh only because every arm edited the source the graphs
 hash over.
 
@@ -2552,8 +2552,8 @@ its measured output. No automatic retry or further trial was launched.
 
 ## Promoted HL-Gauss state-mean baseline (2026-09-14)
 
-The user subsequently promoted the wider HL-Gauss critic and the active
-state-mean run as the new baseline. This supersedes the non-promotion decision
+The wider HL-Gauss critic and the active
+state-mean run were subsequently promoted as the new baseline. This supersedes the non-promotion decision
 above: defaults are now categorical HL-Gauss, 255 atoms on `[-2.2, 2.2]`,
 sigma/bin `3.0`, and state-mean component-clipped PPO. Actor NextLat remains
 off; critic latent and decoded-value auxiliaries remain coefficient 1 each,
@@ -2578,7 +2578,7 @@ from active components to valid states. Final 20-wave arithmetic means:
 At matched waves 77-96, component/state means were correlation
 **0.845115 / 0.835309**, MC EV **0.713530 / 0.696841**, and money
 **52,069.70 / 52,798.89**. These are single-seed online comparisons,
-not evidence of an external win-rate improvement. Promotion is the user's
+not evidence of an external win-rate improvement. Promotion is a deliberate
 baseline choice, not a claim that every measured metric improved.
 
 Verification job **6945** passed **50 regressions**, including compiled BF16
@@ -2625,8 +2625,8 @@ Evidence: `artifacts/probes/hlgauss-state-mean-lr3-20260914/experiment.json`.
 
 ## Promoted dense VAPO temporal defaults (2026-09-14)
 
-The user identified dense-reward trial **7010** as the winner and promoted its
-temporal settings for future runs. This supersedes the gamma/lambda defaults
+Dense-reward trial **7010** was identified as the winner and its
+temporal settings were promoted for future runs. This supersedes the gamma/lambda defaults
 of baseline 6946; the rest of that baseline remains unchanged.
 
 | Setting | Previous baseline | Promoted default |
@@ -2643,7 +2643,7 @@ the normalized final-bank margin, not binary win/loss. Base learning rates,
 HL-Gauss sigma/bin 3, state-mean component clipping, actor auxiliary off, and
 critic auxiliaries at 1 each remain unchanged.
 
-Promotion was the user's decision during the trial. Existing queued ablations
+Promotion was decided during the trial. Existing queued ablations
 retain their frozen commands; future launchers inherit the shared defaults unless explicitly
 overridden. The per-entity critic experiment still requires an explicit
 `--actor-gae-lambda 1`; it is not silently combined with VAPO's shorter trace.
@@ -2678,7 +2678,7 @@ Final evidence:
 
 ### Joint and terminal-only migrated onto VAPO
 
-The user subsequently requested the full VAPO temporal settings for both queued
+The full VAPO temporal settings were subsequently adopted for both queued
 ablations, superseding the earlier decision to retain their original commands.
 Cancelled joint trial **6986** is replaced by fresh trial **7072**; queued
 terminal-only trial **7004** was cancelled before start and replaced by **7073**.
@@ -2873,9 +2873,9 @@ Evidence and design constraints:
 
 ## Promoted terminal-outcome LR3 recipe and entity-only direction (2026-09-14)
 
-The user selected **7122**, HL-Gauss VAPO terminal-outcome LR3, as the best run
+**7122**, HL-Gauss VAPO terminal-outcome LR3, was selected as the best run
 so far. That selection is accepted directly; no new comparison was run to
-reconfirm it. Luna promoted the new-launch defaults:
+reconfirm it. The new-launch defaults were promoted:
 
 - Reward: terminal-only win/loss/draw **+1/-1/0**.
 - Actor/critic base LR: **0.00015**; ordinary Adam rate **0.0000525**.
@@ -2939,7 +2939,7 @@ and measured execution are recorded below. Evidence and calculation assumptions:
 
 ## D96 entity-attention implementation and campaign (2026-09-14)
 
-The user approved **96 for both memory and entities**, not a width sweep.
+**96 for both memory and entities** was approved, not a width sweep.
 `entity-attention` is now the production family. Actor and critic independently
 encode both farms with two shared-weight local blocks and evolve exactly
 16 unit plus ten market-order states through four self/cross/FFN rounds.
@@ -3091,7 +3091,7 @@ the three complete `evaluation-*.json` reports.
 
 ## Independent per-head actor NextLat trial (2026-09-14)
 
-After the D96 control completed, the user requested actor NextLat again, one
+After the D96 control completed, actor NextLat was tried again, one
 predictor per actor head, following `../NextLat`. This is not merely enabling
 the previous shared-attention predictor.
 
@@ -3175,13 +3175,13 @@ there is no trained optimizer/critic recovery checkpoint to resume at iteration
 per-head losses, equal-wave control and cancellation status:
 `artifacts/probes/entity-attention-d96-20260914/actor-head-nextlat-partial-results.json`.
 
-The user subsequently ended this actor-auxiliary direction and requested work
+This actor-auxiliary direction was subsequently ended in favor of work
 on D96 execution efficiency and larger minibatches. Actor NextLat stays off;
 the experimental implementation is retained without enabling it in production.
 
 ## 8192 default and learning-bottleneck analysis (2026-09-14)
 
-The user selected **8192** as the new default. `PpoConfig.minibatch_size` now
+**8192** was selected as the new default. `PpoConfig.minibatch_size` now
 owns that value for production/direct launchers and benchmarks; the forward
 traffic probe follows it. Explicit overrides and historical fixed-shape probes
 retain their declared sizes. Actor NextLat remains off, critic NextLat remains
@@ -3198,9 +3198,9 @@ Six-repeat full production benchmarks **7145/7146** completed:
 | Peak reserved VRAM | 16.66 GiB | 20.53 GiB |
 
 All intended updates and replay gates passed. This probe does **not** establish
-a speed advantage for 8192; the selection is explicit user direction.
+a speed advantage for 8192; the selection is an explicit project decision.
 The 9600/11200 jobs **7147/7148** were cancelled before starting and not retried.
-No new full learning run was launched after the user switched to analysis.
+No new full learning run was launched after the switch to analysis.
 
 The partition is fixed-shape, not balanced: 28 full 8192 batches plus 704 genuine
 states in the last batch, padded with 7488 zero-weight rows. Every genuine state
@@ -3336,7 +3336,7 @@ the704-state tail with7,488 zero-weight padding entries. Actor NextLat remains o
 critic NextLat coefficients remain1/1. The actor initialization is
 `runs/entity-attention-d96-bc-20260914/bc-actor.pt`.
 
-After the user's runtime-budget correction, every performance/diagnostic job has
+After a runtime-budget correction, every performance/diagnostic job has
 a hard **120-second MLQ cap**, exclusive max-parallel-runs1, priority0, one attempt.
 Production probes use three full waves: one cold and two warm. Compilation,
 startup and diagnostic parity checks count against the cap; queue wait does not.
@@ -3592,9 +3592,9 @@ the restored actor in complete games. A resumed optimizer step was not tested.
 Detailed results are in `learning-comparison.json` and
 `learning-native-evaluation.json` beside the graph investigation artifact.
 
-### User-directed continuation and initial-decline diagnosis
+### Directed continuation and initial-decline diagnosis
 
-The user requested continued training because the new entity policy is
+Training was continued because the new entity policy is
 recovering better than its predecessor. The prior plateau-pruned outcome is not
 a conclusion that recovery had stopped: money EMA rose from28096.11 at
 iteration65 to30085.37 at70, but the guard still compared it against39034.22
@@ -3605,7 +3605,7 @@ checkpoint, changing only `training_data_config.autocull` to null. A recursive
 round-trip comparison verified exact equality of every other recovery field,
 including all model, optimizer, RNG, league and warm-start state. The original
 checkpoint remains unchanged. `continuation-checkpoint.json` records both
-digests and the explicit user authorization.
+digests and the explicit authorization.
 
 Job7258 initially resumed that state into
 `runs/production-entity-gqa-d96-outcome-graphs-b8192-20260915-continued`.
@@ -3686,7 +3686,7 @@ guard's treatment of new frames.
 
 ## Rejected critic-only inverted memory attention (2026-09-15)
 
-**Rejected by the user as worse.** Job7286 was cancelled by request (exit143).
+**Rejected as worse.** Job7286 was cancelled by request (exit143).
 The option, operator, special compatibility handling and experiment-only tests
 have been removed from live source. The following is historical evidence for
 the frozen experiment, not a supported architecture or a future trial.
@@ -3723,8 +3723,8 @@ Verification on the frozen implementation:
   frozen scripts directory and declares empty exposure; production admission
   checks were not relaxed.
 
-The user subsequently authorized replacing the running normal-attention
-continuation. Job7263 was cancelled by request after preserving its full
+Replacing the running normal-attention
+continuation was subsequently authorized. Job7263 was cancelled by request after preserving its full
 iteration420 recovery checkpoint in the original run directory:
 `checkpoint-000420.pt`, SHA256
 `2b6479155012aeb77bf7055625b765f8a059d523a509d9c7256cd8bc7d072156`.
@@ -3865,7 +3865,7 @@ the earlier untied initializer7306 is superseded, not reused.
 
 PPO retains the recorded production hyperparameters, seed20260812,
 128 self-play plus64 league games,720 ticks,230080 genuine states per wave,
-B8192, compiled BF16, and the existing auxiliary objectives. The user-specified
+B8192, compiled BF16, and the existing auxiliary objectives. The specified
 budget is enforced as `--max-hours 0.4` with a25-minute MLQ hard cap, exclusive
 parallel limit1 and one attempt. The500-iteration argument is only an upper
 bound. Benchmark and evaluation jobs have120-second caps. Each learning arm is
@@ -3917,8 +3917,8 @@ evidence of stronger fixed-opponent play.
 
 The production-continuation comparison found identical PPO configuration and
 simulator source, but different BC weights and reset critic, optimizers and league
-state. Run variation is plausible, not causally established. The user accepted
-that possibility; preserved production checkpoints107 and420 receive the same
+state. Run variation is plausible, not causally established. That possibility was
+accepted; preserved production checkpoints107 and420 receive the same
 fixed panel rather than attributing differences in moving-league curves to a new
 architecture. Detailed evidence is in `production-discrepancy.json`.
 
@@ -4072,7 +4072,7 @@ Its learning source differs from the matched control source only in
 
 ### Tile cross-attention RoPE extension
 
-The user requested 2D RoPE for tile cross-attention after the original arms.
+2D RoPE for tile cross-attention was requested after the original arms.
 `--tile-cross-rope true` is independently off by default. Unit queries use
 their `(column,row)` coordinates; both tile-memory grids use local farm
 coordinates. Market queries, economy/private-unit keys, and all values remain
@@ -4120,8 +4120,8 @@ No default promotion. Complete results are in `outcome-summary.json`.
 
 ### Requested four-feature combination
 
-The user selected intermediate FFN, untied projected K/V, critic readout FFN,
-and tile cross-attention RoPE together. The exact overrides are
+Intermediate FFN, untied projected K/V, critic readout FFN,
+and tile cross-attention RoPE were selected together. The exact overrides are
 `--inter-attention-ffn true --shared-memory-kv false
 --critic-readout-ffn true --tile-cross-rope true`.
 Local initialization remains enabled; final local readout remains disabled.
@@ -4145,7 +4145,7 @@ versus control. Every repeat contained230080 genuine states,29 actor updates,
 and29 critic-auxiliary updates. Parameter counts are1052402 actor and1124847
 critic. The cold failed attempt remains recorded, not relabeled successful.
 
-Before PPO submission, the user explicitly permitted this combined run to exceed
+Before PPO submission, this combined run was explicitly permitted to exceed
 25 minutes. Learning7413 therefore uses a55-minute trainer budget
 (`--max-hours 0.9166666666666666`) and60-minute MLQ hard cap. Seed, training
 settings, and architecture flags are otherwise unchanged. Evaluation7414 retains
@@ -4185,8 +4185,8 @@ intervals, and terminal queue records are in `combined-four-campaign.json`,
 
 ## RL review experiments, 2026-09-16
 
-The user authorized implementation and experiments, including hardest-opponent
-league selection, with each run under 25 minutes. The user-selected production
+Implementation and experiments were authorized, including hardest-opponent
+league selection, with each run under 25 minutes. The previously selected production
 default `shared_memory_kv=False` is preserved. Primary play evaluation is argmax,
 not sampled decoding. No experimental default is promoted automatically.
 
@@ -4328,7 +4328,7 @@ a gameplay-improvement claim. The remaining learners are queued.
 
 ### Requested BiXT extension
 
-The user additionally requested [BiXT v2](https://arxiv.org/pdf/2402.12138v2).
+[BiXT v2](https://arxiv.org/pdf/2402.12138v2) was additionally requested.
 The separate arm uses32 generic learned latents, width96, four rounds, and the
 existing tokenizer/farm encoders and decision heads. Its actor data sequence is
 26 decision tokens plus220 source tokens; the critic adds16 private-unit tokens.
@@ -4445,7 +4445,7 @@ Focused model-free validation passes 59 configuration/selection/campaign tests;
 separate outcome-diagnostic checks pass, and scoped Ruff/format/whitespace
 checks pass. The independent code review found no blocking regressions.
 
-The [RL architecture review](REVIEW_RL_20260918.md) uses completed historical
+The [RL architecture review](../reviews/rl-review-2026-09-18.md) uses completed historical
 artifacts, not results from the queued run. It records the BC-to-PPO deployed
 score regression, opening credit limitations, and the proposed execution-order
 actor decoder plus independent economic forecasting critic. No speculative
@@ -4495,18 +4495,18 @@ Model-free follow-up checks pass 68 tests (four CUDA cases excluded), scoped
 lint/format checks pass, and independent review found no remaining blocker.
 GPU feasibility, throughput and gameplay conclusions are pending execution.
 
-The [execution-order decoder design](ARCHITECTURE_DECODER_DESIGN.md) specifies
+The [execution-order decoder design](../proposals/architecture-decoder.md) specifies
 the exact ledger, cached causal decoding, BC/PPO replay and native parity gates
 for the proposed actor refactor. That decoder is not implemented. Additional
 historical telemetry in the follow-up artifact directory records the frozen-BC
 sampled v27 score around 27–29%, falling to 0–1% over the final twenty PPO waves;
-the [review](REVIEW_RL_20260918.md) distinguishes this unpaired training evidence
+the [review](../reviews/rl-review-2026-09-18.md) distinguishes this unpaired training evidence
 from the queued matched decoding comparison.
 
 
 ## 2026-09-18: structural ablations with GAE retained and no recurrence
 
-User correction removed the proposed prefix critic and all recurrent modeling.
+A scope correction removed the proposed prefix critic and all recurrent modeling.
 Implemented the shared-plan global workspace actor, execution-order causal
 actor, and feed-forward economic forecasting critic. GAE and its lambda values
 remain unchanged; the baseline remains hardness + source-read + NextLat off.
@@ -4573,7 +4573,7 @@ The installed Kaggle version, Python rules, and Rust parity environment now use
 the 1.32.7 market curves. The previous BC corpora were captured under 1.32.6;
 the current-rules corpora are `data/bc-v16-current-{mirror,starter,pass,random}-64`.
 The clone encoder checks each recorded quote against its inventory under the
-installed rules. [JEPA_RUNS.md](JEPA_RUNS.md) records the parity checks and the
+installed rules. [docs/experiments/jepa-runs.md](jepa-runs.md) records the parity checks and the
 reason prior absolute scores cannot be carried over to this rule set.
 
 BC's CLI default is two epochs. The structural campaign now inherits that
@@ -4599,7 +4599,7 @@ clone in `runs/lejepa-margin-1327-20260923/bc` (30-minute queue cap). PPO job
 **9304** started after BC success, with output in
 `runs/lejepa-margin-1327-20260923/ppo`. Its command requests 35 minutes of
 trainer time, but the running queue limit was reduced from 40 to **30 minutes**
-on user direction. Both are exclusive, normal-priority jobs. The comparison must distinguish
+by decision. Both are exclusive, normal-priority jobs. The comparison must distinguish
 whether the margin improves learning from whether either policy discovers
 carrot, tomato, or egg sales; the v16 teacher supplied no such demonstrations.
 
@@ -4616,7 +4616,7 @@ trade seen in the Kaggle opponent. The record is
 At matched actor wave 25, the schema-v4 margin arm improves fixed-panel critic
 MSE (0.337 versus 0.497) and self-play lower-tail money (~5.8k versus ~1.4k),
 while scripted-v27 sampled score is 0.078 versus 0.188 and argmax score is
-0/64 versus 61/64. This is not yet a clear gameplay win. On user direction,
+0/64 versus 61/64. This is not yet a clear gameplay win. By decision,
 fresh LeJEPA runs now inherit schema v4 for its stronger critic and self-play
 economics; the v27 regression remains visible in the promotion record.
 
@@ -4629,7 +4629,7 @@ checkpoint is **85**. At matched actor wave 75, schema-v4 panel critic MSE is
 0.211 versus 0.529 for v3, self-play mean money is 69.0k versus 64.0k, and
 the 10th percentile is 10.0k versus 3.3k. Scripted-v27 sampled score remains
 lower (0.125 versus 0.250) and argmax is 0/64 versus 63/64. Fresh LeJEPA
-defaults now use v4 by user decision; this is an economic/critic promotion
+defaults now use v4 by explicit decision; this is an economic/critic promotion
 with an unresolved opponent-strength regression.
 
 All future jobs launched for this line of work must finish within **30 minutes
@@ -4662,7 +4662,7 @@ action vocabulary, native sampler and BC contract. These six jobs are queued
 behind shared GPU work, with limits no longer than 30 minutes.
 
 The joint-ratio PPO arm **9321** and its evaluations **9322/9323** were
-cancelled before starting when the user clarified that the priority is the
+cancelled before starting once the priority was clarified to be the
 *action decoder*, rather than the PPO ratio objective. Its manifest remains at
 `artifacts/probes/lejepa-joint-ratio-1327-20260923/campaign.json` as a record
 of the unused commands.
@@ -4680,8 +4680,8 @@ The existing causal actor encodes the public state once, then selects 36 unit,
 market-kind and quantity factors in execution order with an exact device-side
 resource ledger. Later preferences can respond to selected earlier actions;
 the current flat actor updates only legality masks.
-The full proposal is in [ARCHITECTURE_DECODER_DESIGN.md](ARCHITECTURE_DECODER_DESIGN.md)
-and [ARCHITECTURE_ABLATIONS_20260918.md](ARCHITECTURE_ABLATIONS_20260918.md).
+The full proposal is in [docs/proposals/architecture-decoder.md](../proposals/architecture-decoder.md)
+and [docs/experiments/architecture-ablations-2026-09-18.md](architecture-ablations-2026-09-18.md).
 Its earlier compiled gate
 **8163** failed because Inductor fused first-quantity sampling with the ledger
 and emitted a Triton temporary outside its defining loop. The current source
@@ -4744,7 +4744,7 @@ action-audit manifest's two output JSON files.
 
 ### Learnable action-interface ablations
 
-`ACTION_INTERFACE_ABLATIONS.md` is the specific plan for making actions
+`docs/experiments/action-interface-ablations.md` is the specific plan for making actions
 easier to learn. The causal decoder above changes conditioning on prior
 choices, but leaves the ten STOP-terminated market slots, order permutations,
 and repeated-kind splits as policy choices. The highest-value proposed
@@ -4861,7 +4861,7 @@ were 44 carrot, 26 tomato and 0 egg units. The A2 PPO sales job skipped.
 
 Memory-safe control and A2 PPO retries **9518/9519** were briefly queued to
 complete the matched comparison after the OOM, with dependent panels
-**9520–9523** and sales audit **9524**. On user reprioritization, the retries
+**9520–9523** and sales audit **9524**. After a reprioritization, the retries
 were cancelled before a new treatment result; the dependent jobs were
 cancelled or skipped. A2 remains a promising BC-only result, not an established
 PPO winner. Commands are retained in
@@ -4931,7 +4931,7 @@ The causal schema-v4 clone **9403** also finished two epochs: held-out NLL
 thus comparable at this resolution; native PPO gates determine whether the
 extra conditioning earns its runtime and improves outcomes.
 
-To check the user-important trading behavior, native 64-game sampled sales
+To check the high-priority trading behavior, native 64-game sampled sales
 audits **9433/9434** (flat/causal) and **9435/9436** (A2 control/ALL) are queued
 after their respective PPO jobs succeed, all on the same seeds with 20-minute
 limits. They report carrot, tomato and egg units separately, not just an
@@ -4979,7 +4979,7 @@ in parallel, still select/apply their exact ledger effects in order, and use
 cached causal attention only for the 20 ordered market kind/quantity choices.
 It preserves teacher execution order unlike the rejected A3 set. This is a
 design candidate, not a trained or parity-validated result. Following the
-user's priority change, implementation and a short throughput gate for this
+priority change, implementation and a short throughput gate for this
 variant supersede A2 PPO retries. No causal training is authorized by a speed
 claim until the variant passes exact action/replay parity and shows useful
 rollout throughput under a two-minute benchmark cap.
@@ -5016,7 +5016,7 @@ the C1 BC result. All scripts point to the frozen source.
 The campaign holds one frozen-opponent lane in both arms because
 the earlier growing-league run recompiled at 1→2→4 opponent models for
 126/176/204 seconds. Commands and the authoritative future gates are in
-`ACTION_INTERFACE_ABLATIONS.md` and
+`docs/experiments/action-interface-ablations.md` and
 `artifacts/probes/market-causal-v4-20260924/campaign.json`.
 The causal probe **9498** was admitted and failed before producing measurements;
 the 30-minute PPO run **9409** remains stopped after four actor-update waves.
@@ -5032,7 +5032,7 @@ The two-minute CUDA integer-logit check **9562** passed (one selected test,
 **9569/9570**, and trio-sales audit **9571** depend on preceding success. The
 previously queued flat F0 campaign **9543/9553–9556** is the control; its
 frozen source differs from this one only in opt-in interface-4 code. Queue
-commands and the action-ablation plan are in `ACTION_INTERFACE_ABLATIONS.md`.
+commands and the action-ablation plan are in `docs/experiments/action-interface-ablations.md`.
 All Kaggriculture jobs use normal mlq priority and exclusive
 `maxParallelRuns=1`; queue wait is outside each job's cap.
 
@@ -5046,7 +5046,7 @@ two-epoch BC **9579** queued in order. These results must establish fit and
 throughput before a revised causal PPO is queued; the earlier BC checkpoint
 cannot warm start this changed unit decoder.
 
-**2026-09-24 direction change.** The user closed the market-causal arm after
+**2026-09-24 direction change.** The market-causal arm was closed after
 its poor two-epoch unit fit. Revised CUDA contract **9577** was canceled
 before start, so dependent speed/BC **9578/9579** skipped; the uncommitted
 unit-decoder repair was removed. The flat PPO **9553**, part of the same causal
@@ -5076,7 +5076,7 @@ running ALL PPO, median p10 rises to about $7,392. The ALL atom's larger
 sampled quantities are a plausible cause of BC tail risk, but this is not yet
 isolated from unit and market-kind sampling. Two 128-game, four-mode head
 interventions are queued as **9606/9607**, each with a two-minute cap; their
-design and outputs are in `ACTION_INTERFACE_ABLATIONS.md`.
+design and outputs are in `docs/experiments/action-interface-ablations.md`.
 Those head probes **9606/9607** completed. On 128 paired v27 games, A2
 argmax, quantity-only sampled, units+kinds sampled with argmax quantity, and
 all-head sampled produced respectively 0, 2, 24, and 19 games below $1,000.
@@ -5127,7 +5127,7 @@ optimistic numerical oracle that fits location and scale separately for every
 such target, respecting the existing scale floor, yields average quantity NLL
 about 0.1656. The achieved 0.1847 is near that floor. The versioned
 narrow-scale fraction arm and its outcome gate are in
-`ACTION_INTERFACE_ABLATIONS.md`.
+`docs/experiments/action-interface-ablations.md`.
 That A2c narrow-scale fraction arm is now implemented in isolated source
 `9ca98babc31354706ac4584ce6d3a040217ae0d1490382f85c3e289c3c1455ee`.
 Interface 5 keeps the same seven trainable outputs and initialization as
@@ -5291,8 +5291,8 @@ counts or matched Elo. The public [island-GA code](https://github.com/destbreso/
 keeps winning schedules private. No teacher is promoted without a runnable
 1.32.7 comparison and executed trio audit.
 
-**Percentage arm rejected; decoder diagnosis, 2026-09-24.** The user canceled
-PPO **9590** at iteration 66 after the first rollout showed terminal money
+**Percentage arm rejected; decoder diagnosis, 2026-09-24.** PPO **9590** was
+canceled at iteration 66 after the first rollout showed terminal money
 mean/median/p90 of $3,899/$50/$4,739, versus $64,153/$62,787/$140,650 for
 the matched ALL initializer. Percentage STOP/SELL/HIRE fractions were
 0.712/0.051/0.113 versus 0.580/0.106/0.203; unit PASS/HARVEST fractions
@@ -5304,7 +5304,7 @@ The canceled checkpoint is diagnostic only; future runs continue from the
 promoted ALL PPO where applicable. A two-minute, 128-game head-intervention
 probe on percentage BC ran as **9628**. A2c must pass matched sampled
 full-game money and score gates (**9635**) before any PPO is queued; gate details are in
-`ACTION_INTERFACE_ABLATIONS.md`.
+`docs/experiments/action-interface-ablations.md`.
 
 **Head interventions resolved, 2026-09-24.** On 128 paired v27 games, A2 BC
 unit-only, kind-only, unit+quantity, and kind+quantity sampling (**9626**)
@@ -5322,7 +5322,7 @@ maxima of at least five from 1.07 to 6.32, while sells fell from 150.0 to
 with only 2 low-money games. Thus fraction quantity sampling alone is enough
 to collapse percentage BC; narrowed scale remains a hypothesis until its
 paired sampled panel. Details and pre-PPO gate are in
-`ACTION_INTERFACE_ABLATIONS.md`.
+`docs/experiments/action-interface-ablations.md`.
 
 The follow-up 128-game activity probe **9636** showed that unit-only sampling
 has 19.6% PASS and 4.23% HARVEST among active unit decisions, versus 18.2%
@@ -5358,7 +5358,7 @@ affordance scorer already represent those amounts. Goose pickup had zero
 legal opportunities in the A8 panel, so a pickup quantity head cannot by
 itself recover the absent egg trade. No quantity-head checkpoint was trained
 or promoted from these probes. Full results and provenance limits are in
-`ACTION_INTERFACE_ABLATIONS.md`.
+`docs/experiments/action-interface-ablations.md`.
 Cross-tree attempt **9882** matched all 512 canonical game outcomes but
 imported the editable canonical Python package despite the frozen working
 directory; it does not resolve the source-lock caveat. Corrected job

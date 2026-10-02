@@ -167,7 +167,7 @@ Why this is plausible here and not a reflexive patch:
 The measured gap to public-v27 (~5.6x bank at iteration 388-415) is
 behavioral: land purchase, animals, DIG, and FERTILIZE sit at exactly zero in
 the action mix. That is an exploration/curriculum failure, and the
-behavior-cloning warm start (BC_WARMSTART_PLAN.md) attacks it directly. A
+behavior-cloning warm start (docs/proposals/bc-warmstart.md) attacks it directly. A
 representation auxiliary cannot conjure unvisited subsystems out of on-policy
 data that never contains them. NextLat-style latents are worth having, but as
 an accelerant for the post-BC RL fine-tune, not as the headline fix.

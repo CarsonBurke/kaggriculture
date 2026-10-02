@@ -1,4 +1,4 @@
-"""Structured farm transformer: the VIT_PLAN target architecture.
+"""Structured farm transformer: the docs/proposals/vit.md target architecture.
 
 Replaces the convolutional trunk with semantic entity tokens (tiles, units,
 economy) fused by a latent transformer core:
@@ -78,7 +78,7 @@ from kaggriculture.triton_mlp import (
 
 @dataclass(frozen=True)
 class StructuredConfig:
-    """Target-architecture hyperparameters from VIT_PLAN."""
+    """Target-architecture hyperparameters from docs/proposals/vit.md."""
 
     observation_schema_version: int = DEFAULT_OBSERVATION_SCHEMA_VERSION
     action_interface: int = 1

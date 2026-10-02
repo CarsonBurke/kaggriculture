@@ -583,7 +583,7 @@ class PpoConfig:
 #:   every measured recipe ran without it.
 #: * The backbone steps at 1.5e-5 rather than the actor's rate. It moves under
 #:   the summed objective and policy gradient every minibatch, and the slower
-#:   backbone beat the full-rate run from the same clone (JEPA_RUNS.md, job 9281
+#:   backbone beat the full-rate run from the same clone (docs/experiments/jepa-runs.md, job 9281
 #:   against 9275); every 2026-09-27 stage ran it.
 #: * The update retains the actor's farm activations rather than replaying them
 #:   for the objective's belief: at the 4096-row minibatch it fits, 17.2 GiB at

@@ -1,12 +1,12 @@
 # Current solution
 
-Technical reference for the production neural solution as of September 29, 2026.
+Technical reference for the production neural solution as of October 1, 2026.
 Historical checkpoints use their recorded configurations, which may differ from these defaults.
 
 ## Training pipeline
 
 - The production model family is `lejepa`.
-- Training starts from a behavior-cloned actor trained on V16 demonstrations. The BC artifact also contains its trained JEPA objective.
+- Training starts from an actor behavior-cloned on replays of hosted leaderboard games between agents rated at least 2600. The BC artifact also contains its trained JEPA objective.
 - PPO initializes a fresh critic and optimizer state. Loading a BC actor is initialization; resuming a training checkpoint restores the full training state.
 - The actor and shared backbone remain frozen during critic warmup.
 - Warmup lasts at least 10 iterations. Actor training starts when every learner's previous fresh-wave, pre-update Monte Carlo return R² reaches 0.10. Training fails if the critic is still unready at iteration 40.
@@ -35,14 +35,14 @@ Historical checkpoints use their recorded configurations, which may differ from 
 - The actor sees both public farms, both bank balances, the market and town, and its own private seeds, shed contents and carried inventory.
 - The centralized critic additionally receives the opponent's private seeds, shed contents and unit inventories. These features enter the private critic tower, not the shared actor encoder.
 - Farm tokens are ordered own farm first, opponent farm second. Tile order is `y * 10 + x`. Unit slots follow engine execution order, with the farmer first.
-- The production model consumes observation schema 4. The tokenizer emits schema 8 arrays; embedders select the prefix corresponding to the model's recorded schema.
+- The production model consumes observation schema 8, the tokenizer's current schema. Older artifacts record lower schemas; embedders select the prefix corresponding to the model's recorded schema.
 - Tile inputs contain 200 tokens, each with six categorical and 20 continuous features. Categories describe tile kind, occupant, farm ownership, row, column and quadrant. Continuous features describe yield, age, care, decay, lifespan, harvest readiness, shed access and public unit occupancy.
 - Own-unit inputs contain 16 slots with four categorical and 26 continuous features, an active mask, and local tile indices for HERE/NORTH/SOUTH/EAST/WEST. Off-board neighbors have separate validity masks.
 - Unit continuous features include twelve carried-item counts, total cargo, shed access and twelve inventory insertion ranks. Insertion order matters because DROP fills the shed in that order and discards overflow.
 - Economy inputs contain 20 tokens: nine products, three animals, five crops, two farm summaries and one town/clock token.
-- Schema-4 economy feature widths are five per product, three per animal, six per crop, five per farm and fourteen for the town.
+- Schema-4 base economy feature widths are five per product, three per animal, six per crop, five per farm and fourteen for the town.
 - Bank values use signed log1p divided by 12. Schema 4 also includes the unscaled difference between signed-log bank values, computed before low-precision staging to preserve small leads.
-- Later schemas add shop unlock order (5), held-sale value and liquidation (6), supply/demand outlook and forecast prices (7), and crop/animal payback (8). These additions are available but are not consumed by the default production model.
+- Later schemas add shop unlock order (5), held-sale value and liquidation (6), supply/demand outlook and forecast prices (7), and crop/animal payback (8). The production model consumes all of them.
 
 ## Shared backbone
 
@@ -121,15 +121,16 @@ Historical checkpoints use their recorded configurations, which may differ from 
 
 ## League system
 
-- A single-learner wave contains 128 mirror self-play games and 64 league games: 192 physical games in total.
-- Both mirror seats contribute learner trajectories; only the learner seat contributes in league games. This produces 320 trajectories and an 80% mirror / 20% league state mix, with 230,080 valid states for complete default games.
-- The default selector is `hardness`. Budgets of two active, six historical and four built-in opponents are pooled into twelve distinct selections rather than enforced as separate strata.
-- Built-ins are `pass`, `random`, `starter` and `scripted-v27`. Setting built-in lanes to zero disables them.
+- A single-learner wave contains 128 mirror self-play games, 64 snapshot-league games and 40 reference-agent games: 232 physical games in total.
+- Both mirror seats contribute learner trajectories; only the learner seat contributes in league and reference-agent games. This produces 360 trajectories (about 71% mirror), with 258,840 valid states for complete default games.
+- The default selector is `hardness`. Budgets of two active and six historical snapshots are pooled into eight distinct selections rather than enforced as separate strata.
 - Matchup evidence comes from current-learner native terminal results, scored as win 1, draw 0.5 and loss 0. A Beta(1,1) prior handles sparse evidence; effective counts decay by 0.98 per wave.
-- Main lanes select opponents with the lowest posterior learner score. Exact ties are randomized.
-- One lane refreshes stale or uncertain evidence. While unseen opponents remain, another discovery lane tests untested built-ins first, then the newest untested snapshot. With enough candidates, the remaining ten lanes use hardness ranking; without discovery, eleven do.
+- Hardness lanes select the opponents with the lowest posterior learner score. Exact ties are randomized.
+- Two screen lanes spend their games two at a time on stale opponents with the largest (age + 1) × posterior standard deviation, so a forgotten matchup reaches hardness selection within a few waves. While unseen opponents remain, a discovery lane tests the newest untested snapshot.
 - Selected opponents receive approximately equal game counts with balanced learner seats.
-- Actor snapshots are immutable, match the learner's full model configuration, and are saved initially and after every actor-active iteration. The active-pool size of sixteen is not an archive limit.
+- Actor snapshots are immutable, match the learner's full model configuration, and are saved initially and after every actor-active iteration. The archive keeps the latest sixteen, thins older ones to a spacing that doubles with age, and always keeps any snapshot the learner scores under 0.6 against.
+- Ten public Kaggle agents that react to the game state are split in two (`kaggriculture.opponents`). Five league agents (demand-timing, hybrid-2965, harvest-ledger, master-engine-v53 and bronze-v31) are fixed native lanes. Each gets two games per wave, and the rest are allocated in proportion to (1 − estimated score)². The five held-out agents (demand-preserving, demand-advance4, idle-seller, shepherds-ledger and kaito-v48) are never trained against.
+- Engine built-ins (`pass`, `random`, `starter` and `scripted-v27`) remain available as league lanes but are disabled by default.
 - The older `stratified` selector uses age strata and PFSP weights; it remains an explicit alternative.
 - Population mode uses equal counts of ordered learner pairings, with `N * (N - 1) * 13` physical games by default. All seats are learners, with a distinct BC initializer per member and no frozen, built-in or script lanes.
 
@@ -148,7 +149,7 @@ Historical checkpoints use their recorded configurations, which may differ from 
 
 ## Evaluation
 
-- Compatible single-learner runs receive a native development panel every 25 actor-active waves. Recovery checkpoints also trigger a separate external panel against starter, public V27 and public V16.
+- Compatible single-learner runs receive a native development panel every 25 actor-active waves. Recovery checkpoints also trigger a separate external panel against the held-out reference agents.
 - Final selection uses held-out responsive games, paired maps and seats, explicit decoding modes and exact artifact identities.
 - Warmup iterations, actor-active waves and applied optimizer updates are separate exposure measures.
 - Critic pre-update expected-score calibration measures value fitting; it does not establish held-out policy strength or three-class draw calibration.
@@ -162,4 +163,4 @@ Historical checkpoints use their recorded configurations, which may differ from 
 - Architecture and auxiliary objective: `src/kaggriculture/lejepa_model.py`, `src/kaggriculture/lejepa.py`, `src/kaggriculture/entity.py`.
 - Observations and actions: `src/kaggriculture/tokens.py`, `src/kaggriculture/actions.py`, `src/kaggriculture/policy.py`, `src/kaggriculture/resource_conditioning.py`, `src/kaggriculture/navigation.py`.
 - League and simulation: `src/kaggriculture/league.py`, `src/kaggriculture/rollout.py`, `rust/kagg_env/src/core.rs`.
-- Experiment history: `CORE_MODEL_20260926.md`, `JEPA_RUNS.md`, `RUNS.md`.
+- Experiment history: `docs/experiments/core-model-2026-09-26.md`, `docs/experiments/jepa-runs.md`, `docs/experiments/runs.md`.

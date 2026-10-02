@@ -597,7 +597,7 @@ polynomial preserves the zero block and the Frobenius norm is unchanged.
   with every thread's Python stack rather than sitting on the lease until its time limit. Attaching
   a sampling profiler after the fact needs elevated permissions this environment does not grant,
   so arming the dump in advance is the only way to get that stack at all. Probes also queue behind
-  user work with `--after-terminal` rather than jumping it on priority.
+  other queued work with `--after-terminal` rather than jumping it on priority.
 - **Raw simulator parallelism:** the hot binding already releases the GIL and uses Rayon for
   per-row sampling and per-game stepping (`rust/kagg_env/src/python.rs:478-565`). An unarchived
   local scalar spot measurement was fast; persist a matched stage benchmark before reprioritizing.

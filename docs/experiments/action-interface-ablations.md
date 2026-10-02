@@ -1,7 +1,7 @@
 # Action-interface ablations, 2026-09-22 to 2026-09-30
 
 This is the single plan and queue ledger for action-decoding ablations.
-`RUNS.md` records measured outcomes and broader training history. Background
+`docs/experiments/runs.md` records measured outcomes and broader training history. Background
 measurements below remain useful, but the current gates and job IDs in section
 4 supersede the original dated schedule.
 Final submission deadline: 2026-09-30 23:59 UTC. The plan freezes the
@@ -33,7 +33,7 @@ exact ledger, then run cached attention only for the 20 ordered market
 kind/quantity choices. This keeps the teacher's slot order and repeated kinds
 while removing 16 expensive attention steps. Its CUDA parity gate passed and
 its short forward probe was faster, but its two-epoch BC unit fit was much
-worse than flat. The user closed the causal arm on 2026-09-24; all remaining
+worse than flat. The causal arm was closed on 2026-09-24; all remaining
 causal jobs were canceled before start.
 **2026-09-24 quantity priority update.** The memory-safe A2 ALL PPO retry
 succeeded; percentage and narrow-percentage heads failed their sampled-game
@@ -49,35 +49,35 @@ failure before another training run.
 
 ### 1.1 The interface as it is (verified in code)
 
-- Units: 68 `UnitAction` values per unit, up to 16 units ([actions.py:35](src/kaggriculture/actions.py#L35)).
+- Units: 68 `UnitAction` values per unit, up to 16 units ([actions.py:35](../../src/kaggriculture/actions.py#L35)).
   36 are `PICKUP_<ITEM>_<N>`; only fills the shed can cover are legal
-  ([actions.py:285](src/kaggriculture/actions.py#L285)). Moves are primitive and legal anywhere in
+  ([actions.py:285](../../src/kaggriculture/actions.py#L285)). Moves are primitive and legal anywhere in
   bounds, locked tiles included, which matches the engine
-  ([core.rs:2154](rust/kagg_env/src/core.rs#L2154)).
+  ([core.rs:2154](../../rust/kagg_env/src/core.rs#L2154)).
 - Market: 22 `MarketKind` values, 10 slots, STOP always legal and terminal
-  ([actions.py:114](src/kaggriculture/actions.py#L114),
-  [core.rs:1849](rust/kagg_env/src/core.rs#L1849)). Slot logits come from ten learned slot
-  queries in one forward pass ([entity.py:449](src/kaggriculture/entity.py#L449)); a slot sees earlier
+  ([actions.py:114](../../src/kaggriculture/actions.py#L114),
+  [core.rs:1849](../../rust/kagg_env/src/core.rs#L1849)). Slot logits come from ten learned slot
+  queries in one forward pass ([entity.py:449](../../src/kaggriculture/entity.py#L449)); a slot sees earlier
   slots only through the ledger mask.
-- Quantity: 100 absolute bins ([constants.py:175](src/kaggriculture/constants.py#L175)). The logit is
+- Quantity: 100 absolute bins ([constants.py:175](../../src/kaggriculture/constants.py#L175)). The logit is
   a full `bias[kind, q]` plus a rank-32 kind-gated term
-  ([model.py:625](src/kaggriculture/model.py#L625)), and it is evaluated **inside the Rust sampler**
-  ([core.rs:2815](rust/kagg_env/src/core.rs#L2815) `score_quantities`), not on the GPU. Unit and kind
-  logits come from the GPU (Gumbel utilities, [rollout.py:900](src/kaggriculture/rollout.py#L900)) and
-  Rust only masks and selects them ([core.rs:1919](rust/kagg_env/src/core.rs#L1919)).
+  ([model.py:625](../../src/kaggriculture/model.py#L625)), and it is evaluated **inside the Rust sampler**
+  ([core.rs:2815](../../rust/kagg_env/src/core.rs#L2815) `score_quantities`), not on the GPU. Unit and kind
+  logits come from the GPU (Gumbel utilities, [rollout.py:900](../../src/kaggriculture/rollout.py#L900)) and
+  Rust only masks and selects them ([core.rs:1919](../../rust/kagg_env/src/core.rs#L1919)).
 - Engine: units, then market. Market slots of both players advance in lockstep; within a slot both
   players are quoted the same price for each unit round, then commit in seat order
-  ([core.rs:2361](rust/kagg_env/src/core.rs#L2361)). Slot index therefore matters against the
+  ([core.rs:2361](../../rust/kagg_env/src/core.rs#L2361)). Slot index therefore matters against the
   opponent only across slots: my wheat sell in slot 0 is filled at better prices than the opponent's
   wheat sell in slot 1. v27 exploits this by ranking its sells by price impact
-  ([core.rs:1492](rust/kagg_env/src/core.rs#L1492)).
+  ([core.rs:1492](../../rust/kagg_env/src/core.rs#L1492)).
 - Days: hands are deleted at the end of every day and the farmer respawns at (4,4)
-  ([core.rs:2557](rust/kagg_env/src/core.rs#L2557)); hands must be re-hired daily at Fibonacci cost.
-  Units never block each other ([core.rs:2154](rust/kagg_env/src/core.rs#L2154)), so shortest
+  ([core.rs:2557](../../rust/kagg_env/src/core.rs#L2557)); hands must be re-hired daily at Fibonacci cost.
+  Units never block each other ([core.rs:2154](../../rust/kagg_env/src/core.rs#L2154)), so shortest
   paths between two tiles differ only in intermediate positions. The one place an intermediate
   position matters is `spawn_hand`, which puts a new hire on the least-occupied shed-access tile
-  given current unit positions ([core.rs:2962](rust/kagg_env/src/core.rs#L2962), called from
-  `hire` after the unit phase at [core.rs:2489](rust/kagg_env/src/core.rs#L2489)). Replaying 16
+  given current unit positions ([core.rs:2962](../../rust/kagg_env/src/core.rs#L2962), called from
+  `hire` after the unit phase at [core.rs:2489](../../rust/kagg_env/src/core.rs#L2489)). Replaying 16
   episodes with canonical paths changed 13 of 2,773 intermediate positions and 0 of 848 hire
   spawns, so paths are outcome-equivalent on this corpus but not in principle.
 
@@ -85,7 +85,7 @@ failure before another training run.
 
 The production clone trains on `data/bc-v16-current-{mirror,starter,pass,random}-64`, 512
 episode-seats of 719 steps. (`bc-v16-current-v27-64` has a manifest and no episodes;
-[RUNS.md:3041](RUNS.md#L3041) confirms it was never used.) Each file stores the factored targets,
+[docs/experiments/runs.md:3041](runs.md#L3041) confirms it was never used.) Each file stores the factored targets,
 masks, **and the raw observations and engine actions** (`raw_json_zlib`), so any interface can be
 re-projected on CPU without re-running the teacher.
 
@@ -165,8 +165,8 @@ it is.
 3. **"Cheap reparameterizations keep the Rust sampler unchanged."** That holds for unit and kind
    logits, which are GPU-computed. It is false for quantity: any quantity reparameterization changes
    `score_quantities` and the head-shape checks in
-   [python.rs:474](rust/kagg_env/src/python.rs#L474) and
-   [python.rs:728](rust/kagg_env/src/python.rs#L728). The change is small (section 2.2).
+   [python.rs:474](../../rust/kagg_env/src/python.rs#L474) and
+   [python.rs:728](../../rust/kagg_env/src/python.rs#L728). The change is small (section 2.2).
 4. **"Sells first so proceeds fund buys" as the teacher's convention.** v16 buys before selling in
    35% of mixed turns. The original plan inferred that sells-first would be a
    safe canonical order from own-ledger feasibility. The official paired panel
@@ -191,8 +191,8 @@ two-minute hard cap.
 | Arm | Change | State | Next gate |
 | --- | --- | --- | --- |
 | F0 | Flat schema-v4 control | BC completed; causal-campaign PPO canceled | Historical reference only |
-| C0 | Full 36-step causal decoder | Stopped for throughput | Closed by user |
-| C1 | Parallel unit logits, 20 ordered causal market choices | BC unit fit weak; all later jobs canceled | Closed by user |
+| C0 | Full 36-step causal decoder | Stopped for throughput | Closed |
+| C1 | Parallel unit logits, 20 ordered causal market choices | BC unit fit weak; all later jobs canceled | Closed |
 | A2 | Explicit ALL quantity alias | PPO **9588** completed and promoted within A2 | Follow-up unit/kind split **9626** and matched BC sales **9627** |
 | A2b | Fraction-structured integer quantity policy | Two-epoch BC **9589** succeeded; scale-floor NLL ceiling found | PPO **9590** running; paired panels queued |
 | A2c | Narrow-scale fraction head | CPU/native parity passed, immutable source frozen | CUDA gate **9617**, BC **9618**, panels **9619/9620** queued |
@@ -221,11 +221,11 @@ products, or by the Stage-0b ordering rule if that rule wins.
 change, and it is the control that separates "canonical data" from "set-valued head" in A3.
 
 **Touchpoints.** New `canonicalize_demonstration` beside `project_demonstration`
-([demonstrations.py:368](src/kaggriculture/demonstrations.py#L368)); the round-trip gate
-([demonstrations.py:551](src/kaggriculture/demonstrations.py#L551)) changes from byte equality to
+([demonstrations.py:368](../../src/kaggriculture/demonstrations.py#L368)); the round-trip gate
+([demonstrations.py:551](../../src/kaggriculture/demonstrations.py#L551)) changes from byte equality to
 own-ledger equivalence for merged or reordered markets, plus the engine replay and final-state
 check above. New dataset directories carry
-`format_version` 2 in their manifest; [train_bc.py:104](scripts/train_bc.py#L104) accepts it. The
+`format_version` 2 in their manifest; [train_bc.py:104](../../scripts/train_bc.py#L104) accepts it. The
 encoded cache is keyed by manifest hash and needs no change.
 
 **Risk.** Merging changes order execution relative to the opponent. Stage 0b measures that at the
@@ -235,8 +235,8 @@ teacher level before any model sees it.
 
 **Design.** Add one "ALL" row to the quantity head: `all_value[rank]` and `all_bias[kind]`, scored
 exactly like a bin. The legal maximum m is the last true bin of the prefix mask, which Rust already
-guarantees is a prefix ([core.rs:3903](rust/kagg_env/src/core.rs#L3903)). Masks cap at 100 bins
-([core.rs:2752](rust/kagg_env/src/core.rs#L2752)), so ALL means min(legal maximum, 100); for buys
+guarantees is a prefix ([core.rs:3903](../../rust/kagg_env/src/core.rs#L3903)). Masks cap at 100 bins
+([core.rs:2752](../../rust/kagg_env/src/core.rs#L2752)), so ALL means min(legal maximum, 100); for buys
 that is often 100. Inactive rows have an all-false mask, so m is taken as max(mask.sum() - 1, 0)
 and the merge is masked out with the row. The effective logit of
 bin m becomes `logaddexp(score(m), score(ALL))`; every other bin is unchanged. This is the marginal
@@ -253,28 +253,28 @@ The corpus's non-max quantities are specific small integers (1-3 are 56% of all 
 which the per-kind bias already captures, and the only max-relative structure is ALL.
 
 **Touchpoints.** `factored_quantity_logits` gains the mask argument and the merge
-([model.py:625](src/kaggriculture/model.py#L625)). Every `quantity_logits` caller changes with it:
-[ppo.py:1680](src/kaggriculture/ppo.py#L1680), [ppo.py:1724](src/kaggriculture/ppo.py#L1724),
-[ppo.py:2008](src/kaggriculture/ppo.py#L2008), [train_bc.py:881](scripts/train_bc.py#L881),
-[train_bc.py:931](scripts/train_bc.py#L931), [train_bc.py:1257](scripts/train_bc.py#L1257),
-[train_bc.py:1290](scripts/train_bc.py#L1290),
-[causal_actor.py:336](src/kaggriculture/causal_actor.py#L336),
-[causal_actor.py:532](src/kaggriculture/causal_actor.py#L532), the benchmark and probe scripts,
-[latent_dynamics.py:302](src/kaggriculture/latent_dynamics.py#L302),
-[actor_dynamics.py:180](src/kaggriculture/actor_dynamics.py#L180). Python sampling
-([policy.py:616](src/kaggriculture/policy.py#L616)) and `PreparedQuantityHeads`
-([policy.py:98](src/kaggriculture/policy.py#L98)). In Rust, `QuantityHead` gets the ALL row
-([core.rs:423](rust/kagg_env/src/core.rs#L423)), and `score_quantities` merges at m
-([core.rs:2815](rust/kagg_env/src/core.rs#L2815)). The head-shape checks at
-[python.rs:474](rust/kagg_env/src/python.rs#L474) and
-[python.rs:728](rust/kagg_env/src/python.rs#L728) become `[heads, 101, rank]` and
+([model.py:625](../../src/kaggriculture/model.py#L625)). Every `quantity_logits` caller changes with it:
+[ppo.py:1680](../../src/kaggriculture/ppo.py#L1680), [ppo.py:1724](../../src/kaggriculture/ppo.py#L1724),
+[ppo.py:2008](../../src/kaggriculture/ppo.py#L2008), [train_bc.py:881](../../scripts/train_bc.py#L881),
+[train_bc.py:931](../../scripts/train_bc.py#L931), [train_bc.py:1257](../../scripts/train_bc.py#L1257),
+[train_bc.py:1290](../../scripts/train_bc.py#L1290),
+[causal_actor.py:336](../../src/kaggriculture/causal_actor.py#L336),
+[causal_actor.py:532](../../src/kaggriculture/causal_actor.py#L532), the benchmark and probe scripts,
+[latent_dynamics.py:302](../../src/kaggriculture/latent_dynamics.py#L302),
+[actor_dynamics.py:180](../../src/kaggriculture/actor_dynamics.py#L180). Python sampling
+([policy.py:616](../../src/kaggriculture/policy.py#L616)) and `PreparedQuantityHeads`
+([policy.py:98](../../src/kaggriculture/policy.py#L98)). In Rust, `QuantityHead` gets the ALL row
+([core.rs:423](../../rust/kagg_env/src/core.rs#L423)), and `score_quantities` merges at m
+([core.rs:2815](../../rust/kagg_env/src/core.rs#L2815)). The head-shape checks at
+[python.rs:474](../../rust/kagg_env/src/python.rs#L474) and
+[python.rs:728](../../rust/kagg_env/src/python.rs#L728) become `[heads, 101, rank]` and
 `[heads, 22, 101]`. A wave never mixes interfaces: `FrozenActorPool` builds every league slot from
-the learner's own model config and loads strictly ([league.py:307](src/kaggriculture/league.py#L307)),
+the learner's own model config and loads strictly ([league.py:307](../../src/kaggriculture/league.py#L307)),
 and snapshots are validated against it. `_quantity_heads`
-([rollout.py:401](src/kaggriculture/rollout.py#L401)) should still reject a stack with mixed
+([rollout.py:401](../../src/kaggriculture/rollout.py#L401)) should still reject a stack with mixed
 `action_interface` values explicitly. Padding interface-1 heads with `all_bias = -inf` is not an
 option: the select path rejects non-finite quantity tensors
-([python.rs:808](rust/kagg_env/src/python.rs#L808)).
+([python.rs:808](../../rust/kagg_env/src/python.rs#L808)).
 Parity: extend the Rust-vs-Python quantity likelihood tests and the replay-parity audit.
 
 **Risk.** Low. It is also the fallback deliverable if A3 slips.
@@ -340,23 +340,23 @@ observation features do not imply continuous action distributions.
 - A kind whose only legal value is 0 is inactive (not a decision, no gradient), as quantities are
   today.
 - The ledger carries a slot budget, so the compiled queue never exceeds 10 slots (the official
-  `maxMarketOrdersPerTurn`, [mechanics/constants.md:15](mechanics/constants.md)).
+  `maxMarketOrdersPerTurn`, [docs/mechanics/constants.md:15](../mechanics/constants.md)).
 - The compiler emits slots as the active sells first, then HIRE times n, LAND, seeds, animals and
   products. Sells go in fixed kind order, or in price-impact order (v27's rule, a deterministic
   function of state and the chosen set) if Stage 0b shows the ordering is worth money.
 - STOP, permutations and duplicate kinds no longer exist as choices. A mistimed decision on one kind
   cannot truncate the others.
 
-Heads: the ten slot queries ([entity.py:359](src/kaggriculture/entity.py#L359)) become 21 kind
+Heads: the ten slot queries ([entity.py:359](../../src/kaggriculture/entity.py#L359)) become 21 kind
 queries, so every kind has its own decision state. Each kind's rank-32 context feeds the existing
 kind-gated quantity machinery, extended to a 101-row value table (row 0 means "none") plus the ALL
 row. HIRE and LAND reuse the same machinery over their small supports. The `market_kind` linear head
 is deleted in interface 2.
 
 **Why this and not the alternatives.** A causal (autoregressive) kind decoder
-([causal_actor.py](src/kaggriculture/causal_actor.py)) also fixes conditioning. However, it keeps
+([causal_actor.py](../../src/kaggriculture/causal_actor.py)) also fixes conditioning. However, it keeps
 the order redundancy, keeps STOP-truncation, and costs a sequential decode. The prior review reached
-the same conclusion ([REVIEW_RL_20260920.md](REVIEW_RL_20260920.md) section 5.4).
+the same conclusion ([docs/reviews/rl-review-2026-09-20.md](../reviews/rl-review-2026-09-20.md) section 5.4).
 A Plackett-Luce priority over active price-moving kinds is the exact-likelihood way to learn slot
 order. It is added only if Stage 0b shows that neither fixed order nor impact order comes within
 noise of the teacher's own order.
@@ -368,35 +368,35 @@ the difficulty is similar, but it must be measured, not assumed: departure mass 
 canonical teacher states (section 3) is a gate.
 
 **Touchpoints.** Python reference: `MarketKind`/`market_order`/`compile_action` and the ledger
-helpers ([actions.py:114](src/kaggriculture/actions.py#L114),
-[actions.py:379](src/kaggriculture/actions.py#L379)-[481](src/kaggriculture/actions.py#L481),
-[actions.py:667](src/kaggriculture/actions.py#L667)-[722](src/kaggriculture/actions.py#L722)), and
-the market loop of `act_batch` ([policy.py:579](src/kaggriculture/policy.py#L579)-[686](src/kaggriculture/policy.py#L686)),
-which is also the submission path via [inference.py:423](src/kaggriculture/inference.py#L423). Rust:
+helpers ([actions.py:114](../../src/kaggriculture/actions.py#L114),
+[actions.py:379](../../src/kaggriculture/actions.py#L379)-[481](../../src/kaggriculture/actions.py#L481),
+[actions.py:667](../../src/kaggriculture/actions.py#L667)-[722](../../src/kaggriculture/actions.py#L722)), and
+the market loop of `act_batch` ([policy.py:579](../../src/kaggriculture/policy.py#L579)-[686](../../src/kaggriculture/policy.py#L686)),
+which is also the submission path via [inference.py:423](../../src/kaggriculture/inference.py#L423). Rust:
 the market halves of `factor_masks`, `sample_factors` and `select_factors`
-([core.rs:1683](rust/kagg_env/src/core.rs#L1683), [core.rs:1813](rust/kagg_env/src/core.rs#L1813),
-[core.rs:1995](rust/kagg_env/src/core.rs#L1995)), `fill_market_*_mask` and
-`apply_policy_market_order` ([core.rs:2685](rust/kagg_env/src/core.rs#L2685)-[2813](rust/kagg_env/src/core.rs#L2813)),
+([core.rs:1683](../../rust/kagg_env/src/core.rs#L1683), [core.rs:1813](../../rust/kagg_env/src/core.rs#L1813),
+[core.rs:1995](../../rust/kagg_env/src/core.rs#L1995)), `fill_market_*_mask` and
+`apply_policy_market_order` ([core.rs:2685](../../rust/kagg_env/src/core.rs#L2685)-[2813](../../rust/kagg_env/src/core.rs#L2813)),
 and a set-to-slots compiler producing `CompactAction` (`process_market` is untouched). The bindings
 change market array shapes and drop the GPU kind utilities
-([python.rs:426](rust/kagg_env/src/python.rs#L426), [python.rs:682](rust/kagg_env/src/python.rs#L682),
-[python.rs:1451](rust/kagg_env/src/python.rs#L1451)) and
-[rollout.py:900](src/kaggriculture/rollout.py#L900), [rollout.py:1079](src/kaggriculture/rollout.py#L1079).
-Also affected: `ActionFactors` ([policy.py:64](src/kaggriculture/policy.py#L64)), PPO component
-bookkeeping and replay parity ([ppo.py:2336](src/kaggriculture/ppo.py#L2336)), the BC projection
-and loss ([demonstrations.py:368](src/kaggriculture/demonstrations.py#L368),
-[train_bc.py:868](scripts/train_bc.py#L868)), and lejepa, which splits its decision states by `MAX_MARKET_ORDERS`
-([lejepa_model.py:229](src/kaggriculture/lejepa_model.py#L229),
-[lejepa_model.py:360](src/kaggriculture/lejepa_model.py#L360)). Only A2 is inherited by lejepa
+([python.rs:426](../../rust/kagg_env/src/python.rs#L426), [python.rs:682](../../rust/kagg_env/src/python.rs#L682),
+[python.rs:1451](../../rust/kagg_env/src/python.rs#L1451)) and
+[rollout.py:900](../../src/kaggriculture/rollout.py#L900), [rollout.py:1079](../../src/kaggriculture/rollout.py#L1079).
+Also affected: `ActionFactors` ([policy.py:64](../../src/kaggriculture/policy.py#L64)), PPO component
+bookkeeping and replay parity ([ppo.py:2336](../../src/kaggriculture/ppo.py#L2336)), the BC projection
+and loss ([demonstrations.py:368](../../src/kaggriculture/demonstrations.py#L368),
+[train_bc.py:868](../../scripts/train_bc.py#L868)), and lejepa, which splits its decision states by `MAX_MARKET_ORDERS`
+([lejepa_model.py:229](../../src/kaggriculture/lejepa_model.py#L229),
+[lejepa_model.py:360](../../src/kaggriculture/lejepa_model.py#L360)). Only A2 is inherited by lejepa
 for free, because A3's kind queries live in the entity trunk. `CausalActor` and `StrategicActor`
 share `_initialize_heads` but decode markets themselves
-([causal_actor.py:283](src/kaggriculture/causal_actor.py#L283)), so they must reject interface 2
+([causal_actor.py:283](../../src/kaggriculture/causal_actor.py#L283)), so they must reject interface 2
 at construction. The action encoders used by the world-model families
-(`StructuredActionEncoder` in [lejepa.py:382](src/kaggriculture/lejepa.py#L382),
-[structured_dynamics.py:88](src/kaggriculture/structured_dynamics.py#L88),
-[economic_forecasting.py:219](src/kaggriculture/economic_forecasting.py#L219),
-[latent_dynamics.py:73](src/kaggriculture/latent_dynamics.py#L73),
-[actor_dynamics.py:74](src/kaggriculture/actor_dynamics.py#L74)) embed slot-shaped market actions
+(`StructuredActionEncoder` in [lejepa.py:382](../../src/kaggriculture/lejepa.py#L382),
+[structured_dynamics.py:88](../../src/kaggriculture/structured_dynamics.py#L88),
+[economic_forecasting.py:219](../../src/kaggriculture/economic_forecasting.py#L219),
+[latent_dynamics.py:73](../../src/kaggriculture/latent_dynamics.py#L73),
+[actor_dynamics.py:74](../../src/kaggriculture/actor_dynamics.py#L74)) embed slot-shaped market actions
 and need a set-shaped variant or a compile-to-slots adapter. About 30 Python test files and 40 Rust
 tests pin the current interface; interface 2 adds tests beside them rather than editing them.
 
@@ -404,7 +404,7 @@ tests pin the current interface; interface 2 adds tests beside them rather than 
 interface 2. Production league lanes are the run's own snapshots plus Rust built-ins, so this holds.
 (3) Three days is the estimate with parity tests; it is the critical path of the plan.
 (4) PPO scale: entropy is normalized by the active component count
-([rollout.py:1079](src/kaggriculture/rollout.py#L1079)) and the policy loss is a per-component
+([rollout.py:1079](../../src/kaggriculture/rollout.py#L1079)) and the policy loss is a per-component
 mean, so going from about 2.3 to 10-15 market components per state changes the effective step size
 and entropy weight of every head family under an unchanged recipe. Stage 3 reports per-family
 approximate KL and entropy for every arm; if A3's market KL per wave is outside a factor of two of
@@ -427,7 +427,7 @@ endpoint at route start); those steps are relabeled with the next waypoint as ta
   mask. Locked tiles are never targets but remain transit, as the engine allows.
 - There is no claimed-tile mask (1.5.2).
 - Pointer logits: the unit decision state as query against the own-farm tile tokens from the trunk
-  memory ([entity.py:463](src/kaggriculture/entity.py#L463)), with the existing axial RoPE applied to
+  memory ([entity.py:463](../../src/kaggriculture/entity.py#L463)), with the existing axial RoPE applied to
   both sides so the score sees relative displacement.
 - BC relabel: every step of a move run gets its endpoint as the target, the action at arrival is the
   verb, and non-shortest runs split into waypoints as in A1.
@@ -444,17 +444,17 @@ addition and is deferred. The unit mask grows from [16, 68] to [16, 164] bools: 
 250 MB per 230k-state wave, which is acceptable, or bit-packed if memory binds.
 
 **Touchpoints.** `UnitAction` space and `unit_action_mask`/`compile_action`
-([actions.py:35](src/kaggriculture/actions.py#L35), [actions.py:255](src/kaggriculture/actions.py#L255),
-[actions.py:685](src/kaggriculture/actions.py#L685)); the unit loop of `act_batch`
-([policy.py:519](src/kaggriculture/policy.py#L519)-[570](src/kaggriculture/policy.py#L570)). Rust
+([actions.py:35](../../src/kaggriculture/actions.py#L35), [actions.py:255](../../src/kaggriculture/actions.py#L255),
+[actions.py:685](../../src/kaggriculture/actions.py#L685)); the unit loop of `act_batch`
+([policy.py:519](../../src/kaggriculture/policy.py#L519)-[570](../../src/kaggriculture/policy.py#L570)). Rust
 `UnitLedger::action_valid` gains the target class, and the unit halves of `factor_masks`,
 `sample_factors` and `select_factors` split the policy factor from the engine action they compile
-to ([core.rs:493](rust/kagg_env/src/core.rs#L493), [core.rs:1654](rust/kagg_env/src/core.rs#L1654),
-[core.rs:1740](rust/kagg_env/src/core.rs#L1740), [core.rs:1919](rust/kagg_env/src/core.rs#L1919)).
+to ([core.rs:493](../../rust/kagg_env/src/core.rs#L493), [core.rs:1654](../../rust/kagg_env/src/core.rs#L1654),
+[core.rs:1740](../../rust/kagg_env/src/core.rs#L1740), [core.rs:1919](../../rust/kagg_env/src/core.rs#L1919)).
 `UNIT_ACTIONS`-sized arrays change in the bindings, in `_gpu_policy_statistics`, and in the unit
-head ([entity.py:598](src/kaggriculture/entity.py#L598)) and `decode_belief`, which must now receive
-tile states ([entity.py:641](src/kaggriculture/entity.py#L641)). The pickup initialization bias in
-[model.py:575](src/kaggriculture/model.py#L575) is retained for the verb block.
+head ([entity.py:598](../../src/kaggriculture/entity.py#L598)) and `decode_belief`, which must now receive
+tile states ([entity.py:641](../../src/kaggriculture/entity.py#L641)). The pickup initialization bias in
+[model.py:575](../../src/kaggriculture/model.py#L575) is retained for the verb block.
 
 ### 2.5 Not proposed, and why
 
@@ -472,12 +472,12 @@ Primary panels use the fixed native development panel (256 seeds from
 `DEVELOPMENT_SEED_START`, seat determined by seed parity). Two-minute
 preliminary gates may use its first 128 seeds, as A2c does; require a larger
 confirmation before promotion
-([evaluate_architecture_campaign.py](scripts/evaluate_architecture_campaign.py)). Every
+([evaluate_architecture_campaign.py](../../scripts/evaluate_architecture_campaign.py)). Every
 number is reported as score and paired bank (learner minus the same-map baseline), with a
 map-paired bootstrap 95% interval.
 
 **BC metrics, comparable across interfaces.** Evaluate every arm on the same holdout episodes
-(the highest seeds, which [train_bc.py:221](scripts/train_bc.py#L221) holds out), with equivalence
+(the highest seeds, which [train_bc.py:221](../../scripts/train_bc.py#L221) holds out), with equivalence
 defined at the level of what the step does, not how it is encoded.
 - Step-level engine-action NLL: -log of the probability that the arm's policy produces a step
   equivalent to the teacher's. Units are equivalent when the compiled engine action is equal
@@ -493,7 +493,7 @@ defined at the level of what the step does, not how it is encoded.
 
 **Closed loop.** Argmax and T=1 sampled play against starter and scripted-v27 on the 256-map panel.
 The public-v16 panel runs in the official engine (64 seeds, both seats, CPU workers via
-[evaluate_checkpoint.py](scripts/evaluate_checkpoint.py)) for final candidates only.
+[evaluate_checkpoint.py](../../scripts/evaluate_checkpoint.py)) for final candidates only.
 
 **PPO.** Screen each arm from its own two-epoch clone for at most 27 training
 minutes (30-minute hard MLQ limit). Keep optimizer, minibatch, critic warmup,
@@ -505,7 +505,7 @@ panels screen arms, not certify them.
 
 ## 4. Current build and queue plan (2026-09-24)
 
-This section is the authoritative action-ablation plan. `RUNS.md` contains
+This section is the authoritative action-ablation plan. `docs/experiments/runs.md` contains
 observed results, not competing future schedules. Training uses normal MLQ
 priority and exclusive GPU admission; short defect probes **9626/9628/9636**
 were raised one priority level to resolve the current action failure. A job's
@@ -536,8 +536,8 @@ C1 BC **9548** finished with holdout NLL **0.0482** and unit accuracy
 **0.977**, versus F0 **0.0025** and **1.000**. The parallel unit path bypassed
 the decoder's farm/economy attention, a likely capacity cause. C1 PPO
 **9557** and dependents **9558–9560** were canceled before start. A repaired
-unit decoder passed CPU replay/gradient tests, but the user closed the causal
-arm; its queued CUDA contract **9577** was canceled before start, and dependent
+unit decoder passed CPU replay/gradient tests, but the causal arm was
+closed; its queued CUDA contract **9577** was canceled before start, and dependent
 probe/BC **9578/9579** skipped. The uncommitted repair was removed from the
 working tree. F0 PPO **9553** was also canceled during the causal-campaign
 shutdown; its BC **9543** remains a measured reference. Earlier superseded
@@ -703,7 +703,7 @@ versus A2 ALL's 0.580 and 0.106, while mean executed quantity is similar
 whether to sell, not just how many units each order specifies. These are
 different BC fits sharing a trunk; the comparison does not isolate a direct
 quantity-to-kind causal effect.
-**A2b is rejected.** The user canceled PPO **9590** after iteration 66; its
+**A2b is rejected.** PPO **9590** was canceled after iteration 66; its
 dependent panels **9594–9596** were skipped. The first critic-only rollout had
 money mean/median/p90 **$3,899/$50/$4,739**, versus A2 ALL's
 **$64,153/$62,787/$140,650**. Its STOP/SELL/HIRE order fractions were
@@ -1160,8 +1160,8 @@ the initializer for later action runs immediately; record the source and
 checkpoint digest. For market arms, behavior includes relevant trade volume.
 A one-seed argmax gain or held-out BC NLL gain alone is a screening result.
 Keep both decoding modes and the carrot/tomato/egg units in every
-market-related panel. Training jobs stop at 30 minutes; benchmarks stop at
-two minutes. Do not launch a new long run merely to obtain a benchmark
+market-related panel. Training jobs are capped at 30 minutes and benchmarks at
+two minutes; a new long run is not launched merely to obtain a benchmark
 number that would take longer to compile than to measure.
 
 ### 4.5 Public teacher screen

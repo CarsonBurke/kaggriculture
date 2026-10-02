@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prove the native sampler already selects per-row quantity heads out of an N-agent stack.
 
-Stage 0(a) of `POPULATION_LEAGUE_PLAN.md`.  The population wave replaces one
+Stage 0(a) of `docs/proposals/population-league.md`.  The population wave replaces one
 learner plus frozen lanes with N concurrent learners, and it reaches the engine
 through exactly one changed argument: `quantity_kind_gate`/`quantity_values`/
 `quantity_bias` become a stack of N heads instead of `(actor, *opponents)`, and

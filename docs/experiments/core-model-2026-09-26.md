@@ -1,7 +1,7 @@
 # Neural core selection and training
 
-The task is to identify the best features of our models from September 12–26,
-create a coherent core, train it, and submit the resulting neural policy.
+This campaign identifies the best features of our models from September 12–26,
+combines them into a coherent core, trains it, and submits the resulting neural policy.
 The earlier public-script submissions were outside that intended objective.
 They are not candidates in this campaign.
 
@@ -105,8 +105,8 @@ individual coefficients to zero is still invalid for LeJEPA optimizer ownership.
 | PPO objective | TPO eta1 ended at 0/64 against starter and V27 in both decoding modes; the later joint-ratio control also collapsed from strong BC to zero V27 wins | Retain component-ratio clipped PPO |
 | Extra NextLat, writeback, strategic plans, causal market decoding, percentage quantities | No stronger validated policy at useful compute cost; causal arm was previously closed | Exclude from the core |
 
-Primary sources: `JEPA_RUNS.md`, `RUN_COMPARISON_20260918.md`, `RUNS.md`,
-`ACTION_INTERFACE_ABLATIONS.md`, and the actual action-stack configuration and
+Primary sources: `docs/experiments/jepa-runs.md`, `docs/experiments/run-comparison-2026-09-18.md`, `docs/experiments/runs.md`,
+`docs/experiments/action-interface-ablations.md`, and the actual action-stack configuration and
 evaluation JSON files. Historical results under 1.32.6 are not current-rule
 absolute performance claims.
 
@@ -328,7 +328,7 @@ Raw selected measurements: `artifacts/probes/core-model-20260926/collapse-functi
 
 ## Paused for parameter-golf priority
 
-User stopped job 10260 after about 31 minutes and deferred further experiments.
+Job 10260 was stopped after about 31 minutes and deferred further experiments.
 Canceled queued jobs 10261–10263. Schema3/ALL/no-affordance is the leading
 candidate; checkpoint 91 (75 actor waves) scored argmax 64/64 starter, 64/64
 V27, 60/64 V16 on the development panel. Latest durable checkpoint is 116

@@ -1,4 +1,4 @@
-"""Semantic tokenization for the structured farm transformer (VIT_PLAN).
+"""Semantic tokenization for the structured farm transformer (docs/proposals/vit.md).
 
 Turns a raw observation into per-entity token arrays: categorical index
 columns (for learned embeddings) plus continuous columns normalized by known
@@ -69,7 +69,7 @@ TILE_COUNT = BOARD_SIZE * BOARD_SIZE
 # `farm_token_fields`, `town_token_fields`; the critic's private columns by
 # `product_private_fields`).
 #
-# v3: per-unit carried-item insertion ranks (README).
+# v3: per-unit carried-item insertion ranks (docs/training-reference.md).
 # v4: adds the farm token's `money_margin`.
 # v5: adds the town token's per-shop `first_unlock` positions.
 # v6: adds the product token's `held_value` and the farm token's `liquidation`

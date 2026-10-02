@@ -38,7 +38,7 @@ from kaggriculture.encoding import (
 #: rate in the critic, and fed an unbounded logit into HL-Gauss CE; measured
 #: across three controlled 100-wave runs its weight norm was the one
 #: exponentially growing parameter, at a rate no optimizer change moved
-#: (RUNS.md, "The invariant driver"). The constants are the reference's.
+#: (docs/experiments/runs.md, "The invariant driver"). The constants are the reference's.
 #:
 #: The cap costs nothing in expressiveness here. An HL-Gauss target with
 #: `sigma = 0.75` bin widths puts essentially all of its mass inside four
